@@ -1,515 +1,507 @@
-# Trinity/QRDX-Chain Modernization TODO List
-## Bringing the codebase up to post-2022 Ethereum standards
+# QRDX Chain - Quantum-Resistant DeFi Layer-1 Blockchain
+## Development Guide and Technical Overview
 
-This document outlines all necessary changes to modernize this archived Trinity client to support current Ethereum standards and network specifications as of 2025.
+### Project Overview
 
----
+**QRDX Chain** is a purpose-built Layer-1 blockchain implementing post-quantum cryptographic security for decentralized finance. This project is based on the Trinity Ethereum client (pre-2022 Ethereum architecture) and transforms it into a quantum-resistant blockchain with native DeFi capabilities.
 
-## 1. CONSENSUS LAYER INTEGRATION (The Merge - September 2022)
+### Key Characteristics
 
-### 1.1 Proof-of-Stake Transition
-- [ ] **Remove PoW Mining Infrastructure**
-  - [ ] Remove/deprecate `MiningMethod.Ethash` from `trinity/network_configurations.py`
-  - [ ] Remove ethash mining logic and difficulty calculations
-  - [ ] Remove PoW block validation code
-  - [ ] Remove mining-related RPC methods (`eth_mining`, `eth_hashrate`, `eth_getWork`, `eth_submitWork`)
+- **Base:** Trinity client (pre-Merge Ethereum architecture)
+- **Target Performance:**
+  - Block Time: 2 seconds
+  - Throughput: 5,000+ TPS
+- **VM:** QEVM (Quantum-resistant Ethereum Virtual Machine)
+- **Primary Innovation:** Post-quantum cryptography + Advanced AMM + Asset Shielding
+- **Fork Origin:** Trinity Ethereum client codebase
 
-- [ ] **Implement Beacon Chain Integration**
-  - [ ] Add beacon chain client interface (consensus client communication)
-  - [ ] Implement Engine API (JSON-RPC interface for consensus-execution communication)
-    - [ ] `engine_newPayloadV1`, `engine_newPayloadV2`, `engine_newPayloadV3`
-    - [ ] `engine_forkchoiceUpdatedV1`, `engine_forkchoiceUpdatedV2`, `engine_forkchoiceUpdatedV3`
-    - [ ] `engine_getPayloadV1`, `engine_getPayloadV2`, `engine_getPayloadV3`
-    - [ ] `engine_getPayloadBodiesByHashV1`, `engine_getPayloadBodiesByRangeV1`
-    - [ ] `engine_exchangeTransitionConfigurationV1`
-  - [ ] Add JWT authentication for Engine API
-  - [ ] Implement execution payload structure
-  - [ ] Add validator withdrawal processing
-  - [ ] Handle safe head, finalized head tracking
+### Core Components (Per Whitepaper v2.0)
 
-### 1.2 Fork Choice Updates
-- [ ] Implement LMD-GHOST fork choice rule
-- [ ] Replace chain reorganization logic with beacon chain finality
-- [ ] Update block import to wait for beacon chain validation
-- [ ] Implement optimistic sync mode
+#### 1. **QRDX Chain** - Layer-1 Blockchain
+- Post-quantum secure Layer-1 with QEVM
+- NIST-standardized cryptographic primitives
+- Cross-chain bridge infrastructure
+- Native asset shielding capabilities
 
----
+#### 2. **QRDX Protocol** - Quantum-Resistant AMM
+- Based on Uniswap v3/v4 architecture
+- Concentrated liquidity (up to 4000x capital efficiency)
+- Singleton architecture (single contract for all pools)
+- Hooks system for extensible pool behaviors
+- Flash accounting for optimized token transfers
 
-## 2. NETWORK PROTOCOL UPGRADES
+#### 3. **Asset Shielding System**
+- Convert classical assets → quantum-resistant equivalents
+- ETH → qETH, WBTC → qBTC, etc.
+- Trustless bridge mechanism with cryptographic proofs
+- Multi-validator consensus for security
 
-### 2.1 ETH Protocol Versions
-- [ ] **Implement ETH/66** (Request IDs - EIP-2481)
-  - [ ] Add request ID to all request/response pairs
-  - [ ] Update `trinity/protocol/eth/proto.py` to add `ETHProtocolV66`
-  - [ ] Update `trinity/protocol/eth/commands.py` for request IDs
-  - [ ] Update `trinity/protocol/eth/peer.py` for v66 compatibility
-  - [ ] Currently stuck on v65, note in code mentions "Disabled until eth/66 is implemented"
+#### 4. **qRC20 Token Standard**
+- Quantum-resistant version of ERC-20
+- Compatible with existing DeFi tooling
+- Enforces CRYSTALS-Dilithium signatures
 
-- [ ] **Implement ETH/67** (Remove `GetNodeData` - EIP-4938)
-  - [ ] Remove `GetNodeDataV65` and `NodeDataV65` commands
-  - [ ] Update state sync to not rely on node data requests
-  - [ ] Implement alternative state sync mechanisms
+### Post-Quantum Cryptography Implementation
 
-- [ ] **Implement ETH/68** (Transaction type field)
-  - [ ] Add transaction type field to announcements
-  - [ ] Update `NewPooledTransactionHashes` format
+Based on **NIST-standardized algorithms**:
 
-### 2.2 New Protocol: SNAP (Snapshot Protocol)
-- [ ] Implement `snap/1` protocol for state snapshots
-  - [ ] `GetAccountRange`, `AccountRange`
-  - [ ] `GetStorageRanges`, `StorageRanges`
-  - [ ] `GetByteCodes`, `ByteCodes`
-  - [ ] `GetTrieNodes`, `TrieNodes`
-- [ ] Add snapshot sync capability alongside beam/full/light sync
-- [ ] Create `trinity/protocol/snap/` directory structure
+#### **CRYSTALS-Dilithium** (Digital Signatures - FIPS 204)
+- Module-Lattice-Based Digital Signature Algorithm
+- Security Level: NIST Level 3 (comparable to AES-192)
+- Public Key: 1,952 bytes
+- Signature: 3,293 bytes
+- Usage: Transaction signing, block signing, smart contract auth
 
-### 2.3 Discovery Protocol
-- [ ] Update to Discovery v5.1
-- [ ] Add ENR (Ethereum Node Records) support for consensus layer
-- [ ] Update bootnode lists (currently using outdated nodes)
+#### **CRYSTALS-Kyber** (Key Encapsulation - FIPS 203)
+- Module-Lattice-Based Key Encapsulation Mechanism
+- Security Level: NIST Level 3
+- Public Key: 1,184 bytes
+- Usage: Encrypted transactions, validator communication, bridge security
 
----
+#### **Hash Functions**
+- Primary: BLAKE3 (512-bit output)
+- Secondary: SHA3-512
+- Provides 256-bit quantum resistance against Grover's algorithm
 
-## 3. EVM UPDATES & HARD FORKS
+### Why Trinity/Pre-Merge Architecture?
 
-### 3.1 London Fork (August 2021)
-- [ ] **EIP-1559: Fee Market**
-  - [ ] Update transaction structure with `maxFeePerGas` and `maxPriorityFeePerGas`
-  - [ ] Implement base fee calculation per block
-  - [ ] Add `baseFeePerGas` to block headers
-  - [ ] Update gas price logic in transaction pool
-  - [ ] Update RPC responses to include EIP-1559 fields
-  - [ ] Implement fee burning mechanism
-  
-- [ ] **EIP-3529: Reduction in gas refunds**
-  - [ ] Update SSTORE gas refund calculations
-  - [ ] Update SELFDESTRUCT refund rules
+This project uses the Trinity client as foundation because:
+1. **Proven codebase** with mature Ethereum implementation
+2. **No PoS complexity** - easier to modify consensus to QR-PoS
+3. **Full EVM compatibility** - easier to create QEVM variant
+4. **Active P2P/networking layer** - ready for modification
+5. **Well-documented** architecture for implementing quantum-resistant changes
 
-- [ ] **EIP-3541: Reject contracts starting with 0xEF**
-  - [ ] Add validation for contract code starting with 0xEF byte
-
-### 3.2 Arrow Glacier & Gray Glacier (2021-2022)
-- [ ] Implement difficulty bomb delays
-- [ ] Add fork block configurations
-
-### 3.3 Paris Fork (The Merge - September 2022)
-- [ ] Add `ParisVM` to `trinity/_utils/eip1085.py` (currently stops at `BerlinVM`)
-- [ ] **EIP-3675: Upgrade consensus to Proof-of-Stake**
-  - [ ] Remove PoW validation from blocks post-merge
-  - [ ] Add `withdrawalsRoot` to block header
-  - [ ] Handle transition block (terminal total difficulty)
-  - [ ] Update DIFFICULTY opcode to return PREVRANDAO
-  
-### 3.4 Shanghai Fork (April 2023)
-- [ ] Add `ShanghaiVM` implementation
-- [ ] **EIP-3651: Warm COINBASE**
-  - [ ] Update COINBASE gas cost calculation
-  
-- [ ] **EIP-3855: PUSH0 instruction**
-  - [ ] Add PUSH0 opcode (0x5F)
-  
-- [ ] **EIP-3860: Limit and meter initcode**
-  - [ ] Add 49152 byte limit for initcode
-  - [ ] Add initcode gas cost (2 gas per 32-byte chunk)
-  
-- [ ] **EIP-4895: Beacon chain push withdrawals**
-  - [ ] Implement withdrawal processing in block execution
-  - [ ] Add withdrawals to execution payload
-  - [ ] Update state with withdrawal amounts
-
-### 3.5 Cancun Fork (March 2024)
-- [ ] Add `CancunVM` implementation
-- [ ] **EIP-4844: Proto-Danksharding (Blob transactions)**
-  - [ ] Add new transaction type (0x03) for blob transactions
-  - [ ] Implement blob gas pricing (separate from regular gas)
-  - [ ] Add `blobVersionedHashes` to transactions
-  - [ ] Implement blob verification (KZG commitments)
-  - [ ] Add `excessBlobGas` and `blobGasUsed` to block headers
-  - [ ] Update mempool to handle blob transactions
-  - [ ] Implement blob pruning (keep for ~18 days)
-  
-- [ ] **EIP-1153: Transient storage opcodes**
-  - [ ] Add TSTORE opcode (0x5C)
-  - [ ] Add TLOAD opcode (0x5D)
-  
-- [ ] **EIP-4788: Beacon block root in EVM**
-  - [ ] Add `parentBeaconBlockRoot` to block header
-  - [ ] Store beacon roots in system contract
-  
-- [ ] **EIP-5656: MCOPY instruction**
-  - [ ] Add MCOPY opcode (0x5E) for memory copying
-  
-- [ ] **EIP-6780: SELFDESTRUCT only in same transaction**
-  - [ ] Update SELFDESTRUCT behavior
-  
-- [ ] **EIP-7516: BLOBBASEFEE opcode**
-  - [ ] Add BLOBBASEFEE opcode (0x4A)
-
-### 3.6 Prague/Electra Fork (Expected 2025)
-- [ ] Monitor EIP proposals for inclusion
-- [ ] **Potential EIPs to implement:**
-  - [ ] EIP-2537: BLS12-381 precompiles
-  - [ ] EIP-2935: Historical block hashes in state
-  - [ ] EIP-6110: Supply validator deposits on-chain
-  - [ ] EIP-7002: Execution layer triggerable exits
-  - [ ] EIP-7251: Increase max effective balance
-  - [ ] EIP-7549: Move committee index outside attestation
-  - [ ] EIP-7685: General purpose execution layer requests
+The goal is to **transform** this pre-Merge client into a quantum-resistant chain, NOT to maintain PoW.
 
 ---
 
-## 4. RPC API UPDATES
+## Implementation Status
 
-### 4.1 Core JSON-RPC Methods Updates
-- [ ] Update `eth_getBlockByNumber` and `eth_getBlockByHash`
-  - [ ] Add `baseFeePerGas` field
-  - [ ] Add `withdrawals` field (post-Shanghai)
-  - [ ] Add `withdrawalsRoot` field
-  - [ ] Add `blobGasUsed` field (post-Cancun)
-  - [ ] Add `excessBlobGas` field (post-Cancun)
-  - [ ] Add `parentBeaconBlockRoot` field (post-Cancun)
+### ✅ Completed Components
 
-- [ ] Update `eth_getTransactionByHash` and related methods
-  - [ ] Add EIP-1559 fields (`maxFeePerGas`, `maxPriorityFeePerGas`)
-  - [ ] Add `type` field for transaction types
-  - [ ] Add `accessList` for type 1 transactions
-  - [ ] Add `blobVersionedHashes`, `maxFeePerBlobGas` for type 3 transactions
+#### 1. Post-Quantum Cryptography Core (`trinity/crypto/`)
+- **`pqc.py`**: Full implementation of CRYSTALS-Dilithium and CRYSTALS-Kyber
+  - `DilithiumPrivateKey` and `DilithiumPublicKey` classes
+  - `KyberPrivateKey` and `KyberPublicKey` classes  
+  - Key generation, signing, verification, encapsulation, decapsulation
+  - NIST FIPS 204 (Dilithium3) and FIPS 203 (Kyber768)
 
-- [ ] Update `eth_getTransactionReceipt`
-  - [ ] Add `blobGasUsed` and `blobGasPrice` fields
-  - [ ] Update `effectiveGasPrice` calculation
+- **`hashing.py`**: BLAKE3 quantum-resistant hashing
+  - `blake3_256()` and `blake3_512()` functions
+  - `Blake3Hash` class for incremental hashing
+  - Keyed hashing and key derivation functions
+  - 512-bit output provides 256-bit quantum security
 
-- [ ] Add new methods:
-  - [ ] `eth_maxPriorityFeePerGas` - EIP-1559 fee estimation
-  - [ ] `eth_feeHistory` - Historical fee data
-  - [ ] `eth_createAccessList` - Generate access lists
+- **`addresses.py`**: Hybrid address format
+  - `generate_pq_address()`: 0x02 prefix + BLAKE3-256 hash
+  - `generate_legacy_address()`: 0x01 prefix + Keccak-256 hash
+  - Address validation and type checking
+  - Contract address generation for both types
 
-### 4.2 Filter & Subscription Updates
-- [ ] Update `eth_newBlockFilter` for new block structure
-- [ ] Update `eth_subscribe` for new transaction types
-- [ ] Add proper handling for pending transaction subscriptions
+#### 2. Hybrid Transaction Format (`trinity/rlp/transactions.py`)
+- **`BaseHybridTransaction`**: RLP-serializable transaction class
+  - Signature type field: 0x00 (ECDSA) or 0x01 (Dilithium)
+  - Supports both 21-byte legacy and 33-byte PQ addresses
+  - Automatic sender recovery for both signature types
+  - Higher base gas (50,000) for PQ transactions vs legacy (21,000)
 
-### 4.3 Debug/Trace APIs
-- [ ] Update trace APIs for new opcodes
-- [ ] Add support for tracing blob transactions
-- [ ] Update `debug_traceTransaction` for transient storage
+- **`UnsignedTransaction`**: Transaction builder
+  - `sign_ecdsa()`: Sign with ECDSA/secp256k1
+  - `sign_dilithium()`: Sign with Dilithium (includes public key in signature)
+  - Automatic hash function selection (Keccak for ECDSA, BLAKE3 for Dilithium)
 
----
+#### 3. P2P Quantum-Resistant Authentication (`p2p/auth_pqc.py`)
+- **`PQCHandshakeInitiator`** and **`PQCHandshakeResponder`**
+  - Dilithium signatures for peer authentication
+  - Kyber KEM for secure session key establishment
+  - BLAKE3-based key derivation
+  - Protocol version negotiation (0x04 legacy, 0x10 PQC)
 
-## 5. TRANSACTION TYPES & HANDLING
+#### 4. QEVM Precompiled Contracts (`trinity/vm/precompiles_pqc.py`)
+- **0x0A - Dilithium Verify**: On-chain signature verification
+  - Input: message_hash (32) + public_key (1952) + signature (3293)
+  - Output: 0x01 (valid) or 0x00 (invalid)
+  - Gas: 6000 base + 10 per byte
 
-### 5.1 Existing Transaction Types (Already Partially Implemented)
-- [ ] **Type 0 (Legacy)** - Verify full compatibility
-- [ ] **Type 1 (EIP-2930: Access Lists)** - Currently has some support, verify completeness
-- [ ] **Type 2 (EIP-1559: Dynamic Fee)** - Needs implementation
+- **0x0B - BLAKE3-256 Hash**: 256-bit hashing
+  - Gas: 60 base + 12 per word
 
-### 5.2 New Transaction Types
-- [ ] **Type 3 (EIP-4844: Blob Transactions)**
-  - [ ] Add transaction encoding/decoding
-  - [ ] Implement blob verification logic
-  - [ ] Update transaction pool handling
-  - [ ] Add blob gas price market
+- **0x0C - BLAKE3-512 Hash**: 512-bit quantum-resistant hashing
+  - Gas: 90 base + 18 per word
 
-### 5.3 Transaction Pool Updates
-- [ ] Update pool to handle all transaction types
-- [ ] Implement EIP-1559 transaction ordering
-- [ ] Add blob transaction pool management
-- [ ] Update fee estimation logic
-- [ ] Implement proper transaction replacement rules
+- **0x0D - BLAKE3 Keyed Hash**: Message authentication
+  - Gas: 100 base + 20 per word
 
----
+#### 5. Test Suite (`tests/crypto/test_pqc.py`)
+- Comprehensive tests for all PQC operations
+- Dilithium signing/verification tests
+- Kyber encapsulation/decapsulation tests
+- BLAKE3 hashing tests
+- Address generation and validation tests
+- Hybrid transaction signing tests
+- Precompile address validation tests
 
-## 6. STATE MANAGEMENT & SYNC
-
-### 6.1 State Sync Modernization
-- [ ] Implement Snap Sync (faster than current beam/full sync)
-- [ ] Add checkpoint sync capability
-- [ ] Implement state expiry/statelessness preparations (if pursuing this)
-- [ ] Update state healing mechanisms
-
-### 6.2 Database & Storage
-- [ ] Update database schema for new block/transaction fields
-- [ ] Implement efficient storage for withdrawals
-- [ ] Add blob storage and pruning
-- [ ] Optimize state storage (consider moving to newer db backend)
-- [ ] Currently uses LevelDB via `plyvel==1.2.0` - consider alternatives
-
-### 6.3 Trie Updates
-- [ ] Verify Verkle trie preparation (future-proofing)
-- [ ] Optimize MPT implementation for current state sizes
-- [ ] Add witness support for stateless validation
+#### 6. Dependencies (`setup.py`)
+- Added `liboqs-python>=0.10.0` for PQC algorithms
+- Added `blake3>=0.3.3` for quantum-resistant hashing
 
 ---
 
-## 7. TESTING INFRASTRUCTURE
+## Development TODO List
 
-### 7.1 Update Test Fixtures
-- [ ] Update to latest Ethereum test fixtures
-  - [ ] Currently using outdated fixtures stopping at Berlin fork
-  - [ ] Add London fork tests
-  - [ ] Add Paris/Merge fork tests
-  - [ ] Add Shanghai fork tests
-  - [ ] Add Cancun fork tests
-  
-- [ ] Update `fixtures/` directory with latest test vectors
-- [ ] Update RPC test suite in `tests/json-fixtures-over-rpc/`
+### Phase 1: Foundation & Cryptography ✅ COMPLETED
 
-### 7.2 Integration Tests
-- [ ] Add Engine API integration tests
-- [ ] Add blob transaction tests
-- [ ] Add withdrawal processing tests
-- [ ] Test fork transitions (especially The Merge)
-- [ ] Add consensus-execution layer interaction tests
+### Phase 2: VM Integration (IN PROGRESS)
 
-### 7.3 Network Tests
-- [ ] Test ETH/66, ETH/67, ETH/68 protocol implementations
-- [ ] Test SNAP protocol
-- [ ] Test peer compatibility with modern clients
+#### TODO: Integrate PQC Precompiles into VM
+- [ ] Modify VM fork to register PQC precompiles
+- [ ] Add precompiles to execution context
+- [ ] Test precompile gas consumption
+- [ ] Benchmark precompile performance
 
----
+#### TODO: Implement BLAKE3 State Tree
+- [ ] Create `trinity/vm/state/` module for BLAKE3-based MPT
+- [ ] Replace Keccak256 with BLAKE3-512 in state root calculation
+- [ ] Update account state hashing
+- [ ] Implement BLAKE3-based storage proofs
+- [ ] Migrate state snapshots to new format
 
-## 8. DEPENDENCY UPDATES
+### Phase 3: Transaction Pool & Validation
 
-### 8.1 Core Dependencies
-- [ ] **Upgrade Python version**
-  - [ ] Current: Python 3.7-3.8
-  - [ ] Target: Python 3.10+ (3.12 recommended)
-  - [ ] Update in `setup.py`, `tox.ini`, `Dockerfile`
-  
-- [ ] **Upgrade py-evm**
-  - [ ] Current: `py-evm==0.4.0a3` (ancient alpha version)
-  - [ ] Target: Latest stable py-evm with all fork support
-  - [ ] This is critical - py-evm needs to support London through Cancun
-  
-- [ ] **Upgrade ethereum libraries**
-  - [ ] `eth-utils>=1.9.3,<2` → Latest v2.x or v3.x
-  - [ ] `eth-typing>=2.2.2,<3` → Latest v3.x or v4.x
-  - [ ] `eth-keys>=0.3.3,<0.4.0` → Latest v0.5.x
-  - [ ] `web3>=5.12.1,<6` → Latest v6.x or v7.x
-  - [ ] `rlp[rust-backend]>=2,<3` → Latest v4.x
+#### TODO: Transaction Validation
+- [ ] Create `trinity/_utils/transaction_validation.py`
+- [ ] Implement `validate_hybrid_transaction()` function
+- [ ] Add signature type validation
+- [ ] Implement sender recovery for both types
+- [ ] Validate gas limits (higher for PQ transactions)
+- [ ] Add transaction pool support for hybrid transactions
 
-### 8.2 P2P & Networking Dependencies
-- [ ] Update `cryptography>=3.0,<3.2` → Latest v42.x (major security updates)
-- [ ] Update `coincurve>=15.0.0,<16.0.0` → Latest v19.x or v20.x
-- [ ] Update `eth-enr>=0.3.0,<0.4` → Latest with Discovery v5.1 support
-- [ ] Update `trio>=0.16.0,<0.17` → Latest v0.24.x or v0.25.x
+#### TODO: Mempool Integration
+- [ ] Modify mempool to accept both transaction types
+- [ ] Implement separate fee markets for ECDSA vs Dilithium
+- [ ] Add transaction prioritization logic
+- [ ] Implement transaction replacement rules
 
-### 8.3 Other Dependencies
-- [ ] Update `aiohttp==3.6.0` → Latest v3.9.x (security fixes)
-- [ ] Update `SQLAlchemy>=1.3.3,<2` → v2.x (major version upgrade)
-- [ ] Update `ipython>=7.8.0,<7.10.0` → Latest v8.x
-- [ ] Update `uvloop==0.14.0` → Latest v0.19.x
-- [ ] Update all test dependencies to current versions
+### Phase 4: Block & Consensus
 
-### 8.4 Remove Deprecated Dependencies
-- [ ] Evaluate if `lahja` event bus is still optimal (v0.17.0 is old)
-- [ ] Check if `async-service`, `asyncio-cancel-token` have better alternatives
-- [ ] Review `plyvel` vs other LevelDB/database options
+#### TODO: Block Format
+- [ ] Extend block header for PQ signatures (optional)
+- [ ] Support mixed transaction types in blocks
+- [ ] Update block validation logic
+- [ ] Implement BLAKE3-based block hashing
 
----
+#### TODO: Consensus Integration
+- [ ] Validator key management (support both key types)
+- [ ] Block signing with Dilithium
+- [ ] Peer discovery with PQ node identities
+- [ ] Network protocol version negotiation
 
-## 9. NETWORK CONFIGURATION UPDATES
+### Phase 5: RPC & API
 
-### 9.1 Mainnet Updates
-- [ ] Update mainnet configuration in `trinity/network_configurations.py`
-- [ ] Add all fork blocks: London, Arrow Glacier, Gray Glacier, Paris (Merge), Shanghai, Cancun
-- [ ] Update VM configuration to include all VMs through CancunVM
-- [ ] Update genesis parameters if needed
-- [ ] Update bootnodes to current active nodes
+#### TODO: JSON-RPC Extensions
+- [ ] `eth_sendPQRawTransaction`: Send signed PQ transaction
+- [ ] `eth_signPQTransaction`: Sign transaction with PQ key
+- [ ] `personal_signPQTransaction`: Sign with unlocked PQ account
+- [ ] `eth_sendPQTransaction`: Create and send PQ transaction
+- [ ] `eth_getPQAddress`: Get PQ address from public key
+- [ ] `eth_convertAddress`: Convert between legacy and PQ formats
+- [ ] Update existing RPC methods to handle both transaction types
 
-### 9.2 Testnet Updates
-- [ ] **Remove deprecated testnets**
-  - [ ] Remove Ropsten (deprecated 2022)
-  - [ ] Remove Görli (deprecated 2024)
-  
-- [ ] **Add current testnets**
-  - [ ] Add Sepolia configuration (current main testnet)
-  - [ ] Add Holesky configuration (consensus testnet)
-  - [ ] Add Devnet configurations for testing upcoming forks
+### Phase 6: Bridge & Asset Shielding
 
-### 9.3 Genesis Files
-- [ ] Update `trinity/assets/` EIP-1085 genesis files
-- [ ] Add Sepolia genesis
-- [ ] Add Holesky genesis
-- [ ] Update mainnet genesis if parameters changed
+#### TODO: Cross-Chain Bridge
+- [ ] Design bridge contract for Ethereum mainnet
+- [ ] Implement lock/mint mechanism
+- [ ] Create validator set for bridge security
+- [ ] Implement fraud proof system
+- [ ] Add 7-day withdrawal delay
+- [ ] Build relayer network
 
----
+#### TODO: Asset Shielding
+- [ ] Implement ETH → qETH conversion
+- [ ] Support ERC-20 → qRC20 conversion
+- [ ] Create qRC20 token standard contract
+- [ ] Build proof generation for cross-chain transfers
+- [ ] Implement unshielding mechanism
 
-## 10. DOCUMENTATION UPDATES
+### Phase 7: Testing & Benchmarking
 
-### 10.1 Code Documentation
-- [ ] Update all docstrings for modified functions
-- [ ] Document Engine API endpoints
-- [ ] Document new transaction types
-- [ ] Add architecture docs for consensus integration
+#### TODO: Integration Tests
+- [ ] End-to-end transaction flow tests
+- [ ] Cross-signature-type transaction tests
+- [ ] P2P handshake tests (legacy & PQC)
+- [ ] State synchronization tests
+- [ ] Bridge operation tests
 
-### 10.2 User Documentation
-- [ ] Update `README.md` with current status
-- [ ] Update `DEVELOPMENT.md` with new setup requirements
-- [ ] Document running with consensus client (e.g., Lighthouse, Prysm)
-- [ ] Add configuration examples for post-Merge operation
-- [ ] Update CLI documentation
+#### TODO: Performance Benchmarks
+- [ ] Transaction throughput (ECDSA vs Dilithium)
+- [ ] Block validation time
+- [ ] State tree performance
+- [ ] P2P handshake latency
+- [ ] Memory usage comparison
 
-### 10.3 API Documentation
-- [ ] Update RPC API documentation
-- [ ] Document Engine API
-- [ ] Update sync mode documentation
-- [ ] Document blob transaction handling
+### Phase 8: Documentation & Deployment
+
+#### TODO: Documentation
+- [ ] API documentation for PQ operations
+- [ ] Migration guide for developers
+- [ ] Node operator setup guide
+- [ ] Security audit documentation
+- [ ] Deployment playbooks
 
 ---
 
-## 11. INFRASTRUCTURE & DEVOPS
+## Technical Architecture Details
 
-### 11.1 Docker Updates
-- [ ] Update `docker/Dockerfile` to use Python 3.10+
-- [ ] Update `docker/beacon.Dockerfile` for consensus integration
-- [ ] Add docker-compose setup with consensus client
-- [ ] Update DAppNode package in `dappnode/`
+### Transaction Format Specification
 
-### 11.2 CI/CD Updates
-- [ ] Update `.circleci/config.yml` for Python 3.10+
-- [ ] Add tests for all new forks
-- [ ] Add Engine API integration tests in CI
-- [ ] Update tox environments in `tox.ini`
+#### Legacy ECDSA Transaction (Type 0x00)
+```
+RLP([nonce, gas_price, gas, to, value, data, 0x00, RLP([v, r, s])])
+```
+- Uses Keccak256 for hashing
+- 21-byte addresses (0x01 prefix)
+- Base gas: 21,000
 
-### 11.3 Build System
-- [ ] Update `setup.py` with new dependencies
-- [ ] Update `Makefile` commands if needed
-- [ ] Verify `MANIFEST.in` includes all necessary files
-- [ ] Update `mypy.ini` for newer mypy versions
+#### PQ Dilithium Transaction (Type 0x01)
+```
+RLP([nonce, gas_price, gas, to, value, data, 0x01, pubkey || signature])
+```
+- Uses BLAKE3-256 for hashing
+- 33-byte addresses (0x02 prefix)
+- Base gas: 50,000 (higher due to signature verification cost)
+- signature_data = dilithium_pubkey (1952) || dilithium_signature (3293) = 5245 bytes
 
----
+### Address Format Specification
 
-## 12. SECURITY & COMPLIANCE
+#### Legacy Address (21 bytes)
+```
+0x01 || keccak256(ecdsa_pubkey)[-20:]
+```
 
-### 12.1 Security Updates
-- [ ] Audit all cryptography usage for vulnerabilities
-- [ ] Implement JWT authentication for Engine API
-- [ ] Review DOS attack vectors with new transaction types
-- [ ] Audit blob transaction validation
-- [ ] Update all dependencies with known CVEs
+#### PQ Address (33 bytes)
+```
+0x02 || blake3_256(dilithium_pubkey)
+```
 
-### 12.2 Compliance
-- [ ] Ensure MEV-boost compatibility (if supporting validators)
-- [ ] Implement proper handling of censorship-resistant transactions
-- [ ] Add metrics for monitoring consensus-execution health
+### P2P Protocol
 
----
+#### Legacy Handshake (RLPx v4)
+- ECIES encryption
+- ECDH key agreement
+- Keccak256-based MAC
 
-## 13. PERFORMANCE OPTIMIZATION
+#### PQC Handshake (v0x10)
+```
+Initiator → Responder: AUTH_MSG
+  [version=0x10, dilithium_pubkey, kyber_ephemeral_pubkey, nonce, signature]
 
-### 13.1 Sync Performance
-- [ ] Implement parallel block execution
-- [ ] Optimize state sync with Snap protocol
-- [ ] Add caching layers for frequent state reads
-- [ ] Optimize database queries
+Responder → Initiator: ACK_MSG
+  [version=0x10, dilithium_pubkey, kyber_ciphertext, nonce, signature]
 
-### 13.2 EVM Performance
-- [ ] Optimize new opcode implementations
-- [ ] Add JIT compilation considerations
-- [ ] Profile and optimize hot paths
-- [ ] Consider move to Rust EVM (like revm) for performance
+Shared Secret: Kyber decapsulation
+Session Keys: BLAKE3-based KDF
+```
 
-### 13.3 Network Performance
-- [ ] Optimize peer management
-- [ ] Implement better bandwidth management for blobs
-- [ ] Add connection pooling improvements
-- [ ] Optimize block propagation
+### Precompile Contracts
 
----
+| Address | Function | Input | Output | Base Gas |
+|---------|----------|-------|--------|----------|
+| 0x0A | Dilithium Verify | hash(32) + pubkey(1952) + sig(3293) | valid(1) | 6000 |
+| 0x0B | BLAKE3-256 | data(any) | hash(32) | 60 |
+| 0x0C | BLAKE3-512 | data(any) | hash(64) | 90 |
+| 0x0D | BLAKE3-Keyed | key(32) + data(any) | mac(32) | 100 |
 
-## 14. BACKWARDS COMPATIBILITY & MIGRATION
+### Gas Cost Analysis
 
-### 14.1 Database Migration
-- [ ] Create migration scripts for existing Trinity databases
-- [ ] Handle legacy block/transaction formats
-- [ ] Migrate to new schema versions
-- [ ] Add rollback capabilities
+#### Transaction Gas Costs
+- **Legacy ECDSA**: 21,000 base + data costs
+- **PQ Dilithium**: 50,000 base + data costs
+  - Rationale: Dilithium verification is ~2.5x more computationally expensive
 
-### 14.2 Configuration Migration
-- [ ] Migrate old config files to new format
-- [ ] Provide compatibility mode for legacy operations
-- [ ] Document breaking changes
-
----
-
-## 15. MONITORING & OBSERVABILITY
-
-### 15.1 Metrics
-- [ ] Add Prometheus metrics for Engine API
-- [ ] Add metrics for blob transactions
-- [ ] Add consensus-execution sync metrics
-- [ ] Monitor memory usage with new features
-
-### 15.2 Logging
-- [ ] Update logging for new components
-- [ ] Add structured logging for Engine API calls
-- [ ] Improve error messages for common issues
-- [ ] Add debug modes for troubleshooting
+#### Precompile Gas Costs
+- **Dilithium Verify**: 6000 base + 10/byte
+  - Comparable to ecrecover (3000) but accounts for larger signature
+- **BLAKE3 hashes**: Cheaper than SHA256 due to better performance
+  - BLAKE3-256: 60 base + 12/word (vs SHA256: 60 base + 12/word)
+  - BLAKE3-512: 90 base + 18/word
 
 ---
 
-## PRIORITY ORDERING
+## Key Files & Locations
 
-### Phase 1: Critical Foundation (Must-do first)
-1. Upgrade Python to 3.10+
-2. Upgrade py-evm to latest version with fork support
-3. Upgrade all core dependencies
-4. Implement London fork (EIP-1559)
+### Core Cryptography
+- `trinity/crypto/__init__.py` - Module exports
+- `trinity/crypto/pqc.py` - Dilithium & Kyber implementation
+- `trinity/crypto/hashing.py` - BLAKE3 functions
+- `trinity/crypto/addresses.py` - Address generation & validation
 
-### Phase 2: The Merge (Highest Priority)
-1. Implement Engine API
-2. Add Paris fork support
-3. Remove PoW mining
-4. Implement beacon chain integration
-5. Update to ETH/66 and ETH/67
+### Transactions
+- `trinity/rlp/transactions.py` - Hybrid transaction format
+- `trinity/_utils/transaction_validation.py` - (TODO) Validation logic
 
-### Phase 3: Recent Forks
-1. Implement Shanghai fork (withdrawals)
-2. Implement Cancun fork (blobs/4844)
-3. Update RPC APIs for all new fields
-4. Implement Snap protocol
+### Virtual Machine
+- `trinity/vm/precompiles_pqc.py` - PQC precompiled contracts
+- `trinity/vm/state/` - (TODO) BLAKE3 state tree
 
-### Phase 4: Network & Testing
-1. Update network configurations
-2. Remove deprecated testnets, add Sepolia/Holesky
-3. Update test fixtures
-4. Integration testing
+### Networking
+- `p2p/auth_pqc.py` - PQC P2P handshake
+- `p2p/auth.py` - Original ECIES handshake (to be extended)
 
-### Phase 5: Optimization & Polish
-1. Performance optimization
-2. Documentation updates
-3. Migration tools
-4. Monitoring improvements
+### Testing
+- `tests/crypto/test_pqc.py` - PQC functionality tests
+- `tests/integration/` - (TODO) Integration tests
 
 ---
 
-## ESTIMATED EFFORT
+## Development Workflow
 
-- **Total estimated time**: 6-12 months for complete modernization
-- **Minimum viable modernized client**: 3-4 months (through Phase 3)
-- **Team size recommended**: 3-5 experienced Ethereum protocol developers
+### Setting Up Development Environment
+
+```bash
+# Install dependencies
+pip install -e .[dev,p2p,trinity]
+
+# Install PQC libraries
+pip install liboqs-python blake3
+
+# Run tests
+pytest tests/crypto/test_pqc.py -v
+```
+
+### Testing PQC Features
+
+```python
+# Generate Dilithium keypair
+from trinity.crypto.pqc import generate_dilithium_keypair
+
+privkey, pubkey = generate_dilithium_keypair()
+
+# Create and sign transaction
+from trinity.rlp.transactions import create_transaction
+from trinity.crypto.addresses import generate_pq_address
+
+recipient = generate_pq_address(pubkey)
+tx = create_transaction(
+    nonce=0,
+    gas_price=1000000000,
+    gas=50000,
+    to=recipient,
+    value=1000000000000000000,  # 1 QRDX
+    data=b'',
+)
+
+signed_tx = tx.sign_dilithium(privkey)
+print(f"Transaction hash: {signed_tx.hash.hex()}")
+print(f"Sender address: {signed_tx.sender.hex()}")
+```
+
+### Running a Node
+
+```bash
+# (TODO) Once integration is complete
+trinity --network-id=1337 --data-dir=./qrdx-data --enable-pqc
+```
 
 ---
 
-## ALTERNATIVE APPROACH
+## Security Considerations
 
-Given the massive scope of work required, consider:
+### Hybrid Mode Rationale
+- **Backward Compatibility**: Support existing Ethereum tooling
+- **Migration Path**: Users can gradually transition to PQ addresses
+- **Network Effect**: Allow mixed transactions in same block
+- **Future-Proofing**: Easy to deprecate ECDSA once quantum threat is imminent
 
-1. **Fork Modern Client**: Start with a modern client like Reth (Rust), Erigon (Go), or Nethermind (C#) and adapt to your needs
-2. **Focus on Specific Features**: If only certain Trinity features are needed, implement them on top of modern client
-3. **Hybrid Approach**: Use Trinity for specific legacy features, modern client for consensus/execution
+### Signature Size Impact
+- **Dilithium signatures are large**: 3293 bytes vs 65 bytes (ECDSA)
+- **Mitigations**:
+  - Higher base gas reflects computational cost
+  - Precompiles optimize on-chain verification
+  - State tree uses BLAKE3 for efficient hashing
+  - Compressed block propagation (TODO)
 
-The Ethereum ecosystem has moved significantly since Trinity was archived. A complete modernization is a major undertaking comparable to building a new client.
+### Key Management
+- **Private key sizes**:
+  - ECDSA: 32 bytes
+  - Dilithium: 4000 bytes
+- **Considerations**:
+  - Hardware wallet support (TODO)
+  - Secure key storage standards
+  - Key derivation (BIP-32 equivalent for PQ)
 
 ---
 
-## NOTES
+## Performance Targets
 
-- Trinity was archived in ~2021, before The Merge
-- Current latest fork support: Berlin (April 2021)
-- Protocol support: ETH/65 (v66 explicitly noted as not implemented)
-- Major gap: No Proof-of-Stake support at all
-- This would essentially require rebuilding large portions of the client
+### Transaction Throughput
+- **Target**: 5,000+ TPS (per whitepaper)
+- **Current bottlenecks**:
+  - Dilithium verification (~100 microseconds per signature)
+  - Larger transaction size
+  - State tree updates with BLAKE3
 
-**Recommendation**: Unless there are specific Trinity features that cannot be found elsewhere, starting fresh with a modern client codebase or contributing to an existing modern client would likely be more efficient than modernizing Trinity.
+### Optimization Strategies
+1. **Batch verification**: Verify multiple Dilithium signatures together
+2. **Parallel processing**: Multi-threaded transaction validation
+3. **Caching**: Cache verified signatures
+4. **Compression**: Compress PQ signatures in block propagation
+
+---
+
+## Contributing
+
+### Code Style
+- Follow existing Trinity code conventions
+- Type hints for all public functions
+- Comprehensive docstrings
+- Unit tests for new features
+
+### Pull Request Process
+1. Create feature branch from `develop`
+2. Implement feature with tests
+3. Ensure all tests pass
+4. Update CLAUDE.md with changes
+5. Submit PR with detailed description
+
+### Testing Requirements
+- Unit tests for all PQC operations
+- Integration tests for cross-component features
+- Performance benchmarks for critical paths
+- Security audit for cryptographic code
+
+---
+
+## References
+
+### NIST Post-Quantum Standards
+- [FIPS 203: CRYSTALS-Kyber](https://csrc.nist.gov/publications/detail/fips/203/final)
+- [FIPS 204: CRYSTALS-Dilithium](https://csrc.nist.gov/publications/detail/fips/204/final)
+
+### Implementation References
+- [liboqs-python](https://github.com/open-quantum-safe/liboqs-python)
+- [BLAKE3 Specification](https://github.com/BLAKE3-team/BLAKE3-specs)
+- [Trinity Client](https://github.com/ethereum/trinity)
+- [Ethereum Yellow Paper](https://ethereum.github.io/yellowpaper/paper.pdf)
+
+### QRDX Resources
+- QRDX Whitepaper v2.0 (included in repo)
+- QRDX Foundation: research@mail.qrdx.org
+
+---
+
+## Changelog
+
+### 2025-11-06 - Initial Implementation
+- ✅ Implemented CRYSTALS-Dilithium (FIPS 204) signatures
+- ✅ Implemented CRYSTALS-Kyber (FIPS 203) key encapsulation
+- ✅ Implemented BLAKE3 quantum-resistant hashing
+- ✅ Created hybrid transaction format (ECDSA + Dilithium)
+- ✅ Implemented PQ address generation (33-byte format)
+- ✅ Created PQC P2P authentication handshake
+- ✅ Implemented QEVM precompiled contracts (0x0A-0x0D)
+- ✅ Added comprehensive test suite
+- ✅ Updated dependencies (liboqs-python, blake3)
+
+

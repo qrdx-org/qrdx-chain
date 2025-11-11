@@ -28,6 +28,9 @@ deps = {
         'trio>=0.16.0,<0.17',
         'trio-typing>=0.5.0,<0.6',
         "upnpclient>=0.0.8,<1",
+        # Post-Quantum Cryptography (QRDX)
+        "liboqs-python>=0.10.0",
+        "blake3>=0.3.3",
     ],
     'trinity': [
         "aiohttp==3.6.0",
