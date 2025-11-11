@@ -1,0 +1,293 @@
+
+7
+
+Automatic Zoom
+QRDX Protocol Whitepaper v2.0
+QRDX Foundation Research Team
+November 3, 2025
+Contents
+1 QRDX Protocol Whitepaper v2.0 1
+1.1 Quantum-Resistant Decentralized Exchange & Asset Shielding Protocol . . . . . . . 1
+1.2 Abstract . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 2
+1.3 Table of Contents . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 2
+1.4 1. Introduction . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 2
+1.5 2. The Quantum Threat . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 3
+1.6 3. QRDX Chain Architecture . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 4
+1.7 4. Post-Quantum Cryptography Implementation . . . . . . . . . . . . . . . . . . . . 5
+1.8 5. QRDX Protocol: Quantum-Resistant AMM . . . . . . . . . . . . . . . . . . . . . 6
+1.9 6. Asset Shielding Mechanism . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 7
+1.10 7. qRC20 Token Standard . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 8
+1.11 8. Cross-Chain Bridge Infrastructure . . . . . . . . . . . . . . . . . . . . . . . . . . . 9
+1.12 9. Consensus Mechanism . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 11
+1.13 10. Tokenomics . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 12
+1.14 11. Governance Model . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 13
+1.15 12. Security Analysis . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 14
+1.16 13. Performance Benchmarks . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 16
+1.17 14. Roadmap . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 17
+1.18 15. Conclusion . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 18
+1.19 16. References . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 18
+1.20 Appendix A: Glossary . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 19
+1.21 Appendix B: Mathematical Formulas . . . . . . . . . . . . . . . . . . . . . . . . . . . 20
+1.22 Appendix C: Contract Addresses (Mainnet - Post Launch) . . . . . . . . . . . . . . . 21
+1 QRDX Protocol Whitepaper v2.0
+1.1 Quantum-Resistant Decentralized Exchange & Asset Shielding Protocol
+Version: 2.0
+Last Updated: November 3, 2025
+Authors: QRDX Foundation Research Team
+Contact: research@mail.qrdx.org
+1
+1.2 Abstract
+The emergence of quantum computing threatens the cryptographic foundations of blockchain tech-
+nology. QRDX addresses this existential challenge by introducing the first quantum-resistant de-
+centralized exchange protocol with native asset shielding capabilities. Built on Uniswap v3 and v4
+architecture principles and secured by NIST-standardized post-quantum cryptographic algorithms,
+QRDX enables users to shield traditional assets (e.g., ETH → qETH) into quantum-resistant equiv-
+alents while maintaining the eﬀiciency and capital utilization of modern automated market makers
+(AMMs).
+QRDX Chain serves as the foundational Layer-1 blockchain implementing post-quantum security
+primitives, enabling cross-chain asset migration, decentralized trading, and long-term cryptographic
+security. This whitepaper presents the technical architecture, economic model, and security guar-
+antees of the QRDX ecosystem.
+1.3 Table of Contents
+1. Introduction
+2. The Quantum Threat
+3. QRDX Chain Architecture
+4. Post-Quantum Cryptography Implementation
+5. QRDX Protocol: Quantum-Resistant AMM
+6. Asset Shielding Mechanism
+7. qRC20 Token Standard
+8. Cross-Chain Bridge Infrastructure
+9. Consensus Mechanism
+10. Tokenomics
+11. Governance Model
+12. Security Analysis
+13. Performance Benchmarks
+14. Roadmap
+15. Conclusion
+16. References
+1.4 1. Introduction
+1.4.1 1.1 Background
+Blockchain technology relies on cryptographic primitives that are vulnerable to quantum computing
+attacks. Shor’s algorithm, running on a suﬀiciently powerful quantum computer, can break elliptic
+curve cryptography (ECC) and RSA encryption—the backbone of current blockchain security. With
+major technology companies and governments investing billions in quantum computing research,
+the timeline for practical quantum attacks is shrinking.
+1.4.2 1.2 The QRDX Solution
+QRDX introduces a comprehensive quantum-resistant ecosystem consisting of:
+2
+• QRDX Chain: A Layer-1 blockchain implementing post-quantum cryptographic primitives
+• QRDX Protocol: An advanced AMM based on Uniswap v3/v4 architecture with concen-
+trated liquidity
+• Asset Shielding: Native functionality to convert classical blockchain assets into quantum-
+resistant equivalents
+• qRC20 Standard: A quantum-resistant token standard compatible with existing DeFi in-
+frastructure
+1.4.3 1.3 Key Innovations
+1. Post-Quantum Security: Implementation of CRYSTALS-Dilithium (signatures) and
+CRYSTALS-Kyber (key encapsulation)
+2. Concentrated Liquidity: Capital-eﬀicient market making based on Uniswap v3 principles
+3. Singleton Architecture: Inspired by Uniswap v4’s single-contract design for gas eﬀiciency
+4. Cross-Chain Shielding: Trustless bridge mechanism to convert ETH, BTC, and other
+assets to quantum-resistant versions
+5. Hooks System: Extensible plugin architecture for custom pool behaviors
+1.5 2. The Quantum Threat
+1.5.1 2.1 Shor’s Algorithm
+Shor’s algorithm enables quantum computers to factor large integers and solve the discrete loga-
+rithm problem in polynomial time, breaking:
+• RSA encryption (factorization)
+• Elliptic Curve Cryptography (discrete log on elliptic curves)
+• DSA and ECDSA signatures
+1.5.2 2.2 Grover’s Algorithm
+Grover’s algorithm provides quadratic speedup for brute-force attacks, reducing the effective secu-
+rity level of symmetric cryptography by half. A 256-bit hash function provides only 128-bit security
+against quantum attacks.
+1.5.3 2.3 Timeline Estimates
+• NIST (2023): Quantum computers capable of breaking RSA-2048 may exist by 2030-2035
+• IBM Quantum Roadmap: 4,000+ qubit systems by 2025
+• “Store Now, Decrypt Later”: Adversaries are already harvesting encrypted data for
+future quantum decryption
+1.5.4 2.4 Impact on Blockchain
+Current blockchain vulnerabilities include:
+• Wallet Security: Private keys derived from public keys (address reuse)
+• Transaction Integrity: ECDSA signatures can be forged
+• Consensus Security: Validator keys compromised
+3
+• Smart Contract Security: Multi-signature wallets, timelock contracts at risk
+1.6 3. QRDX Chain Architecture
+1.6.1 3.1 Overview
+QRDX Chain is a purpose-built Layer-1 blockchain designed for post-quantum security, high per-
+formance, and DeFi optimization.
+Key Specifications: - Consensus: Quantum-Resistant Proof-of-Stake (QR-PoS) - Block Time:
+2 seconds - Finality: Sub-second (single slot finality) - Throughput: 5,000+ TPS - Smart
+Contract VM: QEVM (Quantum-resistant EVM)
+1.6.2 3.2 QEVM: Quantum-Resistant Ethereum Virtual Machine
+QEVM is a modified EVM that enforces post-quantum cryptographic operations while maintaining
+backward compatibility with Ethereum tooling.
+Modifications: - All signature verification uses CRYSTALS-Dilithium - Key derivation uses
+CRYSTALS-Kyber for key encapsulation - Address generation includes quantum-resistant hash
+functions (SHA3-512, BLAKE3) - Precompiled contracts for eﬀicient post-quantum operations
+1.6.3 3.3 Network Architecture
+￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿
+￿ QRDX Chain (Layer 1) ￿
+￿ ￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿ ￿
+￿ ￿ Consensus Layer (QR-PoS) ￿ ￿
+￿ ￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿ ￿
+￿ ￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿ ￿
+￿ ￿ Execution Layer (QEVM) ￿ ￿
+￿ ￿ - Smart Contracts ￿ ￿
+￿ ￿ - QRDX Protocol (AMM) ￿ ￿
+￿ ￿ - Asset Shielding Contracts ￿ ￿
+￿ ￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿ ￿
+￿ ￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿ ￿
+￿ ￿ Bridge Layer ￿ ￿
+￿ ￿ - Ethereum Bridge ￿ ￿
+￿ ￿ - Bitcoin Bridge ￿ ￿
+￿ ￿ - Multi-Chain Bridges ￿ ￿
+￿ ￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿ ￿
+￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿
+1.6.4 3.4 State Management
+QRDX Chain uses a modified Merkle Patricia Trie with quantum-resistant hash functions:
+• State Root Hash: BLAKE3 (256-bit output extended to 512-bit for quantum resistance)
+• Account State: Includes quantum-resistant public keys and classical bridge mapping
+4
+• Storage Optimization: State pruning and archival nodes for long-term data availability
+1.7 4. Post-Quantum Cryptography Implementation
+1.7.1 4.1 CRYSTALS-Dilithium (Digital Signatures)
+Algorithm: Module-Lattice-Based Digital Signature Algorithm
+NIST Status: FIPS 204 (Standardized 2024)
+Security Level: NIST Level 3 (comparable to AES-192)
+Implementation Details: - Public Key Size: 1,952 bytes - Signature Size: 3,293 bytes - Key
+Generation: ~50 microseconds - Signature Generation: ~100 microseconds - Verification: ~60 mi-
+croseconds
+Usage in QRDX: - Transaction signing - Block signing by validators - Smart contract authenti-
+cation - Multi-signature wallets
+1.7.2 4.2 CRYSTALS-Kyber (Key Encapsulation)
+Algorithm: Module-Lattice-Based Key Encapsulation Mechanism
+NIST Status: FIPS 203 (Standardized 2024)
+Security Level: NIST Level 3
+Implementation Details: - Public Key Size: 1,184 bytes - Ciphertext Size: 1,088 bytes - Shared
+Secret Size: 32 bytes - Encapsulation: ~40 microseconds - Decapsulation: ~50 microseconds
+Usage in QRDX: - Secure key exchange for encrypted transactions - Private transaction pools -
+Validator communication encryption - Cross-chain bridge security
+1.7.3 4.3 Hash Functions
+Primary: BLAKE3 (512-bit output)
+Secondary: SHA3-512
+Merkle Tree: BLAKE3-based
+Rationale: BLAKE3 provides 256-bit quantum resistance (Grover’s algorithm reduces effective
+security by half) while maintaining high performance.
+1.7.4 4.4 Hybrid Security Model
+During the transition period, QRDX supports a hybrid mode:
+• Classical + Post-Quantum Signatures: Dual signing with ECDSA + Dilithium
+• Migration Path: Users can upgrade from classical to quantum-resistant addresses
+• Backward Compatibility: Legacy transactions supported with quantum-resistant wrap-
+ping
+5
+1.8 5. QRDX Protocol: Quantum-Resistant AMM
+1.8.1 5.1 Design Philosophy
+QRDX Protocol inherits proven design principles from Uniswap v3 and v4:
+• Concentrated Liquidity (v3): Capital eﬀiciency through custom price ranges
+• Singleton Architecture (v4): Single contract for all pools, reducing gas costs
+• Hooks System (v4): Extensible plugin architecture for custom logic
+• Flash Accounting (v4): Optimized token transfers
+1.8.2 5.2 Concentrated Liquidity
+Liquidity providers (LPs) can concentrate liquidity within specific price ranges:
+Price Range: [P￿, P￿]
+Liquidity Density: L(P) = k / (P - P￿) for P ￿ [P￿, P￿]
+Benefits: - Up to 4000x capital eﬀiciency vs. Uniswap v2 - Higher fee APY for active LPs - Reduced
+slippage for traders
+1.8.3 5.3 Singleton Architecture
+All QRDX pools exist within a single smart contract (PoolManager):
+contract PoolManager {
+mapping(bytes32 => Pool) public pools;
+function swap(
+bytes32 poolId,
+bool zeroForOne,
+int256 amountSpecified,
+bytes calldata hookData
+) external returns (int256 amount0, int256 amount1);
+function modifyLiquidity(
+bytes32 poolId,
+int24 tickLower,
+int24 tickUpper,
+int256 liquidityDelta
+) external;
+}
+Gas Savings: ~50% reduction compared to multi-contract architectures.
+1.8.4 5.4 Hooks System
+Hooks allow developers to customize pool behavior at key lifecycle points:
+Hook Points: - beforeInitialize / afterInitialize - beforeSwap / afterSwap -
+beforeModifyLiquidity / afterModifyLiquidity - beforeDonate / afterDonate
+6
+Example Use Cases: - Time-weighted average price (TWAP) oracles - Dynamic fees based on
+volatility - Limit orders and stop-loss - KYC/AML compliance checks - Liquidity mining rewards
+1.8.5 5.5 Fee Structure
+QRDX Protocol implements a flexible fee tier system:
+Fee Tier Typical Use Case Expected Volume
+0.01% Stablecoin pairs (qUSDC/qUSDT) High
+0.05% Major pairs (qETH/qUSDC) High
+0.30% Exotic pairs Medium
+1.00% Very exotic pairs Low
+Fee Distribution: - 83.3% to liquidity providers - 16.7% to QRDX protocol treasury (governed
+by QRDX token holders)
+1.8.6 5.6 Price Oracle
+QRDX maintains geometric mean time-weighted average price (TWAP) oracles:
+TWAP(t￿, t￿) = exp((log(P(t￿)) · t￿ - log(P(t￿)) · t￿) / (t￿ - t￿))
+Oracles are quantum-resistant by design, with Dilithium signatures securing price updates.
+1.9 6. Asset Shielding Mechanism
+1.9.1 6.1 Overview
+Asset shielding converts classical blockchain assets into quantum-resistant equivalents on QRDX
+Chain.
+Supported Assets: - ETH → qETH - WBTC → qBTC - USDC → qUSDC - USDT → qUSDT
+- Any ERC-20 → qRC20 equivalent
+1.9.2 6.2 Shielding Process
+User (Ethereum) QRDX Bridge User (QRDX Chain)
+| | |
+| 1. Lock ETH in Bridge Contract | |
+|--------------------------------->| |
+| | 2. Verify Lock (Relayers) |
+| | 3. Generate Proof |
+| | |
+| | 4. Mint qETH |
+| |------------------------------>|
+| | |
+| 5. Emit Proof (Quantum-Resistant)| |
+|<---------------------------------| |
+7
+Security Properties: - Trustless operation via cryptographic proofs - Quantum-resistant sig-
+natures on all bridge operations - Time-lock mechanisms for fraud prevention - Multi-validator
+consensus for large transfers
+1.9.3 6.3 Unshielding (Redemption)
+Users can convert qRC20 tokens back to classical assets:
+1. User burns qETH on QRDX Chain
+2. Bridge validators verify burn transaction (QR signatures)
+3. Multi-sig release of locked ETH on Ethereum
+4. User receives ETH on Ethereum
+Security Measures: - Minimum unshielding delay: 7 days (fraud proof window) - Multi-validator
+approval threshold: 2/3 + 1 - Emergency pause mechanism (governance-controlled)
+1.9.4 6.4 Bridge Security Model
+Components: 1. Relayer Network: Decentralized operators monitoring both chains 2. Val-
+idator Set: QRDX Chain validators with bonded stake 3. Merkle Proof System: Eﬀicient
+proof verification 4. Fraud Proof Mechanism: Challenge period for disputed transfers
+Collateral Requirements: - Validators must bond QRDX tokens (minimum 100,000 QRDX) -
+Slashing conditions: Invalid proofs, downtime, malicious behavior - Insurance fund: 5% of protocol
+revenue allocated to bridge insurance
+1.10 7. qRC20 Token Standard
+1.10.1 7.1 Specification
+qRC20 is the quantum-resistant token standard for QRDX Chain, designed for compatibility with
+ERC-20 tooling while enforcing post-quantum security.
+Interface:
+interface IqRC20 {
+// Standard ERC-20 functions
+function totalSupply() external view returns (uint256);
+function balanceOf(address account) external view returns (uint256);
+function transfer(address recipient, uint256 amount) external returns (bool);
+function allowance(address owner, address spender) external view returns (uint256);
+function approve(address spender, uint256 amount) external returns (bool);
+function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+// Quantum-resistant extensions
+function transferWithProof(
+address recipient,
+uint256 amount,
+bytes calldata dilithiumSignature
+) external returns (bool);
+8
