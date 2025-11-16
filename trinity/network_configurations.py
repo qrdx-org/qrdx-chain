@@ -44,6 +44,7 @@ class MiningMethod(Enum):
     NoProof = "noproof"
     Ethash = "ethash"
     Clique = "clique"
+    QRPoS = "qrpos"  # Quantum-Resistant Proof of Stake
 
 
 class Eth1NetworkConfiguration(NamedTuple):

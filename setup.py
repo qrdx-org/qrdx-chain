@@ -28,6 +28,10 @@ deps = {
         'trio>=0.16.0,<0.17',
         'trio-typing>=0.5.0,<0.6',
         "upnpclient>=0.0.8,<1",
+        # Post-Quantum Cryptography
+        "liboqs-python>=0.9.0,<1.0.0",  # CRYSTALS-Dilithium & Kyber (NIST standardized)
+        "blake3>=0.3.3,<1.0.0",          # BLAKE3 hashing (quantum-resistant)
+        "bech32>=1.2.0,<2.0.0",          # Bech32m address encoding for PQ addresses
     ],
     'trinity': [
         "aiohttp==3.6.0",

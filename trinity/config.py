@@ -153,6 +153,9 @@ class Eth1ChainConfig:
             return ConsensusApplier(NoProofConsensus).amend_vm_configuration(vms)
         elif self.mining_method == MiningMethod.Ethash:
             return ConsensusApplier(PowConsensus).amend_vm_configuration(vms)
+        elif self.mining_method == MiningMethod.QRPoS:
+            from trinity.consensus.qrpos import QRPoSConsensus
+            return ConsensusApplier(QRPoSConsensus).amend_vm_configuration(vms)
         else:
             raise NotImplementedError(f"{self.mining_method} is not supported")
 
@@ -160,6 +163,9 @@ class Eth1ChainConfig:
     def consensus_context_class(self) -> Type[ConsensusContextAPI]:
         if self.mining_method == MiningMethod.Clique:
             return CliqueConsensusContext
+        elif self.mining_method == MiningMethod.QRPoS:
+            from trinity.consensus.qrpos import QRPoSConsensusContext
+            return QRPoSConsensusContext
         else:
             return ConsensusContext
 

@@ -1,0 +1,24 @@
+{
+  "network_id": 1337,
+  "chain_name": "QRPoS-Testnet-1337",
+  "data_dir": "./data",
+  "genesis_config": "../genesis/genesis.json",
+  "port": 30303,
+  "rpc_port": 8545,
+  "ws_port": 8546,
+  "consensus": {
+    "type": "qrpos",
+    "slot_duration": 2,
+    "slots_per_epoch": 32,
+    "validator_registry": "../validators"
+  },
+  "network": {
+    "max_peers": 50,
+    "listen_address": "0.0.0.0",
+    "nat": "any"
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/trinity.log"
+  }
+}

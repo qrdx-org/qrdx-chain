@@ -1,0 +1,34 @@
+{
+  "accounts": {
+    "0x00000000000000000000000000000000deadbeef": {
+      "balance": "0x0ad78ebc5ac6200000"
+    },
+    "0x00000000000000000000000000000000deadcafe": {
+      "balance": "0x0ad78ebc5ac6200000"
+    },
+    "0x1000000000000000000000000000000000000000": {
+      "balance": "0x0",
+      "comment": "AddressRegistry precompile"
+    },
+    "0x2000000000000000000000000000000000000000": {
+      "balance": "0x0",
+      "comment": "ValidatorRegistry precompile (future)"
+    }
+  },
+  "genesis": {
+    "author": "0x0000000000000000000000000000000000000000",
+    "difficulty": "0x0",
+    "extraData": "0xdeadbeef",
+    "gasLimit": "0x1c9c380",
+    "nonce": "0x0000000000000000",
+    "timestamp": "0x0",
+    "comment": "QR-PoS genesis - no PoW fields (difficulty=0, nonce=0)"
+  },
+  "params": {
+    "berlinForkBlock": "0x0",
+    "chainId": "0xcafe",
+    "miningMethod": "qrpos",
+    "comment": "QRDX Chain with Quantum-Resistant Proof of Stake"
+  },
+  "version": "1"
+}
