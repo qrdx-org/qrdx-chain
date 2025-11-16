@@ -27,3 +27,5 @@
 	url = https://github.com/ethereum/lahja.git
 [submodule "web3.py"]
 	path = web3.py
+[submodule "asyncio-run-in-process"]
+	path = asyncio-run-in-process
