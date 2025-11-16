@@ -31,3 +31,5 @@
 	path = asyncio-run-in-process
 [submodule "async-service"]
 	path = async-service
+[submodule "eth-account"]
+	path = eth-account
