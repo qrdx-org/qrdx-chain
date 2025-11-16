@@ -33,3 +33,11 @@
 	path = async-service
 [submodule "eth-account"]
 	path = eth-account
+[submodule "eth-abi"]
+	path = eth-abi
+[submodule "eth-bloom"]
+	path = eth-bloom
+[submodule "eth-tester"]
+	path = eth-tester
+[submodule "trinity-upstream"]
+	path = trinity-upstream
