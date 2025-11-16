@@ -29,3 +29,5 @@
 	path = web3.py
 [submodule "asyncio-run-in-process"]
 	path = asyncio-run-in-process
+[submodule "async-service"]
+	path = async-service
