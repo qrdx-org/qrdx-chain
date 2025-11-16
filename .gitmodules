@@ -9,3 +9,8 @@
 	url = https://github.com/ethereum/eth-utils.git
 [submodule "eth-keys"]
 	path = eth-keys
+[submodule "eth-typing"]
+	path = eth-typing
+	url = https://github.com/ethereum/eth-typing.git
+[submodule "pyrlp"]
+	path = pyrlp
