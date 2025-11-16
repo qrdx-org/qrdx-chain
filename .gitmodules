@@ -1,3 +1,6 @@
 [submodule "fixtures"]
 	path = fixtures
 	url = https://github.com/qrdx-org/tests.git
+[submodule "py-evm"]
+	path = py-evm
+	url = https://github.com/ethereum/py-evm.git
