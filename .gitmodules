@@ -14,3 +14,5 @@
 	url = https://github.com/ethereum/eth-typing.git
 [submodule "pyrlp"]
 	path = pyrlp
+[submodule "eth-hash"]
+	path = eth-hash
