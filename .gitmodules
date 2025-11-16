@@ -4,3 +4,8 @@
 [submodule "py-evm"]
 	path = py-evm
 	url = https://github.com/ethereum/py-evm.git
+[submodule "eth-utils"]
+	path = eth-utils
+	url = https://github.com/ethereum/eth-utils.git
+[submodule "eth-keys"]
+	path = eth-keys
