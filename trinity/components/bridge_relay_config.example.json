@@ -1,0 +1,10 @@
+# QRDX Bridge Relay Configuration Example
+{
+  "eth_rpc_url": "https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID",
+  "qrdx_rpc_url": "http://localhost:8546",
+  "bridge_eth_address": "0x0000000000000000000000000000000000000000",
+  "bridge_qrdx_address": "0x0000000000000000000000000000000000000000",
+  "validator_eth_key": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "validator_dilithium_key": "dilithium_key.bin",
+  "bridge_abi_file": "contracts/bridge/QRDXBridge_abi.json"
+}

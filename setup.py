@@ -13,11 +13,14 @@ deps = {
         "asyncio-cancel-token>=0.2,<0.3",
         "async_lru>=0.1.0,<1.0.0",
         "cached-property>=1.5.1,<2",
-        "coincurve>=15.0.0,<16.0.0",
+        # Post-quantum cryptography dependencies
+        "liboqs-python>=0.9.0",
+        "blake3>=0.4.0",
         # cryptography does not use semver and allows breaking changes within `0.3` version bumps.
         "cryptography>=3.0,<3.2",
         "eth-enr>=0.3.0,<0.4",
         "eth-hash>=0.1.4,<1",
+        # Note: eth-keys kept for backward compatibility but will be phased out
         "eth-keys>=0.3.3,<0.4.0",
         "eth-typing>=2.2.2,<3",
         "lru-dict>=1.1.6,<2",
@@ -139,15 +142,15 @@ with open('./README.md') as readme:
 
 
 setup(
-    name='trinity',
+    name='qrdx-chain',
     # *IMPORTANT*: Don't manually change the version here. Use the 'bumpversion' utility.
-    version='0.1.0-alpha.37',
-    description='The Trinity client for the Ethereum network',
+    version='1.0.0-alpha.1',
+    description='QRDX Chain - Quantum-Resistant Decentralized Exchange & Asset Shielding Protocol',
     long_description=long_description,
     long_description_content_type='text/markdown',
-    author='Ethereum Foundation',
-    author_email='piper@pipermerriam.com',
-    url='https://github.com/ethereum/trinity',
+    author='QRDX Foundation',
+    author_email='research@mail.qrdx.org',
+    url='https://github.com/qrdx-org/qrdx-chain',
     include_package_data=True,
     py_modules=['trinity', 'p2p'],
     python_requires=">=3.7,<4",

@@ -1,0 +1,14 @@
+# QRDX Bridge Relay Service - Requirements
+
+# Core dependencies
+web3>=6.0.0
+eth-account>=0.8.0
+hexbytes>=0.3.0
+
+# Post-quantum cryptography (Phase 1-6 modules)
+# These should be installed from the QRDX blockchain package
+# liboqs-python>=0.9.0
+# blake3>=0.4.0
+
+# Optional: For better performance
+aiohttp>=3.8.0
