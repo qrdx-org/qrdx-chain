@@ -4,8 +4,7 @@ import os
 import re
 from setuptools import setup, find_packages
 
-PYEVM_DEPENDENCY = "py-evm==0.4.0a3"
-
+PYEVM_DEPENDENCY = None  # Using local py-evm fork
 
 deps = {
     'p2p': [
@@ -21,41 +20,42 @@ deps = {
         "eth-enr>=0.3.0,<0.4",
         "eth-hash>=0.1.4,<1",
         # Note: eth-keys kept for backward compatibility but will be phased out
-        "eth-keys>=0.3.3,<0.4.0",
-        "eth-typing>=2.2.2,<3",
+        "eth-keys>=0.3.3,<0.5.0",
+        "eth-typing>=2.2.2,<4",
         "lru-dict>=1.1.6,<2",
-        "pysha3>=1.0.0,<2.0.0",
         "python-snappy>=0.5.3",
-        "rlp[rust-backend]>=2,<3",
+        "rlp>=2.0.1,<4",
         "SQLAlchemy>=1.3.3,<2",
         'trio>=0.16.0,<0.17',
         'trio-typing>=0.5.0,<0.6',
         "upnpclient>=0.0.8,<1",
     ],
     'trinity': [
-        "aiohttp==3.6.0",
+        "aiohttp>=3.8.0,<4",
         "asks>=2.4.8,<3",
         "argcomplete>=1.12.2,<2",
         "asyncio-run-in-process==0.1.0a10",
         "bloom-filter==1.3",
-        "cachetools>=3.1.0,<4.0.0",
+        "cachetools>=3.1.0,<5.0.0",
         "eth-utils>=1.9.3,<2",
-        "ipython>=7.8.0,<7.10.0",  # attach fails with v7.10.{0,1}
-        "jsonschema>=3.2,<4",
+        "eth-typing>=2.2.2,<4",
+        "eth-bloom>=1.0.3,<2",
+        "eth-abi>=2.0.0,<2.3",
+        "ipython>=7.23.0,<8",
+        "jsonschema>=3.2,<5",
         "lahja>=0.17.0,<0.18",
         "mypy-extensions>=0.4.3,<0.5.0",
-        "plyvel==1.2.0",
-        "prometheus-client==0.7.1",
+        "plyvel>=1.5.0",
+        "prometheus-client>=0.9.0",
         "psutil>=5.7.0, <6",
-        PYEVM_DEPENDENCY,
         "pyformance==0.4",
         # requests 2.21 is required to support idna 2.8 which is required elsewhere
         "requests>=2.21,<3",
         "termcolor>=1.1.0,<2.0.0",
         "upnp-port-forward>=0.1.1,<0.2",
-        "uvloop==0.14.0;platform_system=='Linux' or platform_system=='Darwin' or platform_system=='FreeBSD'",  # noqa: E501
+        "uvloop>=0.17.0;platform_system=='Linux' or platform_system=='Darwin' or platform_system=='FreeBSD'",  # noqa: E501
         "web3>=5.12.1,<6",
-        "websockets>=8.1.0",
+        "websockets>=8.1.0,<9",
     ],
     'test': [
         "async-timeout>=3.0.1,<4",
