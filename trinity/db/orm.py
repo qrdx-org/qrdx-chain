@@ -17,6 +17,7 @@ from sqlalchemy import (
     Column,
     Integer,
     String,
+    inspect,
 )
 
 from trinity.exceptions import (
@@ -64,14 +65,17 @@ def _setup_schema(session: BaseSession) -> None:
 
 def _check_is_empty(session: BaseSession) -> bool:
     engine = session.get_bind()
+    inspector = inspect(engine)
     for table_name in Base.metadata.tables.keys():
-        if engine.has_table(table_name):
+        if table_name in inspector.get_table_names():
             return False
     return True
 
 
 def _check_schema_version(session: BaseSession) -> bool:
-    if not session.get_bind().has_table(SchemaVersion.__tablename__):
+    engine = session.get_bind()
+    inspector = inspect(engine)
+    if SchemaVersion.__tablename__ not in inspector.get_table_names():
         return False
 
     try:
@@ -90,8 +94,9 @@ def _check_schema_version(session: BaseSession) -> bool:
 
 def _check_tables_exist(session: BaseSession) -> bool:
     engine = session.get_bind()
+    inspector = inspect(engine)
     for table_name in Base.metadata.tables.keys():
-        if not engine.has_table(table_name):
+        if table_name not in inspector.get_table_names():
             return False
     return True
 

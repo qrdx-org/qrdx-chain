@@ -1,0 +1,31 @@
+{
+  "version": "1",
+  "params": {
+    "chainId": "0x539",
+    "miningMethod": "NoProof",
+    "frontierForkBlock": "0x0",
+    "homesteadForkBlock": "0x0",
+    "EIP150ForkBlock": "0x0",
+    "EIP158ForkBlock": "0x0",
+    "byzantiumForkBlock": "0x0",
+    "constantinopleForkBlock": "0x0",
+    "petersburgForkBlock": "0x0",
+    "istanbulForkBlock": "0x0"
+  },
+  "genesis": {
+    "nonce": "0x0000000000000000",
+    "difficulty": "0x0",
+    "author": "0x0000000000000000000000000000000000000000",
+    "timestamp": "0x0",
+    "extraData": "0x5152445820546573746e6574204765",
+    "gasLimit": "0x2faf080"
+  },
+  "accounts": {
+    "0000000000000000000000000000000000000001": {
+      "balance": "0xd3c21bcecceda1000000"
+    },
+    "1000000000000000000000000000000000000001": {
+      "balance": "0xd3c21bcecceda1000000"
+    }
+  }
+}

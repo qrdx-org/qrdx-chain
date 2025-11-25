@@ -4,8 +4,6 @@ import random
 import struct
 from typing import Tuple
 
-import sha3
-
 import rlp
 from rlp import sedes
 
@@ -28,6 +26,7 @@ from p2p.exceptions import (
 from p2p._utils import (
     get_logger,
     sxor,
+    KeccakHash,
 )
 
 from .constants import (
@@ -46,7 +45,7 @@ from .constants import (
 async def handshake(
         remote: NodeAPI,
         privkey: datatypes.PrivateKey,
-        ) -> Tuple[bytes, bytes, sha3.keccak_256, sha3.keccak_256, asyncio.StreamReader, asyncio.StreamWriter]:  # noqa: E501
+        ) -> Tuple[bytes, bytes, KeccakHash, KeccakHash, asyncio.StreamReader, asyncio.StreamWriter]:  # noqa: E501
     """
     Perform the auth handshake with given remote.
 
@@ -70,7 +69,7 @@ async def handshake(
 
 async def _handshake(initiator: 'HandshakeInitiator', reader: asyncio.StreamReader,
                      writer: asyncio.StreamWriter,
-                     ) -> Tuple[bytes, bytes, sha3.keccak_256, sha3.keccak_256]:
+                     ) -> Tuple[bytes, bytes, KeccakHash, KeccakHash]:
     """See the handshake() function above.
 
     This code was factored out into this helper so that we can create Peers with directly
@@ -139,7 +138,7 @@ class HandshakeBase:
                        remote_ephemeral_pubkey: datatypes.PublicKey,
                        auth_init_ciphertext: bytes,
                        auth_ack_ciphertext: bytes
-                       ) -> Tuple[bytes, bytes, sha3.keccak_256, sha3.keccak_256]:
+                       ) -> Tuple[bytes, bytes, KeccakHash, KeccakHash]:
         """Derive base secrets from ephemeral key agreement."""
         # ecdhe-shared-secret = ecdh.agree(ephemeral-privkey, remote-ephemeral-pubk)
         ecdhe_shared_secret = ecies.ecdh_agree(
@@ -157,11 +156,11 @@ class HandshakeBase:
 
         # setup keccak instances for the MACs
         # egress-mac = sha3.keccak_256(mac-secret ^ recipient-nonce || auth-sent-init)
-        mac1 = sha3.keccak_256(
+        mac1 = KeccakHash(
             sxor(mac_secret, responder_nonce) + auth_init_ciphertext
         )
         # ingress-mac = sha3.keccak_256(mac-secret ^ initiator-nonce || auth-recvd-ack)
-        mac2 = sha3.keccak_256(
+        mac2 = KeccakHash(
             sxor(mac_secret, initiator_nonce) + auth_ack_ciphertext
         )
 

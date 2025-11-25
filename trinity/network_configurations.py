@@ -24,6 +24,10 @@ from eth.chains.ropsten import (
     ROPSTEN_GENESIS_HEADER,
     ROPSTEN_VM_CONFIGURATION,
 )
+from eth.chains.qrdx import (
+    QRDX_GENESIS_HEADER,
+    QRDX_VM_CONFIGURATION,
+)
 
 from eth.rlp.headers import BlockHeader
 
@@ -35,8 +39,11 @@ from p2p.constants import (
 from trinity.constants import (
     GOERLI_NETWORK_ID,
     MAINNET_NETWORK_ID,
-    ROPSTEN_NETWORK_ID
+    ROPSTEN_NETWORK_ID,
 )
+
+# QRDX Network ID (1337 is our testnet)
+QRDX_NETWORK_ID = 1337
 
 
 class MiningMethod(Enum):
@@ -88,5 +95,15 @@ PRECONFIGURED_NETWORKS = {
         ROPSTEN_GENESIS_HEADER,
         ROPSTEN_VM_CONFIGURATION,
         MiningMethod.Ethash,
+    ),
+    QRDX_NETWORK_ID: Eth1NetworkConfiguration(
+        QRDX_NETWORK_ID,
+        'QRDXChain',
+        'qrdx',
+        'qrdx.json',
+        (),  # No bootnodes for local testnet
+        QRDX_GENESIS_HEADER,
+        QRDX_VM_CONFIGURATION,
+        MiningMethod.NoProof,  # QR-PoS uses NoProof mining method
     ),
 }

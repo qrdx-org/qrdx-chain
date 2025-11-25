@@ -11,6 +11,7 @@ from typing import (
 from async_service import Service
 
 import websockets
+from websockets.legacy.client import WebSocketClientProtocol
 
 from trinity._utils.logging import get_logger
 
@@ -37,7 +38,7 @@ class EthstatsClient(Service):
 
     def __init__(
         self,
-        websocket: websockets.client.WebSocketClientProtocol,
+        websocket: WebSocketClientProtocol,
         node_id: str,
     ) -> None:
         self.websocket = websocket

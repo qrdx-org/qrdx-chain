@@ -4,6 +4,7 @@ from typing import Hashable, Sequence, Tuple, TypeVar, AsyncGenerator, Any
 import rlp
 
 import eth_utils
+from eth_hash.auto import keccak
 
 
 # Try to import a snappy exception from a few places
@@ -26,6 +27,31 @@ except (ImportError, ModuleNotFoundError):
 
         # Trying to name the class snappy_CompressedLengthError confuses mypy, hence the rename
         snappy_CompressedLengthError = _NewException
+
+
+class KeccakHash:
+    """
+    Wrapper class that mimics sha3.keccak_256 stateful hash object.
+    Uses eth_hash for compatibility.
+    """
+    
+    def __init__(self, data: bytes = b'') -> None:
+        """Initialize with optional initial data."""
+        self._buffer = bytearray(data)
+    
+    def update(self, data: bytes) -> None:
+        """Update the hash with new data."""
+        self._buffer.extend(data)
+    
+    def digest(self) -> bytes:
+        """Return the current hash digest."""
+        return keccak(bytes(self._buffer))
+    
+    def copy(self) -> 'KeccakHash':
+        """Return a copy of the hash object."""
+        new_hash = KeccakHash()
+        new_hash._buffer = bytearray(self._buffer)
+        return new_hash
 
 
 def get_logger(name: str) -> eth_utils.ExtendedDebugLogger:

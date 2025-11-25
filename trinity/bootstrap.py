@@ -298,7 +298,13 @@ def run(component_types: Tuple[Type[BaseComponentAPI], ...],
     )
     component_manager_manager = AsyncioManager(component_manager_service)
 
-    loop = asyncio.get_event_loop()
+    # Create event loop if it doesn't exist (Python 3.10+)
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
     loop.add_signal_handler(
         signal.SIGTERM,
         component_manager_manager.cancel,

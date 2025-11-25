@@ -153,7 +153,7 @@ class LightPeerChain(PeerSubscriber, Service, BaseLightPeerChain):
         self._pending_replies[request_id] = fut
         return await asyncio.wait_for(fut, timeout=self.reply_timeout)
 
-    @alru_cache(maxsize=1024, cache_exceptions=False)
+    @alru_cache(maxsize=1024)
     @service_timeout(COMPLETION_TIMEOUT)
     async def coro_get_block_header_by_hash(self, block_hash: Hash32) -> BlockHeader:
         """
@@ -168,7 +168,7 @@ class LightPeerChain(PeerSubscriber, Service, BaseLightPeerChain):
             partial(self._get_block_header_by_hash, block_hash)
         )
 
-    @alru_cache(maxsize=1024, cache_exceptions=False)
+    @alru_cache(maxsize=1024)
     @service_timeout(COMPLETION_TIMEOUT)
     async def coro_get_block_body_by_hash(self, block_hash: Hash32) -> BlockBody:
         peer = cast(LESPeer, self.peer_pool.highest_td_peer)
@@ -181,7 +181,7 @@ class LightPeerChain(PeerSubscriber, Service, BaseLightPeerChain):
 
     # TODO add a get_receipts() method to BaseChain API, and dispatch to this, as needed
 
-    @alru_cache(maxsize=1024, cache_exceptions=False)
+    @alru_cache(maxsize=1024)
     @service_timeout(COMPLETION_TIMEOUT)
     async def coro_get_receipts(self, block_hash: Hash32) -> List[Receipt]:
         peer = cast(LESPeer, self.peer_pool.highest_td_peer)
@@ -195,7 +195,7 @@ class LightPeerChain(PeerSubscriber, Service, BaseLightPeerChain):
     # TODO implement AccountDB exceptions that provide the info needed to
     # request accounts and code (and storage?)
 
-    @alru_cache(maxsize=1024, cache_exceptions=False)
+    @alru_cache(maxsize=1024)
     @service_timeout(COMPLETION_TIMEOUT)
     async def coro_get_account(self, block_hash: Hash32, address: ETHAddress) -> Account:
         return await self._retry_on_bad_response(
@@ -219,7 +219,7 @@ class LightPeerChain(PeerSubscriber, Service, BaseLightPeerChain):
             ) from exc
         return rlp.decode(rlp_account, sedes=Account)
 
-    @alru_cache(maxsize=1024, cache_exceptions=False)
+    @alru_cache(maxsize=1024)
     @service_timeout(COMPLETION_TIMEOUT)
     async def coro_get_contract_code(self, block_hash: Hash32, address: ETHAddress) -> bytes:
         """

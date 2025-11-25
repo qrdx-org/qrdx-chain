@@ -106,6 +106,11 @@ fi
 # Create temporary data directory
 DATA_DIR=$(mktemp -d -t qrdx-testnet-XXXXXX)
 
+# Create required subdirectories for Trinity
+mkdir -p "${DATA_DIR}/mainnet-eth1"
+mkdir -p "${DATA_DIR}/logs-eth1"
+mkdir -p "${DATA_DIR}/jsonrpc-ipc"
+
 echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║         QRDX Local Testnet Node                           ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
@@ -187,20 +192,33 @@ echo -e "${BLUE}Initializing QRDX testnet...${NC}"
 GENESIS_FILE="${DATA_DIR}/genesis.json"
 cat > "$GENESIS_FILE" << EOF
 {
-  "config": {
-    "chainId": ${NETWORK_ID},
-    "qrdxBlock": 0
+  "version": "1",
+  "params": {
+    "chainId": "0x$(printf '%x' ${NETWORK_ID})",
+    "miningMethod": "NoProof",
+    "frontierForkBlock": "0x0",
+    "homesteadForkBlock": "0x0",
+    "EIP150ForkBlock": "0x0",
+    "EIP158ForkBlock": "0x0",
+    "byzantiumForkBlock": "0x0",
+    "constantinopleForkBlock": "0x0",
+    "petersburgForkBlock": "0x0",
+    "istanbulForkBlock": "0x0"
   },
-  "nonce": "0x0",
-  "timestamp": "0x0",
-  "extraData": "0x5152445820546573746e6574204765",
-  "gasLimit": "0x2faf080",
-  "difficulty": "0x0",
-  "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-  "coinbase": "0x0000000000000000000000000000000000000000",
-  "alloc": {
+  "genesis": {
+    "nonce": "0x0000000000000000",
+    "difficulty": "0x0",
+    "author": "0x0000000000000000000000000000000000000000",
+    "timestamp": "0x0",
+    "extraData": "0x5152445820546573746e6574204765",
+    "gasLimit": "0x2faf080"
+  },
+  "accounts": {
     "0x0000000000000000000000000000000000000001": {
-      "balance": "1000000000000000000000000"
+      "balance": "0xd3c21bcecceda1000000"
+    },
+    "0x1000000000000000000000000000000000000001": {
+      "balance": "0xd3c21bcecceda1000000"
     }
   }
 }
@@ -228,29 +246,9 @@ TRINITY_ARGS=(
     --port "$P2P_PORT"
     --nodekey "$(cat $NODEKEY_FILE)"
     --genesis "$GENESIS_FILE"
+    --sync-mode full
+    --disable-tx-pool
 )
-
-# Add RPC options
-TRINITY_ARGS+=(
-    --enable-http
-    --http-port "$RPC_PORT"
-    --http-api eth,net,web3,qrdx
-)
-
-# Add WebSocket options
-TRINITY_ARGS+=(
-    --enable-ws
-    --ws-port "$WS_PORT"
-    --ws-api eth,net,web3,qrdx
-)
-
-# Add validator options if applicable
-if [ "$VALIDATOR_INDEX" -ge 0 ]; then
-    TRINITY_ARGS+=(
-        --validator
-        --validator-index "$VALIDATOR_INDEX"
-    )
-fi
 
 # Run Trinity
 cd "$PROJECT_ROOT"

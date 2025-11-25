@@ -5,8 +5,6 @@ import secrets
 import struct
 from typing import ByteString, Tuple
 
-import sha3
-
 import rlp
 
 from cryptography.hazmat.backends import default_backend
@@ -16,10 +14,13 @@ from cached_property import cached_property
 
 from eth_keys import datatypes
 
+from eth_hash.auto import keccak
 from eth_utils import (
     big_endian_to_int,
     get_extended_debug_logger,
 )
+
+from p2p._utils import KeccakHash
 
 from p2p import auth
 from p2p._utils import (
@@ -72,8 +73,8 @@ class Transport(TransportAPI):
                  writer: asyncio.StreamWriter,
                  aes_secret: bytes,
                  mac_secret: bytes,
-                 egress_mac: sha3.keccak_256,
-                 ingress_mac: sha3.keccak_256) -> None:
+                 egress_mac: KeccakHash,
+                 ingress_mac: KeccakHash) -> None:
         self.remote = remote
         self.session = Session(self.remote)
 
