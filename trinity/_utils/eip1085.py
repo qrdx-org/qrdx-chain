@@ -90,8 +90,8 @@ class GenesisParams(NamedTuple):
     gas_limit: int
 
     def to_dict(self) -> GenesisDict:
+        # Note: block_number is computed by fill_header_params_from_parent and should not be passed
         return {
-            'block_number': 0,
             'nonce': self.nonce,
             'difficulty': self.difficulty,
             'coinbase': self.coinbase,
