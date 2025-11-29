@@ -237,7 +237,8 @@ async def run_db_manager(
         manager = DBManager(get_base_db_fn(boot_info))
         with trinity_config.process_id_file('database'):
             with manager.run(trinity_config.database_ipc_path):
-                loop = asyncio.get_event_loop()
+                # Get the currently running loop (Python 3.10+ compatible)
+                loop = asyncio.get_running_loop()
                 try:
                     await loop.run_in_executor(None, manager.wait_stopped)
                 finally:
