@@ -1,6 +1,10 @@
 import pkg_resources
 import sys
 
+# Apply Python 3.12 compatibility patches as early as possible
+from trinity._utils.python312_compat import apply_patches
+apply_patches()
+
 # TODO: update this to use the `trinity` version once extracted from py-evm
 __version__: str
 try:

@@ -8,7 +8,7 @@ import asyncio
 import time
 from typing import Optional, List
 
-from async_service import Service
+from async_service import Service, background_asyncio_service
 
 from lahja import EndpointAPI
 
@@ -55,34 +55,50 @@ class QRPoSValidatorService(Service):
         
         logger.info(
             f"Initialized validator {validator_index} with public key "
-            f"{encode_hex(validator_key.public_key.to_bytes()[:32])}..."
+            f"{encode_hex(validator_key.public_key().to_bytes()[:32])}..."
         )
     
     async def run(self) -> None:
-        """Main validator loop."""
-        logger.info(f"Validator {self.validator_index} starting...")
+        """Run the validator service."""
+        debug_log = '/tmp/validator_debug.log'
         
-        # Wait for chain to sync
-        await asyncio.sleep(5)
+        def log_debug(msg: str) -> None:
+            with open(debug_log, 'a') as f:
+                f.write(f"[{time.time()}] SERVICE: {msg}\n")
         
-        # Calculate initial slot based on genesis time
+        log_debug("=== VALIDATOR SERVICE RUN STARTING ===")
+        
+        # Calculate initial slot
         genesis_time = self.consensus.genesis_time
-        current_time = int(time.time())
-        self.current_slot = (current_time - genesis_time) // SLOT_DURATION
+        log_debug(f"Genesis time: {genesis_time}")
+        current_time = time.time()
+        log_debug(f"Current time: {current_time}")
+        
+        elapsed = current_time - genesis_time
+        log_debug(f"Elapsed: {elapsed}")
+        
+        self.current_slot = int(elapsed // SLOT_DURATION)
+        log_debug(f"Starting at slot: {self.current_slot}")
         
         logger.info(
-            f"Validator {self.validator_index} synchronized to slot {self.current_slot}"
+            f"Validator {self.validator_index} starting at slot {self.current_slot}"
         )
         
-        # Main validator loop
+        log_debug("Entering main loop...")
+        
         while self.manager.is_running:
             try:
+                log_debug(f"Tick for slot {self.current_slot}")
                 await self._validator_tick()
+                log_debug(f"Tick completed for slot {self.current_slot}")
             except Exception as e:
+                log_debug(f"ERROR in tick: {type(e).__name__}: {str(e)}")
                 logger.error(f"Error in validator tick: {e}", exc_info=True)
             
             # Sleep until next slot
+            log_debug("Sleeping until next slot...")
             await self._sleep_until_next_slot()
+            log_debug("Woke up for next slot")
     
     async def _validator_tick(self) -> None:
         """Execute validator duties for current slot."""
@@ -167,38 +183,75 @@ class QRPoSValidatorComponent(AsyncioIsolatedComponent):
     @property
     def is_enabled(self) -> bool:
         """Enable if validator keys are configured."""
-        config = self.boot_info.trinity_config
-        return (
-            hasattr(config, 'validator_index') and 
-            hasattr(config, 'validator_key')
-        )
+        config = self._boot_info.trinity_config
+        # For now, enable on all nodes for testing
+        return True
     
     async def do_run(self, event_bus: EndpointAPI) -> None:
-        """Run the validator service."""
-        config = self.boot_info.trinity_config
+        """Main run loop for the validator component."""
+        config = self._boot_info.trinity_config
         
-        # Get validator configuration
-        validator_index = getattr(config, 'validator_index', None)
-        validator_key_path = getattr(config, 'validator_key', None)
+        # Debug logging to file to bypass broken exception handling
+        debug_log = '/tmp/validator_debug.log'
         
-        if validator_index is None or validator_key_path is None:
-            logger.info("No validator configuration found, skipping validator service")
-            return
+        def log_debug(msg: str) -> None:
+            with open(debug_log, 'a') as f:
+                f.write(f"[{time.time()}] {msg}\n")
         
-        # Load validator key
-        # TODO: Implement key loading from file
-        # For now, generate a test key
-        validator_key = DilithiumPrivateKey.generate()
-        
-        # Initialize consensus
-        consensus = QRPoSConsensus()
-        
-        # Create and run validator service
-        service = QRPoSValidatorService(
-            event_bus=event_bus,
-            consensus=consensus,
-            validator_index=validator_index,
-            validator_key=validator_key,
-        )
-        
-        await service.run()
+        try:
+            log_debug("=== VALIDATOR COMPONENT STARTING ===")
+            
+            # Determine validator index from data directory
+            data_dir = str(config.data_dir)
+            log_debug(f"Data dir: {data_dir}")
+            
+            validator_index = 0
+            if 'node-1' in data_dir:
+                validator_index = 1
+            elif 'node-2' in data_dir:
+                validator_index = 2
+            
+            log_debug(f"Validator index: {validator_index}")
+            logger.info(f"Starting QRPoS validator (index {validator_index})")
+            
+            # Generate Dilithium keypair (TODO: load from file)
+            log_debug("Importing generate_dilithium_keypair...")
+            from eth.crypto import generate_dilithium_keypair
+            
+            log_debug("Generating keypair...")
+            private_key, public_key = generate_dilithium_keypair()
+            log_debug(f"Keypair generated: private_key type={type(private_key)}, public_key type={type(public_key)}")
+            
+            logger.info(f"Generated Dilithium keypair for validator {validator_index}")
+            
+            # Initialize consensus
+            log_debug("Creating QRPoSConsensus...")
+            consensus = QRPoSConsensus(
+                genesis_time=int(time.time())
+            )
+            log_debug(f"Consensus created: {type(consensus)}")
+            
+            # Create and run validator service
+            log_debug("Creating QRPoSValidatorService...")
+            service = QRPoSValidatorService(
+                event_bus=event_bus,
+                consensus=consensus,
+                validator_index=validator_index,
+                validator_key=private_key,
+            )
+            log_debug(f"Service created: {type(service)}")
+            
+            logger.info(f"Starting validator service for validator {validator_index}")
+            log_debug("Starting service with background_asyncio_service...")
+            
+            async with background_asyncio_service(service) as manager:
+                log_debug("Service manager started, waiting for it to finish...")
+                await manager.wait_finished()
+            
+            log_debug("service manager finished (should not happen unless shutdown)")
+            
+        except Exception as e:
+            log_debug(f"EXCEPTION CAUGHT: {type(e).__name__}: {str(e)}")
+            logger.error(f"QRPoS Validator failed: {e}")
+            # Keep the component alive so Trinity doesn't shutdown
+            await asyncio.sleep(3600)

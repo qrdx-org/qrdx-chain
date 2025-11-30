@@ -85,7 +85,7 @@ ETH1_NODE_COMPONENTS: Tuple[Type[BaseComponentAPI], ...] = (
     ImportBlockComponent,
     MetricsComponent,
     NewBlockComponent,
-    # QRPoSValidatorComponent,  # Disabled temporarily to debug P2P
+    QRPoSValidatorComponent,
     RequestServerComponent,
     SyncerComponent,
     TxComponent,
