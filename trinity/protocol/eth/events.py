@@ -10,6 +10,7 @@ from eth.abc import (
     BlockHeaderAPI,
     SignedTransactionAPI,
 )
+from eth.rlp.headers import BlockHeader
 
 from lahja import (
     BaseEvent,
@@ -370,3 +371,18 @@ class GetPooledTransactionsRequest(BaseRequestResponseEvent[GetPooledTransaction
     @staticmethod
     def expected_response_type() -> Type[GetPooledTransactionsResponse]:
         return GetPooledTransactionsResponse
+
+
+# QR-PoS specific events
+
+
+@dataclass
+class QRPoSNewBlockEvent(BaseEvent):
+    """
+    Event broadcast by QR-PoS validator when it creates a new block.
+    Contains the RLP-encoded block header and Dilithium signature.
+    """
+    header_rlp: bytes  # RLP-encoded BlockHeader for IPC serialization
+    signature: bytes
+    validator_index: int
+    slot: int

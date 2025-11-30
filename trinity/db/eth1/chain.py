@@ -70,6 +70,18 @@ class BaseAsyncChainDB(BaseAsyncHeaderDB, ChainDB):
     ) -> Tuple[ReceiptAPI, ...]:
         ...
 
+    @abstractmethod
+    async def coro_persist_qrpos_signature(self, block_hash: Hash32, signature: bytes) -> None:
+        ...
+
+    @abstractmethod
+    async def coro_get_qrpos_signature(self, block_hash: Hash32) -> bytes:
+        ...
+
+    @abstractmethod
+    async def coro_qrpos_signature_exists(self, block_hash: Hash32) -> bool:
+        ...
+
 
 class AsyncChainDB(BaseAsyncChainDB):
     coro_exists = async_method(BaseAsyncChainDB.exists)
@@ -90,3 +102,6 @@ class AsyncChainDB(BaseAsyncChainDB):
     coro_get_block_transactions = async_method(BaseAsyncChainDB.get_block_transactions)
     coro_get_block_uncles = async_method(BaseAsyncChainDB.get_block_uncles)
     coro_get_receipts = async_method(BaseAsyncChainDB.get_receipts)
+    coro_persist_qrpos_signature = async_method(BaseAsyncChainDB.persist_qrpos_signature)
+    coro_get_qrpos_signature = async_method(BaseAsyncChainDB.get_qrpos_signature)
+    coro_qrpos_signature_exists = async_method(BaseAsyncChainDB.qrpos_signature_exists)

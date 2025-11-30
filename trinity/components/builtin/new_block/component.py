@@ -20,6 +20,8 @@ from eth_utils import (
     humanize_hash,
     to_tuple,
 )
+from eth.consensus.qrpos_validator import validate_qrpos_block, validate_qrpos_block_basic
+from eth.consensus.qrpos import QRPoSConsensus
 from lahja import EndpointAPI
 from pyformance import MetricsRegistry
 import trio
@@ -30,7 +32,7 @@ from trinity.components.builtin.metrics.component import metrics_service_from_ar
 from trinity.components.builtin.metrics.service.noop import NOOP_METRICS_SERVICE
 from trinity.constants import TO_NETWORKING_BROADCAST_CONFIG
 from trinity.extensibility import TrioIsolatedComponent
-from trinity.protocol.eth.events import NewBlockEvent, NewBlockHashesEvent
+from trinity.protocol.eth.events import NewBlockEvent, NewBlockHashesEvent, QRPoSNewBlockEvent
 from trinity.protocol.eth.payloads import (
     BlockFields,
     NewBlockHash,
@@ -87,8 +89,11 @@ class NewBlockService(Service):
         self._boot_info = boot_info
 
     async def run(self) -> None:
+        self.logger.info("NewBlockService starting up - registering handlers...")
         self.manager.run_daemon_task(self._handle_imported_blocks)
         self.manager.run_daemon_task(self._handle_new_block_hashes)
+        self.manager.run_daemon_task(self._handle_qrpos_new_blocks)
+        self.logger.info("QR-PoS block handler registered, waiting for events...")
 
         async for event in self._event_bus.stream(NewBlockEvent):
             self.manager.run_task(self._handle_new_block, event.session, event.command.payload)
@@ -125,6 +130,93 @@ class NewBlockService(Service):
             block = event.block
             self.logger.debug("NewBlockImported: %s", block)
             await self._broadcast_new_block_hashes(block)
+
+    async def _handle_qrpos_new_blocks(self) -> None:
+        """Handle QR-PoS blocks created by local validator."""
+        self.logger.info("QR-PoS block handler started, streaming QRPoSNewBlockEvent events...")
+        async for event in self._event_bus.stream(QRPoSNewBlockEvent):
+            # Decode RLP-encoded header
+            from eth.rlp.headers import BlockHeader
+            import rlp
+            header = rlp.decode(event.header_rlp, BlockHeader)
+            
+            self.logger.info(
+                "Received QR-PoS block from local validator %d: block #%d (slot %d)",
+                event.validator_index,
+                header.block_number,
+                event.slot,
+            )
+            
+            # Log the block details
+            self.logger.debug(
+                "QR-PoS block hash: %s, signature size: %d bytes",
+                humanize_hash(header.hash),
+                len(event.signature),
+            )
+            
+            # Validate QR-PoS block
+            try:
+                # Basic validation without full signature check
+                validate_qrpos_block_basic(header)
+                self.logger.debug("QR-PoS block #%d passed basic validation", header.block_number)
+                
+                # Get validator public keys from consensus config
+                # TODO: Load actual validator set from genesis/config
+                # For now, we trust blocks from local validator
+                
+            except ValidationError as e:
+                self.logger.warning(
+                    "QR-PoS block #%d from local validator failed validation: %s",
+                    header.block_number,
+                    e
+                )
+                return
+            
+            # Import block to chain DB
+            try:
+                with get_eth1_chain_with_remote_db(self._boot_info, self._event_bus) as chain:
+                    # Get the block class from the VM
+                    vm = chain.get_vm()
+                    block_class = vm.get_block_class()
+                    
+                    # Create block from header (with empty transactions for now)
+                    # In QR-PoS, blocks may be empty if no transactions are available
+                    block = block_class(header=header, transactions=[], uncles=[])
+                    
+                    # Import the block to the chain
+                    # Note: perform_validation=False because we already validated above
+                    # and the standard validation doesn't understand QR-PoS
+                    import_result = chain.import_block(block, perform_validation=False)
+                    
+                    self.logger.info(
+                        "Successfully imported QR-PoS block #%d (hash: %s)",
+                        header.block_number,
+                        humanize_hash(header.hash),
+                    )
+                    
+                    # Store Dilithium signature in proper database
+                    chain.chaindb.persist_qrpos_signature(header.hash, event.signature)
+                    self.logger.debug(
+                        "Stored QR-PoS signature for block #%d (%d bytes)",
+                        header.block_number,
+                        len(event.signature),
+                    )
+                    
+            except Exception as e:
+                self.logger.error(
+                    "Failed to import QR-PoS block #%d: %s",
+                    header.block_number,
+                    e,
+                    exc_info=True
+                )
+                return
+            
+            # Track the block
+            block_hash = header.hash
+            if block_hash not in self._peer_block_tracker:
+                self._peer_block_tracker[block_hash] = []
+            
+            # TODO: Broadcast to peers via ETH protocol extension
 
     async def _handle_new_block(self, sender: SessionAPI, payload: NewBlockPayload) -> None:
         header = payload.block.header
