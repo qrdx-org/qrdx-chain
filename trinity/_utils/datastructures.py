@@ -132,8 +132,8 @@ class TaskQueue(Generic[TTask]):
             *,
             loop: asyncio.AbstractEventLoop = None) -> None:
         self._maxsize = maxsize
-        self._full_lock = asyncio.Lock(loop=loop)
-        self._open_queue = asyncio.PriorityQueue(maxsize, loop=loop)
+        self._full_lock = asyncio.Lock()
+        self._open_queue = asyncio.PriorityQueue(maxsize)
         self._task_wrapper = SortableTask.orderable_by_func(order_fn)
         self._id_generator = count()
         self._tasks = set()

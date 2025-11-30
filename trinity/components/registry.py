@@ -58,6 +58,9 @@ from trinity.components.builtin.upnp.component import (
 from trinity.components.builtin.tx_pool.component import (
     TxComponent,
 )
+from trinity.components.builtin.qrpos_validator.component import (
+    QRPoSValidatorComponent,
+)
 
 
 BASE_COMPONENTS: Tuple[Type[BaseComponentAPI], ...] = (
@@ -82,6 +85,7 @@ ETH1_NODE_COMPONENTS: Tuple[Type[BaseComponentAPI], ...] = (
     ImportBlockComponent,
     MetricsComponent,
     NewBlockComponent,
+    # QRPoSValidatorComponent,  # Disabled temporarily to debug P2P
     RequestServerComponent,
     SyncerComponent,
     TxComponent,
