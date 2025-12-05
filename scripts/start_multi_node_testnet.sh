@@ -128,10 +128,14 @@ echo ""
 # Generate genesis configuration
 echo -e "${CYAN}Generating genesis configuration...${NC}"
 
-# Create a shared genesis file
+# Create a shared genesis file with RECENT fixed timestamp
+# Using timestamp from ~10 minutes ago to keep slot numbers reasonable
 GENESIS_FILE="/tmp/qrdx-multi-node-genesis.json"
+CURRENT_TIME=$(date +%s)
+GENESIS_TS=$((CURRENT_TIME - 600))  # 10 minutes ago
+GENESIS_TIMESTAMP=$(printf "0x%x" $GENESIS_TS)
 
-cat > "$GENESIS_FILE" << 'EOF'
+cat > "$GENESIS_FILE" << EOF
 {
   "version": "1",
   "params": {
@@ -150,7 +154,7 @@ cat > "$GENESIS_FILE" << 'EOF'
     "nonce": "0x0000000000000000",
     "difficulty": "0x0",
     "author": "0x0000000000000000000000000000000000000000",
-    "timestamp": "0x0",
+    "timestamp": "${GENESIS_TIMESTAMP}",
     "extraData": "0x5152445820546573746e6574204765",
     "gasLimit": "0x2faf080"
   },
@@ -170,6 +174,16 @@ echo -e "${GREEN}✓ Genesis configuration created${NC}"
 # Generate node keys and start nodes
 echo ""
 echo -e "${CYAN}Generating node keys and starting nodes...${NC}"
+echo ""
+
+# Clean old data directories to ensure fresh genesis
+for i in $(seq 0 $((NUM_NODES - 1))); do
+    DATA_DIR="/tmp/qrdx-node-${i}"
+    if [ -d "$DATA_DIR" ]; then
+        echo -e "${YELLOW}Cleaning old data directory: ${DATA_DIR}${NC}"
+        rm -rf "$DATA_DIR"
+    fi
+done
 echo ""
 
 NODE_PIDS=()
@@ -227,8 +241,9 @@ for i in $(seq 0 $((NUM_NODES - 1))); do
         --genesis "${DATA_DIR}/genesis.json" \
         --sync-mode full \
         --disable-tx-pool \
-        --http-listen-address 127.0.0.1 \
-        --http-port $RPC_PORT \
+        --enable-http-apis=eth,net,web3 \
+        --http-listen-address=127.0.0.1 \
+        --http-port=$RPC_PORT \
         $STATIC_PEERS \
         > "$LOG_FILE" 2>&1 &
     

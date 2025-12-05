@@ -34,6 +34,7 @@ from trinity.protocol.eth.commands import (
     Transactions,
     Status,
     GetPooledTransactionsV65,
+    Attestations,
 )
 from trinity.rlp.block_body import BlockBody
 from trinity.rlp.sedes import (
@@ -55,6 +56,7 @@ from .payloads import (
     NewBlockPayload,
     StatusV63Payload,
     StatusPayload,
+    AttestationPayload,
 )
 from .proto import ETHProtocolV63, ETHProtocolV65, ETHProtocolV64
 
@@ -228,6 +230,10 @@ class BaseETHAPI(Application):
         block_fields = BlockFields(block.header, transactions, block.uncles)
         payload = NewBlockPayload(block_fields, total_difficulty)
         self.protocol.send(NewBlock(payload))
+
+    def send_attestations(self, attestations: Sequence[AttestationPayload]) -> None:
+        """Send QR-PoS attestations to peer."""
+        self.protocol.send(Attestations(tuple(attestations)))
 
 
 class ETHV63API(BaseETHAPI):

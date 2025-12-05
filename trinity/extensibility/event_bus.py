@@ -44,33 +44,42 @@ class BaseEventBusService(Service):
         return self._endpoint
 
     async def run(self) -> None:
-        async with self.EndpointType.serve(self._connection_config) as endpoint:
-            self._endpoint = endpoint
+        try:
+            self.logger.info(f"[IPC-DEBUG] Starting {self.EndpointType.__name__} for {self._connection_config.name}")
+            async with self.EndpointType.serve(self._connection_config) as endpoint:
+                self._endpoint = endpoint
+                self.logger.info(f"[IPC-DEBUG] Endpoint {endpoint.name} serving at {self._connection_config.path}")
 
-            # run background task that automatically connects to newly announced endpoints
-            self.manager.run_daemon_task(self._auto_connect_new_announced_endpoints, endpoint)
+                # run background task that automatically connects to newly announced endpoints
+                self.manager.run_daemon_task(self._auto_connect_new_announced_endpoints, endpoint)
 
-            # connect to the *main* endpoint which communicates information
-            # about other endpoints that come online.
-            main_endpoint_config = ConnectionConfig.from_name(
-                MAIN_EVENTBUS_ENDPOINT, self._trinity_config.ipc_dir
-            )
-            await endpoint.connect_to_endpoints(main_endpoint_config)
+                # connect to the *main* endpoint which communicates information
+                # about other endpoints that come online.
+                main_endpoint_config = ConnectionConfig.from_name(
+                    MAIN_EVENTBUS_ENDPOINT, self._trinity_config.ipc_dir
+                )
+                self.logger.info(f"[IPC-DEBUG] {endpoint.name} connecting to MAIN at {main_endpoint_config.path}")
+                await endpoint.connect_to_endpoints(main_endpoint_config)
+                self.logger.info(f"[IPC-DEBUG] {endpoint.name} successfully connected to MAIN")
 
-            # announce ourself to the event bus
-            await endpoint.wait_until_any_endpoint_subscribed_to(
-                EventBusConnected,
-            )
-            await endpoint.broadcast(
-                EventBusConnected(self._connection_config),
-                BroadcastConfig(filter_endpoint=main_endpoint_config.name)
-            )
+                # announce ourself to the event bus
+                await endpoint.wait_until_any_endpoint_subscribed_to(
+                    EventBusConnected,
+                )
+                await endpoint.broadcast(
+                    EventBusConnected(self._connection_config),
+                    BroadcastConfig(filter_endpoint=main_endpoint_config.name)
+                )
 
-            # signal that the endpoint is now available
-            self._endpoint_available.set()
+                # signal that the endpoint is now available
+                self._endpoint_available.set()
+                self.logger.info(f"[IPC-DEBUG] Endpoint {endpoint.name} fully initialized and available")
 
-            # run until the endpoint exits
-            await self.manager.wait_finished()
+                # run until the endpoint exits
+                await self.manager.wait_finished()
+        except Exception as e:
+            self.logger.error(f"[IPC-DEBUG] EventBusService.run() failed for {self._connection_config.name}: {e}", exc_info=True)
+            raise
 
     async def _auto_connect_new_announced_endpoints(
         self,
@@ -94,13 +103,18 @@ class BaseEventBusService(Service):
                 continue
 
             endpoint_names = ",".join((config.name for config in endpoints_to_connect_to))
-            self.logger.debug(
-                "EventBus Endpoint %s connecting to other Endpoints: %s",
+            self.logger.info(
+                "[IPC-DEBUG] EventBus Endpoint %s connecting to other Endpoints: %s",
                 endpoint.name,
                 endpoint_names,
             )
             try:
                 await endpoint.connect_to_endpoints(*endpoints_to_connect_to)
+                self.logger.info(
+                    "[IPC-DEBUG] EventBus Endpoint %s successfully connected to: %s",
+                    endpoint.name,
+                    endpoint_names,
+                )
             except Exception as e:
                 self.logger.warning(
                     "Failed to connect %s to one of %s: %s",

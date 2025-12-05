@@ -371,7 +371,7 @@ class SyncerComponent(AsyncioIsolatedComponent):
     async def do_run(self, event_bus: EndpointAPI) -> None:
         boot_info = self._boot_info
 
-        if boot_info.args.enable_metrics:
+        if getattr(boot_info.args, 'enable_metrics', False):
             metrics_service = metrics_service_from_args(boot_info.args, AsyncioMetricsService)
         else:
             # Use a NoopMetricsService so that no code branches need to be taken if metrics

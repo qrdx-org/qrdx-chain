@@ -64,20 +64,29 @@ class TrioIsolatedComponent(BaseIsolatedComponent):
 
     async def _do_run(self) -> None:
         with child_process_logging(self._boot_info):
-            event_bus_service = TrioEventBusService(
-                self._boot_info.trinity_config,
-                self.get_endpoint_name(),
-            )
-            async with background_trio_service(event_bus_service):
-                event_bus = await event_bus_service.get_event_bus()
-                async with trio.open_nursery() as nursery:
-                    nursery.start_soon(self._loop_monitoring_task, event_bus)
-                    nursery.start_soon(self.run_process, event_bus)
-                    try:
-                        await trio.sleep_forever()
-                    except KeyboardInterrupt:
-                        self.logger.debug("%s: Got KeyboardInterrupt, exiting", self.name)
-                        nursery.cancel_scope.cancel()
+            try:
+                self.logger.info(f"[TRIO-DEBUG] {self.name}: Creating TrioEventBusService")
+                event_bus_service = TrioEventBusService(
+                    self._boot_info.trinity_config,
+                    self.get_endpoint_name(),
+                )
+                self.logger.info(f"[TRIO-DEBUG] {self.name}: Starting event bus service")
+                async with background_trio_service(event_bus_service):
+                    self.logger.info(f"[TRIO-DEBUG] {self.name}: Getting event bus endpoint")
+                    event_bus = await event_bus_service.get_event_bus()
+                    self.logger.info(f"[TRIO-DEBUG] {self.name}: Event bus ready, opening nursery")
+                    async with trio.open_nursery() as nursery:
+                        nursery.start_soon(self._loop_monitoring_task, event_bus)
+                        self.logger.info(f"[TRIO-DEBUG] {self.name}: Starting do_run process")
+                        nursery.start_soon(self.run_process, event_bus)
+                        try:
+                            await trio.sleep_forever()
+                        except KeyboardInterrupt:
+                            self.logger.debug("%s: Got KeyboardInterrupt, exiting", self.name)
+                            nursery.cancel_scope.cancel()
+            except Exception as e:
+                self.logger.error(f"[TRIO-DEBUG] {self.name}: Fatal error in _do_run: {e}", exc_info=True)
+                raise
 
     @abstractmethod
     async def do_run(self, event_bus: EndpointAPI) -> None:

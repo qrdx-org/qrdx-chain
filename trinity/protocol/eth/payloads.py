@@ -39,3 +39,11 @@ class BlockFields(NamedTuple):
 class NewBlockPayload(NamedTuple):
     block: BlockFields
     total_difficulty: int
+
+
+class AttestationPayload(NamedTuple):
+    """Payload for QR-PoS attestation gossip."""
+    slot: int
+    block_hash: Hash32
+    validator_index: int
+    signature: bytes

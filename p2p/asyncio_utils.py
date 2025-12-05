@@ -11,8 +11,6 @@ from typing import (
     TypeVar,
 )
 
-from trio import MultiError
-
 from eth_utils.toolz import first
 
 from p2p._utils import get_logger
@@ -112,7 +110,7 @@ async def cancel_pending_tasks(*tasks: asyncio.Task[Any], timeout: int) -> Async
                     if future.exception():
                         errors.append(future.exception())
             if errors:
-                raise MultiError(errors)
+                raise BaseExceptionGroup("Errors occurred in cancelled tasks", errors)
         else:
             logger.debug("No pending tasks in %s, returning", task)
 

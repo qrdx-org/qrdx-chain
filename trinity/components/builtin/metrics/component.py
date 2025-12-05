@@ -12,7 +12,8 @@ from lahja import EndpointAPI
 
 from trinity.boot_info import BootInfo
 from trinity.components.builtin.metrics.abc import MetricsServiceAPI
-from trinity.components.builtin.metrics.service.trio import TrioMetricsService
+# Lazy import to avoid asks library crash on Python 3.12
+# from trinity.components.builtin.metrics.service.trio import TrioMetricsService
 from trinity.components.builtin.metrics.blockchain_metrics_collector import (
     collect_blockchain_metrics,
 )
@@ -26,7 +27,11 @@ from trinity._utils.services import run_background_trio_services
 
 def metrics_service_from_args(
         args: Namespace,
-        metrics_service_class: Type[MetricsServiceAPI] = TrioMetricsService) -> MetricsServiceAPI:
+        metrics_service_class: Type[MetricsServiceAPI] = None) -> MetricsServiceAPI:
+    # Lazy import to avoid asks library crash
+    if metrics_service_class is None:
+        from trinity.components.builtin.metrics.service.trio import TrioMetricsService
+        metrics_service_class = TrioMetricsService
     return metrics_service_class(
         influx_server=args.metrics_influx_server,
         influx_user=args.metrics_influx_user,

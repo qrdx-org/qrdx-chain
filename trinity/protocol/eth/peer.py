@@ -66,6 +66,7 @@ from .commands import (
     Transactions,
     NewPooledTransactionHashes,
     GetPooledTransactionsV65,
+    Attestations,
 )
 from .constants import MAX_HEADERS_FETCH
 from .events import (
@@ -91,6 +92,8 @@ from .events import (
     GetPooledTransactionsRequest,
     SendPooledTransactionsEvent,
     SendTransactionsEvent,
+    AttestationsEvent,
+    SendAttestationsEvent,
 )
 from .payloads import StatusV63Payload, StatusPayload
 from .proto import ETHProtocolV63, ETHProtocolV64, ETHProtocolV65, BaseETHProtocol
@@ -255,6 +258,7 @@ class ETHPeerPoolEventServer(PeerPoolEventServer[ETHPeer]):
         GetPooledTransactionsV65,
         GetBlockWitnessHashes,
         BlockWitnessHashes,
+        Attestations,
     })
 
     # SendX events that need to be forwarded to peer.sub_proto.send(event.command)
@@ -267,6 +271,7 @@ class ETHPeerPoolEventServer(PeerPoolEventServer[ETHPeer]):
         SendReceiptsEvent,
         SendPooledTransactionsEvent,
         SendTransactionsEvent,
+        SendAttestationsEvent,
     })
 
     async def run(self) -> None:

@@ -24,10 +24,10 @@ from eth.chains.ropsten import (
     ROPSTEN_GENESIS_HEADER,
     ROPSTEN_VM_CONFIGURATION,
 )
-from eth.chains.qrdx import (
-    QRDX_GENESIS_HEADER,
-    QRDX_VM_CONFIGURATION,
-)
+# from eth.chains.qrdx import (
+#     QRDX_GENESIS_HEADER,
+#     QRDX_VM_CONFIGURATION,
+# )
 
 from eth.rlp.headers import BlockHeader
 
@@ -96,14 +96,16 @@ PRECONFIGURED_NETWORKS = {
         ROPSTEN_VM_CONFIGURATION,
         MiningMethod.Ethash,
     ),
-    QRDX_NETWORK_ID: Eth1NetworkConfiguration(
-        QRDX_NETWORK_ID,
-        'QRDXChain',
-        'qrdx',
-        'qrdx.json',
-        (),  # No bootnodes for local testnet
-        QRDX_GENESIS_HEADER,
-        QRDX_VM_CONFIGURATION,
-        MiningMethod.NoProof,  # QR-PoS uses NoProof mining method
-    ),
+    # NOTE: QRDX uses custom genesis files, not preconfigured network
+    # This allows genesis timestamp and other params to be specified per deployment
+    # QRDX_NETWORK_ID: Eth1NetworkConfiguration(
+    #     QRDX_NETWORK_ID,
+    #     'QRDXChain',
+    #     'qrdx',
+    #     'qrdx.json',
+    #     (),  # No bootnodes for local testnet
+    #     QRDX_GENESIS_HEADER,
+    #     QRDX_VM_CONFIGURATION,
+    #     MiningMethod.NoProof,  # QR-PoS uses NoProof mining method
+    # ),
 }

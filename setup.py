@@ -10,7 +10,7 @@ deps = {
     'p2p': [
         "async-service==0.1.0a11",
         "asyncio-cancel-token>=0.2,<0.3",
-        "async_lru>=0.1.0,<1.0.0",
+        "async_lru>=2.0.0,<3.0.0",  # Python 3.12 compatible
         "cached-property>=1.5.1,<2",
         # Post-quantum cryptography dependencies
         "liboqs-python>=0.9.0",
@@ -18,13 +18,13 @@ deps = {
         # cryptography does not use semver and allows breaking changes within `0.3` version bumps.
         "cryptography>=3.0,<3.2",
         "eth-enr>=0.3.0,<0.4",
-        "eth-hash>=0.1.4,<1",
+        "eth-hash>=0.7.0,<1",  # Python 3.12 compatible
         # Note: eth-keys kept for backward compatibility but will be phased out
-        "eth-keys>=0.3.3,<0.5.0",
-        "eth-typing>=2.2.2,<4",
+        "eth-keys>=0.7.0,<1.0.0",  # Python 3.12 compatible
+        "eth-typing>=5.0.0,<6",  # Python 3.12 compatible
         "lru-dict>=1.1.6,<2",
         "python-snappy>=0.5.3",
-        "rlp>=2.0.1,<4",
+        "rlp>=4.0.0,<5",  # Python 3.12 compatible
         "SQLAlchemy>=1.3.3,<2",
         'trio>=0.16.0,<0.17',
         'trio-typing>=0.5.0,<0.6',
@@ -37,10 +37,10 @@ deps = {
         "asyncio-run-in-process==0.1.0a10",
         "bloom-filter==1.3",
         "cachetools>=3.1.0,<5.0.0",
-        "eth-utils>=1.9.3,<2",
-        "eth-typing>=2.2.2,<4",
+        "eth-utils>=5.0.0,<6",  # Python 3.12 compatible
+        "eth-typing>=5.0.0,<6",  # Python 3.12 compatible
         "eth-bloom>=1.0.3,<2",
-        "eth-abi>=2.0.0,<2.3",
+        "eth-abi>=5.0.0,<6",  # Python 3.12 compatible with parsimonious 0.10
         "ipython>=7.23.0,<8",
         "jsonschema>=3.2,<5",
         "lahja>=0.17.0,<0.18",
@@ -54,8 +54,8 @@ deps = {
         "termcolor>=1.1.0,<2.0.0",
         "upnp-port-forward>=0.1.1,<0.2",
         "uvloop>=0.17.0;platform_system=='Linux' or platform_system=='Darwin' or platform_system=='FreeBSD'",  # noqa: E501
-        "web3>=5.12.1,<6",
-        "websockets>=8.1.0,<9",
+        "web3>=7.0.0,<8",  # Python 3.12 compatible
+        "websockets>=15.0.0,<16",  # Python 3.12 compatible
     ],
     'test': [
         "async-timeout>=3.0.1,<4",

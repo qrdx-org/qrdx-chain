@@ -345,10 +345,53 @@ class QRPoSValidatorService(Service):
                 f"for slot {self.current_slot}"
             )
             
-            # TODO: Get current head block
-            # TODO: Create attestation
-            # TODO: Sign attestation with Dilithium key
-            # TODO: Broadcast attestation to network
+            # Get current chain head
+            from trinity._utils.connect import get_eth1_chain_with_remote_db
+            from eth.consensus.qrpos import Attestation
+            from eth.crypto import blake3_hash_bytes
+            
+            with get_eth1_chain_with_remote_db(self.boot_info, self.event_bus) as chain:
+                head = chain.get_canonical_head()
+                
+                # Create attestation data
+                import rlp
+                attestation_data = rlp.encode([
+                    self.current_slot,
+                    head.hash,
+                    self.validator_index,
+                ])
+                signing_message = blake3_hash_bytes(attestation_data)
+                
+                # Sign with Dilithium key
+                signature = self.validator_key.sign(signing_message)
+                
+                # Create attestation object
+                attestation = Attestation(
+                    slot=self.current_slot,
+                    block_hash=head.hash,
+                    validator_index=self.validator_index,
+                    signature=signature,
+                )
+                
+                logger.info(
+                    f"Validator {self.validator_index} created attestation for "
+                    f"block #{head.block_number} (slot {self.current_slot})"
+                )
+                
+                # Broadcast attestation to network via IPC
+                from trinity.protocol.eth.events import QRPoSAttestationEvent
+                
+                self.event_bus.broadcast(
+                    QRPoSAttestationEvent(
+                        slot=self.current_slot,
+                        block_hash=head.hash,
+                        validator_index=self.validator_index,
+                        signature=signature,
+                    ),
+                    FIRE_AND_FORGET_BROADCASTING,
+                )
+                
+                logger.debug(f"Broadcasted attestation for slot {self.current_slot}")
             
         except Exception as e:
             logger.error(
@@ -418,10 +461,46 @@ class QRPoSValidatorComponent(AsyncioIsolatedComponent):
             
             logger.info(f"Generated Dilithium keypair for validator {validator_index}")
             
+            # Get genesis time from genesis block timestamp
+            log_debug("Getting genesis time from chain...")
+            from trinity._utils.connect import get_eth1_chain_with_remote_db
+            with get_eth1_chain_with_remote_db(self._boot_info, event_bus) as chain:
+                genesis_header = chain.get_canonical_block_header_by_number(BlockNumber(0))
+                genesis_time = genesis_header.timestamp
+            log_debug(f"Genesis timestamp from header: {genesis_time}")
+            logger.info(f"Genesis block timestamp: {genesis_time}")
+            
+            # Create genesis validator set (150 validators, all active)
+            log_debug("Creating genesis validator set...")
+            from eth.consensus.qrpos import Validator, ValidatorSet, ValidatorStatus, MIN_STAKE
+            from eth_utils import to_canonical_address
+            
+            genesis_validators = []
+            for i in range(150):  # VALIDATOR_COUNT
+                # Create dummy validators (in production, these would be loaded from genesis)
+                dummy_address = to_canonical_address(f"0x{i:040x}")
+                dummy_pubkey = bytes([i % 256] * 1952)  # Dilithium pubkey is 1952 bytes
+                
+                validator = Validator(
+                    index=i,
+                    public_key=dummy_pubkey,
+                    address=dummy_address,
+                    stake=MIN_STAKE,
+                    status=ValidatorStatus.ACTIVE,
+                    activation_epoch=0,
+                    exit_epoch=None,
+                    slashed=False,
+                )
+                genesis_validators.append(validator)
+            
+            validator_set = ValidatorSet(genesis_validators=genesis_validators)
+            log_debug(f"Created validator set with {len(validator_set.validators)} validators")
+            
             # Initialize consensus
             log_debug("Creating QRPoSConsensus...")
             consensus = QRPoSConsensus(
-                genesis_time=int(time.time())
+                validator_set=validator_set,
+                genesis_time=genesis_time
             )
             log_debug(f"Consensus created: {type(consensus)}")
             

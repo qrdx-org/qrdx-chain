@@ -42,6 +42,7 @@ from .commands import (
     ReceiptsV65,
     Transactions,
     PooledTransactionsV65,
+    Attestations,
 )
 from .events import (
     GetBlockBodiesRequest,
@@ -57,8 +58,9 @@ from .events import (
     SendTransactionsEvent,
     GetPooledTransactionsRequest,
     SendPooledTransactionsEvent,
+    SendAttestationsEvent,
 )
-from .payloads import BlockFields, NewBlockHash, NewBlockPayload
+from .payloads import BlockFields, NewBlockHash, NewBlockPayload, AttestationPayload
 
 
 class ProxyETHAPI:
@@ -263,5 +265,13 @@ class ProxyETHAPI:
         command = NodeDataV65(tuple(nodes))
         self._event_bus.broadcast_nowait(
             SendNodeDataEvent(self.session, command),
+            self._broadcast_config,
+        )
+
+    def send_attestations(self, attestations: Sequence[AttestationPayload]) -> None:
+        """Send QR-PoS attestations to peer."""
+        command = Attestations(tuple(attestations))
+        self._event_bus.broadcast_nowait(
+            SendAttestationsEvent(self.session, command),
             self._broadcast_config,
         )

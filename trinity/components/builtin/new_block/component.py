@@ -28,7 +28,8 @@ import trio
 
 from p2p.abc import SessionAPI
 from trinity.boot_info import BootInfo
-from trinity.components.builtin.metrics.component import metrics_service_from_args
+# Lazy import to avoid async_lru crash on Python 3.12
+# from trinity.components.builtin.metrics.component import metrics_service_from_args
 from trinity.components.builtin.metrics.service.noop import NOOP_METRICS_SERVICE
 from trinity.constants import TO_NETWORKING_BROADCAST_CONFIG
 from trinity.extensibility import TrioIsolatedComponent
@@ -59,17 +60,31 @@ class NewBlockComponent(TrioIsolatedComponent):
         return True
 
     async def do_run(self, event_bus: EndpointAPI) -> None:
-        if self._boot_info.args.enable_metrics:
-            metrics_service = metrics_service_from_args(self._boot_info.args)
-        else:
-            metrics_service = NOOP_METRICS_SERVICE
-        proxy_peer_pool = ETHProxyPeerPool(event_bus, TO_NETWORKING_BROADCAST_CONFIG)
-        async with background_trio_service(proxy_peer_pool):
-            async with background_trio_service(metrics_service):
-                service = NewBlockService(
-                    event_bus, proxy_peer_pool, metrics_service.registry, self._boot_info)
-                async with background_trio_service(service) as manager:
-                    await manager.wait_finished()
+        self.logger.info("[NEWBLOCK-DEBUG] do_run() called, starting component initialization")
+        try:
+            if getattr(self._boot_info.args, 'enable_metrics', False):
+                # Lazy import to avoid async_lru crash
+                from trinity.components.builtin.metrics.component import metrics_service_from_args
+                metrics_service = metrics_service_from_args(self._boot_info.args)
+            else:
+                metrics_service = NOOP_METRICS_SERVICE
+            
+            self.logger.info("[NEWBLOCK-DEBUG] Creating ETHProxyPeerPool")
+            proxy_peer_pool = ETHProxyPeerPool(event_bus, TO_NETWORKING_BROADCAST_CONFIG)
+            
+            self.logger.info("[NEWBLOCK-DEBUG] Starting background services")
+            async with background_trio_service(proxy_peer_pool):
+                async with background_trio_service(metrics_service):
+                    self.logger.info("[NEWBLOCK-DEBUG] Creating NewBlockService")
+                    service = NewBlockService(
+                        event_bus, proxy_peer_pool, metrics_service.registry, self._boot_info)
+                    self.logger.info("[NEWBLOCK-DEBUG] Starting NewBlockService")
+                    async with background_trio_service(service) as manager:
+                        self.logger.info("[NEWBLOCK-DEBUG] NewBlockService running, waiting for finish")
+                        await manager.wait_finished()
+        except Exception as e:
+            self.logger.error(f"[NEWBLOCK-DEBUG] Fatal error in do_run: {e}", exc_info=True)
+            raise
 
 
 class NewBlockService(Service):
@@ -93,7 +108,9 @@ class NewBlockService(Service):
         self.manager.run_daemon_task(self._handle_imported_blocks)
         self.manager.run_daemon_task(self._handle_new_block_hashes)
         self.manager.run_daemon_task(self._handle_qrpos_new_blocks)
-        self.logger.info("QR-PoS block handler registered, waiting for events...")
+        self.manager.run_daemon_task(self._handle_qrpos_attestations)
+        self.manager.run_daemon_task(self._handle_incoming_attestations)
+        self.logger.info("QR-PoS block and attestation handlers registered, waiting for events...")
 
         async for event in self._event_bus.stream(NewBlockEvent):
             self.manager.run_task(self._handle_new_block, event.session, event.command.payload)
@@ -134,7 +151,9 @@ class NewBlockService(Service):
     async def _handle_qrpos_new_blocks(self) -> None:
         """Handle QR-PoS blocks created by local validator."""
         self.logger.info("QR-PoS block handler started, streaming QRPoSNewBlockEvent events...")
+        self.logger.info(f"Event bus: {self._event_bus}, type: {type(self._event_bus)}")
         async for event in self._event_bus.stream(QRPoSNewBlockEvent):
+            self.logger.info(f"*** EVENT RECEIVED IN LOOP! Event: {event}")
             # Decode RLP-encoded header
             from eth.rlp.headers import BlockHeader
             import rlp
@@ -216,7 +235,109 @@ class NewBlockService(Service):
             if block_hash not in self._peer_block_tracker:
                 self._peer_block_tracker[block_hash] = []
             
-            # TODO: Broadcast to peers via ETH protocol extension
+            # Broadcast block to peers
+            # For now, use standard NewBlockHashes announcement
+            # TODO: Extend ETH protocol to include Dilithium signature
+            await self._broadcast_new_block_hashes(block)
+            
+            self.logger.info(
+                "Broadcast QR-PoS block #%d to peers",
+                header.block_number,
+            )
+
+    async def _handle_qrpos_attestations(self) -> None:
+        """Handle QR-PoS attestations created by local validator."""
+        from trinity.protocol.eth.events import QRPoSAttestationEvent
+        
+        self.logger.info("QR-PoS attestation handler started, streaming events...")
+        async for event in self._event_bus.stream(QRPoSAttestationEvent):
+            self.logger.info(
+                "Received QR-PoS attestation from validator %d for slot %d",
+                event.validator_index,
+                event.slot,
+            )
+            
+            # Broadcast attestation to all peers
+            await self._broadcast_attestations([event])
+
+    async def _handle_incoming_attestations(self) -> None:
+        """Handle incoming attestations from peers."""
+        from trinity.protocol.eth.events import AttestationsEvent
+        from eth.consensus.qrpos import Attestation
+        
+        self.logger.info("Incoming attestation handler started...")
+        async for event in self._event_bus.stream(AttestationsEvent):
+            self.logger.info(
+                "Received %d attestation(s) from peer %s",
+                len(event.command.payload),
+                event.session,
+            )
+            
+            # Process each attestation
+            from trinity._utils.connect import get_eth1_chain_with_remote_db
+            with get_eth1_chain_with_remote_db(self._boot_info, self._event_bus) as chain:
+                for att_payload in event.command.payload:
+                    try:
+                        # Create Attestation object
+                        attestation = Attestation(
+                            slot=att_payload.slot,
+                            block_hash=att_payload.block_hash,
+                            validator_index=att_payload.validator_index,
+                            signature=att_payload.signature,
+                        )
+                        
+                        # Add to consensus attestation pool
+                        chain.consensus.add_attestation(attestation)
+                        
+                        self.logger.debug(
+                            "Added attestation from validator %d (slot %d) to pool",
+                            att_payload.validator_index,
+                            att_payload.slot,
+                        )
+                    except Exception as e:
+                        self.logger.warning(
+                            "Failed to process attestation from peer %s: %s",
+                            event.session,
+                            e,
+                        )
+
+    async def _broadcast_attestations(self, events: list) -> None:
+        """Broadcast attestations to all connected peers."""
+        from trinity.protocol.eth.payloads import AttestationPayload
+        
+        all_peers = await self._peer_pool.get_peers()
+        if not all_peers:
+            self.logger.debug("No peers connected, skipping attestation broadcast")
+            return
+            
+        # Convert events to payloads
+        attestations = [
+            AttestationPayload(
+                slot=event.slot,
+                block_hash=event.block_hash,
+                validator_index=event.validator_index,
+                signature=event.signature,
+            )
+            for event in events
+        ]
+        
+        # Send to all peers
+        for peer in all_peers:
+            try:
+                target_peer = await self._peer_pool.ensure_proxy_peer(peer.session)
+                target_peer.eth_api.send_attestations(attestations)
+                self.logger.debug(
+                    "Sent %d attestation(s) to peer %s",
+                    len(attestations),
+                    target_peer,
+                )
+                await trio.sleep(0)  # yield to event loop
+            except Exception as e:
+                self.logger.warning(
+                    "Failed to send attestations to peer %s: %s",
+                    peer,
+                    e,
+                )
 
     async def _handle_new_block(self, sender: SessionAPI, payload: NewBlockPayload) -> None:
         header = payload.block.header

@@ -48,6 +48,7 @@ from .commands import (
     NewPooledTransactionHashes,
     GetPooledTransactionsV65,
     PooledTransactionsV65,
+    Attestations,
 )
 
 
@@ -115,6 +116,14 @@ class NewPooledTransactionHashesEvent(PeerPoolMessageEvent):
     subscribes the event through the event bus.
     """
     command: NewPooledTransactionHashes
+
+
+class AttestationsEvent(PeerPoolMessageEvent):
+    """
+    Event to carry an ``Attestations`` command from the peer pool to any process that
+    subscribes the event through the event bus.
+    """
+    command: Attestations
 
 
 class GetPooledTransactionsEvent(PeerPoolMessageEvent):
@@ -214,6 +223,16 @@ class SendPooledTransactionsEvent(PeerPoolMessageEvent):
     """
     session: SessionAPI
     command: PooledTransactionsV65
+
+
+@dataclass
+class SendAttestationsEvent(PeerPoolMessageEvent):
+    """
+    Event to proxy an ``ETHPeer.eth_api.send_attestations`` call from a proxy peer to the actual
+    peer that sits in the peer pool.
+    """
+    session: SessionAPI
+    command: Attestations
 
 # EXCHANGE HANDLER REQUEST / RESPONSE PAIRS
 
@@ -386,3 +405,15 @@ class QRPoSNewBlockEvent(BaseEvent):
     signature: bytes
     validator_index: int
     slot: int
+
+
+@dataclass
+class QRPoSAttestationEvent(BaseEvent):
+    """
+    Event broadcast by QR-PoS validator when it creates an attestation.
+    Contains attestation data for network propagation.
+    """
+    slot: int
+    block_hash: bytes
+    validator_index: int
+    signature: bytes

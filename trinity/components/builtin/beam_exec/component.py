@@ -42,7 +42,7 @@ class BeamChainExecutionComponent(AsyncioIsolatedComponent):
 
         base_db = DBClient.connect(trinity_config.database_ipc_path)
 
-        if self._boot_info.args.enable_metrics:
+        if getattr(self._boot_info.args, 'enable_metrics', False):
             metrics_service = metrics_service_from_args(
                 self._boot_info.args, AsyncioMetricsService)
         else:

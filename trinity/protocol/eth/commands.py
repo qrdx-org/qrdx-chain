@@ -31,6 +31,7 @@ from .payloads import (
     BlockFields,
     NewBlockPayload,
     StatusPayload,
+    AttestationPayload,
 )
 
 
@@ -155,6 +156,20 @@ class PooledTransactionsV65(BaseCommand[Tuple[SignedTransactionAPI, ...]]):
     protocol_command_id = 10
     serialization_codec: RLPCodec[Tuple[SignedTransactionAPI, ...]] = RLPCodec(
         sedes=sedes.CountableList(SignedTransactionAPI),
+    )
+
+
+class Attestations(BaseCommand[Tuple[AttestationPayload, ...]]):
+    """QR-PoS attestation gossip command."""
+    protocol_command_id = 11
+    serialization_codec: RLPCodec[Tuple[AttestationPayload, ...]] = RLPCodec(
+        sedes=sedes.CountableList(sedes.List((
+            sedes.big_endian_int,  # slot
+            hash_sedes,            # block_hash
+            sedes.big_endian_int,  # validator_index
+            sedes.binary,          # signature
+        ))),
+        process_inbound_payload_fn=apply_formatter_to_array(lambda args: AttestationPayload(*args)),
     )
 
 

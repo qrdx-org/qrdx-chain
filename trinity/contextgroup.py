@@ -3,8 +3,6 @@ import sys
 from types import TracebackType
 from typing import Any, AsyncContextManager, List, Optional, Sequence, Tuple, Type
 
-from trio import MultiError
-
 from p2p.asyncio_utils import create_task
 
 
@@ -47,8 +45,10 @@ class AsyncContextGroup:
             except BaseException:
                 errors.append(sys.exc_info())
         if errors:
-            raise MultiError(
-                tuple(exc_value.with_traceback(exc_tb) for _, exc_value, exc_tb in errors))
+            raise BaseExceptionGroup(
+                "Errors occurred in context managers",
+                tuple(exc_value.with_traceback(exc_tb) for _, exc_value, exc_tb in errors)
+            )
 
     async def __aexit__(self,
                         exc_type: Optional[Type[BaseException]],
