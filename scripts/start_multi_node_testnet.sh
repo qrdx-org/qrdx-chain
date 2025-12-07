@@ -241,6 +241,7 @@ for i in $(seq 0 $((NUM_NODES - 1))); do
         --genesis "${DATA_DIR}/genesis.json" \
         --sync-mode full \
         --disable-tx-pool \
+        --disable-networkdb-component \
         --enable-http-apis=eth,net,web3 \
         --http-listen-address=127.0.0.1 \
         --http-port=$RPC_PORT \

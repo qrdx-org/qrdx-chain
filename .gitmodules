@@ -29,8 +29,10 @@
 	path = web3.py
 [submodule "asyncio-run-in-process"]
 	path = asyncio-run-in-process
+	url = https://github.com/qrdx-org/asyncio-run-in-process.git
 [submodule "async-service"]
 	path = async-service
+	url = https://github.com/qrdx-org/async-service.git
 [submodule "eth-account"]
 	path = eth-account
 [submodule "eth-abi"]
