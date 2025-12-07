@@ -26,7 +26,7 @@ def get_eth1_chain_with_remote_db(boot_info: BootInfo,
     chain_config = app_config.get_chain_config()
 
     chain: ChainAPI
-    base_db = DBClient.connect(boot_info.trinity_config.database_ipc_path)
+    base_db = DBClient.connect(boot_info.trinity_config.database_ipc_path, timeout=30)
     with base_db:
         if boot_info.args.sync_mode == SYNC_LIGHT:
             header_db = AsyncHeaderDB(base_db)
@@ -43,6 +43,6 @@ def get_eth1_chain_with_remote_db(boot_info: BootInfo,
 @contextlib.contextmanager
 def get_eth1_chain_db_with_remote_db(boot_info: BootInfo,
                                      event_bus: EndpointAPI) -> Iterator[ChainDB]:
-    base_db = DBClient.connect(boot_info.trinity_config.database_ipc_path)
+    base_db = DBClient.connect(boot_info.trinity_config.database_ipc_path, timeout=30)
     with base_db:
         yield ChainDB(base_db)

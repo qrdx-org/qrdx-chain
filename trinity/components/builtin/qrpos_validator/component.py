@@ -84,14 +84,11 @@ class QRPoSValidatorService(Service):
         
         log_debug("=== VALIDATOR SERVICE RUN STARTING ===")
         
-        # Get current chain head to determine starting slot
-        from trinity._utils.connect import get_eth1_chain_with_remote_db
-        with get_eth1_chain_with_remote_db(self.boot_info, self.event_bus) as chain:
-            head = chain.get_canonical_head()
-            # Start from next slot after current head
-            self.current_slot = head.block_number
+        # Calculate current slot based on genesis time and current time
+        current_slot = self.consensus.get_current_slot()
+        self.current_slot = current_slot
         
-        log_debug(f"Starting at slot: {self.current_slot} (chain head block number)")
+        log_debug(f"Starting at slot: {self.current_slot} (calculated from genesis time {self.consensus.genesis_time})")
         
         logger.info(
             f"Validator {self.validator_index} starting at slot {self.current_slot}"
@@ -115,7 +112,9 @@ class QRPoSValidatorService(Service):
     
     async def _validator_tick(self) -> None:
         """Execute validator duties for current slot."""
-        self.current_slot += 1
+        # Recalculate current slot based on actual time (not just increment)
+        # This ensures we stay synchronized with wall clock time
+        self.current_slot = self.consensus.get_current_slot()
         
         # Debug log to file
         with open('/tmp/validator_debug.log', 'a') as f:
@@ -255,23 +254,22 @@ class QRPoSValidatorService(Service):
     
     async def _get_attestations_for_block(self) -> List:
         """Get attestations from pool for inclusion in new block."""
-        from trinity._utils.connect import get_eth1_chain_with_remote_db
         from eth.consensus.qrpos import Attestation
         
         try:
-            with get_eth1_chain_with_remote_db(self.boot_info, self.event_bus) as chain:
-                # Get attestations from the consensus attestation pool
-                attestations = chain.consensus.attestation_pool.get_attestations_for_inclusion(
-                    current_slot=self.current_slot,
-                    max_attestations=128,
-                )
-                
-                logger.debug(
-                    f"Retrieved {len(attestations)} attestations for block "
-                    f"(slot {self.current_slot})"
-                )
-                
-                return attestations
+            # Get attestations directly from the consensus engine's attestation pool
+            # No need to access chain.consensus - we have self.consensus
+            attestations = self.consensus.attestation_pool.get_attestations_for_inclusion(
+                current_slot=self.current_slot,
+                max_attestations=128,
+            )
+            
+            logger.debug(
+                f"Retrieved {len(attestations)} attestations for block "
+                f"(slot {self.current_slot})"
+            )
+            
+            return attestations
         except Exception as e:
             logger.warning(f"Failed to get attestations for block: {e}")
             return []
@@ -302,8 +300,9 @@ class QRPoSValidatorService(Service):
         # Calculate block number
         block_number = parent.block_number + 1
         
-        # Timestamp is current time
-        timestamp = int(time.time())
+        # Timestamp must be greater than parent for Byzantium validation
+        # Even though QR-PoS doesn't use PoW difficulty, the header validation still checks this
+        timestamp = max(int(time.time()), parent.timestamp + 1)
         
         # Encode QR-PoS data in extra_data
         # Format: [slot(8 bytes)][validator_index(8 bytes)][pubkey_prefix(16 bytes)]
@@ -359,6 +358,7 @@ class QRPoSValidatorService(Service):
         """Sign block header with Dilithium key."""
         with open('/tmp/validator_debug.log', 'a') as f:
             f.write(f"[{time.time()}] SIGN: Signing block #{header.block_number}...\n")
+            f.write(f"[{time.time()}] SIGN: Validator pubkey: {self.validator_key.public_key().to_bytes().hex()[:64]}...\n")
         
         # Serialize header for signing
         header_bytes = rlp.encode(header)
@@ -421,7 +421,7 @@ class QRPoSValidatorService(Service):
                 # Calculate and store block weight for fork choice
                 if attestations:
                     epoch = self.current_slot // 32  # SLOTS_PER_EPOCH = 32
-                    weight = chain.consensus.calculate_block_weight(
+                    weight = self.consensus.calculate_block_weight(
                         header.hash,
                         attestations,
                         epoch
@@ -434,12 +434,12 @@ class QRPoSValidatorService(Service):
                 
                 # Process attestations for finality
                 if attestations:
-                    finality_gadget = chain.consensus.finality_gadget
+                    finality_gadget = self.consensus.finality_gadget
                     is_justified, is_finalized = finality_gadget.process_attestations(
                         self.current_slot,
                         header.hash,
                         attestations,
-                        chain.consensus.validator_set,
+                        self.consensus.validator_set,
                     )
                     
                     # Update justified checkpoint
@@ -647,18 +647,19 @@ class QRPoSValidatorComponent(AsyncioIsolatedComponent):
             log_debug(f"Validator index: {validator_index}")
             logger.info(f"Starting QRPoS validator (index {validator_index})")
             
-            # Generate deterministic Dilithium keypair based on validator index
-            # This ensures the validator's keypair matches the public key in ValidatorSet
-            log_debug("Importing generate_dilithium_keypair...")
-            from eth.crypto import generate_dilithium_keypair
-            import hashlib
+            # Load Dilithium keypair from disk
+            # Keys are pre-generated and stored in /tmp/qrdx-validator-keys/
+            log_debug("Loading keypair from disk...")
+            from eth.crypto import DilithiumPrivateKey, DilithiumPublicKey
+            import pickle
             
-            log_debug(f"Generating deterministic keypair for validator {validator_index}...")
-            # Use deterministic seed based on validator index for testnet
-            # In production, load from secure keystore
-            seed = hashlib.sha256(f"qrdx-testnet-validator-{validator_index}".encode()).digest()
-            private_key, public_key = generate_dilithium_keypair(seed=seed)
-            log_debug(f"Keypair generated: private_key type={type(private_key)}, public_key type={type(public_key)}")
+            log_debug(f"Loading keypair for validator {validator_index}...")
+            key_file = f"/tmp/qrdx-validator-keys/validator-{validator_index}.key"
+            with open(key_file, 'rb') as f:
+                priv_bytes, pub_bytes = pickle.load(f)
+            private_key = DilithiumPrivateKey(priv_bytes, pub_bytes)
+            public_key = DilithiumPublicKey(pub_bytes)
+            log_debug(f"Keypair loaded: private_key type={type(private_key)}, public_key type={type(public_key)}")
             
             logger.info(f"Generated deterministic Dilithium keypair for validator {validator_index}")
             
@@ -695,12 +696,15 @@ class QRPoSValidatorComponent(AsyncioIsolatedComponent):
             
             genesis_validators = []
             for i in range(NUM_VALIDATORS):
-                # Generate deterministic public keys matching what validators will use
+                # Load deterministic public keys matching what validators will use
                 validator_address = to_canonical_address(f"0x{i:040x}")
                 
-                # Generate same deterministic keypair as validators will use
-                seed = hashlib.sha256(f"qrdx-testnet-validator-{i}".encode()).digest()
-                _, validator_pubkey = generate_dilithium_keypair(seed=seed)
+                # Load same keypair from disk as validators will use
+                import pickle
+                key_file = f"/tmp/qrdx-validator-keys/validator-{i}.key"
+                with open(key_file, 'rb') as f:
+                    _, pub_bytes = pickle.load(f)
+                validator_pubkey = DilithiumPublicKey(pub_bytes)
                 
                 validator = Validator(
                     index=i,

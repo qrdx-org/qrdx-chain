@@ -182,20 +182,23 @@ class NewBlockService(Service):
                 self.logger.debug("QR-PoS block #%d passed basic validation", header.block_number)
                 
                 # Load validator set for signature validation
-                # Validators are generated deterministically from environment config
+                # Validators are loaded from disk - same keys validators use for signing
                 import os
-                import hashlib
+                import pickle
                 from eth.consensus.qrpos import Validator, ValidatorSet, ValidatorStatus, MIN_STAKE
                 from eth_utils import to_canonical_address
-                from eth.crypto import generate_dilithium_keypair
+                from eth.crypto import DilithiumPublicKey
                 
                 NUM_VALIDATORS = int(os.environ.get('QRDX_NUM_VALIDATORS', '3'))
                 
                 genesis_validators = []
                 for i in range(NUM_VALIDATORS):
                     validator_address = to_canonical_address(f"0x{i:040x}")
-                    seed = hashlib.sha256(f"qrdx-testnet-validator-{i}".encode()).digest()
-                    _, validator_pubkey = generate_dilithium_keypair(seed=seed)
+                    # Load same keypair from disk as validators use for signing
+                    key_file = f"/tmp/qrdx-validator-keys/validator-{i}.key"
+                    with open(key_file, 'rb') as f:
+                        _, pub_bytes = pickle.load(f)
+                    validator_pubkey = DilithiumPublicKey(pub_bytes)
                     
                     validator = Validator(
                         index=i,
@@ -304,6 +307,10 @@ class NewBlockService(Service):
                             header.block_number,
                         )
                     
+                    # Get score now while DB context is still open
+                    # This prevents race condition in broadcast
+                    total_difficulty = chain.chaindb.get_score(block.hash)
+                    
             except Exception as e:
                 self.logger.error(
                     "Failed to import QR-PoS block #%d: %s",
@@ -319,7 +326,8 @@ class NewBlockService(Service):
                 self._peer_block_tracker[block_hash] = []
             
             # Broadcast QR-PoS block with Dilithium signature to peers
-            await self._broadcast_qrpos_block(block, event.signature, event.validator_index, event.slot)
+            # Pass total_difficulty from above to avoid DB race condition
+            await self._broadcast_qrpos_block(block, event.signature, event.validator_index, event.slot, total_difficulty)
             
             self.logger.info(
                 "Broadcast QR-PoS block #%d to peers with Dilithium signature",
@@ -585,18 +593,19 @@ class NewBlockService(Service):
             self._peer_block_tracker[block.hash].append(str(target_peer))
 
     async def _broadcast_qrpos_block(self, block: BlockAPI, signature: bytes, 
-                                      validator_index: int, slot: int) -> None:
+                                      validator_index: int, slot: int, total_difficulty: int) -> None:
         """
         Send QR-PoS block with Dilithium signature to all peers that haven't heard about it yet.
-        """
-        from trinity._utils.connect import get_eth1_chain_with_remote_db
         
+        Args:
+            block: The block to broadcast
+            signature: Dilithium signature
+            validator_index: Index of validator who signed
+            slot: Slot number
+            total_difficulty: Total difficulty/score (passed to avoid DB race condition)
+        """
         all_peers = await self._peer_pool.get_peers()
         eligible_peers = self._filter_eligible_peers(all_peers, block.hash)
-        
-        # Get total difficulty
-        with get_eth1_chain_with_remote_db(self._boot_info, self._event_bus) as chain:
-            total_difficulty = chain.chaindb.get_score(block.hash)
         
         for peer in eligible_peers:
             self.logger.debug(
