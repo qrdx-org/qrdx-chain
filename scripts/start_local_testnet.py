@@ -83,23 +83,38 @@ class QRDXTestnet:
         """Generate genesis configuration"""
         genesis_path = Path(self.data_dir) / 'genesis.json'
         
-        # Simple genesis for QRDX testnet
+        import time
+        # Use a recent timestamp (10 minutes ago) to keep slot numbers reasonable
+        genesis_timestamp = int(time.time()) - 600
+        genesis_timestamp_hex = f"0x{genesis_timestamp:x}"
+        
+        # EIP-1085 format genesis for Trinity
         genesis = {
-            "config": {
-                "chainId": self.args.network_id,
-                "qrdxBlock": 0
+            "version": "1",
+            "params": {
+                "chainId": f"0x{self.args.network_id:x}",
+                "miningMethod": "NoProof",
+                "frontierForkBlock": "0x0",
+                "homesteadForkBlock": "0x0",
+                "EIP150ForkBlock": "0x0",
+                "EIP158ForkBlock": "0x0",
+                "byzantiumForkBlock": "0x0",
+                "constantinopleForkBlock": "0x0",
+                "petersburgForkBlock": "0x0",
+                "istanbulForkBlock": "0x0"
             },
-            "nonce": "0x0",
-            "timestamp": "0x0",
-            "extraData": "0x5152445820546573746e6574",
-            "gasLimit": "0x2faf080",  # 50,000,000
-            "difficulty": "0x0",
-            "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-            "coinbase": "0x0000000000000000000000000000000000000000",
-            "alloc": {
+            "genesis": {
+                "nonce": "0x0000000000000000",
+                "difficulty": "0x0",
+                "author": "0x0000000000000000000000000000000000000000",
+                "timestamp": genesis_timestamp_hex,
+                "extraData": "0x5152445820546573746e6574",
+                "gasLimit": "0x2faf080"  # 50,000,000
+            },
+            "accounts": {
                 # Pre-fund test account
                 "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb": {
-                    "balance": "1000000000000000000000000"
+                    "balance": "0x3635c9adc5dea00000"  # 1,000,000 ETH
                 }
             }
         }
@@ -109,6 +124,7 @@ class QRDXTestnet:
             json.dump(genesis, f, indent=2)
         
         print(f"{Colors.GREEN}✓ Generated genesis configuration{Colors.NC}")
+        print(f"{Colors.YELLOW}  Genesis timestamp: {genesis_timestamp} ({genesis_timestamp_hex}){Colors.NC}")
         return str(genesis_path)
     
     def start_node(self):

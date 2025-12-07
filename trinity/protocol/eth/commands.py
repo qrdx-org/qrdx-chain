@@ -32,6 +32,7 @@ from .payloads import (
     NewBlockPayload,
     StatusPayload,
     AttestationPayload,
+    QRPoSNewBlockPayload,
 )
 
 
@@ -170,6 +171,31 @@ class Attestations(BaseCommand[Tuple[AttestationPayload, ...]]):
             sedes.binary,          # signature
         ))),
         process_inbound_payload_fn=apply_formatter_to_array(lambda args: AttestationPayload(*args)),
+    )
+
+
+class QRPoSNewBlock(BaseCommand[QRPoSNewBlockPayload]):
+    """QR-PoS block with Dilithium signature."""
+    protocol_command_id = 12
+    serialization_codec: RLPCodec[QRPoSNewBlockPayload] = RLPCodec(
+        sedes=sedes.List((
+            sedes.List((
+                BlockHeader,
+                sedes.CountableList(UninterpretedTransactionRLP),
+                sedes.CountableList(BlockHeader)
+            )),
+            sedes.big_endian_int,  # total_difficulty
+            sedes.binary,          # signature
+            sedes.big_endian_int,  # validator_index
+            sedes.big_endian_int,  # slot
+        )),
+        process_inbound_payload_fn=compose(
+            lambda args: QRPoSNewBlockPayload(*args),
+            apply_formatter_at_index(
+                lambda args: BlockFields(*args),
+                0,
+            )
+        )
     )
 
 

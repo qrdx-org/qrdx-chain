@@ -49,6 +49,7 @@ from .commands import (
     GetPooledTransactionsV65,
     PooledTransactionsV65,
     Attestations,
+    QRPoSNewBlock,
 )
 
 
@@ -124,6 +125,14 @@ class AttestationsEvent(PeerPoolMessageEvent):
     subscribes the event through the event bus.
     """
     command: Attestations
+
+
+class QRPoSNewBlockEvent_Wire(PeerPoolMessageEvent):
+    """
+    Event to carry a ``QRPoSNewBlock`` command from the peer pool to any process that
+    subscribes the event through the event bus.
+    """
+    command: QRPoSNewBlock
 
 
 class GetPooledTransactionsEvent(PeerPoolMessageEvent):
@@ -228,11 +237,20 @@ class SendPooledTransactionsEvent(PeerPoolMessageEvent):
 @dataclass
 class SendAttestationsEvent(PeerPoolMessageEvent):
     """
-    Event to proxy an ``ETHPeer.eth_api.send_attestations`` call from a proxy peer to the actual
-    peer that sits in the peer pool.
+    Event to proxy attestations send to actual peer in the pool.
     """
     session: SessionAPI
     command: Attestations
+
+
+@dataclass
+class SendQRPoSNewBlockEvent(PeerPoolMessageEvent):
+    """
+    Event to proxy a QR-PoS block with Dilithium signature to actual peer in the pool.
+    """
+    session: SessionAPI
+    command: QRPoSNewBlock
+
 
 # EXCHANGE HANDLER REQUEST / RESPONSE PAIRS
 

@@ -26,6 +26,7 @@ from .commands import (
     GetPooledTransactionsV65,
     PooledTransactionsV65,
     Attestations,
+    QRPoSNewBlock,
 )
 
 if TYPE_CHECKING:
@@ -85,6 +86,7 @@ class ETHProtocolV65(BaseETHProtocol):
         NewPooledTransactionHashes,
         GetPooledTransactionsV65, PooledTransactionsV65,
         Attestations,
+        QRPoSNewBlock,
         GetNodeDataV65, NodeDataV65,
         GetReceiptsV65, ReceiptsV65,
     )

@@ -35,6 +35,7 @@ from trinity.protocol.eth.commands import (
     Status,
     GetPooledTransactionsV65,
     Attestations,
+    QRPoSNewBlock,
 )
 from trinity.rlp.block_body import BlockBody
 from trinity.rlp.sedes import (
@@ -57,6 +58,7 @@ from .payloads import (
     StatusV63Payload,
     StatusPayload,
     AttestationPayload,
+    QRPoSNewBlockPayload,
 )
 from .proto import ETHProtocolV63, ETHProtocolV65, ETHProtocolV64
 
@@ -234,6 +236,19 @@ class BaseETHAPI(Application):
     def send_attestations(self, attestations: Sequence[AttestationPayload]) -> None:
         """Send QR-PoS attestations to peer."""
         self.protocol.send(Attestations(tuple(attestations)))
+
+    def send_qrpos_new_block(self,
+                             block: BlockAPI,
+                             total_difficulty: int,
+                             signature: bytes,
+                             validator_index: int,
+                             slot: int) -> None:
+        """Send QR-PoS block with Dilithium signature to peer."""
+        # generalize transactions to hand off over network
+        transactions = rlp.decode(rlp.encode(block.transactions))
+        block_fields = BlockFields(block.header, transactions, block.uncles)
+        payload = QRPoSNewBlockPayload(block_fields, total_difficulty, signature, validator_index, slot)
+        self.protocol.send(QRPoSNewBlock(payload))
 
 
 class ETHV63API(BaseETHAPI):

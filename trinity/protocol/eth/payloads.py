@@ -47,3 +47,12 @@ class AttestationPayload(NamedTuple):
     block_hash: Hash32
     validator_index: int
     signature: bytes
+
+
+class QRPoSNewBlockPayload(NamedTuple):
+    """Payload for QR-PoS block with Dilithium signature."""
+    block: BlockFields
+    total_difficulty: int
+    signature: bytes
+    validator_index: int
+    slot: int

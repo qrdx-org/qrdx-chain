@@ -6,7 +6,7 @@ Implements block production and attestation for QRDX's QR-PoS consensus.
 
 import asyncio
 import time
-from typing import Optional, List, cast
+from typing import Optional, List, cast, Tuple
 
 from async_service import Service, background_asyncio_service
 
@@ -84,17 +84,14 @@ class QRPoSValidatorService(Service):
         
         log_debug("=== VALIDATOR SERVICE RUN STARTING ===")
         
-        # Calculate initial slot
-        genesis_time = self.consensus.genesis_time
-        log_debug(f"Genesis time: {genesis_time}")
-        current_time = time.time()
-        log_debug(f"Current time: {current_time}")
+        # Get current chain head to determine starting slot
+        from trinity._utils.connect import get_eth1_chain_with_remote_db
+        with get_eth1_chain_with_remote_db(self.boot_info, self.event_bus) as chain:
+            head = chain.get_canonical_head()
+            # Start from next slot after current head
+            self.current_slot = head.block_number
         
-        elapsed = current_time - genesis_time
-        log_debug(f"Elapsed: {elapsed}")
-        
-        self.current_slot = int(elapsed // SLOT_DURATION)
-        log_debug(f"Starting at slot: {self.current_slot}")
+        log_debug(f"Starting at slot: {self.current_slot} (chain head block number)")
         
         logger.info(
             f"Validator {self.validator_index} starting at slot {self.current_slot}"
@@ -123,9 +120,26 @@ class QRPoSValidatorService(Service):
         # Debug log to file
         with open('/tmp/validator_debug.log', 'a') as f:
             f.write(f"[{time.time()}] TICK: slot={self.current_slot}, validator={self.validator_index}\n")
+            f.write(f"[{time.time()}] TICK: About to call get_proposer_for_slot\n")
+            f.write(f"[{time.time()}] TICK: self.consensus = {self.consensus}\n")
+            f.write(f"[{time.time()}] TICK: self.current_slot = {self.current_slot}\n")
         
-        # Check if it's our turn to propose
-        proposer_index = self.current_slot % VALIDATOR_COUNT
+        # Get the proposer for this slot from consensus
+        # This handles the full validator set properly for production
+        # Determine if we are the proposer for this slot
+        try:
+            with open('/tmp/validator_debug.log', 'a') as f:
+                f.write(f"[{time.time()}] TICK: Calling consensus.get_proposer_for_slot({self.current_slot})\n")
+            proposer_index = self.consensus.get_proposer_for_slot(self.current_slot)
+            with open('/tmp/validator_debug.log', 'a') as f:
+                f.write(f"[{time.time()}] TICK: Got proposer_index={proposer_index}\n")
+        except Exception as e:
+            import traceback
+            with open('/tmp/validator_debug.log', 'a') as f:
+                f.write(f"[{time.time()}] TICK: Error getting proposer: {str(e)}\n")
+                f.write(f"[{time.time()}] TICK: Error type: {type(e)}\n")
+                f.write(f"[{time.time()}] TICK: Traceback:\n{traceback.format_exc()}\n")
+            return
         
         with open('/tmp/validator_debug.log', 'a') as f:
             f.write(f"[{time.time()}] TICK: proposer_index={proposer_index}, is_proposer={proposer_index == self.validator_index}\n")
@@ -163,17 +177,32 @@ class QRPoSValidatorService(Service):
             with open('/tmp/validator_debug.log', 'a') as f:
                 f.write(f"[{time.time()}] PROPOSE: Got parent header #{parent_header.block_number}\n")
             
-            # Get pending transactions (empty for now)
+            # Get pending transactions
             transactions = await self._get_pending_transactions()
             with open('/tmp/validator_debug.log', 'a') as f:
                 f.write(f"[{time.time()}] PROPOSE: Got {len(transactions)} transactions\n")
             
-            # Build block header
+            # Get attestations from pool
             with open('/tmp/validator_debug.log', 'a') as f:
-                f.write(f"[{time.time()}] PROPOSE: Building block header...\n")
-            header = await self._build_block_header(parent_header, transactions)
+                f.write(f"[{time.time()}] PROPOSE: Getting attestations from pool...\n")
+            attestations = await self._get_attestations_for_block()
             with open('/tmp/validator_debug.log', 'a') as f:
-                f.write(f"[{time.time()}] PROPOSE: Built block header #{header.block_number}\n")
+                f.write(f"[{time.time()}] PROPOSE: Got {len(attestations)} attestations\n")
+            
+            logger.info(
+                f"Including {len(attestations)} attestations in block "
+                f"#{parent_header.block_number + 1}"
+            )
+            
+            # Build block header and execute transactions
+            with open('/tmp/validator_debug.log', 'a') as f:
+                f.write(f"[{time.time()}] PROPOSE: Building and executing block...\n")
+            header, receipts, computations = await self._build_and_execute_block(
+                parent_header,
+                transactions
+            )
+            with open('/tmp/validator_debug.log', 'a') as f:
+                f.write(f"[{time.time()}] PROPOSE: Built block header #{header.block_number} with correct roots\n")
             
             # Sign block with Dilithium key
             with open('/tmp/validator_debug.log', 'a') as f:
@@ -182,19 +211,16 @@ class QRPoSValidatorService(Service):
             with open('/tmp/validator_debug.log', 'a') as f:
                 f.write(f"[{time.time()}] PROPOSE: _sign_block() returned, signature size={len(signature)}\n")
             
-            # For now, just work with header since we don't have transactions
-            # TODO: Create proper block with transactions when mempool is integrated
-            
-            # Import block locally
-            await self._import_block_locally(header, signature)
+            # Import block locally (with attestations, transactions, and receipts)
+            await self._import_block_locally(header, signature, attestations, transactions, receipts)
             
             # Broadcast to peers
-            await self._broadcast_block(header, signature)
+            await self._broadcast_block(header, signature, transactions)
             
             logger.info(
                 f"Validator {self.validator_index} successfully proposed block "
                 f"#{header.block_number} (hash={encode_hex(header.hash[:8])}...) "
-                f"for slot {self.current_slot}"
+                f"for slot {self.current_slot} with {len(attestations)} attestations"
             )
             
         except Exception as e:
@@ -219,12 +245,60 @@ class QRPoSValidatorService(Service):
             return head
     
     async def _get_pending_transactions(self) -> List[BaseTransactionAPI]:
-        """Get pending transactions from mempool."""
-        # TODO: Query transaction pool via event bus
-        return []  # No transactions for now
+        """
+        Get pending transactions from mempool.
+        
+        Returns empty list for now. Transaction pool integration is a separate phase.
+        For production, this should query the transaction pool component via IPC.
+        """
+        return []  # Empty blocks until transaction pool integrated
     
-    async def _build_block_header(self, parent: BlockHeader, transactions: List[BaseTransactionAPI]) -> BlockHeader:
-        """Build new block header for QR-PoS."""
+    async def _get_attestations_for_block(self) -> List:
+        """Get attestations from pool for inclusion in new block."""
+        from trinity._utils.connect import get_eth1_chain_with_remote_db
+        from eth.consensus.qrpos import Attestation
+        
+        try:
+            with get_eth1_chain_with_remote_db(self.boot_info, self.event_bus) as chain:
+                # Get attestations from the consensus attestation pool
+                attestations = chain.consensus.attestation_pool.get_attestations_for_inclusion(
+                    current_slot=self.current_slot,
+                    max_attestations=128,
+                )
+                
+                logger.debug(
+                    f"Retrieved {len(attestations)} attestations for block "
+                    f"(slot {self.current_slot})"
+                )
+                
+                return attestations
+        except Exception as e:
+            logger.warning(f"Failed to get attestations for block: {e}")
+            return []
+    
+    async def _build_and_execute_block(
+        self,
+        parent: BlockHeader,
+        transactions: List[BaseTransactionAPI],
+    ) -> Tuple[BlockHeader, tuple, tuple]:
+        """
+        Build block header and execute all transactions.
+        
+        This method:
+        1. Creates a base header with QR-PoS metadata
+        2. Executes all transactions using the VM
+        3. Computes correct state/transaction/receipt roots
+        4. Computes bloom filter and gas used
+        5. Persists state to database
+        
+        Returns:
+            Tuple of (complete_header, receipts, computations)
+            The header has all correct merkle roots and is ready to sign.
+        """
+        from trinity._utils.connect import get_eth1_chain_with_remote_db
+        from eth.rlp.receipts import Receipt
+        from eth.abc import ComputationAPI, ReceiptAPI
+        
         # Calculate block number
         block_number = parent.block_number + 1
         
@@ -240,8 +314,8 @@ class QRPoSValidatorService(Service):
             proposer_pubkey[:16]  # First 16 bytes of public key as identifier
         )
         
-        # Build header (simplified - no state execution yet)
-        header = BlockHeader(
+        # Create base header (will be updated with correct roots by VM)
+        base_header = parent.copy(
             difficulty=0,  # QR-PoS has no PoW difficulty
             block_number=block_number,
             gas_limit=parent.gas_limit,
@@ -249,17 +323,37 @@ class QRPoSValidatorService(Service):
             coinbase=Address(proposer_pubkey[:20]),  # Use pubkey as coinbase
             parent_hash=parent.hash,
             uncles_hash=EMPTY_UNCLE_HASH,
-            state_root=parent.state_root,  # TODO: Compute after executing txs
-            transaction_root=Hash32(b'\x00' * 32),  # TODO: Compute from transactions
-            receipt_root=Hash32(b'\x00' * 32),  # TODO: Compute from receipts
-            bloom=0,  # TODO: Compute from receipts
-            gas_used=0,  # TODO: Sum from receipts
             extra_data=extra_data,
             mix_hash=Hash32(b'\x00' * 32),  # Not used in QR-PoS
             nonce=b'\x00' * 8,  # Not used in QR-PoS
         )
         
-        return header
+        # Execute transactions using VM to compute correct roots
+        with get_eth1_chain_with_remote_db(self.boot_info, self.event_bus) as chain:
+            # Get VM for this header
+            vm = chain.get_vm(base_header)
+            
+            # Execute all transactions - this computes state/tx/receipt roots correctly
+            result_header, receipts, computations = vm.apply_all_transactions(
+                transactions,
+                base_header
+            )
+            
+            # Persist state to database (CRITICAL for correct state root)
+            vm.state.persist()
+            
+            # Update header with persisted state root
+            final_header = result_header.copy(
+                state_root=vm.state.state_root
+            )
+            
+            logger.info(
+                f"Executed {len(transactions)} transactions: "
+                f"state_root={encode_hex(final_header.state_root[:8])}..., "
+                f"gas_used={final_header.gas_used}"
+            )
+        
+        return final_header, receipts, computations
     
     def _sign_block(self, header: BlockHeader) -> bytes:
         """Sign block header with Dilithium key."""
@@ -285,25 +379,123 @@ class QRPoSValidatorService(Service):
         
         return signature
     
-    async def _import_block_locally(self, header: BlockHeader, signature: bytes) -> None:
-        """Import proposed block to local chain."""
+    async def _import_block_locally(
+        self,
+        header: BlockHeader,
+        signature: bytes,
+        attestations: List,
+        transactions: List[BaseTransactionAPI],
+        receipts: tuple,
+    ) -> None:
+        """
+        Import proposed block to local chain with attestations.
+        
+        Args:
+            header: Block header with correct state/tx/receipt roots
+            signature: Dilithium signature of the header
+            attestations: List of Attestation objects for this block
+            transactions: List of transactions included in block
+            receipts: Tuple of receipts from transaction execution
+        """
+        from trinity._utils.connect import get_eth1_chain_with_remote_db
+        
         with open('/tmp/validator_debug.log', 'a') as f:
             f.write(f"[{time.time()}] IMPORT: Importing block #{header.block_number}...\n")
-        # TODO: Validate and import block to chain database
-        # For now, just log it
-        logger.info(
-            f"Importing block #{header.block_number} locally "
-            f"(hash={encode_hex(header.hash[:8])}..., sig_size={len(signature)} bytes)"
-        )
+        
+        try:
+            with get_eth1_chain_with_remote_db(self.boot_info, self.event_bus) as chain:
+                # Create block from header and transactions
+                vm = chain.get_vm()
+                block_class = vm.get_block_class()
+                block = block_class(header=header, transactions=transactions, uncles=[])
+                
+                # Import the block
+                chain.import_block(block, perform_validation=False)
+                
+                # Store Dilithium signature
+                chain.chaindb.persist_qrpos_signature(header.hash, signature)
+                
+                # Store attestations with the block
+                chain.chaindb.persist_qrpos_attestations(header.hash, attestations)
+                
+                # Calculate and store block weight for fork choice
+                if attestations:
+                    epoch = self.current_slot // 32  # SLOTS_PER_EPOCH = 32
+                    weight = chain.consensus.calculate_block_weight(
+                        header.hash,
+                        attestations,
+                        epoch
+                    )
+                    chain.chaindb.persist_qrpos_block_weight(header.hash, weight)
+                    logger.debug(
+                        f"Block #{header.block_number} weight: {weight} "
+                        f"({len(attestations)} attestations)"
+                    )
+                
+                # Process attestations for finality
+                if attestations:
+                    finality_gadget = chain.consensus.finality_gadget
+                    is_justified, is_finalized = finality_gadget.process_attestations(
+                        self.current_slot,
+                        header.hash,
+                        attestations,
+                        chain.consensus.validator_set,
+                    )
+                    
+                    # Update justified checkpoint
+                    if is_justified:
+                        chain.chaindb.persist_qrpos_justified_checkpoint(
+                            finality_gadget.justified_slot,
+                            finality_gadget.justified_hash
+                        )
+                        logger.info(
+                            f"✓ Block #{header.block_number} JUSTIFIED "
+                            f"(slot={finality_gadget.justified_slot}, "
+                            f"hash={encode_hex(finality_gadget.justified_hash[:8])}...)"
+                        )
+                    
+                    # Update finalized checkpoint
+                    if is_finalized:
+                        chain.chaindb.persist_qrpos_finalized_checkpoint(
+                            finality_gadget.finalized_slot,
+                            finality_gadget.finalized_hash
+                        )
+                        logger.info(
+                            f"🔒 Block #{header.block_number} FINALIZED "
+                            f"(slot={finality_gadget.finalized_slot}, "
+                            f"hash={encode_hex(finality_gadget.finalized_hash[:8])}...)"
+                        )
+                
+                logger.info(
+                    f"Imported block #{header.block_number} locally "
+                    f"(hash={encode_hex(header.hash[:8])}..., "
+                    f"{len(transactions)} txs, {len(attestations)} attestations, "
+                    f"gas_used={header.gas_used})"
+                )
+        except Exception as e:
+            logger.error(f"Failed to import block locally: {e}", exc_info=True)
     
-    async def _broadcast_block(self, header: BlockHeader, signature: bytes) -> None:
-        """Broadcast proposed block to peers via event bus."""
+    async def _broadcast_block(
+        self,
+        header: BlockHeader,
+        signature: bytes,
+        transactions: List[BaseTransactionAPI],
+    ) -> None:
+        """
+        Broadcast proposed block to peers via event bus.
+        
+        Args:
+            header: Block header with correct state/tx/receipt roots
+            signature: Dilithium signature of the header
+            transactions: List of transactions included in block
+        """
         with open('/tmp/validator_debug.log', 'a') as f:
             f.write(f"[{time.time()}] BROADCAST: Broadcasting block #{header.block_number} via event bus...\n")
             f.write(f"[{time.time()}] BROADCAST: Event type: {QRPoSNewBlockEvent.__name__}\n")
             f.write(f"[{time.time()}] BROADCAST: Header hash: {encode_hex(header.hash)}\n")
             f.write(f"[{time.time()}] BROADCAST: Validator index: {self.validator_index}\n")
             f.write(f"[{time.time()}] BROADCAST: Slot: {self.current_slot}\n")
+            f.write(f"[{time.time()}] BROADCAST: Transactions: {len(transactions)}\n")
         
         try:
             # Create QR-PoS block event
@@ -326,7 +518,10 @@ class QRPoSValidatorService(Service):
             
             logger.info(
                 f"Broadcast block #{header.block_number} to peers "
-                f"(hash={encode_hex(header.hash[:8])}..., sig_size={len(signature)} bytes)"
+                f"(hash={encode_hex(header.hash[:8])}..., "
+                f"sig_size={len(signature)} bytes, "
+                f"{len(transactions)} txs, "
+                f"gas_used={header.gas_used})"
             )
             
             with open('/tmp/validator_debug.log', 'a') as f:
@@ -381,6 +576,7 @@ class QRPoSValidatorService(Service):
                 # Broadcast attestation to network via IPC
                 from trinity.protocol.eth.events import QRPoSAttestationEvent
                 
+                logger.info(f"[ATTESTATION-BROADCAST] Broadcasting attestation for slot {self.current_slot}")
                 self.event_bus.broadcast(
                     QRPoSAttestationEvent(
                         slot=self.current_slot,
@@ -391,7 +587,7 @@ class QRPoSValidatorService(Service):
                     FIRE_AND_FORGET_BROADCASTING,
                 )
                 
-                logger.debug(f"Broadcasted attestation for slot {self.current_slot}")
+                logger.info(f"[ATTESTATION-BROADCAST] Broadcast complete for slot {self.current_slot}")
             
         except Exception as e:
             logger.error(
@@ -451,15 +647,20 @@ class QRPoSValidatorComponent(AsyncioIsolatedComponent):
             log_debug(f"Validator index: {validator_index}")
             logger.info(f"Starting QRPoS validator (index {validator_index})")
             
-            # Generate Dilithium keypair (TODO: load from file)
+            # Generate deterministic Dilithium keypair based on validator index
+            # This ensures the validator's keypair matches the public key in ValidatorSet
             log_debug("Importing generate_dilithium_keypair...")
             from eth.crypto import generate_dilithium_keypair
+            import hashlib
             
-            log_debug("Generating keypair...")
-            private_key, public_key = generate_dilithium_keypair()
+            log_debug(f"Generating deterministic keypair for validator {validator_index}...")
+            # Use deterministic seed based on validator index for testnet
+            # In production, load from secure keystore
+            seed = hashlib.sha256(f"qrdx-testnet-validator-{validator_index}".encode()).digest()
+            private_key, public_key = generate_dilithium_keypair(seed=seed)
             log_debug(f"Keypair generated: private_key type={type(private_key)}, public_key type={type(public_key)}")
             
-            logger.info(f"Generated Dilithium keypair for validator {validator_index}")
+            logger.info(f"Generated deterministic Dilithium keypair for validator {validator_index}")
             
             # Get genesis time from genesis block timestamp
             log_debug("Getting genesis time from chain...")
@@ -470,21 +671,41 @@ class QRPoSValidatorComponent(AsyncioIsolatedComponent):
             log_debug(f"Genesis timestamp from header: {genesis_time}")
             logger.info(f"Genesis block timestamp: {genesis_time}")
             
-            # Create genesis validator set (150 validators, all active)
+            # Create genesis validator set
+            # Number of validators determined by environment or configuration
+            # For testnet: fewer validators for easier testing (3-5)
+            # For production: 150 validators per whitepaper specification
             log_debug("Creating genesis validator set...")
             from eth.consensus.qrpos import Validator, ValidatorSet, ValidatorStatus, MIN_STAKE
             from eth_utils import to_canonical_address
+            import hashlib
+            import os
+            
+            # Read number of validators from environment variable or use testnet default
+            # Production deployment should set QRDX_NUM_VALIDATORS=150
+            NUM_VALIDATORS = int(os.environ.get('QRDX_NUM_VALIDATORS', '3'))
+            
+            if NUM_VALIDATORS < 1:
+                raise ValueError(f"Invalid number of validators: {NUM_VALIDATORS}")
+            
+            logger.info(
+                f"Initializing validator set with {NUM_VALIDATORS} validators "
+                f"(set QRDX_NUM_VALIDATORS=150 for production)"
+            )
             
             genesis_validators = []
-            for i in range(150):  # VALIDATOR_COUNT
-                # Create dummy validators (in production, these would be loaded from genesis)
-                dummy_address = to_canonical_address(f"0x{i:040x}")
-                dummy_pubkey = bytes([i % 256] * 1952)  # Dilithium pubkey is 1952 bytes
+            for i in range(NUM_VALIDATORS):
+                # Generate deterministic public keys matching what validators will use
+                validator_address = to_canonical_address(f"0x{i:040x}")
+                
+                # Generate same deterministic keypair as validators will use
+                seed = hashlib.sha256(f"qrdx-testnet-validator-{i}".encode()).digest()
+                _, validator_pubkey = generate_dilithium_keypair(seed=seed)
                 
                 validator = Validator(
                     index=i,
-                    public_key=dummy_pubkey,
-                    address=dummy_address,
+                    public_key=validator_pubkey.to_bytes(),  # Convert to bytes
+                    address=validator_address,
                     stake=MIN_STAKE,
                     status=ValidatorStatus.ACTIVE,
                     activation_epoch=0,

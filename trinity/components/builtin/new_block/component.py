@@ -15,6 +15,7 @@ from async_service import (
 from eth.abc import (
     BlockAPI,
 )
+from eth_typing import BlockNumber
 from eth_utils import (
     ValidationError,
     humanize_hash,
@@ -110,6 +111,7 @@ class NewBlockService(Service):
         self.manager.run_daemon_task(self._handle_qrpos_new_blocks)
         self.manager.run_daemon_task(self._handle_qrpos_attestations)
         self.manager.run_daemon_task(self._handle_incoming_attestations)
+        self.manager.run_daemon_task(self._handle_incoming_qrpos_blocks)
         self.logger.info("QR-PoS block and attestation handlers registered, waiting for events...")
 
         async for event in self._event_bus.stream(NewBlockEvent):
@@ -179,17 +181,60 @@ class NewBlockService(Service):
                 validate_qrpos_block_basic(header)
                 self.logger.debug("QR-PoS block #%d passed basic validation", header.block_number)
                 
-                # Get validator public keys from consensus config
-                # TODO: Load actual validator set from genesis/config
-                # For now, we trust blocks from local validator
+                # Load validator set for signature validation
+                # Validators are generated deterministically from environment config
+                import os
+                import hashlib
+                from eth.consensus.qrpos import Validator, ValidatorSet, ValidatorStatus, MIN_STAKE
+                from eth_utils import to_canonical_address
+                from eth.crypto import generate_dilithium_keypair
+                
+                NUM_VALIDATORS = int(os.environ.get('QRDX_NUM_VALIDATORS', '3'))
+                
+                genesis_validators = []
+                for i in range(NUM_VALIDATORS):
+                    validator_address = to_canonical_address(f"0x{i:040x}")
+                    seed = hashlib.sha256(f"qrdx-testnet-validator-{i}".encode()).digest()
+                    _, validator_pubkey = generate_dilithium_keypair(seed=seed)
+                    
+                    validator = Validator(
+                        index=i,
+                        public_key=validator_pubkey.to_bytes(),  # Convert to bytes
+                        address=validator_address,
+                        stake=MIN_STAKE,
+                        status=ValidatorStatus.ACTIVE,
+                        activation_epoch=0,
+                        exit_epoch=None,
+                        slashed=False,
+                    )
+                    genesis_validators.append(validator)
+                
+                validator_set = ValidatorSet(genesis_validators=genesis_validators)
+                
+                # Validate signature using validator set
+                from eth.consensus.qrpos_validator import validate_qrpos_block
+                
+                # Get genesis time for slot validation
+                with get_eth1_chain_with_remote_db(self._boot_info, self._event_bus) as chain:
+                    genesis_header = chain.get_canonical_block_header_by_number(BlockNumber(0))
+                    genesis_time = genesis_header.timestamp
+                
+                validator_pubkeys = [v.public_key for v in validator_set.validators]
+                validate_qrpos_block(header, event.signature, validator_pubkeys, genesis_time)
+                
+                self.logger.info(
+                    "QR-PoS block #%d signature validated successfully (validator %d)",
+                    header.block_number, event.validator_index
+                )
                 
             except ValidationError as e:
                 self.logger.warning(
-                    "QR-PoS block #%d from local validator failed validation: %s",
+                    "QR-PoS block #%d from validator %d failed validation: %s",
                     header.block_number,
+                    event.validator_index,
                     e
                 )
-                return
+                continue
             
             # Import block to chain DB
             try:
@@ -221,6 +266,44 @@ class NewBlockService(Service):
                         len(event.signature),
                     )
                     
+                    # Try to get and validate attestations if they exist
+                    try:
+                        attestations = chain.chaindb.get_qrpos_attestations(header.hash)
+                        self.logger.info(
+                            "Block #%d includes %d attestations",
+                            header.block_number,
+                            len(attestations),
+                        )
+                        
+                        # Validate each attestation
+                        valid_count = 0
+                        for attestation in attestations:
+                            try:
+                                chain.consensus.attestation_pool.add_attestation(
+                                    attestation,
+                                    chain.consensus.validator_set,
+                                )
+                                valid_count += 1
+                            except Exception as e:
+                                self.logger.warning(
+                                    "Invalid attestation in block #%d: %s",
+                                    header.block_number,
+                                    e,
+                                )
+                        
+                        self.logger.info(
+                            "Validated %d/%d attestations from block #%d",
+                            valid_count,
+                            len(attestations),
+                            header.block_number,
+                        )
+                    except KeyError:
+                        # No attestations stored for this block yet
+                        self.logger.debug(
+                            "No attestations found for block #%d",
+                            header.block_number,
+                        )
+                    
             except Exception as e:
                 self.logger.error(
                     "Failed to import QR-PoS block #%d: %s",
@@ -228,20 +311,18 @@ class NewBlockService(Service):
                     e,
                     exc_info=True
                 )
-                return
+                continue
             
             # Track the block
             block_hash = header.hash
             if block_hash not in self._peer_block_tracker:
                 self._peer_block_tracker[block_hash] = []
             
-            # Broadcast block to peers
-            # For now, use standard NewBlockHashes announcement
-            # TODO: Extend ETH protocol to include Dilithium signature
-            await self._broadcast_new_block_hashes(block)
+            # Broadcast QR-PoS block with Dilithium signature to peers
+            await self._broadcast_qrpos_block(block, event.signature, event.validator_index, event.slot)
             
             self.logger.info(
-                "Broadcast QR-PoS block #%d to peers",
+                "Broadcast QR-PoS block #%d to peers with Dilithium signature",
                 header.block_number,
             )
 
@@ -249,10 +330,10 @@ class NewBlockService(Service):
         """Handle QR-PoS attestations created by local validator."""
         from trinity.protocol.eth.events import QRPoSAttestationEvent
         
-        self.logger.info("QR-PoS attestation handler started, streaming events...")
+        self.logger.info("[ATTESTATION-HANDLER] QR-PoS attestation handler started, streaming events...")
         async for event in self._event_bus.stream(QRPoSAttestationEvent):
             self.logger.info(
-                "Received QR-PoS attestation from validator %d for slot %d",
+                "[ATTESTATION-HANDLER] Received QR-PoS attestation from validator %d for slot %d",
                 event.validator_index,
                 event.slot,
             )
@@ -300,6 +381,108 @@ class NewBlockService(Service):
                             event.session,
                             e,
                         )
+
+    async def _handle_incoming_qrpos_blocks(self) -> None:
+        """Handle QR-PoS blocks received from peers over the wire protocol."""
+        from trinity.protocol.eth.events import QRPoSNewBlockEvent_Wire
+        from eth_utils import encode_hex
+        
+        self.logger.info("Incoming QR-PoS block handler started...")
+        async for event in self._event_bus.stream(QRPoSNewBlockEvent_Wire):
+            self.logger.info(
+                "Received QR-PoS block #%d from peer %s (sig_size=%d bytes)",
+                event.command.payload.block.header.block_number,
+                event.session,
+                len(event.command.payload.signature),
+            )
+            
+            # Import the block with Dilithium signature
+            from trinity._utils.connect import get_eth1_chain_with_remote_db
+            block_fields = event.command.payload.block
+            header = block_fields.header
+            
+            try:
+                with get_eth1_chain_with_remote_db(self._boot_info, self._event_bus) as chain:
+                    # Get the block class from the VM
+                    vm = chain.get_vm()
+                    block_class = vm.get_block_class()
+                    
+                    # Create block from received data
+                    block = block_class(
+                        header=header,
+                        transactions=block_fields.transactions,
+                        uncles=block_fields.uncles
+                    )
+                    
+                    # Import the block
+                    chain.import_block(block, perform_validation=False)
+                    
+                    # Store Dilithium signature
+                    chain.chaindb.persist_qrpos_signature(
+                        header.hash, 
+                        event.command.payload.signature
+                    )
+                    
+                    # Get attestations for this block and process for finality
+                    attestations = chain.chaindb.get_qrpos_attestations(header.hash)
+                    if attestations:
+                        finality_gadget = chain.consensus.finality_gadget
+                        slot = event.command.payload.slot
+                        epoch = slot // 32  # SLOTS_PER_EPOCH = 32
+                        
+                        # Calculate and store block weight for fork choice
+                        weight = chain.consensus.calculate_block_weight(
+                            header.hash,
+                            attestations,
+                            epoch
+                        )
+                        chain.chaindb.persist_qrpos_block_weight(header.hash, weight)
+                        
+                        is_justified, is_finalized = finality_gadget.process_attestations(
+                            slot,
+                            header.hash,
+                            attestations
+                        )
+                        
+                        # Update justified checkpoint
+                        if is_justified:
+                            chain.chaindb.persist_qrpos_justified_checkpoint(
+                                finality_gadget.justified_slot,
+                                finality_gadget.justified_hash
+                            )
+                            self.logger.info(
+                                "✓ Block #%d JUSTIFIED (slot=%d, hash=%s)",
+                                header.block_number,
+                                finality_gadget.justified_slot,
+                                encode_hex(finality_gadget.justified_hash[:8]),
+                            )
+                        
+                        # Update finalized checkpoint
+                        if is_finalized:
+                            chain.chaindb.persist_qrpos_finalized_checkpoint(
+                                finality_gadget.finalized_slot,
+                                finality_gadget.finalized_hash
+                            )
+                            self.logger.info(
+                                "🔒 Block #%d FINALIZED (slot=%d, hash=%s)",
+                                header.block_number,
+                                finality_gadget.finalized_slot,
+                                encode_hex(finality_gadget.finalized_hash[:8]),
+                            )
+                    
+                    self.logger.info(
+                        "Successfully imported QR-PoS block #%d from peer (hash: %s)",
+                        header.block_number,
+                        humanize_hash(header.hash),
+                    )
+                    
+            except Exception as e:
+                self.logger.error(
+                    "Failed to import QR-PoS block from peer %s: %s",
+                    event.session,
+                    e,
+                    exc_info=True
+                )
 
     async def _broadcast_attestations(self, events: list) -> None:
         """Broadcast attestations to all connected peers."""
@@ -399,6 +582,31 @@ class NewBlockService(Service):
             self.logger.debug("Sending NewBlockHashes(%s) to %s", block.header, peer)
             target_peer = await self._peer_pool.ensure_proxy_peer(peer.session)
             target_peer.eth_api.send_new_block_hashes((new_block_hash,))
+            self._peer_block_tracker[block.hash].append(str(target_peer))
+
+    async def _broadcast_qrpos_block(self, block: BlockAPI, signature: bytes, 
+                                      validator_index: int, slot: int) -> None:
+        """
+        Send QR-PoS block with Dilithium signature to all peers that haven't heard about it yet.
+        """
+        from trinity._utils.connect import get_eth1_chain_with_remote_db
+        
+        all_peers = await self._peer_pool.get_peers()
+        eligible_peers = self._filter_eligible_peers(all_peers, block.hash)
+        
+        # Get total difficulty
+        with get_eth1_chain_with_remote_db(self._boot_info, self._event_bus) as chain:
+            total_difficulty = chain.chaindb.get_score(block.hash)
+        
+        for peer in eligible_peers:
+            self.logger.debug(
+                "Sending QRPoSNewBlock(#%d, sig_size=%d bytes) to %s", 
+                block.number, len(signature), peer
+            )
+            target_peer = await self._peer_pool.ensure_proxy_peer(peer.session)
+            target_peer.eth_api.send_qrpos_new_block(
+                block, total_difficulty, signature, validator_index, slot
+            )
             self._peer_block_tracker[block.hash].append(str(target_peer))
             # add checkpoint here to guarantee the event loop is released per iteration
             await trio.sleep(0)
