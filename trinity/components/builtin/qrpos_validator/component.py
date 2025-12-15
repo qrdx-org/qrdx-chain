@@ -647,19 +647,44 @@ class QRPoSValidatorComponent(AsyncioIsolatedComponent):
             log_debug(f"Validator index: {validator_index}")
             logger.info(f"Starting QRPoS validator (index {validator_index})")
             
-            # Load Dilithium keypair from disk
-            # Keys are pre-generated and stored in /tmp/qrdx-validator-keys/
-            log_debug("Loading keypair from disk...")
+            # Load Dilithium keypair from encrypted keystore
+            # Keys are stored in encrypted EIP-2335 keystores
+            log_debug("Loading keypair from encrypted keystore...")
             from eth.crypto import DilithiumPrivateKey, DilithiumPublicKey
-            import pickle
+            from trinity.keystore import load_dilithium_key_from_keystore
+            from pathlib import Path
+            import os
+            
+            # Get keystore password from environment or prompt
+            password = os.environ.get("QRDX_KEYSTORE_PASSWORD")
+            if not password:
+                import getpass
+                password = getpass.getpass(f"Validator {validator_index} keystore password: ")
+            
+            # Get keystore directory from environment or use default
+            keystore_dir = Path(os.environ.get("QRDX_KEYSTORE_DIR", "/tmp/qrdx-validator-keys"))
             
             log_debug(f"Loading keypair for validator {validator_index}...")
-            key_file = f"/tmp/qrdx-validator-keys/validator-{validator_index}.key"
-            with open(key_file, 'rb') as f:
-                priv_bytes, pub_bytes = pickle.load(f)
+            # Find keystore by derivation path
+            import json
+            keystore_path = None
+            for ks_file in keystore_dir.glob("*.json"):
+                with open(ks_file) as f:
+                    ks_data = json.load(f)
+                    if ks_data.get("path") == f"m/12381/3600/{validator_index}/0/0":
+                        keystore_path = ks_file
+                        break
+            
+            if not keystore_path:
+                raise FileNotFoundError(
+                    f"No keystore found for validator {validator_index} in {keystore_dir}. "
+                    f"Expected derivation path: m/12381/3600/{validator_index}/0/0"
+                )
+            
+            priv_bytes, pub_bytes = load_dilithium_key_from_keystore(keystore_path, password)
             private_key = DilithiumPrivateKey(priv_bytes, pub_bytes)
             public_key = DilithiumPublicKey(pub_bytes)
-            log_debug(f"Keypair loaded: private_key type={type(private_key)}, public_key type={type(public_key)}")
+            log_debug(f"Keypair loaded from keystore: {keystore_path.name}")
             
             logger.info(f"Generated deterministic Dilithium keypair for validator {validator_index}")
             
@@ -699,11 +724,22 @@ class QRPoSValidatorComponent(AsyncioIsolatedComponent):
                 # Load deterministic public keys matching what validators will use
                 validator_address = to_canonical_address(f"0x{i:040x}")
                 
-                # Load same keypair from disk as validators will use
-                import pickle
-                key_file = f"/tmp/qrdx-validator-keys/validator-{i}.key"
-                with open(key_file, 'rb') as f:
-                    _, pub_bytes = pickle.load(f)
+                # Load public key from keystore metadata (no password needed for pubkey)
+                import json
+                pubkey_found = False
+                for ks_file in keystore_dir.glob("*.json"):
+                    with open(ks_file) as f:
+                        ks_data = json.load(f)
+                        if ks_data.get("path") == f"m/12381/3600/{i}/0/0":
+                            pub_bytes = bytes.fromhex(ks_data["pubkey"])
+                            pubkey_found = True
+                            break
+                
+                if not pubkey_found:
+                    raise FileNotFoundError(
+                        f"No keystore found for validator {i} in {keystore_dir}"
+                    )
+                
                 validator_pubkey = DilithiumPublicKey(pub_bytes)
                 
                 validator = Validator(

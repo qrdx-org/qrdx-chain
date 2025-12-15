@@ -182,22 +182,38 @@ class NewBlockService(Service):
                 self.logger.debug("QR-PoS block #%d passed basic validation", header.block_number)
                 
                 # Load validator set for signature validation
-                # Validators are loaded from disk - same keys validators use for signing
+                # Validators are loaded from encrypted keystores
                 import os
-                import pickle
+                import json
+                from pathlib import Path
                 from eth.consensus.qrpos import Validator, ValidatorSet, ValidatorStatus, MIN_STAKE
                 from eth_utils import to_canonical_address
                 from eth.crypto import DilithiumPublicKey
                 
                 NUM_VALIDATORS = int(os.environ.get('QRDX_NUM_VALIDATORS', '3'))
                 
+                # Get keystore directory
+                keystore_dir = Path(os.environ.get("QRDX_KEYSTORE_DIR", "/tmp/qrdx-validator-keys"))
+                
                 genesis_validators = []
                 for i in range(NUM_VALIDATORS):
                     validator_address = to_canonical_address(f"0x{i:040x}")
-                    # Load same keypair from disk as validators use for signing
-                    key_file = f"/tmp/qrdx-validator-keys/validator-{i}.key"
-                    with open(key_file, 'rb') as f:
-                        _, pub_bytes = pickle.load(f)
+                    
+                    # Load public key from keystore metadata (no password needed)
+                    pubkey_found = False
+                    for ks_file in keystore_dir.glob("*.json"):
+                        with open(ks_file) as f:
+                            ks_data = json.load(f)
+                            if ks_data.get("path") == f"m/12381/3600/{i}/0/0":
+                                pub_bytes = bytes.fromhex(ks_data["pubkey"])
+                                pubkey_found = True
+                                break
+                    
+                    if not pubkey_found:
+                        raise FileNotFoundError(
+                            f"No keystore found for validator {i} in {keystore_dir}"
+                        )
+                    
                     validator_pubkey = DilithiumPublicKey(pub_bytes)
                     
                     validator = Validator(

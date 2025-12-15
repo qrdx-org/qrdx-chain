@@ -138,6 +138,10 @@ parser = argparse.ArgumentParser(description='Trinity')
 # to gain control over the main Trinity process
 subparser = parser.add_subparsers(dest='subcommand')
 
+# Configure keystore management subcommands
+from trinity.keystore.cli import configure_keystore_parser
+configure_keystore_parser(subparser)
+
 #
 # Argument Groups
 #

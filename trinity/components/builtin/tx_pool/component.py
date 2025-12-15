@@ -18,6 +18,7 @@ from trinity.constants import (
     MAINNET_NETWORK_ID,
     ROPSTEN_NETWORK_ID,
 )
+from trinity.network_configurations import QRDX_NETWORK_ID
 from trinity.db.manager import DBClient
 from trinity.extensibility import (
     AsyncioIsolatedComponent,
@@ -43,10 +44,10 @@ class TxComponent(AsyncioIsolatedComponent):
     @classmethod
     def validate_cli(cls, boot_info: BootInfo) -> None:
         network_id = boot_info.trinity_config.network_id
-        if network_id not in {MAINNET_NETWORK_ID, ROPSTEN_NETWORK_ID, GOERLI_NETWORK_ID}:
+        if network_id not in {MAINNET_NETWORK_ID, ROPSTEN_NETWORK_ID, GOERLI_NETWORK_ID, QRDX_NETWORK_ID}:
             if not boot_info.args.disable_tx_pool:
                 raise ValidationError(
-                    "The TxPool component only supports Mainnet, Ropsten and Goerli."
+                    "The TxPool component only supports Mainnet, Ropsten, Goerli, and QRDX."
                     "You can run with the transaction pool disabled using "
                     "--disable-tx-pool"
                 )

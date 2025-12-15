@@ -25,6 +25,7 @@ from trinity.constants import (
     MAINNET_NETWORK_ID,
     ROPSTEN_NETWORK_ID
 )
+from trinity.network_configurations import QRDX_NETWORK_ID
 from trinity.rlp.sedes import UninterpretedTransaction
 
 
@@ -71,6 +72,9 @@ class DefaultTransactionValidator():
             return cls(chain, MUIR_GLACIER_ROPSTEN_BLOCK)
         elif network_id == GOERLI_NETWORK_ID:
             return cls(chain, ISTANBUL_GOERLI_BLOCK)
+        elif network_id == QRDX_NETWORK_ID:
+            # QRDX uses latest transaction format, no specific hard fork block
+            return cls(chain, None)
         else:
             raise NotImplementedError(f"Unsupported network id {network_id}")
 

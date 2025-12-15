@@ -171,9 +171,50 @@ EOF
 
 echo -e "${GREEN}✓ Genesis configuration created${NC}"
 
-# Generate node keys and start nodes
+# Generate validator keystores
 echo ""
-echo -e "${CYAN}Generating node keys and starting nodes...${NC}"
+echo -e "${CYAN}Generating validator keystores...${NC}"
+echo ""
+
+# Set keystore directory
+KEYSTORE_DIR="/tmp/qrdx-validator-keys"
+
+# Use default testnet password if not set
+if [ -z "$QRDX_KEYSTORE_PASSWORD" ]; then
+    export QRDX_KEYSTORE_PASSWORD="testnet-insecure-password"
+    echo -e "${YELLOW}⚠️  Using default testnet password (INSECURE - for testing only!)${NC}"
+fi
+
+# Check if keystores already exist with correct number
+EXISTING_KEYSTORES=$(find "$KEYSTORE_DIR" -name "*.json" 2>/dev/null | wc -l)
+if [ "$EXISTING_KEYSTORES" -eq "$NUM_NODES" ]; then
+    echo -e "${GREEN}✓ Found ${NUM_NODES} existing keystores in ${KEYSTORE_DIR}${NC}"
+else
+    # Generate new keystores
+    echo -e "${CYAN}Generating ${NUM_NODES} validator keystores...${NC}"
+    
+    # Remove old keystores
+    rm -rf "$KEYSTORE_DIR"
+    mkdir -p "$KEYSTORE_DIR"
+    
+    # Generate keystores using Python script
+    python3 "${SCRIPT_DIR}/generate_validator_keys.py" \
+        "$NUM_NODES" \
+        --keystore-dir "$KEYSTORE_DIR" \
+        --password-env \
+        2>&1 | grep -E "(Generating|✓|Validator [0-9]+:|Public Key:)" || true
+    
+    echo -e "${GREEN}✓ Validator keystores generated${NC}"
+fi
+
+# Export keystore settings for Trinity
+export QRDX_KEYSTORE_DIR="$KEYSTORE_DIR"
+export QRDX_NUM_VALIDATORS="$NUM_NODES"
+
+echo ""
+
+# Generate node keys and start nodes
+echo -e "${CYAN}Starting nodes...${NC}"
 echo ""
 
 # Clean old data directories to ensure fresh genesis
@@ -240,7 +281,6 @@ for i in $(seq 0 $((NUM_NODES - 1))); do
         --nodekey "${DATA_DIR}/nodekey" \
         --genesis "${DATA_DIR}/genesis.json" \
         --sync-mode full \
-        --disable-tx-pool \
         --disable-networkdb-component \
         --enable-http-apis=eth,net,web3 \
         --http-listen-address=127.0.0.1 \
