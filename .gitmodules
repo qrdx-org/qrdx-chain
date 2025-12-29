@@ -27,6 +27,7 @@
 	url = https://github.com/ethereum/lahja.git
 [submodule "web3.py"]
 	path = web3.py
+	url = https://github.com/ethereum/web3.py.git
 [submodule "asyncio-run-in-process"]
 	path = asyncio-run-in-process
 	url = https://github.com/qrdx-org/asyncio-run-in-process.git
@@ -35,12 +36,16 @@
 	url = https://github.com/qrdx-org/async-service.git
 [submodule "eth-account"]
 	path = eth-account
+	url = https://github.com/ethereum/eth-account.git
 [submodule "eth-abi"]
 	path = eth-abi
+	url = https://github.com/ethereum/eth-abi.git
 [submodule "eth-bloom"]
 	path = eth-bloom
 	url = https://github.com/qrdx-org/eth-bloom.git
 [submodule "eth-tester"]
 	path = eth-tester
+	url = https://github.com/ethereum/eth-tester.git
 [submodule "trinity-upstream"]
 	path = trinity-upstream
+	url = https://github.com/ethereum/trinity.git
