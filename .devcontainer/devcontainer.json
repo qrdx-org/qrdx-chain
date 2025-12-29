@@ -7,7 +7,8 @@
 	"features": {
 		"ghcr.io/devcontainers/features/git-lfs:1": {},
 		"ghcr.io/devcontainers-community/features/llvm:3": {},
-		"ghcr.io/devcontainers-extra/features/pipenv:2": {}
+		"ghcr.io/devcontainers-extra/features/pipenv:2": {},
+		"ghcr.io/devcontainers/features/docker-in-docker:2": {}
 	}
 
 	// Features to add to the dev container. More info: https://containers.dev/features.

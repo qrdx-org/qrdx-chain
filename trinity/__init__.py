@@ -8,9 +8,12 @@ apply_patches()
 # TODO: update this to use the `trinity` version once extracted from py-evm
 __version__: str
 try:
-    __version__ = pkg_resources.get_distribution("trinity").version
+    __version__ = pkg_resources.get_distribution("qrdx-chain").version
 except pkg_resources.DistributionNotFound:
-    __version__ = f"eth-{pkg_resources.get_distribution('py-evm').version}"
+    try:
+        __version__ = pkg_resources.get_distribution("trinity").version
+    except pkg_resources.DistributionNotFound:
+        __version__ = f"eth-{pkg_resources.get_distribution('py-evm').version}"
 
 
 # Setup the `DEBUG2` logging level

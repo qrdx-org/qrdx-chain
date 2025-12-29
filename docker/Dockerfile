@@ -1,18 +1,83 @@
-FROM python:3.7
+FROM python:3.12-slim
+
+# Install system dependencies including liboqs build requirements
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libsnappy-dev \
+    libgmp-dev \
+    git \
+    cmake \
+    ninja-build \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build and install liboqs from source (with shared library)
+RUN cd /tmp && \
+    git clone --depth 1 https://github.com/open-quantum-safe/liboqs.git && \
+    cd liboqs && \
+    mkdir build && cd build && \
+    cmake -GNinja .. \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_BUILD_TYPE=Release && \
+    ninja && \
+    ninja install && \
+    cd /tmp && rm -rf liboqs && \
+    ldconfig
+
+# Set environment variable for liboqs
+ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+ENV OQS_INSTALL_PATH=/usr/local
+
 # Set up code directory
-RUN mkdir -p /usr/src/app
-WORKDIR /usr/src/app
+WORKDIR /usr/src/qrdx-chain
 
-COPY . /usr/src/app
+# Copy all source code
+COPY . .
 
-# Install deps
-RUN apt-get update
-RUN apt-get -y install libsnappy-dev
+# Install Python dependencies in dependency order
+# Base utilities
+RUN pip install --no-cache-dir -e ./eth-utils
+RUN pip install --no-cache-dir -e ./eth-typing
+RUN pip install --no-cache-dir -e ./eth-hash[pycryptodome]
+RUN pip install --no-cache-dir -e ./eth-keys
+RUN pip install --no-cache-dir -e ./pyrlp
+RUN pip install --no-cache-dir -e ./eth-abi
+RUN pip install --no-cache-dir -e ./eth-bloom
+RUN pip install --no-cache-dir -e ./eth-enr
 
-RUN pip install -e .[dev]  --no-cache-dir
-RUN pip install -U trinity --no-cache-dir
+# Async utilities
+RUN pip install --no-cache-dir -e ./async-service
+RUN pip install --no-cache-dir -e ./asyncio-run-in-process
+RUN pip install --no-cache-dir -e ./lahja
 
-RUN echo "Type \`trinity\` to boot or \`trinity --help\` for an overview of commands"
+# Core EVM (without dev extras to avoid dependency conflicts)
+RUN pip install --no-cache-dir -e ./py-evm
 
+# Install pytest (required by eth.tools.fixtures imported by trinity RPC modules)
+RUN pip install --no-cache-dir pytest>=7.0.0
+
+# Testing utilities (without py-evm extra since we already installed it locally)
+RUN pip install --no-cache-dir -e ./eth-tester
+
+# Account management
+RUN pip install --no-cache-dir -e ./eth-account
+
+# Web3.py (without dev extras to avoid dependency conflicts)
+RUN pip install --no-cache-dir -e ./web3.py
+
+# Finally, install QRDX Chain (Trinity with QR-PoS)
+# Local modules already installed, this will install remaining trinity dependencies
+RUN pip install --no-cache-dir -e .
+
+# Expose ports
+# P2P port
 EXPOSE 30303 30303/udp
+# HTTP RPC
+EXPOSE 8545
+# WebSocket RPC  
+EXPOSE 8546
+
+# Set entrypoint
 ENTRYPOINT ["trinity"]
+CMD ["--help"]

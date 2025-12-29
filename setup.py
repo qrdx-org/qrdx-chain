@@ -8,7 +8,7 @@ PYEVM_DEPENDENCY = None  # Using local py-evm fork
 
 deps = {
     'p2p': [
-        "async-service==0.1.0a11",
+        # "async-service==0.1.0a11",  # Installed from local
         "asyncio-cancel-token>=0.2,<0.3",
         "async_lru>=2.0.0,<3.0.0",  # Python 3.12 compatible
         "cached-property>=1.5.1,<2",
@@ -17,17 +17,16 @@ deps = {
         "blake3>=0.4.0",
         # cryptography does not use semver and allows breaking changes within `0.3` version bumps.
         "cryptography>=3.0,<3.2",
-        "eth-enr>=0.3.0,<0.4",
-        "eth-hash>=0.7.0,<1",  # Python 3.12 compatible
-        # Note: eth-keys kept for backward compatibility but will be phased out
-        "eth-keys>=0.7.0,<1.0.0",  # Python 3.12 compatible
-        "eth-typing>=5.0.0,<6",  # Python 3.12 compatible
+        # "eth-enr>=0.3.0,<0.4",  # Installed from local
+        # "eth-hash>=0.7.0,<1",  # Installed from local
+        # "eth-keys>=0.7.0,<1.0.0",  # Installed from local
+        # "eth-typing>=5.0.0,<6",  # Installed from local
         "lru-dict>=1.1.6,<2",
         "python-snappy>=0.5.3",
-        "rlp>=4.0.0,<5",  # Python 3.12 compatible
+        # "rlp>=4.0.0,<5",  # Installed from local
         "SQLAlchemy>=1.3.3,<2",
-        'trio>=0.16.0,<0.17',
-        'trio-typing>=0.5.0,<0.6',
+        # 'trio>=0.32.0',  # Installed via async-service
+        # 'trio-typing>=0.10.0',  # Installed via async-service
         "upnpclient>=0.0.8,<1",
     ],
     'trinity': [
@@ -37,13 +36,14 @@ deps = {
         "asyncio-run-in-process==0.1.0a10",
         "bloom-filter==1.3",
         "cachetools>=3.1.0,<5.0.0",
-        "eth-utils>=5.0.0,<6",  # Python 3.12 compatible
-        "eth-typing>=5.0.0,<6",  # Python 3.12 compatible
-        "eth-bloom>=1.0.3,<2",
-        "eth-abi>=5.0.0,<6",  # Python 3.12 compatible with parsimonious 0.10
+        # Local modules - already installed, no version constraint needed
+        # "eth-utils>=5.0.0,<6",
+        # "eth-typing>=5.0.0,<6",
+        # "eth-bloom>=1.0.3,<2",
+        # "eth-abi>=5.0.0,<6",
         "ipython>=7.23.0,<8",
         "jsonschema>=3.2,<5",
-        "lahja>=0.17.0,<0.18",
+        # "lahja>=0.17.0,<0.18",  # Installed from local
         "mypy-extensions>=0.4.3,<0.5.0",
         "plyvel>=1.5.0",
         "prometheus-client>=0.9.0",
@@ -54,7 +54,7 @@ deps = {
         "termcolor>=1.1.0,<2.0.0",
         "upnp-port-forward>=0.1.1,<0.2",
         "uvloop>=0.17.0;platform_system=='Linux' or platform_system=='Darwin' or platform_system=='FreeBSD'",  # noqa: E501
-        "web3>=7.0.0,<8",  # Python 3.12 compatible
+        # "web3>=7.0.0,<8",  # Installed from local
         "websockets>=15.0.0,<16",  # Python 3.12 compatible
     ],
     'test': [
@@ -69,7 +69,7 @@ deps = {
         "pytest-timeout>=1.4.2,<2",
         "pytest-watch>=4.2.0,<4.3",
         "pytest-xdist>=1.34.0,<2",
-        "eth-tester==0.5.0b3",
+        # eth-tester installed from local directory, no version pin needed
     ],
     # We have to keep some separation between trio and asyncio based tests
     # because `pytest-asyncio` is greedy and tries to run all asyncio fixtures.

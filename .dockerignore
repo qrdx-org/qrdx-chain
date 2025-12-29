@@ -1,0 +1,68 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# GitHub
+.github/workflows/*.yml
+!.github/workflows/docker-build.yml
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+dist/
+build/
+*.egg
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation build artifacts
+docs/_build/
+docs/.sphinx_cache/
+
+# Test data and temporary files
+/tmp/
+*.log
+*.out
+/fixtures/
+
+# Node data directories (if present)
+/node-*
+/qrdx-node-*
+/trinity-data-*
+
+# Test outputs
+test-*.py
+htmlcov/
+.coverage.*
+
+# DappNode specific
+dappnode/build/
+
+# Contracts (not needed in runtime image)
+contracts/node_modules/
+contracts/cache/
+contracts/artifacts/
