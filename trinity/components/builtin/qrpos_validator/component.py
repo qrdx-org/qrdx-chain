@@ -573,7 +573,14 @@ class QRPoSValidatorService(Service):
                     f"block #{head.block_number} (slot {self.current_slot})"
                 )
                 
-                # Broadcast attestation to network via IPC
+                # Add to local attestation pool FIRST
+                self.consensus.add_attestation(attestation)
+                logger.info(
+                    f"[ATTESTATION] Added attestation to local pool (slot {self.current_slot}, "
+                    f"pool size: {len(self.consensus.attestation_pool.attestations.get(self.current_slot, {}))})"
+                )
+                
+                # Then broadcast attestation to network via IPC
                 from trinity.protocol.eth.events import QRPoSAttestationEvent
                 
                 logger.info(f"[ATTESTATION-BROADCAST] Broadcasting attestation for slot {self.current_slot}")

@@ -15,6 +15,7 @@ from async_service import (
 from eth.abc import (
     BlockAPI,
 )
+from eth.exceptions import HeaderNotFound
 from eth_typing import BlockNumber
 from eth_utils import (
     ValidationError,
@@ -103,9 +104,19 @@ class NewBlockService(Service):
         # TODO: old blocks need to be pruned to avoid unbounded growth of tracker
         self._peer_block_tracker: DefaultDict[bytes, List[str]] = collections.defaultdict(list)
         self._boot_info = boot_info
+        self._consensus = None  # Will be initialized in run()
 
     async def run(self) -> None:
-        self.logger.info("NewBlockService starting up - registering handlers...")
+        self.logger.info("NewBlockService starting up - initializing consensus...")
+        
+        # Initialize QRPoSConsensus for validating incoming attestations
+        self._consensus = await self._initialize_consensus()
+        if self._consensus:
+            self.logger.info("QRPoSConsensus initialized successfully")
+        else:
+            self.logger.warning("Failed to initialize QRPoSConsensus, attestation validation disabled")
+        
+        self.logger.info("Registering event handlers...")
         self.manager.run_daemon_task(self._handle_imported_blocks)
         self.manager.run_daemon_task(self._handle_new_block_hashes)
         self.manager.run_daemon_task(self._handle_qrpos_new_blocks)
@@ -116,6 +127,125 @@ class NewBlockService(Service):
 
         async for event in self._event_bus.stream(NewBlockEvent):
             self.manager.run_task(self._handle_new_block, event.session, event.command.payload)
+
+    async def _initialize_consensus(self) -> QRPoSConsensus:
+        """
+        Initialize QRPoSConsensus for validating incoming attestations.
+        Returns None if initialization fails (non-critical, just disables attestation validation).
+        Will retry a few times since keystores may not exist yet on startup.
+        """
+        for attempt in range(5):
+            try:
+                import os
+                import json
+                from pathlib import Path
+                from eth.consensus.qrpos import Validator, ValidatorSet, ValidatorStatus, MIN_STAKE
+                from eth_utils import to_canonical_address
+                from eth.crypto import DilithiumPublicKey
+                
+                # Get configuration from environment
+                NUM_VALIDATORS = int(os.environ.get('QRDX_NUM_VALIDATORS', '3'))
+                keystore_dir = Path(os.environ.get("QRDX_KEYSTORE_DIR", "/tmp/qrdx-validator-keys"))
+                
+                # Find all keystore files (they have UUID filenames like keystore-{uuid}.json)
+                keystore_files = list(keystore_dir.glob("keystore-*.json"))
+                if not keystore_files:
+                    if attempt < 4:
+                        self.logger.debug(f"No keystores found yet (attempt {attempt + 1}/5), waiting...")
+                        await trio.sleep(2)  # Wait 2 seconds before retry
+                        continue
+                    else:
+                        self.logger.warning(f"No keystores found in {keystore_dir} after 5 attempts, cannot initialize consensus")
+                        return None
+                
+                # Get genesis time from the genesis configuration file instead of keystore
+                # The genesis file is passed to trinity via --genesis flag
+                genesis_time = None
+                
+                # Try to find genesis file in the data directory
+                data_dir = Path(self._boot_info.trinity_config.data_dir)
+                genesis_file = data_dir / "genesis.json"
+                
+                if genesis_file.exists():
+                    with open(genesis_file, 'r') as f:
+                        genesis_config = json.load(f)
+                        genesis_timestamp_hex = genesis_config.get('genesis', {}).get('timestamp', '0x0')
+                        genesis_time = int(genesis_timestamp_hex, 16)
+                        self.logger.debug(f"Loaded genesis time from {genesis_file}: {genesis_time}")
+                else:
+                    # Fall back to current time if genesis file not found
+                    import time
+                    genesis_time = int(time.time())
+                    self.logger.warning(f"Genesis file not found at {genesis_file}, using current time: {genesis_time}")
+                
+                if not genesis_time:
+                    self.logger.warning("Could not determine genesis time, cannot initialize consensus")
+                    return None
+                
+                # Load validator set from all keystores
+                # First, read all keystores and extract validator info
+                validator_data = []
+                for keystore_file in keystore_files:
+                    with open(keystore_file, 'r') as f:
+                        keystore = json.load(f)
+                        pub_key_hex = keystore.get('pubkey')  # Standard EIP-2335 field
+                        
+                        if not pub_key_hex:
+                            self.logger.warning(f"Public key not found in {keystore_file.name}")
+                            continue
+                        
+                        # Extract validator index from path (m/12381/3600/{index}/0/0)
+                        path = keystore.get('path', 'm/12381/3600/0/0/0')
+                        parts = path.split('/')
+                        validator_index = int(parts[3]) if len(parts) > 3 else 0
+                        
+                        validator_data.append((validator_index, pub_key_hex))
+                
+                # Sort by validator index to ensure they're added in order
+                validator_data.sort(key=lambda x: x[0])
+                
+                # Now create validators in the correct order
+                genesis_validators = []
+                for validator_index, pub_key_hex in validator_data:
+                    validator_address = to_canonical_address(f"0x{validator_index:040x}")
+                    pub_key = DilithiumPublicKey(bytes.fromhex(pub_key_hex))
+                    
+                    validator = Validator(
+                        index=validator_index,
+                        public_key=pub_key.to_bytes(),
+                        stake=MIN_STAKE,
+                        status=ValidatorStatus.ACTIVE,
+                        address=validator_address,
+                        activation_epoch=0,  # Active from genesis
+                        exit_epoch=None,  # Not exiting
+                        slashed=False,  # Not slashed
+                    )
+                    genesis_validators.append(validator)
+                
+                if not genesis_validators:
+                    self.logger.warning("No validators loaded, cannot initialize consensus")
+                    return None
+                
+                validator_set = ValidatorSet(genesis_validators=genesis_validators)
+                self.logger.info(f"Loaded {len(genesis_validators)} validators for consensus")
+                
+                # Create consensus instance
+                consensus = QRPoSConsensus(
+                    validator_set=validator_set,
+                    genesis_time=genesis_time
+                )
+                
+                return consensus
+                
+            except Exception as e:
+                if attempt < 4:
+                    self.logger.debug(f"Attempt {attempt + 1}/5 to initialize consensus failed: {e}, retrying...")
+                    await trio.sleep(2)
+                else:
+                    self.logger.error(f"Failed to initialize consensus after 5 attempts: {e}", exc_info=True)
+                    return None
+        
+        return None
 
     async def _handle_new_block_hashes(self) -> None:
         async for event in self._event_bus.stream(NewBlockHashesEvent):
@@ -294,21 +424,26 @@ class NewBlockService(Service):
                             len(attestations),
                         )
                         
-                        # Validate each attestation
+                        # Validate each attestation (if consensus is initialized)
                         valid_count = 0
-                        for attestation in attestations:
-                            try:
-                                chain.consensus.attestation_pool.add_attestation(
-                                    attestation,
-                                    chain.consensus.validator_set,
-                                )
-                                valid_count += 1
-                            except Exception as e:
-                                self.logger.warning(
-                                    "Invalid attestation in block #%d: %s",
-                                    header.block_number,
-                                    e,
-                                )
+                        if self._consensus:
+                            for attestation in attestations:
+                                try:
+                                    self._consensus.attestation_pool.add_attestation(
+                                        attestation,
+                                        self._consensus.validator_set,
+                                    )
+                                    valid_count += 1
+                                except Exception as e:
+                                    self.logger.warning(
+                                        "Invalid attestation in block #%d: %s",
+                                        header.block_number,
+                                        e,
+                                    )
+                        else:
+                            self.logger.debug(
+                                "Consensus not initialized, skipping attestation validation"
+                            )
                         
                         self.logger.info(
                             "Validated %d/%d attestations from block #%d",
@@ -323,9 +458,37 @@ class NewBlockService(Service):
                             header.block_number,
                         )
                     
-                    # Get score now while DB context is still open
-                    # This prevents race condition in broadcast
-                    total_difficulty = chain.chaindb.get_score(block.hash)
+                    # Get score - with retry to handle IPC database write delay
+                    # The score is written during import_block() but via IPC it may not
+                    # be immediately visible. Retry a few times with small delays.
+                    total_difficulty = None
+                    for attempt in range(5):
+                        try:
+                            total_difficulty = chain.chaindb.get_score(block.hash)
+                            break
+                        except (KeyError, HeaderNotFound):
+                            if attempt < 4:  # Don't sleep on last attempt
+                                import trio
+                                await trio.sleep(0.01 * (attempt + 1))  # 10ms, 20ms, 30ms, 40ms
+                            else:
+                                # Last attempt failed, calculate score manually
+                                # For PoS, score = parent_score + block_number
+                                try:
+                                    parent_score = chain.chaindb.get_score(header.parent_hash)
+                                    total_difficulty = parent_score + header.block_number
+                                    self.logger.warning(
+                                        "Score not found for block #%d, calculated as %d",
+                                        header.block_number,
+                                        total_difficulty
+                                    )
+                                except Exception as e:
+                                    self.logger.error(
+                                        "Failed to get or calculate score for block #%d: %s",
+                                        header.block_number,
+                                        e
+                                    )
+                                    # Use block number as fallback
+                                    total_difficulty = header.block_number
                     
             except Exception as e:
                 self.logger.error(
@@ -353,6 +516,7 @@ class NewBlockService(Service):
     async def _handle_qrpos_attestations(self) -> None:
         """Handle QR-PoS attestations created by local validator."""
         from trinity.protocol.eth.events import QRPoSAttestationEvent
+        from eth.consensus.qrpos import Attestation
         
         self.logger.info("[ATTESTATION-HANDLER] QR-PoS attestation handler started, streaming events...")
         async for event in self._event_bus.stream(QRPoSAttestationEvent):
@@ -361,6 +525,26 @@ class NewBlockService(Service):
                 event.validator_index,
                 event.slot,
             )
+            
+            # Add to local attestation pool
+            from trinity._utils.connect import get_eth1_chain_with_remote_db
+            with get_eth1_chain_with_remote_db(self._boot_info, self._event_bus) as chain:
+                attestation = Attestation(
+                    slot=event.slot,
+                    block_hash=event.block_hash,
+                    validator_index=event.validator_index,
+                    signature=event.signature,
+                )
+                if self._consensus:
+                    self._consensus.add_attestation(attestation)
+                    self.logger.info(
+                        "[ATTESTATION-HANDLER] Added local attestation from validator %d to pool",
+                        event.validator_index,
+                    )
+                else:
+                    self.logger.warning(
+                        "[ATTESTATION-HANDLER] Consensus not initialized, cannot add attestation"
+                    )
             
             # Broadcast attestation to all peers
             await self._broadcast_attestations([event])
@@ -392,13 +576,17 @@ class NewBlockService(Service):
                         )
                         
                         # Add to consensus attestation pool
-                        chain.consensus.add_attestation(attestation)
-                        
-                        self.logger.debug(
-                            "Added attestation from validator %d (slot %d) to pool",
-                            att_payload.validator_index,
-                            att_payload.slot,
-                        )
+                        if self._consensus:
+                            self._consensus.add_attestation(attestation)
+                            self.logger.debug(
+                                "Added attestation from validator %d (slot %d) to pool",
+                                att_payload.validator_index,
+                                att_payload.slot,
+                            )
+                        else:
+                            self.logger.warning(
+                                "Consensus not initialized, cannot add attestation from peer"
+                            )
                     except Exception as e:
                         self.logger.warning(
                             "Failed to process attestation from peer %s: %s",
@@ -449,13 +637,13 @@ class NewBlockService(Service):
                     
                     # Get attestations for this block and process for finality
                     attestations = chain.chaindb.get_qrpos_attestations(header.hash)
-                    if attestations:
-                        finality_gadget = chain.consensus.finality_gadget
+                    if attestations and self._consensus:
+                        finality_gadget = self._consensus.finality_gadget
                         slot = event.command.payload.slot
                         epoch = slot // 32  # SLOTS_PER_EPOCH = 32
                         
                         # Calculate and store block weight for fork choice
-                        weight = chain.consensus.calculate_block_weight(
+                        weight = self._consensus.calculate_block_weight(
                             header.hash,
                             attestations,
                             epoch
