@@ -95,6 +95,7 @@ from .events import (
     SendTransactionsEvent,
     AttestationsEvent,
     SendAttestationsEvent,
+    QRPoSNewBlockEvent_Wire,
     SendQRPoSNewBlockEvent,
 )
 from .payloads import StatusV63Payload, StatusPayload
@@ -427,6 +428,16 @@ class ETHPeerPoolEventServer(PeerPoolEventServer[ETHPeer]):
         elif isinstance(cmd, BlockWitnessHashes):
             await self.event_bus.broadcast(
                 BlockWitnessHashesEvent(session, cmd),
+                FIRE_AND_FORGET_BROADCASTING
+            )
+        elif isinstance(cmd, Attestations):
+            await self.event_bus.broadcast(
+                AttestationsEvent(session, cmd),
+                FIRE_AND_FORGET_BROADCASTING
+            )
+        elif isinstance(cmd, QRPoSNewBlock):
+            await self.event_bus.broadcast(
+                QRPoSNewBlockEvent_Wire(session, cmd),
                 FIRE_AND_FORGET_BROADCASTING
             )
         else:
