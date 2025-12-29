@@ -43,6 +43,7 @@ from .commands import (
     Transactions,
     PooledTransactionsV65,
     Attestations,
+    QRPoSNewBlock,
 )
 from .events import (
     GetBlockBodiesRequest,
@@ -59,8 +60,9 @@ from .events import (
     GetPooledTransactionsRequest,
     SendPooledTransactionsEvent,
     SendAttestationsEvent,
+    SendQRPoSNewBlockEvent,
 )
-from .payloads import BlockFields, NewBlockHash, NewBlockPayload, AttestationPayload
+from .payloads import BlockFields, NewBlockHash, NewBlockPayload, AttestationPayload, QRPoSNewBlockPayload
 
 
 class ProxyETHAPI:
@@ -273,5 +275,25 @@ class ProxyETHAPI:
         command = Attestations(tuple(attestations))
         self._event_bus.broadcast_nowait(
             SendAttestationsEvent(self.session, command),
+            self._broadcast_config,
+        )
+
+    def send_qrpos_new_block(self,
+                             block: BlockAPI,
+                             total_difficulty: int,
+                             signature: bytes,
+                             validator_index: int,
+                             slot: int) -> None:
+        """Send QR-PoS block with Dilithium signature to peer."""
+        from trinity.rlp.block_body import BlockBody
+        import rlp
+        
+        # Generalize transactions to hand off over network
+        transactions = rlp.decode(rlp.encode(block.transactions))
+        block_fields = BlockFields(block.header, transactions, block.uncles)
+        payload = QRPoSNewBlockPayload(block_fields, total_difficulty, signature, validator_index, slot)
+        command = QRPoSNewBlock(payload)
+        self._event_bus.broadcast_nowait(
+            SendQRPoSNewBlockEvent(self.session, command),
             self._broadcast_config,
         )
