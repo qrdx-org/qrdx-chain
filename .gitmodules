@@ -24,7 +24,7 @@
 	url = https://github.com/ethereum/eth-enr.git
 [submodule "lahja"]
 	path = lahja
-	url = https://github.com/ethereum/lahja.git
+	url = https://github.com/qrdx-org/lahja.git
 [submodule "web3.py"]
 	path = web3.py
 	url = https://github.com/ethereum/web3.py.git
