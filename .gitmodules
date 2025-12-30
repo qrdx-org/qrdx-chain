@@ -49,3 +49,6 @@
 [submodule "trinity-upstream"]
 	path = trinity-upstream
 	url = https://github.com/ethereum/trinity.git
+[submodule "liboqs"]
+	path = liboqs
+	url = https://github.com/qrdx-org/liboqs.git

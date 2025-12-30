@@ -1,5 +1,5 @@
-import pkg_resources
 import sys
+from importlib.metadata import version, PackageNotFoundError
 
 # Apply Python 3.12 compatibility patches as early as possible
 from trinity._utils.python312_compat import apply_patches
@@ -8,12 +8,12 @@ apply_patches()
 # TODO: update this to use the `trinity` version once extracted from py-evm
 __version__: str
 try:
-    __version__ = pkg_resources.get_distribution("qrdx-chain").version
-except pkg_resources.DistributionNotFound:
+    __version__ = version("qrdx-chain")
+except PackageNotFoundError:
     try:
-        __version__ = pkg_resources.get_distribution("trinity").version
-    except pkg_resources.DistributionNotFound:
-        __version__ = f"eth-{pkg_resources.get_distribution('py-evm').version}"
+        __version__ = version("trinity")
+    except PackageNotFoundError:
+        __version__ = f"eth-{version('py-evm')}"
 
 
 # Setup the `DEBUG2` logging level

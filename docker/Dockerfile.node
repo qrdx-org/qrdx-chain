@@ -1,0 +1,94 @@
+FROM python:3.12-slim
+
+# Install system dependencies including liboqs build requirements
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libsnappy-dev \
+    libgmp-dev \
+    git \
+    cmake \
+    ninja-build \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build and install liboqs from source (with shared library)
+RUN cd /tmp && \
+    git clone --depth 1 https://github.com/open-quantum-safe/liboqs.git && \
+    cd liboqs && \
+    mkdir build && cd build && \
+    cmake -GNinja .. \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_BUILD_TYPE=Release && \
+    ninja && \
+    ninja install && \
+    cd /tmp && rm -rf liboqs && \
+    ldconfig
+
+# Set environment variable for liboqs
+ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+ENV OQS_INSTALL_PATH=/usr/local
+
+# Set up code directory
+WORKDIR /usr/src/qrdx-chain
+
+# Copy all source code
+COPY . .
+
+# Install Python dependencies in dependency order
+# Base utilities
+RUN pip install --no-cache-dir -e ./eth-utils
+RUN pip install --no-cache-dir -e ./eth-typing
+RUN pip install --no-cache-dir -e ./eth-hash[pycryptodome]
+RUN pip install --no-cache-dir -e ./eth-keys
+RUN pip install --no-cache-dir -e ./pyrlp
+RUN pip install --no-cache-dir -e ./eth-abi
+RUN pip install --no-cache-dir -e ./eth-bloom
+RUN pip install --no-cache-dir -e ./eth-enr
+
+# Async utilities
+RUN pip install --no-cache-dir -e ./async-service
+RUN pip install --no-cache-dir -e ./asyncio-run-in-process
+RUN pip install --no-cache-dir -e ./lahja
+
+# Core EVM (without dev extras to avoid dependency conflicts)
+RUN pip install --no-cache-dir -e ./py-evm
+
+# Install pytest (required by eth.tools.fixtures imported by trinity RPC modules)
+RUN pip install --no-cache-dir pytest>=7.0.0
+
+# Testing utilities (without py-evm extra since we already installed it locally)
+RUN pip install --no-cache-dir -e ./eth-tester
+
+# Account management
+RUN pip install --no-cache-dir -e ./eth-account
+
+# Web3.py (without dev extras to avoid dependency conflicts)
+RUN pip install --no-cache-dir -e ./web3.py
+
+# Finally, install QRDX Chain (Trinity with QR-PoS)
+# Local modules already installed, this will install remaining trinity dependencies
+RUN pip install --no-cache-dir -e .
+
+# Create data directory
+RUN mkdir -p /root/.local/share/trinity
+
+# Expose ports
+# P2P port
+EXPOSE 30303 30303/udp
+# HTTP RPC
+EXPOSE 8545
+# WebSocket RPC  
+EXPOSE 8546
+
+# Environment variables for node operation
+ENV TRINITY_DATA_DIR=/root/.local/share/trinity
+ENV NETWORK_ID=1234
+
+# Set entrypoint
+ENTRYPOINT ["trinity"]
+
+# Default command runs full node WITHOUT validator (no --enable-qrpos-validator flag)
+# Users can mount volumes for data persistence:
+#   docker run -v qrdx-data:/root/.local/share/trinity qrdx-node
+CMD ["--network-id", "1234", "--port", "30303", "--enable-http-apis", "eth,net,web3"]

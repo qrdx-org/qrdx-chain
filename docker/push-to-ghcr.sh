@@ -8,7 +8,7 @@ set -e
 
 TAG="${1:-latest}"
 REPOSITORY="${2:-qrdx-org/qrdx-chain}"
-IMAGE_NAME="qrdx-chain"
+IMAGE_NAME="qrdx-node"
 REGISTRY="ghcr.io"
 
 echo "=================================================="

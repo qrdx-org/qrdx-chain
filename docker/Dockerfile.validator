@@ -1,0 +1,109 @@
+FROM python:3.12-slim
+
+# Install system dependencies including liboqs build requirements
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libsnappy-dev \
+    libgmp-dev \
+    git \
+    cmake \
+    ninja-build \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build and install liboqs from source (with shared library)
+RUN cd /tmp && \
+    git clone --depth 1 https://github.com/open-quantum-safe/liboqs.git && \
+    cd liboqs && \
+    mkdir build && cd build && \
+    cmake -GNinja .. \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_BUILD_TYPE=Release && \
+    ninja && \
+    ninja install && \
+    cd /tmp && rm -rf liboqs && \
+    ldconfig
+
+# Set environment variable for liboqs
+ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+ENV OQS_INSTALL_PATH=/usr/local
+
+# Set up code directory
+WORKDIR /usr/src/qrdx-chain
+
+# Copy all source code
+COPY . .
+
+# Install Python dependencies in dependency order
+# Base utilities
+RUN pip install --no-cache-dir -e ./eth-utils
+RUN pip install --no-cache-dir -e ./eth-typing
+RUN pip install --no-cache-dir -e ./eth-hash[pycryptodome]
+RUN pip install --no-cache-dir -e ./eth-keys
+RUN pip install --no-cache-dir -e ./pyrlp
+RUN pip install --no-cache-dir -e ./eth-abi
+RUN pip install --no-cache-dir -e ./eth-bloom
+RUN pip install --no-cache-dir -e ./eth-enr
+
+# Async utilities
+RUN pip install --no-cache-dir -e ./async-service
+RUN pip install --no-cache-dir -e ./asyncio-run-in-process
+RUN pip install --no-cache-dir -e ./lahja
+
+# Core EVM (without dev extras to avoid dependency conflicts)
+RUN pip install --no-cache-dir -e ./py-evm
+
+# Install pytest (required by eth.tools.fixtures imported by trinity RPC modules)
+RUN pip install --no-cache-dir pytest>=7.0.0
+
+# Testing utilities (without py-evm extra since we already installed it locally)
+RUN pip install --no-cache-dir -e ./eth-tester
+
+# Account management
+RUN pip install --no-cache-dir -e ./eth-account
+
+# Web3.py (without dev extras to avoid dependency conflicts)
+RUN pip install --no-cache-dir -e ./web3.py
+
+# Finally, install QRDX Chain (Trinity with QR-PoS)
+# Local modules already installed, this will install remaining trinity dependencies
+RUN pip install --no-cache-dir -e .
+
+# Create data and validator keys directory
+RUN mkdir -p /root/.local/share/trinity/validator_keys
+
+# Expose ports
+# P2P port
+EXPOSE 30303 30303/udp
+# HTTP RPC
+EXPOSE 8545
+# WebSocket RPC  
+EXPOSE 8546
+
+# Environment variables for validator operation
+ENV TRINITY_DATA_DIR=/root/.local/share/trinity
+ENV NETWORK_ID=1234
+ENV VALIDATOR_KEYS_DIR=/root/.local/share/trinity/validator_keys
+
+# Health check for validator liveness
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD trinity --version || exit 1
+
+# Set entrypoint
+ENTRYPOINT ["trinity"]
+
+# Default command runs validator node (WITH --enable-qrpos-validator flag)
+# IMPORTANT: You MUST mount validator keys directory with your Dilithium keys:
+#   docker run -v /path/to/keys:/root/.local/share/trinity/validator_keys qrdx-validator
+#
+# Requirements to run as validator:
+# - Minimum stake: 100,000 QRDX (as per whitepaper)
+# - Valid Dilithium (ML-DSA-65) keypair in validator_keys directory
+# - Network connectivity to other validators
+# - Persistent storage for blockchain data
+CMD ["--network-id", "1234", \
+     "--port", "30303", \
+     "--enable-http-apis", "eth,net,web3", \
+     "--enable-qrpos-validator", \
+     "--validator-keys-dir", "/root/.local/share/trinity/validator_keys"]

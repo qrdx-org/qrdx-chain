@@ -705,61 +705,104 @@ class QRPoSValidatorComponent(AsyncioIsolatedComponent):
             logger.info(f"Genesis block timestamp: {genesis_time}")
             
             # Create genesis validator set
-            # Number of validators determined by environment or configuration
-            # For testnet: fewer validators for easier testing (3-5)
-            # For production: 150 validators per whitepaper specification
-            log_debug("Creating genesis validator set...")
+            # Load validators from genesis configuration file
+            # This ensures stake requirements are enforced (100k QRDX minimum)
+            log_debug("Loading validators from genesis configuration...")
             from eth.consensus.qrpos import Validator, ValidatorSet, ValidatorStatus, MIN_STAKE
             from eth_utils import to_canonical_address
             import hashlib
             import os
+            import json
+            from pathlib import Path
             
-            # Read number of validators from environment variable or use testnet default
-            # Production deployment should set QRDX_NUM_VALIDATORS=150
-            NUM_VALIDATORS = int(os.environ.get('QRDX_NUM_VALIDATORS', '3'))
+            # Determine genesis file location
+            genesis_file = Path(os.environ.get('GENESIS_FILE', '/tmp/qrdx-multi-node-genesis.json'))
+            if not genesis_file.exists():
+                raise FileNotFoundError(
+                    f"Genesis file not found: {genesis_file}. "
+                    f"Set GENESIS_FILE environment variable or ensure testnet script created it."
+                )
             
-            if NUM_VALIDATORS < 1:
-                raise ValueError(f"Invalid number of validators: {NUM_VALIDATORS}")
+            # Load genesis configuration
+            with open(genesis_file) as f:
+                genesis_config = json.load(f)
             
-            logger.info(
-                f"Initializing validator set with {NUM_VALIDATORS} validators "
-                f"(set QRDX_NUM_VALIDATORS=150 for production)"
-            )
+            # Extract validators array
+            validators_config = genesis_config.get('validators', [])
+            if not validators_config:
+                raise ValueError(
+                    f"No validators in genesis configuration at {genesis_file}. "
+                    f"Genesis must include 'validators' array with stake information."
+                )
+            
+            logger.info(f"Loading {len(validators_config)} validators from genesis")
+            
+            # Verify keystore directory
+            keystore_dir = Path(os.environ.get("QRDX_KEYSTORE_DIR", "/tmp/qrdx-validator-keys"))
+            if not keystore_dir.exists():
+                raise FileNotFoundError(f"Keystore directory not found: {keystore_dir}")
             
             genesis_validators = []
-            for i in range(NUM_VALIDATORS):
-                # Load deterministic public keys matching what validators will use
-                validator_address = to_canonical_address(f"0x{i:040x}")
+            
+            for val_config in validators_config:
+                # Extract validator info from genesis
+                val_index = val_config['index']
+                val_address = to_canonical_address(val_config['address'])
+                stake_wei = int(val_config['stake'])
                 
-                # Load public key from keystore metadata (no password needed for pubkey)
-                import json
-                pubkey_found = False
+                # CRITICAL: Verify minimum stake requirement
+                if stake_wei < MIN_STAKE:
+                    raise ValueError(
+                        f"Validator {val_index} has insufficient stake! "
+                        f"Got: {stake_wei / 10**18:,.0f} QRDX, "
+                        f"Required: {MIN_STAKE / 10**18:,.0f} QRDX (minimum per whitepaper). "
+                        f"Cannot start validator without proper stake."
+                    )
+                
+                # Load public key from keystore (match by index)
+                keystore_found = False
                 for ks_file in keystore_dir.glob("*.json"):
                     with open(ks_file) as f:
                         ks_data = json.load(f)
-                        if ks_data.get("path") == f"m/12381/3600/{i}/0/0":
-                            pub_bytes = bytes.fromhex(ks_data["pubkey"])
-                            pubkey_found = True
+                        # Check if this keystore is for this validator (by path index)
+                        ks_path = ks_data.get("path", "")
+                        if f"/3600/{val_index}/" in ks_path:
+                            pub_key_hex = ks_data.get("pubkey")
+                            if not pub_key_hex:
+                                raise ValueError(f"No pubkey in {ks_file}")
+                            pub_bytes = bytes.fromhex(pub_key_hex)
+                            keystore_found = True
                             break
                 
-                if not pubkey_found:
+                if not keystore_found:
                     raise FileNotFoundError(
-                        f"No keystore found for validator {i} in {keystore_dir}"
+                        f"No keystore found for validator {val_index} in {keystore_dir}"
                     )
                 
                 validator_pubkey = DilithiumPublicKey(pub_bytes)
                 
                 validator = Validator(
-                    index=i,
-                    public_key=validator_pubkey.to_bytes(),  # Convert to bytes
-                    address=validator_address,
-                    stake=MIN_STAKE,
+                    index=val_index,
+                    public_key=validator_pubkey.to_bytes(),
+                    address=val_address,
+                    stake=stake_wei,  # ✅ FROM GENESIS - enforced above
                     status=ValidatorStatus.ACTIVE,
                     activation_epoch=0,
                     exit_epoch=None,
                     slashed=False,
                 )
                 genesis_validators.append(validator)
+                
+                log_debug(
+                    f"Loaded validator {val_index}: "
+                    f"address={val_address.hex()}, "
+                    f"stake={stake_wei / 10**18:,.0f} QRDX"
+                )
+            
+            logger.info(
+                f"Loaded {len(genesis_validators)} validators from genesis "
+                f"(total stake: {sum(v.stake for v in genesis_validators) / 10**18:,.0f} QRDX)"
+            )
             
             validator_set = ValidatorSet(genesis_validators=genesis_validators)
             log_debug(f"Created validator set with {len(validator_set.validators)} validators")

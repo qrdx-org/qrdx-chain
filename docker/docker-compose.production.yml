@@ -1,0 +1,107 @@
+# QRDX Chain - Production Deployment
+# Docker Compose for running full nodes and validators
+
+version: '3.8'
+
+services:
+  # ======================================
+  # QRDX Full Node (Non-Validator)
+  # ======================================
+  qrdx-node:
+    image: qrdx-node:latest
+    container_name: qrdx-fullnode
+    restart: unless-stopped
+    ports:
+      - "30303:30303"      # P2P
+      - "30303:30303/udp"  # P2P UDP
+      - "8545:8545"        # HTTP RPC
+      - "8546:8546"        # WebSocket RPC
+    volumes:
+      - qrdx-node-data:/root/.local/share/trinity
+    environment:
+      - NETWORK_ID=1234
+      - TRINITY_DATA_DIR=/root/.local/share/trinity
+    command:
+      - --network-id=1234
+      - --port=30303
+      - --enable-http-apis=eth,net,web3
+      - --http-listen-address=0.0.0.0
+      - --http-port=8545
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8545"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+    networks:
+      - qrdx-network
+
+  # ======================================
+  # QRDX Validator Node
+  # ======================================
+  # IMPORTANT: Requires 100,000 QRDX stake
+  # IMPORTANT: Must mount validator keys directory
+  # ======================================
+  qrdx-validator:
+    image: qrdx-validator:latest
+    container_name: qrdx-validator
+    restart: unless-stopped
+    ports:
+      - "30304:30303"      # P2P (different host port)
+      - "30304:30303/udp"  # P2P UDP
+      - "127.0.0.1:8555:8545"  # HTTP RPC (localhost only for security)
+      - "127.0.0.1:8556:8546"  # WebSocket RPC (localhost only)
+    volumes:
+      # CRITICAL: Mount your validator keys directory
+      # Change /path/to/your/validator_keys to actual path
+      - /path/to/your/validator_keys:/root/.local/share/trinity/validator_keys:ro
+      - qrdx-validator-data:/root/.local/share/trinity
+    environment:
+      - NETWORK_ID=1234
+      - TRINITY_DATA_DIR=/root/.local/share/trinity
+      - VALIDATOR_KEYS_DIR=/root/.local/share/trinity/validator_keys
+    command:
+      - --network-id=1234
+      - --port=30303
+      - --enable-http-apis=eth,net,web3
+      - --http-listen-address=0.0.0.0
+      - --http-port=8545
+      - --enable-qrpos-validator
+      - --validator-keys-dir=/root/.local/share/trinity/validator_keys
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8545"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+    networks:
+      - qrdx-network
+    # Resource limits for validator (recommended)
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'
+          memory: 16G
+        reservations:
+          cpus: '4.0'
+          memory: 8G
+
+networks:
+  qrdx-network:
+    driver: bridge
+
+volumes:
+  qrdx-node-data:
+    driver: local
+  qrdx-validator-data:
+    driver: local

@@ -143,82 +143,86 @@ class NewBlockService(Service):
                 from eth_utils import to_canonical_address
                 from eth.crypto import DilithiumPublicKey
                 
-                # Get configuration from environment
-                NUM_VALIDATORS = int(os.environ.get('QRDX_NUM_VALIDATORS', '3'))
-                keystore_dir = Path(os.environ.get("QRDX_KEYSTORE_DIR", "/tmp/qrdx-validator-keys"))
-                
-                # Find all keystore files (they have UUID filenames like keystore-{uuid}.json)
-                keystore_files = list(keystore_dir.glob("keystore-*.json"))
-                if not keystore_files:
-                    if attempt < 4:
-                        self.logger.debug(f"No keystores found yet (attempt {attempt + 1}/5), waiting...")
-                        await trio.sleep(2)  # Wait 2 seconds before retry
-                        continue
-                    else:
-                        self.logger.warning(f"No keystores found in {keystore_dir} after 5 attempts, cannot initialize consensus")
-                        return None
-                
-                # Get genesis time from the genesis configuration file instead of keystore
-                # The genesis file is passed to trinity via --genesis flag
-                genesis_time = None
-                
-                # Try to find genesis file in the data directory
+                # Determine genesis file location
+                # Try data directory first, then fall back to environment variable
                 data_dir = Path(self._boot_info.trinity_config.data_dir)
                 genesis_file = data_dir / "genesis.json"
                 
-                if genesis_file.exists():
-                    with open(genesis_file, 'r') as f:
-                        genesis_config = json.load(f)
-                        genesis_timestamp_hex = genesis_config.get('genesis', {}).get('timestamp', '0x0')
-                        genesis_time = int(genesis_timestamp_hex, 16)
-                        self.logger.debug(f"Loaded genesis time from {genesis_file}: {genesis_time}")
-                else:
-                    # Fall back to current time if genesis file not found
-                    import time
-                    genesis_time = int(time.time())
-                    self.logger.warning(f"Genesis file not found at {genesis_file}, using current time: {genesis_time}")
+                if not genesis_file.exists():
+                    # Fall back to environment variable
+                    genesis_file = Path(os.environ.get('GENESIS_FILE', '/tmp/qrdx-multi-node-genesis.json'))
                 
-                if not genesis_time:
-                    self.logger.warning("Could not determine genesis time, cannot initialize consensus")
+                if not genesis_file.exists():
+                    if attempt < 4:
+                        self.logger.debug(f"Genesis file not found yet (attempt {attempt + 1}/5), waiting...")
+                        await trio.sleep(2)
+                        continue
+                    else:
+                        self.logger.warning(f"No genesis file found after 5 attempts, cannot initialize consensus")
+                        return None
+                
+                # Load genesis configuration
+                with open(genesis_file, 'r') as f:
+                    genesis_config = json.load(f)
+                
+                # Extract genesis time
+                genesis_timestamp_hex = genesis_config.get('genesis', {}).get('timestamp', '0x0')
+                genesis_time = int(genesis_timestamp_hex, 16)
+                self.logger.debug(f"Loaded genesis time from {genesis_file}: {genesis_time}")
+                
+                # Extract validators array
+                validators_config = genesis_config.get('validators', [])
+                if not validators_config:
+                    self.logger.warning(f"No validators in genesis configuration, cannot initialize consensus")
                     return None
                 
-                # Load validator set from all keystores
-                # First, read all keystores and extract validator info
-                validator_data = []
-                for keystore_file in keystore_files:
-                    with open(keystore_file, 'r') as f:
-                        keystore = json.load(f)
-                        pub_key_hex = keystore.get('pubkey')  # Standard EIP-2335 field
-                        
-                        if not pub_key_hex:
-                            self.logger.warning(f"Public key not found in {keystore_file.name}")
-                            continue
-                        
-                        # Extract validator index from path (m/12381/3600/{index}/0/0)
-                        path = keystore.get('path', 'm/12381/3600/0/0/0')
-                        parts = path.split('/')
-                        validator_index = int(parts[3]) if len(parts) > 3 else 0
-                        
-                        validator_data.append((validator_index, pub_key_hex))
+                self.logger.info(f"Loading {len(validators_config)} validators from genesis for block validation")
                 
-                # Sort by validator index to ensure they're added in order
-                validator_data.sort(key=lambda x: x[0])
+                # Get keystore directory
+                keystore_dir = Path(os.environ.get("QRDX_KEYSTORE_DIR", "/tmp/qrdx-validator-keys"))
                 
-                # Now create validators in the correct order
+                # Create validators from genesis configuration
                 genesis_validators = []
-                for validator_index, pub_key_hex in validator_data:
-                    validator_address = to_canonical_address(f"0x{validator_index:040x}")
+                for val_config in validators_config:
+                    val_index = val_config['index']
+                    val_address = to_canonical_address(val_config['address'])
+                    stake_wei = int(val_config['stake'])
+                    
+                    # Verify minimum stake (same check as validator component)
+                    if stake_wei < MIN_STAKE:
+                        self.logger.warning(
+                            f"Validator {val_index} has insufficient stake "
+                            f"({stake_wei / 10**18:,.0f} < {MIN_STAKE / 10**18:,.0f} QRDX), skipping"
+                        )
+                        continue
+                    
+                    # Load public key from validator config (if available) or keystore
+                    pub_key_hex = val_config.get('public_key', '').replace('0x', '')
+                    
+                    if not pub_key_hex and keystore_dir.exists():
+                        # Try to load from keystore as fallback
+                        for ks_file in keystore_dir.glob("*.json"):
+                            with open(ks_file) as f:
+                                ks_data = json.load(f)
+                                if f"/3600/{val_index}/" in ks_data.get("path", ""):
+                                    pub_key_hex = ks_data.get("pubkey", "")
+                                    break
+                    
+                    if not pub_key_hex:
+                        self.logger.warning(f"No public key found for validator {val_index}, skipping")
+                        continue
+                    
                     pub_key = DilithiumPublicKey(bytes.fromhex(pub_key_hex))
                     
                     validator = Validator(
-                        index=validator_index,
+                        index=val_index,
                         public_key=pub_key.to_bytes(),
-                        stake=MIN_STAKE,
+                        stake=stake_wei,  # ✅ FROM GENESIS
                         status=ValidatorStatus.ACTIVE,
-                        address=validator_address,
-                        activation_epoch=0,  # Active from genesis
-                        exit_epoch=None,  # Not exiting
-                        slashed=False,  # Not slashed
+                        address=val_address,
+                        activation_epoch=0,
+                        exit_epoch=None,
+                        slashed=False,
                     )
                     genesis_validators.append(validator)
                 

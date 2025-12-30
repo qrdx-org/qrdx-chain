@@ -135,7 +135,29 @@ CURRENT_TIME=$(date +%s)
 GENESIS_TS=$((CURRENT_TIME - 600))  # 10 minutes ago
 GENESIS_TIMESTAMP=$(printf "0x%x" $GENESIS_TS)
 
-cat > "$GENESIS_FILE" << EOF
+# Minimum stake: 100,000 QRDX = 100,000 * 10^18 wei = 0x152d02c7e14af6800000
+MIN_STAKE_HEX="0x152d02c7e14af6800000"
+MIN_STAKE_WEI="100000000000000000000000"  # For validators array
+
+echo -e "${CYAN}Creating genesis configuration...${NC}"
+
+# Start building genesis accounts section
+# Fund test accounts + all validator accounts
+ACCOUNTS_JSON="{"
+ACCOUNTS_JSON+="\"0x0000000000000000000000000000000000000001\":{\"balance\":\"0xd3c21bcecceda1000000\"},"
+ACCOUNTS_JSON+="\"0x1000000000000000000000000000000000000001\":{\"balance\":\"0xd3c21bcecceda1000000\"}"
+
+# Fund each validator account
+# Validator addresses are 0x0000...0000, 0x0000...0001, ... 0x0000...{N-1}
+for i in $(seq 0 $((NUM_NODES - 1))); do
+    VALIDATOR_ADDRESS=$(printf "0x%040x" $i)
+    ACCOUNTS_JSON+=",\"${VALIDATOR_ADDRESS}\":{\"balance\":\"${MIN_STAKE_HEX}\"}"
+done
+
+ACCOUNTS_JSON+="}"
+
+# Create genesis file with accounts
+cat > "$GENESIS_FILE" << GENESIS_END
 {
   "version": "1",
   "params": {
@@ -158,18 +180,12 @@ cat > "$GENESIS_FILE" << EOF
     "extraData": "0x5152445820546573746e6574204765",
     "gasLimit": "0x2faf080"
   },
-  "accounts": {
-    "0x0000000000000000000000000000000000000001": {
-      "balance": "0xd3c21bcecceda1000000"
-    },
-    "0x1000000000000000000000000000000000000001": {
-      "balance": "0xd3c21bcecceda1000000"
-    }
-  }
+  "accounts": ${ACCOUNTS_JSON},
+  "validators": []
 }
-EOF
+GENESIS_END
 
-echo -e "${GREEN}✓ Genesis configuration created${NC}"
+echo -e "${GREEN}✓ Genesis configuration created (will add validators after keystore generation)${NC}"
 
 # Generate validator keystores
 echo ""
@@ -211,6 +227,72 @@ fi
 export QRDX_KEYSTORE_DIR="$KEYSTORE_DIR"
 export QRDX_NUM_VALIDATORS="$NUM_NODES"
 
+# Now add validators array to genesis with public keys from keystores
+echo ""
+echo -e "${CYAN}Adding validators to genesis configuration...${NC}"
+
+# Build validators array using Python to extract public keys
+python3 - "${NUM_NODES}" "${KEYSTORE_DIR}" << 'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+num_nodes = int(sys.argv[1])
+keystore_dir = Path(sys.argv[2])
+
+# Load genesis
+genesis_file = Path("/tmp/qrdx-multi-node-genesis.json")
+with open(genesis_file) as f:
+    genesis = json.load(f)
+
+# Load keystores and build validators array
+validators = []
+
+# Get all keystore files and sort by index
+keystore_files = []
+for ks_path in keystore_dir.glob("*.json"):
+    with open(ks_path) as f:
+        ks_data = json.load(f)
+        # Extract index from path (m/12381/3600/{index}/0/0)
+        path = ks_data.get('path', '')
+        if '/3600/' in path:
+            idx = int(path.split('/3600/')[1].split('/')[0])
+            keystore_files.append((idx, ks_path))
+
+keystore_files.sort(key=lambda x: x[0])
+
+for idx, ks_path in keystore_files[:num_nodes]:
+    with open(ks_path) as f:
+        keystore = json.load(f)
+        pubkey_hex = keystore.get('pubkey', '')
+        
+        if not pubkey_hex:
+            print(f"ERROR: No pubkey in {ks_path}", file=sys.stderr)
+            sys.exit(1)
+    
+    # Create validator entry
+    validator_address = f"0x{idx:040x}"
+    validator = {
+        "index": idx,
+        "address": validator_address,
+        "public_key": f"0x{pubkey_hex}" if not pubkey_hex.startswith('0x') else pubkey_hex,
+        "stake": "100000000000000000000000",
+        "status": "ACTIVE",
+        "activation_epoch": 0
+    }
+    validators.append(validator)
+
+# Update genesis
+genesis['validators'] = validators
+
+# Write back
+with open(genesis_file, 'w') as f:
+    json.dump(genesis, f, indent=2)
+
+print(f"✓ Added {len(validators)} validators to genesis")
+PYEOF
+
+echo -e "${GREEN}✓ Genesis configuration complete with ${NUM_NODES} funded validators${NC}"
 echo ""
 
 # Generate node keys and start nodes
@@ -273,6 +355,9 @@ for i in $(seq 0 $((NUM_NODES - 1))); do
     
     # Start Trinity node
     LOG_FILE="${DATA_DIR}/trinity.log"
+    
+    # Set PYTHONPATH for proper module loading
+    export PYTHONPATH="/workspaces/qrdx-chain/lahja:/workspaces/qrdx-chain/async-service:/workspaces/qrdx-chain/asyncio-run-in-process:/workspaces/qrdx-chain:$PYTHONPATH"
     
     nohup trinity \
         --data-dir "$DATA_DIR" \

@@ -1,4 +1,4 @@
-name: Build Docker Image
+name: Build Docker Images
 
 on:
   workflow_dispatch:
@@ -11,13 +11,19 @@ on:
         description: 'Push to registry (true/false)'
         required: false
         default: 'false'
+      build_target:
+        description: 'Build target (node/validator/both)'
+        required: false
+        default: 'both'
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME_NODE: ${{ github.repository }}/qrdx-node
+  IMAGE_NAME_VALIDATOR: ${{ github.repository }}/qrdx-validator
 
 jobs:
-  build:
+  build-node:
+    if: github.event.inputs.build_target == 'node' || github.event.inputs.build_target == 'both'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -40,40 +46,100 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
+      - name: Extract metadata (node)
+        id: meta-node
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_NODE }}
           tags: |
             type=raw,value=${{ github.event.inputs.tag }}
             type=raw,value=latest,enable=${{ github.event.inputs.tag == 'latest' }}
             type=sha,prefix={{branch}}-
 
-      - name: Build Docker image
+      - name: Build qrdx-node image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./docker/Dockerfile
+          file: ./docker/Dockerfile.node
           push: ${{ github.event.inputs.push == 'true' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta-node.outputs.tags }}
+          labels: ${{ steps.meta-node.outputs.labels }}
+          cache-from: type=gha,scope=node
+          cache-to: type=gha,mode=max,scope=node
           platforms: linux/amd64
 
-      - name: Image details
+  build-validator:
+    if: github.event.inputs.build_target == 'validator' || github.event.inputs.build_target == 'both'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: github.event.inputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (validator)
+        id: meta-validator
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_VALIDATOR }}
+          tags: |
+            type=raw,value=${{ github.event.inputs.tag }}
+            type=raw,value=latest,enable=${{ github.event.inputs.tag == 'latest' }}
+            type=sha,prefix={{branch}}-
+
+      - name: Build qrdx-validator image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.validator
+          push: ${{ github.event.inputs.push == 'true' }}
+          tags: ${{ steps.meta-validator.outputs.tags }}
+          labels: ${{ steps.meta-validator.outputs.labels }}
+          cache-from: type=gha,scope=validator
+          cache-to: type=gha,mode=max,scope=validator
+          platforms: linux/amd64
+
+  summary:
+    needs: [build-node, build-validator]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build summary
         run: |
           echo "## Docker Build Complete! 🐳" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** ${{ github.event.inputs.tag }}" >> $GITHUB_STEP_SUMMARY
           echo "**Pushed:** ${{ github.event.inputs.push }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** ${{ github.event.inputs.build_target }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ github.event.inputs.push }}" == "true" ]; then
-            echo "### Pull the image:" >> $GITHUB_STEP_SUMMARY
+            echo "### Pull the images:" >> $GITHUB_STEP_SUMMARY
             echo '```bash' >> $GITHUB_STEP_SUMMARY
-            echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ github.event.inputs.build_target }}" == "node" ] || [ "${{ github.event.inputs.build_target }}" == "both" ]; then
+              echo "# Full Node" >> $GITHUB_STEP_SUMMARY
+              echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_NODE }}:${{ github.event.inputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            fi
+            if [ "${{ github.event.inputs.build_target }}" == "validator" ] || [ "${{ github.event.inputs.build_target }}" == "both" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "# Validator Node" >> $GITHUB_STEP_SUMMARY
+              echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_VALIDATOR }}:${{ github.event.inputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            fi
             echo '```' >> $GITHUB_STEP_SUMMARY
           else
-            echo "ℹ️ Image was built but not pushed to registry." >> $GITHUB_STEP_SUMMARY
+            echo "ℹ️ Images were built but not pushed to registry." >> $GITHUB_STEP_SUMMARY
           fi
