@@ -1,4 +1,6 @@
 FROM python:3.12-slim
+LABEL org.opencontainers.image.source https://github.com/qrdx-org/qrdx-chain
+LABEL org.opencontainers.image.license MIT
 
 # Install system dependencies including liboqs build requirements
 RUN apt-get update && apt-get install -y \
