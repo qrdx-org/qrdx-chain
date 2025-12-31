@@ -188,6 +188,7 @@ class QRPoSNewBlock(BaseCommand[QRPoSNewBlockPayload]):
             sedes.binary,          # signature
             sedes.big_endian_int,  # validator_index
             sedes.big_endian_int,  # slot
+            sedes.CountableList(sedes.binary),  # attestations (RLP-encoded)
         )),
         process_inbound_payload_fn=compose(
             lambda args: QRPoSNewBlockPayload(*args),

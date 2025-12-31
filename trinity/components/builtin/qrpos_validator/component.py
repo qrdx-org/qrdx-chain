@@ -42,8 +42,186 @@ from eth.constants import EMPTY_UNCLE_HASH, GENESIS_PARENT_HASH
 from eth_typing import Hash32
 import rlp
 
+# Balance-based stake verification
+from eth.consensus.balance_stake_verifier import (
+    verify_validator_stakes_from_state,
+    ValidatorInfo as BalanceValidatorInfo,
+    MIN_STAKE,
+)
+
 
 logger = get_logger('trinity.components.QRPoSValidator')
+
+
+def load_validators_with_balance_verification(
+    genesis_file_path,
+    keystore_dir_path,
+    state=None,
+):
+    """
+    Load validators with balance-based stake verification.
+    
+    DEFAULT MODE: Verify balances from state (production-ready)
+    Set USE_ONCHAIN_VALIDATORS=false to skip balance verification (development/testing)
+    
+    Staking Model: Validators must hold >= 100k QRDX in their address.
+    No smart contract registration needed - just hold the tokens.
+    
+    Args:
+        genesis_file_path: Path to genesis.json file
+        keystore_dir_path: Path to keystore directory  
+        state: State object for balance checking (if None, skips verification)
+        
+    Returns:
+        List of Validator objects
+    """
+    from eth.consensus.qrpos import Validator, ValidatorStatus, MIN_STAKE as CONSENSUS_MIN_STAKE
+    from eth.crypto import DilithiumPublicKey
+    from pathlib import Path
+    import json
+    
+    # Load validator list from genesis
+    genesis_path = Path(genesis_file_path)
+    with open(genesis_path, 'r') as f:
+        genesis_data = json.load(f)
+    
+    genesis_validators = genesis_data.get('validators', [])
+    
+    # Verify balances from state if available
+    if state:
+        try:
+            logger.info("Verifying validator stakes from chain state...")
+            
+            # Check balances directly from state database
+            validator_infos = verify_validator_stakes_from_state(
+                state=state,
+                validators=genesis_validators,
+                min_stake=MIN_STAKE,
+            )
+            
+            if validator_infos:
+                logger.info(
+                    f"✅ Verified {len(validator_infos)} validators with sufficient balance "
+                    f"(total stake: {sum(v.balance for v in validator_infos) / 10**18:,.0f} QRDX)"
+                )
+                
+                # Convert balance validator info to consensus Validator objects
+                validators = []
+                for vi in validator_infos:
+                    validator = Validator(
+                        index=vi.validator_index,
+                        public_key=vi.dilithium_public_key,
+                        address=to_canonical_address(vi.address),
+                        stake=vi.balance,  # ✅ FROM BALANCE - on-chain verified
+                        status=ValidatorStatus.ACTIVE,
+                        activation_epoch=0,
+                        exit_epoch=None,
+                        slashed=False,
+                    )
+                    validators.append(validator)
+                
+                logger.info(
+                    "🔒 Using balance-based stake verification (production-ready). "
+                    "Stake verified from chain state database."
+                )
+                return validators
+            
+        except Exception as e:
+            logger.warning(
+                f"⚠️  Failed to verify balances from state: {e}. "
+                f"Falling back to genesis without verification..."
+            )
+    else:
+        logger.warning(
+            "⚠️  State not available for balance verification. "
+            "Using genesis without balance checks (not production-ready)."
+        )
+    
+    # Fallback to genesis-based loading
+    logger.info("Loading validators from genesis configuration...")
+    
+    genesis_file = Path(genesis_file_path)
+    if not genesis_file.exists():
+        raise FileNotFoundError(
+            f"Genesis file not found: {genesis_file}. "
+            f"Set GENESIS_FILE environment variable or ensure testnet script created it."
+        )
+    
+    with open(genesis_file) as f:
+        genesis_config = json.load(f)
+    
+    validators_config = genesis_config.get('validators', [])
+    if not validators_config:
+        raise ValueError(
+            f"No validators in genesis configuration at {genesis_file}. "
+            f"Genesis must include 'validators' array with stake information."
+        )
+    
+    logger.info(f"Loading {len(validators_config)} validators from genesis")
+    
+    keystore_dir = Path(keystore_dir_path)
+    if not keystore_dir.exists():
+        raise FileNotFoundError(f"Keystore directory not found: {keystore_dir}")
+    
+    validators = []
+    
+    for val_config in validators_config:
+        val_index = val_config['index']
+        val_address = to_canonical_address(val_config['address'])
+        stake_wei = int(val_config['stake'])
+        
+        # CRITICAL: Verify minimum stake requirement
+        if stake_wei < MIN_STAKE:
+            raise ValueError(
+                f"Validator {val_index} has insufficient stake! "
+                f"Got: {stake_wei / 10**18:,.0f} QRDX, "
+                f"Required: {MIN_STAKE / 10**18:,.0f} QRDX (minimum per whitepaper). "
+                f"Cannot start validator without proper stake."
+            )
+        
+        # Load public key from keystore
+        keystore_found = False
+        for ks_file in keystore_dir.glob("*.json"):
+            with open(ks_file) as f:
+                ks_data = json.load(f)
+                ks_path = ks_data.get("path", "")
+                if f"/3600/{val_index}/" in ks_path:
+                    pub_key_hex = ks_data.get("pubkey")
+                    if not pub_key_hex:
+                        raise ValueError(f"No pubkey in {ks_file}")
+                    pub_bytes = bytes.fromhex(pub_key_hex)
+                    keystore_found = True
+                    break
+        
+        if not keystore_found:
+            raise FileNotFoundError(
+                f"No keystore found for validator {val_index} in {keystore_dir}"
+            )
+        
+        validator_pubkey = DilithiumPublicKey(pub_bytes)
+        
+        validator = Validator(
+            index=val_index,
+            public_key=validator_pubkey.to_bytes(),
+            address=val_address,
+            stake=stake_wei,  # ⚠️ FROM GENESIS - can be modified locally
+            status=ValidatorStatus.ACTIVE,
+            activation_epoch=0,
+            exit_epoch=None,
+            slashed=False,
+        )
+        validators.append(validator)
+    
+    logger.info(
+        f"✅ Loaded {len(validators)} validators from genesis "
+        f"(total stake: {sum(v.stake for v in validators) / 10**18:,.0f} QRDX)"
+    )
+    logger.warning(
+        f"⚠️ Genesis without balance verification is NOT production-ready. "
+        f"Provide state object to enable balance verification."
+    )
+    
+    return validators
 
 
 class QRPoSValidatorService(Service):
@@ -695,114 +873,39 @@ class QRPoSValidatorComponent(AsyncioIsolatedComponent):
             
             logger.info(f"Generated deterministic Dilithium keypair for validator {validator_index}")
             
-            # Get genesis time from genesis block timestamp
-            log_debug("Getting genesis time from chain...")
+            # Get genesis time and state from chain
+            log_debug("Getting genesis time and state from chain...")
             from trinity._utils.connect import get_eth1_chain_with_remote_db
             with get_eth1_chain_with_remote_db(self._boot_info, event_bus) as chain:
                 genesis_header = chain.get_canonical_block_header_by_number(BlockNumber(0))
                 genesis_time = genesis_header.timestamp
+                # Get state for balance verification using VM
+                genesis_vm = chain.get_vm(genesis_header)
+                genesis_state = genesis_vm.state
             log_debug(f"Genesis timestamp from header: {genesis_time}")
             logger.info(f"Genesis block timestamp: {genesis_time}")
             
-            # Create genesis validator set
-            # Load validators from genesis configuration file
-            # This ensures stake requirements are enforced (100k QRDX minimum)
-            log_debug("Loading validators from genesis configuration...")
-            from eth.consensus.qrpos import Validator, ValidatorSet, ValidatorStatus, MIN_STAKE
-            from eth_utils import to_canonical_address
-            import hashlib
+            # Load validators with balance verification from state
+            log_debug("Loading validators with balance verification from chain state...")
+            from eth.consensus.qrpos import ValidatorSet
             import os
-            import json
             from pathlib import Path
             
-            # Determine genesis file location
-            genesis_file = Path(os.environ.get('GENESIS_FILE', '/tmp/qrdx-multi-node-genesis.json'))
-            if not genesis_file.exists():
-                raise FileNotFoundError(
-                    f"Genesis file not found: {genesis_file}. "
-                    f"Set GENESIS_FILE environment variable or ensure testnet script created it."
-                )
+            # Check if balance verification enabled
+            use_balance_verification = os.environ.get('USE_ONCHAIN_VALIDATORS', 'true').lower() == 'true'
             
-            # Load genesis configuration
-            with open(genesis_file) as f:
-                genesis_config = json.load(f)
+            # Determine file paths
+            genesis_file = os.environ.get('GENESIS_FILE', '/tmp/qrdx-multi-node-genesis.json')
+            keystore_dir = os.environ.get("QRDX_KEYSTORE_DIR", "/tmp/qrdx-validator-keys")
             
-            # Extract validators array
-            validators_config = genesis_config.get('validators', [])
-            if not validators_config:
-                raise ValueError(
-                    f"No validators in genesis configuration at {genesis_file}. "
-                    f"Genesis must include 'validators' array with stake information."
-                )
-            
-            logger.info(f"Loading {len(validators_config)} validators from genesis")
-            
-            # Verify keystore directory
-            keystore_dir = Path(os.environ.get("QRDX_KEYSTORE_DIR", "/tmp/qrdx-validator-keys"))
-            if not keystore_dir.exists():
-                raise FileNotFoundError(f"Keystore directory not found: {keystore_dir}")
-            
-            genesis_validators = []
-            
-            for val_config in validators_config:
-                # Extract validator info from genesis
-                val_index = val_config['index']
-                val_address = to_canonical_address(val_config['address'])
-                stake_wei = int(val_config['stake'])
-                
-                # CRITICAL: Verify minimum stake requirement
-                if stake_wei < MIN_STAKE:
-                    raise ValueError(
-                        f"Validator {val_index} has insufficient stake! "
-                        f"Got: {stake_wei / 10**18:,.0f} QRDX, "
-                        f"Required: {MIN_STAKE / 10**18:,.0f} QRDX (minimum per whitepaper). "
-                        f"Cannot start validator without proper stake."
-                    )
-                
-                # Load public key from keystore (match by index)
-                keystore_found = False
-                for ks_file in keystore_dir.glob("*.json"):
-                    with open(ks_file) as f:
-                        ks_data = json.load(f)
-                        # Check if this keystore is for this validator (by path index)
-                        ks_path = ks_data.get("path", "")
-                        if f"/3600/{val_index}/" in ks_path:
-                            pub_key_hex = ks_data.get("pubkey")
-                            if not pub_key_hex:
-                                raise ValueError(f"No pubkey in {ks_file}")
-                            pub_bytes = bytes.fromhex(pub_key_hex)
-                            keystore_found = True
-                            break
-                
-                if not keystore_found:
-                    raise FileNotFoundError(
-                        f"No keystore found for validator {val_index} in {keystore_dir}"
-                    )
-                
-                validator_pubkey = DilithiumPublicKey(pub_bytes)
-                
-                validator = Validator(
-                    index=val_index,
-                    public_key=validator_pubkey.to_bytes(),
-                    address=val_address,
-                    stake=stake_wei,  # ✅ FROM GENESIS - enforced above
-                    status=ValidatorStatus.ACTIVE,
-                    activation_epoch=0,
-                    exit_epoch=None,
-                    slashed=False,
-                )
-                genesis_validators.append(validator)
-                
-                log_debug(
-                    f"Loaded validator {val_index}: "
-                    f"address={val_address.hex()}, "
-                    f"stake={stake_wei / 10**18:,.0f} QRDX"
-                )
-            
-            logger.info(
-                f"Loaded {len(genesis_validators)} validators from genesis "
-                f"(total stake: {sum(v.stake for v in genesis_validators) / 10**18:,.0f} QRDX)"
+            # Load validators using balance verification
+            log_debug(f"Calling load_validators_with_balance_verification(genesis={genesis_file})")
+            genesis_validators = load_validators_with_balance_verification(
+                genesis_file_path=genesis_file,
+                keystore_dir_path=keystore_dir,
+                state=genesis_state if use_balance_verification else None,
             )
+            log_debug(f"Loaded {len(genesis_validators)} validators")
             
             validator_set = ValidatorSet(genesis_validators=genesis_validators)
             log_debug(f"Created validator set with {len(validator_set.validators)} validators")

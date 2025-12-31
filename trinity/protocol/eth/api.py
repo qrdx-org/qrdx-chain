@@ -242,12 +242,20 @@ class BaseETHAPI(Application):
                              total_difficulty: int,
                              signature: bytes,
                              validator_index: int,
-                             slot: int) -> None:
+                             slot: int,
+                             attestations: list = None) -> None:
         """Send QR-PoS block with Dilithium signature to peer."""
         # generalize transactions to hand off over network
         transactions = rlp.decode(rlp.encode(block.transactions))
         block_fields = BlockFields(block.header, transactions, block.uncles)
-        payload = QRPoSNewBlockPayload(block_fields, total_difficulty, signature, validator_index, slot)
+        payload = QRPoSNewBlockPayload(
+            block_fields, 
+            total_difficulty, 
+            signature, 
+            validator_index, 
+            slot,
+            attestations or []  # Include attestations
+        )
         self.protocol.send(QRPoSNewBlock(payload))
 
 

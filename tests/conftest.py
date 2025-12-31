@@ -273,7 +273,6 @@ def chain_without_block_validation(
     return chain
 
 
-@pytest.mark.asyncio
 @pytest.fixture
 async def ipc_server(
         monkeypatch,

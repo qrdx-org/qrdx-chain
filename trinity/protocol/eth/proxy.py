@@ -283,7 +283,8 @@ class ProxyETHAPI:
                              total_difficulty: int,
                              signature: bytes,
                              validator_index: int,
-                             slot: int) -> None:
+                             slot: int,
+                             attestations: list = None) -> None:
         """Send QR-PoS block with Dilithium signature to peer."""
         from trinity.rlp.block_body import BlockBody
         import rlp
@@ -291,7 +292,14 @@ class ProxyETHAPI:
         # Generalize transactions to hand off over network
         transactions = rlp.decode(rlp.encode(block.transactions))
         block_fields = BlockFields(block.header, transactions, block.uncles)
-        payload = QRPoSNewBlockPayload(block_fields, total_difficulty, signature, validator_index, slot)
+        payload = QRPoSNewBlockPayload(
+            block_fields, 
+            total_difficulty, 
+            signature, 
+            validator_index, 
+            slot,
+            attestations or []  # Include attestations
+        )
         command = QRPoSNewBlock(payload)
         self._event_bus.broadcast_nowait(
             SendQRPoSNewBlockEvent(self.session, command),

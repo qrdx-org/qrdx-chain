@@ -6,6 +6,10 @@ from typing import (
     Iterable,
     List,
     Tuple,
+    Set,
+    Dict,
+    Optional,
+    Any,
 )
 
 from async_service import (
@@ -16,7 +20,7 @@ from eth.abc import (
     BlockAPI,
 )
 from eth.exceptions import HeaderNotFound
-from eth_typing import BlockNumber
+from eth_typing import BlockNumber, Hash32
 from eth_utils import (
     ValidationError,
     humanize_hash,
@@ -27,6 +31,14 @@ from eth.consensus.qrpos import QRPoSConsensus
 from lahja import EndpointAPI
 from pyformance import MetricsRegistry
 import trio
+
+# On-chain stake verification
+from eth.consensus.balance_stake_verifier import (
+    verify_validator_stakes_from_state,
+    MIN_STAKE,
+)
+# Import shared validator loading function from validator component
+from trinity.components.builtin.qrpos_validator.component import load_validators_with_balance_verification
 
 from p2p.abc import SessionAPI
 from trinity.boot_info import BootInfo
@@ -105,6 +117,9 @@ class NewBlockService(Service):
         self._peer_block_tracker: DefaultDict[bytes, List[str]] = collections.defaultdict(list)
         self._boot_info = boot_info
         self._consensus = None  # Will be initialized in run()
+        # Buffer for blocks waiting for their parent
+        self._pending_blocks: Dict[bytes, List[Tuple[Any, int]]] = {}  # parent_hash -> [(event, retry_count), ...]
+        self._requested_blocks: Set[bytes] = set()  # Track requested block hashes
 
     async def run(self) -> None:
         self.logger.info("NewBlockService starting up - initializing consensus...")
@@ -131,6 +146,8 @@ class NewBlockService(Service):
     async def _initialize_consensus(self) -> QRPoSConsensus:
         """
         Initialize QRPoSConsensus for validating incoming attestations.
+        Uses hybrid on-chain/genesis validator loading for production-ready verification.
+        
         Returns None if initialization fails (non-critical, just disables attestation validation).
         Will retry a few times since keystores may not exist yet on startup.
         """
@@ -139,17 +156,13 @@ class NewBlockService(Service):
                 import os
                 import json
                 from pathlib import Path
-                from eth.consensus.qrpos import Validator, ValidatorSet, ValidatorStatus, MIN_STAKE
-                from eth_utils import to_canonical_address
-                from eth.crypto import DilithiumPublicKey
+                from eth.consensus.qrpos import ValidatorSet
                 
                 # Determine genesis file location
-                # Try data directory first, then fall back to environment variable
                 data_dir = Path(self._boot_info.trinity_config.data_dir)
                 genesis_file = data_dir / "genesis.json"
                 
                 if not genesis_file.exists():
-                    # Fall back to environment variable
                     genesis_file = Path(os.environ.get('GENESIS_FILE', '/tmp/qrdx-multi-node-genesis.json'))
                 
                 if not genesis_file.exists():
@@ -161,77 +174,40 @@ class NewBlockService(Service):
                         self.logger.warning(f"No genesis file found after 5 attempts, cannot initialize consensus")
                         return None
                 
-                # Load genesis configuration
+                # Load genesis timestamp
                 with open(genesis_file, 'r') as f:
                     genesis_config = json.load(f)
                 
-                # Extract genesis time
                 genesis_timestamp_hex = genesis_config.get('genesis', {}).get('timestamp', '0x0')
                 genesis_time = int(genesis_timestamp_hex, 16)
                 self.logger.debug(f"Loaded genesis time from {genesis_file}: {genesis_time}")
                 
-                # Extract validators array
-                validators_config = genesis_config.get('validators', [])
-                if not validators_config:
-                    self.logger.warning(f"No validators in genesis configuration, cannot initialize consensus")
-                    return None
+                # Get state for balance verification
+                use_balance_verification = os.environ.get('USE_ONCHAIN_VALIDATORS', 'true').lower() == 'true'
                 
-                self.logger.info(f"Loading {len(validators_config)} validators from genesis for block validation")
+                # Get genesis state for balance checking
+                from trinity._utils.connect import get_eth1_chain_with_remote_db
+                with get_eth1_chain_with_remote_db(self._boot_info, self._event_bus) as chain:
+                    genesis_header = chain.get_canonical_block_header_by_number(0)
+                    genesis_vm = chain.get_vm(genesis_header)
+                    genesis_state = genesis_vm.state
                 
                 # Get keystore directory
-                keystore_dir = Path(os.environ.get("QRDX_KEYSTORE_DIR", "/tmp/qrdx-validator-keys"))
+                keystore_dir = os.environ.get("QRDX_KEYSTORE_DIR", "/tmp/qrdx-validator-keys")
                 
-                # Create validators from genesis configuration
-                genesis_validators = []
-                for val_config in validators_config:
-                    val_index = val_config['index']
-                    val_address = to_canonical_address(val_config['address'])
-                    stake_wei = int(val_config['stake'])
-                    
-                    # Verify minimum stake (same check as validator component)
-                    if stake_wei < MIN_STAKE:
-                        self.logger.warning(
-                            f"Validator {val_index} has insufficient stake "
-                            f"({stake_wei / 10**18:,.0f} < {MIN_STAKE / 10**18:,.0f} QRDX), skipping"
-                        )
-                        continue
-                    
-                    # Load public key from validator config (if available) or keystore
-                    pub_key_hex = val_config.get('public_key', '').replace('0x', '')
-                    
-                    if not pub_key_hex and keystore_dir.exists():
-                        # Try to load from keystore as fallback
-                        for ks_file in keystore_dir.glob("*.json"):
-                            with open(ks_file) as f:
-                                ks_data = json.load(f)
-                                if f"/3600/{val_index}/" in ks_data.get("path", ""):
-                                    pub_key_hex = ks_data.get("pubkey", "")
-                                    break
-                    
-                    if not pub_key_hex:
-                        self.logger.warning(f"No public key found for validator {val_index}, skipping")
-                        continue
-                    
-                    pub_key = DilithiumPublicKey(bytes.fromhex(pub_key_hex))
-                    
-                    validator = Validator(
-                        index=val_index,
-                        public_key=pub_key.to_bytes(),
-                        stake=stake_wei,  # ✅ FROM GENESIS
-                        status=ValidatorStatus.ACTIVE,
-                        address=val_address,
-                        activation_epoch=0,
-                        exit_epoch=None,
-                        slashed=False,
-                    )
-                    genesis_validators.append(validator)
+                # Load validators with balance verification from state
+                genesis_validators = load_validators_with_balance_verification(
+                    genesis_file_path=str(genesis_file),
+                    keystore_dir_path=keystore_dir,
+                    state=genesis_state if use_balance_verification else None,
+                )
                 
                 if not genesis_validators:
                     self.logger.warning("No validators loaded, cannot initialize consensus")
                     return None
                 
                 validator_set = ValidatorSet(genesis_validators=genesis_validators)
-                self.logger.info(f"Loaded {len(genesis_validators)} validators for consensus")
+                self.logger.info(f"✅ Loaded {len(genesis_validators)} validators for block validation")
                 
                 # Create consensus instance
                 consensus = QRPoSConsensus(
@@ -516,6 +492,9 @@ class NewBlockService(Service):
                 "Broadcast QR-PoS block #%d to peers with Dilithium signature",
                 header.block_number,
             )
+            
+            # Check if any pending blocks can now be imported
+            await self._try_import_pending_blocks(header.hash)
 
     async def _handle_qrpos_attestations(self) -> None:
         """Handle QR-PoS attestations created by local validator."""
@@ -639,8 +618,36 @@ class NewBlockService(Service):
                         event.command.payload.signature
                     )
                     
-                    # Get attestations for this block and process for finality
-                    attestations = chain.chaindb.get_qrpos_attestations(header.hash)
+                    # Store attestations received from peer (if any)
+                    from eth.consensus.qrpos import Attestation
+                    attestations = []
+                    if event.command.payload.attestations:
+                        # Decode RLP attestations from payload
+                        import rlp
+                        from rlp.sedes import big_endian_int, binary
+                        from eth_typing import Hash32
+                        
+                        for att_rlp in event.command.payload.attestations:
+                            att_data = rlp.decode(att_rlp, sedes=rlp.sedes.List([
+                                big_endian_int,  # slot
+                                binary,          # block_hash  
+                                big_endian_int,  # validator_index
+                                binary,          # signature
+                            ]))
+                            attestations.append(Attestation(
+                                slot=att_data[0],
+                                block_hash=Hash32(att_data[1]),
+                                validator_index=att_data[2],
+                                signature=att_data[3],
+                            ))
+                        
+                        # Persist attestations
+                        chain.chaindb.persist_qrpos_attestations(header.hash, attestations)
+                        self.logger.debug(
+                            "Persisted %d attestations for block #%d from peer",
+                            len(attestations),
+                            header.block_number,
+                        )
                     if attestations and self._consensus:
                         finality_gadget = self._consensus.finality_gadget
                         slot = event.command.payload.slot
@@ -692,6 +699,40 @@ class NewBlockService(Service):
                         humanize_hash(header.hash),
                     )
                     
+            except ValidationError as e:
+                # Check if this is a missing parent error
+                if "Cannot import block" in str(e) and "before importing its parent" in str(e):
+                    parent_hash = header.parent_hash
+                    
+                    # Store block for later (max 3 retries)
+                    if parent_hash not in self._pending_blocks:
+                        self._pending_blocks[parent_hash] = []
+                    self._pending_blocks[parent_hash].append((event, 0))
+                    
+                    self.logger.info(
+                        "Buffering block #%d (waiting for parent %s), %d parent hashes pending",
+                        header.block_number,
+                        encode_hex(parent_hash[:8]),
+                        len(self._pending_blocks),
+                    )
+                    
+                    # Request the missing parent from peer if not already requested
+                    if parent_hash not in self._requested_blocks:
+                        self._requested_blocks.add(parent_hash)
+                        # Note: Block hash request would go here
+                        # For now, we wait for natural sync
+                        self.logger.debug(
+                            "Need parent block %s for #%d",
+                            encode_hex(parent_hash[:8]),
+                            header.block_number,
+                        )
+                else:
+                    self.logger.error(
+                        "Failed to import QR-PoS block from peer %s: %s",
+                        event.session,
+                        e,
+                        exc_info=True
+                    )
             except Exception as e:
                 self.logger.error(
                     "Failed to import QR-PoS block from peer %s: %s",
@@ -699,7 +740,92 @@ class NewBlockService(Service):
                     e,
                     exc_info=True
                 )
+            else:
+                # Block imported successfully - check if any pending blocks can now be imported
+                await self._try_import_pending_blocks(header.hash)
 
+    async def _try_import_pending_blocks(self, imported_hash: Hash32) -> None:
+        """Try to import blocks that were waiting for this block as parent."""
+        if imported_hash not in self._pending_blocks:
+            return
+        
+        # Get all blocks waiting for this parent
+        blocks_to_retry = []
+        if imported_hash in self._pending_blocks:
+            blocks_to_retry = self._pending_blocks.pop(imported_hash)
+            if not isinstance(blocks_to_retry, list):
+                blocks_to_retry = [blocks_to_retry]
+        
+        # Remove from requested set
+        self._requested_blocks.discard(imported_hash)
+        
+        for pending_event, retry_count in blocks_to_retry:
+            if retry_count >= 3:
+                self.logger.warning(
+                    "Dropping block after 3 failed retries (parent: %s)",
+                    encode_hex(imported_hash[:8]),
+                )
+                continue
+            
+            self.logger.info(
+                "Retrying import of pending block (parent now available: %s)",
+                encode_hex(imported_hash[:8]),
+            )
+            
+            # Update retry count and re-add to pending if needed
+            try:
+                # Try to import the block
+                payload = pending_event.command.payload
+                header = payload.block.header
+                block = payload.block
+                
+                # Import via chain
+                chain = self.chain
+                chain.import_block(block, perform_validation=True)
+                
+                # Persist attestations if present
+                if payload.attestations:
+                    for attestation_bytes in payload.attestations:
+                        chain.chaindb.persist_qrpos_attestation(
+                            header.block_number,
+                            attestation_bytes
+                        )
+                
+                self.logger.info(
+                    "Successfully imported pending block #%d (hash: %s)",
+                    header.block_number,
+                    humanize_hash(header.hash),
+                )
+                
+                # Check if this block unblocks other pending blocks
+                await self._try_import_pending_blocks(header.hash)
+                
+            except ValidationError as e:
+                if "Cannot import block" in str(e) and "before importing its parent" in str(e):
+                    # Still missing parent, re-buffer with incremented retry count
+                    new_parent_hash = header.parent_hash
+                    if new_parent_hash not in self._pending_blocks:
+                        self._pending_blocks[new_parent_hash] = []
+                    self._pending_blocks[new_parent_hash].append((pending_event, retry_count + 1))
+                    self.logger.debug(
+                        "Re-buffering block #%d (still waiting for parent %s), retry %d/3",
+                        header.block_number,
+                        encode_hex(new_parent_hash[:8]),
+                        retry_count + 1,
+                    )
+                else:
+                    self.logger.error(
+                        "Failed to import pending block: %s",
+                        e,
+                        exc_info=True
+                    )
+            except Exception as e:
+                self.logger.error(
+                    "Failed to import pending block: %s",
+                    e,
+                    exc_info=True
+                )
+    
     async def _broadcast_attestations(self, events: list) -> None:
         """Broadcast attestations to all connected peers."""
         from trinity.protocol.eth.payloads import AttestationPayload
@@ -815,14 +941,48 @@ class NewBlockService(Service):
         all_peers = await self._peer_pool.get_peers()
         eligible_peers = self._filter_eligible_peers(all_peers, block.hash)
         
+        # Retrieve attestations for this block to include in broadcast
+        import rlp
+        from rlp.sedes import big_endian_int, binary
+        attestations_rlp = []
+        try:
+            from trinity._utils.connect import get_eth1_chain_with_remote_db
+            with get_eth1_chain_with_remote_db(self._boot_info, self._event_bus) as chain:
+                attestations = chain.chaindb.get_qrpos_attestations(block.hash)
+                # Encode each attestation as RLP for wire protocol
+                for att in attestations:
+                    att_rlp = rlp.encode([
+                        att.slot,
+                        att.block_hash,
+                        att.validator_index,
+                        att.signature,
+                    ], sedes=rlp.sedes.List([
+                        big_endian_int,
+                        binary,
+                        big_endian_int,
+                        binary,
+                    ]))
+                    attestations_rlp.append(att_rlp)
+                self.logger.debug(
+                    "Including %d attestations in block #%d broadcast",
+                    len(attestations_rlp),
+                    block.number,
+                )
+        except KeyError:
+            # No attestations for this block (empty block or genesis)
+            self.logger.debug(
+                "No attestations found for block #%d, broadcasting without",
+                block.number,
+            )
+        
         for peer in eligible_peers:
             self.logger.debug(
-                "Sending QRPoSNewBlock(#%d, sig_size=%d bytes) to %s", 
-                block.number, len(signature), peer
+                "Sending QRPoSNewBlock(#%d, sig_size=%d bytes, %d attestations) to %s", 
+                block.number, len(signature), len(attestations_rlp), peer
             )
             target_peer = await self._peer_pool.ensure_proxy_peer(peer.session)
             target_peer.eth_api.send_qrpos_new_block(
-                block, total_difficulty, signature, validator_index, slot
+                block, total_difficulty, signature, validator_index, slot, attestations_rlp
             )
             self._peer_block_tracker[block.hash].append(str(target_peer))
             # add checkpoint here to guarantee the event loop is released per iteration

@@ -54,7 +54,7 @@ deps = {
         "termcolor>=1.1.0,<2.0.0",
         "upnp-port-forward>=0.1.1,<0.2",
         "uvloop>=0.17.0;platform_system=='Linux' or platform_system=='Darwin' or platform_system=='FreeBSD'",  # noqa: E501
-        # "web3>=7.0.0,<8",  # Installed from local
+        # "web3>=6.0.0,<7",  # Installed from local (for StakeTracker contract integration)
         "websockets>=15.0.0,<16",  # Python 3.12 compatible
     ],
     'test': [

@@ -56,3 +56,4 @@ class QRPoSNewBlockPayload(NamedTuple):
     signature: bytes
     validator_index: int
     slot: int
+    attestations: list  # List of RLP-encoded attestation tuples
