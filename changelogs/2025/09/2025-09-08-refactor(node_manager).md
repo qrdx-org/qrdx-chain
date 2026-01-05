@@ -2,7 +2,7 @@
 
 **Contributer**: The-Sycorax (https://github.com/The-Sycorax)
 
-**Commit**: [c55a2bf0f479ef4a00ca6d76925583bd21a82095](https://github.com/The-Sycorax/denaro/commit/c55a2bf0f479ef4a00ca6d76925583bd21a82095)
+**Commit**: [c55a2bf0f479ef4a00ca6d76925583bd21a82095](https://github.com/The-Sycorax/qrdx/commit/c55a2bf0f479ef4a00ca6d76925583bd21a82095)
 
 **Date**: September 8th, 2025
 
@@ -13,13 +13,13 @@
 
   - The built-in HTTP client is removed, and callers now inject a shared `httpx.AsyncClient`. This makes transport handling explicit and decouples client management from peer logic.  
 
-  - All state-changing peer requests are signed using a canonical payload, timestamp, and nonce. Identity headers (`x-node-id`, `x-public-key`, `x-signature`, `x-timestamp`, and `x-nonce`) standardize authentication, while optional `x-denaro-*` headers extend flexibility. The `x-peer-url` header is included when `SELF_URL` is public or when both peers appear to reside on the same LAN.  
+  - All state-changing peer requests are signed using a canonical payload, timestamp, and nonce. Identity headers (`x-node-id`, `x-public-key`, `x-signature`, `x-timestamp`, and `x-nonce`) standardize authentication, while optional `x-qrdx-*` headers extend flexibility. The `x-peer-url` header is included when `SELF_URL` is public or when both peers appear to reside on the same LAN.  
 
   - Peer propagation selects only from nodes that have been seen recently and that advertise a valid URL. This ensures propagation flows through active, reachable peers rather than stale registry entries.  
 
   - HTTP handling is simplified: transport errors are re-raised, `409` responses act as synchronization hints, and successful responses return parsed JSON. Non-`409` HTTP statuses and JSON decode failures yield `None`, leaving error handling to the caller. Legacy features such as chunked streaming and the hex-size guard are removed.  
 
-  - **Bootstrap change:** `NodesManager.init` no longer seeds a default peer when storage is empty. A configurable `MAIN_DENARO_NODE_URL` replaces implicit seeding, but initialization itself does not automatically populate peer state.  
+  - **Bootstrap change:** `NodesManager.init` no longer seeds a default peer when storage is empty. A configurable `MAIN_qrdx_NODE_URL` replaces implicit seeding, but initialization itself does not automatically populate peer state.  
 
 
 ---
@@ -87,7 +87,7 @@
         - Building and signing canonical JSON payloads for state-changing requests.
           - Attaches identity headers: 
             - `x-node-id`, `x-public-key`, `x-signature`, `x-timestamp`, `x-nonce`.        
-          - Supports optional `x-denaro-*` headers for chain context.
+          - Supports optional `x-qrdx-*` headers for chain context.
         
         - Controlling self-URL advertisement:
           - Includes `x-peer-url` only when `SELF_URL` is public, or when both peers appear local (LAN) via IP classification.
@@ -99,7 +99,7 @@
 
     - **New Functions:**
         - `_signed_request`:
-            - Builds a canonical payload, signs it, and attaches identity and optional `x-denaro-*` headers. Includes `x-peer-url` only when allowed (public `SELF_URL` or local-to-local).
+            - Builds a canonical payload, signs it, and attaches identity and optional `x-qrdx-*` headers. Includes `x-peer-url` only when allowed (public `SELF_URL` or local-to-local).
         - `is_url_local`:
             - Resolves hostnames and classifies IPs (private, loopback, and link-local) to determine whether the local URL should be advertised.
         - `push_tx`:
@@ -140,8 +140,8 @@
 
 - ### Constants:
     - `MAX_PEERS_COUNT = 200` (previously `MAX_NODES_COUNT = 100`).
-    - `MAIN_DENARO_NODE_URL` (from `MAIN_DENARO_NODE`) is introduced. **Note:** not used by `NodesManager.init` for seeding.
-    - `SELF_URL` (from `DENARO_SELF_URL`) now gates `x-peer-url` exposure.
+    - `MAIN_qrdx_NODE_URL` (from `MAIN_qrdx_NODE`) is introduced. **Note:** not used by `NodesManager.init` for seeding.
+    - `SELF_URL` (from `qrdx_SELF_URL`) now gates `x-peer-url` exposure.
     - `INACTIVE_NODES_DELTA` is removed.
 
 ---
@@ -155,3 +155,4 @@
     - The legacy client header `Sender-Node` is removed. Identity is now carried via `x-node-id`, `x-public-key`, `x-signature`, `x-timestamp`, and `x-nonce`.
     - The `NodeInterface.base_url` attribute is removed.
     - Bootstrap seeding has been removed. Any initial peers must be provided by higher-level bootstrapping logic.
+

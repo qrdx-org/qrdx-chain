@@ -2,7 +2,7 @@
 
 **Contributer**: The-Sycorax (https://github.com/The-Sycorax)
 
-**Commit**: [563deca4b8c0acfcca16c45eaf46a2271e0182a5](https://github.com/The-Sycorax/denaro/commit/563deca4b8c0acfcca16c45eaf46a2271e0182a5)
+**Commit**: [563deca4b8c0acfcca16c45eaf46a2271e0182a5](https://github.com/The-Sycorax/qrdx/commit/563deca4b8c0acfcca16c45eaf46a2271e0182a5)
 
 **Date**: September 10th, 2025
 
@@ -11,7 +11,7 @@
 ### Overview
 - This commit introduces a GPU accelerated single worker miner that uses PyCUDA to JIT (Just in Time) compile a CUDA kernel for a SHA256 based nonce search over a constant block prefix.
 - Implements integer and fractional difficulty. Integer difficulty requires a suffix match on the previous block hash in hex. Fractional difficulty restricts the next hex digit to a limited uppercase charset.
-- Sends requests to a Denaro node API via HTTP endpoints `/get_mining_info` and `/push_block`. Handles success, stale, and failure statuses.
+- Sends requests to a qrdx node API via HTTP endpoints `/get_mining_info` and `/push_block`. Handles success, stale, and failure statuses.
 - Uses a 90 second refresh window for work to reduce stale results. Performs batched searches with grid step based nonce progression.
 - Provides a configurable CLI and GPU launch parameters.
 - Prepares `PATH` and `LD_LIBRARY_PATH` entries for CUDA toolchain availability. 
@@ -21,7 +21,7 @@
 
 ### Command Line Arguments:
 - `--address`, `-a`: Mining address to receive rewards *(required)*.
-- `--node`, `-n`: URL of the Denaro node API (Default: http://127.0.0.1:3006/).
+- `--node`, `-n`: URL of the qrdx node API (Default: http://127.0.0.1:3006/).
 - `--max-blocks`, `-m`: Max number of blocks to mine before exit (Default: 10).
 - `--gpu-blocks`: CUDA grid blocks per launch (Default: 256).
 - `--gpu-threads`: CUDA threads per block (Default: 256).
@@ -56,7 +56,7 @@
   - Returns: int seconds since epoch.
 
 - **`submit_block`**:
-  - Sends a post request to a Denaro node API at the `/push_block` endpoint. 
+  - Sends a post request to a qrdx node API at the `/push_block` endpoint. 
   - The post request includes the following JSON payload fields: `block_content` as hex, `txs` as provided by the node, and `id` equal to `last_block_id` + 1.  
   - Maps all response messages from the node to their associated constants accordingly.
   - Returns: int `STATUS_*` code.

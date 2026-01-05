@@ -2,14 +2,14 @@
 
 **Contributer**: The-Sycorax (https://github.com/The-Sycorax)
 
-**Commit**: [c55a2bf0f479ef4a00ca6d76925583bd21a82095](https://github.com/The-Sycorax/denaro/commit/c55a2bf0f479ef4a00ca6d76925583bd21a82095)
+**Commit**: [c55a2bf0f479ef4a00ca6d76925583bd21a82095](https://github.com/The-Sycorax/qrdx/commit/c55a2bf0f479ef4a00ca6d76925583bd21a82095)
 
 **Date**: September 8th, 2025
  
 ---
 
 ### Overview & Security:
-  - This change represents a complete networking and security refactor for `denaro/node/main.py`. Denaro nodes now uses authenticated, signed peer-to-peer requests, a structured handshake, and a hardened sync pipeline (with fork handling and pull/push sync). Resource limits and input validation have been tightened across the board. 
+  - This change represents a complete networking and security refactor for `qrdx/node/main.py`. qrdx nodes now uses authenticated, signed peer-to-peer requests, a structured handshake, and a hardened sync pipeline (with fork handling and pull/push sync). Resource limits and input validation have been tightened across the board. 
   
   - Several API endpoints have been replaced or split by trust level (peer vs. external client). A new security subsystem (caches, reputation, DNS protections, query cost accounting) underpins request handling and propagation. Startup and middleware flows have been simplified and made deterministic.
 
@@ -376,7 +376,7 @@
   - `MAX_PENDING_POOL_SIZE`: Mempool size cap for pending transactions.
   - `CONNECTION_TIMEOUT`: Shared HTTP client timeout.
   - `VALID_HEX_PATTERN`, `VALID_ADDRESS_PATTERN`: Input validation patterns.
-  - `MAIN_DENARO_NODE_URL`, `DENARO_SELF_URL`: Bootstrap and self-reachability configuration.
+  - `MAIN_qrdx_NODE_URL`, `qrdx_SELF_URL`: Bootstrap and self-reachability configuration.
 
 ---
 
@@ -394,5 +394,5 @@
   - Added `get_pending_transaction_count` to `database.py`. This function returns the total number of transactions in the pending pool. 
   - Added `remove_all_pending_transactions` to `database.py`. This function truncates the entire `pending_transactions` table.
   - The `get_blocks` function in `database.py` no longer uses `OLD_BLOCKS_TRANSACTIONS_ORDER`.
-  - Moved `schema.sql` to `denaro` sub-directory.
+  - Moved `schema.sql` to `qrdx` sub-directory.
   

@@ -5,11 +5,11 @@
 # Copyright (c) 2024-2025
 #
 # Overview:
-# This bash script automates the setup required to run a Denaro node. It handles system
+# This bash script automates the setup required to run a QRDX node. It handles system
 # package updates, configures environment variables, configures the PostgreSQL database, 
 # sets up a Python virtual environment, installs the required Python dependencies, and 
-# initiates the Denaro node. This script ensures that all prerequisites for operating a
-# Denaro node are met and properly configured accoring to the user's preference.
+# initiates the QRDX node. This script ensures that all prerequisites for operating a
+# QRDX node are met and properly configured accoring to the user's preference.
 
 # Parse command-line arguments for skipping prompts and setting up DB only
 SKIP_APT_INSTALL=false
@@ -26,18 +26,18 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
-echo "Starting Denaro node setup..."
+echo "Starting QRDX node setup..."
 echo ""
 
 # Global variables DB and host config
-POSTGRES_USER="denaro"
-POSTGRES_PASSWORD="denaro"
-DENARO_DATABASE_NAME="denaro"
-DENARO_DATABASE_HOST="127.0.0.1"
-DENARO_NODE_HOST="127.0.0.1"
-DENARO_NODE_PORT="3006"
-DENARO_SELF_URL= ""
-DENARO_BOOTSTRAP_NODE="https://node.denaro.network"
+POSTGRES_USER="qrdx"
+POSTGRES_PASSWORD="qrdx"
+QRDX_DATABASE_NAME="qrdx"
+QRDX_DATABASE_HOST="127.0.0.1"
+QRDX_NODE_HOST="127.0.0.1"
+QRDX_NODE_PORT="3006"
+QRDX_SELF_URL= ""
+QRDX_BOOTSTRAP_NODE="https://node.qrdx.network"
 LOG_LEVEL="INFO"
 LOG_CONSOLE_HIGHLIGHTING="True"
 
@@ -175,7 +175,7 @@ load_env_variables() {
     if [[ -f "$env_file" ]]; then
         #echo "Loading existing configurations..."
         while IFS='=' read -r key value; do
-            if [[ $key == POSTGRES_USER || $key == POSTGRES_PASSWORD || $key == DENARO_DATABASE_NAME || $key == DENARO_DATABASE_HOST || $key == DENARO_NODE_HOST || $key == DENARO_NODE_PORT || $key == DENARO_SELF_URL || $key == DENARO_BOOTSTRAP_NODE || $key == LOG_LEVEL || $key == LOG_CONSOLE_HIGHLIGHTING ]]; then
+            if [[ $key == POSTGRES_USER || $key == POSTGRES_PASSWORD || $key == QRDX_DATABASE_NAME || $key == QRDX_DATABASE_HOST || $key == QRDX_NODE_HOST || $key == QRDX_NODE_PORT || $key == QRDX_SELF_URL || $key == QRDX_BOOTSTRAP_NODE || $key == LOG_LEVEL || $key == LOG_CONSOLE_HIGHLIGHTING ]]; then
                 eval $key="'$value'"
             fi
         done < "$env_file"
@@ -196,12 +196,12 @@ identify_missing_variables() {
     # Check each variable to see if it's present and has a value
     grep -qE "^POSTGRES_USER=.+" "$env_file" || missing_vars+=("POSTGRES_USER")
     grep -qE "^POSTGRES_PASSWORD=.+" "$env_file" || missing_vars+=("POSTGRES_PASSWORD")
-    grep -qE "^DENARO_DATABASE_NAME=.+" "$env_file" || missing_vars+=("DENARO_DATABASE_NAME")
-    grep -qE "^DENARO_DATABASE_HOST=.+" "$env_file" || missing_vars+=("DENARO_DATABASE_HOST")
-    grep -qE "^DENARO_NODE_HOST=.+" "$env_file" || missing_vars+=("DENARO_NODE_HOST")
-    grep -qE "^DENARO_NODE_PORT=.+" "$env_file" || missing_vars+=("DENARO_NODE_PORT")
-    grep -qE "^DENARO_SELF_URL=.+" "$env_file" || missing_vars+=("DENARO_SELF_URL")
-    grep -qE "^DENARO_BOOTSTRAP_NODE=.+" "$env_file" || missing_vars+=("DENARO_BOOTSTRAP_NODE")
+    grep -qE "^QRDX_DATABASE_NAME=.+" "$env_file" || missing_vars+=("QRDX_DATABASE_NAME")
+    grep -qE "^QRDX_DATABASE_HOST=.+" "$env_file" || missing_vars+=("QRDX_DATABASE_HOST")
+    grep -qE "^QRDX_NODE_HOST=.+" "$env_file" || missing_vars+=("QRDX_NODE_HOST")
+    grep -qE "^QRDX_NODE_PORT=.+" "$env_file" || missing_vars+=("QRDX_NODE_PORT")
+    grep -qE "^QRDX_SELF_URL=.+" "$env_file" || missing_vars+=("QRDX_SELF_URL")
+    grep -qE "^QRDX_BOOTSTRAP_NODE=.+" "$env_file" || missing_vars+=("QRDX_BOOTSTRAP_NODE")
     grep -qE "^LOG_LEVEL=.+" "$env_file" || missing_vars+=("LOG_LEVEL")
     grep -qE "^LOG_CONSOLE_HIGHLIGHTING=.+" "$env_file" || missing_vars+=("LOG_CONSOLE_HIGHLIGHTING")
     echo "${missing_vars[@]}"
@@ -250,7 +250,7 @@ update_variable() {
                 fi
             done
             
-        elif [[ "$var_name" == "DENARO_NODE_PORT" ]]; then
+        elif [[ "$var_name" == "QRDX_NODE_PORT" ]]; then
             # Special handling for port input with validation
             validate_port_input "$prompt ($prompt_value_string $var_value):" "$var_name" $show_current_vars
         else
@@ -313,7 +313,7 @@ set_env_variables() {
                             local update_missing_vars=true
                             local show_current_vars=true
                             PROMPT_FOR_DEFAUT=false
-                            missing_vars=("POSTGRES_USER" "POSTGRES_PASSWORD" "DENARO_DATABASE_NAME" "DENARO_DATABASE_HOST" "DENARO_NODE_HOST" "DENARO_NODE_PORT" "DENARO_SELF_URL "DENARO_BOOTSTRAP_NODE" "LOG_LEVEL" "LOG_CONSOLE_HIGHLIGHTING"")
+                            missing_vars=("POSTGRES_USER" "POSTGRES_PASSWORD" "QRDX_DATABASE_NAME" "QRDX_DATABASE_HOST" "QRDX_NODE_HOST" "QRDX_NODE_PORT" "QRDX_SELF_URL "QRDX_BOOTSTRAP_NODE" "LOG_LEVEL" "LOG_CONSOLE_HIGHLIGHTING"")
                             echo "Leave blank to keep the current value."
                             echo ""
                             break;;
@@ -374,23 +374,23 @@ set_env_variables() {
     
     local initial_db_user=$(read_env_variable "POSTGRES_USER" | sha256sum | cut -d' ' -f1)
     local initial_db_pass=$(read_env_variable "POSTGRES_PASSWORD" | sha256sum | cut -d' ' -f1)
-    local initial_db_name=$(read_env_variable "DENARO_DATABASE_NAME" | sha256sum | cut -d' ' -f1)
+    local initial_db_name=$(read_env_variable "QRDX_DATABASE_NAME" | sha256sum | cut -d' ' -f1)
    
     # Use the update_variable function for each required variable based on its presence in missing_vars array
     [[ " ${missing_vars[*]} " =~ " POSTGRES_USER " ]] && update_variable "Enter database username" "POSTGRES_USER" $update_missing_vars $show_current_vars
     [[ " ${missing_vars[*]} " =~ " POSTGRES_PASSWORD " ]] && update_variable "Enter password for database user" "POSTGRES_PASSWORD" $update_missing_vars $show_current_vars
-    [[ " ${missing_vars[*]} " =~ " DENARO_DATABASE_NAME " ]] && update_variable "Enter database name" "DENARO_DATABASE_NAME" $update_missing_vars $show_current_vars
-    [[ " ${missing_vars[*]} " =~ " DENARO_DATABASE_HOST " ]] && update_variable "Enter database host" "DENARO_DATABASE_HOST" $update_missing_vars $show_current_vars
-    [[ " ${missing_vars[*]} " =~ " DENARO_NODE_HOST " ]] && update_variable "Enter local Denaro node address or hostname" "DENARO_NODE_HOST" $update_missing_vars $show_current_vars
-    [[ " ${missing_vars[*]} " =~ " DENARO_NODE_PORT " ]] && update_variable "Enter local Denaro node port" "DENARO_NODE_PORT" $update_missing_vars $show_current_vars
-    [[ " ${missing_vars[*]} " =~ " DENARO_SELF_URL " ]] && update_variable "Enter the public address of this Denaro node (e.g., https://yourdomain.com). Leave blank if the node is private" "DENARO_SELF_URL" $update_missing_vars $show_current_vars
-    [[ " ${missing_vars[*]} " =~ " DENARO_BOOTSTRAP_NODE " ]] && update_variable "Enter the address of a main Denaro node to sync with" "DENARO_BOOTSTRAP_NODE" $update_missing_vars $show_current_vars
-    [[ " ${missing_vars[*]} " =~ " LOG_LEVEL " ]] && update_variable "Enter the log level for the Denaro node (DEBUG, INFO, WARNING, ERROR, CRITICAL)" "LOG_LEVEL" $update_missing_vars $show_current_vars
+    [[ " ${missing_vars[*]} " =~ " QRDX_DATABASE_NAME " ]] && update_variable "Enter database name" "QRDX_DATABASE_NAME" $update_missing_vars $show_current_vars
+    [[ " ${missing_vars[*]} " =~ " QRDX_DATABASE_HOST " ]] && update_variable "Enter database host" "QRDX_DATABASE_HOST" $update_missing_vars $show_current_vars
+    [[ " ${missing_vars[*]} " =~ " QRDX_NODE_HOST " ]] && update_variable "Enter local QRDX node address or hostname" "QRDX_NODE_HOST" $update_missing_vars $show_current_vars
+    [[ " ${missing_vars[*]} " =~ " QRDX_NODE_PORT " ]] && update_variable "Enter local QRDX node port" "QRDX_NODE_PORT" $update_missing_vars $show_current_vars
+    [[ " ${missing_vars[*]} " =~ " QRDX_SELF_URL " ]] && update_variable "Enter the public address of this QRDX node (e.g., https://yourdomain.com). Leave blank if the node is private" "QRDX_SELF_URL" $update_missing_vars $show_current_vars
+    [[ " ${missing_vars[*]} " =~ " QRDX_BOOTSTRAP_NODE " ]] && update_variable "Enter the address of a main QRDX node to sync with" "QRDX_BOOTSTRAP_NODE" $update_missing_vars $show_current_vars
+    [[ " ${missing_vars[*]} " =~ " LOG_LEVEL " ]] && update_variable "Enter the log level for the QRDX node (DEBUG, INFO, WARNING, ERROR, CRITICAL)" "LOG_LEVEL" $update_missing_vars $show_current_vars
     [[ " ${missing_vars[*]} " =~ " LOG_CONSOLE_HIGHLIGHTING " ]] && update_variable "Enable log highlighting? (True/False)" "LOG_CONSOLE_HIGHLIGHTING" $update_missing_vars $show_current_vars
     
     local new_db_user=$(read_env_variable "POSTGRES_USER" | sha256sum | cut -d' ' -f1)
     local new_db_pass=$(read_env_variable "POSTGRES_PASSWORD" | sha256sum | cut -d' ' -f1)
-    local new_db_name=$(read_env_variable "DENARO_DATABASE_NAME" | sha256sum | cut -d' ' -f1)
+    local new_db_name=$(read_env_variable "QRDX_DATABASE_NAME" | sha256sum | cut -d' ' -f1)
     
     [[ "$initial_db_user" != "$new_db_user" ]] && db_user_changed=true
     [[ "$initial_db_pass" != "$new_db_pass" ]] && db_pass_changed=true
@@ -411,14 +411,14 @@ setup_database() {
     echo ""
     echo "Starting Database Setup..."
     echo ""
-    echo "Checking if '$DENARO_DATABASE_NAME' database exists..."
+    echo "Checking if '$QRDX_DATABASE_NAME' database exists..."
     # Check if database exists
-    if ! sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw $DENARO_DATABASE_NAME; then
-        echo "Creating '$DENARO_DATABASE_NAME' database..."
-        sudo -u postgres psql -c "CREATE DATABASE $DENARO_DATABASE_NAME;" >&/dev/null || { echo "Database creation failed"; exit 1; }
+    if ! sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw $QRDX_DATABASE_NAME; then
+        echo "Creating '$QRDX_DATABASE_NAME' database..."
+        sudo -u postgres psql -c "CREATE DATABASE $QRDX_DATABASE_NAME;" >&/dev/null || { echo "Database creation failed"; exit 1; }
         db_modified=true
     else
-        echo "'$DENARO_DATABASE_NAME' database already exists, skipping..."
+        echo "'$QRDX_DATABASE_NAME' database already exists, skipping..."
     fi
     echo ""
     
@@ -452,12 +452,12 @@ setup_database() {
     
     # Check if user already has all privileges on the database
     echo "Checking if user has all database privileges..."
-    has_CTc_priv=$(sudo -u postgres psql -X -A -t -c "SELECT bool_or(datacl::text LIKE '%$POSTGRES_USER=CTc%') FROM pg_database WHERE datname = '$DENARO_DATABASE_NAME';")
+    has_CTc_priv=$(sudo -u postgres psql -X -A -t -c "SELECT bool_or(datacl::text LIKE '%$POSTGRES_USER=CTc%') FROM pg_database WHERE datname = '$QRDX_DATABASE_NAME';")
     if [ ! "$has_CTc_priv" = "t" ]; then
         echo "Granting all database privileges to user..."
-        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $DENARO_DATABASE_NAME TO $POSTGRES_USER;" >&/dev/null || { echo "Granting privileges failed"; exit 1; }
-        sudo -u postgres psql -d $DENARO_DATABASE_NAME -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO $POSTGRES_USER;" >&/dev/null || { echo "Granting privileges failed"; exit 1; }
-        sudo -u postgres psql -d $DENARO_DATABASE_NAME -c "GRANT ALL ON SCHEMA public TO $POSTGRES_USER;" >&/dev/null || { echo "Granting privileges failed"; exit 1; }
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $QRDX_DATABASE_NAME TO $POSTGRES_USER;" >&/dev/null || { echo "Granting privileges failed"; exit 1; }
+        sudo -u postgres psql -d $QRDX_DATABASE_NAME -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO $POSTGRES_USER;" >&/dev/null || { echo "Granting privileges failed"; exit 1; }
+        sudo -u postgres psql -d $QRDX_DATABASE_NAME -c "GRANT ALL ON SCHEMA public TO $POSTGRES_USER;" >&/dev/null || { echo "Granting privileges failed"; exit 1; }
         db_modified=true
         echo "Privileges granted."
     else
@@ -467,10 +467,10 @@ setup_database() {
     
     # Check if the database owner is already set to the specified user
     echo "Checking if database owner is already '$POSTGRES_USER'..."
-    CURRENT_OWNER=$(sudo -u postgres psql -tAc "SELECT d.datname, pg_catalog.pg_get_userbyid(d.datdba) as owner FROM pg_catalog.pg_database d WHERE d.datname = '$DENARO_DATABASE_NAME'")
+    CURRENT_OWNER=$(sudo -u postgres psql -tAc "SELECT d.datname, pg_catalog.pg_get_userbyid(d.datdba) as owner FROM pg_catalog.pg_database d WHERE d.datname = '$QRDX_DATABASE_NAME'")
     if [[ $CURRENT_OWNER != *"$POSTGRES_USER"* ]]; then
         echo "Setting database owner to '$POSTGRES_USER'..."
-        sudo -u postgres psql -c "ALTER DATABASE $DENARO_DATABASE_NAME OWNER TO $POSTGRES_USER;" >&/dev/null || { echo "Setting database owner failed"; exit 1; }
+        sudo -u postgres psql -c "ALTER DATABASE $QRDX_DATABASE_NAME OWNER TO $POSTGRES_USER;" >&/dev/null || { echo "Setting database owner failed"; exit 1; }
         db_modified=true
         echo "Database owner set."
     else
@@ -503,7 +503,7 @@ setup_database() {
     
         echo "Importing database schema from schema.sql..."
         # Import schema
-        PGPASSWORD=$POSTGRES_PASSWORD psql -U $POSTGRES_USER -d $DENARO_DATABASE_NAME -c "SET client_min_messages TO WARNING;" -f denaro/schema.sql >&/dev/null || { echo "Schema import failed"; exit 1; }
+        PGPASSWORD=$POSTGRES_PASSWORD psql -U $POSTGRES_USER -d $QRDX_DATABASE_NAME -c "SET client_min_messages TO WARNING;" -f QRDX/schema.sql >&/dev/null || { echo "Schema import failed"; exit 1; }
         echo ""
         echo "Database setup complete!"
         echo ""
@@ -693,13 +693,13 @@ echo ""
 # Ask user if they want to start the node
 echo "Node setup complete!"
 echo ""
-echo "Ready to start the Denaro node."
+echo "Ready to start the QRDX node."
 
 # Function to validate the initial response (y/n)
 validate_start_node_response() {
     while true; do
         # Prompt the user for input
-        read -p "Do you want to start the Denaro node now? (y/n): " start_node
+        read -p "Do you want to start the QRDX node now? (y/n): " start_node
         # Check if the response is either 'y' or 'n' (case-insensitive)
         if [[ "$start_node" =~ ^[YyNn]$ ]]; then
             break  # Exit the loop if the input is valid
@@ -713,10 +713,10 @@ validate_start_node_response() {
 # Validate start_node input
 start_node(){
     echo ""
-    echo "Starting Denaro node on http://$DENARO_NODE_HOST:$DENARO_NODE_PORT..."
+    echo "Starting QRDX node on http://$QRDX_NODE_HOST:$QRDX_NODE_PORT..."
     echo "Press Ctrl+C to exit."
     echo ""
-    python3 run_node.py || { echo "Failed to start Denaro Node"; exit 1; }
+    python3 run_node.py || { echo "Failed to start QRDX Node"; exit 1; }
 }
 
 if $SKIP_PROMPTS; then
@@ -732,3 +732,5 @@ fi
 
 echo ""
 echo "Script executed successfully."
+
+

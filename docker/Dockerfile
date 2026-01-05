@@ -17,7 +17,7 @@ RUN apt-get update -y && apt-get upgrade -y && apt-get install -y wget libgmp-de
 WORKDIR /app
 
 # Copy the application code and necessary scripts into the container
-COPY ./denaro ./denaro
+COPY ./qrdx ./qrdx
 COPY ./run_node.py .
 COPY ./requirements.txt .
 

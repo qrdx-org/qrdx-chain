@@ -1,0 +1,198 @@
+# QRDX Node Configuration
+# This file controls which modules are enabled and their settings
+
+[node]
+# Unique identifier for this node (generated if not set)
+# node_id = ""
+
+# Chain ID for network identification
+chain_id = 1
+
+# Data directory for node storage
+data_dir = "./data"
+
+# Log level: DEBUG, INFO, WARNING, ERROR
+log_level = "INFO"
+
+
+# =============================================================================
+# P2P NETWORKING
+# =============================================================================
+[p2p]
+# Enable P2P networking
+enabled = true
+
+# Network listen address
+listen_addr = "0.0.0.0"
+
+# TCP port for RLPx connections
+listen_port = 30303
+
+# UDP port for discovery (usually same as listen_port)
+discovery_port = 30303
+
+# Maximum number of peers
+max_peers = 50
+
+# Maximum pending peer connections
+max_pending_peers = 25
+
+
+[p2p.discovery]
+# Enable node discovery via Kademlia DHT
+enabled = true
+
+# Bootstrap nodes (qnode:// URIs)
+bootnodes = [
+    # "qnode://<pubkey>@bootnode1.qrdx.network:30303",
+    # "qnode://<pubkey>@bootnode2.qrdx.network:30303",
+]
+
+# Enable DNS discovery
+dns_discovery = false
+dns_networks = []
+
+
+[p2p.security]
+# Enable post-quantum cryptography for node communication
+post_quantum_enabled = true
+
+# Post-quantum algorithm for key encapsulation
+pq_kem_algorithm = "Kyber768"
+
+# Post-quantum algorithm for signatures
+pq_sig_algorithm = "Dilithium3"
+
+# Require post-quantum capable peers (reject non-PQ peers)
+pq_required = false
+
+
+# =============================================================================
+# RPC INTERFACES
+# =============================================================================
+[rpc]
+# Enable RPC interfaces
+enabled = true
+
+
+[rpc.http]
+# Enable HTTP JSON-RPC server
+enabled = true
+
+# Listen address for HTTP RPC
+host = "127.0.0.1"
+
+# Port for HTTP RPC
+port = 8545
+
+# Enable CORS (for browser access)
+cors_enabled = true
+cors_origins = ["*"]
+
+# Rate limiting (requests per minute per IP)
+rate_limit = 1000
+
+
+[rpc.websocket]
+# Enable WebSocket JSON-RPC server
+enabled = true
+
+# Listen address for WebSocket RPC
+host = "127.0.0.1"
+
+# Port for WebSocket RPC
+port = 8546
+
+# Maximum concurrent WebSocket connections
+max_connections = 100
+
+# Enable subscriptions
+subscriptions_enabled = true
+
+
+[rpc.modules]
+# Enable specific RPC namespaces
+eth = true      # eth_* methods (Web3 compatible)
+net = true      # net_* methods
+web3 = true     # web3_* methods
+qrdx = true     # qrdx_* methods (chain-specific)
+admin = false   # admin_* methods (privileged)
+debug = false   # debug_* methods (development)
+
+
+[rpc.legacy]
+# Enable legacy Denaro REST endpoints (deprecated)
+enabled = false
+
+# Port for legacy REST API (if different from HTTP RPC)
+port = 3007
+
+# Show deprecation warnings in responses
+deprecation_warnings = true
+
+
+# =============================================================================
+# DATABASE
+# =============================================================================
+[database]
+# Database type: "postgresql"
+type = "postgresql"
+
+
+[database.postgresql]
+host = "127.0.0.1"
+port = 5432
+database = "qrdx"
+user = "qrdx"
+password = "qrdx"
+
+# Connection pool settings
+pool_min_size = 5
+pool_max_size = 20
+
+
+# =============================================================================
+# CONSENSUS
+# =============================================================================
+[consensus]
+# Consensus mechanism: "pow" (proof of work)
+mechanism = "pow"
+
+# Enable mining on this node
+mining_enabled = false
+
+
+[consensus.pow]
+# Mining threads (0 = auto-detect)
+threads = 0
+
+
+# =============================================================================
+# SYNC
+# =============================================================================
+[sync]
+# Sync mode: "full", "fast" (future)
+mode = "full"
+
+# Maximum blocks to request per batch
+batch_size = 128
+
+
+# =============================================================================
+# METRICS & MONITORING
+# =============================================================================
+[metrics]
+# Enable Prometheus metrics endpoint
+enabled = false
+
+# Metrics endpoint address
+host = "127.0.0.1"
+port = 9090
+
+
+[health]
+# Enable health check endpoint
+enabled = true
+
+# Health check endpoint path
+path = "/health"

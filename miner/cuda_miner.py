@@ -595,3 +595,5 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\nExiting miner.")
         sys.exit(0)
+
+

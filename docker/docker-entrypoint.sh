@@ -1,14 +1,14 @@
 #!/bin/bash
 
 ###############################################################################
-# Denaro Node Container Entrypoint
+# qrdx Node Container Entrypoint
 #
 # Overview
-#   This script launches a Denaro node inside a container. It prepares runtime
+#   This script launches a qrdx node inside a container. It prepares runtime
 #   configuration, optionally acquires a public URL via Pinggy, coordinates
 #   bootstrap peer discovery through a registry file, ensures the node-specific
 #   PostgreSQL database exists and has the required schema, then starts the
-#   Denaro node process.
+#   qrdx node process.
 #
 # Lifecycle and responsibilities
 #   1. Initialization:
@@ -28,30 +28,30 @@
 #        - Private nodes in discovery mode wait for any public node.
 #        - A peer URL that is not the current node is selected when available.
 #        - If a timeout occurs or no peer is available, the bootstrap target is
-#          set to `DENARO_SELF_URL` .
+#          set to `qrdx_SELF_URL` .
 #
 #   4. Env generation, database provisioning, and application launch:
 #        - An application `.env` file is generated with the required variables.
 #        - PostgreSQL readiness is awaited.
 #        - The node database is created if it does not already exist.
 #        - The schema is imported only on first database creation.
-#        - Finally, the Denaro node is started via `python run_node.py``.
+#        - Finally, the qrdx node is started via `python run_node.py``.
 #
 # Inputs via environment:
 #   NODE_NAME                   Name of this node
-#   DENARO_NODE_HOST            Hostname or IP the node binds to or advertises
-#   DENARO_NODE_PORT            Port that the node listens on inside the container
+#   qrdx_NODE_HOST            Hostname or IP the node binds to or advertises
+#   qrdx_NODE_PORT            Port that the node listens on inside the container
 #   ENABLE_PINGGY_TUNNEL        When "true", Pinggy tunneling is enabled to expose
 #                               the node on the Internet.
-#   DENARO_BOOTSTRAP_NODE       "self", "discover", or any explicit URL
-#   DENARO_DATABASE_HOST        Hostname of the database service
+#   qrdx_BOOTSTRAP_NODE       "self", "discover", or any explicit URL
+#   qrdx_DATABASE_HOST        Hostname of the database service
 #   POSTGRES_USER               Database user
 #   POSTGRES_PASSWORD           Database password
 #
 # Outputs and artifacts:
 #   - A registry file at /shared/registry/public_nodes.txt contains public URLs when available.
 #   - A .env file is written in the working directory for the application runtime.
-#   - A PostgreSQL database named "denaro_<sanitized node name>" is created if absent.
+#   - A PostgreSQL database named "qrdx_<sanitized node name>" is created if absent.
 #
 # Fallback strategy and exit behavior:
 #   - The script is designed to be resilient and avoid exiting on recoverable issues.
@@ -64,7 +64,7 @@
 
 set -e
 
-echo "--- Denaro Node Container Entrypoint for ${NODE_NAME} ---"
+echo "--- qrdx Node Container Entrypoint for ${NODE_NAME} ---"
 
 # --- CONFIGURATION ---
 REGISTRY_DIR="/shared/node-registry"                          # Shared registry directory
@@ -72,16 +72,16 @@ REGISTRY_FILE="${REGISTRY_DIR}/public_nodes.txt"              # Shared peer regi
 mkdir -p "$REGISTRY_DIR"                                      # Ensure registry directory exists
 
 SANITIZED_NODE_NAME=$(echo "${NODE_NAME}" | tr '-' '_')       # Replace hyphens with underscores for DB naming
-DB_NAME="denaro_${SANITIZED_NODE_NAME}"                       # Per-node database name
+DB_NAME="qrdx_${SANITIZED_NODE_NAME}"                       # Per-node database name
 
 # Default to internal URL if unset
-if [ -z "${DENARO_SELF_URL}" ]; then
-  export DENARO_SELF_URL="http://${NODE_NAME}:${DENARO_NODE_PORT}"
+if [ -z "${qrdx_SELF_URL}" ]; then
+  export qrdx_SELF_URL="http://${NODE_NAME}:${qrdx_NODE_PORT}"
 fi
 
 # Normalize bootstrap intent default if unset
-if [ -z "${DENARO_BOOTSTRAP_NODE}" ]; then
-  export DENARO_BOOTSTRAP_NODE="https://node.denaro.network"
+if [ -z "${qrdx_BOOTSTRAP_NODE}" ]; then
+  export qrdx_BOOTSTRAP_NODE="https://node.qrdx.network"
 fi
 
 if [ -z "${LOG_LEVEL}" ]; then
@@ -119,7 +119,7 @@ if [ "${ENABLE_PINGGY_TUNNEL}" = "true" ]; then
   echo "Pinggy tunnel enabled. Starting tunnel..."
   # Launch the tunnel in the background. Suppress strict host checks due to ephemeral endpoints.
   ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      -p 443 -R0:localhost:${DENARO_NODE_PORT} free.pinggy.io > /tmp/pinggy.log 2>&1 &
+      -p 443 -R0:localhost:${qrdx_NODE_PORT} free.pinggy.io > /tmp/pinggy.log 2>&1 &
 
   echo "Waiting for Pinggy to provide a public URL..."
   COUNTER=0
@@ -130,7 +130,7 @@ if [ "${ENABLE_PINGGY_TUNNEL}" = "true" ]; then
     PUBLIC_ADDRESS=$(grep -o 'https://[a-zA-Z0-9-]*\.a\.free\.pinggy\.link' /tmp/pinggy.log | head -n 1 || true)
     if [ -n "$PUBLIC_ADDRESS" ]; then
       echo "SUCCESS: Captured public URL: ${PUBLIC_ADDRESS}"
-      export DENARO_SELF_URL="${PUBLIC_ADDRESS}"                 # Promote captured public URL to self URL
+      export qrdx_SELF_URL="${PUBLIC_ADDRESS}"                 # Promote captured public URL to self URL
       echo "${PUBLIC_ADDRESS}" >> "${REGISTRY_FILE}"             # Publish to registry for peer discovery
       echo "Published public URL to registry."
       break
@@ -143,7 +143,7 @@ if [ "${ENABLE_PINGGY_TUNNEL}" = "true" ]; then
   if [ -z "$PUBLIC_ADDRESS" ]; then
     echo "WARNING: Could not get public URL from Pinggy output. Falling back to internal URL."
     echo "Disabling tunneling to prevent dependent logic from waiting on a public endpoint."
-    export DENARO_SELF_URL="http://${NODE_NAME}:${DENARO_NODE_PORT}"
+    export qrdx_SELF_URL="http://${NODE_NAME}:${qrdx_NODE_PORT}"
     export ENABLE_PINGGY_TUNNEL="false"
     # Show last lines of the log for diagnostics without aborting
     echo "Pinggy log tail for diagnostics:"
@@ -154,9 +154,9 @@ else
 fi
 
 # --- STAGE 2 AND 3: BOOTSTRAP DISCOVERY WHEN REQUESTED ---
-# Discovery runs only when DENARO_BOOTSTRAP_NODE equals "discover".
+# Discovery runs only when qrdx_BOOTSTRAP_NODE equals "discover".
 # If a fixed bootstrap address is provided, this entire block is skipped.
-if [ "${DENARO_BOOTSTRAP_NODE}" = "discover" ]; then
+if [ "${qrdx_BOOTSTRAP_NODE}" = "discover" ]; then
   # Determine how many URLs to expect in the registry
   # Public nodes that are discoverable wait for a partner. Private nodes wait for any public node.
   EXPECTED_URLS=1
@@ -182,36 +182,36 @@ if [ "${DENARO_BOOTSTRAP_NODE}" = "discover" ]; then
   if [ "$(wc -l < "${REGISTRY_FILE}" 2>/dev/null || echo 0)" -lt "${EXPECTED_URLS}" ]; then
     echo "WARNING: Timed out waiting for enough public nodes to register."
     # Fallback policy keeps the node operable and able to gossip later
-    export DENARO_BOOTSTRAP_NODE="${DENARO_SELF_URL}"
-    echo "Applying fallback for discovery: setting DENARO_BOOTSTRAP_NODE to self."
+    export qrdx_BOOTSTRAP_NODE="${qrdx_SELF_URL}"
+    echo "Applying fallback for discovery: setting qrdx_BOOTSTRAP_NODE to self."
   else
     # Registry has enough lines. Pick a peer that is not ourselves
-    OTHER_PUBLIC_ADDRESS=$(grep -v "${DENARO_SELF_URL}" "${REGISTRY_FILE}" | head -n 1 || true)
+    OTHER_PUBLIC_ADDRESS=$(grep -v "${qrdx_SELF_URL}" "${REGISTRY_FILE}" | head -n 1 || true)
     if [ -n "${OTHER_PUBLIC_ADDRESS}" ]; then
-      export DENARO_BOOTSTRAP_NODE="${OTHER_PUBLIC_ADDRESS}"
-      echo "Discovered and selected bootstrap peer: ${DENARO_BOOTSTRAP_NODE}"
+      export qrdx_BOOTSTRAP_NODE="${OTHER_PUBLIC_ADDRESS}"
+      echo "Discovered and selected bootstrap peer: ${qrdx_BOOTSTRAP_NODE}"
     else
       echo "WARNING: Could not discover a different bootstrap peer URL. Falling back to self."
-      export DENARO_BOOTSTRAP_NODE="${DENARO_SELF_URL}"
+      export qrdx_BOOTSTRAP_NODE="${qrdx_SELF_URL}"
     fi
   fi
 fi
 
 # Final resolution when the literal value is "self"
-if [ "${DENARO_BOOTSTRAP_NODE}" = "self" ]; then
-  export DENARO_BOOTSTRAP_NODE="${DENARO_SELF_URL}"
+if [ "${qrdx_BOOTSTRAP_NODE}" = "self" ]; then
+  export qrdx_BOOTSTRAP_NODE="${qrdx_SELF_URL}"
 fi
 
 # --- STAGE 4: CONFIGURE AND LAUNCH ---
 echo "Configuring .env file for ${NODE_NAME}..."
 cat << EOF > /app/.env
-DENARO_NODE_HOST=${DENARO_NODE_HOST}
-DENARO_NODE_PORT=${DENARO_NODE_PORT}
-DENARO_SELF_URL=${DENARO_SELF_URL}
-DENARO_BOOTSTRAP_NODE=${DENARO_BOOTSTRAP_NODE}
+qrdx_NODE_HOST=${qrdx_NODE_HOST}
+qrdx_NODE_PORT=${qrdx_NODE_PORT}
+qrdx_SELF_URL=${qrdx_SELF_URL}
+qrdx_BOOTSTRAP_NODE=${qrdx_BOOTSTRAP_NODE}
 
-DENARO_DATABASE_NAME=${DB_NAME}
-DENARO_DATABASE_HOST=${DENARO_DATABASE_HOST}
+qrdx_DATABASE_NAME=${DB_NAME}
+qrdx_DATABASE_HOST=${qrdx_DATABASE_HOST}
 POSTGRES_USER=${POSTGRES_USER}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
 
@@ -244,13 +244,13 @@ if ! psql -h postgres -U "${POSTGRES_USER}" -d "postgres" -tc "SELECT 1 FROM pg_
   echo "Database '${DB_NAME}' does not exist. Creating..."
   psql -h postgres -U "${POSTGRES_USER}" -d "postgres" -c "CREATE DATABASE \"${DB_NAME}\""
   echo "Importing database schema from schema.sql..."
-  psql -h postgres -U "${POSTGRES_USER}" -d "${DB_NAME}" < denaro/schema.sql
+  psql -h postgres -U "${POSTGRES_USER}" -d "${DB_NAME}" < qrdx/schema.sql
 else
   echo "Database '${DB_NAME}' already exists."
 fi
 
 unset PGPASSWORD
 
-# Launch the Denaro Node
-echo "Starting Denaro node on 0.0.0.0:${DENARO_NODE_PORT}..."
+# Launch the qrdx Node
+echo "Starting qrdx node on 0.0.0.0:${qrdx_NODE_PORT}..."
 exec python /app/run_node.py

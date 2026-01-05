@@ -2,7 +2,7 @@
 """
 Purpose:
   Parse the project's docker-compose.yml and compute dependency topology limited
-  to "node" services (label denaro.node=true). Emit a single JSON file used by
+  to "node" services (label qrdx.node=true). Emit a single JSON file used by
   per-service healthchecks to decide whether readiness probing is needed.
 
 Hardcoded paths:
@@ -61,9 +61,9 @@ def normalize_labels(spec: Dict[str, Any]) -> List[str]:
 def is_node_service(spec: Dict[str, Any]) -> bool:
     labels = normalize_labels(spec)
     for entry in labels:
-        if entry == "denaro.node=true":
+        if entry == "qrdx.node=true":
             return True
-        if entry.startswith("denaro.node=") and entry.split("=", 1)[1].lower() == "true":
+        if entry.startswith("qrdx.node=") and entry.split("=", 1)[1].lower() == "true":
             return True
     return False
 
@@ -110,3 +110,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+

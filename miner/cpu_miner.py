@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-A multi-process miner for the Denaro cryptocurrency.
+A multi-process miner for the QRDX cryptocurrency.
 This version includes inter-process communication to prevent stale block submissions
 and correctly uses the Merkle root provided by the node.
 It also supports mining a maximum number of blocks before exiting.
@@ -21,12 +21,12 @@ import os
 # Get the absolute path of the directory containing the current script.
 dir_path = os.path.dirname(os.path.realpath(__file__))
 
-# Add the project root to sys.path so `denaro` can be imported
+# Add the project root to sys.path so `qrdx` can be imported
 project_root = os.path.abspath(os.path.join(dir_path, '..'))
 sys.path.insert(0, project_root)
 
 # Absolute import
-from denaro.helpers import string_to_bytes, timestamp
+from qrdx.helpers import string_to_bytes, timestamp
 
 
 # --- Constants ---
@@ -275,3 +275,5 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\nExiting miner.")
         sys.exit(0)
+
+

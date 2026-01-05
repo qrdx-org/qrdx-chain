@@ -3,14 +3,14 @@
 Name: docker-healthcheck.py
 
 Purpose
-  One-time conditional healthcheck for Denaro nodes. Uses `topology.json` to decide
+  One-time conditional healthcheck for qrdx nodes. Uses `topology.json` to decide
   whether to probe. If probing is required, it calls `/get_status` endpoint exactly
   once and only marks ready if the response JSON has {"ok": true}. After first
   success, a per-boot readiness file prevents further probes.
 
 Inputs (env)
   NODE_NAME                    [required] service key for this node (e.g., "node-8005")
-  DENARO_NODE_PORT             [required] container-internal port (e.g., "8005")
+  qrdx_NODE_PORT             [required] container-internal port (e.g., "8005")
   TOPOLOGY_FILE                [default "/shared/node-topology/topology.json"]
   HEALTHCHECK_READINESS_FILE       [default "/tmp/node_ready"]
 
@@ -66,7 +66,7 @@ def _touch_once(path: str) -> None:
 
 def main() -> int:
     node_name = os.getenv("NODE_NAME")
-    node_port = os.getenv("DENARO_NODE_PORT")
+    node_port = os.getenv("qrdx_NODE_PORT")
     url = f"http://127.0.0.1:{node_port}/get_status" if node_port else None
     
     topology_path = os.getenv("TOPOLOGY_FILE", "/shared/node-topology/topology.json")
@@ -80,7 +80,7 @@ def main() -> int:
     if not node_name:
         _log("NODE_NAME not set"); return 1
     if not node_port:
-        _log("DENARO_NODE_PORT not set"); return 1
+        _log("qrdx_NODE_PORT not set"); return 1
     if not url:
         _log("HEALTHCHECK_URL could not be constructed"); return 1
 
@@ -113,3 +113,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+

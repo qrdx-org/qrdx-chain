@@ -2,7 +2,7 @@
 
 **Contributor**: The-Sycorax (https://github.com/The-Sycorax)
 
-**Commit**: [fa34e7bf5e27d8220c4100e399c60fbc47b9b4ce](https://github.com/The-Sycorax/denaro/commit/fa34e7bf5e27d8220c4100e399c60fbc47b9b4ce)
+**Commit**: [fa34e7bf5e27d8220c4100e399c60fbc47b9b4ce](https://github.com/The-Sycorax/qrdx/commit/fa34e7bf5e27d8220c4100e399c60fbc47b9b4ce)
 
 **Date**: 2025-10-14
 
@@ -61,7 +61,7 @@ This refactor also cleans up the project's structure by moving all Docker-relate
     - ### Overview:
         - Topology generation is handled by this script. It runs once at startup within the topology service to analyze the `docker-compose.yml` file and build a dependency map.
             - This map is then consumed by the healthcheck script in each node to determine if it has downstream dependents.
-            - The script identifies nodes by filtering for the `denaro.node=true` label and parses their `depends_on` sections to build the topology.
+            - The script identifies nodes by filtering for the `qrdx.node=true` label and parses their `depends_on` sections to build the topology.
         - The output results in a "reverse dependency map" where each key is an upstream node and its value is a list of nodes that depend on it.
         - This map is subsequently written to the shared volume at `/shared/node-topology/topology.json`, making it available to all other nodes.
 
@@ -70,7 +70,7 @@ This refactor also cleans up the project's structure by moving all Docker-relate
     - ### Execution Flow:
         - **1․** The script begins by loading and parsing the YAML content from `/project/docker-compose.yml`.
 
-        - **2․** It then filters the services to identify nodes, looking for a `denaro.node=true` label. This process correctly handles labels defined as either lists or dictionaries.
+        - **2․** It then filters the services to identify nodes, looking for a `qrdx.node=true` label. This process correctly handles labels defined as either lists or dictionaries.
 
         - **3․** For each identified node, it extracts its upstream dependencies from the `depends_on` section, supporting both list and dictionary formats.
 
@@ -147,7 +147,7 @@ This refactor also cleans up the project's structure by moving all Docker-relate
         ---
 
     - ### Constants:
-        - **`NODE_NAME`:** The name of the Denaro node.
-        - **`DENARO_NODE_PORT`:** The port number that the Denaro node is running on.
+        - **`NODE_NAME`:** The name of the qrdx node.
+        - **`qrdx_NODE_PORT`:** The port number that the qrdx node is running on.
         - **`TOPOLOGY_FILE`:** Path to the topology file (`/shared/node-topology/topology.json`).
         - **`HEALTHCHECK_READINESS_FILE`:** Readiness file path (`/tmp/node_ready`).

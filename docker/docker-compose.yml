@@ -1,12 +1,12 @@
-x-denaro-node-base: &denaro-node-base
+x-qrdx-node-base: &qrdx-node-base
   build:
     context: ".."
     dockerfile: "./docker/Dockerfile"
   restart: unless-stopped
   working_dir: /app
   env_file: ["../.env"]
-  labels: ["denaro.node=true"]
-  networks: [denaro-net]
+  labels: ["qrdx.node=true"]
+  networks: [qrdx-net]
   volumes:
     - type: volume
       target: /app
@@ -18,9 +18,9 @@ x-denaro-node-base: &denaro-node-base
       target: /shared/node-topology
       read_only: true
   environment:
-    &denaro-node-env
-    DENARO_DATABASE_HOST: 'postgres'
-    DENARO_NODE_HOST: '0.0.0.0'
+    &qrdx-node-env
+    qrdx_DATABASE_HOST: 'postgres'
+    qrdx_NODE_HOST: '0.0.0.0'
 
 services:
   topology:
@@ -32,16 +32,16 @@ services:
       - ./generate-topology.py:/app/generate-topology.py:ro
       - ./docker-compose.yml:/project/docker-compose.yml:ro
       - node-topology:/shared/node-topology
-    networks: [denaro-net]
+    networks: [qrdx-net]
 
   postgres:
     image: postgres:14
     env_file: ["../.env"]
     volumes: [postgres_data:/var/lib/postgresql/data]
-    networks: [denaro-net]
+    networks: [qrdx-net]
 
   node-3006:
-    <<: *denaro-node-base
+    <<: *qrdx-node-base
     hostname: node-3006
     volumes: [node_3006_data:/app, node-registry:/shared/node-registry, node-topology:/shared/node-topology:ro]
     depends_on:
@@ -49,27 +49,27 @@ services:
       postgres: { condition: service_started }
     ports: ["3006:3006"]
     environment:
-      <<: *denaro-node-env
+      <<: *qrdx-node-env
       NODE_NAME: 'node-3006'
-      DENARO_NODE_PORT: '3006'
+      qrdx_NODE_PORT: '3006'
       
       # This variable specifies either the selection criteria or a fixed address for the bootstrap-node.
-      # It essentially connects the node to Denaro's P2P Network. Defaults to 'self' if left blank.
+      # It essentially connects the node to qrdx's P2P Network. Defaults to 'self' if left blank.
       # Accepted values:
       #   - 'self': Uses the node’s own internal address. If this value is set but no peers connect to this
       #           node, then it will be isolated from the rest of P2P network. 
       #   - 'discover': Selects an address from the shared peer registry at /registry/public_nodes.txt.
-      #   - The address of a Denaro Node that is reachable via the Internet or internal network.
-      DENARO_BOOTSTRAP_NODE: 'https://node.denaro.network'
+      #   - The address of a qrdx Node that is reachable via the Internet or internal network.
+      qrdx_BOOTSTRAP_NODE: 'https://node.qrdx.network'
       
       # This variable enables public tunnleing via Pinggy.io for up to 60 minutes.
       #ENABLE_PINGGY_TUNNEL: 'true'
  
       # This variable specifies the the publically reachable address of the node itself, and is required for
-      # publically facing nodes. When left blank it will default to http://${NODE_NAME}:${DENARO_NODE_PORT}. 
+      # publically facing nodes. When left blank it will default to http://${NODE_NAME}:${qrdx_NODE_PORT}. 
       # Setting ENABLE_PINGGY_TUNNEL to 'true' will override this variable with the public URL that is
       # assigneed to the node via Pinggy.io.
-      DENARO_SELF_URL: ''
+      qrdx_SELF_URL: ''
 
 volumes:
   node-topology:
@@ -78,5 +78,5 @@ volumes:
   postgres_data:
 
 networks:
-  denaro-net:
+  qrdx-net:
     driver: bridge

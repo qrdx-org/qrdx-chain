@@ -2,14 +2,14 @@
 
 **Contributer**: The-Sycorax (https://github.com/The-Sycorax)
 
-**Commit**: [c55a2bf0f479ef4a00ca6d76925583bd21a82095](https://github.com/The-Sycorax/denaro/commit/c55a2bf0f479ef4a00ca6d76925583bd21a82095)
+**Commit**: [c55a2bf0f479ef4a00ca6d76925583bd21a82095](https://github.com/The-Sycorax/qrdx/commit/c55a2bf0f479ef4a00ca6d76925583bd21a82095)
 
 **Date**: September 8th, 2025
 
 ---
 
 ### Overview
-- This commit introduces `denaro/node/identity.py` for handling node identity and cryptographic operations. Provides initialization, key persistence, signing, verification, and canonical JSON serialization using the P256 (secp256r1) curve.
+- This commit introduces `qrdx/node/identity.py` for handling node identity and cryptographic operations. Provides initialization, key persistence, signing, verification, and canonical JSON serialization using the P256 (secp256r1) curve.
     
 - This module ensures each node has a reproducible and secure cryptographic identity, supporting message authenticity and integrity within the system.
 
@@ -67,3 +67,4 @@
 - **`_private_key`**: Internal variable holding the private key.  
 - **`_public_key`**: Internal variable holding the derived public key.  
 - **`_node_id`**: Internal variable holding the computed Node ID.
+

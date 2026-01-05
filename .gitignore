@@ -15,3 +15,4 @@ denaro/node/node_key.priv
 testing_framework/node_key.priv
 testing
 logs/
+ref/

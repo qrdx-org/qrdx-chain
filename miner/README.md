@@ -1,6 +1,6 @@
-## Denaro CUDA Miner Setup and Usage
+## qrdx CUDA Miner Setup and Usage
 
-`cuda_miner.py` is a GPU accelerated single worker mining script for Denaro. It uses PyCUDA to JIT (Just in Time) compile a CUDA kernel for a SHA256 based nonce search over a constant block prefix and submits candidate blocks to a specified Denaro node.
+`cuda_miner.py` is a GPU accelerated single worker mining script for qrdx. It uses PyCUDA to JIT (Just in Time) compile a CUDA kernel for a SHA256 based nonce search over a constant block prefix and submits candidate blocks to a specified qrdx node.
 
 ---
 
@@ -46,7 +46,7 @@
 
 ## 3. Python Environment (Optional):
 
-- Only perform this step if you do not already have Python virtual environment setup for Denaro.
+- Only perform this step if you do not already have Python virtual environment setup for qrdx.
     - For more details refer to : [README.md](../README.md).
 
 1. **Create and activate a Python virtual environment:**
@@ -76,7 +76,7 @@
 - **Options:**        
     * `--address`, `-a`: Mining address to receive rewards *(required)*.
     
-    * `--node`, `-n`: URL of the Denaro node API (Default: http://127.0.0.1:3006/).
+    * `--node`, `-n`: URL of the qrdx node API (Default: http://127.0.0.1:3006/).
     
     * `--max-blocks`, `-m`: Max number of blocks to mine before exit (Default: 10).
     
@@ -207,6 +207,7 @@ This section provides guidance on how to fine tune the existing GPU settings to 
   - **High temperatures or loud fans**:
     - Reduce **Iterations** to shorten kernels and lower sustained load.
     - If needed, also reduce **Blocks** or improve cooling. Confirm that power limiting is not capping clocks.
+
 
 
 

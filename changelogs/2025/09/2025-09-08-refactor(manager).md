@@ -2,14 +2,14 @@
 
 **Contributer**: The-Sycorax (https://github.com/The-Sycorax)
 
-**Commit**: [c55a2bf0f479ef4a00ca6d76925583bd21a82095](https://github.com/The-Sycorax/denaro/commit/c55a2bf0f479ef4a00ca6d76925583bd21a82095)
+**Commit**: [c55a2bf0f479ef4a00ca6d76925583bd21a82095](https://github.com/The-Sycorax/qrdx/commit/c55a2bf0f479ef4a00ca6d76925583bd21a82095)
 
 **Date**: September 8th, 2025
 
 ---
 
 ### Overview:
-  - This change consolidates Denaro’s consensus logic into a single, deterministic path. It now uses a fixed **512-block** retarget period with bounded adjustments, introduces a power-of-two halving schedule, standardizes Merkle computation over sorted transaction hashes, tightens timestamp and size rules, normalizes mempool hashing, and persists the header-encoded difficulty.
+  - This change consolidates qrdx’s consensus logic into a single, deterministic path. It now uses a fixed **512-block** retarget period with bounded adjustments, introduces a power-of-two halving schedule, standardizes Merkle computation over sorted transaction hashes, tightens timestamp and size rules, normalizes mempool hashing, and persists the header-encoded difficulty.
   
   - Height-gated special cases and ad hoc historical exceptions are removed. Stored difficulty now reflects the header’s encoded value rather than a local recomputation.
   
@@ -18,13 +18,13 @@
 ---
 
 ### New Monetary Policy:
-  - The new monetary policy for Denaro has been chosen for its optimal balance of a scarce total supply, frequent halving events, and mathematical elegance; with all block subsidy parameters being powers-of-two:
+  - The new monetary policy for qrdx has been chosen for its optimal balance of a scarce total supply, frequent halving events, and mathematical elegance; with all block subsidy parameters being powers-of-two:
     - **Initial Reward: 64 DNR** (2^6)
     - **Halving Interval: 262,144** blocks (2^18) 
       - Targets ~2.5 years per halving
     - **Maximum halvings: 64** (2^6)
     - **Estimated Emission Lifespan: ~160 years** (64 halvings)      
-    - **Based on this policy, we can calculate the maximum total supply for Denaro to be capped at: 33,554,432 DNR** (2^25)
+    - **Based on this policy, we can calculate the maximum total supply for qrdx to be capped at: 33,554,432 DNR** (2^25)
     
   - The previous logic has been replaced with a single policy that caps issuance under the new schedule and removes the prior piecewise logic.
   
