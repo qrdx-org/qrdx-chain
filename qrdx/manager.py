@@ -607,3 +607,322 @@ async def validate_consensus_compatibility(peer_info: dict) -> bool:
     
     return True
 
+
+# ============================================================================
+# PROOF OF STAKE BLOCK MANAGEMENT
+# ============================================================================
+
+async def create_pos_block(
+    slot: int,
+    parent_hash: str,
+    transactions: List[Transaction],
+    proposer_address: str,
+    proposer_public_key: bytes,
+    sign_func,  # Callable[[bytes], bytes] for signing
+    randao_mix: bytes = None,
+    attestations: List = None,
+    graffiti: str = "",
+) -> dict:
+    """
+    Create a new Proof-of-Stake block.
+    
+    Args:
+        slot: Slot number for this block
+        parent_hash: Hash of the parent block
+        transactions: Transactions to include
+        proposer_address: Address of the block proposer (PQ address)
+        proposer_public_key: Dilithium public key of proposer
+        sign_func: Function to sign messages with proposer's key
+        randao_mix: Current RANDAO mix (optional)
+        attestations: Attestations to include (optional)
+        graffiti: Optional proposer message
+        
+    Returns:
+        Dictionary containing the block data
+    """
+    from .constants import SLOTS_PER_EPOCH
+    from .consensus import get_pos_rules
+    
+    database = Database.instance
+    pos_rules = get_pos_rules()
+    
+    # Calculate epoch
+    epoch = slot // SLOTS_PER_EPOCH
+    
+    # Get previous block for validation
+    parent_block = await database.get_block(parent_hash)
+    if not parent_block and slot > 0:
+        logger.error(f"Parent block {parent_hash} not found")
+        return None
+    
+    block_number = (parent_block['id'] + 1) if parent_block else 0
+    
+    # Calculate merkle root for transactions
+    merkle_root = pos_rules.calculate_merkle_tree(transactions)
+    
+    # Calculate state root (placeholder - would be full state root in production)
+    state_root = hashlib.sha256(
+        bytes.fromhex(parent_hash) + merkle_root.encode()
+    ).hexdigest()
+    
+    # Generate RANDAO reveal
+    randao_domain = b'RANDAO_REVEAL'
+    randao_message = slot.to_bytes(8, 'little') + randao_domain
+    randao_reveal = sign_func(randao_message)
+    
+    # Update RANDAO mix
+    if randao_mix:
+        new_randao_mix = pos_rules.compute_new_randao_mix(randao_mix, randao_reveal)
+    else:
+        new_randao_mix = hashlib.sha256(randao_reveal).digest()
+    
+    # Build block data
+    block_timestamp = timestamp()
+    
+    block_data = {
+        'number': block_number,
+        'parent_hash': parent_hash,
+        'state_root': state_root,
+        'transactions_root': merkle_root,
+        'timestamp': block_timestamp,
+        'proposer_address': proposer_address,
+        'proposer_public_key': proposer_public_key.hex(),
+        'slot': slot,
+        'epoch': epoch,
+        'randao_reveal': randao_reveal.hex(),
+        'randao_mix': new_randao_mix.hex(),
+        'graffiti': graffiti,
+        'attestations': attestations or [],
+        'transactions': [tx.hex() if hasattr(tx, 'hex') else str(tx) for tx in transactions],
+    }
+    
+    # Compute signing root
+    signing_data = (
+        block_number.to_bytes(8, 'little') +
+        bytes.fromhex(parent_hash) +
+        bytes.fromhex(state_root) +
+        bytes.fromhex(merkle_root) +
+        block_timestamp.to_bytes(8, 'little') +
+        slot.to_bytes(8, 'little') +
+        epoch.to_bytes(8, 'little') +
+        randao_reveal
+    )
+    signing_root = hashlib.sha256(signing_data).digest()
+    
+    # Sign the block
+    signature = sign_func(signing_root)
+    block_data['proposer_signature'] = signature.hex()
+    
+    # Compute block hash
+    block_hash_data = (
+        block_number.to_bytes(8, 'little') +
+        bytes.fromhex(parent_hash) +
+        bytes.fromhex(state_root) +
+        bytes.fromhex(merkle_root) +
+        block_timestamp.to_bytes(8, 'little') +
+        slot.to_bytes(8, 'little') +
+        proposer_address.encode('utf-8')
+    )
+    block_hash = hashlib.sha256(block_hash_data).hexdigest()
+    block_data['hash'] = block_hash
+    
+    return block_data
+
+
+async def validate_pos_block(block_data: dict, validators: list, randao_mix: bytes) -> tuple:
+    """
+    Validate a PoS block.
+    
+    Args:
+        block_data: Block data dictionary
+        validators: List of active validators
+        randao_mix: Current RANDAO mix
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    from .consensus import validate_pos_block as consensus_validate
+    
+    # Create a simple object from dict for validation
+    class BlockObj:
+        pass
+    
+    block = BlockObj()
+    block.slot = block_data['slot']
+    block.proposer_address = block_data['proposer_address']
+    block.proposer_public_key = bytes.fromhex(block_data['proposer_public_key'])
+    block.proposer_signature = bytes.fromhex(block_data['proposer_signature'])
+    block.randao_reveal = bytes.fromhex(block_data.get('randao_reveal', ''))
+    block.attestations = block_data.get('attestations', [])
+    block.transactions = block_data.get('transactions', [])
+    block.hash = block_data['hash']
+    
+    # Compute signing root
+    signing_data = (
+        block_data['number'].to_bytes(8, 'little') +
+        bytes.fromhex(block_data['parent_hash']) +
+        bytes.fromhex(block_data['state_root']) +
+        bytes.fromhex(block_data['transactions_root']) +
+        block_data['timestamp'].to_bytes(8, 'little') +
+        block_data['slot'].to_bytes(8, 'little') +
+        block_data['epoch'].to_bytes(8, 'little') +
+        bytes.fromhex(block_data.get('randao_reveal', ''))
+    )
+    block.signing_root = hashlib.sha256(signing_data).digest()
+    
+    return await consensus_validate(block, validators, randao_mix)
+
+
+async def commit_pos_block(block_data: dict, transactions: List[Transaction]) -> bool:
+    """
+    Commit a validated PoS block to the database.
+    
+    Args:
+        block_data: Block data dictionary
+        transactions: Parsed transactions
+        
+    Returns:
+        True if successful
+    """
+    from .constants import INITIAL_REWARD
+    from .consensus import calculate_block_reward
+    
+    database = Database.instance
+    
+    try:
+        # Calculate reward
+        total_stake = Decimal('100000')  # Would come from validator registry
+        attestation_count = len(block_data.get('attestations', []))
+        
+        block_reward = calculate_block_reward(
+            block_data['slot'],
+            total_stake,
+            attestation_count,
+        )
+        
+        # Regular transactions (exclude coinbase)
+        regular_transactions = [
+            tx for tx in transactions
+            if isinstance(tx, Transaction) and not isinstance(tx, CoinbaseTransaction)
+        ]
+        
+        fees = sum(tx.fees for tx in regular_transactions)
+        total_reward = block_reward + fees
+        
+        # Create coinbase for proposer
+        coinbase = CoinbaseTransaction(
+            block_data['hash'],
+            block_data['proposer_address'],
+            total_reward,
+        )
+        
+        # Add block to database
+        await database.add_block(
+            block_data['number'],
+            block_data['hash'],
+            '',  # content (PoS doesn't use hex content)
+            block_data['proposer_address'],
+            0,  # random (not used in PoS)
+            Decimal('1.0'),  # difficulty (fixed in PoS)
+            total_reward,
+            block_data['timestamp'],
+        )
+        
+        # Update block with PoS fields
+        async with database.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE blocks SET
+                    slot = $1,
+                    epoch = $2,
+                    proposer_signature = $3,
+                    randao_reveal = $4,
+                    attestations_included = $5
+                WHERE hash = $6
+            """,
+                block_data['slot'],
+                block_data['epoch'],
+                block_data['proposer_signature'],
+                block_data.get('randao_reveal', ''),
+                attestation_count,
+                block_data['hash'],
+            )
+        
+        # Add transactions
+        await database.add_transaction(coinbase, block_data['hash'])
+        
+        if regular_transactions:
+            await database.add_transactions(regular_transactions, block_data['hash'])
+            
+        # Update outputs
+        await database.add_unspent_transactions_outputs(
+            regular_transactions + [coinbase]
+        )
+        
+        if regular_transactions:
+            await database.remove_pending_transactions_by_hash([
+                tx.hash() for tx in regular_transactions
+            ])
+            await database.remove_unspent_outputs(regular_transactions)
+            await database.remove_pending_spent_outputs(regular_transactions)
+        
+        logger.info(
+            f"PoS block committed: slot={block_data['slot']}, "
+            f"hash={block_data['hash'][:16]}..., "
+            f"txs={len(regular_transactions)}, reward={total_reward}"
+        )
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to commit PoS block: {e}")
+        await database.delete_block(block_data['number'])
+        return False
+
+
+async def get_pos_chain_head() -> dict:
+    """
+    Get the current chain head for PoS consensus.
+    
+    Returns:
+        Dictionary with slot, epoch, block_hash, and finalized info
+    """
+    from .constants import SLOTS_PER_EPOCH
+    
+    database = Database.instance
+    last_block = await database.get_last_block()
+    
+    if not last_block:
+        return {
+            'slot': 0,
+            'epoch': 0,
+            'block_hash': '0' * 64,
+            'finalized_slot': 0,
+            'justified_slot': 0,
+        }
+    
+    slot = last_block.get('slot', last_block['id'])
+    epoch = slot // SLOTS_PER_EPOCH
+    
+    # Get finality info from epochs table
+    async with database.pool.acquire() as conn:
+        finalized = await conn.fetchrow("""
+            SELECT epoch, start_slot FROM epochs 
+            WHERE finalized = true 
+            ORDER BY epoch DESC LIMIT 1
+        """)
+        
+        justified = await conn.fetchrow("""
+            SELECT epoch, start_slot FROM epochs 
+            WHERE justified = true 
+            ORDER BY epoch DESC LIMIT 1
+        """)
+    
+    return {
+        'slot': slot,
+        'epoch': epoch,
+        'block_hash': last_block['hash'],
+        'finalized_slot': finalized['start_slot'] if finalized else 0,
+        'finalized_epoch': finalized['epoch'] if finalized else 0,
+        'justified_slot': justified['start_slot'] if justified else 0,
+        'justified_epoch': justified['epoch'] if justified else 0,
+    }

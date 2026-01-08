@@ -8,6 +8,9 @@
 # Chain ID for network identification
 chain_id = 1
 
+# Network name
+network_name = "qrdx-mainnet"
+
 # Data directory for node storage
 data_dir = "./data"
 
@@ -42,11 +45,35 @@ max_pending_peers = 25
 # Enable node discovery via Kademlia DHT
 enabled = true
 
-# Bootstrap nodes (qnode:// URIs)
+# Bootstrap nodes for initial peer discovery
+# Supports two formats:
+#
+# 1. Simple HTTP URLs:
+#    "http://hostname:port"
+#
+# 2. qnode:// URIs (includes node public key for identity verification):
+#    "qnode://<pubkey_hex>@hostname:port"
+#    The public key allows verification of the bootstrap node's identity
+#    during handshake, preventing MITM attacks on bootstrap connections.
+#
+# You can mix both formats in the same list.
 bootnodes = [
-    # "qnode://<pubkey>@bootnode1.qrdx.network:30303",
-    # "qnode://<pubkey>@bootnode2.qrdx.network:30303",
+    # Simple HTTP format (backward compatible)
+    "http://node.qrdx.network:3007",
+    
+    # qnode:// URI format with public key for identity verification
+    # "qnode://a1b2c3d4e5f6...@node2.qrdx.network:30303",
+    
+    # Additional bootstrap nodes
+    "http://node2.qrdx.network:3007",
+    "http://node3.qrdx.network:3007",
 ]
+
+# Environment variable alternative (comma-separated, supports both formats):
+# QRDX_BOOTSTRAP_NODES="http://node1:3007,qnode://abc123@node2:30303"
+
+# Legacy single bootstrap node (for compatibility)
+# bootstrap_node = "http://node.qrdx.network:3007"
 
 # Enable DNS discovery
 dns_discovery = false
@@ -152,19 +179,125 @@ pool_max_size = 20
 
 
 # =============================================================================
+# GENESIS CONFIGURATION
+# =============================================================================
+[genesis]
+# Genesis block configuration
+# These settings are only used when initializing a new chain (block height = 0)
+
+# Chain identification
+chain_id = 1
+network_name = "qrdx-mainnet"
+
+# Total initial supply (in QRDX)
+initial_supply = 100000000
+
+# Genesis timestamp (Unix timestamp, 0 = use current time)
+# For mainnet launch, this should be a coordinated future time
+genesis_time = 0
+
+
+# Prefunded accounts at genesis
+# These accounts receive their balance at block 0
+# Format: { address = [balance, "label"] }
+[genesis.prefunded_accounts]
+# Treasury - ecosystem development, grants, partnerships
+"Qrdx_treasury_00000000000000000000000000000001" = [10000000, "Treasury"]
+
+# Foundation - long-term development and maintenance  
+"Qrdx_foundation_000000000000000000000000000001" = [5000000, "Foundation"]
+
+# Validator incentive fund - bootstrapping initial validators
+"Qrdx_validator_incentive_0000000000000000001" = [2000000, "Validator Incentive Fund"]
+
+# Community fund - airdrops, community initiatives
+"Qrdx_community_fund_00000000000000000000001" = [3000000, "Community Fund"]
+
+# Custom prefunded accounts can be added here for private networks:
+# "your_custom_address" = [1000, "Description"]
+
+
+# =============================================================================
 # CONSENSUS
 # =============================================================================
 [consensus]
-# Consensus mechanism: "pow" (proof of work)
-mechanism = "pow"
-
-# Enable mining on this node
-mining_enabled = false
+# Consensus mechanism: "pos" (proof of stake - mainnet)
+# Note: PoW is deprecated and will be removed in future versions
+mechanism = "pos"
 
 
-[consensus.pow]
-# Mining threads (0 = auto-detect)
-threads = 0
+[consensus.pos]
+# PoS parameters (should match network consensus)
+slot_duration = 2          # seconds per slot
+slots_per_epoch = 32       # slots per epoch (64 seconds)
+attestation_threshold = 0.667  # 2/3+ for finality
+
+
+# =============================================================================
+# VALIDATOR (PoS)
+# =============================================================================
+[validator]
+# Enable validator mode (requires PQ wallet and minimum stake)
+# WARNING: Validators MUST use Post-Quantum (PQ) wallets only!
+enabled = false
+
+# Path to the Post-Quantum wallet file (Dilithium3)
+# CRITICAL: Only PQ wallets can be validators. Traditional wallets will be rejected.
+pq_wallet_path = "./data/validator_wallet.json"
+
+# Wallet password (or use QRDX_VALIDATOR_PASSWORD env var)
+# Leave empty to prompt at startup
+pq_wallet_password = ""
+
+# Custom graffiti message included in proposed blocks (max 32 chars)
+graffiti = ""
+
+
+[validator.staking]
+# Minimum stake required to be a validator (in QRDX)
+# WARNING: Do not change unless you know what you're doing!
+min_stake = 100000
+
+# Maximum effective stake per validator (excess doesn't increase rewards)
+max_effective_stake = 1000000
+
+# Number of epochs for unbonding period (~7 days)
+unbonding_epochs = 5040
+
+
+[validator.attestation]
+# Maximum attestations to include per block
+max_attestations_per_block = 128
+
+# Maximum slot distance for attestation inclusion
+max_inclusion_distance = 32
+
+# Seconds into slot to wait before aggregating attestations
+aggregation_delay = 1.0
+
+
+[validator.slashing_protection]
+# Enable local slashing protection database
+# STRONGLY RECOMMENDED - prevents accidental double-signing
+enabled = true
+
+# Path to slashing protection database
+db_path = "./data/slashing_protection.db"
+
+# Maximum historical entries to keep per validator
+max_history = 10000
+
+
+[validator.rewards]
+# Fee recipient address for block rewards
+# If empty, rewards go to validator address
+fee_recipient = ""
+
+# Automatically compound rewards (stake rewards back)
+auto_compound = false
+
+# Minimum reward amount to trigger compounding (in QRDX)
+compound_threshold = 100
 
 
 # =============================================================================

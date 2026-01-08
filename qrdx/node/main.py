@@ -46,6 +46,7 @@ from qrdx.manager import (
 
 from qrdx.node.nodes_manager import NodesManager, NodeInterface
 from qrdx.node.utils import ip_is_local
+from qrdx.node.bootstrap import BootstrapManager, get_bootstrap_manager, init_bootstrap_manager
 from qrdx.transactions import Transaction, CoinbaseTransaction
 from qrdx import Database
 from qrdx.constants import (
@@ -56,7 +57,8 @@ from qrdx.constants import (
     DENARO_BOOTSTRAP_NODE, DENARO_SELF_URL, POSTGRES_USER,
     POSTGRES_PASSWORD, DENARO_DATABASE_NAME, DENARO_DATABASE_HOST,
     MAX_TX_DATA_SIZE, DENARO_NODE_HOST, DENARO_NODE_PORT, MAX_REORG_DEPTH,
-    LOG_INCLUDE_REQUEST_CONTENT, LOG_INCLUDE_RESPONSE_CONTENT, LOG_MAX_PATH_LENGTH
+    LOG_INCLUDE_REQUEST_CONTENT, LOG_INCLUDE_RESPONSE_CONTENT, LOG_MAX_PATH_LENGTH,
+    BOOTSTRAP_NODES
 )
 from qrdx.node.identity import (
     initialize_identity, get_node_id, get_public_key_hex, 
@@ -1329,21 +1331,55 @@ async def do_handshake_with_peer(peer_url_to_connect: str):
         })
 
 
+async def bootstrap_from_all_nodes():
+    """
+    Bootstrap from all configured bootstrap nodes.
+    
+    This attempts handshakes with all bootstrap nodes to ensure
+    maximum peer discovery at startup.
+    """
+    logger.info(f"Bootstrapping from {len(BOOTSTRAP_NODES)} configured bootstrap nodes...")
+    
+    successful = 0
+    for node_url in BOOTSTRAP_NODES:
+        node_url = node_url.strip().rstrip('/')
+        if not node_url:
+            continue
+        
+        try:
+            logger.info(f"Attempting bootstrap from {node_url}")
+            await do_handshake_with_peer(node_url)
+            successful += 1
+        except Exception as e:
+            logger.warning(f"Failed to bootstrap from {node_url}: {e}")
+        
+        # Small delay between bootstrap attempts
+        await asyncio.sleep(1)
+    
+    logger.info(
+        f"Bootstrap complete: {successful}/{len(BOOTSTRAP_NODES)} nodes successful, "
+        f"{len(NodesManager.peers)} total peers"
+    )
+    return successful
+
+
 async def periodic_peer_discovery():
     """
     Periodically discovers new peers via gossip and verifies them via handshake.
-    This version is now resilient to unreachable peers.
+    This version is now resilient to unreachable peers and supports multiple bootstrap nodes.
     """
     await asyncio.sleep(20)
-    await do_handshake_with_peer(DENARO_BOOTSTRAP_NODE)
+    
+    # Initial bootstrap from all configured nodes
+    await bootstrap_from_all_nodes()
 
     while True:
         await asyncio.sleep(60)
         logger.debug("Running periodic peer discovery...")
         
         if not NodesManager.peers:
-            logger.info("Peer list is empty. Retrying handshake with bootstrap node.")
-            await do_handshake_with_peer(DENARO_BOOTSTRAP_NODE)
+            logger.info("Peer list is empty. Re-bootstrapping from configured nodes.")
+            await bootstrap_from_all_nodes()
             continue
 
         connectable_peers_tuples = [
@@ -1399,7 +1435,10 @@ async def is_url_local(url: str) -> bool:
 
 
 async def check_own_reachability():
-    """A one-time startup task to determine if the node is publicly reachable"""
+    """
+    A one-time startup task to determine if the node is publicly reachable.
+    Tries multiple bootstrap nodes for verification.
+    """
     global self_is_public
     await asyncio.sleep(10)
 
@@ -1414,31 +1453,42 @@ async def check_own_reachability():
         NodesManager.set_public_status(False)
         return
 
-    logger.info(f"Potential public URL is {DENARO_SELF_URL}. Asking bootstrap node to verify")
-    bootstrap_interface = NodeInterface(DENARO_BOOTSTRAP_NODE, client=http_client, db=db)
+    logger.info(f"Potential public URL is {DENARO_SELF_URL}. Asking bootstrap nodes to verify")
     
-    try:
-        is_reachable = await bootstrap_interface.check_peer_reachability(DENARO_SELF_URL)
-        if is_reachable:
-            self_is_public = True
-            NodesManager.set_public_status(True)
-            logger.info(f"SUCCESS: Node confirmed to be publicly reachable at {DENARO_SELF_URL}")
-        else:
-            self_is_public = False
-            NodesManager.set_public_status(False)
-            logger.warning(f"DENARO_SELF_URL is set to {DENARO_SELF_URL}, but it was not reachable by the bootstrap node. Operating as a private node.")
-    
+    # Try each bootstrap node until one can verify reachability
+    for bootstrap_url in BOOTSTRAP_NODES:
+        bootstrap_url = bootstrap_url.strip().rstrip('/')
+        if not bootstrap_url:
+            continue
+            
+        logger.debug(f"Checking reachability via {bootstrap_url}")
+        bootstrap_interface = NodeInterface(bootstrap_url, client=http_client, db=db)
+        
+        try:
+            is_reachable = await bootstrap_interface.check_peer_reachability(DENARO_SELF_URL)
+            if is_reachable:
+                self_is_public = True
+                NodesManager.set_public_status(True)
+                logger.info(f"SUCCESS: Node confirmed to be publicly reachable at {DENARO_SELF_URL}")
+                return
+            else:
+                logger.debug(f"Bootstrap node {bootstrap_url} reports us as not reachable")
 
-    except httpx.RequestError:
-        # The bootstrap node is unreachable. We can't verify, so we must assume we are private.
-        self_is_public = False
-        NodesManager.set_public_status(False)
-        logger.warning(f"Bootstrap node at {DENARO_BOOTSTRAP_NODE} is unreachable. Assuming this is a private node.")
+        except httpx.RequestError:
+            logger.debug(f"Bootstrap node at {bootstrap_url} is unreachable, trying next...")
+            continue
+        
+        except Exception as e:
+            logger.debug(f"Error checking reachability via {bootstrap_url}: {e}")
+            continue
     
-    except Exception as e:
-        self_is_public = False
-        NodesManager.set_public_status(False)
-        logger.error(f"Failed to verify reachability with bootstrap node. Assuming private. Error: {e}")
+    # None of the bootstrap nodes could verify us
+    self_is_public = False
+    NodesManager.set_public_status(False)
+    logger.warning(
+        f"DENARO_SELF_URL is set to {DENARO_SELF_URL}, but no bootstrap node could verify reachability. "
+        f"Operating as a private node."
+    )
 
 
 async def periodic_update_fetcher():

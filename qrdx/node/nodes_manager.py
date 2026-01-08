@@ -5,7 +5,7 @@ import json
 import time
 from os.path import dirname, exists
 from random import sample
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 
 import asyncio
 import ipaddress
@@ -15,8 +15,9 @@ from urllib.parse import urlparse, urlencode
 import httpx
 
 from ..constants import (
-    ACTIVE_NODES_DELTA, MAX_PEERS_COUNT, DENARO_SELF_URL,
-    LOG_INCLUDE_REQUEST_CONTENT, LOG_INCLUDE_RESPONSE_CONTENT, LOG_MAX_PATH_LENGTH
+    ACTIVE_NODES_DELTA, MAX_PEERS_COUNT, DENARO_SELF_URL, BOOTSTRAP_NODES,
+    LOG_INCLUDE_REQUEST_CONTENT, LOG_INCLUDE_RESPONSE_CONTENT, LOG_MAX_PATH_LENGTH,
+    CONNECTION_TIMEOUT
 )
 
 from .identity import get_node_id, get_public_key_hex, sign_message, get_canonical_json_bytes
@@ -32,16 +33,30 @@ class NodesManager:
     self_id: str = None
     peers: dict = None
     self_is_public: bool = False
+    bootstrap_nodes: List[str] = BOOTSTRAP_NODES
+    _bootstrap_complete: bool = False
 
     # The self-contained httpx.AsyncClient has been REMOVED from this class.
     # It will now be passed in from the main application.
 
     @staticmethod
-    def init(self_node_id: str):
-        """Initializes the manager, loading peers from the JSON file."""
+    def init(self_node_id: str, bootstrap_nodes: Optional[List[str]] = None):
+        """
+        Initializes the manager, loading peers from the JSON file.
+        
+        Args:
+            self_node_id: This node's unique identifier
+            bootstrap_nodes: Optional list of bootstrap node URLs to use
+        """
         NodesManager.self_id = self_node_id
+        NodesManager._bootstrap_complete = False
+        
+        # Set custom bootstrap nodes if provided
+        if bootstrap_nodes:
+            NodesManager.bootstrap_nodes = bootstrap_nodes
+        
         if not exists(NodesManager.db_path):
-            NodesManager.purge_peers() # Corrected from self.purge_peers()
+            NodesManager.purge_peers()
         else:
             with open(NodesManager.db_path, 'r') as f:
                 data = json.load(f)
@@ -58,6 +73,117 @@ class NodesManager:
         """Saves the current peer list to the JSON file."""
         with open(NodesManager.db_path, 'w') as f:
             json.dump({'peers': NodesManager.peers}, f, indent=4)
+
+    @staticmethod
+    async def bootstrap_from_nodes(
+        client: httpx.AsyncClient,
+        handshake_func: callable,
+    ) -> int:
+        """
+        Bootstrap from configured bootstrap nodes.
+        
+        Attempts to connect to each bootstrap node and perform handshakes
+        to discover initial peers.
+        
+        Args:
+            client: HTTP client for making requests
+            handshake_func: Async function to perform handshake with a peer URL
+            
+        Returns:
+            Number of successful bootstrap connections
+        """
+        if NodesManager._bootstrap_complete:
+            logger.debug("Bootstrap already completed, skipping")
+            return 0
+        
+        successful = 0
+        failed_nodes = []
+        
+        logger.info(f"Starting bootstrap from {len(NodesManager.bootstrap_nodes)} nodes...")
+        
+        for node_url in NodesManager.bootstrap_nodes:
+            node_url = node_url.strip().rstrip('/')
+            if not node_url:
+                continue
+                
+            try:
+                logger.info(f"Attempting bootstrap handshake with {node_url}")
+                await handshake_func(node_url)
+                successful += 1
+                logger.info(f"Successfully bootstrapped from {node_url}")
+                
+            except httpx.RequestError as e:
+                logger.warning(f"Bootstrap node {node_url} unreachable: {e}")
+                failed_nodes.append(node_url)
+                
+            except Exception as e:
+                logger.error(f"Error bootstrapping from {node_url}: {e}")
+                failed_nodes.append(node_url)
+            
+            # Small delay between bootstrap attempts
+            await asyncio.sleep(0.5)
+        
+        NodesManager._bootstrap_complete = True
+        
+        if successful == 0:
+            logger.warning(
+                f"Failed to bootstrap from any node. "
+                f"Tried: {', '.join(NodesManager.bootstrap_nodes)}"
+            )
+        else:
+            logger.info(
+                f"Bootstrap complete: {successful}/{len(NodesManager.bootstrap_nodes)} nodes, "
+                f"{len(NodesManager.peers)} peers discovered"
+            )
+        
+        return successful
+
+    @staticmethod
+    def get_bootstrap_nodes() -> List[str]:
+        """Get the list of configured bootstrap nodes."""
+        return NodesManager.bootstrap_nodes.copy()
+    
+    @staticmethod
+    def set_bootstrap_nodes(nodes: List[str]):
+        """
+        Set the list of bootstrap nodes.
+        
+        Args:
+            nodes: List of bootstrap node URLs
+        """
+        NodesManager.bootstrap_nodes = [
+            n.strip().rstrip('/') for n in nodes if n.strip()
+        ]
+        logger.info(f"Updated bootstrap nodes: {NodesManager.bootstrap_nodes}")
+    
+    @staticmethod
+    def add_bootstrap_node(url: str) -> bool:
+        """
+        Add a bootstrap node to the list.
+        
+        Args:
+            url: Bootstrap node URL
+            
+        Returns:
+            True if added, False if already exists
+        """
+        url = url.strip().rstrip('/')
+        if url in NodesManager.bootstrap_nodes:
+            return False
+        NodesManager.bootstrap_nodes.append(url)
+        logger.info(f"Added bootstrap node: {url}")
+        return True
+    
+    @staticmethod
+    def is_bootstrap_complete() -> bool:
+        """Check if initial bootstrap has completed."""
+        return NodesManager._bootstrap_complete
+    
+    @staticmethod
+    def reset_bootstrap():
+        """Reset bootstrap state to allow re-bootstrapping."""
+        NodesManager._bootstrap_complete = False
+        logger.info("Bootstrap state reset")
 
     @staticmethod
     async def request(client: httpx.AsyncClient, url: str, method: str = 'GET', signed: bool = False, node_id: Optional[str] = None, **kwargs):
