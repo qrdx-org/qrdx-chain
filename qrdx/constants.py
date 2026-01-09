@@ -6,6 +6,7 @@ used throughout the codebase. Constants are organized by category for easy
 reference and maintenance.
 """
 import ast
+import os
 import re
 from decimal import Decimal
 from dotenv import dotenv_values
@@ -14,7 +15,8 @@ from fastecdsa import curve
 # =============================================================================
 # ENVIRONMENT CONFIGURATION
 # =============================================================================
-# Load environment variables once at module import
+# Load environment variables from .env file and merge with os.environ
+# os.environ takes precedence over .env file
 _config = dotenv_values(".env")
 
 NODE_DEFAULTS = {
@@ -22,6 +24,7 @@ NODE_DEFAULTS = {
     'POSTGRES_PASSWORD':               'qrdx',
     'QRDX_DATABASE_NAME':              'qrdx',
     'QRDX_DATABASE_HOST':              '127.0.0.1',
+    'QRDX_DATABASE_PATH':              '',  # If set, use SQLite instead of PostgreSQL
     'QRDX_NODE_HOST':                  '127.0.0.1',
     'QRDX_NODE_PORT':                  '3007',
     'QRDX_SELF_URL':                   '',
@@ -193,8 +196,9 @@ def parse_bool(v):
     return v
 
 for key, default_raw in DEFAULTS.items():
-    # dotenv_values returns strings or None. None is treated as missing.
-    raw = _config.get(key)
+    # Check environment variables first (highest priority),
+    # then .env file, then defaults
+    raw = os.environ.get(key) or _config.get(key)
     value_raw = default_raw if raw is None else raw
 
     # Parses only boolean-literals. Leaves other values untouched.
@@ -218,8 +222,11 @@ DENARO_SELF_URL = namespace.get('QRDX_SELF_URL', '')
 DENARO_BOOTSTRAP_NODE = namespace.get('QRDX_BOOTSTRAP_NODE', 'http://node.qrdx.network')
 DENARO_DATABASE_NAME = namespace.get('QRDX_DATABASE_NAME', 'qrdx')
 DENARO_DATABASE_HOST = namespace.get('QRDX_DATABASE_HOST', '127.0.0.1')
+DENARO_DATABASE_PATH = namespace.get('QRDX_DATABASE_PATH', '')  # SQLite path (if set, use SQLite)
 DENARO_NODE_HOST = namespace.get('QRDX_NODE_HOST', '127.0.0.1')
 DENARO_NODE_PORT = namespace.get('QRDX_NODE_PORT', '3007')
+POSTGRES_USER = namespace.get('POSTGRES_USER', 'qrdx')
+POSTGRES_PASSWORD = namespace.get('POSTGRES_PASSWORD', 'qrdx')
 
 # ==================================================================================
 # BOOTSTRAP NODES CONFIGURATION

@@ -56,7 +56,8 @@ from qrdx.constants import (
     MAX_BATCH_BYTES, VALID_HEX_PATTERN, VALID_ADDRESS_PATTERN,
     DENARO_BOOTSTRAP_NODE, DENARO_SELF_URL, POSTGRES_USER,
     POSTGRES_PASSWORD, DENARO_DATABASE_NAME, DENARO_DATABASE_HOST,
-    MAX_TX_DATA_SIZE, DENARO_NODE_HOST, DENARO_NODE_PORT, MAX_REORG_DEPTH,
+    DENARO_DATABASE_PATH, MAX_TX_DATA_SIZE, DENARO_NODE_HOST, 
+    DENARO_NODE_PORT, MAX_REORG_DEPTH,
     LOG_INCLUDE_REQUEST_CONTENT, LOG_INCLUDE_RESPONSE_CONTENT, LOG_MAX_PATH_LENGTH,
     BOOTSTRAP_NODES
 )
@@ -1824,16 +1825,56 @@ async def startup():
     self_node_id = get_node_id()
     NodesManager.init(self_node_id)
 
-    db = await Database.create(
-        user=POSTGRES_USER,
-        password=POSTGRES_PASSWORD,
-        database=DENARO_DATABASE_NAME,
-        host=DENARO_DATABASE_HOST
-    )
+    # Use SQLite if DENARO_DATABASE_PATH is set, otherwise use PostgreSQL
+    if DENARO_DATABASE_PATH:
+        logger.info(f"Using SQLite database: {DENARO_DATABASE_PATH}")
+        from ..database_sqlite import DatabaseSQLite
+        db = await DatabaseSQLite.create(db_path=DENARO_DATABASE_PATH)
+    else:
+        logger.info(f"Using PostgreSQL database: {DENARO_DATABASE_NAME}")
+        db = await Database.create(
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            database=DENARO_DATABASE_NAME,
+            host=DENARO_DATABASE_HOST
+        )
     
     logger.info("Clearing pending transaction pool.")
     await db.remove_all_pending_transactions()
     logger.info("Pending transaction pool cleared.")
+    
+    # Initialize genesis if needed (PoS)
+    logger.info("Checking genesis state...")
+    from ..validator.genesis_init import initialize_genesis_if_needed
+    genesis_created = await initialize_genesis_if_needed(db)
+    if genesis_created:
+        logger.info("Genesis block created for PoS network")
+    else:
+        logger.info("Genesis block already exists")
+    
+    # Initialize PoS validator if enabled
+    validator_node = None
+    validator_enabled = os.getenv('QRDX_VALIDATOR_ENABLED', 'false').lower() == 'true'
+    if validator_enabled:
+        logger.info("🔷 PoS Validator Mode Enabled")
+        validator_wallet_path = os.getenv('QRDX_VALIDATOR_WALLET')
+        validator_password = os.getenv('QRDX_VALIDATOR_PASSWORD', '')
+        
+        if validator_wallet_path and os.path.exists(validator_wallet_path):
+            try:
+                from ..validator.node_integration import initialize_validator_node
+                validator_node = await initialize_validator_node(db, validator_wallet_path, validator_password)
+                
+                if validator_node:
+                    logger.info(f"✅ Validator node started: {validator_node.wallet.address}")
+                    # Store globally for access in endpoints
+                    app.state.validator = validator_node
+                else:
+                    logger.error("❌ Failed to initialize validator node")
+            except Exception as e:
+                logger.error(f"❌ Validator initialization error: {e}", exc_info=True)
+        else:
+            logger.warning(f"⚠️  Validator wallet not found: {validator_wallet_path}")
     
     logger.info("Starting background tasks.")
     asyncio.create_task(check_own_reachability())
@@ -1847,6 +1888,11 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     """Clean shutdown"""
+    # Stop validator if running
+    if hasattr(app.state, 'validator') and app.state.validator:
+        await app.state.validator.stop()
+        logger.info("Validator stopped.")
+    
     # Close the shared HTTP client
     if http_client:
         await http_client.aclose()
@@ -2352,6 +2398,11 @@ async def handshake_challenge(request: Request):
     height = await db.get_next_block_id() - 1
     last_block = await db.get_block_by_id(height) if height > -1 else None
     
+    # Handle different database implementations (PostgreSQL uses 'hash', SQLite uses 'block_hash')
+    last_hash = None
+    if last_block:
+        last_hash = last_block.get('hash') or last_block.get('block_hash')
+    
     return {
         "ok": True, 
         "result": {
@@ -2361,10 +2412,9 @@ async def handshake_challenge(request: Request):
             "is_public": NodesManager.self_is_public,
             "url": DENARO_SELF_URL,
             "height": height,
-            "last_hash": last_block['hash'] if last_block else None
+            "last_hash": last_hash
         }
     }
-
 
 
 @app.post("/handshake/response")

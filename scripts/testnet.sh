@@ -81,10 +81,6 @@ check_dependencies() {
         missing_deps+=("python3")
     fi
     
-    if ! command_exists psql; then
-        missing_deps+=("postgresql-client")
-    fi
-    
     if ! command_exists jq; then
         missing_deps+=("jq")
     fi
@@ -117,16 +113,16 @@ import json
 import os
 sys.path.insert(0, '${PROJECT_DIR}')
 
-from qrdx.crypto.keys import generate_pq_keypair
-from qrdx.crypto.address import pubkey_to_address
+from qrdx.crypto.pq.dilithium import generate_keypair
+from qrdx.crypto.address import public_key_to_address, AddressType
 from decimal import Decimal
 import hashlib
 
 # Generate PQ keypair (Dilithium3)
-private_key, public_key = generate_pq_keypair()
+private_key, public_key = generate_keypair()
 
-# Generate address
-address = pubkey_to_address(public_key)
+# Generate address from public key bytes
+address = public_key_to_address(public_key.to_bytes(), AddressType.POST_QUANTUM)
 
 # Create wallet structure
 wallet = {
@@ -134,8 +130,8 @@ wallet = {
     "type": "pq",
     "algorithm": "dilithium3",
     "address": address,
-    "public_key": public_key.hex(),
-    "private_key": private_key.hex(),
+    "public_key": public_key.to_hex(),
+    "private_key": private_key.to_hex(),
     "label": "Validator ${validator_id}",
     "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
@@ -195,8 +191,8 @@ sys.path.insert(0, '${PROJECT_DIR}')
 from qrdx.validator.genesis import GenesisCreator, GenesisConfig
 
 # Validator data
-validator_addresses = ${validator_addresses[@]@Q}
-validator_pubkeys = ${validator_pubkeys[@]@Q}
+validator_addresses = [${validator_addresses[@]@Q}]
+validator_pubkeys = [${validator_pubkeys[@]@Q}]
 
 # Create genesis config
 config = GenesisConfig(
@@ -217,8 +213,9 @@ creator = GenesisCreator(config)
 # Add validators
 for i, (addr, pubkey) in enumerate(zip(validator_addresses, validator_pubkeys)):
     stake = Decimal("100000")  # 100K QRDX stake
-    creator.add_validator(addr, pubkey, stake)
-    log_info(f"Added validator {i}: {addr[:20]}... stake={stake}")
+    success = creator.add_validator(addr, pubkey, stake)
+    if success:
+        print(f"Added validator {i}: {addr[:20]}... stake={stake}", file=sys.stderr)
 
 # Create genesis
 state, block = creator.create_genesis()
@@ -244,50 +241,27 @@ EOF
 setup_databases() {
     local num_nodes=$1
     
-    log_step "Setting up PostgreSQL databases"
+    log_step "Setting up SQLite databases"
     
-    # Check if PostgreSQL is running
-    if ! pg_isready -h localhost -p 5432 >/dev/null 2>&1; then
-        log_warn "PostgreSQL not running, attempting to start..."
-        
-        # Try to start PostgreSQL (varies by system)
-        if command_exists systemctl; then
-            sudo systemctl start postgresql || true
-        elif command_exists service; then
-            sudo service postgresql start || true
-        fi
-        
-        sleep 2
-        
-        if ! pg_isready -h localhost -p 5432 >/dev/null 2>&1; then
-            log_error "PostgreSQL is not running. Please start PostgreSQL manually."
-            return 1
-        fi
-    fi
+    # Create database directory
+    local db_dir="${TESTNET_DIR}/databases"
+    mkdir -p "${db_dir}"
     
-    log_success "PostgreSQL is running"
-    
-    # Create databases for each node
+    # Create SQLite database for each node
     for i in $(seq 0 $((num_nodes - 1))); do
-        local db_name="qrdx_testnet_node${i}"
+        local db_file="${db_dir}/node${i}.db"
+        log_info "Creating SQLite database: ${db_file}"
         
-        # Drop existing database if it exists
-        psql -h localhost -U "${POSTGRES_USER:-qrdx}" -tc "DROP DATABASE IF EXISTS ${db_name}" postgres 2>/dev/null || true
+        # Remove existing database for clean restart
+        rm -f "${db_file}"
         
-        # Create database
-        psql -h localhost -U "${POSTGRES_USER:-qrdx}" -tc "CREATE DATABASE ${db_name}" postgres 2>/dev/null || {
-            log_warn "Database ${db_name} may already exist or user doesn't have permissions"
-        }
+        # Create new empty database file
+        touch "${db_file}"
         
-        # Initialize schema
-        if [ -f "${PROJECT_DIR}/qrdx/schema.sql" ]; then
-            psql -h localhost -U "${POSTGRES_USER:-qrdx}" -d "${db_name}" -f "${PROJECT_DIR}/qrdx/schema.sql" >/dev/null 2>&1 || true
-        fi
-        
-        log_info "Database created: ${db_name}"
+        log_success "Database created: ${db_file}"
     done
     
-    log_success "All databases created"
+    log_success "All SQLite databases created"
 }
 
 # =============================================================================
@@ -334,12 +308,8 @@ QRDX_SELF_URL=http://127.0.0.1:${node_port}
 # Bootstrap configuration
 QRDX_BOOTSTRAP_NODES=${bootstrap_nodes}
 
-# Database
-QRDX_DATABASE_NAME=qrdx_testnet_node${node_id}
-QRDX_DATABASE_HOST=127.0.0.1
-QRDX_DATABASE_PORT=5432
-POSTGRES_USER=${POSTGRES_USER:-qrdx}
-POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-qrdx}
+# Database (SQLite)
+QRDX_DATABASE_PATH=${TESTNET_DIR}/databases/node${node_id}.db
 
 # RPC
 QRDX_RPC_ENABLED=true

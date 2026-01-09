@@ -67,12 +67,7 @@ class ConsensusSchedule:
         Modify this method to update activation heights before deployment.
         """
         self._activations = [
-            ConsensusActivation(
-                version=ConsensusVersion.CONSENSUS_V1,
-                activation_height=0,
-                description="Security fixes: proper Merkle trees, MTP timestamps, improved difficulty, coinbase validation",
-                is_hard_fork=False
-            ),
+            # QR-PoS from genesis - only V2_POS is active
             ConsensusActivation(
                 version=ConsensusVersion.CONSENSUS_V2_POS,
                 activation_height=0,  # PoS from genesis for mainnet

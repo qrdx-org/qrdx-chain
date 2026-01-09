@@ -512,7 +512,8 @@ class NodeInterface:
         if current_height > -1:
             last_block = await self.db.get_block_by_id(current_height)
             if last_block:
-                last_block_hash = last_block['hash']
+                # Handle different database implementations
+                last_block_hash = last_block.get('hash') or last_block.get('block_hash')
 
         # This data will be added to the signature and the request headers.
         our_state = {

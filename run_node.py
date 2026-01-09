@@ -1,5 +1,6 @@
 import uvicorn
 import logging
+import os
 from dotenv import dotenv_values
 
 # Suppress uvicorn's default logging and warnings
@@ -19,8 +20,9 @@ for uvicorn_logger in uvicorn_loggers:
 
 config = dotenv_values(".env")
 
-QRDX_NODE_HOST = config.get("QRDX_NODE_HOST", "127.0.0.1")
-QRDX_NODE_PORT = int(config.get("QRDX_NODE_PORT", "3006"))
+# Prioritize environment variables over .env file (for testnet configs)
+QRDX_NODE_HOST = os.getenv("QRDX_NODE_HOST", config.get("QRDX_NODE_HOST", "127.0.0.1"))
+QRDX_NODE_PORT = int(os.getenv("QRDX_NODE_PORT", config.get("QRDX_NODE_PORT", "3006")))
 
 if __name__ == "__main__":
     uvicorn.run(

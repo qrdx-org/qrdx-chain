@@ -3,12 +3,14 @@
 {
 	"name": "Python 3",
 	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
-	"image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+	"image": "mcr.microsoft.com/devcontainers/python:1-3.13-bookworm",
 	"features": {
 		"ghcr.io/devcontainers/features/docker-in-docker:2": {},
 		"ghcr.io/devcontainers/features/node:1": {},
 		"ghcr.io/devcontainers-community/features/llvm:3": {},
-		"ghcr.io/devcontainers-community/npm-features/typescript:1": {}
+		"ghcr.io/devcontainers-community/npm-features/typescript:1": {},
+		"ghcr.io/devcontainers-extra/features/cmake:1": {},
+		"ghcr.io/devcontainers-extra/features/ninja-asdf:2": {}
 	},
 
 	// Features to add to the dev container. More info: https://containers.dev/features.
