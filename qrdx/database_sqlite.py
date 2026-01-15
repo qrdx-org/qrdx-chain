@@ -110,10 +110,51 @@ class DatabaseSQLite:
             last_attestation INTEGER
         );
         
+        CREATE TABLE IF NOT EXISTS validator_stakes (
+            validator_address TEXT PRIMARY KEY,
+            stake INTEGER NOT NULL,
+            effective_stake INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            activation_epoch INTEGER,
+            exit_epoch INTEGER,
+            slashed BOOLEAN DEFAULT 0,
+            uptime_score REAL DEFAULT 1.0,
+            validator_index INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE TABLE IF NOT EXISTS stake_deposits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            validator_address TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            tx_hash TEXT,
+            block_number INTEGER,
+            epoch INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (validator_address) REFERENCES validator_stakes(validator_address)
+        );
+        
+        CREATE TABLE IF NOT EXISTS stake_withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            validator_address TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            request_epoch INTEGER NOT NULL,
+            completion_epoch INTEGER,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            FOREIGN KEY (validator_address) REFERENCES validator_stakes(validator_address)
+        );
+        
         CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(block_height);
         CREATE INDEX IF NOT EXISTS idx_transactions_block ON transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_unspent_address ON unspent_outputs(address);
         CREATE INDEX IF NOT EXISTS idx_validator_epoch ON validator_states(epoch);
+        CREATE INDEX IF NOT EXISTS idx_stakes_status ON validator_stakes(status);
+        CREATE INDEX IF NOT EXISTS idx_stakes_activation ON validator_stakes(activation_epoch);
+        CREATE INDEX IF NOT EXISTS idx_deposits_validator ON stake_deposits(validator_address);
+        CREATE INDEX IF NOT EXISTS idx_withdrawals_validator ON stake_withdrawals(validator_address);
         """
         
         await self.connection.executescript(schema)

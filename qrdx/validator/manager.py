@@ -146,6 +146,7 @@ class ValidatorManager:
         self,
         wallet: PQWallet,
         config: ValidatorConfig,
+        database=None,
         stake_manager: StakeManager = None,
         selector: ValidatorSelector = None,
         attestation_pool: AttestationPool = None,
@@ -157,6 +158,7 @@ class ValidatorManager:
         Args:
             wallet: PQ wallet for signing (MUST be Post-Quantum type)
             config: Validator configuration
+            database: Database instance for persistence
             stake_manager: Optional stake manager instance
             selector: Optional validator selector instance
             attestation_pool: Optional attestation pool instance
@@ -173,9 +175,10 @@ class ValidatorManager:
         
         self.wallet = wallet
         self.config = config
+        self.database = database
         
         # Components
-        self.stake_manager = stake_manager or StakeManager(config)
+        self.stake_manager = stake_manager or StakeManager(config, database)
         self.selector = selector or ValidatorSelector()
         self.attestation_pool = attestation_pool or AttestationPool(
             max_attestations_per_slot=config.attestation.max_attestations_per_block
@@ -258,6 +261,9 @@ class ValidatorManager:
             return
         
         logger.info("Starting ValidatorManager...")
+        
+        # Load stakes from database
+        await self.stake_manager.load_from_database()
         
         # Check stake requirement
         stake = await self.stake_manager.get_effective_stake(self.wallet.address)
@@ -455,8 +461,17 @@ class ValidatorManager:
         if not self._validator or not self._validator.can_propose:
             return None
         
+        # Enforce minimum stake requirement (Ethereum-grade security)
+        current_stake = await self.stake_manager.get_effective_stake(self.wallet.address)
+        min_required = self.config.staking.min_validator_stake
+        if current_stake < min_required:
+            logger.error(f"Insufficient stake for block proposal: {current_stake} < {min_required} QRDX")
+            return None
+        
         # Check if we're the proposer for this slot
         validators = self._validator_set.validators if self._validator_set else [self._validator]
+        
+        logger.info(f"Checking proposer for slot {slot}: validator_set has {len(validators)} validators")
         
         if not self.selector.is_proposer(
             slot, 
@@ -464,8 +479,10 @@ class ValidatorManager:
             validators,
             self._randao_mix
         ):
-            logger.debug(f"Not proposer for slot {slot}")
+            logger.info(f"Not proposer for slot {slot} - selected another validator")
             return None
+        
+        logger.info(f"🎯 Selected as proposer for slot {slot}!")
         
         # Slashing protection check
         if self.slashing_protection:
@@ -588,6 +605,13 @@ class ValidatorManager:
             Created attestation or None
         """
         if not self._validator or not self._validator.can_attest:
+            return None
+        
+        # Enforce minimum stake requirement (Ethereum-grade security)
+        current_stake = await self.stake_manager.get_effective_stake(self.wallet.address)
+        min_required = self.config.staking.min_validator_stake
+        if current_stake < min_required:
+            logger.error(f"Insufficient stake for attestation: {current_stake} < {min_required} QRDX")
             return None
         
         slots_per_epoch = POS_CONSTANTS['SLOTS_PER_EPOCH']

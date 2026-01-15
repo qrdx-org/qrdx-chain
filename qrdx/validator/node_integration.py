@@ -8,17 +8,20 @@ import asyncio
 import json
 import os
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from ..logger import get_logger
 from ..constants import SLOTS_PER_EPOCH, SLOT_DURATION
 from .config import ValidatorConfig
 from .manager import ValidatorManager
-from .types import Validator, ValidatorSet
+from .types import Validator, ValidatorSet, ValidatorStatus
 from ..wallet_v2.pq_wallet import PQWallet
 from ..crypto.pq.dilithium import PQPrivateKey as PrivateKey, PQPublicKey as PublicKey
 
 logger = get_logger(__name__)
+
+# Slot duration in seconds (from SLOT_DURATION constant which is in int format)
+SLOT_DURATION_SECONDS = SLOT_DURATION if isinstance(SLOT_DURATION, int) else 12
 
 
 class ValidatorNode:
@@ -34,7 +37,7 @@ class ValidatorNode:
     - Handle slashing detection
     """
     
-    def __init__(self, db, validator_wallet_path: str, password: str = ""):
+    def __init__(self, db, validator_wallet_path: str, password: str = "", broadcast_callback=None):
         """
         Initialize validator node.
         
@@ -42,10 +45,12 @@ class ValidatorNode:
             db: Database instance
             validator_wallet_path: Path to PQ wallet JSON file
             password: Wallet password (optional for testnet)
+            broadcast_callback: Async function to broadcast blocks to peers
         """
         self.db = db
         self.wallet_path = validator_wallet_path
         self.password = password
+        self.broadcast_callback = broadcast_callback
         
         self.wallet: Optional[PQWallet] = None
         self.config: Optional[ValidatorConfig] = None
@@ -80,23 +85,110 @@ class ValidatorNode:
             self.wallet = PQWallet(private_key=private_key)
             logger.info(f"Wallet loaded: {address}")
             
-            # Create validator configuration
-            self.config = ValidatorConfig(
-                slots_per_epoch=SLOTS_PER_EPOCH,
-                slot_duration=SLOT_DURATION,
-                min_stake=100_000,  # 100k QRDX minimum stake
-                max_validators=1000,
-                finalization_threshold=2/3,
-                slashing_enabled=True,
-            )
+            # Create validator configuration (use defaults)
+            self.config = ValidatorConfig(enabled=True)
             
-            # Initialize ValidatorManager
+            # Initialize ValidatorManager with database
             logger.info("Initializing ValidatorManager...")
             self.manager = ValidatorManager(
                 wallet=self.wallet,
-                config=self.config
+                config=self.config,
+                database=self.db  # Pass database for stake persistence
             )
             
+            # Load existing stakes from database
+            await self.manager.stake_manager.load_from_database()
+            
+            # Register initial stake (using deposit mechanism)
+            from decimal import Decimal
+            current_stake = await self.manager.stake_manager.get_stake(self.wallet.address)
+            
+            # Only deposit if we don't have enough stake
+            min_stake = self.config.staking.min_validator_stake
+            if current_stake < min_stake:
+                stake_needed = min_stake  # Deposit full minimum if no stake exists
+                logger.info(f"Depositing {stake_needed} QRDX stake (current: {current_stake})")
+                await self.manager.stake_manager.deposit(
+                    validator_address=self.wallet.address,
+                    amount=stake_needed,
+                    tx_hash=f"genesis_{self.wallet.address[:16]}",
+                    block_number=0,
+                    epoch=0
+                )
+            else:
+                logger.info(f"Validator already has sufficient stake: {current_stake} QRDX")
+            
+            # Initialize validator state (for now, set to ACTIVE immediately)
+            # In production, validators would go through activation queue
+            actual_stake = await self.manager.stake_manager.get_stake(self.wallet.address)
+            effective_stake = await self.manager.stake_manager.get_effective_stake(self.wallet.address)
+            
+            # Verify meets minimum stake before creating validator
+            if effective_stake < min_stake:
+                raise Exception(f"Insufficient stake: {effective_stake} < {min_stake} QRDX required")
+            
+            # Create and activate validator (bypass activation queue for testnet)
+            self.manager._validator = Validator(
+                address=self.wallet.address,
+                public_key=self.wallet.public_key,
+                stake=actual_stake,
+                effective_stake=effective_stake,
+                status=ValidatorStatus.ACTIVE,
+                activation_epoch=0,
+                slashed=False,
+                uptime_score=1.0,
+                index=0
+            )
+            
+            # Create validator set with ALL active validators from database
+            # This enables proper proposer selection across multiple validators
+            all_validators = [self.manager._validator]
+            
+            # Load other validators from database
+            try:
+                cursor = await self.db.connection.execute(
+                    "SELECT validator_address, stake FROM validator_stakes WHERE status = 'PENDING' OR status = 'ACTIVE'"
+                )
+                rows = await cursor.fetchall()
+                
+                logger.info(f"Found {len(rows)} validators in database")
+                
+                for row in rows:
+                    other_address = row[0]
+                    if other_address != self.wallet.address:
+                        # Create validator object for other validators
+                        from decimal import Decimal
+                        other_stake = Decimal(str(row[1])) / Decimal("100000000")
+                        other_validator = Validator(
+                            address=other_address,
+                            public_key=b'',  # Unknown for remote validators
+                            stake=other_stake,
+                            effective_stake=other_stake,
+                            status=ValidatorStatus.ACTIVE,
+                            activation_epoch=0,
+                            slashed=False,
+                            uptime_score=1.0,
+                            index=len(all_validators)
+                        )
+                        all_validators.append(other_validator)
+                        logger.info(f"Added validator to set: {other_address[:30]}... (stake: {other_stake} QRDX)")
+            except Exception as e:
+                logger.warning(f"Could not load other validators: {e}")
+            
+            # Calculate total stake
+            total_stake = sum(v.stake for v in all_validators)
+            
+            self.manager._validator_set = ValidatorSet(
+                epoch=0,
+                validators=all_validators,
+                total_stake=total_stake
+            )
+            
+            logger.info(f"Validator set created with {len(all_validators)} validators (total stake: {total_stake} QRDX)")
+            
+            logger.info(f"Validator stake: {actual_stake} QRDX (effective: {effective_stake} QRDX)")
+            
+            logger.info(f"✅ Validator registered and activated: {self.wallet.address}")
             logger.info("✅ Validator initialization complete")
             return True
             
@@ -148,27 +240,61 @@ class ValidatorNode:
                 current_slot = await self._get_current_slot()
                 current_epoch = current_slot // SLOTS_PER_EPOCH
                 
-                # Check if this validator is the proposer for this slot
-                # TODO: Use ValidatorSelector to determine proposer
-                # For now, simple round-robin based on validator index
+                logger.info(f"📍 Checking slot {current_slot} (epoch {current_epoch}) for block proposal...")
                 
-                logger.debug(f"Slot {current_slot}, Epoch {current_epoch}")
+                # Get latest block from database for parent hash and next height
+                next_block_id = await self.db.get_next_block_id()
+                latest_block = await self.db.get_block_by_id(next_block_id - 1)
+                parent_hash = latest_block.get('hash') or latest_block.get('block_hash') if latest_block else '0' * 64
+                next_height = next_block_id  # Sequential: 0 (genesis), 1, 2, 3...
                 
-                # TODO: Implement block proposal logic
-                # 1. Check if we're the proposer
-                # 2. Collect pending transactions
-                # 3. Build block
-                # 4. Sign with PQ key
-                # 5. Broadcast to network
+                # Get pending transactions
+                pending_txs = await self.db.get_need_propagate_transactions() or []
+                
+                # Attempt to propose block (ValidatorManager checks if we're the proposer)
+                block = await self.manager.propose_block(
+                    slot=current_slot,
+                    parent_hash=parent_hash,
+                    transactions=pending_txs[:100],  # Limit to 100 txs per block
+                    state_root=None  # Will compute if needed
+                )
+                
+                if block:
+                    logger.info(f"📦 Proposed block #{next_height} at slot {current_slot}: {block.hash[:16]}...")
+                    
+                    # Add block to database with sequential height
+                    await self.db.add_block(
+                        block_hash=block.hash,
+                        block_height=next_height,
+                        block_content=str(block.to_dict()),
+                        validator_address=block.proposer_address,
+                        timestamp=block.timestamp
+                    )
+                    
+                    # Broadcast block to network peers
+                    if self.broadcast_callback:
+                        try:
+                            block_data = {
+                                'id': next_height,
+                                'block_content': str(block.to_dict()),
+                                'block_hash': block.hash,
+                                'validator_address': block.proposer_address
+                            }
+                            await self.broadcast_callback('submit_block', block_data, ignore_node_id=None, db=self.db)
+                            logger.info(f"📡 Broadcast block #{next_height} to peers")
+                        except Exception as e:
+                            logger.warning(f"Failed to broadcast block: {e}")
+                    
+                    logger.info(f"✅ Block {block.hash[:16]}... added to chain")
                 
                 # Wait for next slot
-                await asyncio.sleep(SLOT_DURATION)
+                await asyncio.sleep(SLOT_DURATION_SECONDS)
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in block production loop: {e}", exc_info=True)
-                await asyncio.sleep(SLOT_DURATION)
+                await asyncio.sleep(SLOT_DURATION_SECONDS)
         
         logger.info("Block production loop stopped")
     
@@ -182,21 +308,39 @@ class ValidatorNode:
         while self._running:
             try:
                 current_slot = await self._get_current_slot()
+                current_epoch = current_slot // SLOTS_PER_EPOCH
                 
-                # TODO: Implement attestation logic
-                # 1. Wait for block proposal
-                # 2. Validate proposed block
-                # 3. Create attestation
-                # 4. Sign with PQ key
-                # 5. Broadcast to network
+                # Wait briefly for block proposals to arrive
+                await asyncio.sleep(SLOT_DURATION_SECONDS / 3)
                 
-                await asyncio.sleep(SLOT_DURATION)
+                # Get latest block to attest to
+                latest_block = await self.db.get_block_by_id(await self.db.get_next_block_id() - 1)
+                if latest_block:
+                    block_hash = latest_block.get('hash') or latest_block.get('block_hash')
+                    
+                    # Create attestation (ValidatorManager checks if we can attest)
+                    attestation = await self.manager.create_attestation(
+                        slot=current_slot,
+                        block_hash=block_hash,
+                        source_epoch=max(0, current_epoch - 1),
+                        target_epoch=current_epoch
+                    )
+                    
+                    if attestation:
+                        # Submit to pool
+                        submitted = await self.manager.submit_attestation(attestation)
+                        if submitted:
+                            logger.info(f"✅ Attested to block {block_hash[:16]}... at slot {current_slot}")
+                            logger.debug(f"Attestation broadcast: epoch {current_epoch}, source {attestation.source_epoch}, target {attestation.target_epoch}")
+                
+                # Wait for rest of slot
+                await asyncio.sleep(2 * SLOT_DURATION_SECONDS / 3)
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in attestation loop: {e}", exc_info=True)
-                await asyncio.sleep(SLOT_DURATION)
+                await asyncio.sleep(SLOT_DURATION_SECONDS)
         
         logger.info("Attestation loop stopped")
     
@@ -216,20 +360,21 @@ class ValidatorNode:
                 if current_slot % SLOTS_PER_EPOCH == 0:
                     logger.info(f"🔄 Processing epoch {current_epoch} boundary")
                     
-                    # TODO: Implement epoch processing
-                    # 1. Calculate rewards and penalties
-                    # 2. Update validator balances
-                    # 3. Rotate validator committees
-                    # 4. Finalize justified checkpoints
-                    # 5. Detect and execute slashing
+                    # Process epoch transition using ValidatorManager
+                    try:
+                        # TODO: Implement epoch processing (rewards, finality, validator rotation)
+                        # await self.manager.process_epoch(current_epoch)
+                        logger.info(f"✅ Epoch {current_epoch} boundary detected")
+                    except Exception as e:
+                        logger.error(f"Failed to process epoch {current_epoch}: {e}", exc_info=True)
                 
-                await asyncio.sleep(SLOT_DURATION)
+                await asyncio.sleep(SLOT_DURATION_SECONDS)
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in epoch processing loop: {e}", exc_info=True)
-                await asyncio.sleep(SLOT_DURATION)
+                await asyncio.sleep(SLOT_DURATION_SECONDS)
         
         logger.info("Epoch processing loop stopped")
     
@@ -241,18 +386,27 @@ class ValidatorNode:
             Current slot number
         """
         # Get genesis time from database or use a default
-        # For testnet, we can use current time divided by slot duration
         now = datetime.now(timezone.utc)
         
-        # TODO: Get actual genesis timestamp from database
-        # For now, assume genesis was at Unix epoch
-        genesis_time = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        # Try to get genesis block timestamp
+        try:
+            genesis_block = await self.db.get_block_by_id(0)
+            if genesis_block and 'timestamp' in genesis_block:
+                genesis_time = datetime.fromtimestamp(genesis_block['timestamp'], tz=timezone.utc)
+            else:
+                # Fallback: genesis is NOW (start of chain)
+                genesis_time = now
+        except:
+            # Fallback: genesis is NOW
+            genesis_time = now
         
         elapsed = (now - genesis_time).total_seconds()
-        return int(elapsed // SLOT_DURATION)
+        current_slot = int(elapsed // SLOT_DURATION_SECONDS)
+        # Ensure slot is at least 0
+        return max(0, current_slot)
 
 
-async def initialize_validator_node(db, wallet_path: str, password: str = "") -> Optional[ValidatorNode]:
+async def initialize_validator_node(db, wallet_path: str, password: str = "", broadcast_callback=None) -> Optional[ValidatorNode]:
     """
     Initialize and start a validator node.
     
@@ -260,11 +414,12 @@ async def initialize_validator_node(db, wallet_path: str, password: str = "") ->
         db: Database instance
         wallet_path: Path to PQ wallet JSON
         password: Wallet password
+        broadcast_callback: Async function to broadcast blocks to peers
     
     Returns:
         ValidatorNode instance if successful, None otherwise
     """
-    validator = ValidatorNode(db, wallet_path, password)
+    validator = ValidatorNode(db, wallet_path, password, broadcast_callback)
     
     if await validator.initialize():
         await validator.start()

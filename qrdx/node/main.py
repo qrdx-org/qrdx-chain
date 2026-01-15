@@ -1863,7 +1863,12 @@ async def startup():
         if validator_wallet_path and os.path.exists(validator_wallet_path):
             try:
                 from ..validator.node_integration import initialize_validator_node
-                validator_node = await initialize_validator_node(db, validator_wallet_path, validator_password)
+                validator_node = await initialize_validator_node(
+                    db, 
+                    validator_wallet_path, 
+                    validator_password,
+                    broadcast_callback=propagate  # Pass propagate function for block broadcasting
+                )
                 
                 if validator_node:
                     logger.info(f"✅ Validator node started: {validator_node.wallet.address}")
