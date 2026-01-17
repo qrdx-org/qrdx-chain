@@ -73,6 +73,9 @@ async def calculate_difficulty() -> Tuple[Decimal, dict]:
     Calculate difficulty using version-appropriate consensus rules.
     """
     database = Database.instance
+    if database is None:
+        return START_DIFFICULTY, {}
+    
     last_block = await database.get_last_block()
 
     if last_block is None:

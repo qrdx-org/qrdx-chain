@@ -12,6 +12,7 @@ This module handles the bootstrap of a new chain.
 import asyncio
 import hashlib
 import json
+import os
 from dataclasses import asdict
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -320,6 +321,7 @@ class GenesisInitializer:
                 tx_hash=tx_hash,
                 index=0,
                 address=address,
+                amount=int(balance * 1000000),  # Convert to smallest unit (microQRDX)
             )
             
             logger.debug(f"Created genesis output: {address[:20]}... = {balance} QRDX ({label})")
@@ -397,6 +399,7 @@ class GenesisInitializer:
 async def initialize_genesis_if_needed(
     db,
     prefunded_accounts: Optional[Dict[str, Tuple[Decimal, str]]] = None,
+    genesis_file: Optional[str] = None,
 ) -> bool:
     """
     Convenience function to initialize genesis if the chain is empty.
@@ -404,6 +407,7 @@ async def initialize_genesis_if_needed(
     Args:
         db: Database connection
         prefunded_accounts: Optional custom prefunded accounts
+        genesis_file: Optional path to genesis configuration JSON file
         
     Returns:
         True if genesis was initialized or already existed
@@ -411,6 +415,46 @@ async def initialize_genesis_if_needed(
     initializer = GenesisInitializer(db)
     
     if await initializer.is_genesis_needed():
+        # Try to load genesis from file if provided
+        if genesis_file and os.path.exists(genesis_file):
+            try:
+                import json
+                with open(genesis_file, 'r') as f:
+                    genesis_data = json.load(f)
+                
+                # Extract accounts and validators from genesis file
+                state = genesis_data.get('state', {})
+                accounts = state.get('accounts', {})
+                validators_data = state.get('validators', [])
+                
+                # Convert accounts to prefunded_accounts format
+                if accounts and not prefunded_accounts:
+                    prefunded_accounts = {}
+                    for addr, info in accounts.items():
+                        balance = Decimal(info.get('balance', info) if isinstance(info, dict) else info)
+                        label = info.get('label', 'genesis-allocation') if isinstance(info, dict) else 'genesis-allocation'
+                        prefunded_accounts[addr] = (balance, label)
+                    logger.info(f"Loaded {len(prefunded_accounts)} prefunded accounts from genesis file")
+                
+                # Convert validators list to tuple format if present
+                validators = []
+                if validators_data:
+                    for v in validators_data:
+                        address = v['address']
+                        pubkey = v['public_key']
+                        stake = Decimal(v['stake'])
+                        validators.append((address, pubkey, stake))
+                    logger.info(f"Loaded {len(validators)} validators from genesis file")
+                
+                return await initializer.initialize_genesis(
+                    prefunded_accounts=prefunded_accounts,
+                    validators=validators if validators else None,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to load genesis file {genesis_file}: {e}")
+                logger.info("Falling back to default genesis")
+        
+        # Use default or provided prefunded accounts
         return await initializer.initialize_genesis(
             prefunded_accounts=prefunded_accounts or GENESIS_PREFUNDED_ACCOUNTS,
         )

@@ -132,8 +132,9 @@ MAX_TX_DATA_SIZE = 1_900_000
 # Regex pattern for validating hexadecimal strings
 VALID_HEX_PATTERN = re.compile(r'^[0-9a-fA-F]+$')
 
-# Regex pattern for validating QRDX addresses (starts with Q or R, 45 chars total)
-VALID_ADDRESS_PATTERN = re.compile(r'^[QR][1-9A-HJ-NP-Za-km-z]{44}$')
+# Regex pattern for validating QRDX addresses
+# Supports both traditional (Q/R + 44 chars) and PQ (0xPQ + 64 hex chars) addresses
+VALID_ADDRESS_PATTERN = re.compile(r'^(?:[QR][1-9A-HJ-NP-Za-km-z]{44}|0xPQ[0-9a-fA-F]{64})$')
 
 
 # ==================================================================================

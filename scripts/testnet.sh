@@ -190,9 +190,9 @@ sys.path.insert(0, '${PROJECT_DIR}')
 
 from qrdx.validator.genesis import GenesisCreator, GenesisConfig
 
-# Validator data
-validator_addresses = [${validator_addresses[@]@Q}]
-validator_pubkeys = [${validator_pubkeys[@]@Q}]
+# Validator data - properly format as Python lists with commas
+validator_addresses = [$(printf "'%s'," "${validator_addresses[@]}" | sed 's/,$//')] 
+validator_pubkeys = [$(printf "'%s'," "${validator_pubkeys[@]}" | sed 's/,$//')]
 
 # Create genesis config
 config = GenesisConfig(

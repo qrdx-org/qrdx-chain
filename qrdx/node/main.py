@@ -325,6 +325,8 @@ class InputValidator:
         if not address:
             return False
 
+        # Traditional addresses (Q/R prefix): 45 chars
+        # PQ addresses (0xPQ prefix): 68 chars (0xPQ + 64 hex)
         if len(address) < 40 or len(address) > 128:
             return False
 
@@ -1846,7 +1848,19 @@ async def startup():
     # Initialize genesis if needed (PoS)
     logger.info("Checking genesis state...")
     from ..validator.genesis_init import initialize_genesis_if_needed
-    genesis_created = await initialize_genesis_if_needed(db)
+    
+    # Look for genesis configuration file in testnet directory
+    genesis_file = None
+    if DENARO_DATABASE_PATH:
+        # Extract directory from database path
+        db_dir = os.path.dirname(DENARO_DATABASE_PATH)
+        testnet_dir = os.path.dirname(db_dir)  # Go up one level from databases/
+        potential_genesis = os.path.join(testnet_dir, 'genesis_config.json')
+        if os.path.exists(potential_genesis):
+            genesis_file = potential_genesis
+            logger.info(f"Found genesis configuration: {genesis_file}")
+    
+    genesis_created = await initialize_genesis_if_needed(db, genesis_file=genesis_file)
     if genesis_created:
         logger.info("Genesis block created for PoS network")
     else:

@@ -372,9 +372,33 @@ class DatabaseSQLite:
     
     async def get_spendable_outputs(self, address: str):
         """Get spendable outputs for address"""
-        return []
+        cursor = await self.connection.execute("""
+            SELECT tx_hash, output_index, amount 
+            FROM unspent_outputs 
+            WHERE address = ?
+        """, (address,))
+        
+        rows = await cursor.fetchall()
+        outputs = []
+        
+        for tx_hash, output_index, amount in rows:
+            # Convert tx_hash bytes to hex if needed
+            if isinstance(tx_hash, bytes):
+                tx_hash = tx_hash.hex()
+            
+            # Create a simple object with the required attributes
+            class Output:
+                def __init__(self, address, amount, tx_hash, index):
+                    self.address = address
+                    self.amount = amount / 1000000  # Convert from microQRDX to QRDX
+                    self.tx_hash = tx_hash
+                    self.index = index
+            
+            outputs.append(Output(address, amount, tx_hash, output_index))
+        
+        return outputs
     
-    async def get_address_transactions(self, address: str, limit: int = 100):
+    async def get_address_transactions(self, address: str, limit: int = 100, offset: int = 0, check_signatures: bool = False):
         """Get transactions for address"""
         return []
     
