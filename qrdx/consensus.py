@@ -471,6 +471,13 @@ class Consensus_V2_PoS(BaseConsensusRules):
         if expected_proposer.address != proposer_address:
             return False, f"Wrong proposer: expected {expected_proposer.address}"
         
+        # CONSENSUS ENFORCEMENT: Verify proposer meets minimum stake requirement
+        # This prevents Byzantine validators from proposing blocks with insufficient stake
+        proposer_stake = getattr(expected_proposer, 'effective_stake', 
+                                 getattr(expected_proposer, 'stake', Decimal('0')))
+        if proposer_stake < self.min_validator_stake:
+            return False, f"Proposer stake {proposer_stake} below minimum {self.min_validator_stake} QRDX"
+        
         return True, ""
     
     def _select_proposer(
@@ -529,6 +536,7 @@ class Consensus_V2_PoS(BaseConsensusRules):
         attestations: List[Any],
         block_slot: int,
         validators: Dict[str, bytes],  # address -> public_key
+        validator_stakes: Dict[str, Decimal] = None,  # address -> effective_stake
     ) -> Tuple[bool, List[str]]:
         """
         Validate attestations included in a block.
@@ -537,6 +545,7 @@ class Consensus_V2_PoS(BaseConsensusRules):
             attestations: List of attestations
             block_slot: Slot of the block including these attestations
             validators: Map of validator addresses to public keys
+            validator_stakes: Optional map of validator addresses to stakes (for stake validation)
             
         Returns:
             Tuple of (all_valid, list_of_errors)
@@ -560,6 +569,17 @@ class Consensus_V2_PoS(BaseConsensusRules):
             if not validator_pk:
                 errors.append(f"Attestation {i}: unknown validator")
                 continue
+            
+            # CONSENSUS ENFORCEMENT: Verify attester meets minimum stake requirement
+            # This prevents attestations from under-staked validators counting toward finality
+            if validator_stakes:
+                attester_stake = validator_stakes.get(att.validator_address, Decimal('0'))
+                if attester_stake < self.min_validator_stake:
+                    errors.append(
+                        f"Attestation {i}: validator {att.validator_address} has insufficient stake "
+                        f"({attester_stake} < {self.min_validator_stake} QRDX)"
+                    )
+                    continue
             
             if hasattr(att, 'verify'):
                 if not att.verify(validator_pk):
@@ -836,10 +856,15 @@ async def validate_pos_block(
     # 4. Validate attestations if present
     if hasattr(block, 'attestations') and block.attestations:
         validator_pks = {v.address: v.public_key for v in validators}
+        validator_stakes = {
+            v.address: getattr(v, 'effective_stake', getattr(v, 'stake', Decimal('0')))
+            for v in validators
+        }
         valid, errors = pos_rules.validate_attestations(
             block.attestations,
             block.slot,
             validator_pks,
+            validator_stakes,
         )
         if not valid:
             return False, f"Invalid attestations: {errors}"

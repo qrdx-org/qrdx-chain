@@ -283,6 +283,13 @@ class StakeManager:
         if amount <= 0:
             raise ValidatorError("Deposit amount must be positive")
         
+        # SECURITY: Prevent unrealistic stake amounts (overflow protection)
+        MAX_SAFE_STAKE = Decimal("92233720368")  # ~92B QRDX (max int64 / 1e8)
+        if amount > MAX_SAFE_STAKE:
+            raise ValidatorError(
+                f"Deposit amount {amount} QRDX exceeds maximum safe value {MAX_SAFE_STAKE} QRDX"
+            )
+        
         async with self._lock:
             # Create deposit record
             deposit = StakeDeposit(
@@ -296,6 +303,13 @@ class StakeManager:
             # Update stake
             current_stake = self._stakes.get(validator_address, Decimal("0"))
             new_stake = current_stake + amount
+            
+            # SECURITY: Additional overflow check on total stake
+            if new_stake > MAX_SAFE_STAKE:
+                raise ValidatorError(
+                    f"Total stake {new_stake} QRDX would exceed maximum safe value {MAX_SAFE_STAKE} QRDX"
+                )
+            
             self._stakes[validator_address] = new_stake
             
             # Persist to database
@@ -419,6 +433,10 @@ class StakeManager:
             
         Returns:
             True if successful
+            
+        Raises:
+            ValidatorError: If withdrawal cannot be completed
+            InsufficientStakeError: If withdrawal would violate minimum stake
         """
         async with self._lock:
             for address, withdrawals in self._pending_withdrawals.items():
@@ -429,8 +447,22 @@ class StakeManager:
                                 f"Withdrawal {withdrawal_id} is not ready"
                             )
                         
+                        # SECURITY: Check if deducting would violate minimum stake
+                        current_stake = self._stakes.get(address, Decimal("0"))
+                        remaining_stake = current_stake - withdrawal.amount
+                        min_stake = self.config.staking.min_validator_stake
+                        
+                        # Allow complete exit (stake to 0) but not partial below minimum
+                        if remaining_stake > 0 and remaining_stake < min_stake:
+                            raise InsufficientStakeError(
+                                required=min_stake,
+                                actual=remaining_stake,
+                                message=f"Withdrawal would leave {remaining_stake} QRDX, minimum is {min_stake} QRDX. "
+                                       f"Either withdraw all stake (exit validator) or keep at least minimum."
+                            )
+                        
                         # Deduct from stake
-                        self._stakes[address] -= withdrawal.amount
+                        self._stakes[address] = remaining_stake
                         
                         # Update withdrawal
                         withdrawal.status = WithdrawalStatus.COMPLETED
@@ -442,7 +474,7 @@ class StakeManager:
                         
                         logger.info(
                             f"Withdrawal completed: {address} withdrew "
-                            f"{withdrawal.amount} QRDX (tx: {tx_hash})"
+                            f"{withdrawal.amount} QRDX (remaining: {remaining_stake} QRDX, tx: {tx_hash})"
                         )
                         
                         return True
