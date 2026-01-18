@@ -48,6 +48,7 @@ from qrdx.node.nodes_manager import NodesManager, NodeInterface
 from qrdx.node.utils import ip_is_local
 from qrdx.node.bootstrap import BootstrapManager, get_bootstrap_manager, init_bootstrap_manager
 from qrdx.transactions import Transaction, CoinbaseTransaction
+from qrdx.transactions.contract_transaction import ContractTransaction
 from qrdx import Database
 from qrdx.constants import (
     MAX_MINING_CANDIDATES, NODE_VERSION, MAX_BLOCKS_PER_SUBMISSION,
@@ -1998,7 +1999,12 @@ async def push_tx(
         )
         raise HTTPException(status.HTTP_400_BAD_REQUEST, error_msg)
 
-    tx = await Transaction.from_hex(tx_hex)
+    # Try to deserialize as Contract or Regular transaction
+    try:
+        tx = await ContractTransaction.from_hex(tx_hex)
+    except:
+        # Fall back to regular transaction
+        tx = await Transaction.from_hex(tx_hex)
     
     
     # Verify the transaction before accepting it into the mempool.
@@ -2062,12 +2068,19 @@ async def submit_tx(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error_msg)
 
     try:
-        tx = await Transaction.from_hex(tx_hex)
+        # Try contract transaction first
+        try:
+            tx = await ContractTransaction.from_hex(tx_hex)
+        except:
+            # Fall back to regular transaction
+            tx = await Transaction.from_hex(tx_hex)
         
         # Verify the transaction before accepting it.
         if not await tx.verify():
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transaction verification failed.")
         
+    except HTTPException:
+        raise
     except Exception as e:
         # Catch verification errors or deserialization errors
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid transaction: {e}")

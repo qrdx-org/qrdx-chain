@@ -1,0 +1,3 @@
+[submodule "py-evm"]
+	path = py-evm
+	url = https://github.com/qrdx-org/py-evm

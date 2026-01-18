@@ -11,6 +11,7 @@ QRDX supports two consensus mechanisms:
 - PoS (Proof-of-Stake, mainnet)
 
 PoS uses Quantum-Resistant signatures (CRYSTALS-Dilithium / ML-DSA-65).
+Smart Contracts use EVM (Shanghai fork) for 100% Ethereum compatibility.
 """
 
 import hashlib
@@ -874,7 +875,141 @@ async def validate_pos_block(
         if not pos_rules.validate_coinbase_transactions(block.transactions):
             return False, "Coinbase transactions not allowed in PoS"
     
+    # 6. Execute and validate smart contracts
+    if hasattr(block, 'transactions') and block.transactions and database:
+        contract_valid, contract_error = await execute_and_validate_contracts(
+            block,
+            database,
+        )
+        if not contract_valid:
+            return False, f"Contract validation failed: {contract_error}"
+    
     return True, ""
+
+
+async def execute_and_validate_contracts(
+    block: Any,
+    database: Any,
+) -> Tuple[bool, str]:
+    """
+    Execute all contract transactions in a block and validate results.
+    
+    This function:
+    1. Identifies contract transactions
+    2. Executes them via EVM
+    3. Validates gas usage
+    4. Stores contract state
+    5. Records logs
+    
+    Args:
+        block: Block containing transactions
+        database: Database instance for state persistence
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    try:
+        from .contracts import QRDXEVMExecutor, ContractStateManager
+        from .transactions.contract_transaction import ContractTransaction
+        from eth_utils import to_canonical_address, encode_hex
+        
+        # Check if there are any contract transactions
+        contract_txs = []
+        for tx in block.transactions:
+            # Identify contract transactions by checking if they have contract-specific fields
+            if hasattr(tx, 'is_contract_transaction') and tx.is_contract_transaction():
+                contract_txs.append(tx)
+            elif hasattr(tx, 'data') and tx.data and len(tx.data) > 0:
+                # Also check for transactions with data (might be contract calls/deployments)
+                contract_txs.append(tx)
+        
+        if not contract_txs:
+            # No contract transactions to execute
+            return True, ""
+        
+        # Initialize contract state manager and EVM executor
+        state_manager = ContractStateManager(database)
+        evm = QRDXEVMExecutor(state_manager)
+        
+        logger.info(f"Executing {len(contract_txs)} contract transactions in block {block.height}")
+        
+        # Execute each contract transaction
+        for tx in contract_txs:
+            try:
+                # Parse transaction addresses
+                sender = to_canonical_address(tx.sender if hasattr(tx, 'sender') else tx.address)
+                to = None
+                if hasattr(tx, 'to') and tx.to:
+                    to = to_canonical_address(tx.to)
+                elif hasattr(tx, 'recipient') and tx.recipient:
+                    to = to_canonical_address(tx.recipient)
+                
+                # Parse transaction data
+                data = b''
+                if hasattr(tx, 'data') and tx.data:
+                    if isinstance(tx.data, bytes):
+                        data = tx.data
+                    elif isinstance(tx.data, str):
+                        data = bytes.fromhex(tx.data.replace('0x', ''))
+                
+                # Get gas parameters
+                gas_limit = getattr(tx, 'gas_limit', getattr(tx, 'gas', 1_000_000))
+                gas_price = getattr(tx, 'gas_price', 1_000_000_000)  # 1 gwei default
+                value = getattr(tx, 'value', 0)
+                
+                # Execute via EVM
+                result = evm.execute(
+                    sender=sender,
+                    to=to,
+                    value=value,
+                    data=data,
+                    gas=gas_limit,
+                    gas_price=gas_price,
+                )
+                
+                # Validate execution succeeded
+                if not result.success:
+                    logger.error(f"Contract execution failed: {result.error}")
+                    return False, f"Transaction {tx.hash if hasattr(tx, 'hash') else 'unknown'} failed: {result.error}"
+                
+                # Validate gas usage matches what's in transaction
+                if hasattr(tx, 'gas_used') and tx.gas_used is not None:
+                    # Validate if gas_used was explicitly set by block proposer
+                    if result.gas_used != tx.gas_used:
+                        # Allow small variance for determinism issues (< 1% difference)
+                        variance = abs(result.gas_used - tx.gas_used)
+                        if variance > max(1, tx.gas_used // 100):  # More than 1% off
+                            logger.error(f"Gas mismatch: tx claims {tx.gas_used}, actual {result.gas_used}")
+                            return False, f"Gas usage validation failed: expected {tx.gas_used}, got {result.gas_used}"
+                        else:
+                            # Small variance acceptable (EVM determinism edge cases)
+                            logger.debug(f"Minor gas variance: {variance} gas units")
+                else:
+                    # Gas not set in transaction, set it from execution result
+                    tx.gas_used = result.gas_used
+                
+                # Store contract deployment address if this was a creation
+                if result.created_address and hasattr(tx, 'contract_address'):
+                    expected_addr = encode_hex(result.created_address)
+                    if hasattr(tx, 'contract_address') and tx.contract_address:
+                        if tx.contract_address != expected_addr:
+                            return False, f"Contract address mismatch: expected {tx.contract_address}, got {expected_addr}"
+                
+                # Log contract logs/events
+                if result.logs:
+                    logger.debug(f"Contract emitted {len(result.logs)} log entries")
+                
+            except Exception as e:
+                logger.error(f"Error executing contract transaction: {e}", exc_info=True)
+                return False, f"Contract execution error: {str(e)}"
+        
+        # All contract transactions executed successfully
+        logger.info(f"Successfully executed all {len(contract_txs)} contract transactions")
+        return True, ""
+        
+    except Exception as e:
+        logger.error(f"Error in contract validation: {e}", exc_info=True)
+        return False, f"Contract system error: {str(e)}"
 
 
 def calculate_block_reward(

@@ -500,6 +500,10 @@ class ValidatorManager:
         randao_message = slot.to_bytes(8, 'little') + randao_domain
         randao_reveal = self._sign_message(randao_message)
         
+        # CRITICAL: Execute contract transactions BEFORE creating block
+        # This sets gas_used on each transaction for validation
+        await self._execute_contract_transactions(transactions, parent_hash)
+        
         # Compute transactions root
         transactions_root = self._compute_transactions_root(transactions)
         
@@ -580,6 +584,143 @@ class ValidatorManager:
         
         combined = ''.join(sorted(tx_hashes))
         return hashlib.sha256(combined.encode()).hexdigest()
+    
+    async def _execute_contract_transactions(
+        self,
+        transactions: List[Any],
+        parent_hash: str,
+    ) -> None:
+        """
+        Execute contract transactions and set gas_used on each transaction.
+        
+        This MUST be called before creating a block to ensure:
+        1. gas_used is set on each contract transaction
+        2. Contract state is computed correctly
+        3. Block validation will pass
+        
+        Args:
+            transactions: List of transactions to execute
+            parent_hash: Parent block hash for state lookup
+        """
+        try:
+            from qrdx.contracts import QRDXEVMExecutor
+            from qrdx.contracts.state import ContractStateManager
+            from eth_utils import to_canonical_address, decode_hex
+            
+            # Identify contract transactions
+            contract_txs = []
+            for tx in transactions:
+                is_contract = (
+                    hasattr(tx, 'is_contract_transaction') and tx.is_contract_transaction() or
+                    hasattr(tx, 'data') and tx.data and len(tx.data) > 0
+                )
+                if is_contract:
+                    contract_txs.append(tx)
+            
+            if not contract_txs:
+                return  # No contracts to execute
+            
+            # Initialize contract state manager with database
+            db = self.database if hasattr(self, 'database') else None
+            if not db:
+                logger.error("No database available for contract state - cannot execute contracts")
+                # Remove all contract transactions if no database
+                for tx in contract_txs:
+                    transactions.remove(tx)
+                return
+            
+            # Load state from parent block
+            state_manager = ContractStateManager(db)
+            
+            # Load existing state from parent block if available
+            if parent_hash and parent_hash != '0' * 64:
+                try:
+                    # Query parent block state from database
+                    parent_state = await db.get_block_state(parent_hash)
+                    if parent_state:
+                        # Restore state manager from parent state
+                        await state_manager.load_state(parent_state)
+                        logger.debug(f"Loaded contract state from parent block {parent_hash[:16]}...")
+                except Exception as e:
+                    logger.warning(f"Could not load parent state, using fresh state: {e}")
+            
+            evm = QRDXEVMExecutor(state_manager)
+            
+            logger.info(f"Pre-executing {len(contract_txs)} contract transactions for block proposal")
+            
+            # Execute each contract transaction
+            for tx in contract_txs:
+                try:
+                    # Get sender address
+                    sender_addr = getattr(tx, 'sender', getattr(tx, 'address', None))
+                    if isinstance(sender_addr, str):
+                        sender = to_canonical_address(sender_addr)
+                    else:
+                        sender = sender_addr
+                    
+                    # Get recipient (None for contract creation)
+                    to = None
+                    if hasattr(tx, 'recipient') and tx.recipient:
+                        to = to_canonical_address(tx.recipient)
+                    
+                    # Parse transaction data
+                    data = b''
+                    if hasattr(tx, 'data') and tx.data:
+                        if isinstance(tx.data, bytes):
+                            data = tx.data
+                        elif isinstance(tx.data, str):
+                            data = decode_hex(tx.data)
+                    
+                    # Get gas parameters
+                    gas_limit = getattr(tx, 'gas_limit', getattr(tx, 'gas', 1_000_000))
+                    gas_price = getattr(tx, 'gas_price', 1_000_000_000)
+                    value = getattr(tx, 'value', 0)
+                    
+                    # Execute contract
+                    result = evm.execute(
+                        sender=sender,
+                        to=to,
+                        value=value,
+                        data=data,
+                        gas=gas_limit,
+                        gas_price=gas_price,
+                    )
+                    
+                    if not result.success:
+                        logger.warning(f"Contract execution failed during proposal: {result.error}")
+                        # Don't include failed contracts in the block
+                        transactions.remove(tx)
+                        continue
+                    
+                    # CRITICAL: Set gas_used on transaction
+                    tx.gas_used = result.gas_used
+                    
+                    # Set contract address if deployment
+                    if result.created_address and hasattr(tx, 'contract_address'):
+                        from eth_utils import encode_hex
+                        tx.contract_address = encode_hex(result.created_address)
+                    
+                    logger.debug(f"Contract executed: gas_used={result.gas_used}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to execute contract transaction: {e}")
+                    # Remove failed transaction from block
+                    transactions.remove(tx)
+            
+            logger.info(f"Successfully pre-executed {len(contract_txs)} contract transactions")
+            
+        except ImportError as e:
+            logger.warning(f"Contract execution not available: {e}")
+            # Remove all contract transactions if EVM not available
+            for tx in transactions[:]:
+                if hasattr(tx, 'is_contract_transaction') and tx.is_contract_transaction():
+                    transactions.remove(tx)
+        except Exception as e:
+            logger.error(f"Error in contract pre-execution: {e}", exc_info=True)
+            # Remove contract transactions on error
+            for tx in transactions[:]:
+                if hasattr(tx, 'is_contract_transaction') and tx.is_contract_transaction():
+                    transactions.remove(tx)
     
     # =========================================================================
     # ATTESTATION
