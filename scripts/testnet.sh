@@ -208,6 +208,11 @@ for i, addr in enumerate(validator_addresses):
     pre_allocations[addr] = Decimal("${DEFAULT_GENESIS_BALANCE}")
     config.pre_allocations[addr] = Decimal("${DEFAULT_GENESIS_BALANCE}")
 
+# Add test account for contract deployment (derived from private key 0x01)
+test_account = "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+config.pre_allocations[test_account] = Decimal("1000000000")  # 1B QRDX for testing
+print(f"Added test account: {test_account} balance=1000000000", file=sys.stderr)
+
 creator = GenesisCreator(config)
 
 # Add validators

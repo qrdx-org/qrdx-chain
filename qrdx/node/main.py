@@ -1896,6 +1896,353 @@ async def startup():
         else:
             logger.warning(f"⚠️  Validator wallet not found: {validator_wallet_path}")
     
+    # Initialize RPC server if enabled
+    rpc_enabled = os.getenv('QRDX_RPC_ENABLED', 'false').lower() == 'true'
+    if rpc_enabled:
+        logger.info("🔷 JSON-RPC Server Enabled")
+        try:
+            from ..rpc.server import RPCServer
+            from ..rpc.modules.eth import EthModule
+            from ..rpc.modules.qrdx import QRDXModule
+            from ..rpc.modules.net import NetModule
+            from ..contracts import ContractStateManager, QRDXEVMExecutor
+            
+            # Initialize contract system first
+            logger.info("Initializing contract execution system...")
+            state_manager = ContractStateManager(db)
+            evm_executor = QRDXEVMExecutor(state_manager)
+            logger.info("✅ Contract system initialized")
+            
+            # Create RPC server
+            rpc_server = RPCServer()
+            
+            # Create context for modules
+            from dataclasses import dataclass
+            @dataclass
+            class RPCContext:
+                db: Any
+                config: Any = None
+                helpers: Any = None
+                state_manager: Any = None
+                evm_executor: Any = None
+            
+            context = RPCContext(
+                db=db,
+                state_manager=state_manager,
+                evm_executor=evm_executor
+            )
+            
+            # Register Ethereum module (standard eth_* methods)
+            eth_module = EthModule()
+            eth_module.context = context
+            rpc_server.register_module(eth_module)
+            
+            # Register contract methods manually (not a full module)
+            async def eth_sendTransaction_handler(tx_params):
+                """Deploy or call a contract (requires signed transaction)."""
+                try:
+                    from eth_utils import to_canonical_address, encode_hex, decode_hex
+                    from eth_keys import keys
+                    from eth_account._utils.signing import serializable_unsigned_transaction_from_dict, encode_transaction
+                    from eth_account._utils.legacy_transactions import Transaction as LegacyTransaction
+                    from decimal import Decimal
+                    import rlp
+                    
+                    if not tx_params:
+                        raise Exception("Missing transaction parameters")
+                    
+                    # Extract signature components
+                    r = tx_params.get('r')
+                    s = tx_params.get('s')
+                    v = tx_params.get('v')
+                    
+                    if not r or not s or not v:
+                        raise Exception("Transaction must be signed (missing r, s, or v)")
+                    
+                    # Extract transaction parameters
+                    to_hex = tx_params.get('to', '')
+                    data_hex = tx_params.get('data', '0x')
+                    gas = int(tx_params.get('gas', '1000000'))
+                    gas_price_wei = int(tx_params.get('gasPrice', '1000000000'))
+                    value_wei = int(tx_params.get('value', '0'))
+                    nonce = int(tx_params.get('nonce', '0'))
+                    
+                    # Build unsigned transaction for signature recovery
+                    unsigned_tx = LegacyTransaction(
+                        nonce=nonce,
+                        gas_price=gas_price_wei,
+                        gas=gas,
+                        to=decode_hex(to_hex) if to_hex else b'',
+                        value=value_wei,
+                        data=decode_hex(data_hex)
+                    )
+                    
+                    # Convert r, s, v to integers
+                    r_int = int(r, 16) if isinstance(r, str) else r
+                    s_int = int(s, 16) if isinstance(s, str) else s
+                    v_int = int(v, 16) if isinstance(v, str) else v
+                    
+                    # Recover sender from signature
+                    # v is chain_id * 2 + 35 or 36 for EIP-155, or 27/28 for legacy
+                    if v_int >= 35:
+                        # EIP-155
+                        chain_id = (v_int - 35) // 2
+                        recovery_id = v_int - (chain_id * 2 + 35)
+                    else:
+                        # Legacy
+                        recovery_id = v_int - 27
+                        chain_id = None
+                    
+                    # Hash the unsigned transaction
+                    if chain_id is not None:
+                        # EIP-155 signing hash
+                        tx_for_hash = LegacyTransaction(
+                            nonce=nonce,
+                            gasPrice=gas_price_wei,  # camelCase!
+                            gas=gas,
+                            to=decode_hex(to_hex) if to_hex else b'',
+                            value=value_wei,
+                            data=decode_hex(data_hex)
+                        )
+                        msg_hash = rlp.encode(list(tx_for_hash) + [chain_id, 0, 0])
+                    else:
+                        msg_hash = rlp.encode(unsigned_tx)
+                    
+                    from eth_hash.auto import keccak
+                    message_hash = keccak(msg_hash)
+                    
+                    # Recover public key and address
+                    signature_bytes = r_int.to_bytes(32, 'big') + s_int.to_bytes(32, 'big')
+                    signature = keys.Signature(signature_bytes=signature_bytes)
+                    
+                    public_key = signature.recover_public_key_from_msg_hash(message_hash)
+                    sender = public_key.to_canonical_address()
+                    sender_hex = encode_hex(sender)
+                    
+                    logger.info(f"eth_sendTransaction: from={sender_hex}, to={to_hex}, data_len={len(data_hex)}, signed=True")
+                    
+                    to = decode_hex(to_hex) if to_hex else None
+                    data = decode_hex(data_hex)
+                    
+                    # Convert wei to QRDX (1 QRDX = 10^18 wei for Ethereum compatibility)
+                    value_qrdx = Decimal(value_wei) / Decimal(10**18)
+                    gas_price_qrdx = Decimal(gas_price_wei) / Decimal(10**18)
+                    
+                    logger.info(f"Executing EVM: sender={sender_hex}, to={encode_hex(to) if to else 'CONTRACT_DEPLOY'}, data_len={len(data)}, value={value_qrdx} QRDX")
+                    
+                    result = evm_executor.execute(
+                        sender,
+                        to,
+                        int(value_qrdx * Decimal(10**18)),  # Convert back to wei
+                        data,
+                        gas,
+                        int(gas_price_qrdx * Decimal(10**18))  # Convert back to wei
+                    )
+                    
+                    logger.info(f"EVM result: success={result.success}, gas_used={result.gas_used}")
+                    
+                    if not result.success:
+                        logger.error(f"EVM execution failed: {result.error}")
+                        raise Exception(f"Execution failed: {result.error}")
+                    
+                    if result.created_address:
+                        contract_addr = encode_hex(result.created_address)
+                        logger.info(f"✅ Contract deployed at: {contract_addr}")
+                        return contract_addr
+                    else:
+                        output = encode_hex(result.output)
+                        logger.info(f"✅ Call output: {output}")
+                        return output
+                        
+                except Exception as e:
+                    logger.error(f"eth_sendTransaction error: {e}", exc_info=True)
+                    raise Exception(f"Transaction failed: {str(e)}")
+            
+            async def eth_call_handler(call_params):
+                """Read-only contract call."""
+                from eth_utils import to_canonical_address, encode_hex, decode_hex
+                
+                sender_hex = call_params.get('from', '0x' + '0' * 40)
+                to_hex = call_params['to']
+                data_hex = call_params.get('data', '0x')
+                
+                sender = to_canonical_address(sender_hex)
+                to = to_canonical_address(to_hex)
+                data = decode_hex(data_hex)
+                
+                result = evm_executor.call(
+                    sender=sender,
+                    to=to,
+                    data=data,
+                    value=0,
+                    gas=10000000
+                )
+                
+                if not result.success:
+                    raise Exception(f"Call failed: {result.error}")
+                
+                return encode_hex(result.output)
+            
+            async def eth_sendRawTransaction_handler(raw_tx_hex):
+                """Send a pre-signed raw transaction with full state synchronization."""
+                try:
+                    from eth_utils import decode_hex, encode_hex
+                    from eth_keys import keys
+                    from decimal import Decimal
+                    import rlp
+                    from eth_hash.auto import keccak
+                    from ..contracts.state_sync import StateSyncManager, ExecutionContext
+                    
+                    # Decode raw transaction
+                    raw_tx = decode_hex(raw_tx_hex)
+                    
+                    # Parse RLP-encoded signed transaction
+                    tx_data = rlp.decode(raw_tx)
+                    
+                    # Extract fields (nonce, gasPrice, gas, to, value, data, v, r, s)
+                    nonce = int.from_bytes(tx_data[0], 'big') if tx_data[0] else 0
+                    gas_price_wei = int.from_bytes(tx_data[1], 'big') if tx_data[1] else 0
+                    gas = int.from_bytes(tx_data[2], 'big') if tx_data[2] else 21000
+                    to_bytes = tx_data[3]
+                    value_wei = int.from_bytes(tx_data[4], 'big') if tx_data[4] else 0
+                    data = tx_data[5]
+                    v_int = int.from_bytes(tx_data[6], 'big')
+                    r_int = int.from_bytes(tx_data[7], 'big')
+                    s_int = int.from_bytes(tx_data[8], 'big')
+                    
+                    # Recover chain ID and recovery_id from v
+                    if v_int >= 35:
+                        # EIP-155
+                        chain_id = (v_int - 35) // 2
+                        recovery_id = v_int - (chain_id * 2 + 35)
+                        # Build message hash with EIP-155
+                        unsigned_data = [tx_data[i] for i in range(6)] + [chain_id.to_bytes((chain_id.bit_length() + 7) // 8, 'big'), b'', b'']
+                        message_hash = keccak(rlp.encode(unsigned_data))
+                    else:
+                        # Legacy (pre-EIP-155)
+                        recovery_id = v_int - 27
+                        # Build message hash without chain_id
+                        unsigned_data = [tx_data[i] for i in range(6)]
+                        message_hash = keccak(rlp.encode(unsigned_data))
+                    
+                    # Recover sender from signature
+                    signature_bytes = r_int.to_bytes(32, 'big') + s_int.to_bytes(32, 'big') + bytes([recovery_id])
+                    signature = keys.Signature(signature_bytes=signature_bytes)
+                    public_key = signature.recover_public_key_from_msg_hash(message_hash)
+                    sender = public_key.to_canonical_address()
+                    sender_hex = encode_hex(sender)
+                    
+                    to_hex = encode_hex(to_bytes) if to_bytes else None
+                    
+                    logger.info(f"eth_sendRawTransaction: from={sender_hex}, to={to_hex}, nonce={nonce}, signed=True")
+                    
+                    # Get current block for determinism
+                    current_block = await db.get_last_block()
+                    block_height = current_block.block_height
+                    block_hash = current_block.block_hash
+                    block_timestamp = current_block.timestamp
+                    
+                    # Create sync manager and ensure tables exist
+                    sync_manager = StateSyncManager(db, state_manager)
+                    await sync_manager.ensure_tables_exist()
+                    
+                    # Create execution context for atomic state management
+                    context_exec = ExecutionContext(
+                        block_height=block_height,
+                        block_hash=block_hash,
+                        block_timestamp=block_timestamp,
+                        db=db,
+                        evm_state=state_manager,
+                        sync_manager=sync_manager
+                    )
+                    
+                    # Prepare execution (sync balance from native to EVM)
+                    await context_exec.prepare_execution(sender_hex)
+                    
+                    # Generate transaction hash
+                    tx_hash = keccak(raw_tx)
+                    tx_hash_hex = encode_hex(tx_hash)
+                    
+                    # Execute transaction
+                    try:
+                        result = evm_executor.execute(
+                            sender,
+                            to_bytes if to_bytes else None,
+                            value_wei,
+                            data,
+                            gas,
+                            gas_price_wei
+                        )
+                        
+                        # Finalize execution (commit or revert)
+                        await context_exec.finalize_execution(
+                            sender=sender_hex,
+                            tx_hash=tx_hash_hex,
+                            success=result.success,
+                            gas_used=result.gas_used,
+                            gas_price=gas_price_wei,
+                            value=value_wei
+                        )
+                        
+                        logger.info(f"EVM result: success={result.success}, gas_used={result.gas_used}")
+                        
+                        if not result.success:
+                            logger.error(f"EVM execution failed: {result.error}")
+                            raise Exception(f"Execution failed: {result.error}")
+                        
+                        if result.created_address:
+                            contract_addr = encode_hex(result.created_address)
+                            logger.info(f"✅ Contract deployed at: {contract_addr}")
+                            return contract_addr
+                        else:
+                            # Return transaction hash for regular transactions
+                            return tx_hash_hex
+                    
+                    except Exception as e:
+                        # Ensure rollback on any exception
+                        await context_exec.finalize_execution(
+                            sender=sender_hex,
+                            tx_hash=tx_hash_hex,
+                            success=False,
+                            gas_used=0,
+                            gas_price=0,
+                            value=0
+                        )
+                        raise
+                        
+                except Exception as e:
+                    logger.error(f"eth_sendRawTransaction error: {e}", exc_info=True)
+                    raise Exception(f"Transaction failed: {str(e)}")
+            
+            rpc_server.register_method('eth_sendTransaction', eth_sendTransaction_handler)
+            rpc_server.register_method('eth_call', eth_call_handler)
+            rpc_server.register_method('eth_sendRawTransaction', eth_sendRawTransaction_handler)
+            
+            # Register QRDX-specific module
+            qrdx_module = QRDXModule()
+            qrdx_module.context = context
+            rpc_server.register_module(qrdx_module)
+            
+            # Register network module
+            net_module = NetModule()
+            net_module.context = context
+            rpc_server.register_module(net_module)
+            
+            # Store RPC server globally
+            app.state.rpc_server = rpc_server
+            
+            # Add RPC endpoint to FastAPI app
+            @app.post("/rpc")
+            async def rpc_endpoint(body: dict = Body(...)):
+                """JSON-RPC 2.0 endpoint"""
+                return await rpc_server.handle_request(body)
+            
+            logger.info(f"✅ JSON-RPC server initialized with {len(rpc_server.get_methods())} methods")
+            logger.info(f"   RPC endpoint: http://{DENARO_NODE_HOST}:{DENARO_NODE_PORT}/rpc")
+            
+        except Exception as e:
+            logger.error(f"❌ RPC server initialization error: {e}", exc_info=True)
+    
     logger.info("Starting background tasks.")
     asyncio.create_task(check_own_reachability())
     asyncio.create_task(periodic_peer_discovery())

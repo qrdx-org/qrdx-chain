@@ -9,6 +9,7 @@ CRITICAL: Validators MUST use Post-Quantum (PQ) wallets.
 import asyncio
 import hashlib
 import time
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -591,12 +592,13 @@ class ValidatorManager:
         parent_hash: str,
     ) -> None:
         """
-        Execute contract transactions and set gas_used on each transaction.
+        Execute contract transactions with full state synchronization.
         
         This MUST be called before creating a block to ensure:
-        1. gas_used is set on each contract transaction
-        2. Contract state is computed correctly
-        3. Block validation will pass
+        1. Balances are synced from native to EVM state
+        2. gas_used is set on each contract transaction
+        3. Contract state is computed correctly
+        4. Block validation will pass
         
         Args:
             transactions: List of transactions to execute
@@ -605,7 +607,8 @@ class ValidatorManager:
         try:
             from qrdx.contracts import QRDXEVMExecutor
             from qrdx.contracts.state import ContractStateManager
-            from eth_utils import to_canonical_address, decode_hex
+            from qrdx.contracts.state_sync import StateSyncManager, ExecutionContext
+            from eth_utils import to_canonical_address, decode_hex, encode_hex
             
             # Identify contract transactions
             contract_txs = []
@@ -646,17 +649,29 @@ class ValidatorManager:
             
             evm = QRDXEVMExecutor(state_manager)
             
-            logger.info(f"Pre-executing {len(contract_txs)} contract transactions for block proposal")
+            # Create state sync manager
+            sync_manager = StateSyncManager(db, state_manager)
+            await sync_manager.ensure_tables_exist()
             
-            # Execute each contract transaction
+            # Get current block info for determinism
+            current_block = await db.get_last_block()
+            block_height = current_block.block_height + 1  # Next block
+            block_hash = parent_hash  # Use parent hash as reference
+            block_timestamp = int(time.time())  # This will be overwritten by actual block timestamp
+            
+            logger.info(f"Pre-executing {len(contract_txs)} contract transactions for block proposal at height {block_height}")
+            
+            # Execute each contract transaction with state sync
             for tx in contract_txs:
                 try:
                     # Get sender address
                     sender_addr = getattr(tx, 'sender', getattr(tx, 'address', None))
                     if isinstance(sender_addr, str):
                         sender = to_canonical_address(sender_addr)
+                        sender_hex = sender_addr
                     else:
                         sender = sender_addr
+                        sender_hex = encode_hex(sender)
                     
                     # Get recipient (None for contract creation)
                     to = None
@@ -676,38 +691,84 @@ class ValidatorManager:
                     gas_price = getattr(tx, 'gas_price', 1_000_000_000)
                     value = getattr(tx, 'value', 0)
                     
-                    # Execute contract
-                    result = evm.execute(
-                        sender=sender,
-                        to=to,
-                        value=value,
-                        data=data,
-                        gas=gas_limit,
-                        gas_price=gas_price,
+                    # Generate transaction hash for audit trail
+                    tx_hash = getattr(tx, 'tx_hash', getattr(tx, 'hash', encode_hex(os.urandom(32))))
+                    
+                    # Create execution context for this transaction
+                    context = ExecutionContext(
+                        block_height=block_height,
+                        block_hash=block_hash,
+                        block_timestamp=block_timestamp,
+                        db=db,
+                        evm_state=state_manager,
+                        sync_manager=sync_manager
                     )
                     
-                    if not result.success:
-                        logger.warning(f"Contract execution failed during proposal: {result.error}")
-                        # Don't include failed contracts in the block
-                        transactions.remove(tx)
-                        continue
+                    # Prepare execution (sync balance from native to EVM)
+                    await context.prepare_execution(sender_hex)
                     
-                    # CRITICAL: Set gas_used on transaction
-                    tx.gas_used = result.gas_used
-                    
-                    # Set contract address if deployment
-                    if result.created_address and hasattr(tx, 'contract_address'):
-                        from eth_utils import encode_hex
-                        tx.contract_address = encode_hex(result.created_address)
-                    
-                    logger.debug(f"Contract executed: gas_used={result.gas_used}")
+                    # Execute contract
+                    try:
+                        result = evm.execute(
+                            sender=sender,
+                            to=to,
+                            value=value,
+                            data=data,
+                            gas=gas_limit,
+                            gas_price=gas_price,
+                        )
+                        
+                        # Finalize execution (commit or revert)
+                        await context.finalize_execution(
+                            sender=sender_hex,
+                            tx_hash=tx_hash,
+                            success=result.success,
+                            gas_used=result.gas_used,
+                            gas_price=gas_price,
+                            value=value
+                        )
+                        
+                        if not result.success:
+                            logger.warning(f"Contract execution failed during proposal: {result.error}")
+                            # Don't include failed contracts in the block
+                            transactions.remove(tx)
+                            continue
+                        
+                        # CRITICAL: Set gas_used on transaction
+                        tx.gas_used = result.gas_used
+                        
+                        # Set contract address if deployment
+                        if result.created_address and hasattr(tx, 'contract_address'):
+                            tx.contract_address = encode_hex(result.created_address)
+                        
+                        logger.debug(f"Contract executed with state sync: gas_used={result.gas_used}")
+                        
+                    except Exception as e:
+                        # Ensure rollback on exception
+                        await context.finalize_execution(
+                            sender=sender_hex,
+                            tx_hash=tx_hash,
+                            success=False,
+                            gas_used=0,
+                            gas_price=0,
+                            value=0
+                        )
+                        raise
                     
                 except Exception as e:
-                    logger.error(f"Failed to execute contract transaction: {e}")
+                    logger.error(f"Failed to execute contract transaction: {e}", exc_info=True)
                     # Remove failed transaction from block
                     transactions.remove(tx)
             
-            logger.info(f"Successfully pre-executed {len(contract_txs)} contract transactions")
+            # Create state checkpoint after all executions
+            if contract_txs:
+                combined_state_root = await sync_manager.create_state_checkpoint(
+                    block_height=block_height,
+                    block_hash=block_hash
+                )
+                logger.info(f"Created state checkpoint for block {block_height}: {combined_state_root[:16]}...")
+            
+            logger.info(f"Successfully pre-executed {len(contract_txs)} contract transactions with state sync")
             
         except ImportError as e:
             logger.warning(f"Contract execution not available: {e}")
