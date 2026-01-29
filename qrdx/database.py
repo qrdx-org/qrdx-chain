@@ -511,11 +511,21 @@ class Database:
         return sum([[{'tx_hash': tx_input.tx_hash, 'index': tx_input.index} for tx_input in tx.inputs] for tx in txs], [])
 
     async def get_spendable_outputs(self, address: str, check_pending_txs: bool = False) -> List[TransactionInput]:
-        point = string_to_point(address)
-        search = ['%'+point_to_bytes(string_to_point(address), address_format).hex()+'%' for address_format in list(AddressFormat)]
-        addresses = [point_to_string(point, address_format) for address_format in list(AddressFormat)]
-        addresses.reverse()
-        search.reverse()
+        # Check if this is a modern address format (0xPQ... or 0x...)
+        is_modern_address = address.startswith('0xPQ') or (address.startswith('0x') and len(address) == 42)
+        
+        if is_modern_address:
+            # Modern address - query directly
+            addresses = [address]
+            point = None  # No elliptic curve point for modern addresses
+        else:
+            # Legacy address - use elliptic curve point conversion
+            point = string_to_point(address)
+            search = ['%'+point_to_bytes(string_to_point(address), address_format).hex()+'%' for address_format in list(AddressFormat)]
+            addresses = [point_to_string(point, address_format) for address_format in list(AddressFormat)]
+            addresses.reverse()
+            search.reverse()
+        
         async with self.pool.acquire() as connection:
             if await connection.fetchrow('SELECT tx_hash, index FROM unspent_outputs WHERE address IS NULL') is not None:
                 await self.set_unspent_outputs_addresses()
@@ -526,9 +536,19 @@ class Database:
         return [TransactionInput(tx_hash, index, amount=Decimal(amount) / SMALLEST, public_key=point) for tx_hash, index, amount in unspent_outputs]
 
     async def get_address_balance(self, address: str, check_pending_txs: bool = False) -> Decimal:
-        point = string_to_point(address)
-        search = ['%'+point_to_bytes(string_to_point(address), address_format).hex()+'%' for address_format in list(AddressFormat)]
-        addresses = [point_to_string(point, address_format) for address_format in list(AddressFormat)]
+        # Check if this is a modern address format (0xPQ... or 0x...)
+        is_modern_address = address.startswith('0xPQ') or (address.startswith('0x') and len(address) == 42)
+        
+        if is_modern_address:
+            # Modern address - query directly
+            addresses = [address]
+            search = ['%' + address + '%']  # Search for exact address in hex
+        else:
+            # Legacy address - use elliptic curve point conversion
+            point = string_to_point(address)
+            search = ['%'+point_to_bytes(string_to_point(address), address_format).hex()+'%' for address_format in list(AddressFormat)]
+            addresses = [point_to_string(point, address_format) for address_format in list(AddressFormat)]
+        
         tx_inputs = await self.get_spendable_outputs(address, check_pending_txs=check_pending_txs)
         balance = sum([tx_input.amount for tx_input in tx_inputs], Decimal(0))
         if check_pending_txs:
