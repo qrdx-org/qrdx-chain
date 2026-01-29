@@ -2,12 +2,12 @@
   "version": "1.0.0",
   "chain_id": 1,
   "network_name": "qrdx-mainnet",
-  "genesis_time": 1769650854,
+  "genesis_time": 1769712740,
   "genesis_slot": 0,
-  "genesis_block_hash": "5bf08a12bc218bfb72954ba566477ba5104d63ae0973656268d4e0bc01251e5c",
-  "state_root": "3a6cf6c76de9a11003ad3080b9a8236c999c31ca8803edd58d913e2172d270a6",
-  "validators_root": "2307a40abf1e285455dd1e933522d3cd492b669f347408c147efad91857e0967",
-  "randao_seed": "63bf232247332efad6c996d96c9e8aac3e093abf3a2ed99aadf8a969564a6644",
+  "genesis_block_hash": "69ee4969ef0519bb2f06c340bf975bbfbf35b9c14e23e7a68d7abd9a201ceb36",
+  "state_root": "1090d7790a867902d8d9145d0e52be42a7f107c5f164958e85a0c6deb9492b55",
+  "validators_root": "ac45d973cc5fafc2dd2be02432a05064f36431a0cf232a9c66932f41a2751969",
+  "randao_seed": "cf7655579fe7f3b20305f82c285f43a6afea83487c1fbde9f44d14f751e6eefd",
   "total_supply": "100000000",
   "total_staked": "200000"
 }

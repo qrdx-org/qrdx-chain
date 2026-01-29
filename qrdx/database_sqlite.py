@@ -147,6 +147,140 @@ class DatabaseSQLite:
             FOREIGN KEY (validator_address) REFERENCES validator_stakes(validator_address)
         );
         
+        -- Contract tracking tables
+        CREATE TABLE IF NOT EXISTS account_state (
+            address TEXT PRIMARY KEY,
+            balance TEXT NOT NULL DEFAULT '0',
+            nonce INTEGER NOT NULL DEFAULT 0,
+            code_hash TEXT,
+            storage_root TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            is_contract BOOLEAN NOT NULL DEFAULT 0
+        );
+        
+        CREATE TABLE IF NOT EXISTS contract_metadata (
+            contract_address TEXT PRIMARY KEY,
+            name TEXT,
+            symbol TEXT,
+            compiler_version TEXT,
+            source_code TEXT,
+            abi TEXT,
+            verified BOOLEAN NOT NULL DEFAULT 0,
+            verified_at INTEGER,
+            FOREIGN KEY (contract_address) REFERENCES account_state(address)
+        );
+        
+        CREATE TABLE IF NOT EXISTS contract_code (
+            code_hash TEXT PRIMARY KEY,
+            bytecode BLOB NOT NULL,
+            deployed_at INTEGER NOT NULL,
+            deployer TEXT NOT NULL,
+            size INTEGER NOT NULL
+        );
+        
+        CREATE TABLE IF NOT EXISTS contract_storage (
+            contract_address TEXT NOT NULL,
+            storage_key TEXT NOT NULL,
+            storage_value TEXT NOT NULL,
+            block_number INTEGER NOT NULL,
+            PRIMARY KEY (contract_address, storage_key)
+        );
+        
+        CREATE TABLE IF NOT EXISTS contract_transactions (
+            tx_hash TEXT PRIMARY KEY,
+            block_number INTEGER NOT NULL,
+            tx_index INTEGER NOT NULL,
+            from_address TEXT NOT NULL,
+            to_address TEXT,
+            value TEXT NOT NULL DEFAULT '0',
+            gas_limit INTEGER NOT NULL,
+            gas_used INTEGER NOT NULL,
+            gas_price TEXT NOT NULL,
+            nonce INTEGER NOT NULL,
+            input_data BLOB,
+            contract_address TEXT,
+            status INTEGER NOT NULL DEFAULT 1,
+            error_message TEXT,
+            created_at INTEGER NOT NULL
+        );
+        
+        CREATE TABLE IF NOT EXISTS contract_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tx_hash TEXT NOT NULL,
+            block_number INTEGER NOT NULL,
+            log_index INTEGER NOT NULL,
+            contract_address TEXT NOT NULL,
+            topic0 TEXT,
+            topic1 TEXT,
+            topic2 TEXT,
+            topic3 TEXT,
+            data BLOB,
+            removed BOOLEAN NOT NULL DEFAULT 0,
+            UNIQUE(tx_hash, log_index),
+            FOREIGN KEY (tx_hash) REFERENCES contract_transactions(tx_hash)
+        );
+        
+        CREATE TABLE IF NOT EXISTS attestations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slot INTEGER NOT NULL,
+            epoch INTEGER NOT NULL,
+            block_hash TEXT NOT NULL,
+            validator_address TEXT NOT NULL,
+            validator_index INTEGER NOT NULL,
+            signature TEXT NOT NULL,
+            source_epoch INTEGER NOT NULL,
+            target_epoch INTEGER NOT NULL,
+            included_in_block TEXT,
+            inclusion_slot INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(slot, validator_address)
+        );
+        
+        CREATE TABLE IF NOT EXISTS epochs (
+            epoch INTEGER PRIMARY KEY,
+            start_slot INTEGER NOT NULL,
+            end_slot INTEGER NOT NULL,
+            active_validators INTEGER NOT NULL DEFAULT 0,
+            total_stake TEXT NOT NULL DEFAULT '0',
+            finalized BOOLEAN NOT NULL DEFAULT 0,
+            justified BOOLEAN NOT NULL DEFAULT 0,
+            finality_root TEXT,
+            randao_mix TEXT,
+            total_rewards TEXT NOT NULL DEFAULT '0',
+            total_penalties TEXT NOT NULL DEFAULT '0',
+            started_at TIMESTAMP,
+            finalized_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE TABLE IF NOT EXISTS validators (
+            address TEXT PRIMARY KEY,
+            public_key TEXT NOT NULL,
+            stake TEXT NOT NULL,
+            effective_stake TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            activation_epoch INTEGER,
+            exit_epoch INTEGER,
+            slashed BOOLEAN NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE TABLE IF NOT EXISTS stakes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            validator_address TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            deposit_epoch INTEGER NOT NULL,
+            withdrawal_requested_epoch INTEGER,
+            withdrawal_completed_epoch INTEGER,
+            withdrawable_at TIMESTAMP,
+            deposit_tx_hash TEXT,
+            withdrawal_tx_hash TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (validator_address) REFERENCES validators(address)
+        );
+        
         CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(block_height);
         CREATE INDEX IF NOT EXISTS idx_transactions_block ON transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_unspent_address ON unspent_outputs(address);
@@ -155,6 +289,24 @@ class DatabaseSQLite:
         CREATE INDEX IF NOT EXISTS idx_stakes_activation ON validator_stakes(activation_epoch);
         CREATE INDEX IF NOT EXISTS idx_deposits_validator ON stake_deposits(validator_address);
         CREATE INDEX IF NOT EXISTS idx_withdrawals_validator ON stake_withdrawals(validator_address);
+        CREATE INDEX IF NOT EXISTS idx_account_state_address ON account_state(address);
+        CREATE INDEX IF NOT EXISTS idx_account_state_is_contract ON account_state(is_contract);
+        CREATE INDEX IF NOT EXISTS idx_contract_metadata_verified ON contract_metadata(verified);
+        CREATE INDEX IF NOT EXISTS idx_contract_tx_block ON contract_transactions(block_number);
+        CREATE INDEX IF NOT EXISTS idx_contract_tx_from ON contract_transactions(from_address);
+        CREATE INDEX IF NOT EXISTS idx_contract_tx_to ON contract_transactions(to_address);
+        CREATE INDEX IF NOT EXISTS idx_contract_logs_tx ON contract_logs(tx_hash);
+        CREATE INDEX IF NOT EXISTS idx_contract_logs_block ON contract_logs(block_number);
+        CREATE INDEX IF NOT EXISTS idx_contract_logs_address ON contract_logs(contract_address);
+        CREATE INDEX IF NOT EXISTS idx_contract_logs_topic0 ON contract_logs(topic0);
+        CREATE INDEX IF NOT EXISTS idx_contract_logs_topic1 ON contract_logs(topic1);
+        CREATE INDEX IF NOT EXISTS idx_contract_logs_topic2 ON contract_logs(topic2);
+        CREATE INDEX IF NOT EXISTS idx_attestations_slot ON attestations(slot);
+        CREATE INDEX IF NOT EXISTS idx_attestations_epoch ON attestations(epoch);
+        CREATE INDEX IF NOT EXISTS idx_attestations_validator ON attestations(validator_address);
+        CREATE INDEX IF NOT EXISTS idx_attestations_block ON attestations(block_hash);
+        CREATE INDEX IF NOT EXISTS idx_validators_status ON validators(status);
+        CREATE INDEX IF NOT EXISTS idx_stakes_validator ON stakes(validator_address);
         """
         
         await self.connection.executescript(schema)
@@ -276,6 +428,260 @@ class DatabaseSQLite:
         """Get all pending transaction hashes"""
         cursor = await self.connection.execute("SELECT tx_hash FROM pending_transactions")
         rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+    
+    # Contract tracking methods
+    
+    async def add_contract_log(self, tx_hash: str, block_number: int, log_index: int, 
+                               contract_address: str, topic0: str = None, topic1: str = None,
+                               topic2: str = None, topic3: str = None, data: bytes = None):
+        """Add contract event log"""
+        await self.connection.execute("""
+            INSERT INTO contract_logs 
+            (tx_hash, block_number, log_index, contract_address, topic0, topic1, topic2, topic3, data, removed)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        """, (tx_hash, block_number, log_index, contract_address, topic0, topic1, topic2, topic3, data))
+        await self.connection.commit()
+    
+    async def add_contract_metadata(self, contract_address: str, name: str = None, 
+                                   symbol: str = None, verified: bool = False, abi: str = None):
+        """Add or update contract metadata"""
+        await self.connection.execute("""
+            INSERT OR REPLACE INTO contract_metadata 
+            (contract_address, name, symbol, verified, abi)
+            VALUES (?, ?, ?, ?, ?)
+        """, (contract_address, name, symbol, verified, abi))
+        await self.connection.commit()
+    
+    async def get_address_tokens(self, address: str, transfer_topic: str):
+        """Get tokens owned by address from Transfer events"""
+        # Normalize address to 64-char hex (32 bytes)
+        address_topic = "0x" + address.lower().replace("0x", "").zfill(64)
+        
+        cursor = await self.connection.execute("""
+            SELECT DISTINCT 
+                cl.contract_address,
+                cm.name,
+                cm.symbol,
+                COALESCE(cm.verified, 0) as verified,
+                COUNT(DISTINCT cl.id) as transfer_count
+            FROM contract_logs cl
+            LEFT JOIN contract_metadata cm ON cl.contract_address = cm.contract_address
+            WHERE cl.topic0 = ?
+              AND cl.topic2 = ?
+              AND cl.removed = 0
+            GROUP BY cl.contract_address, cm.name, cm.symbol, cm.verified
+        """, (transfer_topic, address_topic))
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    
+    async def get_token_info(self, token_address: str, transfer_topic: str):
+        """Get token contract information"""
+        # Get metadata
+        cursor = await self.connection.execute("""
+            SELECT * FROM contract_metadata WHERE contract_address = ?
+        """, (token_address,))
+        metadata = await cursor.fetchone()
+        
+        if not metadata:
+            return None
+        
+        # Get transfer count
+        cursor = await self.connection.execute("""
+            SELECT COUNT(*) as count FROM contract_logs
+            WHERE contract_address = ? AND topic0 = ? AND removed = 0
+        """, (token_address, transfer_topic))
+        transfer_row = await cursor.fetchone()
+        transfer_count = transfer_row[0] if transfer_row else 0
+        
+        # Get unique holders (distinct topic2 recipients)
+        cursor = await self.connection.execute("""
+            SELECT COUNT(DISTINCT topic2) as count FROM contract_logs
+            WHERE contract_address = ? AND topic0 = ? AND removed = 0
+        """, (token_address, transfer_topic))
+        holder_row = await cursor.fetchone()
+        holder_count = holder_row[0] if holder_row else 0
+        
+        result = dict(metadata)
+        result['total_transfers'] = transfer_count
+        result['total_holders'] = holder_count
+        return result
+    
+    async def get_top_addresses_by_balance(self, limit: int, offset: int):
+        """Get top addresses by balance (sum of unspent outputs)"""
+        cursor = await self.connection.execute("""
+            SELECT 
+                address,
+                SUM(amount) as balance,
+                COUNT(*) as output_count
+            FROM unspent_outputs
+            WHERE address IS NOT NULL AND address != ''
+            GROUP BY address
+            ORDER BY balance DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    
+    async def get_top_addresses_by_transactions(self, limit: int, offset: int):
+        """Get most active addresses by transaction count"""
+        # SQLite doesn't have UNNEST, so we need a different approach
+        # This is a simplified version - for full implementation, we'd need to parse the arrays
+        cursor = await self.connection.execute("""
+            SELECT DISTINCT
+                address,
+                COUNT(*) as tx_count
+            FROM unspent_outputs
+            WHERE address IS NOT NULL AND address != ''
+            GROUP BY address
+            ORDER BY tx_count DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    
+    async def get_top_addresses_by_tokens(self, limit: int, offset: int, transfer_topic: str):
+        """Get addresses with most token holdings"""
+        cursor = await self.connection.execute("""
+            SELECT 
+                topic2 as address_topic,
+                COUNT(DISTINCT contract_address) as token_count,
+                COUNT(*) as transfer_count
+            FROM contract_logs
+            WHERE topic0 = ? AND removed = 0 AND topic2 IS NOT NULL
+            GROUP BY topic2
+            ORDER BY token_count DESC
+            LIMIT ? OFFSET ?
+        """, (transfer_topic, limit, offset))
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    
+    async def get_recent_transactions_with_blocks(self, limit: int, offset: int):
+        """Get recent transactions with block info"""
+        cursor = await self.connection.execute("""
+            SELECT 
+                t.tx_hash,
+                t.block_hash,
+                b.block_height as block_number,
+                b.timestamp,
+                t.fees
+            FROM transactions t
+            JOIN blocks b ON t.block_hash = b.block_hash
+            ORDER BY b.block_height DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    
+    async def get_recent_contract_transactions(self, limit: int, offset: int):
+        """Get recent contract transactions"""
+        cursor = await self.connection.execute("""
+            SELECT 
+                ct.tx_hash,
+                ct.block_number,
+                ct.from_address,
+                ct.to_address,
+                ct.value,
+                ct.gas_used,
+                ct.status,
+                b.timestamp
+            FROM contract_transactions ct
+            LEFT JOIN blocks b ON b.block_height = ct.block_number
+            ORDER BY ct.block_number DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    
+    async def get_recent_blocks_with_validators(self, limit: int, offset: int):
+        """Get recent blocks with validator information"""
+        cursor = await self.connection.execute("""
+            SELECT 
+                b.block_height as id,
+                b.block_hash as hash,
+                b.validator_address as address,
+                b.validator_address as proposer_address,
+                b.timestamp,
+                (SELECT COUNT(*) FROM transactions WHERE block_hash = b.block_hash) as tx_count,
+                NULL as slot,
+                NULL as epoch,
+                0 as attestations_included,
+                0 as reward
+            FROM blocks b
+            ORDER BY b.block_height DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    
+    async def get_validator_info(self, validator_address: str):
+        """Get validator information"""
+        cursor = await self.connection.execute("""
+            SELECT address, stake, effective_stake, status
+            FROM validators
+            WHERE address = ?
+        """, (validator_address,))
+        
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    
+    async def get_attestations_filtered(self, filters: dict, limit: int, offset: int):
+        """Get attestations with filters"""
+        where_clauses = []
+        params = []
+        
+        if 'slot' in filters and filters['slot'] is not None:
+            where_clauses.append("slot = ?")
+            params.append(filters['slot'])
+        
+        if 'epoch' in filters and filters['epoch'] is not None:
+            where_clauses.append("epoch = ?")
+            params.append(filters['epoch'])
+        
+        if 'validator_address' in filters and filters['validator_address']:
+            where_clauses.append("validator_address = ?")
+            params.append(filters['validator_address'])
+        
+        if 'block_hash' in filters and filters['block_hash']:
+            where_clauses.append("block_hash = ?")
+            params.append(filters['block_hash'])
+        
+        where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
+        params.extend([limit, offset])
+        
+        query = f"""
+            SELECT 
+                a.id,
+                a.slot,
+                a.epoch,
+                a.block_hash,
+                a.validator_address,
+                a.validator_index,
+                a.source_epoch,
+                a.target_epoch,
+                a.included_in_block,
+                a.inclusion_slot,
+                a.created_at,
+                v.stake,
+                v.effective_stake,
+                v.status as validator_status
+            FROM attestations a
+            LEFT JOIN validators v ON a.validator_address = v.address
+            WHERE {where_clause}
+            ORDER BY a.slot DESC, a.validator_index ASC
+            LIMIT ? OFFSET ?
+        """
+        
+        cursor = await self.connection.execute(query, tuple(params))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
         return [row[0] for row in rows]
     
     async def get_pending_transactions_by_hash(self, hashes: list):
