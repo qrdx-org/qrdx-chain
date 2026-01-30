@@ -326,8 +326,10 @@ class InputValidator:
         if not address:
             return False
 
-        # Traditional addresses (Q/R prefix): 45 chars
-        # PQ addresses (0xPQ prefix): 68 chars (0xPQ + 64 hex)
+        # Supported address formats:
+        # - Traditional QRDX (Q/R prefix): 45 chars
+        # - Ethereum (0x prefix): 42 chars
+        # - PQ addresses (0xPQ prefix): 68 chars
         if len(address) < 40 or len(address) > 128:
             return False
 

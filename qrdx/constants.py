@@ -133,8 +133,11 @@ MAX_TX_DATA_SIZE = 1_900_000
 VALID_HEX_PATTERN = re.compile(r'^[0-9a-fA-F]+$')
 
 # Regex pattern for validating QRDX addresses
-# Supports both traditional (Q/R + 44 chars) and PQ (0xPQ + 64 hex chars) addresses
-VALID_ADDRESS_PATTERN = re.compile(r'^(?:[QR][1-9A-HJ-NP-Za-km-z]{44}|0xPQ[0-9a-fA-F]{64})$')
+# Supports:
+# - Traditional QRDX: Q/R + 44 base58 chars
+# - PQ addresses: 0xPQ + 64 hex chars  
+# - Ethereum addresses: 0x + 40 hex chars
+VALID_ADDRESS_PATTERN = re.compile(r'^(?:[QR][1-9A-HJ-NP-Za-km-z]{44}|0xPQ[0-9a-fA-F]{64}|0x[0-9a-fA-F]{40})$')
 
 
 # ==================================================================================
