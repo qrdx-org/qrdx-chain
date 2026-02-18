@@ -1,13 +1,16 @@
 {
   "version": "1.0.0",
-  "chain_id": 1,
-  "network_name": "qrdx-mainnet",
-  "genesis_time": 1769712740,
+  "chain_id": 9999,
+  "network_name": "qrdx-testnet-local",
+  "genesis_time": 1769884440,
   "genesis_slot": 0,
-  "genesis_block_hash": "69ee4969ef0519bb2f06c340bf975bbfbf35b9c14e23e7a68d7abd9a201ceb36",
-  "state_root": "1090d7790a867902d8d9145d0e52be42a7f107c5f164958e85a0c6deb9492b55",
-  "validators_root": "ac45d973cc5fafc2dd2be02432a05064f36431a0cf232a9c66932f41a2751969",
-  "randao_seed": "cf7655579fe7f3b20305f82c285f43a6afea83487c1fbde9f44d14f751e6eefd",
+  "genesis_block_hash": "f24174884f39aa3690a822e26719fe7de3ab34eefa9f84bd2fe3a883d8b4a739",
+  "state_root": "1f83e448439ea32327c79dac557b595cfa46b56e4d0baeb0e140219dfbd9e2f4",
+  "validators_root": "d7d1730a4edaae2102a3cca5c92137dd27b76ea610e74828e0c3c1a6491a89af",
+  "randao_seed": "232e86109eed1190e66f060b8b18043c8c9fe4d8ad5842893b439cc7d8521529",
   "total_supply": "100000000",
-  "total_staked": "200000"
+  "total_staked": "100000",
+  "system_wallets": 10,
+  "system_wallet_controller": "0xPQ15Ef2c827b9D0F9d5868Ad2f516e43ddB7dBBee202204553331d667a2c138D9E",
+  "total_system_wallets": "75000000"
 }

@@ -281,6 +281,19 @@ class DatabaseSQLite:
             FOREIGN KEY (validator_address) REFERENCES validators(address)
         );
         
+        CREATE TABLE IF NOT EXISTS system_wallets (
+            address TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            wallet_type TEXT NOT NULL,
+            controller_address TEXT NOT NULL,
+            is_burner BOOLEAN NOT NULL DEFAULT 0,
+            category TEXT NOT NULL,
+            balance TEXT NOT NULL DEFAULT '0',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
         CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(block_height);
         CREATE INDEX IF NOT EXISTS idx_transactions_block ON transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_unspent_address ON unspent_outputs(address);
@@ -298,6 +311,8 @@ class DatabaseSQLite:
         CREATE INDEX IF NOT EXISTS idx_contract_logs_tx ON contract_logs(tx_hash);
         CREATE INDEX IF NOT EXISTS idx_contract_logs_block ON contract_logs(block_number);
         CREATE INDEX IF NOT EXISTS idx_contract_logs_address ON contract_logs(contract_address);
+        CREATE INDEX IF NOT EXISTS idx_system_wallets_controller ON system_wallets(controller_address);
+        CREATE INDEX IF NOT EXISTS idx_system_wallets_category ON system_wallets(category);
         CREATE INDEX IF NOT EXISTS idx_contract_logs_topic0 ON contract_logs(topic0);
         CREATE INDEX IF NOT EXISTS idx_contract_logs_topic1 ON contract_logs(topic1);
         CREATE INDEX IF NOT EXISTS idx_contract_logs_topic2 ON contract_logs(topic2);

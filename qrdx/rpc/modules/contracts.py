@@ -362,7 +362,7 @@ class EthereumRPCModule:
                     'transactionHash': tx_hash,
                     'transactionIndex': hex(tx['tx_index']),
                     'blockNumber': hex(tx['block_number']),
-                    'blockHash': '0x' + ('0' * 64),  # TODO: Get actual block hash
+                    'blockHash': tx.get('block_hash', '0x' + ('0' * 64)) if isinstance(tx.get('block_hash'), str) else '0x' + ('0' * 64),
                     'from': tx['from_address'],
                     'to': tx['to_address'],
                     'cumulativeGasUsed': hex(tx['gas_used']),
@@ -501,7 +501,7 @@ class EthereumRPCModule:
                 """,
                 tx.tx_hash,
                 block_number,
-                0,  # TODO: Get actual tx index
+                tx.tx_index if hasattr(tx, 'tx_index') else 0,
                 tx.sender,
                 tx.to,
                 str(tx.value),

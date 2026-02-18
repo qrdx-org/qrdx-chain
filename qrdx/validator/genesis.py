@@ -95,6 +95,10 @@ class GenesisConfig:
     # Validators
     validators: List[GenesisValidator] = field(default_factory=list)
     
+    # System wallets
+    system_wallet_controller: Optional[str] = None  # PQ address that controls system wallets
+    enable_system_wallets: bool = True
+    
     # Extra data
     extra_data: bytes = b""
 
@@ -128,9 +132,14 @@ class GenesisState:
     # Accounts
     accounts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     
+    # System wallets
+    system_wallets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    system_wallet_controller: str = ""  # PQ address controlling system wallets
+    
     # Totals
     total_supply: str = "0"
     total_staked: str = "0"
+    total_system_wallets: str = "0"
 
 
 @dataclass
@@ -173,6 +182,7 @@ class GenesisCreator:
         self.config = config
         self._validators: List[GenesisValidator] = list(config.validators)
         self._accounts: Dict[str, GenesisAccount] = {}
+        self._system_wallet_manager = None
         
         # Initialize pre-allocations
         for address, balance in config.pre_allocations.items():
@@ -181,6 +191,23 @@ class GenesisCreator:
                 balance=balance,
                 label="pre-allocation",
             )
+        
+        # Initialize system wallets if enabled
+        if config.enable_system_wallets and config.system_wallet_controller:
+            self._init_system_wallets(config.system_wallet_controller)
+    
+    def _init_system_wallets(self, controller_address: str):
+        """Initialize system wallets with controller."""
+        from ..crypto.system_wallets import initialize_system_wallets
+        
+        self._system_wallet_manager = initialize_system_wallets(controller_address)
+        logger.info(
+            f"System wallets initialized with controller: {controller_address[:16]}..."
+        )
+    
+    def get_system_wallet_manager(self):
+        """Get system wallet manager."""
+        return self._system_wallet_manager
     
     def add_validator(
         self,
@@ -387,6 +414,26 @@ class GenesisCreator:
                 "label": a.label,
             }
         
+        # Add system wallets
+        total_system_wallet_balance = Decimal("0")
+        if self._system_wallet_manager:
+            state.system_wallet_controller = self._system_wallet_manager.controller_address
+            for wallet in self._system_wallet_manager.get_all_wallets():
+                state.system_wallets[wallet.address] = {
+                    "balance": str(wallet.genesis_balance),
+                    "name": wallet.name,
+                    "description": wallet.description,
+                    "type": wallet.wallet_type.value,
+                    "is_burner": wallet.is_burner,
+                    "category": wallet.category,
+                }
+                # Add to balances for consistency
+                state.balances[wallet.address] = str(wallet.genesis_balance)
+                total_system_wallet_balance += wallet.genesis_balance
+            
+            logger.info(f"Added {len(state.system_wallets)} system wallets")
+            logger.info(f"Total system wallet balance: {total_system_wallet_balance}")
+        
         # Compute roots
         validators_root = self._compute_validators_root(self._validators)
         state.genesis_validators_root = validators_root.hex()
@@ -398,6 +445,10 @@ class GenesisCreator:
         # Set totals
         state.total_supply = str(self.config.initial_supply)
         state.total_staked = str(total_staked)
+        if self._system_wallet_manager:
+            state.total_system_wallets = str(
+                self._system_wallet_manager.get_total_genesis_balance()
+            )
         
         # Compute state root
         state_root = self._compute_state_root(state)

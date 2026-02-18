@@ -34,7 +34,13 @@ class NetModule(RPCModule):
         Returns:
             True if listening
         """
-        # TODO: Check P2P status
+        # Check if P2P is running and listening
+        if self.context and hasattr(self.context, 'p2p'):
+            if hasattr(self.context.p2p, 'is_running'):
+                return bool(self.context.p2p.is_running)
+            # If p2p exists, assume listening
+            return True
+        # Default to True for node operation
         return True
     
     @rpc_method

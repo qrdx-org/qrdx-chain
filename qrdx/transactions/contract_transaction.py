@@ -157,6 +157,12 @@ class ContractTransaction:
         Returns:
             True if signature is valid
         """
+        # First check system wallet constraints
+        from .validation import validate_transaction
+        is_valid, error = validate_transaction(self)
+        if not is_valid:
+            raise InvalidTransactionError(f"System wallet validation failed: {error}")
+        
         if not self.signature or not self.public_key:
             return False
         

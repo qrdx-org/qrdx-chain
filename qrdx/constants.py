@@ -117,6 +117,111 @@ ACTIVE_NODES_DELTA = 60 * 60 * 24 * 7  # peers inactive longer than 7 days are c
 
 
 # ==================================================================================
+# SYSTEM WALLETS CONFIGURATION
+# ==================================================================================
+# System wallets are special off-curve addresses that:
+# - Cannot be generated from private keys
+# - Are pre-funded in genesis
+# - Are controlled by a designated PQ controller wallet
+# - Provide decentralized treasury and system functions
+
+# System wallet address range: 0x0000...0001 through 0x0000...00FF
+SYSTEM_WALLET_ADDRESSES = {
+    "GARBAGE_COLLECTOR": "0x0000000000000000000000000000000000000001",
+    "COMMUNITY_GRANTS": "0x0000000000000000000000000000000000000002",
+    "DEVELOPER_FUND": "0x0000000000000000000000000000000000000003",
+    "ECOSYSTEM_FUND": "0x0000000000000000000000000000000000000004",
+    "STAKING_REWARDS": "0x0000000000000000000000000000000000000005",
+    "MARKETING": "0x0000000000000000000000000000000000000006",
+    "LIQUIDITY_RESERVE": "0x0000000000000000000000000000000000000007",
+    "TREASURY_MULTISIG": "0x0000000000000000000000000000000000000008",
+    "BUG_BOUNTY": "0x0000000000000000000000000000000000000009",
+    "AIRDROP": "0x000000000000000000000000000000000000000a",
+}
+
+# System wallet genesis balances (in QRDX)
+SYSTEM_WALLET_GENESIS_BALANCES = {
+    "GARBAGE_COLLECTOR": Decimal("0"),  # Burner wallet, starts empty
+    "COMMUNITY_GRANTS": Decimal("5000000"),  # 5M QRDX
+    "DEVELOPER_FUND": Decimal("10000000"),  # 10M QRDX
+    "ECOSYSTEM_FUND": Decimal("8000000"),  # 8M QRDX
+    "STAKING_REWARDS": Decimal("15000000"),  # 15M QRDX
+    "MARKETING": Decimal("3000000"),  # 3M QRDX
+    "LIQUIDITY_RESERVE": Decimal("7000000"),  # 7M QRDX
+    "TREASURY_MULTISIG": Decimal("20000000"),  # 20M QRDX
+    "BUG_BOUNTY": Decimal("1000000"),  # 1M QRDX
+    "AIRDROP": Decimal("6000000"),  # 6M QRDX
+}
+
+# Total system wallet allocation
+TOTAL_SYSTEM_WALLET_ALLOCATION = Decimal("75000000")  # 75M QRDX
+
+# System wallet metadata
+SYSTEM_WALLET_METADATA = {
+    "GARBAGE_COLLECTOR": {
+        "name": "Garbage Collector",
+        "description": "Automated garbage collection wallet that burns unclaimed tokens and fees",
+        "category": "system",
+        "is_burner": True,
+    },
+    "COMMUNITY_GRANTS": {
+        "name": "Community Grant Wallet",
+        "description": "Distributes grants to community projects and ecosystem development initiatives",
+        "category": "treasury",
+        "is_burner": False,
+    },
+    "DEVELOPER_FUND": {
+        "name": "Developer Fund",
+        "description": "Core development team funding wallet for protocol maintenance and improvements",
+        "category": "treasury",
+        "is_burner": False,
+    },
+    "ECOSYSTEM_FUND": {
+        "name": "Ecosystem Fund",
+        "description": "Strategic investments in projects building on the QRDX network",
+        "category": "treasury",
+        "is_burner": False,
+    },
+    "STAKING_REWARDS": {
+        "name": "Staking Rewards Pool",
+        "description": "Distributes staking rewards to network validators and delegators",
+        "category": "system",
+        "is_burner": False,
+    },
+    "MARKETING": {
+        "name": "Marketing & Partnerships",
+        "description": "Funds marketing initiatives, partnerships, and ecosystem growth campaigns",
+        "category": "treasury",
+        "is_burner": False,
+    },
+    "LIQUIDITY_RESERVE": {
+        "name": "Liquidity Pool Reserve",
+        "description": "Reserve funds for maintaining liquidity across DEX pools",
+        "category": "defi",
+        "is_burner": False,
+    },
+    "TREASURY_MULTISIG": {
+        "name": "Treasury Multisig",
+        "description": "Main protocol treasury controlled by multi-signature governance",
+        "category": "treasury",
+        "is_burner": False,
+    },
+    "BUG_BOUNTY": {
+        "name": "Bug Bounty Program",
+        "description": "Rewards security researchers for finding and reporting vulnerabilities",
+        "category": "security",
+        "is_burner": False,
+    },
+    "AIRDROP": {
+        "name": "Airdrop Distribution",
+        "description": "Manages community airdrops and token distribution campaigns",
+        "category": "distribution",
+        "is_burner": False,
+    },
+}
+
+
+# ==================================================================================
 # MINING CONSTANTS
 # ==================================================================================
 # Maximum transaction candidates to consider for block template

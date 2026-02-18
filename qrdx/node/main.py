@@ -1939,6 +1939,12 @@ async def startup():
             eth_module.context = context
             rpc_server.register_module(eth_module)
             
+            # Register web3 utility module
+            from ..rpc.modules.web3 import Web3Module
+            web3_module = Web3Module()
+            web3_module.context = context
+            rpc_server.register_module(web3_module)
+            
             # Register contract methods manually (not a full module)
             async def eth_sendTransaction_handler(tx_params):
                 """Deploy or call a contract (requires signed transaction)."""

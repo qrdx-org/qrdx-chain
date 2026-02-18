@@ -82,6 +82,8 @@ class GenesisInitializer:
         genesis_time: Optional[int] = None,
         network_name: str = "qrdx-mainnet",
         chain_id: int = 1,
+        system_wallet_controller: Optional[str] = None,
+        enable_system_wallets: bool = True,
     ) -> bool:
         """
         Initialize the database with genesis state.
@@ -121,6 +123,8 @@ class GenesisInitializer:
                 genesis_time=genesis_time or int(datetime.now(timezone.utc).timestamp()),
                 pre_allocations=pre_allocations,
                 min_genesis_validators=0,  # Allow genesis without validators
+                system_wallet_controller=system_wallet_controller,
+                enable_system_wallets=enable_system_wallets,
             )
             
             creator = GenesisCreator(config)
@@ -233,6 +237,7 @@ class GenesisInitializer:
         - Genesis block
         - Coinbase transactions for prefunded accounts
         - Initial validator records (if any)
+        - System wallets (if enabled)
         """
         logger.info("Initializing database with genesis data...")
         
@@ -246,10 +251,14 @@ class GenesisInitializer:
             "randao_seed": state.randao_seed,
             "prefunded_accounts": len(prefunded_accounts),
             "validators": len(state.validators),
+            "system_wallets": len(state.system_wallets),
+            "system_wallet_controller": state.system_wallet_controller,
         }
         
-        # Calculate total reward (sum of all prefunded balances)
+        # Calculate total reward (sum of all prefunded balances + system wallet balances)
         total_reward = sum(amount for amount, _ in prefunded_accounts.values())
+        if state.system_wallets:
+            total_reward += sum(Decimal(w['balance']) for w in state.system_wallets.values())
         
         # Insert genesis block
         await self.db.add_block(
@@ -268,6 +277,14 @@ class GenesisInitializer:
         # Create genesis outputs for prefunded accounts
         # Each prefunded account gets a genesis output they can spend
         await self._create_genesis_outputs(block.block_hash, prefunded_accounts)
+        
+        # Initialize system wallets if present
+        if state.system_wallets:
+            await self._init_system_wallets(
+                block.block_hash,
+                state.system_wallets,
+                state.system_wallet_controller
+            )
         
         # Initialize validators if any
         if state.validators:
@@ -328,6 +345,120 @@ class GenesisInitializer:
         
         logger.info(f"Created {len(prefunded_accounts)} genesis outputs")
     
+    async def _init_system_wallets(
+        self,
+        genesis_block_hash: str,
+        system_wallets: Dict[str, Dict[str, Any]],
+        controller_address: str,
+    ):
+        """
+        Initialize system wallets in genesis.
+        
+        Creates:
+        - Spendable outputs for system wallets (controlled by controller)
+        - System wallet metadata in database
+        """
+        from ..crypto.hashing import sha256
+        
+        logger.info(f"Initializing {len(system_wallets)} system wallets")
+        logger.info(f"System wallet controller: {controller_address}")
+        
+        for idx, (address, wallet_info) in enumerate(system_wallets.items()):
+            balance = Decimal(wallet_info['balance'])
+            name = wallet_info['name']
+            is_burner = wallet_info.get('is_burner', False)
+            
+            # Skip creating outputs for burner wallets (they can only receive, not spend)
+            if is_burner:
+                logger.info(f"Skipping output for burner wallet: {name} at {address}")
+                continue
+            
+            # Create deterministic transaction hash for system wallet
+            tx_data = f"genesis:system:{idx}:{address}:{balance}".encode()
+            tx_hash = sha256(tx_data)
+            
+            # Create genesis transaction for system wallet
+            tx_hex = json.dumps({
+                "type": "genesis_system_wallet",
+                "recipient": address,
+                "amount": str(balance),
+                "name": name,
+                "controller": controller_address,
+                "category": wallet_info['category'],
+                "index": idx,
+            })
+            
+            # Insert transaction
+            await self.db.add_transaction(
+                block_hash=genesis_block_hash,
+                tx_hash=tx_hash,
+                tx_hex=tx_hex,
+                inputs_addresses=[],
+                outputs_addresses=[address],
+                outputs_amounts=[int(balance * 1000000)],
+                fees=Decimal("0"),
+            )
+            
+            # Create unspent output (controlled by controller wallet)
+            await self.db.add_unspent_output(
+                tx_hash=tx_hash,
+                index=0,
+                address=address,
+                amount=int(balance * 1000000),
+            )
+            
+            # Store system wallet metadata
+            try:
+                # Try PostgreSQL syntax first
+                try:
+                    await self.db.execute("""
+                        INSERT INTO system_wallets (
+                            address, name, description, wallet_type,
+                            controller_address, is_burner, category, balance
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        ON CONFLICT (address) DO NOTHING
+                    """,
+                        address,
+                        name,
+                        wallet_info['description'],
+                        wallet_info['type'],
+                        controller_address,
+                        is_burner,
+                        wallet_info['category'],
+                        str(balance)
+                    )
+                    logger.debug(f"Stored system wallet metadata (PostgreSQL): {name}")
+                except Exception as pg_err:
+                    # Try SQLite syntax
+                    logger.debug(f"PostgreSQL insert failed: {pg_err}, trying SQLite syntax")
+                    await self.db.execute("""
+                        INSERT OR IGNORE INTO system_wallets (
+                            address, name, description, wallet_type,
+                            controller_address, is_burner, category, balance
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        address,
+                        name,
+                        wallet_info['description'],
+                        wallet_info['type'],
+                        controller_address,
+                        is_burner,
+                        wallet_info['category'],
+                        str(balance)
+                    )
+                    logger.debug(f"Stored system wallet metadata (SQLite): {name}")
+            except Exception as e:
+                # Log the error but continue - system wallets work via UTXOs even without this table
+                logger.error(f"Failed to store system wallet metadata for {name}: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            logger.debug(
+                f"Initialized system wallet: {name} at {address} = {balance} QRDX"
+            )
+        
+        logger.info(f"System wallets initialized successfully")
+    
     async def _init_validators(self, validators: List[Dict[str, Any]]):
         """Initialize validators from genesis state."""
         logger.info(f"Initializing {len(validators)} genesis validators")
@@ -369,6 +500,9 @@ class GenesisInitializer:
             "randao_seed": state.randao_seed,
             "total_supply": state.total_supply,
             "total_staked": state.total_staked,
+            "system_wallets": len(state.system_wallets),
+            "system_wallet_controller": state.system_wallet_controller,
+            "total_system_wallets": state.total_system_wallets,
         }
         
         # Try to store in a metadata table if it exists
@@ -422,10 +556,14 @@ async def initialize_genesis_if_needed(
                 with open(genesis_file, 'r') as f:
                     genesis_data = json.load(f)
                 
-                # Extract accounts and validators from genesis file
+                # Extract config, state, and block from genesis file
+                config_data = genesis_data.get('config', {})
                 state = genesis_data.get('state', {})
+                block_data = genesis_data.get('block', {})
+                
                 accounts = state.get('accounts', {})
                 validators_data = state.get('validators', [])
+                system_wallet_controller = state.get('system_wallet_controller')
                 
                 # Convert accounts to prefunded_accounts format
                 if accounts and not prefunded_accounts:
@@ -446,13 +584,29 @@ async def initialize_genesis_if_needed(
                         validators.append((address, pubkey, stake))
                     logger.info(f"Loaded {len(validators)} validators from genesis file")
                 
+                # Extract genesis time and chain info
+                genesis_time = state.get('genesis_time', block_data.get('timestamp'))
+                network_name = state.get('network_name', config_data.get('network_name', 'qrdx-mainnet'))
+                chain_id = state.get('chain_id', config_data.get('chain_id', 1))
+                
+                logger.info(f"Loading genesis for {network_name} (chain_id={chain_id})")
+                if system_wallet_controller:
+                    logger.info(f"System wallet controller: {system_wallet_controller}")
+                
                 return await initializer.initialize_genesis(
                     prefunded_accounts=prefunded_accounts,
                     validators=validators if validators else None,
+                    genesis_time=genesis_time,
+                    network_name=network_name,
+                    chain_id=chain_id,
+                    system_wallet_controller=system_wallet_controller,
+                    enable_system_wallets=bool(system_wallet_controller),
                 )
             except Exception as e:
                 logger.warning(f"Failed to load genesis file {genesis_file}: {e}")
                 logger.info("Falling back to default genesis")
+                import traceback
+                traceback.print_exc()
         
         # Use default or provided prefunded accounts
         return await initializer.initialize_genesis(

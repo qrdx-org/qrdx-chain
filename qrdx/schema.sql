@@ -390,3 +390,41 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 
 CREATE INDEX IF NOT EXISTS checkpoints_epoch_idx ON checkpoints (epoch);
 CREATE INDEX IF NOT EXISTS checkpoints_finalized_idx ON checkpoints (finalized);
+
+-- =============================================================================
+-- SYSTEM WALLETS TABLE
+-- Tracks system-owned wallets controlled by a PQ controller wallet
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS system_wallets (
+    address VARCHAR(66) PRIMARY KEY,  -- 0x0000...000X format
+    name VARCHAR(255) NOT NULL,
+    description TEXT NOT NULL,
+    wallet_type VARCHAR(50) NOT NULL,
+    controller_address VARCHAR(128) NOT NULL,  -- PQ address that controls this wallet
+    is_burner BOOLEAN NOT NULL DEFAULT FALSE,
+    category VARCHAR(50) NOT NULL,  -- system, treasury, defi, distribution, security
+    genesis_balance NUMERIC(24, 6) NOT NULL DEFAULT 0,
+    
+    created_at TIMESTAMP(0) NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP(0) NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS system_wallets_controller_idx ON system_wallets (controller_address);
+CREATE INDEX IF NOT EXISTS system_wallets_category_idx ON system_wallets (category);
+CREATE INDEX IF NOT EXISTS system_wallets_type_idx ON system_wallets (wallet_type);
+
+-- =============================================================================
+-- CHAIN METADATA TABLE
+-- Stores genesis and chain configuration metadata
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS chain_metadata (
+    key VARCHAR(255) PRIMARY KEY,
+    value JSONB NOT NULL,
+    created_at TIMESTAMP(0) NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP(0) NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS chain_metadata_value_idx ON chain_metadata USING GIN (value);
+

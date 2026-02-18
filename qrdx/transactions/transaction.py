@@ -142,6 +142,13 @@ class Transaction:
         return self.outputs and all(tx_output.verify() for tx_output in self.outputs)
 
     async def verify(self, check_double_spend: bool = True) -> bool:
+        # First check system wallet constraints
+        from .validation import validate_transaction
+        is_valid, error = validate_transaction(self)
+        if not is_valid:
+            logger.warning(f'Transaction rejected: {error}')
+            return False
+        
         if check_double_spend and not self._verify_double_spend_same_transaction():
             logger.warning('Transaction rejected: double spend inside same transaction')
             return False

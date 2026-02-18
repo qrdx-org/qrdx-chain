@@ -156,6 +156,49 @@ get_wallet_pubkey() {
     python3 -c "import json; print(json.load(open('${wallet_path}'))['public_key'])"
 }
 
+generate_master_controller_wallet() {
+    local wallet_path="${WALLETS_DIR}/master_controller.json"
+    
+    log_info "Generating Master Controller PQ wallet..."
+    
+    # Create master controller wallet using QRDX wallet CLI
+    python3 << EOF
+import sys
+import json
+import os
+sys.path.insert(0, '${PROJECT_DIR}')
+
+from qrdx.crypto.pq.dilithium import PQPrivateKey
+from decimal import Decimal
+
+# Generate PQ keypair (Dilithium/ML-DSA-65)
+private_key = PQPrivateKey.generate()
+public_key = private_key.public_key
+address = public_key.to_address()
+
+# Create wallet structure
+wallet = {
+    "version": "2.0",
+    "type": "pq",
+    "algorithm": "dilithium3",
+    "address": address,
+    "public_key": public_key.to_hex(),
+    "private_key": private_key.to_hex(),
+    "label": "Master Controller (System Wallets)",
+    "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "purpose": "Controls all system wallets (treasury, grants, etc.)"
+}
+
+# Save wallet
+os.makedirs(os.path.dirname('${wallet_path}'), exist_ok=True)
+with open('${wallet_path}', 'w') as f:
+    json.dump(wallet, f, indent=2)
+
+# Output address for shell script
+print(address)
+EOF
+}
+
 # =============================================================================
 # GENESIS CREATION
 # =============================================================================
@@ -165,6 +208,14 @@ create_genesis_config() {
     local genesis_file="${TESTNET_DIR}/genesis_config.json"
     
     log_step "Creating genesis configuration"
+    
+    # Get master controller wallet address
+    local controller_wallet_path="${WALLETS_DIR}/master_controller.json"
+    local controller_address=$(get_wallet_address "$controller_wallet_path")
+    
+    log_info "Master Controller: ${controller_address}"
+    log_info "  (Controls all 10 system wallets with 75M QRDX)"
+    echo
     
     # Collect validator addresses
     local validator_addresses=()
@@ -194,12 +245,17 @@ from qrdx.validator.genesis import GenesisCreator, GenesisConfig
 validator_addresses = [$(printf "'%s'," "${validator_addresses[@]}" | sed 's/,$//')] 
 validator_pubkeys = [$(printf "'%s'," "${validator_pubkeys[@]}" | sed 's/,$//')]
 
-# Create genesis config
+# Master controller address
+controller_address = '${controller_address}'
+
+# Create genesis config with system wallets
 config = GenesisConfig(
     chain_id=9999,
     network_name="qrdx-testnet-local",
     min_genesis_validators=1,
     initial_supply=Decimal("100000000"),  # 100M QRDX
+    system_wallet_controller=controller_address,
+    enable_system_wallets=True,
 )
 
 # Create prefunded accounts for validators
@@ -232,6 +288,9 @@ print(json.dumps({
     'genesis_hash': block.block_hash,
     'state_root': state.state_root,
     'validators': len(state.validators),
+    'system_wallets': len(state.system_wallets),
+    'system_controller': state.system_wallet_controller,
+    'total_system_allocation': state.total_system_wallets,
     'total_prefunded': str(sum(Decimal(v) for v in config.pre_allocations.values()))
 }))
 EOF
@@ -467,6 +526,14 @@ cmd_start() {
     # Create directories
     mkdir -p "${TESTNET_DIR}" "${LOGS_DIR}" "${DATA_DIR}" "${WALLETS_DIR}" "${CONFIG_DIR}" "${TESTNET_DIR}/pids"
     
+    # Generate master controller wallet
+    log_step "Generating master controller wallet"
+    local controller_address=$(generate_master_controller_wallet)
+    log_success "Master Controller: ${controller_address}"
+    log_info "  Controls 10 system wallets (75M QRDX total)"
+    log_info "  Wallet saved: ${WALLETS_DIR}/master_controller.json"
+    echo
+    
     # Generate validator wallets
     log_step "Generating validator wallets"
     for i in $(seq 0 $((num_validators - 1))); do
@@ -530,6 +597,14 @@ cmd_start() {
         echo "  Node ${i} (${role}): http://127.0.0.1:${port} (RPC: ${rpc})"
     done
     echo
+    log_info "Master Controller Wallet:"
+    local controller_wallet_path="${WALLETS_DIR}/master_controller.json"
+    local controller_addr=$(get_wallet_address "$controller_wallet_path")
+    echo "  Address:  ${controller_addr}"
+    echo "  Purpose:  Controls all system wallets"
+    echo "  Wallets:  10 system wallets (75M QRDX)"
+    echo "  File:     ${controller_wallet_path}"
+    echo
     log_info "Validator Wallets:"
     for i in $(seq 0 $((num_validators - 1))); do
         local wallet_path="${WALLETS_DIR}/validator_${i}.json"
@@ -538,6 +613,18 @@ cmd_start() {
         echo "    Wallet: ${wallet_path}"
         echo "    Balance: ${DEFAULT_GENESIS_BALANCE} QRDX"
     done
+    echo
+    log_info "System Wallets (Controlled by Master):"
+    echo "  Garbage Collector:    0x...0001 (0 QRDX, burner)"
+    echo "  Community Grants:     0x...0002 (5M QRDX)"
+    echo "  Developer Fund:       0x...0003 (10M QRDX)"
+    echo "  Ecosystem Fund:       0x...0004 (8M QRDX)"
+    echo "  Staking Rewards:      0x...0005 (15M QRDX)"
+    echo "  Marketing:            0x...0006 (3M QRDX)"
+    echo "  Liquidity Reserve:    0x...0007 (7M QRDX)"
+    echo "  Treasury Multisig:    0x...0008 (20M QRDX)"
+    echo "  Bug Bounty:           0x...0009 (1M QRDX)"
+    echo "  Airdrop:              0x...000a (6M QRDX)"
     echo
     log_info "Useful Commands:"
     echo "  Status:  ./scripts/testnet.sh status"

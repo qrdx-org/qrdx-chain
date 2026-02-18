@@ -394,7 +394,8 @@ deactivate
 ---
 
 ## Nodeless Wallet Setup
-To setup a nodeless wallet, use... COMMING SOON
+To setup a nodeless wallet, use [QRDX Wallet Client GUI](https://github.com/The-Sycorax/QRDXWalletClient-GUI).
+
 ---
 
 ## Mining

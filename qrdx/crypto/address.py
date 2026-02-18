@@ -311,3 +311,72 @@ def web3_to_legacy_address(web3_address: str) -> str:
         "See docs/MODERNIZATION_PLAN.md for details."
     )
 
+
+# System wallet address validation
+
+def is_system_address(address: str) -> bool:
+    """
+    Check if an address is a system-owned address.
+    
+    System addresses are in the reserved range:
+    - 0x0000...0001 through 0x0000...00FF (system wallets)
+    - 0x0000...0100 through 0x0000...0FFF (reserved for future use)
+    
+    Args:
+        address: Address to check
+        
+    Returns:
+        True if address is a system address
+    """
+    from .system_wallets import is_system_wallet_address, is_address_off_curve
+    return is_system_wallet_address(address) or is_address_off_curve(address)
+
+
+def validate_system_address(address: str) -> tuple[bool, str]:
+    """
+    Validate a system address.
+    
+    Args:
+        address: Address to validate
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if not address.startswith("0x"):
+        return False, "System address must start with 0x"
+    
+    if not is_valid_address(address):
+        return False, "Invalid address format"
+    
+    if not is_system_address(address):
+        return False, f"Address {address} is not in system address range"
+    
+    return True, "OK"
+
+
+def is_reserved_address(address: str) -> bool:
+    """
+    Check if address is in any reserved range.
+    
+    Reserved ranges:
+    - System wallets: 0x0000...0001 - 0x0000...00FF
+    - Precompiles: 0x0000...0100 - 0x0000...01FF
+    - QPL programs: 0x0000...0200 - 0x0000...02FF
+    - Future: 0x0000...0300 - 0x0000...0FFF
+    
+    Args:
+        address: Address to check
+        
+    Returns:
+        True if address is in any reserved range
+    """
+    if not address.startswith("0x"):
+        return False
+    
+    try:
+        addr_int = int(address, 16)
+        # All addresses from 0x0 to 0xFFF are reserved
+        return 0x0000000000000000000000000000000000000000 <= addr_int <= 0x0000000000000000000000000000000000000FFF
+    except ValueError:
+        return False
+

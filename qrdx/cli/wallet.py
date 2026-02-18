@@ -254,9 +254,241 @@ def info_cmd(wallet_file: str, show_private: bool):
         click.echo(click.style("⚠️  NEVER share your private key with anyone!", fg="red", bold=True))
 
 
+@cli.command("send")
+@click.argument("wallet_file", type=click.Path(exists=True))
+@click.argument("to_address")
+@click.argument("amount", type=float)
+@click.option("--node", "-n", default="http://localhost:3007", help="Node RPC URL")
+@click.option("--fee", "-f", type=float, default=0.01, help="Transaction fee in QRDX")
+@click.option(
+    "--from-system-wallet",
+    type=str,
+    help="Send from system wallet address (requires master controller wallet)"
+)
+@click.option("--wait", "-w", is_flag=True, help="Wait for confirmation")
+def send_cmd(wallet_file: str, to_address: str, amount: float, node: str, fee: float, from_system_wallet: Optional[str], wait: bool):
+    """Send QRDX to an address.
+    
+    Examples:
+    
+        qrdx-wallet send wallet.json 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb 10.5
+        
+        qrdx-wallet send master.json 0x123... 100 --from-system-wallet 0x...0003 --wait
+        
+        qrdx-wallet send wallet.json 0xPQ... 50 --fee 0.02
+    """
+    from decimal import Decimal
+    
+    wallet_path = Path(wallet_file)
+    password = get_password(prompt="Enter wallet password: ")
+    
+    try:
+        wallet = load_wallet(wallet_path, password)
+    except WalletDecryptionError:
+        raise click.ClickException("Invalid password")
+    except Exception as e:
+        raise click.ClickException(f"Failed to load wallet: {e}")
+    
+    # Validate destination address
+    if not is_valid_address(to_address):
+        raise click.ClickException(f"Invalid destination address: {to_address}")
+    
+    # Determine sender
+    if from_system_wallet:
+        # System wallet transaction - requires master controller
+        if not isinstance(wallet, PQWallet):
+            raise click.ClickException("System wallet transactions require a PQ master controller wallet")
+        
+        sender_address = from_system_wallet
+        controller_address = wallet.address
+        
+        click.echo()
+        click.echo(click.style("System Wallet Transaction", fg="cyan", bold=True))
+        click.echo(f"From (System):  {sender_address}")
+        click.echo(f"Controller:     {controller_address}")
+    else:
+        # Regular transaction
+        if isinstance(wallet, UnifiedWallet):
+            # Use traditional wallet for regular transactions
+            sender = wallet.traditional if wallet.traditional else wallet.pq
+            sender_address = sender.address
+        else:
+            sender = wallet
+            sender_address = wallet.address
+        
+        click.echo()
+        click.echo(click.style("Transaction", fg="cyan", bold=True))
+        click.echo(f"From:  {sender_address}")
+    
+    click.echo(f"To:    {to_address}")
+    click.echo(f"Amount: {amount} QRDX")
+    click.echo(f"Fee:    {fee} QRDX")
+    click.echo()
+    
+    if not click.confirm("Send transaction?"):
+        click.echo("Cancelled.")
+        return
+    
+    # Build and send transaction
+    try:
+        import httpx
+        
+        # Get UTXOs
+        click.echo("Fetching UTXOs...")
+        utxo_response = httpx.post(
+            f"{node}/rpc",
+            json={
+                "jsonrpc": "2.0",
+                "method": "qrdx_getUTXOs",
+                "params": [sender_address],
+                "id": 1
+            },
+            timeout=10.0
+        )
+        
+        if utxo_response.status_code != 200:
+            raise click.ClickException(f"Failed to fetch UTXOs (HTTP {utxo_response.status_code})")
+        
+        utxo_result = utxo_response.json()
+        if "error" in utxo_result:
+            raise click.ClickException(f"RPC error: {utxo_result['error'].get('message', 'Unknown error')}")
+        
+        utxos = utxo_result.get("result", [])
+        if not utxos:
+            raise click.ClickException(f"No UTXOs found for {sender_address}")
+        
+        # Build transaction
+        click.echo(f"Found {len(utxos)} UTXOs")
+        
+        amount_smallest = int(Decimal(str(amount)) * Decimal("1000000"))  # Convert to microQRDX
+        fee_smallest = int(Decimal(str(fee)) * Decimal("1000000"))
+        total_needed = amount_smallest + fee_smallest
+        
+        # Select UTXOs
+        selected_utxos = []
+        total_input = 0
+        for utxo in utxos:
+            selected_utxos.append(utxo)
+            total_input += int(utxo['amount'])
+            if total_input >= total_needed:
+                break
+        
+        if total_input < total_needed:
+            available = total_input / 1000000
+            needed = total_needed / 1000000
+            raise click.ClickException(f"Insufficient balance. Have: {available} QRDX, Need: {needed} QRDX")
+        
+        # Calculate change
+        change = total_input - total_needed
+        
+        # Build transaction data
+        tx_data = {
+            "inputs": [{"tx_hash": utxo["tx_hash"], "index": utxo["index"]} for utxo in selected_utxos],
+            "outputs": [
+                {"address": to_address, "amount": amount_smallest}
+            ],
+            "fee": fee_smallest,
+        }
+        
+        if change > 0:
+            tx_data["outputs"].append({"address": sender_address, "amount": change})
+        
+        # Add system wallet fields if applicable
+        if from_system_wallet:
+            tx_data["system_wallet_source"] = sender_address
+            tx_data["controller_address"] = controller_address
+        
+        # Sign transaction
+        click.echo("Signing transaction...")
+        
+        # Create signature
+        import json
+        import hashlib
+        tx_bytes = json.dumps(tx_data, sort_keys=True).encode()
+        tx_hash = hashlib.sha256(tx_bytes).digest()
+        
+        if from_system_wallet:
+            # Sign with controller (PQ wallet)
+            signature = wallet.sign(tx_hash)
+            tx_data["controller_signature"] = signature.hex()
+        else:
+            # Sign with sender wallet
+            if isinstance(wallet, UnifiedWallet):
+                signer = wallet.traditional if wallet.traditional else wallet.pq
+            else:
+                signer = wallet
+            signature = signer.sign(tx_hash)
+            tx_data["signature"] = signature.hex()
+        
+        # Send transaction
+        click.echo("Broadcasting transaction...")
+        
+        send_response = httpx.post(
+            f"{node}/rpc",
+            json={
+                "jsonrpc": "2.0",
+                "method": "qrdx_sendTransaction",
+                "params": [tx_data],
+                "id": 2
+            },
+            timeout=30.0
+        )
+        
+        if send_response.status_code != 200:
+            raise click.ClickException(f"Failed to send transaction (HTTP {send_response.status_code})")
+        
+        send_result = send_response.json()
+        if "error" in send_result:
+            raise click.ClickException(f"Transaction failed: {send_result['error'].get('message', 'Unknown error')}")
+        
+        tx_hash_result = send_result.get("result", {}).get("tx_hash", "unknown")
+        
+        click.echo()
+        click.echo(click.style("✓ Transaction sent!", fg="green", bold=True))
+        click.echo(f"TX Hash: {tx_hash_result}")
+        
+        if wait:
+            click.echo()
+            click.echo("Waiting for confirmation...")
+            import time
+            for i in range(30):
+                time.sleep(2)
+                
+                # Check transaction status
+                status_response = httpx.post(
+                    f"{node}/rpc",
+                    json={
+                        "jsonrpc": "2.0",
+                        "method": "qrdx_getTransaction",
+                        "params": [tx_hash_result],
+                        "id": 3
+                    },
+                    timeout=10.0
+                )
+                
+                if status_response.status_code == 200:
+                    status_result = status_response.json()
+                    if "result" in status_result and status_result["result"]:
+                        tx_info = status_result["result"]
+                        if tx_info.get("confirmed", False):
+                            click.echo(click.style("✓ Transaction confirmed!", fg="green", bold=True))
+                            click.echo(f"Block: {tx_info.get('block_hash', 'unknown')[:16]}...")
+                            break
+                
+                click.echo(f"  Waiting... ({i*2}s)")
+            else:
+                click.echo(click.style("⚠ Timeout waiting for confirmation", fg="yellow"))
+                click.echo("Transaction may still be pending. Check status manually.")
+        
+    except ImportError:
+        click.echo("Install httpx to send transactions: pip install httpx")
+    except Exception as e:
+        raise click.ClickException(f"Transaction failed: {e}")
+
+
 @cli.command("balance")
 @click.argument("wallet_file", type=click.Path(exists=True))
-@click.option("--node", "-n", default="http://localhost:8000", help="Node RPC URL")
+@click.option("--node", "-n", default="http://localhost:3007", help="Node RPC URL")
 def balance_cmd(wallet_file: str, node: str):
     """Check wallet balance.
     
@@ -512,6 +744,119 @@ def import_cmd(private_key: str, wallet_type: str, name: str, output: Optional[s
     click.echo(click.style("✓ Wallet imported successfully!", fg="green"))
     click.echo(f"Address: {wallet.address}")
     click.echo(f"Saved to: {wallet_path}")
+
+
+@cli.command("system-wallets")
+@click.option("--node", "-n", default="http://localhost:3007", help="Node RPC URL")
+def system_wallets_cmd(node: str):
+    """List all system wallets and their balances.
+    
+    Examples:
+    
+        qrdx-wallet system-wallets
+        
+        qrdx-wallet system-wallets --node http://node.qrdx.network:3007
+    """
+    try:
+        import httpx
+        
+        click.echo()
+        click.echo(click.style("QRDX System Wallets", fg="cyan", bold=True))
+        click.echo("=" * 80)
+        
+        # Get system wallet info from node
+        response = httpx.post(
+            f"{node}/rpc",
+            json={
+                "jsonrpc": "2.0",
+                "method": "qrdx_getSystemWallets",
+                "params": [],
+                "id": 1
+            },
+            timeout=10.0
+        )
+        
+        if response.status_code != 200:
+            raise click.ClickException(f"Failed to fetch system wallets (HTTP {response.status_code})")
+        
+        result = response.json()
+        if "error" in result:
+            # Fallback to known addresses
+            click.echo(click.style("⚠ Node doesn't support system wallet query, showing known addresses", fg="yellow"))
+            click.echo()
+            
+            system_wallet_addresses = [
+                ("0x0000000000000000000000000000000000000001", "Garbage Collector (Burner)"),
+                ("0x0000000000000000000000000000000000000002", "Community Grants"),
+                ("0x0000000000000000000000000000000000000003", "Developer Fund"),
+                ("0x0000000000000000000000000000000000000004", "Ecosystem Fund"),
+                ("0x0000000000000000000000000000000000000005", "Staking Rewards"),
+                ("0x0000000000000000000000000000000000000006", "Marketing & Partnerships"),
+                ("0x0000000000000000000000000000000000000007", "Liquidity Pool Reserve"),
+                ("0x0000000000000000000000000000000000000008", "Treasury Multisig"),
+                ("0x0000000000000000000000000000000000000009", "Bug Bounty Program"),
+                ("0x000000000000000000000000000000000000000a", "Airdrop Distribution"),
+            ]
+            
+            total_balance = 0
+            for address, name in system_wallet_addresses:
+                # Try to get balance
+                try:
+                    bal_response = httpx.post(
+                        f"{node}/rpc",
+                        json={
+                            "jsonrpc": "2.0",
+                            "method": "qrdx_getBalance",
+                            "params": [address],
+                            "id": 1
+                        },
+                        timeout=5.0
+                    )
+                    
+                    if bal_response.status_code == 200:
+                        bal_result = bal_response.json()
+                        balance = bal_result.get("result", "unknown")
+                        if balance != "unknown":
+                            try:
+                                total_balance += float(balance)
+                            except:
+                                pass
+                    else:
+                        balance = "unknown"
+                except:
+                    balance = "unknown"
+                
+                click.echo(f"{name:30} {address:50} {balance:>15}")
+            
+            if total_balance > 0:
+                click.echo("=" * 80)
+                click.echo(f"{'Total':30} {' ':50} {total_balance:>15.2f}")
+        else:
+            wallets = result.get("result", [])
+            controller = None
+            
+            click.echo()
+            for wallet in wallets:
+                address = wallet.get("address")
+                name = wallet.get("name", "Unknown")
+                balance = wallet.get("balance", "0")
+                is_burner = wallet.get("is_burner", False)
+                
+                if controller is None:
+                    controller = wallet.get("controller_address")
+                
+                burner_mark = " 🔥" if is_burner else ""
+                click.echo(f"{name:30} {address:50} {balance:>15}{burner_mark}")
+            
+            click.echo()
+            click.echo("=" * 80)
+            if controller:
+                click.echo(f"Controller: {controller}")
+        
+    except ImportError:
+        click.echo("Install httpx to query system wallets: pip install httpx")
+    except Exception as e:
+        raise click.ClickException(f"Failed to fetch system wallets: {e}")
 
 
 @cli.command("list")
