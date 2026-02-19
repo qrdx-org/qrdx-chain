@@ -6,11 +6,10 @@ This module implements a professional, scalable system for managing blockchain
 consensus rules across different versions/forks. It allows for clean separation
 of concerns and easy addition of new consensus versions.
 
-QRDX supports two consensus mechanisms:
-- PoW (legacy, deprecated)
-- PoS (Proof-of-Stake, mainnet)
+QRDX uses a single consensus mechanism:
+- QR-PoS (Quantum-Resistant Proof-of-Stake)
 
-PoS uses Quantum-Resistant signatures (CRYSTALS-Dilithium / ML-DSA-65).
+QR-PoS uses Quantum-Resistant signatures (CRYSTALS-Dilithium / ML-DSA-65).
 Smart Contracts use EVM (Shanghai fork) for 100% Ethereum compatibility.
 """
 
@@ -31,7 +30,6 @@ class ConsensusVersion(IntEnum):
     Consensus versions in chronological order.
     Each version represents a set of consensus rules.
     """
-    CONSENSUS_V1 = 1      # Original PoW consensus (deprecated)
     CONSENSUS_V2_POS = 2  # PoS consensus (mainnet)
 
 
@@ -86,7 +84,7 @@ class ConsensusSchedule:
         """
         Determine which consensus version is active at a given block height.
         """
-        active_version = ConsensusVersion.CONSENSUS_V1
+        active_version = ConsensusVersion.CONSENSUS_V2_POS
         
         for activation in self._activations:
             if activation.is_active(block_height):
@@ -171,120 +169,6 @@ class BaseConsensusRules(ABC):
         
         if difficulty < 0 or difficulty > 6553.5:
             logger.warning("Block rejected: difficulty out of range")
-            return False
-        
-        return True
-
-
-class Consensus_V1(BaseConsensusRules):
-    """
-    Encapsulates all consensus rules for V1 (Security improvements and bug fixes).
-    """
-    @property
-    def version(self) -> ConsensusVersion:
-        return ConsensusVersion.CONSENSUS_V1
-    
-    def calculate_merkle_tree(self, transactions: List[Union[Any, str]]) -> str:
-        """Proper binary Merkle tree implementation."""
-        tx_hashes = []
-        for tx in transactions:
-            if isinstance(tx, str):
-                tx_hashes.append(tx)
-            else:
-                tx_hashes.append(tx.hash())
-        
-        if not tx_hashes:
-            return hashlib.sha256(b'').hexdigest()
-        
-        current_level = sorted(tx_hashes)
-        
-        while len(current_level) > 1:
-            next_level = []
-            
-            for i in range(0, len(current_level), 2):
-                left = current_level[i]
-                right = current_level[i + 1] if i + 1 < len(current_level) else left
-                
-                combined = left + right
-                parent_hash = hashlib.sha256(combined.encode('utf-8')).hexdigest()
-                next_level.append(parent_hash)
-            
-            current_level = next_level
-        
-        return current_level[0]
-
-    async def validate_timestamp(
-        self,
-        content_time: int,
-        block_id: int,
-        last_timestamp: int,
-        current_time: int,
-        get_median_time_past_func: Callable = None) -> bool:
-        """Median Time Past (MTP) timestamp validation."""
-        if get_median_time_past_func is None:
-            raise ValueError("MTP function required for V1+ timestamp validation")
-        
-        median_time = await get_median_time_past_func(block_id - 1)
-        
-        if content_time <= median_time:
-            logger.warning(f"Block rejected: timestamp {content_time} not greater than MTP {median_time}")
-            return False
-        
-        if content_time > current_time + 60:  # Stricter future limit
-            logger.warning("Block rejected: timestamp too far in future")
-            return False
-        
-        return True
-    
-    def calculate_new_difficulty(
-        self,
-        time_ratio: Decimal,
-        current_difficulty: Decimal,
-        legacy_hashrate_func: Callable = None) -> Decimal:
-        """
-        Calculate the adjusted mining difficulty for the next period.
-        
-        Args:
-            time_ratio: Ratio of target block time to actual average block time.
-                       Values > 1.0 indicate blocks mined too slowly (increase difficulty).
-                       Values < 1.0 indicate blocks mined too quickly (decrease difficulty).
-                       Clamped between 0.25 and 4.0 for stability.
-            current_difficulty: The current difficulty value before adjustment.
-            legacy_hashrate_func: Optional legacy function for backward compatibility.
-        
-        Returns:
-            The adjusted difficulty value, never below START_DIFFICULTY.
-        
-        The adjustment is calculated by converting difficulty to hashrate,
-        applying the time adjustment ratio in hashrate space, and converting
-        back to difficulty to maintain the proper logarithmic relationship.
-        """
-        from .constants import START_DIFFICULTY
-        from .manager import difficulty_to_hashrate, hashrate_to_difficulty
-        
-        ratio = max(Decimal('0.25'), min(time_ratio, Decimal('4.0')))
-        
-        # Apply ratio to hashrate, not directly to difficulty
-        current_hashrate = difficulty_to_hashrate(current_difficulty)
-        new_estimated_hashrate = current_hashrate * ratio
-        new_difficulty = hashrate_to_difficulty(new_estimated_hashrate)
-        
-        # Ensure difficulty doesn't drop below starting value
-        new_difficulty = max(START_DIFFICULTY, new_difficulty)
-        
-        return new_difficulty
-    
-    def validate_coinbase_transactions(self, transactions: List[Any]) -> bool:
-        """V1 validation: Forbids coinbase transactions in regular tx list."""
-        from .transactions import CoinbaseTransaction
-        
-        coinbase_count = sum(
-            1 for tx in transactions 
-            if isinstance(tx, CoinbaseTransaction)
-        )
-        
-        if coinbase_count > 0:
-            logger.warning(f"Block rejected: {coinbase_count} coinbase in regular txs")
             return False
         
         return True
@@ -704,7 +588,6 @@ class ConsensusEngine:
         self.schedule = schedule or CONSENSUS_SCHEDULE
         self._rules_cache: Dict[ConsensusVersion, BaseConsensusRules] = {}
         self._rules_map: Dict[ConsensusVersion, type[BaseConsensusRules]] = {
-            ConsensusVersion.CONSENSUS_V1: Consensus_V1,
             ConsensusVersion.CONSENSUS_V2_POS: Consensus_V2_PoS,
         }
     
