@@ -33,10 +33,10 @@ class PQWallet(BaseWallet):
     Post-Quantum wallet using Dilithium3.
     
     Provides quantum-resistant signatures with NIST Level 3 security.
-    Signatures are larger (~3293 bytes) but provide future-proof security.
+    Signatures are larger (~3309 bytes) but provide future-proof security.
     
-    Note: Requires liboqs-python to be installed for full functionality.
-    Falls back to deterministic test mode if unavailable.
+    REQUIRES liboqs-python. There is NO fallback mode — nodes without
+    liboqs cannot operate PQ wallets.
     
     Example:
         # Generate new PQ wallet

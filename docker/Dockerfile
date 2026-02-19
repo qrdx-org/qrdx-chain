@@ -19,7 +19,7 @@ WORKDIR /app
 # Copy the application code and necessary scripts into the container
 COPY ./qrdx ./qrdx
 COPY ./run_node.py .
-COPY ./requirements.txt .
+COPY ./requirements-v3.txt .
 
 # Docker-layer artifacts from docker/ subdir (relative to context root)
 # Place both scripts under /app/docker inside the image.
@@ -29,8 +29,8 @@ COPY ./docker/docker-healthcheck.py ./docker/docker-healthcheck.py
 # Make the entrypoint and healcheck executable
 RUN chmod +x ./docker/docker-entrypoint.sh ./docker/docker-healthcheck.py
 
-# Install Python dependencies from requirements.txt
-RUN pip install --no-cache-dir -r ./requirements.txt
+# Install Python dependencies from requirements-v3.txt (includes liboqs-python)
+RUN pip install --no-cache-dir -r ./requirements-v3.txt
 
 
 # Execute healthcheck to see if the API is responsive.

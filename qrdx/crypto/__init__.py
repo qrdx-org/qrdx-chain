@@ -35,12 +35,17 @@ from .encoding import rlp_encode, rlp_decode, encode_transaction
 # Post-quantum cryptography - lazy loaded
 # Import directly from qrdx.crypto.pq when needed
 def __getattr__(name):
-    """Lazy loading for PQ crypto to avoid liboqs dependency issues."""
-    pq_names = {
+    """Lazy loading for PQ crypto to avoid liboqs dependency issues at import."""
+    pq_sig_names = {
         'PQPrivateKey', 'PQPublicKey', 'PQSignature',
-        'pq_generate_keypair', 'pq_sign', 'pq_verify'
+        'PQCryptoError', 'PQSignatureError',
+        'pq_generate_keypair', 'pq_sign', 'pq_verify',
     }
-    if name in pq_names:
+    pq_kem_names = {
+        'KEMPrivateKey', 'KEMPublicKey', 'KEMError',
+        'kyber_generate_keypair', 'kyber_encapsulate', 'kyber_decapsulate',
+    }
+    if name in pq_sig_names:
         from . import pq
         if name == 'pq_generate_keypair':
             return pq.generate_keypair
@@ -48,6 +53,9 @@ def __getattr__(name):
             return pq.sign
         elif name == 'pq_verify':
             return pq.verify
+        return getattr(pq, name)
+    if name in pq_kem_names:
+        from . import pq
         return getattr(pq, name)
     raise AttributeError(f"module 'qrdx.crypto' has no attribute {name!r}")
 
@@ -57,13 +65,22 @@ __all__ = [
     "PublicKey",
     "Signature",
     "generate_keypair",
-    # Post-Quantum Keys (Dilithium3)
+    # Post-Quantum Signatures (ML-DSA-65 / Dilithium3)
     "PQPrivateKey",
     "PQPublicKey",
     "PQSignature",
+    "PQCryptoError",
+    "PQSignatureError",
     "pq_generate_keypair",
     "pq_sign",
     "pq_verify",
+    # Post-Quantum KEM (ML-KEM-768 / Kyber768)
+    "KEMPrivateKey",
+    "KEMPublicKey",
+    "KEMError",
+    "kyber_generate_keypair",
+    "kyber_encapsulate",
+    "kyber_decapsulate",
     # Signing
     "sign_transaction",
     "sign_message",

@@ -21,3 +21,15 @@ testnet/
 *.log
 *.env
 *.html
+
+# === Security: Private keys and secrets ===
+*.priv
+*.key
+*.pem
+*private_key*
+*secret_key*
+*_privkey*
+*.keystore
+validator_wallet.json
+slashing_protection.db
+data/

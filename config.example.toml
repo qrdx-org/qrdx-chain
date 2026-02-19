@@ -170,8 +170,10 @@ type = "postgresql"
 host = "127.0.0.1"
 port = 5432
 database = "qrdx"
-user = "qrdx"
-password = "qrdx"
+# SECURITY: Set credentials via environment variables or local config
+# DO NOT commit real passwords to version control
+user = "${QRDX_DB_USER}"
+password = "${QRDX_DB_PASSWORD}"
 
 # Connection pool settings
 pool_min_size = 5

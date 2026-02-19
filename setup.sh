@@ -30,9 +30,10 @@ echo "Starting QRDX node setup..."
 echo ""
 
 # Global variables DB and host config
-POSTGRES_USER="qrdx"
-POSTGRES_PASSWORD="qrdx"
-QRDX_DATABASE_NAME="qrdx"
+# SECURITY: Credentials pulled from environment, never hardcoded
+POSTGRES_USER="${QRDX_DB_USER:-}"
+POSTGRES_PASSWORD="${QRDX_DB_PASSWORD:-}"
+QRDX_DATABASE_NAME="${QRDX_DB_NAME:-qrdx}"
 QRDX_DATABASE_HOST="127.0.0.1"
 QRDX_NODE_HOST="127.0.0.1"
 QRDX_NODE_PORT="3006"
