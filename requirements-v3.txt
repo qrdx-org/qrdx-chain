@@ -10,7 +10,7 @@ requests~=2.31.0
 fastapi~=0.109.0
 slowapi~=0.1.9
 icecream~=2.1.3
-asyncpg~=0.29.0
+aiosqlite>=0.19.0
 uvicorn~=0.27.0
 starlette~=0.35.0
 python-dateutil~=2.8.2
@@ -63,6 +63,12 @@ netifaces>=0.11.0
 # For Debian/Ubuntu: apt-get install liboqs-dev
 # Or build from source following OQS instructions
 liboqs-python>=0.9.0
+
+# BLAKE3 hashing for PQ node identity
+blake3>=0.4.0
+
+# AES-256-GCM channel encryption (post-PQ-handshake)
+cryptography>=42.0.0
 
 # ============================================================================
 # NEW: CLI WALLET

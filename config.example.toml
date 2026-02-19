@@ -162,22 +162,16 @@ deprecation_warnings = true
 # DATABASE
 # =============================================================================
 [database]
-# Database type: "postgresql"
-type = "postgresql"
+# Database type: "sqlite" (PostgreSQL has been sunset)
+type = "sqlite"
 
 
-[database.postgresql]
-host = "127.0.0.1"
-port = 5432
-database = "qrdx"
-# SECURITY: Set credentials via environment variables or local config
-# DO NOT commit real passwords to version control
-user = "${QRDX_DB_USER}"
-password = "${QRDX_DB_PASSWORD}"
+[database.sqlite]
+# Path to the SQLite database file (relative to data_dir or absolute)
+path = "data/qrdx.db"
 
-# Connection pool settings
-pool_min_size = 5
-pool_max_size = 20
+# Enable WAL mode for better concurrent read performance
+wal_mode = true
 
 
 # =============================================================================

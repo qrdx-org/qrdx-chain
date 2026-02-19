@@ -17,7 +17,7 @@ import asyncio
 import time
 
 from ..logger import get_logger
-from ..database import Database
+from ..database_sqlite import DatabaseSQLite as Database
 from .state import ContractStateManager, Account
 
 logger = get_logger(__name__)

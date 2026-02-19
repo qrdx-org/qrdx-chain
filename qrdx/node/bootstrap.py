@@ -35,16 +35,18 @@ class BootstrapNode:
     """
     Represents a bootstrap node with health tracking.
     
-    Supports both simple HTTP URLs and qnode:// URIs.
-    When created from a qnode:// URI, the public_key field
-    can be used for identity verification during handshake.
+    Supports HTTP URLs, qnode:// URIs, and @-schema addresses.
+    When created from an @-schema address, the node_id field
+    can be used for identity verification during PQ handshake.
     """
     url: str                              # HTTP URL for API connection
     public_key: str = ""                  # Node's public key (from qnode URI)
     host: str = ""                        # Hostname
     port: int = 0                         # Port number
-    original_uri: str = ""                # Original URI (qnode:// or http://)
-    is_qnode_uri: bool = False            # True if from qnode:// URI
+    original_uri: str = ""                # Original URI (@-schema, qnode://, or http://)
+    is_qnode_uri: bool = False            # True if from qnode:// or @-schema URI
+    node_id: str = ""                     # PQ node ID (qx…) from @-schema
+    algo: str = ""                        # PQ algorithm from @-schema
     status: BootstrapStatus = BootstrapStatus.UNKNOWN
     last_check: float = 0
     failures: int = 0
@@ -61,13 +63,20 @@ class BootstrapNode:
             port=parsed.port,
             original_uri=parsed.original,
             is_qnode_uri=parsed.is_qnode,
+            node_id=getattr(parsed, 'node_id', ''),
+            algo=getattr(parsed, 'algo', ''),
         )
     
     @classmethod
     def from_uri(cls, uri: str) -> 'BootstrapNode':
-        """Create BootstrapNode from URI string (qnode:// or http://)."""
+        """Create BootstrapNode from URI string (@-schema, qnode://, or http://)."""
         parsed = parse_bootstrap_node(uri)
         return cls.from_parsed(parsed)
+
+    @property
+    def is_pq(self) -> bool:
+        """True if this node was parsed from an @-schema address."""
+        return bool(self.node_id and self.algo)
 
 
 @dataclass
@@ -399,13 +408,17 @@ class BootstrapManager:
             "unhealthy_nodes": len([n for n in self._nodes.values() if n.status == BootstrapStatus.UNHEALTHY]),
             "unreachable_nodes": len([n for n in self._nodes.values() if n.status == BootstrapStatus.UNREACHABLE]),
             "qnode_uri_nodes": len([n for n in self._nodes.values() if n.is_qnode_uri]),
+            "pq_nodes": len([n for n in self._nodes.values() if n.is_pq]),
             "total_peers_discovered": len(self._discovered_peers),
             "nodes": [
                 {
                     "url": n.url,
                     "original_uri": n.original_uri,
                     "public_key": n.public_key[:32] + "..." if n.public_key else "",
+                    "node_id": n.node_id,
+                    "algo": n.algo,
                     "is_qnode_uri": n.is_qnode_uri,
+                    "is_pq": n.is_pq,
                     "status": n.status.value,
                     "failures": n.failures,
                     "latency_ms": round(n.latency_ms, 2),

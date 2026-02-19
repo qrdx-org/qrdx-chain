@@ -6,11 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE 1
 ENV PYTHONUNBUFFERED 1
 
 # Install all system dependencies in a single layer for better Docker image caching.
-# - postgresql-client: for psql and pg_isready commands in the entrypoint.
 # - openssh-client: for the Pinggy.io ssh tunnel command.
 # - wget: required for the HEALTHCHECK command.
-# - build-essential tools (gcc) and dev libraries (libgmp-dev, libpq-dev): for compiling Python packages.
-RUN apt-get update -y && apt-get upgrade -y && apt-get install -y wget libgmp-dev libpq-dev gcc openssh-client postgresql-client && rm -rf /var/lib/apt/lists/*
+# - build-essential tools (gcc) and dev libraries (libgmp-dev): for compiling Python packages.
+RUN apt-get update -y && apt-get upgrade -y && apt-get install -y wget libgmp-dev gcc openssh-client && rm -rf /var/lib/apt/lists/*
 
 
 # Set the working directory inside the container

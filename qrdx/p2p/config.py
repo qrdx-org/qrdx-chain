@@ -49,7 +49,7 @@ class SecurityConfig:
     pq_sig_algorithm: str = "Dilithium3"
     
     # Require PQ-capable peers (reject others)
-    pq_required: bool = False
+    pq_required: bool = True
     
     # Connection timeout (seconds)
     handshake_timeout: float = 10.0

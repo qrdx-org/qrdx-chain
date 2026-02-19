@@ -5,7 +5,7 @@ Core imports are lazily loaded to avoid dependency conflicts.
 For direct module access, import from submodules:
     
     from qrdx.crypto import PrivateKey, PublicKey
-    from qrdx.database import Database
+    from qrdx.database_sqlite import DatabaseSQLite as Database
     from qrdx.exceptions import DoubleSpendException
 """
 
@@ -13,7 +13,7 @@ For direct module access, import from submodules:
 def __getattr__(name):
     """Lazy module loading to prevent dependency conflicts."""
     if name == 'Database':
-        from .database import Database
+        from .database_sqlite import DatabaseSQLite as Database
         return Database
     elif name == 'main':
         from .node import main

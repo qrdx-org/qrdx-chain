@@ -18,9 +18,9 @@ from dataclasses import dataclass, field
 
 import ipaddress
 import socket
+import sqlite3
 from urllib.parse import urlparse
 
-from asyncpg import UniqueViolationError
 from fastapi import FastAPI, Body, Query, Depends, HTTPException, status 
 from fastapi.responses import RedirectResponse, Response
 
@@ -49,14 +49,13 @@ from qrdx.node.utils import ip_is_local
 from qrdx.node.bootstrap import BootstrapManager, get_bootstrap_manager, init_bootstrap_manager
 from qrdx.transactions import Transaction, CoinbaseTransaction
 from qrdx.transactions.contract_transaction import ContractTransaction
-from qrdx import Database
+from qrdx.database_sqlite import DatabaseSQLite as Database
 from qrdx.constants import (
     MAX_MINING_CANDIDATES, NODE_VERSION, MAX_BLOCKS_PER_SUBMISSION,
     MAX_BLOCK_CONTENT_SIZE, MAX_PEERS, MAX_CONCURRENT_SYNCS,
     MAX_TX_FETCH_LIMIT, MAX_MEMPOOL_SIZE, CONNECTION_TIMEOUT,
     MAX_BATCH_BYTES, VALID_HEX_PATTERN, VALID_ADDRESS_PATTERN,
-    DENARO_BOOTSTRAP_NODE, DENARO_SELF_URL, POSTGRES_USER,
-    POSTGRES_PASSWORD, DENARO_DATABASE_NAME, DENARO_DATABASE_HOST,
+    DENARO_BOOTSTRAP_NODE, DENARO_SELF_URL,
     DENARO_DATABASE_PATH, MAX_TX_DATA_SIZE, DENARO_NODE_HOST, 
     DENARO_NODE_PORT, MAX_REORG_DEPTH,
     LOG_INCLUDE_REQUEST_CONTENT, LOG_INCLUDE_RESPONSE_CONTENT, LOG_MAX_PATH_LENGTH,
@@ -1830,19 +1829,15 @@ async def startup():
     self_node_id = get_node_id()
     NodesManager.init(self_node_id)
 
-    # Use SQLite if DENARO_DATABASE_PATH is set, otherwise use PostgreSQL
-    if DENARO_DATABASE_PATH:
-        logger.info(f"Using SQLite database: {DENARO_DATABASE_PATH}")
-        from ..database_sqlite import DatabaseSQLite
-        db = await DatabaseSQLite.create(db_path=DENARO_DATABASE_PATH)
-    else:
-        logger.info(f"Using PostgreSQL database: {DENARO_DATABASE_NAME}")
-        db = await Database.create(
-            user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD,
-            database=DENARO_DATABASE_NAME,
-            host=DENARO_DATABASE_HOST
-        )
+    # Initialize SQLite database
+    db_path = str(DENARO_DATABASE_PATH) if DENARO_DATABASE_PATH else 'data/qrdx.db'
+    logger.info(f"Using SQLite database: {db_path}")
+
+    # Ensure the database directory exists
+    import os
+    os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else '.', exist_ok=True)
+
+    db = await Database.create(db_path=db_path)
     
     logger.info("Clearing pending transaction pool.")
     await db.remove_all_pending_transactions()
@@ -2397,7 +2392,7 @@ async def push_tx(
             return {'ok': True, 'result': 'Transaction has been accepted'}
         else:
             return {'ok': False, 'error': 'Transaction has not been added'}
-    except UniqueViolationError:
+    except sqlite3.IntegrityError:
         return {'ok': False, 'error': 'Transaction already present'}
     except Exception as e:
         await security.security_monitor.log_event('transaction_error', {
@@ -2455,7 +2450,7 @@ async def submit_tx(
             return {'ok': True, 'result': 'Transaction has been accepted'}
         else:
             return {'ok': False, 'error': 'Transaction failed validation'}
-    except UniqueViolationError:
+    except sqlite3.IntegrityError:
         return {'ok': False, 'error': 'Transaction already present in pending pool'}
     except Exception as e:
         return {'ok': False, 'error': 'Transaction rejected'}

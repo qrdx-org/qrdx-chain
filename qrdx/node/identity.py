@@ -1,108 +1,237 @@
-# denaro/node/identity.py
+"""
+QRDX Node Identity — Post-Quantum (Dilithium3 + BLAKE3)
+
+Implements PQ node identity per Whitepaper §5.1:
+- Dilithium3 (ML-DSA-65) keypair for signing and authentication
+- BLAKE3 hash of public key as Node ID, prefixed with 'qx'
+- @-schema addressing: dilithium3@qx<blake3_hash>@<host>:<port>
+
+All classical identity (P256/ECDSA, secp256k1) has been removed.
+"""
 
 import os
-import hashlib
-import json # Import json for canonical serialization
-from fastecdsa import keys, ecdsa
-from qrdx.constants import CURVE
+import json
+import re
+from typing import Optional, Tuple
+
+import blake3
+import oqs
+
 from ..logger import get_logger
 
 logger = get_logger(__name__)
 
-# Define the path for the node's private key file
-KEY_FILE_PATH = os.path.join(os.path.dirname(__file__), 'node_key.priv')
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+# Resolve algorithm name at import time (ML-DSA-65 preferred, Dilithium3 legacy)
+def _resolve_sig_algorithm() -> str:
+    for name in ('ML-DSA-65', 'Dilithium3'):
+        try:
+            oqs.Signature(name)
+            return name
+        except Exception:
+            continue
+    raise RuntimeError('No supported PQ signature algorithm found in liboqs')
 
-# --- Private variables to hold the loaded key and derived IDs ---
-_private_key: int = None
-_public_key = None
-_node_id: str = None
+PQ_ALGORITHM = _resolve_sig_algorithm()  # NIST Level 3 — CRYSTALS-Dilithium / ML-DSA-65
+KEY_FILE_PATH = os.path.join(os.path.dirname(__file__), 'node_key.pq')
+PUBKEY_FILE_PATH = os.path.join(os.path.dirname(__file__), 'node_key.pq.pub')
 
-def generate_new_key():
-    """Generates a new P256 private key and its corresponding public key."""
-    return keys.gen_keypair(CURVE)
+# @-schema regex: dilithium3@qx<hex40>@host:port
+_AT_SCHEMA_RE = re.compile(
+    r'^(?P<algo>[a-zA-Z0-9-]+)@(?P<id>qx[a-fA-F0-9]{40,})@(?P<host>[^:]+):(?P<port>\d+)$'
+)
 
-def save_key(key: int):
-    """Saves the private key (an integer) to the key file."""
-    with open(KEY_FILE_PATH, 'w') as f:
-        f.write(str(key))
-    logger.info(f"New node identity created and saved to {KEY_FILE_PATH}")
+# ---------------------------------------------------------------------------
+# Module-level state
+# ---------------------------------------------------------------------------
+_secret_key: Optional[bytes] = None
+_public_key: Optional[bytes] = None
+_node_id: Optional[str] = None  # qx<blake3_hex_40>
 
-def load_key() -> int:
-    """Loads the private key from the key file."""
-    if not os.path.exists(KEY_FILE_PATH):
+
+# ---------------------------------------------------------------------------
+# Key Management
+# ---------------------------------------------------------------------------
+
+def _derive_node_id(public_key: bytes) -> str:
+    """
+    Derive the node ID from a Dilithium public key.
+
+    Returns 'qx' + first 20 bytes (40 hex chars) of BLAKE3(pubkey).
+    """
+    h = blake3.blake3(public_key).hexdigest()
+    return f"qx{h[:40]}"
+
+
+def generate_new_keypair() -> Tuple[bytes, bytes]:
+    """Generate a fresh Dilithium3 keypair. Returns (secret_key, public_key)."""
+    signer = oqs.Signature(PQ_ALGORITHM)
+    public_key = signer.generate_keypair()
+    secret_key = signer.export_secret_key()
+    return secret_key, public_key
+
+
+def save_keys(secret_key: bytes, public_key: bytes) -> None:
+    """Persist keys to disk with restrictive permissions."""
+    with open(KEY_FILE_PATH, 'wb') as f:
+        f.write(secret_key)
+    os.chmod(KEY_FILE_PATH, 0o600)
+
+    with open(PUBKEY_FILE_PATH, 'wb') as f:
+        f.write(public_key)
+    os.chmod(PUBKEY_FILE_PATH, 0o644)
+
+    logger.info(f"PQ node identity saved to {KEY_FILE_PATH}")
+
+
+def load_keys() -> Optional[Tuple[bytes, bytes]]:
+    """Load keys from disk. Returns (secret_key, public_key) or None."""
+    if not os.path.exists(KEY_FILE_PATH) or not os.path.exists(PUBKEY_FILE_PATH):
         return None
-    with open(KEY_FILE_PATH, 'r') as f:
-        key_int = int(f.read().strip())
-        return key_int
+    with open(KEY_FILE_PATH, 'rb') as f:
+        secret_key = f.read()
+    with open(PUBKEY_FILE_PATH, 'rb') as f:
+        public_key = f.read()
+    if not secret_key or not public_key:
+        return None
+    return secret_key, public_key
 
-def initialize_identity():
+
+# ---------------------------------------------------------------------------
+# Initialization
+# ---------------------------------------------------------------------------
+
+def initialize_identity() -> None:
     """
-    The main initialization function. It loads an existing key or creates a new one,
-    then populates the global identity variables.
+    Load or create the PQ node identity.
+
+    Populates module globals: _secret_key, _public_key, _node_id.
     """
-    global _private_key, _public_key, _node_id
-    
-    priv_key_int = load_key()
-    if priv_key_int is None:
-        logger.info("No node key found. Generating a new identity...")
-        priv_key_int, _ = generate_new_key()
-        save_key(priv_key_int)
-    
-    _private_key = priv_key_int
-    _public_key = keys.get_public_key(_private_key, CURVE)
-    
-    # The Node ID is the SHA256 hash of the public key bytes (uncompressed format)
-    # fastecdsa uses X and Y coordinates for the public key. We'll concatenate them.
-    pubkey_bytes = _public_key.x.to_bytes(32, 'big') + _public_key.y.to_bytes(32, 'big')
-    _node_id = hashlib.sha256(pubkey_bytes).hexdigest()
-    
-    logger.info(f"Node Identity Initialized. Node ID: {_node_id}")
+    global _secret_key, _public_key, _node_id
 
-def get_private_key() -> int:
-    """Returns the loaded private key as an integer."""
-    return _private_key
+    loaded = load_keys()
+    if loaded is None:
+        logger.info("No PQ node key found. Generating a new Dilithium3 identity...")
+        _secret_key, _public_key = generate_new_keypair()
+        save_keys(_secret_key, _public_key)
+    else:
+        _secret_key, _public_key = loaded
 
-def get_public_key_hex() -> str:
-    """Returns the uncompressed public key as a hex string."""
-    pubkey_bytes = _public_key.x.to_bytes(32, 'big') + _public_key.y.to_bytes(32, 'big')
-    return pubkey_bytes.hex()
+    _node_id = _derive_node_id(_public_key)
+    logger.info(f"PQ Node Identity Initialized. Node ID: {_node_id}")
+
+
+# ---------------------------------------------------------------------------
+# Accessors
+# ---------------------------------------------------------------------------
 
 def get_node_id() -> str:
-    """Returns the node's unique ID."""
+    """Return the node's BLAKE3-derived ID (e.g. 'qx1a2b3c…')."""
+    if _node_id is None:
+        raise RuntimeError("Identity not initialized. Call initialize_identity() first.")
     return _node_id
 
+
+def get_public_key_bytes() -> bytes:
+    """Return raw Dilithium3 public key bytes."""
+    if _public_key is None:
+        raise RuntimeError("Identity not initialized.")
+    return _public_key
+
+
+def get_public_key_hex() -> str:
+    """Return Dilithium3 public key as hex string."""
+    return get_public_key_bytes().hex()
+
+
+def get_secret_key_bytes() -> bytes:
+    """Return raw Dilithium3 secret key bytes."""
+    if _secret_key is None:
+        raise RuntimeError("Identity not initialized.")
+    return _secret_key
+
+
+# ---------------------------------------------------------------------------
+# @-Schema Addressing
+# ---------------------------------------------------------------------------
+
+def get_at_schema_address(host: str, port: int) -> str:
+    """
+    Build the @-schema address for this node.
+
+    Format: dilithium3@<node_id>@<host>:<port>
+    Example: dilithium3@qx1a2b3c4d5e6f7890abcdef1234567890abcdef12@node.qrdx.org:30303
+    """
+    return f"dilithium3@{get_node_id()}@{host}:{port}"
+
+
+def parse_at_schema(address: str) -> dict:
+    """
+    Parse an @-schema address string.
+
+    Returns dict with keys: algo, node_id, host, port.
+    Raises ValueError on invalid format.
+    """
+    m = _AT_SCHEMA_RE.match(address)
+    if not m:
+        raise ValueError(f"Invalid @-schema address: {address!r}")
+    return {
+        'algo': m.group('algo'),
+        'node_id': m.group('id'),
+        'host': m.group('host'),
+        'port': int(m.group('port')),
+    }
+
+
+def validate_at_schema(address: str) -> bool:
+    """Return True if address is a valid @-schema string."""
+    return _AT_SCHEMA_RE.match(address) is not None
+
+
+# ---------------------------------------------------------------------------
+# Signing & Verification
+# ---------------------------------------------------------------------------
+
 def sign_message(message: bytes) -> str:
-    """Signs a message (bytes) and returns the signature as a hex string."""
-    if not _private_key:
-        raise Exception("Identity not initialized. Cannot sign message.")
-    
-    # fastecdsa.ecdsa.sign returns a tuple (r, s)
-    r, s = ecdsa.sign(message, _private_key, curve=CURVE, hashfunc=hashlib.sha256)
-    
-    # We'll concatenate r and s to form the signature
-    return r.to_bytes(32, 'big').hex() + s.to_bytes(32, 'big').hex()
+    """
+    Sign *message* with this node's Dilithium3 secret key.
+
+    Returns the signature as a hex string.
+    """
+    if _secret_key is None:
+        raise RuntimeError("Identity not initialized. Cannot sign.")
+
+    signer = oqs.Signature(PQ_ALGORITHM, _secret_key)
+    signature = signer.sign(message)
+    return signature.hex()
+
 
 def verify_signature(pubkey_hex: str, signature_hex: str, message: bytes) -> bool:
-    """Verifies a signature against a message using the provided public key."""
+    """
+    Verify a Dilithium3 signature.
+
+    Args:
+        pubkey_hex: Signer's Dilithium public key (hex).
+        signature_hex: Signature (hex).
+        message: Original message bytes.
+
+    Returns True iff valid.
+    """
     try:
-        # Reconstruct the public key from the hex string
-        pubkey_bytes = bytes.fromhex(pubkey_hex)
-        x = int.from_bytes(pubkey_bytes[:32], 'big')
-        y = int.from_bytes(pubkey_bytes[32:], 'big')
-        pub_key = keys.Point(x, y, curve=CURVE)
-
-        # Reconstruct the signature from the hex string
-        signature_bytes = bytes.fromhex(signature_hex)
-        r = int.from_bytes(signature_bytes[:32], 'big')
-        s = int.from_bytes(signature_bytes[32:], 'big')
-
-        # The verify function returns True on success, raises an exception on failure
-        return ecdsa.verify((r, s), message, pub_key, curve=CURVE, hashfunc=hashlib.sha256)
+        pub = bytes.fromhex(pubkey_hex)
+        sig = bytes.fromhex(signature_hex)
+        verifier = oqs.Signature(PQ_ALGORITHM)
+        return verifier.verify(message, sig, pub)
     except Exception:
-        # Catch any errors during parsing or verification
         return False
 
-def get_canonical_json_bytes(data: dict) -> bytes:
-    """Creates a canonical (reproducible) byte representation of a JSON object."""
-    return json.dumps(data, sort_keys=True, separators=(',', ':')).encode('utf-8')
 
+# ---------------------------------------------------------------------------
+# Canonical JSON
+# ---------------------------------------------------------------------------
+
+def get_canonical_json_bytes(data: dict) -> bytes:
+    """Deterministic JSON serialization for signing payloads."""
+    return json.dumps(data, sort_keys=True, separators=(',', ':')).encode('utf-8')

@@ -20,11 +20,7 @@ from fastecdsa import curve
 _config = dotenv_values(".env")
 
 NODE_DEFAULTS = {
-    'POSTGRES_USER':                   'qrdx',
-    'POSTGRES_PASSWORD':               'qrdx',
-    'QRDX_DATABASE_NAME':              'qrdx',
-    'QRDX_DATABASE_HOST':              '127.0.0.1',
-    'QRDX_DATABASE_PATH':              '',  # If set, use SQLite instead of PostgreSQL
+    'QRDX_DATABASE_PATH':              'data/qrdx.db',  # SQLite database path
     'QRDX_NODE_HOST':                  '127.0.0.1',
     'QRDX_NODE_PORT':                  '3007',
     'QRDX_SELF_URL':                   '',
@@ -329,22 +325,19 @@ for key, default_raw in DEFAULTS.items():
 # New code should use the QRDX_* prefixed versions.
 DENARO_SELF_URL = namespace.get('QRDX_SELF_URL', '')
 DENARO_BOOTSTRAP_NODE = namespace.get('QRDX_BOOTSTRAP_NODE', 'http://node.qrdx.network')
-DENARO_DATABASE_NAME = namespace.get('QRDX_DATABASE_NAME', 'qrdx')
-DENARO_DATABASE_HOST = namespace.get('QRDX_DATABASE_HOST', '127.0.0.1')
-DENARO_DATABASE_PATH = namespace.get('QRDX_DATABASE_PATH', '')  # SQLite path (if set, use SQLite)
+DENARO_DATABASE_PATH = namespace.get('QRDX_DATABASE_PATH', 'data/qrdx.db')  # SQLite path
 DENARO_NODE_HOST = namespace.get('QRDX_NODE_HOST', '127.0.0.1')
 DENARO_NODE_PORT = namespace.get('QRDX_NODE_PORT', '3007')
-POSTGRES_USER = namespace.get('POSTGRES_USER', 'qrdx')
-POSTGRES_PASSWORD = namespace.get('POSTGRES_PASSWORD', 'qrdx')
 
 # ==================================================================================
 # BOOTSTRAP NODES CONFIGURATION
 # ==================================================================================
-# Supports two formats:
+# Supports three formats:
 # 1. Simple HTTP URLs: http://node.qrdx.network:3007
-# 2. qnode:// URIs: qnode://<pubkey_hex>@hostname:port
+# 2. qnode:// URIs (legacy): qnode://<pubkey_hex>@hostname:port
+# 3. @-schema addresses (PQ): dilithium3@qx<blake3_hex>@hostname:port
 #
-# qnode URI format provides the node's public key for identity verification
+# @-schema provides the PQ node ID for identity verification during handshake
 
 import re
 from typing import NamedTuple
@@ -359,6 +352,14 @@ class ParsedBootstrapNode(NamedTuple):
     port: int             # Port number
     original: str         # Original URI string
     is_qnode: bool        # True if parsed from qnode:// URI
+    node_id: str = ''     # PQ node ID (e.g. 'qx1a2b3c…') from @-schema
+    algo: str = ''        # PQ algorithm from @-schema (e.g. 'dilithium3')
+
+
+# @-schema regex: algo@qx<hex40+>@host:port
+_BOOTSTRAP_AT_SCHEMA_RE = re.compile(
+    r'^([a-zA-Z0-9-]+)@(qx[a-fA-F0-9]{40,})@([^:]+):(\d+)$'
+)
 
 
 def parse_bootstrap_node(uri: str) -> ParsedBootstrapNode:
@@ -366,8 +367,9 @@ def parse_bootstrap_node(uri: str) -> ParsedBootstrapNode:
     Parse a bootstrap node URI.
     
     Supports:
-    - Simple HTTP URLs: http://node.example.com:3007
-    - qnode URIs: qnode://<pubkey>@node.example.com:30303
+    - @-schema: dilithium3@qx<node_id>@host:port  (PQ, preferred)
+    - qnode URIs: qnode://<pubkey>@host:port       (legacy)
+    - HTTP URLs: http://host:port                  (fallback)
     
     Args:
         uri: Bootstrap node URI string
@@ -377,7 +379,24 @@ def parse_bootstrap_node(uri: str) -> ParsedBootstrapNode:
     """
     uri = uri.strip()
     
-    # Check for qnode:// URI format
+    # Check for @-schema format: algo@qx<hex>@host:port
+    at_match = _BOOTSTRAP_AT_SCHEMA_RE.match(uri)
+    if at_match:
+        algo = at_match.group(1)
+        node_id = at_match.group(2)
+        host = at_match.group(3)
+        port = int(at_match.group(4))
+        http_url = f"http://{host}:{port}"
+        return ParsedBootstrapNode(
+            url=http_url,
+            public_key="",   # public key obtained during handshake
+            host=host,
+            port=port,
+            original=uri,
+            is_qnode=True,
+            node_id=node_id,
+            algo=algo,
+        )
     if uri.startswith('qnode://'):
         # Format: qnode://<pubkey>@<host>:<port>
         # pubkey is hex-encoded, typically 64+ chars

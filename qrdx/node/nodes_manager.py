@@ -299,9 +299,16 @@ class NodesManager:
             return None
 
     @staticmethod
-    def add_or_update_peer(node_id: str, pubkey: str, url: str | None, is_public: bool):
+    def add_or_update_peer(node_id: str, pubkey: str, url: str | None, is_public: bool, at_schema: str = ''):
         """
         Adds a new peer or updates an existing one's information.
+        
+        Args:
+            node_id: Peer's node ID (qx…)
+            pubkey: Peer's Dilithium public key (hex)
+            url: Peer's HTTP URL for API connection
+            is_public: Whether the peer is publicly reachable
+            at_schema: Peer's @-schema address (optional)
         """
         if node_id == NodesManager.self_id:
             return False
@@ -316,6 +323,7 @@ class NodesManager:
         NodesManager.peers[node_id] = {
             'pubkey': pubkey,
             'url': url_to_store,
+            'at_schema': at_schema,
             'last_seen': int(time.time()),
             'is_public': is_public
         }

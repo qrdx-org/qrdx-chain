@@ -1,322 +1,392 @@
 """
-QRDX P2P Node Identity
+QRDX P2P Node Identity (Post-Quantum)
 
-Implements node identity using secp256k1 keys and optional
-post-quantum keys for enhanced security.
+Implements node identity and addressing for the P2P layer using:
+- Dilithium3 (ML-DSA-65) keypairs for identity/authentication
+- BLAKE3 hash of public key as Node ID (prefixed 'qx')
+- @-schema addressing: dilithium3@qx<blake3_hash>@<host>:<port>
+- Kademlia XOR distance using 160-bit BLAKE3-derived node IDs
+
+All classical identity (secp256k1, keccak256, qnode://, enode://) has been removed.
 """
 
 import os
-import hashlib
+import re
 from dataclasses import dataclass
 from typing import Optional, Tuple
-from urllib.parse import urlparse, parse_qs, urlencode
 
-from ..crypto.keys import PrivateKey, PublicKey, generate_keypair
-from ..crypto.hashing import keccak256
+import blake3
+import oqs
+
+from ..logger import get_logger
+
+logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Resolve algorithm name at import time (ML-DSA-65 preferred, Dilithium3 legacy)
+def _resolve_sig_algorithm() -> str:
+    for name in ('ML-DSA-65', 'Dilithium3'):
+        try:
+            oqs.Signature(name)
+            return name
+        except Exception:
+            continue
+    raise RuntimeError('No supported PQ signature algorithm found in liboqs')
+
+PQ_SIG_ALGORITHM = _resolve_sig_algorithm()
+NODE_ID_HEX_LEN = 40          # 20 bytes = 160 bits, expressed as 40 hex chars
+NODE_ID_PREFIX = 'qx'
+NODE_ID_FULL_LEN = len(NODE_ID_PREFIX) + NODE_ID_HEX_LEN  # 42
+
+# @-schema regex
+_AT_SCHEMA_RE = re.compile(
+    r'^(?P<algo>[a-zA-Z0-9-]+)@(?P<id>qx[a-fA-F0-9]{40,})@(?P<host>[^:]+):(?P<port>\d+)$'
+)
+
+# Type alias for 20-byte node ID
+NodeID = bytes  # 20 bytes
 
 
-# Type alias for 32-byte node ID
-NodeID = bytes
-
+# ---------------------------------------------------------------------------
+# Address
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Address:
     """Network address for a node."""
-    
+
     ip: str
     tcp_port: int
     udp_port: Optional[int] = None
-    
+
     def __post_init__(self):
         if self.udp_port is None:
             self.udp_port = self.tcp_port
-    
+
     @property
     def tcp_endpoint(self) -> Tuple[str, int]:
-        """Get TCP endpoint tuple."""
         return (self.ip, self.tcp_port)
-    
+
     @property
     def udp_endpoint(self) -> Tuple[str, int]:
-        """Get UDP endpoint tuple."""
         return (self.ip, self.udp_port)
-    
+
     def __str__(self) -> str:
         if self.tcp_port == self.udp_port:
             return f"{self.ip}:{self.tcp_port}"
         return f"{self.ip}:{self.tcp_port}/udp:{self.udp_port}"
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def derive_node_id(public_key: bytes) -> NodeID:
+    """
+    Derive the 20-byte Kademlia node ID from a Dilithium public key.
+
+    Algorithm: first 20 bytes of BLAKE3(pubkey).
+    """
+    h = blake3.blake3(public_key).digest()
+    return h[:20]
+
+
+def derive_node_id_hex(public_key: bytes) -> str:
+    """
+    Derive the 'qx'-prefixed hex node ID from a Dilithium public key.
+
+    Returns 'qx' + first 40 hex chars of BLAKE3(pubkey).
+    """
+    return NODE_ID_PREFIX + blake3.blake3(public_key).hexdigest()[:NODE_ID_HEX_LEN]
+
+
+def node_id_to_hex(node_id: NodeID) -> str:
+    """Convert 20-byte node ID to 'qx'-prefixed hex string."""
+    return NODE_ID_PREFIX + node_id.hex()
+
+
+def hex_to_node_id(hex_str: str) -> NodeID:
+    """Convert 'qx'-prefixed or plain hex string to 20-byte node ID."""
+    if hex_str.startswith(NODE_ID_PREFIX):
+        hex_str = hex_str[len(NODE_ID_PREFIX):]
+    if hex_str.startswith('0x'):
+        hex_str = hex_str[2:]
+    return bytes.fromhex(hex_str)
+
+
+# ---------------------------------------------------------------------------
+# Node
+# ---------------------------------------------------------------------------
+
 class Node:
     """
-    Represents a node in the QRDX network.
-    
+    Represents a node in the QRDX P2P network.
+
     Each node has:
-    - A secp256k1 keypair for identity and authentication
-    - A unique node ID (keccak256 of public key)
-    - Optional post-quantum keys for future-proof communication
-    - Network address information
+    - A Dilithium3 public key for identity and authentication
+    - A 160-bit BLAKE3-derived node ID for Kademlia routing
+    - An @-schema address for peer discovery
+    - Network address information (host, port)
     """
-    
+
     def __init__(
         self,
-        private_key: Optional[PrivateKey] = None,
+        public_key: bytes,
         address: Optional[Address] = None,
-        pq_public_key: Optional[bytes] = None,
+        *,
+        secret_key: Optional[bytes] = None,
     ):
         """
-        Initialize node.
-        
+        Initialize a node.
+
         Args:
-            private_key: Node's private key (generates new if None)
-            address: Network address (None for local-only nodes)
-            pq_public_key: Post-quantum public key (optional)
+            public_key: Dilithium3 public key bytes.
+            address: Network address (None for local-only nodes).
+            secret_key: Dilithium3 secret key (only for local node).
         """
-        if private_key is None:
-            private_key = PrivateKey.generate()
-        
-        self._private_key = private_key
-        self._public_key = private_key.public_key
+        self._public_key = public_key
+        self._secret_key = secret_key
         self._address = address
-        self._pq_public_key = pq_public_key
-        
-        # Compute node ID (keccak256 of uncompressed public key)
-        self._node_id = keccak256(self._public_key.to_bytes())
-    
+
+        # Compute Kademlia node ID — first 20 bytes of BLAKE3(pubkey)
+        self._node_id: NodeID = derive_node_id(public_key)
+        self._node_id_hex: str = derive_node_id_hex(public_key)
+
+    # -- Constructors -------------------------------------------------------
+
     @classmethod
-    def from_uri(cls, uri: str) -> "Node":
+    def from_at_schema(cls, address: str) -> 'Node':
         """
-        Parse node from URI.
-        
-        Format: qnode://<pubkey>@<host>:<port>[?pq=<pq_pubkey>][&chain=<chain_id>]
-        
-        Args:
-            uri: Node URI string
-            
-        Returns:
-            Node instance (without private key)
+        Parse a node from an @-schema address string.
+
+        Format: dilithium3@qx<blake3_40hex>@<host>:<port>
+
+        Returns a Node **without** a secret key (remote peer).
         """
-        if not uri.startswith("qnode://"):
-            raise ValueError(f"Invalid node URI scheme: {uri}")
-        
-        # Parse URI
-        parsed = urlparse(uri)
-        
-        # Extract public key from username part
-        pubkey_hex = parsed.username
-        if not pubkey_hex:
-            raise ValueError(f"Missing public key in URI: {uri}")
-        
-        # Parse host and port
-        host = parsed.hostname
-        port = parsed.port
-        if not host or not port:
-            raise ValueError(f"Missing host or port in URI: {uri}")
-        
-        # Parse query parameters
-        params = parse_qs(parsed.query)
-        pq_pubkey = None
-        if "pq" in params:
-            import base64
-            pq_pubkey = base64.b64decode(params["pq"][0])
-        
-        # Create public key
-        public_key = PublicKey.from_hex(pubkey_hex)
-        
-        # Create node without private key
+        m = _AT_SCHEMA_RE.match(address)
+        if not m:
+            raise ValueError(f"Invalid @-schema address: {address!r}")
+
+        algo = m.group('algo')
+        # Accept both legacy 'dilithium3' and FIPS 'ml-dsa-65' names
+        accepted = {PQ_SIG_ALGORITHM.lower(), 'dilithium3', 'ml-dsa-65'}
+        if algo.lower() not in accepted:
+            raise ValueError(f"Unsupported algorithm in @-schema: {algo}")
+
+        node_id_hex = m.group('id')
+        host = m.group('host')
+        port = int(m.group('port'))
+
+        # We don't have the public key from the @-schema alone —
+        # store the node ID and address. Public key is obtained during handshake.
         node = cls.__new__(cls)
-        node._private_key = None
-        node._public_key = public_key
+        node._public_key = None  # Unknown until handshake
+        node._secret_key = None
         node._address = Address(ip=host, tcp_port=port)
-        node._pq_public_key = pq_pubkey
-        node._node_id = keccak256(public_key.to_bytes())
-        
+        node._node_id = hex_to_node_id(node_id_hex)
+        node._node_id_hex = node_id_hex
         return node
-    
+
     @classmethod
-    def from_enode(cls, enode: str) -> "Node":
+    def from_http_url(cls, url: str) -> 'Node':
         """
-        Parse node from Ethereum enode URI.
-        
-        Format: enode://<pubkey>@<host>:<port>
-        
-        Args:
-            enode: Enode URI string
-            
-        Returns:
-            Node instance (without private key)
+        Create a placeholder node from an HTTP(S) URL.
+
+        Used for legacy/bootstrap compatibility. The node will have no
+        public key or node ID until a handshake completes.
         """
-        if not enode.startswith("enode://"):
-            raise ValueError(f"Invalid enode URI: {enode}")
-        
-        # Convert to qnode format
-        uri = "qnode://" + enode[8:]
-        return cls.from_uri(uri)
-    
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        host = parsed.hostname or 'localhost'
+        port = parsed.port or 30303
+
+        node = cls.__new__(cls)
+        node._public_key = None
+        node._secret_key = None
+        node._address = Address(ip=host, tcp_port=port)
+        node._node_id = b'\x00' * 20  # Placeholder — resolved after handshake
+        node._node_id_hex = NODE_ID_PREFIX + '0' * NODE_ID_HEX_LEN
+        return node
+
     @classmethod
-    def load_or_generate(cls, key_path: str, address: Optional[Address] = None) -> "Node":
+    def generate(cls, address: Optional[Address] = None) -> 'Node':
+        """Generate a new node with a fresh Dilithium3 keypair."""
+        signer = oqs.Signature(PQ_SIG_ALGORITHM)
+        public_key = signer.generate_keypair()
+        secret_key = signer.export_secret_key()
+        return cls(public_key=public_key, address=address, secret_key=secret_key)
+
+    @classmethod
+    def load_or_generate(cls, key_path: str, address: Optional[Address] = None) -> 'Node':
         """
-        Load node from key file or generate new.
-        
-        Args:
-            key_path: Path to private key file
-            address: Network address
-            
-        Returns:
-            Node instance
+        Load node from key files on disk, or generate new.
+
+        Stores: <key_path> (secret key) and <key_path>.pub (public key).
         """
-        if os.path.exists(key_path):
+        pub_path = key_path + '.pub'
+        if os.path.exists(key_path) and os.path.exists(pub_path):
             with open(key_path, 'rb') as f:
-                key_bytes = f.read()
-            private_key = PrivateKey(key_bytes)
-        else:
-            private_key = PrivateKey.generate()
-            os.makedirs(os.path.dirname(key_path), exist_ok=True)
-            with open(key_path, 'wb') as f:
-                f.write(private_key.to_bytes())
-            os.chmod(key_path, 0o600)  # Restrict permissions
-        
-        return cls(private_key=private_key, address=address)
-    
+                secret_key = f.read()
+            with open(pub_path, 'rb') as f:
+                public_key = f.read()
+            return cls(public_key=public_key, address=address, secret_key=secret_key)
+
+        node = cls.generate(address=address)
+
+        os.makedirs(os.path.dirname(key_path) or '.', exist_ok=True)
+        with open(key_path, 'wb') as f:
+            f.write(node._secret_key)
+        os.chmod(key_path, 0o600)
+        with open(pub_path, 'wb') as f:
+            f.write(node._public_key)
+        os.chmod(pub_path, 0o644)
+
+        logger.info(f"Generated new PQ node identity at {key_path}")
+        return node
+
+    # -- Properties ---------------------------------------------------------
+
     @property
     def node_id(self) -> NodeID:
-        """Get 32-byte node ID."""
+        """20-byte Kademlia node ID."""
         return self._node_id
-    
+
     @property
     def node_id_hex(self) -> str:
-        """Get node ID as hex string."""
-        return self._node_id.hex()
-    
+        """'qx'-prefixed hex node ID (42 chars)."""
+        return self._node_id_hex
+
     @property
-    def public_key(self) -> PublicKey:
-        """Get node's public key."""
+    def public_key(self) -> Optional[bytes]:
+        """Dilithium3 public key bytes (None for unresolved peers)."""
         return self._public_key
-    
+
     @property
-    def private_key(self) -> Optional[PrivateKey]:
-        """Get node's private key (None for remote nodes)."""
-        return self._private_key
-    
+    def public_key_hex(self) -> Optional[str]:
+        """Dilithium3 public key hex string."""
+        return self._public_key.hex() if self._public_key else None
+
+    @property
+    def secret_key(self) -> Optional[bytes]:
+        """Dilithium3 secret key (only for the local node)."""
+        return self._secret_key
+
+    @property
+    def has_secret_key(self) -> bool:
+        """True if this is the local node with signing capability."""
+        return self._secret_key is not None
+
     @property
     def address(self) -> Optional[Address]:
-        """Get node's network address."""
         return self._address
-    
+
     @address.setter
     def address(self, value: Address):
-        """Set node's network address."""
         self._address = value
-    
+
     @property
-    def pq_public_key(self) -> Optional[bytes]:
-        """Get post-quantum public key."""
-        return self._pq_public_key
-    
-    @pq_public_key.setter
-    def pq_public_key(self, value: bytes):
-        """Set post-quantum public key."""
-        self._pq_public_key = value
-    
-    def to_uri(self, include_pq: bool = True) -> str:
+    def is_resolved(self) -> bool:
+        """True if the public key is known (handshake completed)."""
+        return self._public_key is not None
+
+    # -- @-Schema -----------------------------------------------------------
+
+    def to_at_schema(self) -> str:
         """
-        Convert to qnode URI.
-        
-        Args:
-            include_pq: Include post-quantum key in URI
-            
-        Returns:
-            URI string
+        Convert to @-schema address string.
+
+        Format: dilithium3@qx<blake3_hex>@<host>:<port>
         """
         if self._address is None:
-            raise ValueError("Cannot create URI without address")
-        
-        pubkey_hex = self._public_key.to_hex(with_prefix=False)
-        base_uri = f"qnode://{pubkey_hex}@{self._address.ip}:{self._address.tcp_port}"
-        
-        params = {}
-        if include_pq and self._pq_public_key:
-            import base64
-            params["pq"] = base64.b64encode(self._pq_public_key).decode()
-        
-        if params:
-            return base_uri + "?" + urlencode(params)
-        return base_uri
-    
-    def to_enode(self) -> str:
+            raise ValueError("Cannot create @-schema URI without address")
+        return (
+            f"{PQ_SIG_ALGORITHM.lower()}@{self._node_id_hex}"
+            f"@{self._address.ip}:{self._address.tcp_port}"
+        )
+
+    def to_http_url(self) -> str:
         """
-        Convert to Ethereum enode URI.
-        
-        Returns:
-            Enode URI string
+        Convert to an HTTP base URL for API requests.
+
+        Returns: http://<host>:<port>
         """
         if self._address is None:
-            raise ValueError("Cannot create enode without address")
-        
-        pubkey_hex = self._public_key.to_hex(with_prefix=False)
-        return f"enode://{pubkey_hex}@{self._address.ip}:{self._address.tcp_port}"
-    
-    def distance(self, other: "Node") -> int:
+            raise ValueError("Cannot create URL without address")
+        return f"http://{self._address.ip}:{self._address.tcp_port}"
+
+    # -- Identity operations ------------------------------------------------
+
+    def resolve(self, public_key: bytes) -> None:
         """
-        Calculate XOR distance to another node.
-        
-        Used for Kademlia routing.
-        
-        Args:
-            other: Other node
-            
-        Returns:
-            Distance as integer
+        Resolve this node's identity after a successful handshake.
+
+        Sets the public key and recomputes the Kademlia node ID.
         """
+        self._public_key = public_key
+        self._node_id = derive_node_id(public_key)
+        self._node_id_hex = derive_node_id_hex(public_key)
+
+    def sign(self, message: bytes) -> bytes:
+        """
+        Sign a message with this node's Dilithium3 secret key.
+
+        Returns raw signature bytes.
+        Raises RuntimeError if this node has no secret key.
+        """
+        if self._secret_key is None:
+            raise RuntimeError("Cannot sign: no secret key (remote node)")
+
+        signer = oqs.Signature(PQ_SIG_ALGORITHM, self._secret_key)
+        return signer.sign(message)
+
+    def verify(self, message: bytes, signature: bytes) -> bool:
+        """
+        Verify a Dilithium3 signature against this node's public key.
+
+        Returns True if valid.
+        """
+        if self._public_key is None:
+            raise RuntimeError("Cannot verify: public key unknown (unresolved node)")
+
+        verifier = oqs.Signature(PQ_SIG_ALGORITHM)
+        return verifier.verify(message, signature, self._public_key)
+
+    # -- Kademlia XOR distance ---------------------------------------------
+
+    def distance(self, other: 'Node') -> int:
+        """XOR distance to another node (for Kademlia routing)."""
         return int.from_bytes(self._node_id, 'big') ^ int.from_bytes(other._node_id, 'big')
-    
+
     def distance_to(self, node_id: NodeID) -> int:
-        """
-        Calculate XOR distance to a node ID.
-        
-        Args:
-            node_id: Target node ID bytes
-            
-        Returns:
-            Distance as integer
-        """
+        """XOR distance to a raw node ID."""
         return int.from_bytes(self._node_id, 'big') ^ int.from_bytes(node_id, 'big')
-    
-    def log_distance(self, other: "Node") -> int:
+
+    def log_distance(self, other: 'Node') -> int:
         """
-        Calculate log2 distance (bucket index) to another node.
-        
-        Args:
-            other: Other node
-            
-        Returns:
-            Bucket index (0-255)
+        Log2 distance (Kademlia bucket index) to another node.
+
+        Returns 0-159 for 160-bit node IDs.
         """
-        distance = self.distance(other)
-        if distance == 0:
+        d = self.distance(other)
+        if d == 0:
             return 0
-        return distance.bit_length() - 1
-    
+        return d.bit_length() - 1
+
+    # -- Dunder -------------------------------------------------------------
+
     def __eq__(self, other) -> bool:
         if not isinstance(other, Node):
             return False
         return self._node_id == other._node_id
-    
+
     def __hash__(self) -> int:
         return hash(self._node_id)
-    
+
     def __repr__(self) -> str:
         addr = f"@{self._address}" if self._address else ""
-        return f"Node({self.node_id_hex[:16]}...{addr})"
-
-
-def node_id_to_hex(node_id: NodeID) -> str:
-    """Convert node ID bytes to hex string."""
-    return node_id.hex()
-
-
-def hex_to_node_id(hex_str: str) -> NodeID:
-    """Convert hex string to node ID bytes."""
-    if hex_str.startswith('0x'):
-        hex_str = hex_str[2:]
-    return bytes.fromhex(hex_str)
+        resolved = "" if self.is_resolved else " [unresolved]"
+        return f"Node({self._node_id_hex[:16]}...{addr}{resolved})"
