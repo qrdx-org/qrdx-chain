@@ -6,6 +6,12 @@ Protocol-level time-weighted average price oracle:
   - Updated on every pool interaction (swap / add / remove liquidity)
   - Accumulator-based — O(1) reads for any historical window
   - Manipulation resistant through geometric mean + accumulator design
+
+Security features:
+  - Minimum observation period before TWAP is valid
+  - Outlier price rejection (> MAX_PRICE_CHANGE_PCT from last)
+  - Same-block observation dedup (overwrite, not append)
+  - Staleness check method
 """
 
 from __future__ import annotations
@@ -21,6 +27,9 @@ logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
 MAX_OBSERVATIONS = 8640  # ~24 h at 10-second blocks
+MIN_OBSERVATION_PERIOD = 60.0   # seconds — TWAP not valid until this much data
+MAX_PRICE_CHANGE_PCT = Decimal("0.50")  # 50% max single-observation price change
+STALENESS_THRESHOLD = 300.0     # 5 minutes — oracle considered stale
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +80,10 @@ class TWAPOracle:
 
         Should be called on every pool interaction.
 
+        Security:
+          - Rejects outlier prices (>50% change from last)
+          - Same-block observations overwrite the previous (dedup)
+
         Args:
             price: current spot price
             timestamp: observation time (defaults to now)
@@ -86,9 +99,26 @@ class TWAPOracle:
 
         if self._observations:
             prev = self._observations[-1]
+
+            # --- Outlier rejection ---
+            if prev.price > 0:
+                change = abs(price - prev.price) / prev.price
+                if change > MAX_PRICE_CHANGE_PCT:
+                    raise ValueError(
+                        f"Outlier price rejected: {change:.2%} change exceeds "
+                        f"max {MAX_PRICE_CHANGE_PCT:.2%}"
+                    )
+
             dt = Decimal(str(now - prev.timestamp))
             if dt < 0:
                 raise ValueError("Timestamp must be monotonically increasing")
+
+            # --- Same-block dedup: if dt == 0, overwrite last observation ---
+            if dt == 0:
+                prev.price = price
+                prev.log_price_cumulative = prev.log_price_cumulative  # no time elapsed
+                return prev
+
             cumulative = prev.log_price_cumulative + log_price * dt
         else:
             cumulative = ZERO
@@ -115,12 +145,19 @@ class TWAPOracle:
         Formula: exp( (cumulative_end - cumulative_start) / (t_end - t_start) )
 
         Returns:
-            TWAP price, or None if insufficient data
+            TWAP price, or None if insufficient data or min period not met
         """
         if len(self._observations) < 2:
             return None
 
         end = self._observations[-1]
+        start_obs = self._observations[0]
+
+        # --- Min observation period enforcement ---
+        total_span = end.timestamp - start_obs.timestamp
+        if total_span < MIN_OBSERVATION_PERIOD:
+            return None  # not enough data yet
+
         target_time = end.timestamp - window_seconds
 
         # Find the observation closest to (but before) target_time
@@ -171,3 +208,17 @@ class TWAPOracle:
         """Look up price at a specific timestamp."""
         obs = self._find_observation_at(timestamp)
         return obs.price if obs else None
+
+    def is_stale(self, threshold: float = STALENESS_THRESHOLD) -> bool:
+        """Check if the oracle data is stale (no recent observations)."""
+        if not self._observations:
+            return True
+        age = time.time() - self._observations[-1].timestamp
+        return age > threshold
+
+    @property
+    def age(self) -> float:
+        """Seconds since last observation."""
+        if not self._observations:
+            return float("inf")
+        return time.time() - self._observations[-1].timestamp

@@ -20,6 +20,10 @@ from .orderbook import (
     OrderType,
     OrderBook,
     Trade,
+    SelfTradeAction,
+    MIN_ORDER_SIZE,
+    MAX_ORDERS_PER_ADDRESS,
+    MAX_ORDERS_PER_BLOCK_PER_ADDRESS,
 )
 from .amm import (
     PoolState,
@@ -46,10 +50,19 @@ from .oracle import (
     Observation,
     TWAPOracle,
 )
+from .hooks import (
+    HookFlags,
+    HookContext,
+    HookResult,
+    HookRegistry,
+    CircuitBreaker,
+)
 
 __all__ = [
     # Order Book
     "Order", "OrderSide", "OrderStatus", "OrderType", "OrderBook", "Trade",
+    "SelfTradeAction", "MIN_ORDER_SIZE", "MAX_ORDERS_PER_ADDRESS",
+    "MAX_ORDERS_PER_BLOCK_PER_ADDRESS",
     # AMM
     "PoolState", "Position", "TickInfo", "ConcentratedLiquidityPool",
     "PoolManager", "FeeTier",
@@ -60,4 +73,6 @@ __all__ = [
     "FillResult", "FillSource", "UnifiedRouter",
     # Oracle
     "Observation", "TWAPOracle",
+    # Hooks
+    "HookFlags", "HookContext", "HookResult", "HookRegistry", "CircuitBreaker",
 ]

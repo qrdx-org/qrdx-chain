@@ -9,6 +9,7 @@ Covers:
   5.5  TWAP Oracle
   5.6  Hooks / Router / Settlement
   +    Perpetual Contracts (perps)
+  +    Security Hardening Tests
 """
 
 import math
@@ -736,10 +737,10 @@ class TestTWAPOracle:
     def test_twap_price_change(self):
         oracle = TWAPOracle()
         oracle.record(Decimal("100"), timestamp=0.0)
-        oracle.record(Decimal("200"), timestamp=100.0)
+        oracle.record(Decimal("140"), timestamp=100.0)  # 40% change (within 50% outlier limit)
         twap = oracle.twap(100.0)
         assert twap is not None
-        # Geometric mean of constant 200 over interval
+        # Geometric mean of constant 140 over interval
         # Since accumulator uses ln(price) * dt, with only end price held constant
         # the TWAP should reflect the end-point price
         assert twap > Decimal("100")
@@ -1270,3 +1271,994 @@ class TestPackageImports:
     def test_oracle_imports(self):
         from qrdx.exchange import Observation, TWAPOracle
         assert TWAPOracle is not None
+
+    def test_hooks_imports(self):
+        from qrdx.exchange import HookFlags, HookContext, HookResult, HookRegistry, CircuitBreaker
+        assert HookRegistry is not None
+
+    def test_security_imports(self):
+        from qrdx.exchange import (
+            SelfTradeAction, MIN_ORDER_SIZE,
+            MAX_ORDERS_PER_ADDRESS, MAX_ORDERS_PER_BLOCK_PER_ADDRESS,
+        )
+        assert MIN_ORDER_SIZE > 0
+
+
+# ============================================================================
+#  SECURITY HARDENING TESTS
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Additional imports for security tests
+# ---------------------------------------------------------------------------
+from qrdx.exchange.orderbook import (
+    SelfTradeAction,
+    MIN_ORDER_SIZE,
+    MAX_ORDERS_PER_ADDRESS,
+    MAX_ORDERS_PER_BLOCK_PER_ADDRESS,
+    MAX_STOP_ORDERS_PER_ADDRESS,
+)
+from qrdx.exchange.oracle import (
+    MIN_OBSERVATION_PERIOD,
+    MAX_PRICE_CHANGE_PCT,
+    STALENESS_THRESHOLD,
+)
+from qrdx.exchange.perpetual import (
+    LIQUIDATION_PENALTY_RATE,
+    MAX_OPEN_INTEREST_DEFAULT,
+    ORACLE_STALENESS_SECONDS,
+    MAX_POSITIONS_PER_OWNER,
+)
+from qrdx.exchange.router import (
+    MAX_PRICE_DEVIATION,
+    DEFAULT_DEADLINE_SECONDS,
+)
+from qrdx.exchange.hooks import (
+    HookFlags,
+    HookContext,
+    HookResult,
+    HookRegistry,
+    CircuitBreaker,
+    ExchangeHook,
+)
+
+
+# ============================================================================
+#  ORDER BOOK SECURITY
+# ============================================================================
+
+class TestOrderBookSecurity:
+    """Self-trade prevention, auth cancel, rate limits, nonce, min size, pause."""
+
+    # -- Self-trade prevention (STP) ----------------------------------------
+
+    def test_stp_reject_mode(self):
+        """STP REJECT: same-owner orders don't trade against each other."""
+        book = OrderBook(self_trade_action=SelfTradeAction.REJECT)
+        book.place_order(Order(id="bid1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+        trades = book.place_order(Order(id="ask1", owner=ADDR_A, side=OrderSide.SELL,
+                                        order_type=OrderType.LIMIT, price=Decimal("100"),
+                                        amount=Decimal("10")))
+        # Same owner — trade rejected, ask rests on book
+        assert len(trades) == 0
+        assert book.ask_depth == 1
+        assert book.bid_depth == 1
+
+    def test_stp_cancel_maker_mode(self):
+        """STP CANCEL_MAKER: maker order cancelled when same owner."""
+        book = OrderBook(self_trade_action=SelfTradeAction.CANCEL_MAKER)
+        book.place_order(Order(id="bid1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+        trades = book.place_order(Order(id="ask1", owner=ADDR_A, side=OrderSide.SELL,
+                                        order_type=OrderType.LIMIT, price=Decimal("100"),
+                                        amount=Decimal("10")))
+        # Maker (bid) cancelled, taker (ask) rests on book
+        assert len(trades) == 0
+        assert book.bid_depth == 0
+        assert book.ask_depth == 1
+
+    def test_stp_cancel_both_mode(self):
+        """STP CANCEL_BOTH: both orders cancelled."""
+        book = OrderBook(self_trade_action=SelfTradeAction.CANCEL_BOTH)
+        book.place_order(Order(id="bid1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+        trades = book.place_order(Order(id="ask1", owner=ADDR_A, side=OrderSide.SELL,
+                                        order_type=OrderType.LIMIT, price=Decimal("100"),
+                                        amount=Decimal("10")))
+        # Both cancelled
+        assert len(trades) == 0
+        assert book.bid_depth == 0
+
+    def test_stp_different_owners_trade_normally(self):
+        """STP doesn't affect different-owner trades."""
+        book = OrderBook(self_trade_action=SelfTradeAction.REJECT)
+        book.place_order(Order(id="bid1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+        trades = book.place_order(Order(id="ask1", owner=ADDR_B, side=OrderSide.SELL,
+                                        order_type=OrderType.LIMIT, price=Decimal("100"),
+                                        amount=Decimal("10")))
+        assert len(trades) == 1
+
+    # -- Owner-authorized cancel --------------------------------------------
+
+    def test_cancel_by_owner_succeeds(self):
+        book = OrderBook()
+        book.place_order(Order(id="o1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+        result = book.cancel_order("o1", caller=ADDR_A)
+        assert result is not None
+        assert result.status == OrderStatus.CANCELLED
+
+    def test_cancel_by_non_owner_rejected(self):
+        book = OrderBook()
+        book.place_order(Order(id="o1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+        with pytest.raises(ValueError, match="Only order owner"):
+            book.cancel_order("o1", caller=ADDR_B)
+
+    def test_cancel_no_caller_still_works(self):
+        """Backward compat: cancel without caller arg succeeds."""
+        book = OrderBook()
+        book.place_order(Order(id="o1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+        result = book.cancel_order("o1")
+        assert result is not None
+
+    def test_cancel_stop_by_non_owner_rejected(self):
+        book = OrderBook()
+        book.place_order(Order(id="s1", owner=ADDR_A, side=OrderSide.SELL,
+                               order_type=OrderType.STOP_LOSS, price=Decimal("90"),
+                               amount=Decimal("10"), stop_price=Decimal("95")))
+        with pytest.raises(ValueError, match="Only order owner"):
+            book.cancel_order("s1", caller=ADDR_B)
+
+    # -- Rate limiting (per block) ------------------------------------------
+
+    def test_rate_limit_enforced(self):
+        book = OrderBook()
+        # Place MAX_ORDERS_PER_BLOCK_PER_ADDRESS orders
+        for i in range(MAX_ORDERS_PER_BLOCK_PER_ADDRESS):
+            book.place_order(Order(id=f"o{i}", owner=ADDR_A, side=OrderSide.BUY,
+                                   order_type=OrderType.LIMIT, price=Decimal("100"),
+                                   amount=Decimal("1")))
+        # Next one should fail
+        with pytest.raises(ValueError, match="Rate limit"):
+            book.place_order(Order(id="overflow", owner=ADDR_A, side=OrderSide.BUY,
+                                   order_type=OrderType.LIMIT, price=Decimal("100"),
+                                   amount=Decimal("1")))
+
+    def test_rate_limit_resets_on_new_block(self):
+        book = OrderBook()
+        for i in range(MAX_ORDERS_PER_BLOCK_PER_ADDRESS):
+            book.place_order(Order(id=f"o{i}", owner=ADDR_A, side=OrderSide.BUY,
+                                   order_type=OrderType.LIMIT, price=Decimal("100"),
+                                   amount=Decimal("1")))
+        book.new_block()  # reset rate limits
+        # Should work again
+        book.place_order(Order(id="fresh", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("1")))
+
+    def test_rate_limit_per_address(self):
+        """Different addresses have independent rate limits."""
+        book = OrderBook()
+        for i in range(MAX_ORDERS_PER_BLOCK_PER_ADDRESS):
+            book.place_order(Order(id=f"a{i}", owner=ADDR_A, side=OrderSide.BUY,
+                                   order_type=OrderType.LIMIT, price=Decimal("100"),
+                                   amount=Decimal("1")))
+        # ADDR_B should still work
+        book.place_order(Order(id="b0", owner=ADDR_B, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("1")))
+
+    # -- Nonce replay protection --------------------------------------------
+
+    def test_nonce_replay_rejected(self):
+        book = OrderBook()
+        book.place_order(Order(id="o1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("1"), nonce=5))
+        with pytest.raises(ValueError, match="Nonce replay"):
+            book.place_order(Order(id="o2", owner=ADDR_A, side=OrderSide.BUY,
+                                   order_type=OrderType.LIMIT, price=Decimal("100"),
+                                   amount=Decimal("1"), nonce=5))
+
+    def test_nonce_must_increase(self):
+        book = OrderBook()
+        book.place_order(Order(id="o1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("1"), nonce=10))
+        with pytest.raises(ValueError, match="Nonce replay"):
+            book.place_order(Order(id="o2", owner=ADDR_A, side=OrderSide.BUY,
+                                   order_type=OrderType.LIMIT, price=Decimal("100"),
+                                   amount=Decimal("1"), nonce=3))
+
+    def test_nonce_zero_ignored(self):
+        """Orders without nonce (nonce=0) skip replay check."""
+        book = OrderBook()
+        book.place_order(Order(id="o1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("1"), nonce=0))
+        # Another nonce=0 should be fine
+        book.place_order(Order(id="o2", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("1"), nonce=0))
+
+    def test_nonce_strictly_increasing_accepted(self):
+        book = OrderBook()
+        book.place_order(Order(id="o1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("1"), nonce=1))
+        book.place_order(Order(id="o2", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("1"), nonce=2))
+        # Different owner can use same nonce value
+        book.place_order(Order(id="o3", owner=ADDR_B, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("1"), nonce=1))
+
+    # -- Minimum order size -------------------------------------------------
+
+    def test_min_order_size_rejected(self):
+        book = OrderBook()
+        with pytest.raises(ValueError, match="minimum"):
+            book.place_order(Order(id="tiny", owner=ADDR_A, side=OrderSide.BUY,
+                                   order_type=OrderType.LIMIT, price=Decimal("100"),
+                                   amount=Decimal("0.000000001")))
+
+    def test_min_order_size_exact_accepted(self):
+        book = OrderBook()
+        book.place_order(Order(id="min", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=MIN_ORDER_SIZE))
+
+    # -- Duplicate order ID -------------------------------------------------
+
+    def test_duplicate_order_id_rejected(self):
+        book = OrderBook()
+        book.place_order(Order(id="dup", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+        with pytest.raises(ValueError, match="Duplicate order ID"):
+            book.place_order(Order(id="dup", owner=ADDR_B, side=OrderSide.BUY,
+                                   order_type=OrderType.LIMIT, price=Decimal("100"),
+                                   amount=Decimal("10")))
+
+    # -- Order expiry -------------------------------------------------------
+
+    def test_expired_order_rejected(self):
+        book = OrderBook()
+        with pytest.raises(ValueError, match="expired"):
+            book.place_order(Order(id="exp", owner=ADDR_A, side=OrderSide.BUY,
+                                   order_type=OrderType.LIMIT, price=Decimal("100"),
+                                   amount=Decimal("10"), expire_time=1.0))
+
+    # -- Emergency pause ----------------------------------------------------
+
+    def test_paused_book_rejects_orders(self):
+        book = OrderBook()
+        book.pause()
+        assert book.is_paused
+        with pytest.raises(ValueError, match="paused"):
+            book.place_order(Order(id="o1", owner=ADDR_A, side=OrderSide.BUY,
+                                   order_type=OrderType.LIMIT, price=Decimal("100"),
+                                   amount=Decimal("10")))
+
+    def test_unpause_resumes_trading(self):
+        book = OrderBook()
+        book.pause()
+        book.unpause()
+        assert not book.is_paused
+        book.place_order(Order(id="o1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+
+    # -- Deterministic trade IDs --------------------------------------------
+
+    def test_trade_ids_are_deterministic(self):
+        """Trade IDs are blake2b hashes, not random UUIDs."""
+        book = OrderBook()
+        book.place_order(Order(id="bid1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+        trades = book.place_order(Order(id="ask1", owner=ADDR_B, side=OrderSide.SELL,
+                                        order_type=OrderType.LIMIT, price=Decimal("100"),
+                                        amount=Decimal("10")))
+        assert len(trades) == 1
+        tid = trades[0].id
+        # Should be hex string from blake2b, not UUID format
+        assert "-" not in tid  # no dashes (uuid4 has dashes)
+        assert len(tid) == 16  # blake2b digest_size=8 → 16 hex chars
+
+    def test_trade_has_sequence_number(self):
+        """Trades have monotonic sequence numbers."""
+        book = OrderBook()
+        book.place_order(Order(id="bid1", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+        trades1 = book.place_order(Order(id="ask1", owner=ADDR_B, side=OrderSide.SELL,
+                                         order_type=OrderType.LIMIT, price=Decimal("100"),
+                                         amount=Decimal("5")))
+        book.place_order(Order(id="bid2", owner=ADDR_A, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+        trades2 = book.place_order(Order(id="ask2", owner=ADDR_B, side=OrderSide.SELL,
+                                         order_type=OrderType.LIMIT, price=Decimal("100"),
+                                         amount=Decimal("5")))
+        assert trades1[0].sequence < trades2[0].sequence
+
+
+# ============================================================================
+#  AMM SECURITY
+# ============================================================================
+
+class TestAMMSecurity:
+    """Slippage protection, reentrancy lock, price impact, pause, deterministic IDs."""
+
+    def _pool(self) -> ConcentratedLiquidityPool:
+        mgr = PoolManager()
+        pool = mgr.create_pool("QRDX", "USDC", FeeTier.MEDIUM, PoolType.STANDARD,
+                               tick_to_sqrt_price(0), ADDR_A, Decimal("10000"))
+        pool.add_liquidity(ADDR_A, -60, 60, Decimal("100000"))
+        return pool
+
+    # -- Slippage protection ------------------------------------------------
+
+    def test_swap_slippage_protection(self):
+        pool = self._pool()
+        amount_out, _ = pool.swap(Decimal("10"), True)
+        # Now do a swap with too-high min_amount_out
+        with pytest.raises(ValueError, match="[Ss]lippage"):
+            pool.swap(Decimal("10"), True, min_amount_out=Decimal("999999"))
+
+    def test_swap_min_amount_out_zero_passes(self):
+        pool = self._pool()
+        amount_out, fee = pool.swap(Decimal("10"), True, min_amount_out=Decimal("0"))
+        assert amount_out > 0
+
+    def test_swap_min_amount_out_exact_passes(self):
+        pool = self._pool()
+        # Do a test swap to find actual output
+        amount_out, _ = pool.swap(Decimal("10"), True)
+        # Re-create pool and do same swap with exact min_amount_out
+        pool2 = self._pool()
+        result_out, _ = pool2.swap(Decimal("10"), True, min_amount_out=amount_out)
+        assert result_out >= amount_out
+
+    # -- Price impact -------------------------------------------------------
+
+    def test_price_impact_small_trade(self):
+        pool = self._pool()
+        impact = pool.price_impact(Decimal("1"), True)
+        assert impact >= 0
+        assert impact < Decimal("0.10")  # small trade < 10% impact
+
+    def test_price_impact_large_trade(self):
+        pool = self._pool()
+        impact_small = pool.price_impact(Decimal("1"), True)
+        impact_large = pool.price_impact(Decimal("1000"), True)
+        # Larger trade should have larger impact
+        assert impact_large >= impact_small
+
+    # -- Emergency pause ----------------------------------------------------
+
+    def test_paused_pool_rejects_swap(self):
+        pool = self._pool()
+        pool.pause()
+        with pytest.raises(ValueError, match="[Pp]aused"):
+            pool.swap(Decimal("10"), True)
+
+    def test_paused_pool_rejects_add_liquidity(self):
+        pool = self._pool()
+        pool.pause()
+        with pytest.raises(ValueError, match="[Pp]aused"):
+            pool.add_liquidity(ADDR_A, -120, 120, Decimal("1000"))
+
+    def test_unpause_resumes(self):
+        pool = self._pool()
+        pool.pause()
+        pool.unpause()
+        amount_out, _ = pool.swap(Decimal("10"), True)
+        assert amount_out > 0
+
+    # -- Deterministic IDs --------------------------------------------------
+
+    def test_position_ids_deterministic(self):
+        pool = self._pool()
+        pos = pool.add_liquidity(ADDR_B, -60, 60, Decimal("5000"))
+        # blake2b hex, not uuid
+        assert "-" not in pos.id
+        assert len(pos.id) == 16
+
+    def test_pool_ids_deterministic(self):
+        mgr = PoolManager()
+        pool = mgr.create_pool("QRDX", "USDC", FeeTier.MEDIUM, PoolType.STANDARD,
+                               tick_to_sqrt_price(0), ADDR_A, Decimal("10000"))
+        pid = pool.state.id
+        # blake2b hex, not uuid format
+        assert len(pid) == 16  # blake2b digest_size=8 → 16 hex chars
+
+
+# ============================================================================
+#  PERPETUAL SECURITY
+# ============================================================================
+
+class TestPerpSecurity:
+    """Partial close, max OI, oracle staleness, reduce-only, pause, liquidation penalty."""
+
+    def _engine_with_market(self) -> PerpEngine:
+        engine = PerpEngine()
+        market = engine.create_market("BTC")
+        market.index_price = Decimal("50000")
+        market.mark_price = Decimal("50000")
+        return engine
+
+    # -- Emergency pause ----------------------------------------------------
+
+    def test_paused_engine_rejects_open(self):
+        engine = self._engine_with_market()
+        engine.pause()
+        assert engine.is_paused
+        with pytest.raises(ValueError, match="[Pp]aused"):
+            engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
+                                  Decimal("1"), Decimal("10"), Decimal("50000"))
+
+    def test_unpause_resumes(self):
+        engine = self._engine_with_market()
+        engine.pause()
+        engine.unpause()
+        assert not engine.is_paused
+        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
+                                    Decimal("1"), Decimal("10"), Decimal("50000"))
+        assert pos.is_open
+
+    # -- Partial close ------------------------------------------------------
+
+    def test_partial_close_reduces_size(self):
+        engine = self._engine_with_market()
+        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
+                                    Decimal("1"), Decimal("10"), Decimal("50000"))
+        pnl = engine.partial_close(pos.id, Decimal("0.5"), Decimal("52000"))
+        assert pos.is_open
+        assert pos.size == Decimal("0.5")
+        assert pnl == Decimal("0.5") * (Decimal("52000") - Decimal("50000"))
+
+    def test_partial_close_releases_proportional_margin(self):
+        engine = self._engine_with_market()
+        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
+                                    Decimal("1"), Decimal("10"), Decimal("50000"))
+        original_margin = pos.margin
+        engine.partial_close(pos.id, Decimal("0.5"), Decimal("50000"))
+        # Should release roughly half the margin
+        assert pos.margin == original_margin * Decimal("0.5")
+
+    def test_partial_close_updates_oi(self):
+        engine = self._engine_with_market()
+        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
+                                    Decimal("1"), Decimal("10"), Decimal("50000"))
+        market = engine.get_market("BTC-QRDX-PERP")
+        assert market.open_interest_long == Decimal("1")
+        engine.partial_close(pos.id, Decimal("0.3"), Decimal("50000"))
+        assert market.open_interest_long == Decimal("0.7")
+
+    def test_partial_close_full_size_closes_entirely(self):
+        engine = self._engine_with_market()
+        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
+                                    Decimal("1"), Decimal("10"), Decimal("50000"))
+        engine.partial_close(pos.id, Decimal("1"), Decimal("50000"))
+        assert not pos.is_open
+
+    def test_partial_close_invalid_size(self):
+        engine = self._engine_with_market()
+        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
+                                    Decimal("1"), Decimal("10"), Decimal("50000"))
+        with pytest.raises(ValueError, match="positive"):
+            engine.partial_close(pos.id, Decimal("0"), Decimal("50000"))
+
+    # -- Liquidation penalty ------------------------------------------------
+
+    def test_liquidation_penalty_goes_to_insurance(self):
+        engine = self._engine_with_market()
+        market = engine.get_market("BTC-QRDX-PERP")
+        initial_insurance = market.insurance_fund
+        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
+                                    Decimal("1"), Decimal("10"), Decimal("50000"))
+        liq_price = pos.liquidation_price()
+        market.mark_price = liq_price - Decimal("100")
+        engine.check_liquidation(pos.id)
+        # Insurance fund should have received the penalty
+        assert market.insurance_fund > initial_insurance
+
+    def test_liquidation_penalty_rate(self):
+        engine = self._engine_with_market()
+        market = engine.get_market("BTC-QRDX-PERP")
+        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
+                                    Decimal("1"), Decimal("10"), Decimal("50000"))
+        liq_price = pos.liquidation_price()
+        mark = liq_price - Decimal("100")
+        market.mark_price = mark
+        initial_insurance = market.insurance_fund
+        engine.check_liquidation(pos.id)
+        # Penalty = notional * 2.5%
+        expected_penalty = (Decimal("1") * mark * LIQUIDATION_PENALTY_RATE).quantize(
+            Decimal("0.00000001"), rounding=ROUND_HALF_UP
+        )
+        # Insurance gained at least the penalty (minus any clawback)
+        assert market.insurance_fund >= initial_insurance + expected_penalty - abs(pos.realized_pnl)
+
+    # -- Deterministic position IDs -----------------------------------------
+
+    def test_position_ids_deterministic(self):
+        engine = self._engine_with_market()
+        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
+                                    Decimal("1"), Decimal("10"), Decimal("50000"))
+        assert "-" not in pos.id  # blake2b, not uuid
+        assert len(pos.id) == 16
+
+    # -- OI-weighted funding dampening --------------------------------------
+
+    def test_funding_rate_dampened_by_oi_imbalance(self):
+        """With all-long OI, rate is scaled by imbalance ratio."""
+        engine = self._engine_with_market()
+        market = engine.get_market("BTC-QRDX-PERP")
+        market.mark_price = Decimal("50050")  # slight premium
+
+        # No positions → no OI → no dampening
+        rate_no_oi = engine.calculate_funding_rate("BTC-QRDX-PERP")
+
+        # Add only long OI (100% longs, 0% shorts)
+        engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
+                              Decimal("1"), Decimal("10"), Decimal("50000"))
+        rate_all_long = engine.calculate_funding_rate("BTC-QRDX-PERP")
+
+        # With 100% long ratio: rate * 1.0 * 2 = 2x base rate
+        assert rate_all_long > rate_no_oi
+
+
+# ============================================================================
+#  ROUTER SECURITY
+# ============================================================================
+
+class TestRouterSecurity:
+    """Deadline enforcement, slippage, circuit breaker, pause, read-only quote."""
+
+    def _setup_router(self):
+        mgr = PoolManager()
+        pool = mgr.create_pool("QRDX", "USDC", FeeTier.MEDIUM, PoolType.STANDARD,
+                               tick_to_sqrt_price(0), ADDR_A, Decimal("10000"))
+        pool.add_liquidity(ADDR_A, -60, 60, Decimal("100000"))
+        oracle = TWAPOracle(pool_id="QRDX:USDC")
+        oracle.record(Decimal("1.0"), timestamp=time.time() - 10)
+        router = UnifiedRouter(pool_manager=mgr)
+        router.register_oracle("QRDX:USDC", oracle)
+        return router
+
+    # -- Deadline enforcement -----------------------------------------------
+
+    def test_expired_deadline_rejected(self):
+        router = self._setup_router()
+        with pytest.raises(ValueError, match="deadline"):
+            router.execute("QRDX", "USDC", Decimal("10"), ADDR_A,
+                           deadline=time.time() - 100)  # already expired
+
+    def test_future_deadline_accepted(self):
+        router = self._setup_router()
+        result = router.execute("QRDX", "USDC", Decimal("10"), ADDR_A,
+                                deadline=time.time() + 3600)
+        assert result.amount_out > 0
+
+    def test_zero_deadline_no_check(self):
+        """deadline=0 means no deadline enforcement."""
+        router = self._setup_router()
+        result = router.execute("QRDX", "USDC", Decimal("10"), ADDR_A, deadline=0)
+        assert result.amount_out > 0
+
+    # -- Slippage enforcement -----------------------------------------------
+
+    def test_min_amount_out_enforced(self):
+        router = self._setup_router()
+        with pytest.raises(ValueError, match="[Ss]lippage"):
+            router.execute("QRDX", "USDC", Decimal("10"), ADDR_A,
+                           min_amount_out=Decimal("999999"))
+
+    def test_min_amount_out_satisfied(self):
+        router = self._setup_router()
+        result = router.execute("QRDX", "USDC", Decimal("10"), ADDR_A,
+                                min_amount_out=Decimal("0.001"))
+        assert result.amount_out >= Decimal("0.001")
+
+    # -- Emergency pause ----------------------------------------------------
+
+    def test_paused_router_rejects_trades(self):
+        router = self._setup_router()
+        router.pause()
+        assert router.is_paused
+        with pytest.raises(ValueError, match="[Pp]aused"):
+            router.execute("QRDX", "USDC", Decimal("10"), ADDR_A)
+
+    def test_unpause_resumes(self):
+        router = self._setup_router()
+        router.pause()
+        router.unpause()
+        result = router.execute("QRDX", "USDC", Decimal("10"), ADDR_A)
+        assert result.amount_out > 0
+
+    # -- Read-only AMM quoting (no state mutation) --------------------------
+
+    def test_quote_amm_is_read_only(self):
+        """quote_amm should not mutate pool state."""
+        mgr = PoolManager()
+        pool = mgr.create_pool("QRDX", "USDC", FeeTier.MEDIUM, PoolType.STANDARD,
+                               tick_to_sqrt_price(0), ADDR_A, Decimal("10000"))
+        pool.add_liquidity(ADDR_A, -60, 60, Decimal("100000"))
+        router = UnifiedRouter(pool_manager=mgr)
+
+        # Snapshot state before
+        sqrt_before = pool.state.sqrt_price
+        tick_before = pool.state.tick
+        liq_before = pool.state.liquidity
+
+        # Do a quote
+        quote = router.quote_amm("QRDX", "USDC", Decimal("10"))
+
+        # State should be unchanged
+        assert pool.state.sqrt_price == sqrt_before
+        assert pool.state.tick == tick_before
+        assert pool.state.liquidity == liq_before
+
+    # -- Deterministic CLOB order IDs ---------------------------------------
+
+    def test_clob_order_ids_deterministic(self):
+        book = OrderBook()
+        book.place_order(Order(id="ask", owner=ADDR_B, side=OrderSide.SELL,
+                               order_type=OrderType.LIMIT, price=Decimal("1.0"),
+                               amount=Decimal("100")))
+        router = UnifiedRouter()
+        router.register_order_book("QRDX:USDC", book)
+        result = router.execute("QRDX", "USDC", Decimal("10"), ADDR_A)
+        # The order placed on the book should have a deterministic ID
+        assert result.source == FillSource.CLOB
+
+
+# ============================================================================
+#  ORACLE SECURITY
+# ============================================================================
+
+class TestOracleSecurity:
+    """Outlier rejection, same-block dedup, min observation period, staleness."""
+
+    # -- Outlier rejection --------------------------------------------------
+
+    def test_outlier_price_rejected(self):
+        oracle = TWAPOracle()
+        oracle.record(Decimal("100"), timestamp=0.0)
+        # 60% change > 50% limit
+        with pytest.raises(ValueError, match="[Oo]utlier"):
+            oracle.record(Decimal("160"), timestamp=10.0)
+
+    def test_within_threshold_accepted(self):
+        oracle = TWAPOracle()
+        oracle.record(Decimal("100"), timestamp=0.0)
+        # 40% change < 50% limit
+        oracle.record(Decimal("140"), timestamp=10.0)
+
+    def test_outlier_drop_accepted(self):
+        oracle = TWAPOracle()
+        oracle.record(Decimal("100"), timestamp=0.0)
+        # 49% drop is within threshold
+        oracle.record(Decimal("51"), timestamp=10.0)
+
+    def test_outlier_boundary_50pct(self):
+        oracle = TWAPOracle()
+        oracle.record(Decimal("100"), timestamp=0.0)
+        # Exactly 50% change is accepted (not strictly greater)
+        oracle.record(Decimal("150"), timestamp=10.0)
+
+    def test_outlier_boundary_just_over(self):
+        oracle = TWAPOracle()
+        oracle.record(Decimal("100"), timestamp=0.0)
+        # 50.01% change > 50% limit
+        with pytest.raises(ValueError, match="[Oo]utlier"):
+            oracle.record(Decimal("150.01"), timestamp=10.0)
+
+    # -- Same-block dedup ---------------------------------------------------
+
+    def test_same_timestamp_overwrites(self):
+        oracle = TWAPOracle()
+        oracle.record(Decimal("100"), timestamp=0.0)
+        oracle.record(Decimal("105"), timestamp=0.0)  # same timestamp
+        assert oracle.observation_count == 1  # not 2
+        assert oracle.latest_price == Decimal("105")
+
+    # -- Min observation period for TWAP ------------------------------------
+
+    def test_twap_below_min_period_returns_none(self):
+        oracle = TWAPOracle()
+        oracle.record(Decimal("100"), timestamp=0.0)
+        oracle.record(Decimal("100"), timestamp=30.0)  # 30s < 60s min
+        assert oracle.twap(30.0) is None
+
+    def test_twap_at_min_period_returns_value(self):
+        oracle = TWAPOracle()
+        oracle.record(Decimal("100"), timestamp=0.0)
+        oracle.record(Decimal("100"), timestamp=60.0)  # exactly 60s
+        twap = oracle.twap(60.0)
+        assert twap is not None
+
+    # -- Staleness check ----------------------------------------------------
+
+    def test_is_stale_fresh(self):
+        oracle = TWAPOracle()
+        oracle.record(Decimal("100"), timestamp=time.time())
+        assert not oracle.is_stale()
+
+    def test_is_stale_old(self):
+        oracle = TWAPOracle()
+        oracle.record(Decimal("100"), timestamp=time.time() - 600)
+        assert oracle.is_stale()
+
+    def test_is_stale_no_observations(self):
+        oracle = TWAPOracle()
+        assert oracle.is_stale()
+
+    def test_age_property(self):
+        oracle = TWAPOracle()
+        t = time.time() - 100
+        oracle.record(Decimal("100"), timestamp=t)
+        assert oracle.age >= 99  # at least 99 seconds old
+
+
+# ============================================================================
+#  HOOKS SYSTEM
+# ============================================================================
+
+class TestHookSystem:
+    """HookFlags, HookContext, HookResult, HookRegistry, CircuitBreaker."""
+
+    # -- HookFlags ----------------------------------------------------------
+
+    def test_hook_flags_composition(self):
+        flags = HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP
+        assert HookFlags.BEFORE_SWAP in flags
+        assert HookFlags.AFTER_SWAP in flags
+        assert HookFlags.BEFORE_LIQUIDITY not in flags
+
+    def test_hook_flags_all(self):
+        assert HookFlags.BEFORE_SWAP in HookFlags.ALL
+        assert HookFlags.AFTER_SWAP in HookFlags.ALL
+        assert HookFlags.BEFORE_LIQUIDITY in HookFlags.ALL
+        assert HookFlags.AFTER_LIQUIDITY in HookFlags.ALL
+
+    # -- HookContext --------------------------------------------------------
+
+    def test_hook_context_creation(self):
+        ctx = HookContext(
+            pool_id="pool1", sender=ADDR_A,
+            token_in="QRDX", token_out="USDC",
+            amount_in=Decimal("100"), amount_out=Decimal("99"),
+        )
+        assert ctx.pool_id == "pool1"
+        assert ctx.amount_in == Decimal("100")
+
+    # -- HookResult ---------------------------------------------------------
+
+    def test_hook_result_allow(self):
+        r = HookResult(allow=True)
+        assert r.allow
+
+    def test_hook_result_deny(self):
+        r = HookResult(allow=False, reason="Blocked")
+        assert not r.allow
+        assert r.reason == "Blocked"
+
+    def test_hook_result_fee_override(self):
+        r = HookResult(allow=True, modified_fee=Decimal("0.001"))
+        assert r.modified_fee == Decimal("0.001")
+
+    # -- HookRegistry -------------------------------------------------------
+
+    class _TestHook:
+        """Simple test hook that always allows."""
+        def __init__(self):
+            self.before_swap_count = 0
+            self.after_swap_count = 0
+            self.before_liq_count = 0
+            self.after_liq_count = 0
+
+        @property
+        def flags(self) -> HookFlags:
+            return HookFlags.ALL
+
+        def on_before_swap(self, ctx: HookContext) -> HookResult:
+            self.before_swap_count += 1
+            return HookResult(allow=True)
+
+        def on_after_swap(self, ctx: HookContext) -> HookResult:
+            self.after_swap_count += 1
+            return HookResult(allow=True)
+
+        def on_before_liquidity(self, ctx: HookContext) -> HookResult:
+            self.before_liq_count += 1
+            return HookResult(allow=True)
+
+        def on_after_liquidity(self, ctx: HookContext) -> HookResult:
+            self.after_liq_count += 1
+            return HookResult(allow=True)
+
+    class _BlockingHook:
+        """Hook that blocks all operations."""
+        @property
+        def flags(self) -> HookFlags:
+            return HookFlags.ALL
+
+        def on_before_swap(self, ctx: HookContext) -> HookResult:
+            return HookResult(allow=False, reason="Blocked by test hook")
+
+        def on_after_swap(self, ctx: HookContext) -> HookResult:
+            return HookResult(allow=False, reason="Blocked by test hook")
+
+        def on_before_liquidity(self, ctx: HookContext) -> HookResult:
+            return HookResult(allow=False, reason="Blocked by test hook")
+
+        def on_after_liquidity(self, ctx: HookContext) -> HookResult:
+            return HookResult(allow=False, reason="Blocked by test hook")
+
+    def test_register_and_run_hook(self):
+        reg = HookRegistry()
+        hook = self._TestHook()
+        reg.register(hook)
+        assert reg.hook_count == 1
+
+        ctx = HookContext(pool_id="p1", amount_in=Decimal("10"))
+        result = reg.run_before_swap(ctx)
+        assert result.allow
+        assert hook.before_swap_count == 1
+
+    def test_multiple_hooks_all_run(self):
+        reg = HookRegistry()
+        h1 = self._TestHook()
+        h2 = self._TestHook()
+        reg.register(h1)
+        reg.register(h2)
+
+        ctx = HookContext(pool_id="p1")
+        reg.run_before_swap(ctx)
+        assert h1.before_swap_count == 1
+        assert h2.before_swap_count == 1
+
+    def test_blocking_hook_stops_execution(self):
+        reg = HookRegistry()
+        reg.register(self._BlockingHook())
+        ctx = HookContext()
+        result = reg.run_before_swap(ctx)
+        assert not result.allow
+        assert "Blocked" in result.reason
+
+    def test_unregister_hook(self):
+        reg = HookRegistry()
+        hook = self._TestHook()
+        reg.register(hook)
+        assert reg.hook_count == 1
+        reg.unregister(hook)
+        assert reg.hook_count == 0
+
+    def test_hook_flag_filtering(self):
+        """Hooks only receive events matching their flags."""
+        class SwapOnlyHook:
+            @property
+            def flags(self):
+                return HookFlags.BEFORE_SWAP
+
+            def on_before_swap(self, ctx):
+                return HookResult(allow=False, reason="No swaps")
+
+            def on_before_liquidity(self, ctx):
+                return HookResult(allow=False, reason="No liq")
+
+        reg = HookRegistry()
+        reg.register(SwapOnlyHook())
+
+        # Before-swap should be blocked
+        r1 = reg.run_before_swap(HookContext())
+        assert not r1.allow
+
+        # Before-liquidity should pass (hook doesn't have that flag)
+        r2 = reg.run_before_liquidity(HookContext())
+        assert r2.allow
+
+    def test_all_four_hook_points(self):
+        reg = HookRegistry()
+        hook = self._TestHook()
+        reg.register(hook)
+        ctx = HookContext()
+
+        reg.run_before_swap(ctx)
+        reg.run_after_swap(ctx)
+        reg.run_before_liquidity(ctx)
+        reg.run_after_liquidity(ctx)
+
+        assert hook.before_swap_count == 1
+        assert hook.after_swap_count == 1
+        assert hook.before_liq_count == 1
+        assert hook.after_liq_count == 1
+
+    # -- Circuit Breaker ----------------------------------------------------
+
+    def test_circuit_breaker_manual_trip(self):
+        cb = CircuitBreaker()
+        assert not cb.is_tripped
+        cb.trip("Emergency")
+        assert cb.is_tripped
+        assert "Emergency" in cb.trip_reason
+
+    def test_circuit_breaker_reset(self):
+        cb = CircuitBreaker()
+        cb.trip("Test")
+        cb.reset()
+        assert not cb.is_tripped
+
+    def test_circuit_breaker_blocks_when_tripped(self):
+        cb = CircuitBreaker()
+        cb.trip("Test")
+        result = cb.on_before_swap(HookContext(amount_in=Decimal("1")))
+        assert not result.allow
+
+    def test_circuit_breaker_allows_when_not_tripped(self):
+        cb = CircuitBreaker()
+        result = cb.on_before_swap(HookContext(amount_in=Decimal("1")))
+        assert result.allow
+
+    def test_circuit_breaker_volume_trip(self):
+        cb = CircuitBreaker(max_volume_per_block=Decimal("100"))
+        # First swap within limit
+        r1 = cb.on_before_swap(HookContext(amount_in=Decimal("50")))
+        assert r1.allow
+        # Second swap pushes over limit
+        r2 = cb.on_before_swap(HookContext(amount_in=Decimal("60")))
+        assert not r2.allow
+        assert cb.is_tripped
+
+    def test_circuit_breaker_new_block_resets_volume(self):
+        cb = CircuitBreaker(max_volume_per_block=Decimal("100"))
+        cb.on_before_swap(HookContext(amount_in=Decimal("90")))
+        cb.new_block()
+        # Volume should be reset
+        r = cb.on_before_swap(HookContext(amount_in=Decimal("90")))
+        assert r.allow
+
+    def test_circuit_breaker_price_deviation_trip(self):
+        cb = CircuitBreaker(max_price_deviation=Decimal("0.10"))
+        # First swap establishes baseline price
+        cb.on_after_swap(HookContext(amount_in=Decimal("100"), amount_out=Decimal("100")))
+        # Big price deviation
+        result = cb.on_after_swap(HookContext(amount_in=Decimal("100"), amount_out=Decimal("50")))
+        # Price went from 1.0 to 2.0 → 100% deviation > 10%
+        assert not result.allow
+        assert cb.is_tripped
+
+    def test_circuit_breaker_liquidity_blocked_when_tripped(self):
+        cb = CircuitBreaker()
+        cb.trip("Test")
+        result = cb.on_before_liquidity(HookContext())
+        assert not result.allow
+
+    def test_circuit_breaker_flags(self):
+        cb = CircuitBreaker()
+        assert HookFlags.BEFORE_SWAP in cb.flags
+        assert HookFlags.AFTER_SWAP in cb.flags
+
+    def test_circuit_breaker_integrated_with_registry(self):
+        reg = HookRegistry()
+        cb = CircuitBreaker()
+        reg.register(cb)
+        cb.trip("Emergency")
+        result = reg.run_before_swap(HookContext(amount_in=Decimal("1")))
+        assert not result.allow

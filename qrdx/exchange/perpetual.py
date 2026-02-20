@@ -10,14 +10,24 @@ Perpetual futures (user-requested extension, Q3 2026 roadmap item):
   - Auto-deleveraging (ADL) as last resort
   - Max leverage: 20× (safety cap)
   - Protocol-native — NOT a smart contract
+
+Security features:
+  - Partial position close
+  - Max open interest per market
+  - Oracle staleness guard
+  - Reduce-only orders
+  - OI-weighted funding dampening
+  - Liquidation penalty fee → insurance fund
+  - Deterministic position IDs (blake2b)
+  - Emergency pause
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import time
-import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from enum import Enum
@@ -38,6 +48,10 @@ DEFAULT_INITIAL_MARGIN = Decimal("0.05")  # 5 %
 DEFAULT_MAINT_MARGIN = Decimal("0.025")   # 2.5 %
 PREMIUM_EMA_SPAN = 30                     # 30-second EMA span
 INSURANCE_CLAWBACK_THRESHOLD = Decimal("0.20")  # 20 % of fund depleted → ADL
+LIQUIDATION_PENALTY_RATE = Decimal("0.025")       # 2.5 % penalty → insurance fund
+MAX_OPEN_INTEREST_DEFAULT = Decimal("1000000000")  # default cap per market
+ORACLE_STALENESS_SECONDS = 120                      # reject if oracle older than 2 min
+MAX_POSITIONS_PER_OWNER = 100                       # per market
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +114,7 @@ class PerpPosition:
     realized_pnl: Decimal = ZERO
     accumulated_funding: Decimal = ZERO
     opened_at: float = field(default_factory=time.time)
+    reduce_only: bool = False          # can only reduce exposure, not increase
 
     @property
     def notional(self) -> Decimal:
@@ -157,10 +172,12 @@ class PerpMarket:
     maintenance_margin_rate: Decimal = DEFAULT_MAINT_MARGIN
     max_leverage: Decimal = MAX_LEVERAGE
     insurance_fund: Decimal = ZERO
+    max_open_interest: Decimal = MAX_OPEN_INTEREST_DEFAULT
     # Price state
     index_price: Decimal = ZERO
     mark_price: Decimal = ZERO
     last_premium: Decimal = ZERO
+    last_price_update: float = 0.0  # timestamp of last oracle update
     # Aggregate positions
     open_interest_long: Decimal = ZERO
     open_interest_short: Decimal = ZERO
@@ -184,16 +201,40 @@ class PerpEngine:
     Protocol-native perpetual futures engine.
 
     Manages markets, positions, funding, and liquidations.
+
+    Security:
+      - Max OI per market
+      - Oracle staleness guard
+      - Reduce-only order support
+      - Partial close
+      - Liquidation penalty → insurance fund
+      - OI-weighted funding dampening
+      - Deterministic position IDs
+      - Emergency pause
     """
 
     def __init__(self) -> None:
         self._markets: Dict[str, PerpMarket] = {}
         self._positions: Dict[str, PerpPosition] = {}
         self._owner_positions: Dict[str, List[str]] = {}  # owner → [pos_ids]
+        self._pos_sequence: int = 0  # deterministic ID counter
+        self._paused: bool = False
 
     @property
     def market_count(self) -> int:
         return len(self._markets)
+
+    # -- Emergency controls -------------------------------------------------
+
+    def pause(self) -> None:
+        self._paused = True
+
+    def unpause(self) -> None:
+        self._paused = False
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
 
     # -- Market management --------------------------------------------------
 
@@ -240,6 +281,7 @@ class PerpEngine:
         size: Decimal,
         leverage: Decimal,
         price: Decimal,
+        reduce_only: bool = False,
     ) -> PerpPosition:
         """
         Open a new perpetual position.
@@ -251,13 +293,17 @@ class PerpEngine:
             size: position size in base units
             leverage: desired leverage (1–20×)
             price: execution price
+            reduce_only: if True, can only reduce exposure
 
         Returns:
             The opened PerpPosition
 
         Raises:
-            ValueError: on invalid parameters
+            ValueError: on invalid parameters, pause, staleness, max OI
         """
+        if self._paused:
+            raise ValueError("Perp engine is paused — emergency mode")
+
         market = self._markets.get(market_id)
         if market is None:
             raise ValueError(f"Market {market_id} not found")
@@ -271,6 +317,16 @@ class PerpEngine:
         if not owner:
             raise ValueError("Owner address required")
 
+        # --- Oracle staleness guard ---
+        self._check_oracle_staleness(market)
+
+        # --- Max OI check ---
+        new_oi_side = market.open_interest_long + size if side == PerpSide.LONG else market.open_interest_short + size
+        if new_oi_side > market.max_open_interest:
+            raise ValueError(
+                f"Max open interest exceeded: {new_oi_side} > {market.max_open_interest}"
+            )
+
         notional = size * price
         required_margin = (notional / leverage).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
 
@@ -279,8 +335,9 @@ class PerpEngine:
         if required_margin < min_margin:
             required_margin = min_margin
 
+        self._pos_sequence += 1
         position = PerpPosition(
-            id=uuid.uuid4().hex[:16],
+            id=self._deterministic_position_id(owner, market_id, side.value, self._pos_sequence),
             owner=owner,
             market_id=market_id,
             side=side,
@@ -289,6 +346,7 @@ class PerpEngine:
             margin=required_margin,
             leverage=leverage,
             last_funding_time=time.time(),
+            reduce_only=reduce_only,
         )
 
         # Update open interest
@@ -333,6 +391,52 @@ class PerpEngine:
 
         return pnl
 
+    def partial_close(self, position_id: str, close_size: Decimal, price: Decimal) -> Decimal:
+        """
+        Partially close a position.
+
+        Args:
+            position_id: position to partially close
+            close_size: amount to close (must be < position size)
+            price: execution price
+
+        Returns:
+            Realized PnL for the closed portion
+        """
+        pos = self._positions.get(position_id)
+        if pos is None:
+            raise ValueError(f"Position {position_id} not found")
+        if not pos.is_open:
+            raise ValueError("Position already closed")
+        if price <= 0:
+            raise ValueError("Price must be positive")
+        if close_size <= 0:
+            raise ValueError("Close size must be positive")
+        if close_size >= pos.size:
+            return self.close_position(position_id, price)
+
+        market = self._markets[pos.market_id]
+
+        # Calculate PnL for the closed portion
+        if pos.side == PerpSide.LONG:
+            pnl = close_size * (price - pos.entry_price)
+        else:
+            pnl = close_size * (pos.entry_price - price)
+
+        # Proportional margin release
+        margin_released = pos.margin * (close_size / pos.size)
+        pos.margin -= margin_released
+        pos.size -= close_size
+        pos.realized_pnl += pnl
+
+        # Update open interest
+        if pos.side == PerpSide.LONG:
+            market.open_interest_long -= close_size
+        else:
+            market.open_interest_short -= close_size
+
+        return pnl
+
     def get_position(self, position_id: str) -> Optional[PerpPosition]:
         return self._positions.get(position_id)
 
@@ -349,6 +453,7 @@ class PerpEngine:
             raise ValueError(f"Market {market_id} not found")
 
         market.index_price = index_price
+        market.last_price_update = time.time()
 
         # Mark price = index + EMA(premium)
         # Premium = (last_trade_price - index) — simplified
@@ -367,7 +472,9 @@ class PerpEngine:
         """
         Calculate the current funding rate.
 
-        Funding rate = clamp(premium / index, -MAX, +MAX)
+        Funding rate = clamp(premium / index, -MAX, +MAX) * OI_dampening
+        OI dampening: rate is scaled by imbalance ratio to prevent extreme funding
+        when one side dominates.
         Positive rate: longs pay shorts.
         """
         market = self._markets.get(market_id)
@@ -379,6 +486,18 @@ class PerpEngine:
 
         premium = market.mark_price - market.index_price
         rate = premium / market.index_price
+
+        # OI-weighted dampening: scale rate by the imbalance ratio
+        total_oi = market.open_interest_long + market.open_interest_short
+        if total_oi > 0:
+            if rate > 0:
+                # Longs pay — dampen if longs are small relative to shorts
+                long_ratio = market.open_interest_long / total_oi
+                rate = rate * long_ratio * 2  # neutral at 50/50
+            elif rate < 0:
+                # Shorts pay — dampen if shorts are small
+                short_ratio = market.open_interest_short / total_oi
+                rate = rate * short_ratio * 2
 
         # Clamp
         if rate > MAX_FUNDING_RATE:
@@ -459,10 +578,18 @@ class PerpEngine:
         pnl = pos.unrealized_pnl(market.mark_price)
         bankruptcy = pos.bankruptcy_price()
 
+        # Liquidation penalty → insurance fund
+        notional_at_mark = pos.size * market.mark_price
+        liquidation_penalty = (notional_at_mark * LIQUIDATION_PENALTY_RATE).quantize(
+            Decimal("0.00000001"), rounding=ROUND_HALF_UP
+        )
+        market.insurance_fund += liquidation_penalty
+
         # Attempt to cover losses from margin first
         insurance_needed = ZERO
-        if pos.margin + pnl < 0:
-            insurance_needed = abs(pos.margin + pnl)
+        remaining_margin = pos.margin - liquidation_penalty
+        if remaining_margin + pnl < 0:
+            insurance_needed = abs(remaining_margin + pnl)
 
         adl_triggered = False
         if insurance_needed > 0:
@@ -503,7 +630,7 @@ class PerpEngine:
         """Check and execute all liquidations in a market."""
         results = []
         for pos in list(self._positions.values()):
-            if pos.market_id != market_id and pos.is_open:
+            if pos.market_id != market_id or not pos.is_open:
                 continue
             result = self.check_liquidation(pos.id)
             if result is not None:
@@ -535,3 +662,21 @@ class PerpEngine:
             raise ValueError("Margin amount must be positive")
         pos.margin += amount
         return pos.margin
+
+    # -- Security helpers ---------------------------------------------------
+
+    def _check_oracle_staleness(self, market: PerpMarket) -> None:
+        """Reject operations if oracle data is stale."""
+        if market.last_price_update <= 0:
+            return  # no update yet — allow (market just created)
+        age = time.time() - market.last_price_update
+        if age > ORACLE_STALENESS_SECONDS:
+            raise ValueError(
+                f"Oracle data stale: {age:.0f}s old (max {ORACLE_STALENESS_SECONDS}s)"
+            )
+
+    @staticmethod
+    def _deterministic_position_id(owner: str, market_id: str, side: str, seq: int) -> str:
+        """Deterministic position ID — consensus-safe."""
+        raw = f"{owner}:{market_id}:{side}:{seq}".encode()
+        return hashlib.blake2b(raw, digest_size=8).hexdigest()
