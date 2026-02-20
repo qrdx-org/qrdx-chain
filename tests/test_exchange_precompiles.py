@@ -55,13 +55,17 @@ def _encode_amount(value: Decimal) -> bytes:
     return _encode_uint256(value)
 
 
-def _make_computation(input_data: bytes, sender: bytes = b'\x01' * 20) -> MagicMock:
+def _make_computation(input_data: bytes, sender: bytes = b'\x01' * 20, timestamp: int = None) -> MagicMock:
     """Create a mock ComputationAPI for precompile testing."""
+    import time as _time
     comp = MagicMock()
     comp.msg.data = input_data
     comp.msg.sender = sender
     comp.output = b""
     comp.consume_gas = MagicMock()
+    # Provide deterministic block timestamp for deadline checks
+    ts = timestamp if timestamp is not None else int(_time.time())
+    comp.state.execution_context.timestamp = ts
     return comp
 
 
@@ -70,9 +74,21 @@ def _clean_exchange_state():
     """Reset exchange state between tests."""
     _exchange_pools.clear()
     _exchange_orderbooks.clear()
+    # Also reset the ExchangeStateManager singleton so that _get_pools()
+    # falls back to the module-level dicts during these unit tests.
+    try:
+        from qrdx.exchange.state_manager import ExchangeStateManager
+        ExchangeStateManager.reset_instance()
+    except ImportError:
+        pass
     yield
     _exchange_pools.clear()
     _exchange_orderbooks.clear()
+    try:
+        from qrdx.exchange.state_manager import ExchangeStateManager
+        ExchangeStateManager.reset_instance()
+    except ImportError:
+        pass
 
 
 # ── Registry Tests ────────────────────────────────────────────────────

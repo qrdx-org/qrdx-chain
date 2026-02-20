@@ -630,8 +630,8 @@ class ExchangeStateManager:
                 "liquidity": pool.state.liquidity,
                 "fee_growth_global_0": pool.state.fee_growth_global_0,
                 "fee_growth_global_1": pool.state.fee_growth_global_1,
-                "total_fees_0": pool.state.total_fees_0,
-                "total_fees_1": pool.state.total_fees_1,
+                "protocol_fees_0": pool.state.protocol_fees_0,
+                "protocol_fees_1": pool.state.protocol_fees_1,
                 "total_volume_0": pool.state.total_volume_0,
                 "total_volume_1": pool.state.total_volume_1,
             }
@@ -644,12 +644,11 @@ class ExchangeStateManager:
                 "total_volume": book.total_volume,
             }
 
-        # Deep-copy oracle states
+        # Deep-copy oracle states (snapshot the observations list length)
         oracle_snapshots: Dict[str, dict] = {}
         for pair_key, oracle in self._oracles.items():
             oracle_snapshots[pair_key] = {
-                "latest_price": oracle.latest_price,
-                "observation_count": oracle.observation_count,
+                "observations_count": oracle.observation_count,
             }
 
         # Deep-copy perp market states
@@ -705,8 +704,8 @@ class ExchangeStateManager:
                 pool.state.liquidity = pstate["liquidity"]
                 pool.state.fee_growth_global_0 = pstate["fee_growth_global_0"]
                 pool.state.fee_growth_global_1 = pstate["fee_growth_global_1"]
-                pool.state.total_fees_0 = pstate["total_fees_0"]
-                pool.state.total_fees_1 = pstate["total_fees_1"]
+                pool.state.protocol_fees_0 = pstate["protocol_fees_0"]
+                pool.state.protocol_fees_1 = pstate["protocol_fees_1"]
                 pool.state.total_volume_0 = pstate["total_volume_0"]
                 pool.state.total_volume_1 = pstate["total_volume_1"]
 
@@ -717,12 +716,14 @@ class ExchangeStateManager:
                 book.total_trades = bstate["total_trades"]
                 book.total_volume = bstate["total_volume"]
 
-        # Restore oracle states
+        # Restore oracle states (truncate observations to snapshot length)
         for pair_key, ostate in snapshot.get("oracle_snapshots", {}).items():
             oracle = self._oracles.get(pair_key)
             if oracle:
-                oracle.latest_price = ostate["latest_price"]
-                oracle.observation_count = ostate["observation_count"]
+                target_count = ostate["observations_count"]
+                # Trim any observations added after the snapshot
+                while oracle.observation_count > target_count:
+                    oracle._observations.pop()
 
         # Restore perp states
         for market_id, mstate in snapshot.get("perp_snapshots", {}).items():
