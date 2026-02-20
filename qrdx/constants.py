@@ -786,6 +786,53 @@ GOVERNANCE_DOMAIN_SEPARATOR = b"QRDX-GOVERNANCE-v1"
 
 
 # ==================================================================================
+# EXCHANGE ENGINE CONSTANTS  (Whitepaper §7)
+# ==================================================================================
+
+# --- Fee Tiers (basis-point notation) ---
+EXCHANGE_FEE_TIER_ULTRA_LOW = 100     # 0.01 %
+EXCHANGE_FEE_TIER_LOW       = 500     # 0.05 %
+EXCHANGE_FEE_TIER_MEDIUM    = 3000    # 0.30 %
+EXCHANGE_FEE_TIER_HIGH      = 10000   # 1.00 %
+
+# --- Fee Distribution (§7.6) ---
+EXCHANGE_FEE_LP_SHARE        = Decimal("0.70")
+EXCHANGE_FEE_CREATOR_SHARE   = Decimal("0.15")
+EXCHANGE_FEE_TREASURY_SHARE  = Decimal("0.10")
+EXCHANGE_FEE_VALIDATOR_SHARE = Decimal("0.05")
+
+# --- Order Book (§7.2) ---
+EXCHANGE_ORDERBOOK_MAKER_FEE = Decimal("0.0002")   # 0.02 %
+EXCHANGE_ORDERBOOK_TAKER_FEE = Decimal("0.0005")   # 0.05 %
+EXCHANGE_ORDERBOOK_MAX_DEPTH = 500                   # price levels per side
+
+# --- Pool Types & Stake Requirements (§7.3) ---
+EXCHANGE_POOL_STAKE_STANDARD      = Decimal("10000")
+EXCHANGE_POOL_STAKE_BOOTSTRAP     = Decimal("25000")
+EXCHANGE_POOL_BURN_SUBSIDIZED     = Decimal("5000")
+EXCHANGE_POOL_STAKE_INSTITUTIONAL = Decimal("100000")
+
+# --- Tick Math Bounds ---
+EXCHANGE_MIN_TICK = -887272
+EXCHANGE_MAX_TICK =  887272
+
+# --- Perpetual Contracts (roadmap extension) ---
+PERP_MAX_LEVERAGE               = Decimal("20")
+PERP_DEFAULT_INITIAL_MARGIN     = Decimal("0.05")    # 5 %
+PERP_DEFAULT_MAINTENANCE_MARGIN = Decimal("0.025")   # 2.5 %
+PERP_FUNDING_INTERVAL_SECONDS   = 8 * 3600           # 8 hours
+PERP_MAX_FUNDING_RATE           = Decimal("0.01")     # ±1 % cap
+PERP_INSURANCE_CLAWBACK_PCT     = Decimal("0.20")     # ADL trigger
+
+# --- Gas Costs (§7.7) ---
+EXCHANGE_GAS_SWAP           = 65_000
+EXCHANGE_GAS_ADD_LIQUIDITY  = 90_000
+EXCHANGE_GAS_LIMIT_ORDER    = 40_000
+EXCHANGE_GAS_CANCEL_ORDER   = 25_000
+EXCHANGE_GAS_CREATE_POOL    = 150_000
+
+
+# ==================================================================================
 # GENESIS PREFUNDED ACCOUNTS
 # ==================================================================================
 # These accounts are pre-funded at genesis with initial balances.
