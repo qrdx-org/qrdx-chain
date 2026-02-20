@@ -234,7 +234,7 @@ class EthModule(RPCModule):
             try:
                 nonce = await self.context.state_manager.get_nonce(address)
                 return hex(nonce)
-            except:
+            except Exception:
                 pass
         
         # For non-contract addresses in QRDX, check transaction count
@@ -243,7 +243,7 @@ class EthModule(RPCModule):
                 # Count transactions from this address
                 tx_count = await self.context.db.get_transaction_count_by_address(address)
                 return hex(tx_count if tx_count else 0)
-            except:
+            except Exception:
                 pass
         
         return "0x0"
@@ -344,7 +344,7 @@ class EthModule(RPCModule):
             # For now, return False as we don't have a way to determine network height
             # A production implementation would compare against known peers
             return False
-        except:
+        except Exception:
             return False
     
     @rpc_method
@@ -422,7 +422,7 @@ class EthModule(RPCModule):
                 code = await self.context.state_manager.get_code(address)
                 if code:
                     return "0x" + code.hex()
-            except:
+            except Exception:
                 pass
         return "0x"
     
@@ -447,7 +447,7 @@ class EthModule(RPCModule):
             # This would query the contract_logs table
             # For now return empty as the full implementation is in contracts.py module
             return logs
-        except:
+        except Exception:
             return []
     
     @rpc_method
@@ -477,7 +477,7 @@ class EthModule(RPCModule):
                 # Get storage value
                 value = await self.context.state_manager.get_storage(address, key)
                 return '0x' + value.hex() if value else '0x' + ('0' * 64)
-            except:
+            except Exception:
                 pass
         return '0x' + ('0' * 64)
     
@@ -663,7 +663,7 @@ class EthModule(RPCModule):
                 # Get full transaction objects
                 block_txs = await self.context.db.get_transactions_by_block_id(block.get("id", 0))
                 transactions = [self._format_transaction(tx) for tx in block_txs]
-            except:
+            except Exception:
                 # If can't get full transactions, just return hashes
                 transactions = []
         

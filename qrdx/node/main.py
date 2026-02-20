@@ -2352,7 +2352,7 @@ async def push_tx(
     # Try to deserialize as Contract or Regular transaction
     try:
         tx = await ContractTransaction.from_hex(tx_hex)
-    except:
+    except Exception:
         # Fall back to regular transaction
         tx = await Transaction.from_hex(tx_hex)
     
@@ -2421,7 +2421,7 @@ async def submit_tx(
         # Try contract transaction first
         try:
             tx = await ContractTransaction.from_hex(tx_hex)
-        except:
+        except Exception:
             # Fall back to regular transaction
             tx = await Transaction.from_hex(tx_hex)
         
@@ -3280,7 +3280,7 @@ async def get_address_tokens(
     try:
         from eth_utils import to_checksum_address
         normalized_address = to_checksum_address(address) if address.startswith('0x') and len(address) == 42 else address
-    except:
+    except (ImportError, ValueError):
         normalized_address = address
     
     # ERC20 Transfer event signature: Transfer(address,address,uint256)
@@ -3384,7 +3384,7 @@ async def get_token_info(
     try:
         from eth_utils import to_checksum_address
         normalized_address = to_checksum_address(token_address) if token_address.startswith('0x') and len(token_address) == 42 else token_address
-    except:
+    except (ImportError, ValueError):
         normalized_address = token_address
     
     transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"

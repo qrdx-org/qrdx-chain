@@ -33,9 +33,15 @@ class Transaction:
             elif all(len(tx_output.address_bytes) == 33 for tx_output in outputs):
                 version = 3
             else:
-                raise NotImplementedError()
+                raise ValueError(
+                    "Cannot determine transaction version: "
+                    f"output address lengths are {[len(o.address_bytes) for o in outputs]}"
+                )
         if version > 3:
-            raise NotImplementedError()
+            raise ValueError(
+                f"Unsupported transaction version {version}; "
+                "this node supports versions 1-3"
+            )
         self.version = version
         
         #self.timestamp = timestamp
@@ -260,7 +266,10 @@ class Transaction:
         tx_bytes = BytesIO(bytes.fromhex(hexstring))
         version = int.from_bytes(tx_bytes.read(1), ENDIAN)
         if version > 3:
-            raise NotImplementedError()
+            raise ValueError(
+                f"Unsupported transaction version {version} in hex payload; "
+                "this node supports versions 1-3"
+            )
 
         inputs_count = int.from_bytes(tx_bytes.read(1), ENDIAN)
 

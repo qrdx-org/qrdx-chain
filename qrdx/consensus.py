@@ -904,68 +904,7 @@ async def execute_and_validate_contracts(
         return False, f"Contract system error: {str(e)}"
 
 
-async def execute_and_validate_exchange(
-    block: Any,
-    database: Any = None,
-) -> Tuple[bool, str]:
-    """
-    Execute all exchange transactions in a block and validate results.
-
-    This function:
-    1. Extracts exchange transactions from the block
-    2. Processes them through the ExchangeStateManager
-    3. Validates the resulting state root against the block header (if present)
-
-    Args:
-        block: Block containing transactions
-        database: Database instance (not currently used; reserved for
-                  future DB persistence of exchange state)
-
-    Returns:
-        Tuple of (is_valid, error_message)
-    """
-    try:
-        from .exchange.block_processor import (
-            extract_exchange_transactions,
-            process_exchange_transactions,
-        )
-
-        # Extract exchange-typed transactions
-        exchange_txs = extract_exchange_transactions(block)
-        if not exchange_txs:
-            return True, ""
-
-        block_height = getattr(block, 'number', getattr(block, 'height', 0))
-        block_timestamp = getattr(block, 'timestamp', 0.0)
-
-        # Process exchange transactions
-        success, error, computed_root = process_exchange_transactions(
-            block_height, block_timestamp, exchange_txs,
-        )
-        if not success:
-            return False, f"Exchange processing failed: {error}"
-
-        # Validate state root if the block provides one
-        expected_root = getattr(block, 'exchange_state_root', None)
-        if expected_root and expected_root != '0' * 64:
-            if computed_root != expected_root:
-                return False, (
-                    f"Exchange state root mismatch: expected "
-                    f"{expected_root[:16]}..., computed {computed_root[:16]}..."
-                )
-
-        logger.info(
-            "Successfully executed %d exchange transactions, state_root=%s",
-            len(exchange_txs), computed_root[:16],
-        )
-        return True, ""
-
-    except ImportError:
-        # Exchange module not available — backward compatible
-        return True, ""
-    except Exception as e:
-        logger.error(f"Error in exchange validation: {e}", exc_info=True)
-        return False, f"Exchange system error: {str(e)}"
+# NOTE: execute_and_validate_exchange is defined below (single canonical version)
 
 
 async def execute_and_validate_exchange(

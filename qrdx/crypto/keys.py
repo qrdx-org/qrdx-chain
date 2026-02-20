@@ -171,8 +171,22 @@ class PublicKey:
                 # Uncompressed format with 04 prefix
                 self._key = EthPublicKey(key[1:])
             elif len(key) == 33:
-                # Compressed format - need to decompress
-                raise NotImplementedError("Compressed public key not yet supported")
+                # Compressed format — decompress via secp256k1 curve equation
+                # y² = x³ + 7  (mod p)
+                prefix = key[0]
+                if prefix not in (0x02, 0x03):
+                    raise InvalidKeyError(
+                        f"Invalid compressed public key prefix: 0x{prefix:02x}"
+                    )
+                x = int.from_bytes(key[1:], "big")
+                p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+                y_sq = (pow(x, 3, p) + 7) % p
+                # Tonelli-Shanks for p ≡ 3 (mod 4) reduces to modular exponentiation
+                y = pow(y_sq, (p + 1) // 4, p)
+                if (y % 2 == 0) != (prefix == 0x02):
+                    y = p - y
+                uncompressed = x.to_bytes(32, "big") + y.to_bytes(32, "big")
+                self._key = EthPublicKey(uncompressed)
             else:
                 raise InvalidKeyError(f"Invalid public key length: {len(key)}")
         else:
@@ -219,8 +233,12 @@ class PublicKey:
             Public key bytes
         """
         if compressed:
-            # TODO: Implement compression
-            raise NotImplementedError("Compressed format not yet supported")
+            # SEC1 compressed format: 0x02/0x03 prefix + 32-byte x coordinate
+            raw = self._key.to_bytes()  # 64 bytes: x (32) || y (32)
+            x = raw[:32]
+            y_last = raw[-1]
+            prefix = bytes([0x02 if y_last % 2 == 0 else 0x03])
+            return prefix + x
         return self._key.to_bytes()
     
     def to_hex(self, with_prefix: bool = True, compressed: bool = False) -> str:

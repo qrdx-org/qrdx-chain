@@ -348,23 +348,29 @@ class ValidatorNode:
         """
         Epoch boundary processing loop.
         Handles rewards, penalties, validator rotation, finalization.
+
+        Delegates to ValidatorLifecycleManager.process_epoch() which
+        handles activation queue, exit queue, and withdrawals.
         """
+        from .lifecycle import ValidatorLifecycleManager
+        lifecycle_mgr = ValidatorLifecycleManager()
+
         logger.info("Epoch processing loop started")
+        last_processed_epoch: int = -1
         
         while self._running:
             try:
                 current_slot = await self._get_current_slot()
                 current_epoch = current_slot // SLOTS_PER_EPOCH
                 
-                # Check if we're at epoch boundary
-                if current_slot % SLOTS_PER_EPOCH == 0:
+                # Check if we're at epoch boundary and haven't processed this epoch
+                if current_slot % SLOTS_PER_EPOCH == 0 and current_epoch > last_processed_epoch:
                     logger.info(f"🔄 Processing epoch {current_epoch} boundary")
                     
-                    # Process epoch transition using ValidatorManager
                     try:
-                        # TODO: Implement epoch processing (rewards, finality, validator rotation)
-                        # await self.manager.process_epoch(current_epoch)
-                        logger.info(f"✅ Epoch {current_epoch} boundary detected")
+                        await lifecycle_mgr.process_epoch(current_epoch)
+                        last_processed_epoch = current_epoch
+                        logger.info(f"✅ Epoch {current_epoch} processed: activations/exits applied")
                     except Exception as e:
                         logger.error(f"Failed to process epoch {current_epoch}: {e}", exc_info=True)
                 
@@ -396,7 +402,7 @@ class ValidatorNode:
             else:
                 # Fallback: genesis is NOW (start of chain)
                 genesis_time = now
-        except:
+        except Exception:
             # Fallback: genesis is NOW
             genesis_time = now
         

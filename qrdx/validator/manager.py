@@ -508,9 +508,9 @@ class ValidatorManager:
         # Compute transactions root
         transactions_root = self._compute_transactions_root(transactions)
         
-        # Use provided state root or compute placeholder
+        # Use provided state root or compute from consensus state
         if not state_root:
-            state_root = '0' * 64  # Placeholder
+            state_root = await self._compute_state_root(transactions_root)
         
         # Get attestations to include
         attestations = await self.attestation_pool.select_attestations_for_inclusion(
@@ -585,6 +585,44 @@ class ValidatorManager:
         
         combined = ''.join(sorted(tx_hashes))
         return hashlib.sha256(combined.encode()).hexdigest()
+
+    async def _compute_state_root(self, transactions_root: str) -> str:
+        """
+        Compute a deterministic state root for block proposal.
+
+        Combines:
+          1. UTXO set hash from the database
+          2. Exchange engine state root (pools, order books, oracles, perps)
+          3. Transactions root of the proposed block
+        """
+        hasher = hashlib.sha256()
+
+        # 1. UTXO state hash from database
+        utxo_hash = '0' * 64
+        try:
+            if self.database is not None:
+                utxo_hash = await self.database.get_unspent_outputs_hash()
+        except Exception as e:
+            logger.debug(f"Could not get UTXO hash for state root: {e}")
+
+        hasher.update(utxo_hash.encode())
+
+        # 2. Exchange engine state root
+        exchange_root = '0' * 64
+        try:
+            from ..exchange.state_manager import ExchangeStateManager
+            mgr = ExchangeStateManager.get_instance()
+            if mgr is not None:
+                exchange_root = mgr.compute_state_root()
+        except Exception as e:
+            logger.debug(f"Could not get exchange state root: {e}")
+
+        hasher.update(exchange_root.encode())
+
+        # 3. Transactions root
+        hasher.update(transactions_root.encode())
+
+        return hasher.hexdigest()
     
     async def _execute_contract_transactions(
         self,

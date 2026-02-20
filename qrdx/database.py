@@ -426,13 +426,18 @@ class Database:
         outputs = sum([[(transaction.hash(), index, output.address) for index, output in enumerate(transaction.outputs)] for transaction in transactions], [])
         await self.add_unspent_outputs(outputs)
 
-    async def remove_unspent_outputs(self, transactions: List[Transaction]) -> None:
+    async def remove_unspent_outputs(self, transactions: List[Transaction], _retry: int = 0) -> None:
         inputs = sum([[(tx_input.tx_hash, tx_input.index) for tx_input in transaction.inputs] for transaction in transactions], [])
         try:
             async with self.pool.acquire() as connection:
                 await connection.execute('DELETE FROM unspent_outputs WHERE (tx_hash, index) = ANY($1::tx_output[])', inputs)
-        except:
-            await self.remove_unspent_outputs(transactions)
+        except Exception as e:
+            if _retry < 3:
+                import asyncio
+                await asyncio.sleep(0.1 * (2 ** _retry))
+                await self.remove_unspent_outputs(transactions, _retry=_retry + 1)
+            else:
+                raise RuntimeError(f"remove_unspent_outputs failed after 3 retries: {e}") from e
 
     async def remove_pending_spent_outputs(self, transactions: List[Transaction]) -> None:
         inputs = sum([[(tx_input.tx_hash, tx_input.index) for tx_input in transaction.inputs] for transaction in transactions], [])

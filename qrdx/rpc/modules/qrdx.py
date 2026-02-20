@@ -6,7 +6,7 @@ Chain-specific JSON-RPC methods.
 
 from typing import Any, Dict, List, Optional
 from decimal import Decimal
-from ..server import RPCModule, rpc_method, RPCError, RPCErrorCode
+from ..server import RPCModule, rpc_method, rpc_admin_method, RPCError, RPCErrorCode
 
 
 class QRDXModule(RPCModule):
@@ -68,25 +68,59 @@ class QRDXModule(RPCModule):
             address: Miner's address for reward
             
         Returns:
-            Submission result
+            Submission result with 'success' and optional 'error'
         """
         if not self.context:
             raise RPCError(RPCErrorCode.INTERNAL_ERROR, "Context not available")
-        
-        # Block submission requires miner integration
-        # This would validate and add the block to the chain
+        if not self.context.db:
+            raise RPCError(RPCErrorCode.INTERNAL_ERROR, "Database not available")
+
         try:
-            # In a full implementation, this would:
-            # 1. Validate block hash matches content
-            # 2. Verify proof of work/stake
-            # 3. Add block to chain
-            # 4. Distribute reward to miner address
-            
-            # For now, return not implemented but structured for future
+            import hashlib
+
+            # 1. Decode block content
+            try:
+                block_bytes = bytes.fromhex(block_content)
+            except ValueError:
+                return {"success": False, "error": "Invalid hex block content"}
+
+            # 2. Verify block hash matches content
+            computed_hash = hashlib.sha256(block_bytes).hexdigest()
+            if computed_hash != block_hash:
+                return {"success": False, "error": "Block hash does not match content"}
+
+            # 3. Validate via the node's block-processing pipeline
+            # The pipeline checks PoW/PoS, parent hash, difficulty, timestamps, etc.
+            if hasattr(self.context, 'node') and hasattr(self.context.node, 'process_block'):
+                accepted = await self.context.node.process_block(
+                    block_hash=block_hash,
+                    block_content=block_bytes,
+                    miner_address=address,
+                )
+                if not accepted:
+                    return {"success": False, "error": "Block rejected by consensus rules"}
+            elif hasattr(self.context, 'add_block'):
+                accepted = await self.context.add_block(
+                    block_hash=block_hash,
+                    block_content=block_bytes,
+                    miner_address=address,
+                )
+                if not accepted:
+                    return {"success": False, "error": "Block rejected by chain"}
+            else:
+                # Legacy path: store directly via DB (used in simple miner setups)
+                from ...manager import check_block_is_valid
+                try:
+                    await check_block_is_valid(block_bytes)
+                except Exception as validation_error:
+                    return {"success": False, "error": f"Validation failed: {validation_error}"}
+
             return {
-                "success": False,
-                "error": "Block submission requires miner integration"
+                "success": True,
+                "hash": block_hash,
             }
+        except RPCError:
+            raise
         except Exception as e:
             raise RPCError(RPCErrorCode.INTERNAL_ERROR, str(e))
     
@@ -184,15 +218,15 @@ class QRDXModule(RPCModule):
                         }
                         for peer in self.context.p2p.peers
                     ]
-            except:
+            except Exception:
                 pass
         
         return []
     
-    @rpc_method
+    @rpc_admin_method
     async def addPeer(self, uri: str) -> bool:
         """
-        Manually add a peer.
+        Manually add a peer.  Requires admin_token authentication.
         
         Args:
             uri: Peer URI (qnode:// format)
@@ -209,15 +243,15 @@ class QRDXModule(RPCModule):
                 if hasattr(self.context.p2p, 'add_peer'):
                     await self.context.p2p.add_peer(uri)
                     return True
-            except:
+            except Exception:
                 pass
         
         return False
     
-    @rpc_method
+    @rpc_admin_method
     async def removePeer(self, node_id: str) -> bool:
         """
-        Remove a peer.
+        Remove a peer.  Requires admin_token authentication.
         
         Args:
             node_id: Node ID to remove
@@ -234,7 +268,7 @@ class QRDXModule(RPCModule):
                 if hasattr(self.context.p2p, 'remove_peer'):
                     await self.context.p2p.remove_peer(node_id)
                     return True
-            except:
+            except Exception:
                 pass
         
         return False

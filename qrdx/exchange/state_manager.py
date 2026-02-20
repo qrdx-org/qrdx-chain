@@ -115,6 +115,11 @@ class ExchangeStateManager:
         # Per-sender nonces for replay protection
         self._nonces: Dict[str, int] = {}
 
+        # --- EVM precompile state (consensus-safe, owned by this manager) ---
+        # Exchange precompiles delegate to these dicts instead of module-level state.
+        self._precompile_pools: Dict[bytes, dict] = {}
+        self._precompile_orderbooks: Dict[str, dict] = {}
+
         # --- Block-level tracking ---
         self._current_block_height: int = 0
         self._current_block_timestamp: float = 0.0
@@ -601,7 +606,63 @@ class ExchangeStateManager:
     # =====================================================================
 
     def take_snapshot(self) -> Dict[str, Any]:
-        """Capture current state for potential revert."""
+        """
+        Capture current state for potential revert.
+
+        MUST deep-copy ALL consensus-critical state so that revert_block()
+        can restore the exact pre-block state.  This includes:
+          - Nonces
+          - Counters
+          - Pool manager pools (precompile pools + native pools metadata)
+          - Order books (precompile + native)
+          - Oracle observations
+          - Perp positions & markets
+          - Precompile EVM pools/orderbooks
+        """
+        import copy
+
+        # Deep-copy pool states from PoolManager
+        pool_snapshots: Dict[str, dict] = {}
+        for pool_id, pool in self.pool_manager._pools.items():
+            pool_snapshots[pool_id] = {
+                "sqrt_price": pool.state.sqrt_price,
+                "tick": pool.state.tick,
+                "liquidity": pool.state.liquidity,
+                "fee_growth_global_0": pool.state.fee_growth_global_0,
+                "fee_growth_global_1": pool.state.fee_growth_global_1,
+                "total_fees_0": pool.state.total_fees_0,
+                "total_fees_1": pool.state.total_fees_1,
+                "total_volume_0": pool.state.total_volume_0,
+                "total_volume_1": pool.state.total_volume_1,
+            }
+
+        # Deep-copy order book states
+        book_snapshots: Dict[str, dict] = {}
+        for pair_key, book in self._order_books.items():
+            book_snapshots[pair_key] = {
+                "total_trades": book.total_trades,
+                "total_volume": book.total_volume,
+            }
+
+        # Deep-copy oracle states
+        oracle_snapshots: Dict[str, dict] = {}
+        for pair_key, oracle in self._oracles.items():
+            oracle_snapshots[pair_key] = {
+                "latest_price": oracle.latest_price,
+                "observation_count": oracle.observation_count,
+            }
+
+        # Deep-copy perp market states
+        perp_snapshots: Dict[str, dict] = {}
+        for market_id, market in self.perp_engine._markets.items():
+            perp_snapshots[market_id] = {
+                "index_price": market.index_price,
+                "mark_price": market.mark_price,
+                "open_interest_long": market.open_interest_long,
+                "open_interest_short": market.open_interest_short,
+                "insurance_fund": market.insurance_fund,
+            }
+
         snapshot = {
             "nonces": dict(self._nonces),
             "block_height": self._current_block_height,
@@ -609,17 +670,73 @@ class ExchangeStateManager:
             "total_orders": self._total_orders,
             "total_pools": self._total_pools,
             "total_positions": self._total_positions,
+            # Deep-copied engine state
+            "pool_snapshots": pool_snapshots,
+            "book_snapshots": book_snapshots,
+            "oracle_snapshots": oracle_snapshots,
+            "perp_snapshots": perp_snapshots,
+            # Precompile EVM state (deep copy)
+            "precompile_pools": copy.deepcopy(self._precompile_pools),
+            "precompile_orderbooks": copy.deepcopy(self._precompile_orderbooks),
         }
         self._snapshot = snapshot
         return snapshot
 
     def _restore_snapshot(self, snapshot: Dict[str, Any]) -> None:
-        """Restore state from snapshot."""
+        """
+        Restore state from snapshot on revert.
+
+        Restores ALL consensus-critical fields captured in take_snapshot().
+        """
+        import copy
+
         self._nonces = snapshot["nonces"]
         self._total_swaps = snapshot["total_swaps"]
         self._total_orders = snapshot["total_orders"]
         self._total_pools = snapshot["total_pools"]
         self._total_positions = snapshot["total_positions"]
+
+        # Restore pool states
+        for pool_id, pstate in snapshot.get("pool_snapshots", {}).items():
+            pool = self.pool_manager._pools.get(pool_id)
+            if pool:
+                pool.state.sqrt_price = pstate["sqrt_price"]
+                pool.state.tick = pstate["tick"]
+                pool.state.liquidity = pstate["liquidity"]
+                pool.state.fee_growth_global_0 = pstate["fee_growth_global_0"]
+                pool.state.fee_growth_global_1 = pstate["fee_growth_global_1"]
+                pool.state.total_fees_0 = pstate["total_fees_0"]
+                pool.state.total_fees_1 = pstate["total_fees_1"]
+                pool.state.total_volume_0 = pstate["total_volume_0"]
+                pool.state.total_volume_1 = pstate["total_volume_1"]
+
+        # Restore order book states
+        for pair_key, bstate in snapshot.get("book_snapshots", {}).items():
+            book = self._order_books.get(pair_key)
+            if book:
+                book.total_trades = bstate["total_trades"]
+                book.total_volume = bstate["total_volume"]
+
+        # Restore oracle states
+        for pair_key, ostate in snapshot.get("oracle_snapshots", {}).items():
+            oracle = self._oracles.get(pair_key)
+            if oracle:
+                oracle.latest_price = ostate["latest_price"]
+                oracle.observation_count = ostate["observation_count"]
+
+        # Restore perp states
+        for market_id, mstate in snapshot.get("perp_snapshots", {}).items():
+            market = self.perp_engine._markets.get(market_id)
+            if market:
+                market.index_price = mstate["index_price"]
+                market.mark_price = mstate["mark_price"]
+                market.open_interest_long = mstate["open_interest_long"]
+                market.open_interest_short = mstate["open_interest_short"]
+                market.insurance_fund = mstate["insurance_fund"]
+
+        # Restore precompile EVM state
+        self._precompile_pools = copy.deepcopy(snapshot.get("precompile_pools", {}))
+        self._precompile_orderbooks = copy.deepcopy(snapshot.get("precompile_orderbooks", {}))
 
     # =====================================================================
     #  Query interface (read-only, for API layer)

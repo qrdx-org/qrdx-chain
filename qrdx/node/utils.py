@@ -4,7 +4,7 @@ import ipaddress
 def ip_is_local(ip: str) -> bool:
     try:
         addr = ipaddress.ip_address(ip)
-    except:
+    except (ValueError, TypeError):
         return False
     networks = [
         '10.0.0.0/8',

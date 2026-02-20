@@ -819,11 +819,11 @@ def system_wallets_cmd(node: str):
                         if balance != "unknown":
                             try:
                                 total_balance += float(balance)
-                            except:
+                            except (ValueError, TypeError):
                                 pass
                     else:
                         balance = "unknown"
-                except:
+                except Exception:
                     balance = "unknown"
                 
                 click.echo(f"{name:30} {address:50} {balance:>15}")

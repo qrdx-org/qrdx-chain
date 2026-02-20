@@ -432,16 +432,36 @@ class DatabaseSQLite:
     # Additional methods required by node endpoints
     
     async def get_need_propagate_transactions(self):
-        """Get transactions that need propagation"""
-        return []
+        """Get transactions that need propagation (not propagated in the last 30s)."""
+        cursor = await self.connection.execute("""
+            SELECT tx_hash, tx_hex FROM pending_transactions
+            WHERE propagation_time IS NULL
+               OR propagation_time < datetime('now', '-30 seconds')
+            ORDER BY time_received ASC
+            LIMIT 200
+        """)
+        rows = await cursor.fetchall()
+        return [{'tx_hash': row[0], 'tx_hex': row[1]} for row in rows]
     
     async def update_pending_transactions_propagation_time(self, tx_hashes: list):
         """Update propagation time for transactions"""
         pass
     
     async def get_unspent_outputs_hash(self):
-        """Get hash of unspent outputs"""
-        return "0" * 64
+        """Get deterministic hash of unspent outputs for state root computation."""
+        import hashlib
+        cursor = await self.connection.execute("""
+            SELECT tx_hash, output_index, address, amount
+            FROM unspent_outputs
+            ORDER BY tx_hash ASC, output_index ASC
+        """)
+        rows = await cursor.fetchall()
+        if not rows:
+            return "0" * 64
+        hasher = hashlib.sha256()
+        for row in rows:
+            hasher.update(f"{row[0]}:{row[1]}:{row[2]}:{row[3]}".encode())
+        return hasher.hexdigest()
     
     async def get_pending_transaction_count(self):
         """Get count of pending transactions"""
@@ -707,7 +727,6 @@ class DatabaseSQLite:
         cursor = await self.connection.execute(query, tuple(params))
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-        return [row[0] for row in rows]
     
     async def get_pending_transactions_by_hash(self, hashes: list):
         """Get pending transactions by hash"""
@@ -830,16 +849,41 @@ class DatabaseSQLite:
         return outputs
     
     async def get_address_transactions(self, address: str, limit: int = 100, offset: int = 0, check_signatures: bool = False):
-        """Get transactions for address"""
-        return []
+        """Get transactions for address from the transactions table."""
+        cursor = await self.connection.execute("""
+            SELECT tx_hash, tx_hex, block_hash, inputs_addresses,
+                   outputs_addresses, outputs_amounts, fees, created_at
+            FROM transactions
+            WHERE inputs_addresses LIKE ? OR outputs_addresses LIKE ?
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        """, (f'%{address}%', f'%{address}%', limit, offset))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
     
     async def get_address_pending_transactions(self, address: str, hex_only: bool = False):
-        """Get pending transactions for address"""
-        return []
+        """Get pending transactions for address from the mempool."""
+        cursor = await self.connection.execute("""
+            SELECT tx_hash, tx_hex, inputs_addresses, fees, time_received
+            FROM pending_transactions
+            WHERE inputs_addresses LIKE ?
+            ORDER BY time_received DESC
+        """, (f'%{address}%',))
+        rows = await cursor.fetchall()
+        if hex_only:
+            return [row[1] for row in rows]
+        return [dict(row) for row in rows]
     
     async def get_address_pending_spent_outputs(self, address: str):
-        """Get pending spent outputs for address"""
-        return []
+        """Get pending spent outputs for address."""
+        cursor = await self.connection.execute("""
+            SELECT pso.tx_hash, pso.output_index
+            FROM pending_spent_outputs pso
+            JOIN unspent_outputs uo ON pso.tx_hash = uo.tx_hash AND pso.output_index = uo.output_index
+            WHERE uo.address = ?
+        """, (address,))
+        rows = await cursor.fetchall()
+        return [(row[0], row[1]) for row in rows]
     
     async def add_peer(self, peer_url: str):
         """Add or update peer"""

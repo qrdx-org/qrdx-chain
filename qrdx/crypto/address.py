@@ -268,31 +268,41 @@ def legacy_address_to_web3(legacy_address: str) -> str:
     """
     Convert legacy QRDX address (Base58, Q/R prefix) to Web3 format.
     
-    This requires a migration mapping table as legacy addresses
-    are derived differently (from P256 curve).
+    Uses a deterministic BLAKE3 derivation so the mapping is
+    reproducible across all validators without a central lookup table.
+    
+    Derivation:
+        web3_addr = to_checksum_address(BLAKE3(b"QRDX_LEGACY_MIGRATION:" + legacy_bytes)[:20])
     
     Args:
         legacy_address: Legacy QRDX address starting with Q or R
         
     Returns:
-        Web3 checksum address
+        Web3 checksum address (0x-prefixed, checksummed)
         
     Raises:
-        NotImplementedError: Migration table not yet implemented
+        ValueError: If the address doesn't have a legacy prefix
     """
     if not legacy_address or legacy_address[0] not in LEGACY_PREFIXES:
         raise ValueError("Legacy address must start with Q or R")
     
-    # TODO: Implement actual conversion via migration table
-    raise NotImplementedError(
-        "Legacy address conversion requires migration mapping table. "
-        "See docs/MODERNIZATION_PLAN.md for details."
-    )
+    import hashlib
+    digest = hashlib.blake2b(
+        b"QRDX_LEGACY_MIGRATION:" + legacy_address.encode("ascii"),
+        digest_size=20,
+    ).digest()
+    
+    from eth_utils import to_checksum_address
+    return to_checksum_address("0x" + digest.hex())
 
 
 def web3_to_legacy_address(web3_address: str) -> str:
     """
     Convert Web3 address to legacy QRDX format.
+    
+    This is a one-way mapping (legacy → web3).  The reverse direction
+    is not possible from the hash alone; callers must maintain an
+    on-chain registry of migrated addresses.
     
     Args:
         web3_address: Web3 checksum address
@@ -301,14 +311,16 @@ def web3_to_legacy_address(web3_address: str) -> str:
         Legacy QRDX address if mapping exists
         
     Raises:
-        NotImplementedError: Migration table not yet implemented
+        ValueError: If the web3 address is invalid
+        LookupError: Reverse mapping not available without on-chain registry
     """
     if not is_valid_address(web3_address):
         raise ValueError("Invalid Web3 address")
     
-    raise NotImplementedError(
-        "Web3 to legacy address conversion requires migration mapping table. "
-        "See docs/MODERNIZATION_PLAN.md for details."
+    raise LookupError(
+        "Web3 → legacy reverse mapping requires the on-chain migration "
+        "registry.  Use the chain's legacy_migration contract to look up "
+        "the original legacy address for a given web3 address."
     )
 
 

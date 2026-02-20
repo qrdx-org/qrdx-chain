@@ -163,6 +163,44 @@ def rpc_method(func: RPCMethod) -> RPCMethod:
     return func
 
 
+def rpc_admin_method(func: RPCMethod) -> RPCMethod:
+    """
+    Decorator to mark an RPC method as admin-only.
+
+    Admin methods require an ``admin_token`` parameter that must match
+    the ``QRDX_RPC_ADMIN_TOKEN`` environment variable.  If the env var
+    is not set, admin methods are disabled entirely.
+
+    Usage:
+        @rpc_admin_method
+        async def addPeer(self, uri: str, admin_token: str = "") -> bool:
+            ...
+    """
+    import functools
+    import os
+
+    @functools.wraps(func)
+    async def wrapper(self, *args, admin_token: str = "", **kwargs):
+        expected = os.environ.get("QRDX_RPC_ADMIN_TOKEN", "")
+        if not expected:
+            from .server import RPCError, RPCErrorCode  # deferred to avoid circular
+            raise RPCError(
+                RPCErrorCode.METHOD_NOT_FOUND,
+                "Admin methods are disabled (QRDX_RPC_ADMIN_TOKEN not set)",
+            )
+        if not admin_token or admin_token != expected:
+            from .server import RPCError, RPCErrorCode
+            raise RPCError(
+                RPCErrorCode.INVALID_PARAMS,
+                "Invalid or missing admin_token",
+            )
+        return await func(self, *args, **kwargs)
+
+    wrapper.__rpc_method__ = True
+    wrapper.__rpc_admin__ = True
+    return wrapper
+
+
 class RPCRateLimiter:
     """
     Token-bucket rate limiter for JSON-RPC requests.
