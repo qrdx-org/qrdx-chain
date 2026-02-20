@@ -24,9 +24,9 @@ NODE_DEFAULTS = {
     'QRDX_NODE_HOST':                  '127.0.0.1',
     'QRDX_NODE_PORT':                  '3007',
     'QRDX_SELF_URL':                   '',
-    'QRDX_BOOTSTRAP_NODE':             'http://node.qrdx.network',
+    'QRDX_BOOTSTRAP_NODE':             'http://node.qrdx.org',
     # Comma-separated list of bootstrap nodes
-    'QRDX_BOOTSTRAP_NODES':            'http://node.qrdx.network,http://node2.qrdx.network,http://node3.qrdx.network',
+    'QRDX_BOOTSTRAP_NODES':            'http://node.qrdx.org,http://node2.qrdx.org,http://node3.qrdx.org',
 }
 
 LOGGER_DEFAULTS = {    
@@ -324,7 +324,7 @@ for key, default_raw in DEFAULTS.items():
 # These aliases maintain backward compatibility with older code references.
 # New code should use the QRDX_* prefixed versions.
 DENARO_SELF_URL = namespace.get('QRDX_SELF_URL', '')
-DENARO_BOOTSTRAP_NODE = namespace.get('QRDX_BOOTSTRAP_NODE', 'http://node.qrdx.network')
+DENARO_BOOTSTRAP_NODE = namespace.get('QRDX_BOOTSTRAP_NODE', 'http://node.qrdx.org')
 DENARO_DATABASE_PATH = namespace.get('QRDX_DATABASE_PATH', 'data/qrdx.db')  # SQLite path
 DENARO_NODE_HOST = namespace.get('QRDX_NODE_HOST', '127.0.0.1')
 DENARO_NODE_PORT = namespace.get('QRDX_NODE_PORT', '3007')

@@ -13,26 +13,39 @@ class DiscoveryConfig:
     # Enable discovery
     enabled: bool = True
     
-    # Bootstrap nodes (qnode:// URIs)
+    # Bootstrap nodes (@-schema, qnode://, or http:// URIs)
     bootnodes: List[str] = field(default_factory=list)
     
-    # Enable DNS-based discovery
-    dns_enabled: bool = False
+    # Enable DNS-based seed discovery
+    dns_enabled: bool = True
     
-    # DNS discovery networks
-    dns_networks: List[str] = field(default_factory=list)
+    # DNS seed domains (queried for signed TXT records)
+    dns_seeds: List[str] = field(default_factory=lambda: [
+        "seeds.qrdx.org",
+        "seeds2.qrdx.org",
+        "dnsseed.qrdxvalidators.org",
+    ])
     
-    # Kademlia k-bucket size
-    bucket_size: int = 16
+    # Require Dilithium signatures on DNS seed records
+    dns_require_signatures: bool = True
     
-    # Number of k-buckets (256 for 256-bit node IDs)
-    num_buckets: int = 256
+    # Kademlia k-bucket size (contacts per bucket)
+    bucket_size: int = 20
+    
+    # Number of k-buckets (160 for 160-bit BLAKE3 node IDs)
+    num_buckets: int = 160
     
     # Discovery refresh interval (seconds)
-    refresh_interval: int = 30
+    refresh_interval: int = 60
     
-    # Node lookup concurrency
+    # Node lookup concurrency (Kademlia α parameter)
     lookup_concurrency: int = 3
+    
+    # Persist routing table to disk for self-sustaining operation
+    persist_routing_table: bool = True
+    
+    # Routing table persistence directory
+    routing_table_path: str = "data/"
 
 
 @dataclass
