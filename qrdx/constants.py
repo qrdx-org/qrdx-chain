@@ -702,6 +702,90 @@ EMERGENCY_RECOVERY_TOTAL     = 5
 
 
 # ==================================================================================
+# qRC20 TOKEN STANDARD (Whitepaper §9)
+# ==================================================================================
+
+# Maximum supply for a single qRC20 token (2^96 - 1 raw units)
+QRC20_MAX_SUPPLY = Decimal("79228162514264337593543950335")
+
+# Default token decimals (same as ERC-20 convention)
+QRC20_DEFAULT_DECIMALS = 18
+
+# Maximum tokens that can be registered in one registry
+QRC20_MAX_REGISTRY_SIZE = 10_000
+
+# Batch transfer limit per call
+QRC20_MAX_BATCH_SIZE = 256
+
+# Domain separators for PQ signature verification
+QRC20_DOMAIN_TRANSFER = b"QRDX-QRC20-TRANSFER-v1"
+QRC20_DOMAIN_APPROVE  = b"QRDX-QRC20-APPROVE-v1"
+QRC20_DOMAIN_PERMIT   = b"QRDX-QRC20-PERMIT-v1"
+
+# Well-known shielded tokens (§9.4) — mapped to bridge source chains
+QRC20_SHIELDED_TOKENS = {
+    "qETH":  {"source_chain": "ETHEREUM", "post_doomsday_trade": True},
+    "qBTC":  {"source_chain": "BITCOIN",  "post_doomsday_trade": True},
+    "qSOL":  {"source_chain": "SOLANA",   "post_doomsday_trade": True},
+    "qUSDC": {"source_chain": "ETHEREUM", "post_doomsday_trade": True},
+    "qUSDT": {"source_chain": "ETHEREUM", "post_doomsday_trade": True},
+    "QRDX":  {"source_chain": "NATIVE",   "post_doomsday_trade": True},
+}
+
+
+# ==================================================================================
+# ON-CHAIN GOVERNANCE (Whitepaper §13)
+# ==================================================================================
+
+# --- Proposal Thresholds ---
+GOVERNANCE_PROPOSAL_DEPOSIT = Decimal("10000000")     # 10M QRDX to submit proposal
+GOVERNANCE_TEMPERATURE_SUPPORT = Decimal("1000000")   # 1M QRDX temperature-check min
+GOVERNANCE_MIN_DISCUSSION_DAYS = 3                    # Days before formal proposal
+
+# --- Voting Configuration ---
+GOVERNANCE_VOTING_PERIOD_DAYS = 7                     # 7-day voting window
+GOVERNANCE_VOTING_PERIOD_EPOCHS = 7 * 24 * 60         # ~7 days in epochs (1 epoch ≈ 64s)
+GOVERNANCE_QUORUM_THRESHOLD = Decimal("0.10")         # 10% of circulating supply
+GOVERNANCE_APPROVAL_THRESHOLD = Decimal("0.60")       # 60% for parameter changes
+GOVERNANCE_SUPERMAJORITY_THRESHOLD = Decimal("0.75")  # 75% for protocol upgrades
+
+# --- Vote Types ---
+GOVERNANCE_VOTE_FOR = 1
+GOVERNANCE_VOTE_AGAINST = 2
+GOVERNANCE_VOTE_ABSTAIN = 3
+
+# --- Timelock ---
+GOVERNANCE_TIMELOCK_MIN_DELAY_SECONDS = 2 * 24 * 3600   # 2 days minimum
+GOVERNANCE_TIMELOCK_MAX_DELAY_SECONDS = 14 * 24 * 3600  # 14 days maximum
+GOVERNANCE_TIMELOCK_DEFAULT_DELAY_SECONDS = 2 * 24 * 3600  # 2 days default
+
+# --- Guardian Council (§13.4) ---
+GOVERNANCE_GUARDIAN_THRESHOLD = 3   # 3-of-5 PQ multisig
+GOVERNANCE_GUARDIAN_TOTAL = 5
+
+# --- Governable Parameter Defaults (§13.5) ---
+GOVERNANCE_DEFAULT_PARAMETERS = {
+    "trading_fee_tiers":           [Decimal("0.0001"), Decimal("0.0005"),
+                                    Decimal("0.003"), Decimal("0.01")],
+    "orderbook_maker_fee":         Decimal("0.0002"),
+    "orderbook_taker_fee":         Decimal("0.0005"),
+    "bridge_fee_bps":              10,
+    "min_validator_stake":         Decimal("100000"),
+    "pool_creation_stake":         Decimal("10000"),
+    "pool_creation_subsidy_burn":  Decimal("5000"),
+    "validator_set_size":          150,
+    "block_time_seconds":          2,
+    "proposal_threshold":          Decimal("10000000"),
+    "voting_period_days":          7,
+    "oracle_attestation_threshold": Decimal("0.667"),
+    "min_chain_adapters":          1,
+}
+
+# Domain separator for governance signatures
+GOVERNANCE_DOMAIN_SEPARATOR = b"QRDX-GOVERNANCE-v1"
+
+
+# ==================================================================================
 # GENESIS PREFUNDED ACCOUNTS
 # ==================================================================================
 # These accounts are pre-funded at genesis with initial balances.
