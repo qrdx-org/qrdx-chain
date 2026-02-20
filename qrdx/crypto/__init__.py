@@ -45,6 +45,13 @@ def __getattr__(name):
         'KEMPrivateKey', 'KEMPublicKey', 'KEMError',
         'kyber_generate_keypair', 'kyber_encapsulate', 'kyber_decapsulate',
     }
+    # Threshold Dilithium / multisig names
+    threshold_names = {
+        'ThresholdConfig', 'MultisigKeySet', 'PartialSignature', 'MultisigSignature',
+        'derive_multisig_address', 'create_multisig_keyset', 'generate_multisig_keyset',
+        'create_partial_signature', 'aggregate_partial_signatures',
+        'verify_multisig', 'is_multisig_address',
+    }
     if name in pq_sig_names:
         from . import pq
         if name == 'pq_generate_keypair':
@@ -57,6 +64,9 @@ def __getattr__(name):
     if name in pq_kem_names:
         from . import pq
         return getattr(pq, name)
+    if name in threshold_names:
+        from . import threshold_dilithium
+        return getattr(threshold_dilithium, name)
     raise AttributeError(f"module 'qrdx.crypto' has no attribute {name!r}")
 
 __all__ = [
@@ -107,5 +117,17 @@ __all__ = [
     "rlp_encode",
     "rlp_decode",
     "encode_transaction",
+    # Threshold Dilithium / Multisig (Whitepaper §6.1)
+    "ThresholdConfig",
+    "MultisigKeySet",
+    "PartialSignature",
+    "MultisigSignature",
+    "derive_multisig_address",
+    "create_multisig_keyset",
+    "generate_multisig_keyset",
+    "create_partial_signature",
+    "aggregate_partial_signatures",
+    "verify_multisig",
+    "is_multisig_address",
 ]
 

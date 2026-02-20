@@ -1,10 +1,12 @@
 """
-Minimal 100% EVM-Compatible Executor for QRDX
+QRDX EVM Executor (Production)
 
-Direct integration with py-evm (Shanghai fork) for full Ethereum compatibility.
-Stripped down to essentials - no unnecessary abstractions.
+Direct integration with py-evm QRDX fork for full Ethereum + PQ compatibility.
+Uses QRDXVM (extends ShanghaiVM) with quantum-resistant precompiles at
+0x09-0x0c.  Stripped down to essentials — no unnecessary abstractions.
 """
 
+import logging
 import sys
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
@@ -12,11 +14,11 @@ from dataclasses import dataclass
 # Add py-evm to path
 sys.path.insert(0, '/workspaces/qrdx-chain-denaro/py-evm')
 
-from eth.vm.forks.shanghai import ShanghaiVM
+from eth.vm.forks.qrdx import QRDXVM
 from eth.db.atomic import AtomicDB
 from eth.db.account import AccountDB
-from eth.vm.forks.shanghai.state import ShanghaiState
-from eth.vm.forks.shanghai.computation import ShanghaiComputation
+from eth.vm.forks.qrdx.state import QRDXState
+from eth.vm.forks.qrdx.computation import QRDXComputation
 from eth.vm.message import Message
 from eth.vm.transaction_context import BaseTransactionContext
 from eth.vm.execution_context import ExecutionContext
@@ -32,6 +34,8 @@ from eth_utils import (
     decode_hex,
 )
 import rlp
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -49,7 +53,7 @@ class QRDXEVMExecutor:
     """
     100% EVM-Compatible Executor.
     
-    Uses py-evm Shanghai fork directly - no custom modifications.
+    Uses py-evm QRDX fork (extends Shanghai) with PQ precompiles.
     Handles QRDX-specific state management externally.
     """
     
@@ -149,7 +153,7 @@ class QRDXEVMExecutor:
             )
             
             # Create state with persistent root
-            state = ShanghaiState(self.state_db, exec_context, self.state_root)
+            state = QRDXState(self.state_db, exec_context, self.state_root)
             
             # Sync account state from QRDX state manager
             self._sync_to_evm(state, sender, to)
@@ -183,15 +187,15 @@ class QRDXEVMExecutor:
                 origin=origin,
             )
             
-            # Execute via Shanghai computation
+            # Execute via QRDX computation (includes PQ precompiles)
             if is_create:
-                computation = ShanghaiComputation.apply_create_message(
+                computation = QRDXComputation.apply_create_message(
                     state,
                     message,
                     tx_context,
                 )
             else:
-                computation = ShanghaiComputation.apply_message(
+                computation = QRDXComputation.apply_message(
                     state,
                     message,
                     tx_context,
@@ -226,8 +230,6 @@ class QRDXEVMExecutor:
             # Commit state changes and persist state root
             state.persist()
             self.state_root = state.state_root
-            
-            # Handle contract creation storage
             created_address = None
             if is_create and success:
                 created_address = to
@@ -269,8 +271,6 @@ class QRDXEVMExecutor:
             )
             
         except Exception as e:
-            from ..logger import get_logger
-            logger = get_logger(__name__)
             logger.error(f"EVM execution error: {e}", exc_info=True)
             return EVMResult(
                 success=False,
@@ -361,7 +361,7 @@ class QRDXEVMExecutor:
         rlp_encoded = rlp.encode([sender, nonce])
         return keccak(rlp_encoded)[12:]  # Take last 20 bytes
     
-    def _sync_to_evm(self, state: ShanghaiState, sender: bytes, to: Optional[bytes]) -> None:
+    def _sync_to_evm(self, state: QRDXState, sender: bytes, to: Optional[bytes]) -> None:
         """Sync QRDX state to EVM state."""
         # Sync sender
         sender_addr = to_checksum_address(sender)
@@ -393,7 +393,7 @@ class QRDXEVMExecutor:
                 value = to_int(hexstr=value_hex)
                 state.set_storage(to, key, value)
     
-    def _sync_from_evm(self, state: ShanghaiState, sender: bytes, to: Optional[bytes]) -> None:
+    def _sync_from_evm(self, state: QRDXState, sender: bytes, to: Optional[bytes]) -> None:
         """Sync EVM state back to QRDX state."""
         # Sync sender balances/nonces
         sender_addr = to_checksum_address(sender)

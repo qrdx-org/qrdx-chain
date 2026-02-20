@@ -106,23 +106,23 @@ class ContractStateManager:
             return self._accounts_cache[address]
         
         # Load from database
-        async with self.db.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT balance, nonce, code_hash, storage_root
-                FROM account_state
-                WHERE address = $1
-                """,
-                address
-            )
+        cursor = await self.db.connection.execute(
+            """
+            SELECT balance, nonce, code_hash, storage_root
+            FROM account_state
+            WHERE address = ?
+            """,
+            (address,)
+        )
+        row = await cursor.fetchone()
         
         if row:
             account = Account(
                 address=address,
-                balance=int(row['balance']),
-                nonce=row['nonce'],
-                code_hash=bytes.fromhex(row['code_hash']) if row['code_hash'] else None,
-                storage_root=bytes.fromhex(row['storage_root']) if row['storage_root'] else None,
+                balance=int(row[0]),
+                nonce=int(row[1]),
+                code_hash=bytes.fromhex(row[2]) if row[2] else None,
+                storage_root=bytes.fromhex(row[3]) if row[3] else None,
             )
         else:
             # New account
@@ -207,14 +207,14 @@ class ContractStateManager:
             return self._code_cache[account.code_hash]
         
         # Load from database
-        async with self.db.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT bytecode FROM contract_code WHERE code_hash = $1",
-                account.code_hash.hex()
-            )
+        cursor = await self.db.connection.execute(
+            "SELECT bytecode FROM contract_code WHERE code_hash = ?",
+            (account.code_hash.hex(),)
+        )
+        row = await cursor.fetchone()
         
         if row:
-            bytecode = bytes(row['bytecode'])
+            bytecode = bytes(row[0]) if isinstance(row[0], (bytes, memoryview)) else bytes.fromhex(row[0])
             self._code_cache[account.code_hash] = bytecode
             return bytecode
         
@@ -241,19 +241,14 @@ class ContractStateManager:
         self._code_cache[code_hash] = code
         
         # Store in database
-        async with self.db.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO contract_code (code_hash, bytecode, deployed_at, deployer, size)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (code_hash) DO NOTHING
-                """,
-                code_hash.hex(),
-                code,
-                block_number,
-                deployer,
-                len(code)
-            )
+        await self.db.connection.execute(
+            """
+            INSERT OR IGNORE INTO contract_code (code_hash, bytecode, deployed_at, deployer, size)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (code_hash.hex(), code, block_number, deployer, len(code))
+        )
+        await self.db.connection.commit()
     
     async def get_code_hash(self, address: str) -> bytes:
         """Get contract code hash."""
@@ -279,19 +274,18 @@ class ContractStateManager:
             return self._storage_cache[cache_key]
         
         # Load from database
-        async with self.db.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT storage_value
-                FROM contract_storage
-                WHERE contract_address = $1 AND storage_key = $2
-                """,
-                address,
-                key.hex()
-            )
+        cursor = await self.db.connection.execute(
+            """
+            SELECT storage_value
+            FROM contract_storage
+            WHERE contract_address = ? AND storage_key = ?
+            """,
+            (address, key.hex())
+        )
+        row = await cursor.fetchone()
         
         if row:
-            value = bytes.fromhex(row['storage_value'])
+            value = bytes.fromhex(row[0])
         else:
             value = b'\x00' * 32  # Default empty value
         
@@ -329,11 +323,11 @@ class ContractStateManager:
             self._dirty_storage.discard(key)
         
         # Mark for database deletion
-        async with self.db.pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM contract_storage WHERE contract_address = $1",
-                address
-            )
+        await self.db.connection.execute(
+            "DELETE FROM contract_storage WHERE contract_address = ?",
+            (address,)
+        )
+        await self.db.connection.commit()
     
     async def account_exists(self, address: str) -> bool:
         """Check if account exists."""
@@ -348,8 +342,9 @@ class ContractStateManager:
             Snapshot ID
         """
         snapshot = {
-            'accounts': dict(self._accounts_cache),
+            'accounts': {addr: Account(**vars(acc)) for addr, acc in self._accounts_cache.items()},
             'storage': dict(self._storage_cache),
+            'code': dict(self._code_cache),
             'dirty_accounts': set(self._dirty_accounts),
             'dirty_storage': set(self._dirty_storage),
         }
@@ -369,6 +364,7 @@ class ContractStateManager:
         snapshot = self._snapshots[snapshot_id]
         self._accounts_cache = snapshot['accounts']
         self._storage_cache = snapshot['storage']
+        self._code_cache = snapshot['code']
         self._dirty_accounts = snapshot['dirty_accounts']
         self._dirty_storage = snapshot['dirty_storage']
         
@@ -382,33 +378,34 @@ class ContractStateManager:
         Args:
             block_number: Current block number
         """
-        async with self.db.pool.acquire() as conn:
-            # Commit account changes
-            for address in self._dirty_accounts:
-                if address in self._accounts_cache:
-                    account = self._accounts_cache[address]
-                    
-                    if account.is_empty:
-                        # Delete empty account
-                        await conn.execute(
-                            "DELETE FROM account_state WHERE address = $1",
-                            address
-                        )
-                    else:
-                        # Upsert account
-                        await conn.execute(
-                            """
-                            INSERT INTO account_state 
-                            (address, balance, nonce, code_hash, storage_root, created_at, updated_at, is_contract)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                            ON CONFLICT (address) DO UPDATE SET
-                                balance = EXCLUDED.balance,
-                                nonce = EXCLUDED.nonce,
-                                code_hash = EXCLUDED.code_hash,
-                                storage_root = EXCLUDED.storage_root,
-                                updated_at = EXCLUDED.updated_at,
-                                is_contract = EXCLUDED.is_contract
-                            """,
+        conn = self.db.connection
+
+        # Commit account changes
+        for address in self._dirty_accounts:
+            if address in self._accounts_cache:
+                account = self._accounts_cache[address]
+
+                if account.is_empty:
+                    await conn.execute(
+                        "DELETE FROM account_state WHERE address = ?",
+                        (address,)
+                    )
+                else:
+                    await conn.execute(
+                        """
+                        INSERT INTO account_state
+                        (address, balance, nonce, code_hash, storage_root,
+                         created_at, updated_at, is_contract)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (address) DO UPDATE SET
+                            balance = excluded.balance,
+                            nonce = excluded.nonce,
+                            code_hash = excluded.code_hash,
+                            storage_root = excluded.storage_root,
+                            updated_at = excluded.updated_at,
+                            is_contract = excluded.is_contract
+                        """,
+                        (
                             address,
                             str(account.balance),
                             account.nonce,
@@ -416,41 +413,38 @@ class ContractStateManager:
                             account.storage_root.hex() if account.storage_root else None,
                             block_number,
                             block_number,
-                            account.is_contract
+                            account.is_contract,
                         )
-            
-            # Commit storage changes
-            for (address, key) in self._dirty_storage:
-                if (address, key) in self._storage_cache:
-                    value = self._storage_cache[(address, key)]
-                    
-                    if value == b'\x00' * 32:
-                        # Delete zero value
-                        await conn.execute(
-                            """
-                            DELETE FROM contract_storage
-                            WHERE contract_address = $1 AND storage_key = $2
-                            """,
-                            address,
-                            key.hex()
-                        )
-                    else:
-                        # Upsert storage
-                        await conn.execute(
-                            """
-                            INSERT INTO contract_storage
-                            (contract_address, storage_key, storage_value, block_number)
-                            VALUES ($1, $2, $3, $4)
-                            ON CONFLICT (contract_address, storage_key) DO UPDATE SET
-                                storage_value = EXCLUDED.storage_value,
-                                block_number = EXCLUDED.block_number
-                            """,
-                            address,
-                            key.hex(),
-                            value.hex(),
-                            block_number
-                        )
-        
+                    )
+
+        # Commit storage changes
+        for (address, key) in self._dirty_storage:
+            if (address, key) in self._storage_cache:
+                value = self._storage_cache[(address, key)]
+
+                if value == b'\x00' * 32:
+                    await conn.execute(
+                        """
+                        DELETE FROM contract_storage
+                        WHERE contract_address = ? AND storage_key = ?
+                        """,
+                        (address, key.hex())
+                    )
+                else:
+                    await conn.execute(
+                        """
+                        INSERT INTO contract_storage
+                        (contract_address, storage_key, storage_value, block_number)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT (contract_address, storage_key) DO UPDATE SET
+                            storage_value = excluded.storage_value,
+                            block_number = excluded.block_number
+                        """,
+                        (address, key.hex(), value.hex(), block_number)
+                    )
+
+        await conn.commit()
+
         # Clear dirty sets
         self._dirty_accounts.clear()
         self._dirty_storage.clear()

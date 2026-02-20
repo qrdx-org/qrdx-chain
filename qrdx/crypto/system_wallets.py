@@ -4,8 +4,13 @@ QRDX System Wallets Module
 Implements system-owned wallets that are:
 1. Off-curve (no private key exists)
 2. Pre-funded in genesis
-3. Controlled by a single PQ wallet defined in genesis
+3. Controlled by a single PQ wallet or m-of-n multisig keyset defined in genesis
 4. Have custom 0x0000...000X addresses
+
+Multisig Support (Whitepaper §6.1):
+    Each system wallet can be optionally governed by a MultisigKeySet.
+    When a multisig keyset is assigned, spending requires m-of-n threshold
+    Dilithium signatures instead of a single controller signature.
 
 These wallets provide decentralized system functionality with secure,
 quantum-resistant control via a designated controller wallet.
@@ -14,7 +19,7 @@ quantum-resistant control via a designated controller wallet.
 import hashlib
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from enum import Enum
 
 from .hashing import sha256
@@ -97,127 +102,260 @@ class SystemWallet:
 class SystemWalletManager:
     """
     Manages system wallets and their controller.
-    
+
+    Supports two controller modes:
+      1. Single PQ Key: original mode — one PQ address authorises all spends
+      2. Multisig KeySet: upgraded mode — m-of-n threshold Dilithium signatures
+         required to authorise spends
+
+    Per-wallet multisig overrides are also supported: individual system wallets
+    can have their own MultisigKeySet (e.g. Treasury at 5-of-9 while others
+    stay at the default controller).
+
     Provides:
     - System wallet creation and validation
-    - Controller wallet verification
+    - Controller wallet verification (single-key and multisig)
     - Transaction authorization checks
     """
-    
+
     def __init__(self, controller_pq_address: str):
         """
         Initialize system wallet manager.
-        
+
         Args:
             controller_pq_address: The PQ address that controls all system wallets
         """
         from .address import is_pq_address, is_valid_address
-        
-        if not is_valid_address(controller_pq_address):
+        from .threshold_dilithium import is_multisig_address
+
+        # Accept PQ addresses or multisig addresses as controller
+        valid = is_valid_address(controller_pq_address) or is_multisig_address(controller_pq_address)
+        if not valid:
             raise ValueError(f"Invalid controller address: {controller_pq_address}")
-        
-        if not is_pq_address(controller_pq_address):
+
+        # Must be PQ or multisig — not a traditional ECDSA address
+        if not (is_pq_address(controller_pq_address) or is_multisig_address(controller_pq_address)):
             raise ValueError(
-                f"Controller must be a post-quantum address (0xPQ prefix): "
+                f"Controller must be a post-quantum (0xPQ) or multisig (0xPQMS) address: "
                 f"{controller_pq_address}"
             )
-        
+
         self.controller_address = controller_pq_address
         self._system_wallets: Dict[str, SystemWallet] = {}
-        
+
+        # Per-wallet multisig keysets (optional overrides)
+        self._wallet_multisigs: Dict[str, 'MultisigKeySet'] = {}
+
+        # Global multisig keyset (optional — replaces single-key controller)
+        self._global_multisig: Optional['MultisigKeySet'] = None
+
         logger.info(f"System wallet manager initialized with controller: {controller_pq_address}")
-    
+
+    # ── Multisig Configuration ──────────────────────────────────────
+
+    def set_global_multisig(self, keyset: 'MultisigKeySet') -> None:
+        """
+        Upgrade the global controller to a multisig keyset.
+
+        After this, all wallets without per-wallet overrides require
+        m-of-n threshold signatures.
+
+        Args:
+            keyset: MultisigKeySet to use as global controller
+        """
+        self._global_multisig = keyset
+        self.controller_address = keyset.address
+        logger.info(
+            f"Global multisig set: {keyset.config} at {keyset.address}"
+        )
+
+    def set_wallet_multisig(self, wallet_address: str, keyset: 'MultisigKeySet') -> None:
+        """
+        Assign a per-wallet multisig keyset.
+
+        This wallet will require its own m-of-n threshold to spend,
+        independent of the global controller.
+
+        Args:
+            wallet_address: System wallet address
+            keyset: MultisigKeySet specific to this wallet
+        """
+        if not self.is_system_wallet(wallet_address):
+            raise ValueError(f"Not a registered system wallet: {wallet_address}")
+        self._wallet_multisigs[wallet_address] = keyset
+        logger.info(
+            f"Wallet-level multisig set for {wallet_address}: "
+            f"{keyset.config} at {keyset.address}"
+        )
+
+    def get_wallet_multisig(self, wallet_address: str) -> Optional['MultisigKeySet']:
+        """Get the effective multisig keyset for a wallet (per-wallet or global)."""
+        return self._wallet_multisigs.get(wallet_address, self._global_multisig)
+
+    def is_multisig_controlled(self, wallet_address: Optional[str] = None) -> bool:
+        """Check if a wallet (or the global controller) uses multisig."""
+        if wallet_address and wallet_address in self._wallet_multisigs:
+            return True
+        return self._global_multisig is not None
+
+    # ── Registration & Query ────────────────────────────────────────
+
     def register_system_wallet(self, wallet: SystemWallet) -> None:
         """
         Register a system wallet.
-        
+
         Args:
             wallet: SystemWallet instance to register
         """
         if wallet.address in self._system_wallets:
             raise ValueError(f"System wallet already registered: {wallet.address}")
-        
+
         self._system_wallets[wallet.address] = wallet
         logger.info(
             f"Registered system wallet: {wallet.name} at {wallet.address} "
             f"with balance {wallet.genesis_balance} QRDX"
         )
-    
+
     def get_system_wallet(self, address: str) -> Optional[SystemWallet]:
         """Get system wallet by address."""
         return self._system_wallets.get(address)
-    
+
     def is_system_wallet(self, address: str) -> bool:
         """Check if an address is a registered system wallet."""
         return address in self._system_wallets
-    
+
     def is_burner_wallet(self, address: str) -> bool:
         """Check if an address is a burner wallet (funds are destroyed)."""
         wallet = self.get_system_wallet(address)
         return wallet is not None and wallet.is_burner
-    
+
+    # ── Spending Authorization ──────────────────────────────────────
+
     def can_spend_from(self, system_wallet_address: str, spender_address: str) -> bool:
         """
-        Check if a spender can spend from a system wallet.
-        
+        Check if a spender can spend from a system wallet (single-key mode).
+
+        For multisig-controlled wallets use ``verify_multisig_spend`` instead;
+        this method returns ``False`` for them when a non-controller address is
+        used, but ``True`` when the spender matches the (possibly multisig)
+        controller address.
+
         Args:
             system_wallet_address: The system wallet address
             spender_address: The address attempting to spend
-            
+
         Returns:
-            True if spender is the controller wallet, False otherwise
+            True if spender is the effective controller, False otherwise
         """
         if not self.is_system_wallet(system_wallet_address):
             return False  # Not a system wallet
-        
-        # Only the controller wallet can spend from system wallets
+
+        # Per-wallet multisig overrides
+        wallet_ms = self._wallet_multisigs.get(system_wallet_address)
+        if wallet_ms:
+            return spender_address == wallet_ms.address
+
+        # Global controller (could be single PQ key or global multisig address)
         return spender_address == self.controller_address
-    
+
+    def verify_multisig_spend(
+        self,
+        system_wallet_address: str,
+        message: bytes,
+        multisig_signature: 'MultisigSignature',
+    ) -> tuple[bool, str]:
+        """
+        Verify a multisig threshold signature for a system wallet spend.
+
+        This is the primary authorization path for multisig-controlled wallets.
+
+        Args:
+            system_wallet_address: The system wallet address
+            message: The transaction message that was signed
+            multisig_signature: The m-of-n MultisigSignature
+
+        Returns:
+            Tuple of (is_valid, reason)
+        """
+        from .threshold_dilithium import verify_multisig as _verify_ms
+
+        if not self.is_system_wallet(system_wallet_address):
+            return False, f"Not a system wallet: {system_wallet_address}"
+
+        wallet = self.get_system_wallet(system_wallet_address)
+        if wallet and wallet.is_burner:
+            return False, f"Cannot spend from burner wallet: {system_wallet_address}"
+
+        keyset = self.get_wallet_multisig(system_wallet_address)
+        if keyset is None:
+            return False, (
+                f"No multisig keyset configured for {system_wallet_address}; "
+                f"use single-key can_spend_from() instead"
+            )
+
+        if _verify_ms(keyset, message, multisig_signature):
+            return True, "OK"
+        return False, "Multisig verification failed"
+
     def validate_system_transaction(
         self,
         from_address: str,
         signer_address: str,
     ) -> tuple[bool, str]:
         """
-        Validate a transaction involving a system wallet.
-        
+        Validate a transaction involving a system wallet (single-key mode).
+
+        For multisig wallets, use ``verify_multisig_spend`` instead.
+
         Args:
             from_address: Address sending funds
             signer_address: Address that signed the transaction
-            
+
         Returns:
             Tuple of (is_valid, error_message)
         """
         # Check if spending from a system wallet
         if not self.is_system_wallet(from_address):
             return True, "OK"  # Not a system wallet, no special validation needed
-        
+
         # Check if transaction is from burner wallet (should never spend)
         wallet = self.get_system_wallet(from_address)
         if wallet and wallet.is_burner:
             return False, f"Cannot spend from burner wallet: {from_address}"
-        
+
+        # Check per-wallet multisig
+        wallet_ms = self._wallet_multisigs.get(from_address)
+        if wallet_ms:
+            if signer_address == wallet_ms.address:
+                return True, "OK"
+            return False, (
+                f"System wallet {from_address} requires multisig {wallet_ms.address}, "
+                f"not {signer_address}"
+            )
+
         # Verify signer is the controller
         if signer_address != self.controller_address:
             return False, (
                 f"System wallet {from_address} can only be spent by controller "
                 f"{self.controller_address}, not {signer_address}"
             )
-        
+
         return True, "OK"
-    
+
+    # ── Aggregate Queries ───────────────────────────────────────────
+
     def get_all_wallets(self) -> List[SystemWallet]:
         """Get all registered system wallets."""
         return list(self._system_wallets.values())
-    
+
     def get_total_genesis_balance(self) -> Decimal:
         """Calculate total balance across all system wallets."""
         return sum(w.genesis_balance for w in self._system_wallets.values())
-    
+
     def export_genesis_allocations(self) -> Dict[str, tuple[Decimal, str]]:
         """
         Export system wallet allocations for genesis.
-        
+
         Returns:
             Dict of {address: (balance, label)}
         """

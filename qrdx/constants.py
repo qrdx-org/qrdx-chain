@@ -622,6 +622,34 @@ POS_CONSTANTS = {
 
 
 # ==================================================================================
+# MULTISIG & WALLET ARCHITECTURE (Whitepaper §6)
+# ==================================================================================
+
+# Threshold Dilithium limits
+MULTISIG_MAX_SIGNERS = 150       # Maximum n (total signers in a keyset)
+MULTISIG_MAX_THRESHOLD = 100     # Maximum m (required signers)
+MULTISIG_MIN_THRESHOLD = 1       # Minimum m (1-of-n is the simplest multisig)
+MULTISIG_ADDRESS_PREFIX = "0xPQMS"  # Prefix for derived multisig addresses
+
+# Domain separator for threshold signing (prevents cross-wallet replay)
+MULTISIG_DOMAIN_SEPARATOR = b"QRDX-THRESHOLD-DILITHIUM-v1"
+
+# Spending Scope bitmask (Whitepaper §6.2)
+SPENDING_SCOPE_NONE     = 0
+SPENDING_SCOPE_TRANSFER = 1   # Basic token transfers
+SPENDING_SCOPE_SWAP     = 2   # Exchange / DEX operations
+SPENDING_SCOPE_STAKE    = 4   # Staking deposits / withdrawals
+SPENDING_SCOPE_BRIDGE   = 8   # Cross-chain bridge operations
+SPENDING_SCOPE_ALL      = 15  # All operations
+
+# Default institutional custody thresholds (Whitepaper §6.3)
+TREASURY_MULTISIG_THRESHOLD = 5    # 5-of-9 for main treasury
+TREASURY_MULTISIG_TOTAL     = 9
+EMERGENCY_RECOVERY_THRESHOLD = 3   # 3-of-5 for emergency
+EMERGENCY_RECOVERY_TOTAL     = 5
+
+
+# ==================================================================================
 # GENESIS PREFUNDED ACCOUNTS
 # ==================================================================================
 # These accounts are pre-funded at genesis with initial balances.
