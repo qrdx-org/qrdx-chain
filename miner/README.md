@@ -1,5 +1,11 @@
 ## qrdx CUDA Miner Setup and Usage
 
+> [!warning]
+> QRDX is a Proof of Stake chain, all Proof of Work code (including this miner) are retired and scheduled for removal
+
+
+### QRDX CAN BE MINED WITH ANY DENARO MINER. FOR A NON-PYTHON IMPLEMENTATION REFER TO: https://github.com/connor33341/denarocudaminer.git
+
 `cuda_miner.py` is a GPU accelerated single worker mining script for qrdx. It uses PyCUDA to JIT (Just in Time) compile a CUDA kernel for a SHA256 based nonce search over a constant block prefix and submits candidate blocks to a specified qrdx node.
 
 ---
