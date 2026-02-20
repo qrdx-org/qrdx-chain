@@ -1,0 +1,175 @@
+# QRDX Production Docker Compose
+# Multi-service deployment with monitoring stack
+#
+# Usage:
+#   docker compose -f docker/docker-compose.prod.yml up -d
+#
+# Services:
+#   - qrdx-node     : QRDX blockchain node
+#   - prometheus     : Metrics collection
+#   - grafana        : Metrics dashboard
+#
+# Volumes:
+#   - qrdx-data      : Blockchain data (SQLite + wallets)
+#   - prometheus-data : Metrics storage
+#   - grafana-data    : Dashboard config
+
+version: "3.8"
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  # ---------------------------------------------------------------------------
+  # QRDX Node
+  # ---------------------------------------------------------------------------
+  qrdx-node:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: qrdx-node
+    restart: unless-stopped
+    logging: *default-logging
+
+    ports:
+      # HTTP JSON-RPC
+      - "${QRDX_RPC_HTTP_PORT:-8545}:8545"
+      # WebSocket JSON-RPC
+      - "${QRDX_RPC_WS_PORT:-8546}:8546"
+      # P2P
+      - "${QRDX_P2P_PORT:-30303}:30303"
+      # Legacy REST (if enabled)
+      - "${QRDX_LEGACY_PORT:-3007}:3007"
+      # Prometheus metrics
+      - "${QRDX_METRICS_PORT:-9090}:9090"
+
+    volumes:
+      - qrdx-data:/app/data
+      # Mount config (read-only)
+      - ./config.toml:/app/config.toml:ro
+      # Mount TLS certs (read-only, optional)
+      - ${QRDX_TLS_CERT_DIR:-./certs}:/app/certs:ro
+
+    environment:
+      - QRDX_CONFIG=/app/config.toml
+      - QRDX_DATA_DIR=/app/data
+      - QRDX_LOG_LEVEL=${QRDX_LOG_LEVEL:-INFO}
+      - QRDX_CHAIN_ID=${QRDX_CHAIN_ID:-1}
+      - QRDX_METRICS_ENABLED=true
+      - QRDX_METRICS_PORT=9090
+      # Sensitive values from environment only
+      - QRDX_VALIDATOR_PASSWORD=${QRDX_VALIDATOR_PASSWORD:-}
+      - QRDX_TLS_CERT=${QRDX_TLS_CERT:-}
+      - QRDX_TLS_KEY=${QRDX_TLS_KEY:-}
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "${QRDX_CPU_LIMIT:-4.0}"
+          memory: "${QRDX_MEM_LIMIT:-4G}"
+        reservations:
+          cpus: "1.0"
+          memory: "1G"
+
+    healthcheck:
+      test: ["CMD", "python3", "/app/docker/docker-healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # Run as non-root
+    user: "1000:1000"
+
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    networks:
+      - qrdx-net
+
+  # ---------------------------------------------------------------------------
+  # Prometheus — Metrics Collection
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: qrdx-prometheus
+    restart: unless-stopped
+    logging: *default-logging
+
+    ports:
+      - "${PROMETHEUS_PORT:-9091}:9090"
+
+    volumes:
+      - prometheus-data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "1G"
+
+    networks:
+      - qrdx-net
+
+  # ---------------------------------------------------------------------------
+  # Grafana — Dashboards
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: qrdx-grafana
+    restart: unless-stopped
+    logging: *default-logging
+
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"
+
+    networks:
+      - qrdx-net
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  qrdx-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  qrdx-net:
+    driver: bridge

@@ -1,0 +1,64 @@
+# QRDX Alert Rules for Prometheus
+
+groups:
+  - name: qrdx_node_alerts
+    rules:
+      # Chain stall — no new blocks for 5 minutes
+      - alert: ChainStall
+        expr: increase(qrdx_blocks_processed_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "QRDX chain stall detected"
+          description: "No new blocks processed in the last 5 minutes."
+
+      # Low peer count
+      - alert: LowPeerCount
+        expr: qrdx_peer_count < 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low peer count ({{ $value }})"
+          description: "Node has fewer than 3 peers for over 2 minutes."
+
+      # High RPC error rate
+      - alert: HighRPCErrorRate
+        expr: rate(qrdx_rpc_errors_total[5m]) / rate(qrdx_rpc_requests_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High RPC error rate ({{ $value | humanizePercentage }})"
+          description: "More than 10% of RPC requests are failing."
+
+      # Mempool backlog
+      - alert: MempoolBacklog
+        expr: qrdx_mempool_size > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Large mempool backlog ({{ $value }})"
+          description: "Mempool has over 10,000 pending transactions."
+
+      # Validator inactive
+      - alert: ValidatorInactive
+        expr: qrdx_validator_active == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Validator is inactive"
+          description: "This validator node has been inactive for 5 minutes."
+
+      # Finality stall — finalized epoch not advancing
+      - alert: FinalityStall
+        expr: increase(qrdx_finalized_epoch[10m]) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Finality stall detected"
+          description: "Finalized epoch has not advanced in 10 minutes."
