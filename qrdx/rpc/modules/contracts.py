@@ -123,10 +123,12 @@ class EthereumRPCModule:
             if not result.success:
                 raise RPCError(-32000, f"Transaction failed: {result.error}")
             
-            # Return transaction hash (simplified - should compute actual hash)
-            import hashlib
-            tx_data = sender + (to or b'') + data
-            tx_hash = '0x' + hashlib.sha256(tx_data).hexdigest()
+            # Compute proper keccak256 transaction hash
+            from eth_hash.auto import keccak
+            import rlp
+            # Hash sender + to + data + value + gas as a deterministic blob
+            tx_blob = sender + (to or b'') + data + value.to_bytes(32, 'big') + gas.to_bytes(8, 'big')
+            tx_hash = '0x' + keccak(tx_blob).hex()
             
             return tx_hash
             
@@ -415,12 +417,12 @@ class EthereumRPCModule:
             
             # Block range filter
             if 'fromBlock' in filter_params:
-                from_block = self._parse_block_number(filter_params['fromBlock'])
+                from_block = await self._parse_block_number(filter_params['fromBlock'])
                 query += f" AND block_number >= ${len(params) + 1}"
                 params.append(from_block)
             
             if 'toBlock' in filter_params:
-                to_block = self._parse_block_number(filter_params['toBlock'])
+                to_block = await self._parse_block_number(filter_params['toBlock'])
                 query += f" AND block_number <= ${len(params) + 1}"
                 params.append(to_block)
             
@@ -546,10 +548,10 @@ class EthereumRPCModule:
             row = await conn.fetchrow("SELECT MAX(id) as height FROM blocks")
             return row['height'] if row and row['height'] else 0
     
-    def _parse_block_number(self, block_param: str) -> int:
+    async def _parse_block_number(self, block_param: str) -> int:
         """Parse block number parameter."""
         if block_param == 'latest' or block_param == 'pending':
-            return 999999999  # Large number for latest
+            return await self._get_current_block_number()
         elif block_param == 'earliest':
             return 0
         else:

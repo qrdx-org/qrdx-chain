@@ -20,6 +20,7 @@ testnet/
 *.db
 *.log
 *.env
+*.bak
 *.html
 
 # === Security: Private keys and secrets ===
