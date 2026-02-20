@@ -75,6 +75,21 @@ class TestConversionFunctions:
         assert wei == 10**9
 
 
+class MockCursor:
+    """Mock database cursor returned by execute."""
+    
+    def __init__(self, row=None):
+        self._row = row
+    
+    async def fetchone(self):
+        return self._row
+    
+    async def fetchall(self):
+        if self._row:
+            return [self._row]
+        return []
+
+
 class MockConnection:
     """Mock database connection."""
     
@@ -86,6 +101,11 @@ class MockConnection:
         # Store in mock table if INSERT
         if 'INSERT' in query.upper():
             self.db.last_insert = params
+        # Return a MockCursor (for fetchone/fetchall)
+        return MockCursor(row=None)
+    
+    async def commit(self):
+        """Mock commit."""
         pass
     
     async def fetchrow(self, query, *params):
@@ -129,6 +149,7 @@ class MockDatabase:
         self.balances = {}
         self.pool = MockPool(self)
         self.last_insert = None
+        self.connection = MockConnection(self)
         
     async def get_address_balance(self, address: str) -> Decimal:
         """Mock balance lookup."""

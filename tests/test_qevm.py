@@ -191,14 +191,19 @@ class TestPrecompileRegistry:
                 f"Precompile at {addr.hex()} is a class, not a function"
             )
 
-    def test_registry_has_seven_precompiles(self):
-        assert len(QRDX_PRECOMPILES) == 7
+    def test_registry_has_twelve_precompiles(self):
+        assert len(QRDX_PRECOMPILES) == 12
 
     def test_correct_addresses(self):
         from eth.vm.forks.qrdx.precompiles import (
             ORACLE_GET_CHAIN_STATE_ADDRESS,
             ORACLE_VERIFY_PROOF_ADDRESS,
             ORACLE_SUBMIT_CROSS_CHAIN_TX_ADDRESS,
+            EXCHANGE_CREATE_POOL_ADDRESS,
+            EXCHANGE_SWAP_ADDRESS,
+            EXCHANGE_ADD_LIQUIDITY_ADDRESS,
+            EXCHANGE_PLACE_LIMIT_ORDER_ADDRESS,
+            EXCHANGE_CANCEL_ORDER_ADDRESS,
         )
         expected = {
             DILITHIUM_VERIFY_ADDRESS,
@@ -208,6 +213,11 @@ class TestPrecompileRegistry:
             ORACLE_GET_CHAIN_STATE_ADDRESS,
             ORACLE_VERIFY_PROOF_ADDRESS,
             ORACLE_SUBMIT_CROSS_CHAIN_TX_ADDRESS,
+            EXCHANGE_CREATE_POOL_ADDRESS,
+            EXCHANGE_SWAP_ADDRESS,
+            EXCHANGE_ADD_LIQUIDITY_ADDRESS,
+            EXCHANGE_PLACE_LIMIT_ORDER_ADDRESS,
+            EXCHANGE_CANCEL_ORDER_ADDRESS,
         }
         assert set(QRDX_PRECOMPILES.keys()) == expected
 

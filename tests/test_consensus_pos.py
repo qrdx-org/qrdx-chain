@@ -1705,13 +1705,21 @@ class TestSyncCommitteeManager:
         randao = os.urandom(32)
         committee = mgr.compute_sync_committee(0, validators, randao)
 
-        # Record signatures for 2 of 4 members
-        mgr.record_sync_signature(0, committee.pubkeys[0], b'\x01' * 32)
-        mgr.record_sync_signature(0, committee.pubkeys[1], b'\x02' * 32)
+        # Record signatures for 2 unique committee members
+        # Use a set to find unique pubkeys, then record exactly 2
+        unique_pubkeys = list(dict.fromkeys(committee.pubkeys))  # preserve order, deduplicate
+        mgr.record_sync_signature(0, unique_pubkeys[0], b'\x01' * 32)
+        if len(unique_pubkeys) >= 2:
+            mgr.record_sync_signature(0, unique_pubkeys[1], b'\x02' * 32)
 
         agg = mgr.aggregate_sync_signatures(0, committee)
         assert agg is not None
-        assert agg.participation_count == 2
+        # Count how many committee slots are covered by the signed pubkeys
+        signed = {unique_pubkeys[0]}
+        if len(unique_pubkeys) >= 2:
+            signed.add(unique_pubkeys[1])
+        expected = sum(1 for pk in committee.pubkeys if pk in signed)
+        assert agg.participation_count == expected
 
     def test_aggregate_no_signatures(self):
         mgr = SyncCommitteeManager(sync_committee_size=4, epochs_per_period=256)

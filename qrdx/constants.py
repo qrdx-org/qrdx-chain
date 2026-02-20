@@ -519,7 +519,7 @@ SYNC_COMMITTEE_SIZE = 512              # Number of validators in sync committee
 SYNC_COMMITTEE_SUBNET_COUNT = 4        # Number of subnets for distribution
 
 # --- Validator Set ---
-MIN_VALIDATORS = 1                     # Minimum validators to operate (testnet: 1)
+MIN_VALIDATORS = int(os.environ.get('QRDX_MIN_VALIDATORS', '4'))  # Mainnet: 4, testnet override via env
 MAX_VALIDATORS = 150                   # Maximum active validators
 MIN_VALIDATOR_STAKE = Decimal('100000')  # 100,000 QRDX minimum stake
 MAX_EFFECTIVE_STAKE = Decimal('1000000')  # 1,000,000 QRDX max effective stake

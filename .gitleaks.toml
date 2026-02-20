@@ -1,0 +1,48 @@
+# QRDX Chain — Gitleaks Configuration
+# Prevents accidental credential / key leakage
+
+title = "QRDX Gitleaks Configuration"
+
+[extend]
+# Use the default gitleaks rules as a base
+useDefault = true
+
+# Additional rules for blockchain-specific secrets
+[[rules]]
+id = "qrdx-private-key-hex"
+description = "QRDX private key (hex format)"
+regex = '''(?i)(private[_-]?key|secret[_-]?key|priv[_-]?key)\s*[:=]\s*['\"]?[0-9a-fA-F]{64,}['\"]?'''
+tags = ["key", "QRDX"]
+
+[[rules]]
+id = "dilithium-secret-key"
+description = "Dilithium ML-DSA-65 secret key bytes"
+regex = '''(?i)(dilithium[_-]?secret|ml[_-]?dsa[_-]?secret|signing[_-]?key)\s*[:=]\s*['\"][0-9a-fA-F]{100,}['\"]'''
+tags = ["key", "PQ", "QRDX"]
+
+[[rules]]
+id = "kyber-secret-key"
+description = "Kyber ML-KEM-768 secret key"
+regex = '''(?i)(kyber[_-]?secret|ml[_-]?kem[_-]?secret|kem[_-]?secret)\s*[:=]\s*['\"][0-9a-fA-F]{100,}['\"]'''
+tags = ["key", "PQ", "QRDX"]
+
+[[rules]]
+id = "validator-mnemonic"
+description = "Validator mnemonic seed phrase"
+regex = '''(?i)(mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*['\"][a-z ]{50,}['\"]'''
+tags = ["key", "QRDX"]
+
+[[rules]]
+id = "rpc-api-key"
+description = "RPC or API authentication key"
+regex = '''(?i)(api[_-]?key|auth[_-]?token|bearer[_-]?token|rpc[_-]?key)\s*[:=]\s*['\"][a-zA-Z0-9_-]{20,}['\"]'''
+tags = ["token", "QRDX"]
+
+# Allowed paths (test fixtures, examples)
+[allowlist]
+paths = [
+    '''tests/fixtures/.*''',
+    '''examples/.*''',
+    '''docs/.*\.md''',
+    '''.*\.example\.toml''',
+]

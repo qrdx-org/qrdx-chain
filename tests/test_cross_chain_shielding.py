@@ -1206,6 +1206,12 @@ def _load_precompiles():
     """Load precompiles module from py-evm path."""
     spec = importlib.util.spec_from_file_location("qrdx_precompiles", _precompiles_path)
     mod = importlib.util.module_from_spec(spec)
+    # Save any existing modules so we can restore them
+    _saved = {}
+    _to_mock = ['eth', 'eth.abc', 'eth_typing', 'eth.crypto']
+    for name in _to_mock:
+        _saved[name] = sys.modules.get(name, None)
+
     # We need to mock the imports that precompiles.py requires
     sys.modules['eth'] = MagicMock()
     sys.modules['eth.abc'] = MagicMock()
@@ -1216,6 +1222,14 @@ def _load_precompiles():
     sys.modules['eth_typing'].Address = lambda x: x
 
     spec.loader.exec_module(mod)
+
+    # Restore original modules to avoid contaminating other test files
+    for name in _to_mock:
+        if _saved[name] is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = _saved[name]
+
     return mod
 
 
@@ -1364,10 +1378,10 @@ class TestSubmitCrossChainTxPrecompile:
 # ══════════════════════════════════════════════════════════════════════
 
 class TestPrecompileRegistry:
-    """Step 4.5 — Verify all 7 precompiles are registered."""
+    """Step 4.5 — Verify all 12 precompiles are registered."""
 
     def test_total_precompile_count(self):
-        assert len(QRDX_PRECOMPILES) == 7
+        assert len(QRDX_PRECOMPILES) == 12
 
     def test_oracle_precompiles_registered(self):
         # Oracle addresses should be in the registry

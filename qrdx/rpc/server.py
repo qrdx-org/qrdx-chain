@@ -10,8 +10,10 @@ Implements the JSON-RPC 2.0 specification with support for:
 
 import json
 import asyncio
+import time
+from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 
 from ..logger import get_logger
@@ -161,17 +163,97 @@ def rpc_method(func: RPCMethod) -> RPCMethod:
     return func
 
 
+class RPCRateLimiter:
+    """
+    Token-bucket rate limiter for JSON-RPC requests.
+
+    Limits are per-client (by IP or identifier) and globally.
+    Thread-safe via asyncio lock.
+    """
+
+    def __init__(
+        self,
+        per_client_rps: int = 50,
+        global_rps: int = 500,
+        burst_multiplier: float = 2.0,
+    ):
+        self.per_client_rps = per_client_rps
+        self.global_rps = global_rps
+        self.burst_multiplier = burst_multiplier
+        self._clients: Dict[str, Dict[str, float]] = defaultdict(
+            lambda: {"tokens": per_client_rps * burst_multiplier, "last": time.monotonic()}
+        )
+        self._global_tokens = global_rps * burst_multiplier
+        self._global_last = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def check(self, client_id: str = "anonymous") -> bool:
+        """
+        Check if a request from client_id is allowed.
+
+        Returns True if allowed, False if rate-limited.
+        """
+        async with self._lock:
+            now = time.monotonic()
+
+            # Refill global bucket
+            elapsed_g = now - self._global_last
+            self._global_tokens = min(
+                self.global_rps * self.burst_multiplier,
+                self._global_tokens + elapsed_g * self.global_rps,
+            )
+            self._global_last = now
+
+            if self._global_tokens < 1.0:
+                return False
+            self._global_tokens -= 1.0
+
+            # Refill per-client bucket
+            bucket = self._clients[client_id]
+            elapsed_c = now - bucket["last"]
+            bucket["tokens"] = min(
+                self.per_client_rps * self.burst_multiplier,
+                bucket["tokens"] + elapsed_c * self.per_client_rps,
+            )
+            bucket["last"] = now
+
+            if bucket["tokens"] < 1.0:
+                return False
+            bucket["tokens"] -= 1.0
+
+            return True
+
+    def cleanup(self, max_age: float = 600.0) -> int:
+        """Remove stale client buckets older than max_age seconds."""
+        now = time.monotonic()
+        stale = [k for k, v in self._clients.items() if now - v["last"] > max_age]
+        for k in stale:
+            del self._clients[k]
+        return len(stale)
+
+
 class RPCServer:
     """
     JSON-RPC 2.0 server.
     
     Manages method registration and request handling.
     Can be used with HTTP or WebSocket transports.
+    Includes built-in rate limiting per client and globally.
     """
     
-    def __init__(self):
+    def __init__(
+        self,
+        rate_limit: bool = True,
+        per_client_rps: int = 50,
+        global_rps: int = 500,
+    ):
         self._methods: Dict[str, RPCMethod] = {}
         self._modules: Dict[str, RPCModule] = {}
+        self._rate_limiter: Optional[RPCRateLimiter] = (
+            RPCRateLimiter(per_client_rps=per_client_rps, global_rps=global_rps)
+            if rate_limit
+            else None
+        )
     
     def register_method(self, name: str, handler: RPCMethod):
         """
@@ -213,16 +295,26 @@ class RPCServer:
         """Get list of registered method names."""
         return list(self._methods.keys())
     
-    async def handle_request(self, data: Union[str, bytes, dict]) -> Optional[str]:
+    async def handle_request(
+        self,
+        data: Union[str, bytes, dict],
+        client_id: str = "anonymous",
+    ) -> Optional[str]:
         """
         Handle a JSON-RPC request.
         
         Args:
             data: Request data (JSON string or dict)
+            client_id: Client identifier for rate limiting (e.g. IP address)
             
         Returns:
             JSON response string, or None for notifications
         """
+        # Rate limit check
+        if self._rate_limiter is not None:
+            if not await self._rate_limiter.check(client_id):
+                error = RPCError(RPCErrorCode.LIMIT_EXCEEDED, "Rate limit exceeded")
+                return RPCResponse(error=error.to_dict()).to_json()
         # Parse request
         try:
             if isinstance(data, (str, bytes)):

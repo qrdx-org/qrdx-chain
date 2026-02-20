@@ -14,6 +14,7 @@ Run this script to verify the system wallet implementation.
 
 import sys
 import asyncio
+import pytest
 from decimal import Decimal
 from pathlib import Path
 
@@ -107,6 +108,24 @@ def test_pq_controller_wallet():
     print("\n✓ PQ controller wallet tests passed!")
     
     return controller_key, controller_address
+
+
+@pytest.fixture
+def controller_key():
+    """Generate a PQ controller key for tests."""
+    return PQPrivateKey.generate()
+
+
+@pytest.fixture
+def controller_address(controller_key):
+    """Derive controller address from PQ key."""
+    return controller_key.public_key.to_address()
+
+
+@pytest.fixture
+def manager(controller_address):
+    """Initialize system wallet manager with controller."""
+    return initialize_system_wallets(controller_address)
 
 
 def test_system_wallet_manager(controller_address):
