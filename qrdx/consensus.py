@@ -767,6 +767,15 @@ async def validate_pos_block(
         if not contract_valid:
             return False, f"Contract validation failed: {contract_error}"
     
+    # 7. Execute and validate exchange transactions
+    if hasattr(block, 'transactions') and block.transactions:
+        exchange_valid, exchange_error = await execute_and_validate_exchange(
+            block,
+            database,
+        )
+        if not exchange_valid:
+            return False, f"Exchange validation failed: {exchange_error}"
+    
     return True, ""
 
 
@@ -893,6 +902,142 @@ async def execute_and_validate_contracts(
     except Exception as e:
         logger.error(f"Error in contract validation: {e}", exc_info=True)
         return False, f"Contract system error: {str(e)}"
+
+
+async def execute_and_validate_exchange(
+    block: Any,
+    database: Any = None,
+) -> Tuple[bool, str]:
+    """
+    Execute all exchange transactions in a block and validate results.
+
+    This function:
+    1. Extracts exchange transactions from the block
+    2. Processes them through the ExchangeStateManager
+    3. Validates the resulting state root against the block header (if present)
+
+    Args:
+        block: Block containing transactions
+        database: Database instance (not currently used; reserved for
+                  future DB persistence of exchange state)
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    try:
+        from .exchange.block_processor import (
+            extract_exchange_transactions,
+            process_exchange_transactions,
+        )
+
+        # Extract exchange-typed transactions
+        exchange_txs = extract_exchange_transactions(block)
+        if not exchange_txs:
+            return True, ""
+
+        block_height = getattr(block, 'number', getattr(block, 'height', 0))
+        block_timestamp = getattr(block, 'timestamp', 0.0)
+
+        # Process exchange transactions
+        success, error, computed_root = process_exchange_transactions(
+            block_height, block_timestamp, exchange_txs,
+        )
+        if not success:
+            return False, f"Exchange processing failed: {error}"
+
+        # Validate state root if the block provides one
+        expected_root = getattr(block, 'exchange_state_root', None)
+        if expected_root and expected_root != '0' * 64:
+            if computed_root != expected_root:
+                return False, (
+                    f"Exchange state root mismatch: expected "
+                    f"{expected_root[:16]}..., computed {computed_root[:16]}..."
+                )
+
+        logger.info(
+            "Successfully executed %d exchange transactions, state_root=%s",
+            len(exchange_txs), computed_root[:16],
+        )
+        return True, ""
+
+    except ImportError:
+        # Exchange module not available — backward compatible
+        return True, ""
+    except Exception as e:
+        logger.error(f"Error in exchange validation: {e}", exc_info=True)
+        return False, f"Exchange system error: {str(e)}"
+
+
+async def execute_and_validate_exchange(
+    block: Any,
+    database: Any = None,
+) -> Tuple[bool, str]:
+    """
+    Execute all exchange transactions in a block and validate results.
+
+    This function:
+    1. Extracts exchange transactions from the block
+    2. Processes them through the ExchangeStateManager
+    3. Validates exchange state root if present in block header
+    4. Executes block-boundary duties (funding, liquidation)
+
+    Called as step 7 of validate_pos_block.
+
+    Args:
+        block: Block containing transactions
+        database: Database instance (for future persistence)
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    try:
+        from .exchange.block_processor import (
+            extract_exchange_transactions,
+            process_exchange_transactions,
+        )
+
+        # Extract exchange transactions from the block
+        exchange_txs = extract_exchange_transactions(block)
+
+        if not exchange_txs:
+            # No exchange transactions — valid by default
+            return True, ""
+
+        # Determine block height and timestamp
+        block_height = getattr(block, 'height', getattr(block, 'number', 0))
+        block_timestamp = getattr(block, 'timestamp', 0)
+        if isinstance(block_timestamp, str):
+            block_timestamp = float(block_timestamp)
+
+        # Process exchange transactions
+        success, error, state_root = process_exchange_transactions(
+            block_height, block_timestamp, exchange_txs,
+        )
+
+        if not success:
+            return False, error
+
+        # Validate state root if the block declares one
+        expected_root = getattr(block, 'exchange_state_root', None)
+        if expected_root and expected_root != state_root:
+            return False, (
+                f"Exchange state root mismatch: "
+                f"expected {expected_root[:16]}..., "
+                f"computed {state_root[:16]}..."
+            )
+
+        logger.info(
+            f"Validated {len(exchange_txs)} exchange txs in block {block_height}, "
+            f"state_root={state_root[:16]}..."
+        )
+        return True, ""
+
+    except ImportError:
+        # Exchange module not available — skip validation (backward compat)
+        return True, ""
+    except Exception as e:
+        logger.error(f"Error in exchange validation: {e}", exc_info=True)
+        return False, f"Exchange system error: {str(e)}"
 
 
 def calculate_block_reward(

@@ -7,6 +7,7 @@ using the consensus engine for rule versioning.
 """
 
 import hashlib
+import time
 from decimal import Decimal
 from io import BytesIO
 from math import ceil, floor, log
@@ -663,9 +664,32 @@ async def create_pos_block(
     # Calculate merkle root for transactions
     merkle_root = pos_rules.calculate_merkle_tree(transactions)
     
-    # Calculate state root (placeholder - would be full state root in production)
+    # Process exchange transactions and compute exchange state root
+    exchange_state_root = '0' * 64  # default if no exchange txs
+    try:
+        from .exchange.block_processor import (
+            extract_exchange_transactions,
+            process_exchange_transactions,
+        )
+        from .exchange.transactions import ExchangeTransaction
+        exchange_txs = [
+            tx for tx in transactions
+            if isinstance(tx, ExchangeTransaction)
+        ]
+        if exchange_txs:
+            success, error, exchange_state_root = process_exchange_transactions(
+                block_number, int(time.time()), exchange_txs,
+            )
+            if not success:
+                logger.error(f"Exchange processing failed in block creation: {error}")
+                return None
+    except ImportError:
+        pass  # Exchange module not available — backward compat
+
+    # Calculate state root (includes exchange state root)
     state_root = hashlib.sha256(
-        bytes.fromhex(parent_hash) + merkle_root.encode()
+        bytes.fromhex(parent_hash) + merkle_root.encode() +
+        bytes.fromhex(exchange_state_root)
     ).hexdigest()
     
     # Generate RANDAO reveal
@@ -687,6 +711,7 @@ async def create_pos_block(
         'parent_hash': parent_hash,
         'state_root': state_root,
         'transactions_root': merkle_root,
+        'exchange_state_root': exchange_state_root,
         'timestamp': block_timestamp,
         'proposer_address': proposer_address,
         'proposer_public_key': proposer_public_key.hex(),
@@ -759,6 +784,10 @@ async def validate_pos_block(block_data: dict, validators: list, randao_mix: byt
     block.attestations = block_data.get('attestations', [])
     block.transactions = block_data.get('transactions', [])
     block.hash = block_data['hash']
+    block.number = block_data['number']
+    block.height = block_data['number']
+    block.timestamp = block_data.get('timestamp', 0)
+    block.exchange_state_root = block_data.get('exchange_state_root', '0' * 64)
     
     # Compute signing root
     signing_data = (
@@ -839,14 +868,16 @@ async def commit_pos_block(block_data: dict, transactions: List[Transaction]) ->
                     epoch = $2,
                     proposer_signature = $3,
                     randao_reveal = $4,
-                    attestations_included = $5
-                WHERE hash = $6
+                    attestations_included = $5,
+                    exchange_state_root = $6
+                WHERE hash = $7
             """,
                 block_data['slot'],
                 block_data['epoch'],
                 block_data['proposer_signature'],
                 block_data.get('randao_reveal', ''),
                 attestation_count,
+                block_data.get('exchange_state_root', '0' * 64),
                 block_data['hash'],
             )
         

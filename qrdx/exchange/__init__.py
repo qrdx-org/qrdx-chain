@@ -57,6 +57,22 @@ from .hooks import (
     HookRegistry,
     CircuitBreaker,
 )
+from .transactions import (
+    ExchangeOpType,
+    ExchangeTransaction,
+    EXCHANGE_GAS_COSTS,
+)
+from .state_manager import (
+    ExchangeExecResult,
+    ExchangeStateManager,
+)
+from .block_processor import (
+    process_exchange_transactions,
+    validate_exchange_state_root,
+    extract_exchange_transactions,
+    build_oracle_update_tx,
+    get_validator_fee_share,
+)
 
 __all__ = [
     # Order Book
@@ -75,4 +91,12 @@ __all__ = [
     "Observation", "TWAPOracle",
     # Hooks
     "HookFlags", "HookContext", "HookResult", "HookRegistry", "CircuitBreaker",
+    # Transactions (blockchain integration)
+    "ExchangeOpType", "ExchangeTransaction", "EXCHANGE_GAS_COSTS",
+    # State Manager (consensus bridge)
+    "ExchangeExecResult", "ExchangeStateManager",
+    # Block Processor (consensus integration)
+    "process_exchange_transactions", "validate_exchange_state_root",
+    "extract_exchange_transactions", "build_oracle_update_tx",
+    "get_validator_fee_share",
 ]
