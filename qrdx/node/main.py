@@ -63,8 +63,16 @@ from qrdx.constants import (
 )
 from qrdx.node.identity import (
     initialize_identity, get_node_id, get_public_key_hex, 
-    verify_signature, get_canonical_json_bytes, sign_message
+    verify_signature, get_canonical_json_bytes, sign_message,
+    get_public_key_bytes,
 )
+
+# Kademlia DHT integration
+from qrdx.p2p.node import Node as P2PNode, Address as P2PAddress, hex_to_node_id as p2p_hex_to_node_id
+from qrdx.p2p.routing import RoutingTable, KBucketEntry
+from qrdx.p2p.discovery import KademliaDiscovery
+from qrdx.p2p.dns_seeds import DNSSeedDiscovery
+from qrdx.p2p.config import DiscoveryConfig
 
 logger = get_logger(__name__)
 
@@ -793,6 +801,26 @@ startup_time = time.time()
 # Connection pool for HTTP requests
 http_client: Optional[httpx.AsyncClient] = None
 
+# Kademlia DHT subsystem
+dht_discovery: Optional[KademliaDiscovery] = None
+dht_dns_seeds: Optional[DNSSeedDiscovery] = None
+dht_config: DiscoveryConfig = DiscoveryConfig()
+
+# ---- Always-on JSON-RPC server (required for DHT inter-node protocol) ----
+from qrdx.rpc.server import RPCServer
+from qrdx.rpc.modules.dht import DHTModule
+
+rpc_server = RPCServer()
+
+# Register DHT module unconditionally — it's core networking, not optional
+dht_rpc_module = DHTModule()
+rpc_server.register_module(dht_rpc_module)
+
+@app.post("/rpc")
+async def rpc_endpoint(body: dict = Body(...)):
+    """JSON-RPC 2.0 endpoint"""
+    return await rpc_server.handle_request(body)
+
 LAST_PENDING_TRANSACTIONS_CLEAN = [0]
 block_processing_lock = asyncio.Lock()
 
@@ -1336,6 +1364,200 @@ async def do_handshake_with_peer(peer_url_to_connect: str):
         })
 
 
+# ============================================================================
+# KADEMLIA DHT BRIDGE
+# ============================================================================
+
+
+async def _dht_bridge_sync() -> None:
+    """
+    Bidirectional sync between Kademlia DHT routing table and NodesManager.
+
+    - Push NodesManager peers into the DHT routing table
+    - Pull DHT-discovered peers into NodesManager via handshake
+    """
+    if dht_discovery is None:
+        return
+
+    # --- Push: NodesManager → DHT routing table ---
+    pushed = 0
+    for peer_id, peer_data in list(NodesManager.peers.items()):
+        url = peer_data.get('url', '')
+        if not url:
+            continue
+        try:
+            parsed = urlparse(url)
+            host = parsed.hostname or 'localhost'
+            port = parsed.port or 30303
+            # Derive a node_id from the peer_id string if it looks like qx-hex
+            if peer_id.startswith('qx') and len(peer_id) >= 42:
+                nid = p2p_hex_to_node_id(peer_id)
+            else:
+                # Use a hash of the peer_id as a fallback node ID
+                nid = hashlib.blake2b(peer_id.encode(), digest_size=20).digest()
+
+            entry = KBucketEntry(
+                node_id=nid,
+                node_id_hex=peer_id if peer_id.startswith('qx') else 'qx' + nid.hex(),
+                host=host,
+                port=port,
+                public_key_hex=peer_data.get('pubkey', ''),
+                at_schema='',
+                last_seen=time.monotonic(),
+                added_at=time.monotonic(),
+                is_inbound=False,
+            )
+            added, _ = dht_discovery.routing_table._buckets[
+                dht_discovery.routing_table._bucket_index(nid)
+            ].add_or_update(entry, rate_limit=False)
+            if added:
+                pushed += 1
+        except Exception:
+            pass  # Skip malformed peers silently
+
+    # --- Pull: DHT routing table → NodesManager ---
+    pulled = 0
+    for bucket in dht_discovery.routing_table._buckets:
+        for entry in bucket.entries:
+            entry_node_id = entry.node_id_hex
+            if entry_node_id not in NodesManager.peers and entry_node_id != self_node_id:
+                if len(NodesManager.peers) < MAX_PEERS and entry.host:
+                    peer_url = f"http://{entry.host}:{entry.port}"
+                    asyncio.create_task(do_handshake_with_peer(peer_url))
+                    pulled += 1
+                    if pulled >= 10:  # Limit handshake burst per sync cycle
+                        break
+        if pulled >= 10:
+            break
+
+    if pushed or pulled:
+        logger.debug(f"DHT bridge sync: pushed {pushed} peers to DHT, pulled {pulled} for handshake")
+
+
+async def _periodic_dht_bridge() -> None:
+    """Periodically sync DHT routing table with NodesManager."""
+    await asyncio.sleep(30)  # Initial delay
+    while True:
+        try:
+            await _dht_bridge_sync()
+        except Exception as e:
+            logger.error(f"DHT bridge sync error: {e}")
+        await asyncio.sleep(120)  # Sync every 2 minutes
+
+
+async def _init_dht() -> None:
+    """
+    Initialize the Kademlia DHT subsystem during node startup.
+
+    - Creates the local P2P Node from the existing identity
+    - Loads or creates the routing table (with disk persistence)
+    - Initializes DNS seed discovery
+    - Bootstraps the DHT from DNS seeds + hardcoded bootstrap nodes
+    - Starts the periodic refresh loop
+    - Starts the DHT ↔ NodesManager bridge
+    """
+    global dht_discovery, dht_dns_seeds, dht_config
+
+    try:
+        # Build the local P2P Node from existing identity
+        pub_key = get_public_key_bytes()
+        listen_host = DENARO_NODE_HOST or '0.0.0.0'
+        listen_port = int(DENARO_NODE_PORT) if DENARO_NODE_PORT else 30303
+        local_addr = P2PAddress(ip=listen_host, tcp_port=listen_port)
+        local_node = P2PNode(public_key=pub_key, address=local_addr)
+
+        logger.info(f"DHT local node: {local_node.node_id_hex} @ {listen_host}:{listen_port}")
+
+        # Load or create routing table with disk persistence
+        persist_dir = dht_config.routing_table_path
+        os.makedirs(persist_dir, exist_ok=True)
+
+        rt_path = os.path.join(persist_dir, 'routing_table.json')
+        if os.path.exists(rt_path):
+            routing_table = RoutingTable.load(local_node.node_id, persist_dir)
+            logger.info(f"Loaded persisted routing table: {routing_table.total_nodes} nodes")
+        else:
+            routing_table = RoutingTable(local_node.node_id, persist_path=persist_dir)
+            logger.info("Created fresh routing table")
+
+        # Create KademliaDiscovery instance
+        dht_discovery = KademliaDiscovery(
+            local_node=local_node,
+            routing_table=routing_table,
+            http_client=http_client,
+        )
+
+        # Initialize DNS seed discovery
+        if dht_config.dns_enabled:
+            dht_dns_seeds = DNSSeedDiscovery(
+                seed_domains=dht_config.dns_seeds,
+                require_signatures=dht_config.dns_require_signatures,
+            )
+            logger.info(f"DNS seed discovery enabled: {dht_config.dns_seeds}")
+
+        # Collect bootstrap seeds: DNS seeds → hardcoded bootstrap nodes
+        seed_nodes: List[Tuple[str, int]] = []
+
+        # Try DNS seeds first
+        if dht_dns_seeds is not None:
+            try:
+                dns_addrs = await dht_dns_seeds.discover_with_fallback(
+                    hardcoded_bootstrap=[str(url) for url in BOOTSTRAP_NODES],
+                )
+                for addr in dns_addrs:
+                    # Parse @-schema addresses or HTTP URLs
+                    if '@' in addr and addr.count('@') == 2:
+                        # @-schema: algo@id@host:port
+                        parts = addr.split('@')
+                        host_port = parts[2]
+                        host, port_str = host_port.rsplit(':', 1)
+                        seed_nodes.append((host, int(port_str)))
+                    elif '://' in addr:
+                        parsed = urlparse(addr)
+                        host = parsed.hostname or 'localhost'
+                        port = parsed.port or 30303
+                        seed_nodes.append((host, port))
+                logger.info(f"DNS seed discovery returned {len(dns_addrs)} addresses")
+            except Exception as e:
+                logger.warning(f"DNS seed discovery failed: {e}")
+
+        # Always include hardcoded bootstrap nodes as fallback
+        for url in BOOTSTRAP_NODES:
+            try:
+                parsed = urlparse(str(url).strip().rstrip('/'))
+                host = parsed.hostname or 'localhost'
+                port = parsed.port or 30303
+                if (host, port) not in seed_nodes:
+                    seed_nodes.append((host, port))
+            except Exception:
+                pass
+
+        # Bootstrap the DHT
+        if seed_nodes:
+            discovered = await dht_discovery.bootstrap(seed_nodes)
+            logger.info(f"DHT bootstrap discovered {discovered} nodes")
+        else:
+            logger.warning("No DHT seed nodes available — DHT will rely on incoming connections")
+
+        # Start the periodic refresh loop
+        dht_discovery.start()
+
+        # Wire DHT into the module-level RPC module so dht_message / dht_getStats etc. work
+        dht_rpc_module.set_discovery(dht_discovery, dht_dns_seeds)
+        logger.info("DHT wired into RPC module (dht_* methods live)")
+
+        # Start the bridge sync loop
+        asyncio.create_task(_periodic_dht_bridge())
+
+        logger.info("✅ Kademlia DHT subsystem initialized")
+
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize DHT subsystem: {e}", exc_info=True)
+        # DHT failure is non-fatal — node continues with HTTP gossip only
+        dht_discovery = None
+        dht_dns_seeds = None
+
+
 async def bootstrap_from_all_nodes():
     """
     Bootstrap from all configured bootstrap nodes.
@@ -1426,6 +1648,20 @@ async def periodic_peer_discovery():
         except Exception as e:
             # Use the correctly scoped variable in the log message
             logger.error(f"Error during peer discovery with {peer_url}: {e}")
+
+        # Supplement with DHT iterative lookup for our own node ID
+        if dht_discovery is not None and len(NodesManager.peers) < MAX_PEERS:
+            try:
+                from qrdx.p2p.node import derive_node_id as _dni
+                local_nid = _dni(get_public_key_bytes())
+                dht_found = await dht_discovery.iterative_find_node(local_nid, count=10)
+                for entry in dht_found:
+                    if entry.node_id_hex not in NodesManager.peers and entry.node_id_hex != self_node_id:
+                        if len(NodesManager.peers) < MAX_PEERS and entry.host:
+                            peer_url_dht = f"http://{entry.host}:{entry.port}"
+                            asyncio.create_task(do_handshake_with_peer(peer_url_dht))
+            except Exception as e:
+                logger.debug(f"DHT peer discovery supplement error: {e}")
 
 
 async def is_url_local(url: str) -> bool:
@@ -1893,12 +2129,18 @@ async def startup():
         else:
             logger.warning(f"⚠️  Validator wallet not found: {validator_wallet_path}")
     
-    # Initialize RPC server if enabled
+    # ---- Wire module-level RPC server into app.state ----
+    app.state.dht_rpc_module = dht_rpc_module
+    app.state.rpc_server = rpc_server
+
+    logger.info(f"✅ JSON-RPC server initialized (dht_* always-on): {len(rpc_server.get_methods())} methods")
+    logger.info(f"   RPC endpoint: http://{DENARO_NODE_HOST}:{DENARO_NODE_PORT}/rpc")
+
+    # ---- Optional EVM / chain RPC modules (gated by QRDX_RPC_ENABLED) ----
     rpc_enabled = os.getenv('QRDX_RPC_ENABLED', 'false').lower() == 'true'
     if rpc_enabled:
-        logger.info("🔷 JSON-RPC Server Enabled")
+        logger.info("🔷 EVM / chain JSON-RPC modules enabled")
         try:
-            from ..rpc.server import RPCServer
             from ..rpc.modules.eth import EthModule
             from ..rpc.modules.qrdx import QRDXModule
             from ..rpc.modules.net import NetModule
@@ -1909,9 +2151,6 @@ async def startup():
             state_manager = ContractStateManager(db)
             evm_executor = QRDXEVMExecutor(state_manager)
             logger.info("✅ Contract system initialized")
-            
-            # Create RPC server
-            rpc_server = RPCServer()
             
             # Create context for modules
             from dataclasses import dataclass
@@ -2231,17 +2470,7 @@ async def startup():
             net_module.context = context
             rpc_server.register_module(net_module)
             
-            # Store RPC server globally
-            app.state.rpc_server = rpc_server
-            
-            # Add RPC endpoint to FastAPI app
-            @app.post("/rpc")
-            async def rpc_endpoint(body: dict = Body(...)):
-                """JSON-RPC 2.0 endpoint"""
-                return await rpc_server.handle_request(body)
-            
-            logger.info(f"✅ JSON-RPC server initialized with {len(rpc_server.get_methods())} methods")
-            logger.info(f"   RPC endpoint: http://{DENARO_NODE_HOST}:{DENARO_NODE_PORT}/rpc")
+            logger.info(f"✅ EVM / chain RPC modules registered: {len(rpc_server.get_methods())} total methods")
             
         except Exception as e:
             logger.error(f"❌ RPC server initialization error: {e}", exc_info=True)
@@ -2251,6 +2480,9 @@ async def startup():
     asyncio.create_task(periodic_peer_discovery())
     asyncio.create_task(periodic_update_fetcher())
 
+    # Initialize Kademlia DHT subsystem (non-blocking, non-fatal)
+    await _init_dht()
+
     logger.info(f"Denaro node server started on http://{DENARO_NODE_HOST}:{DENARO_NODE_PORT}")
     logger.info("Application startup complete.")
     
@@ -2258,6 +2490,11 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     """Clean shutdown"""
+    # Stop Kademlia DHT (persists routing table to disk)
+    if dht_discovery is not None:
+        dht_discovery.stop()
+        logger.info("Kademlia DHT stopped and routing table persisted.")
+
     # Stop validator if running
     if hasattr(app.state, 'validator') and app.state.validator:
         await app.state.validator.stop()

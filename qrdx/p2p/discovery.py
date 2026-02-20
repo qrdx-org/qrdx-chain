@@ -355,22 +355,39 @@ class KademliaDiscovery:
         msg: DHTMessage,
     ) -> Optional[DHTMessage]:
         """
-        Send a DHT RPC message to a remote node via HTTP POST.
+        Send a DHT RPC message to a remote node via JSON-RPC 2.0.
+
+        Wraps the DHT message in a ``dht_message`` JSON-RPC call
+        and POSTs to the node's ``/rpc`` endpoint.
 
         Returns the response message, or None on failure.
         """
-        url = f"http://{host}:{port}/dht/message"
+        url = f"http://{host}:{port}/rpc"
         client = self._client or httpx.AsyncClient()
         should_close = self._client is None
+
+        # Build JSON-RPC 2.0 envelope
+        rpc_payload = {
+            "jsonrpc": "2.0",
+            "method": "dht_message",
+            "params": [msg.to_dict()],
+            "id": 1,
+        }
 
         try:
             response = await client.post(
                 url,
-                json=msg.to_dict(),
+                json=rpc_payload,
                 timeout=DHT_RPC_TIMEOUT,
             )
             if response.status_code == 200:
-                return DHTMessage.from_dict(response.json())
+                rpc_resp = response.json()
+                # JSON-RPC: result is in "result" key, errors in "error"
+                if isinstance(rpc_resp, dict) and 'result' in rpc_resp:
+                    return DHTMessage.from_dict(rpc_resp['result'])
+                # Handle non-standard response (raw dict) for backward compat
+                if isinstance(rpc_resp, dict) and 'type' in rpc_resp:
+                    return DHTMessage.from_dict(rpc_resp)
             return None
         except (httpx.RequestError, httpx.HTTPStatusError, Exception) as e:
             logger.debug(f"DHT RPC to {host}:{port} failed: {e}")
