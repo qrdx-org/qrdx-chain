@@ -642,6 +642,58 @@ SPENDING_SCOPE_STAKE    = 4   # Staking deposits / withdrawals
 SPENDING_SCOPE_BRIDGE   = 8   # Cross-chain bridge operations
 SPENDING_SCOPE_ALL      = 15  # All operations
 
+
+# ==================================================================================
+# CROSS-CHAIN BRIDGE & ORACLE (Whitepaper §8, §10)
+# ==================================================================================
+
+# Chain identifiers (matches bridge.types.ChainId)
+BRIDGE_CHAIN_QRDX     = 0
+BRIDGE_CHAIN_ETHEREUM  = 1
+BRIDGE_CHAIN_BITCOIN   = 2
+BRIDGE_CHAIN_SOLANA    = 3
+BRIDGE_CHAIN_COSMOS    = 4
+
+# Confirmation requirements per chain (source chain finality)
+BRIDGE_CONFIRMATIONS_ETH = 12    # ~3 minutes (Ethereum PoS)
+BRIDGE_CONFIRMATIONS_BTC = 6     # ~60 minutes (Bitcoin PoW)
+BRIDGE_CONFIRMATIONS_SOL = 32    # ~12.8 seconds (Solana finality)
+BRIDGE_CONFIRMATIONS_COSMOS = 1  # Instant finality (Tendermint)
+
+# Bridge fees (basis points: 10 bps = 0.1%)
+BRIDGE_FEE_BPS = 10
+
+# Doomsday Protocol (§8.5)
+DOOMSDAY_CANARY_ADDRESS = "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+DOOMSDAY_CANARY_BOUNTY = Decimal("1000000")  # 1M QRDX
+
+# Fraud proof window for high-value unshields (§8.2)
+FRAUD_PROOF_WINDOW_SECONDS = 604800  # 7 days
+HIGH_VALUE_THRESHOLD_USD = Decimal("100000")  # $100K
+
+# Oracle attestation threshold (§10.2)
+# Minimum fraction of validators required: ≥ 2/3+1
+ORACLE_ATTESTATION_QUORUM_NUMERATOR = 2
+ORACLE_ATTESTATION_QUORUM_DENOMINATOR = 3
+
+# Oracle precompile addresses (Step 4.5)
+ORACLE_PRECOMPILE_GET_CHAIN_STATE = 0x0200
+ORACLE_PRECOMPILE_VERIFY_PROOF = 0x0201
+ORACLE_PRECOMPILE_SUBMIT_CROSS_CHAIN_TX = 0x0202
+
+# Oracle precompile gas costs
+ORACLE_GAS_GET_CHAIN_STATE = 100_000
+ORACLE_GAS_VERIFY_PROOF = 200_000
+ORACLE_GAS_SUBMIT_CROSS_CHAIN_TX = 500_000
+
+# Bridge token minimum/maximum amounts
+BRIDGE_MIN_AMOUNT_ETH = Decimal("0.01")
+BRIDGE_MAX_AMOUNT_ETH = Decimal("10000")
+BRIDGE_MIN_AMOUNT_BTC = Decimal("0.0001")
+BRIDGE_MAX_AMOUNT_BTC = Decimal("1000")
+BRIDGE_MIN_AMOUNT_SOL = Decimal("0.01")
+BRIDGE_MAX_AMOUNT_SOL = Decimal("100000")
+
 # Default institutional custody thresholds (Whitepaper §6.3)
 TREASURY_MULTISIG_THRESHOLD = 5    # 5-of-9 for main treasury
 TREASURY_MULTISIG_TOTAL     = 9
