@@ -411,25 +411,112 @@ class NodesManager:
         return None
 
 class NodeInterface:
+    """
+    Inter-node communication via JSON-RPC 2.0 at ``/rpc``.
+
+    Every public method maps to a ``p2p_*`` RPC call on the remote node
+    instead of hitting legacy REST endpoints.  This eliminates the
+    Dilithium-signed-request overhead and the 403 errors that plagued
+    REST-based propagation.
+    """
+
+    _rpc_id_counter = 0
+
     def __init__(self, url: str, client: httpx.AsyncClient, db):
         self.url = url.strip('/')
-        self.client = client  # Store the shared client instance
-        self.db = db          # Store the shared database connection instance
+        self.client = client
+        self.db = db
+
+    # -----------------------------------------------------------------
+    #  Low-level JSON-RPC transport
+    # -----------------------------------------------------------------
+
+    @classmethod
+    def _next_id(cls) -> int:
+        cls._rpc_id_counter += 1
+        return cls._rpc_id_counter
+
+    async def _rpc_call(self, method: str, params=None) -> Optional[Any]:
+        """
+        Send a JSON-RPC 2.0 request to the peer's ``/rpc`` endpoint.
+
+        Returns the parsed JSON response dict (the *full* response
+        including ``jsonrpc``, ``id``, ``result``/``error`` keys) or
+        ``None`` on network / parse failure.  Callers that need the
+        legacy ``{ok, result}`` shape should use the wrapper helpers.
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "id": self._next_id(),
+        }
+        if params is not None:
+            payload["params"] = params
+
+        rpc_url = f"{self.url}/rpc"
+        start_time = time.time()
+        try:
+            response = await self.client.post(
+                rpc_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            elapsed = time.time() - start_time
+            logger.debug(
+                f"RPC {method} → {self.url} [{response.status_code}] ({elapsed:.3f}s)"
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.RequestError as exc:
+            elapsed = time.time() - start_time
+            logger.warning(
+                f"RPC {method} → {self.url} NETWORK_ERROR ({elapsed:.3f}s)"
+            )
+            raise exc
+        except (json.JSONDecodeError, httpx.HTTPStatusError) as exc:
+            elapsed = time.time() - start_time
+            logger.warning(
+                f"RPC {method} → {self.url} ERROR ({elapsed:.3f}s): {exc}"
+            )
+            return None
+
+    def _unwrap(self, rpc_resp: Optional[dict]) -> Optional[dict]:
+        """
+        Convert a raw JSON-RPC response into the ``{ok, result}`` dict
+        that callers throughout the codebase expect.
+
+        - On success the ``result`` field of the RPC response already
+          contains the ``{ok, result, ...}`` dict produced by P2PModule.
+        - On JSON-RPC-level errors we synthesise ``{ok: False, error: …}``.
+        """
+        if rpc_resp is None:
+            return None
+
+        if "error" in rpc_resp and rpc_resp["error"] is not None:
+            err = rpc_resp["error"]
+            return {"ok": False, "error": err.get("message", str(err))}
+
+        inner = rpc_resp.get("result")
+        if isinstance(inner, dict):
+            return inner
+
+        # Scalar result — wrap in ok envelope
+        return {"ok": True, "result": inner}
+
+    # -----------------------------------------------------------------
+    #  Handshake helpers  (still uses REST for the signed exchange)
+    # -----------------------------------------------------------------
 
     async def _signed_request(self, path: str, data: dict = {}, method: str = 'POST', signed_headers_data: dict = None) -> Optional[Any]:
         """
-        Creates and sends a cryptographically signed request.
-        This now includes timestamp and nonce for replay protection.
-        An optional 'signed_headers_data' dict can be provided to include additional
-        data in the signature (like chain state) that isn't part of the main body.
+        Creates and sends a cryptographically signed REST request.
+        Kept for the handshake flow which needs Dilithium-signed auth.
         """
         current_time = int(time.time())
         nonce = os.urandom(16).hex()
-        
-        # The body of the request is the 'data' dictionary serialized to a string.
+
         body_str = json.dumps(data)
-        
-        # The payload to be signed includes the body, timestamp, nonce, and any extra header data.
+
         payload_to_sign = {
             "body": body_str,
             "timestamp": current_time,
@@ -440,7 +527,7 @@ class NodeInterface:
 
         canonical_bytes_to_sign = get_canonical_json_bytes(payload_to_sign)
         signature = sign_message(canonical_bytes_to_sign)
-        
+
         headers = {
             'x-node-id': get_node_id(),
             'x-public-key': get_public_key_hex(),
@@ -449,12 +536,11 @@ class NodeInterface:
             'x-nonce': nonce,
             'Content-Type': 'application/json'
         }
-        
-        # Add the extra data to the headers so the recipient can verify the signature
+
         if signed_headers_data:
             for key, value in signed_headers_data.items():
                 headers[f'x-denaro-{key}'] = str(value)
-        
+
         should_advertise = False
         if DENARO_SELF_URL:
             if not await self.is_url_local(DENARO_SELF_URL):
@@ -464,7 +550,7 @@ class NodeInterface:
 
         if should_advertise:
             headers['x-peer-url'] = DENARO_SELF_URL
-        
+
         full_url = f'{self.url}/{path}'
         result = await NodesManager.request(self.client, full_url, method=method, content=body_str, headers=headers, signed=True)
         return result
@@ -482,70 +568,81 @@ class NodeInterface:
         except (socket.gaierror, ValueError, IndexError):
             return False
 
-    # --- All following methods are now simplified to use self.client via _signed_request ---
+    # -----------------------------------------------------------------
+    #  P2P RPC methods  (all via JSON-RPC at /rpc)
+    # -----------------------------------------------------------------
 
     async def push_tx(self, tx_hex: str):
-        return await self._signed_request('push_tx', {'tx_hex': tx_hex})
-    
+        resp = await self._rpc_call("p2p_pushTx", [tx_hex])
+        return self._unwrap(resp)
+
     async def submit_block(self, block_data: dict):
-        return await self._signed_request('submit_block', block_data)
+        # Tag the sender so the receiver can do a follow-up sync
+        block_data_with_sender = {**block_data, '_sender_node_id': get_node_id()}
+        resp = await self._rpc_call("p2p_submitBlock", [block_data_with_sender])
+        return self._unwrap(resp)
 
     async def submit_blocks(self, blocks_payload: list):
-        return await self._signed_request("submit_blocks", blocks_payload)
-    
+        resp = await self._rpc_call("p2p_submitBlocks", [blocks_payload])
+        return self._unwrap(resp)
+
     async def get_block(self, block: str):
-        return await NodesManager.request(self.client, f'{self.url}/get_block', params={'block': block})
-        
+        resp = await self._rpc_call("p2p_getBlock", [block])
+        return self._unwrap(resp)
+
     async def get_blocks(self, offset: int, limit: int):
-        return await NodesManager.request(self.client, f'{self.url}/get_blocks', params={'offset': offset, 'limit': limit})
+        resp = await self._rpc_call("p2p_getBlocks", [offset, limit])
+        return self._unwrap(resp)
 
     async def get_status(self):
-        return await NodesManager.request(self.client, f'{self.url}/get_status')
+        resp = await self._rpc_call("p2p_getStatus")
+        # Wrap in the {ok, result} envelope callers expect
+        if resp is None:
+            return None
+        if "error" in resp and resp["error"] is not None:
+            return {"ok": False, "error": resp["error"].get("message", "")}
+        return {"ok": True, "result": resp.get("result")}
 
     async def get_peers(self):
-        return await self._signed_request('get_peers', method='POST')
+        resp = await self._rpc_call("p2p_getPeers")
+        return self._unwrap(resp)
 
     async def handshake_challenge(self):
-        """Initiates a handshake by asking for a challenge. Unsigned request."""
-        return await NodesManager.request(self.client, f'{self.url}/handshake/challenge')
+        """Initiates a handshake — uses RPC instead of REST."""
+        resp = await self._rpc_call("p2p_handshakeChallenge")
+        return self._unwrap(resp)
 
     async def handshake_response(self, challenge: str):
         """
-        Responds to a challenge to prove identity. This is now a signed request
-        that also includes our own chain state in the headers for negotiation.
+        Responds to a challenge to prove identity.
+        Includes our chain state so the remote can negotiate sync direction.
         """
-        # Get our node's current chain state from the database.
         current_height = await self.db.get_next_block_id() - 1
         last_block_hash = None
         if current_height > -1:
             last_block = await self.db.get_block_by_id(current_height)
             if last_block:
-                # Handle different database implementations
                 last_block_hash = last_block.get('hash') or last_block.get('block_hash')
 
-        # This data will be added to the signature and the request headers.
-        our_state = {
-            'height': current_height,
-            'last_hash': last_block_hash
-        }
-
-        # The main body of the request only needs the challenge.
-        payload = {'challenge': challenge}
-        
-        return await self._signed_request('handshake/response', data=payload, signed_headers_data=our_state)
+        resp = await self._rpc_call(
+            "p2p_handshakeResponse",
+            [challenge, current_height, last_block_hash],
+        )
+        return self._unwrap(resp)
 
     async def check_peer_reachability(self, url_to_check: str) -> bool:
+        """Still uses signed REST — reachability checks need auth."""
         payload = {'url_to_check': url_to_check}
         resp = await self._signed_request('check_reachability', data=payload)
-        
         if resp and resp.get('ok'):
             return resp.get('result', {}).get('reachable', False)
         return False
-        
+
     async def get_mempool_hashes(self) -> Optional[dict]:
-        return await self._signed_request('get_mempool_hashes')
+        resp = await self._rpc_call("p2p_getMempoolHashes")
+        return self._unwrap(resp)
 
     async def get_transactions_by_hash(self, hashes: List[str]) -> Optional[dict]:
-        payload = {'hashes': hashes}
-        return await self._signed_request('get_transactions_by_hash', payload)
+        resp = await self._rpc_call("p2p_getTransactionsByHash", [hashes])
+        return self._unwrap(resp)
 

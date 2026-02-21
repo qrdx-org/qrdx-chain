@@ -809,6 +809,7 @@ dht_config: DiscoveryConfig = DiscoveryConfig()
 # ---- Always-on JSON-RPC server (required for DHT inter-node protocol) ----
 from qrdx.rpc.server import RPCServer
 from qrdx.rpc.modules.dht import DHTModule
+from qrdx.rpc.modules.p2p import P2PModule
 
 rpc_server = RPCServer()
 
@@ -816,10 +817,18 @@ rpc_server = RPCServer()
 dht_rpc_module = DHTModule()
 rpc_server.register_module(dht_rpc_module)
 
+# Register P2P module unconditionally — block/tx propagation over JSON-RPC
+p2p_rpc_module = P2PModule()
+rpc_server.register_module(p2p_rpc_module)
+
 @app.post("/rpc")
 async def rpc_endpoint(body: dict = Body(...)):
     """JSON-RPC 2.0 endpoint"""
-    return await rpc_server.handle_request(body)
+    result = await rpc_server.handle_request(body)
+    if result is None:
+        return Response(status_code=204)
+    # handle_request returns a JSON string; send it raw to avoid double-encoding
+    return Response(content=result, media_type="application/json")
 
 LAST_PENDING_TRANSACTIONS_CLEAN = [0]
 block_processing_lock = asyncio.Lock()
@@ -1146,6 +1155,38 @@ async def _push_sync_to_peer(peer_info: dict, start_block: int, db_conn: Databas
         logger.debug(f"Push-sync task for peer {peer_id} has finished.")
 
 
+async def _follow_up_sync(sender_node_id: str):
+    """
+    Immediately after accepting a block, check whether the sending peer has
+    even more blocks we haven't seen yet.  This eliminates the up-to-60-second
+    gap between poll cycles and keeps non-validator nodes tightly in sync.
+    """
+    if security.sync_state_manager.is_syncing:
+        return  # Don't pile on if a full sync is already running
+
+    peer_info = NodesManager.get_peer(sender_node_id)
+    if not peer_info or not peer_info.get('url'):
+        return
+
+    try:
+        interface = NodeInterface(peer_info['url'], client=http_client, db=db)
+        remote_status = await interface.get_status()
+        if not (remote_status and remote_status.get('ok')):
+            return
+
+        remote_height = remote_status['result']['height']
+        local_height = await db.get_next_block_id() - 1
+
+        if remote_height > local_height:
+            logger.info(
+                f"[FOLLOW-UP] Still behind peer {sender_node_id} "
+                f"(local={local_height}, remote={remote_height}). Triggering immediate sync."
+            )
+            await _sync_blockchain(node_id=sender_node_id)
+    except Exception as e:
+        logger.debug(f"[FOLLOW-UP] Check failed for {sender_node_id}: {e}")
+
+
 async def check_peer_and_sync(peer_info: dict):
     """
     Checks a given peer's chain status and triggers a sync if their chain is longer.
@@ -1436,13 +1477,13 @@ async def _dht_bridge_sync() -> None:
 
 async def _periodic_dht_bridge() -> None:
     """Periodically sync DHT routing table with NodesManager."""
-    await asyncio.sleep(30)  # Initial delay
+    await asyncio.sleep(10)  # Quick DHT start
     while True:
         try:
             await _dht_bridge_sync()
         except Exception as e:
             logger.error(f"DHT bridge sync error: {e}")
-        await asyncio.sleep(120)  # Sync every 2 minutes
+        await asyncio.sleep(30)  # DHT sync every 30s
 
 
 async def _init_dht() -> None:
@@ -1595,13 +1636,13 @@ async def periodic_peer_discovery():
     Periodically discovers new peers via gossip and verifies them via handshake.
     This version is now resilient to unreachable peers and supports multiple bootstrap nodes.
     """
-    await asyncio.sleep(20)
+    await asyncio.sleep(5)  # Start peer discovery quickly
     
     # Initial bootstrap from all configured nodes
     await bootstrap_from_all_nodes()
 
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)  # Refresh peers every 30s
         logger.debug("Running periodic peer discovery...")
         
         if not NodesManager.peers:
@@ -1681,7 +1722,7 @@ async def check_own_reachability():
     Tries multiple bootstrap nodes for verification.
     """
     global self_is_public
-    await asyncio.sleep(10)
+    await asyncio.sleep(3)  # Brief startup delay
 
     if not DENARO_SELF_URL:
         logger.info("DENARO_SELF_URL not set. Assuming this is a private node.")
@@ -1738,11 +1779,11 @@ async def periodic_update_fetcher():
     It periodically polls random peers to ensure the node is on the heaviest chain
     and to learn about new unconfirmed transactions.
     """
-    await asyncio.sleep(30) 
+    await asyncio.sleep(5)  # Fast start — begin polling almost immediately
 
     logger.info("Starting periodic update fetcher for this node...")
     while True:
-        await asyncio.sleep(60) 
+        await asyncio.sleep(8)  # Poll every 8s for fast chain convergence
         
         # 1. CHECK FOR LONGER CHAINS (BLOCK SYNC)
         if not security.sync_state_manager.is_syncing:
@@ -1823,14 +1864,66 @@ async def periodic_update_fetcher():
 
 
 async def process_and_create_block(block_info: dict) -> bool:
-    """Processes a single block dictionary with validation"""
-    block = block_info['block']
-    txs_hex = block_info['transactions']
-    block_content = block.get('content')
+    """Processes a single block dictionary with validation.
     
+    Supports both PoW blocks (hex content → manager.create_block) and
+    PoS blocks (already-committed dict data → direct DB insert).
+    """
+    block = block_info['block']
+    txs_hex = block_info.get('transactions', [])
+    block_content = block.get('content', '')
+
+    block_height = block.get('id') or block.get('block_height', 0)
+    block_hash = block.get('hash') or block.get('block_hash', '')
+    validator_address = block.get('address') or block.get('validator_address', '')
+
+    # ---- PoS fast-path ----
+    # If we already have a block_hash (produced by a validator) we store it
+    # directly rather than running the PoW validation pipeline.
+    if block_hash and validator_address:
+        # Security: basic sanity checks even during sync
+        if not isinstance(block_hash, str) or len(block_hash) < 16:
+            logger.warning(f"[SYNC] Rejecting block with malformed hash at height {block_height}")
+            return False
+
+        # Security: block height must be exactly the next expected
+        expected_height = await db.get_next_block_id()
+        if block_height != expected_height:
+            logger.warning(
+                f"[SYNC] Rejecting PoS block: height {block_height} != expected {expected_height}"
+            )
+            return False
+
+        try:
+            timestamp_val = block.get('timestamp', 0)
+            await db.add_block(
+                block_hash=block_hash,
+                block_height=block_height,
+                block_content=block_content or '',
+                validator_address=validator_address,
+                timestamp=timestamp_val,
+            )
+            # Store accompanying transactions
+            for tx_hex in (txs_hex or []):
+                try:
+                    tx = await Transaction.from_hex(tx_hex)
+                    await db.add_transaction(tx, block_hash)
+                except Exception:
+                    pass  # Non-critical during sync
+            logger.debug(f"[SYNC] Stored PoS block {block_height} ({block_hash[:16]}...) validator={validator_address[:20]}")
+            return True
+        except Exception as e:
+            logger.error(f"[SYNC] Failed to store PoS block {block_height}: {e}")
+            return False
+
+    # ---- Legacy PoW path ----
+    if not block_content:
+        logger.warning(f"Sync failed: No block content for block {block_height}.")
+        return False
+
     # Validate block content size
     if len(block_content) > MAX_BLOCK_CONTENT_SIZE:
-        logger.warning(f"Sync failed: Block content too large for block {block.get('id')}.")
+        logger.warning(f"Sync failed: Block content too large for block {block_height}.")
         return False
     
     try:
@@ -1838,16 +1931,16 @@ async def process_and_create_block(block_info: dict) -> bool:
         for tx_hex in txs_hex:
             is_valid, error_msg = security.input_validator.validate_transaction_data(tx_hex)
             if not is_valid:
-                logger.warning(f"Sync failed: Invalid transaction in block {block.get('id')}: {error_msg}")
+                logger.warning(f"Sync failed: Invalid transaction in block {block_height}: {error_msg}")
                 return False
             transactions.append(await Transaction.from_hex(tx_hex))
 
     except Exception as e:
-        logger.error(f"Sync failed: Could not deserialize transactions for block {block.get('id')}: {e}")
+        logger.error(f"Sync failed: Could not deserialize transactions for block {block_height}: {e}")
         return False
 
     if not await create_block(block_content, transactions):
-        logger.warning(f"Sync failed: Invalid block received from peer at height {block.get('id')}.")
+        logger.warning(f"Sync failed: Invalid block received from peer at height {block_height}.")
         return False
         
     return True
@@ -1920,6 +2013,11 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
 
 async def _sync_blockchain(node_id: str = None): 
     """Synchronizes the local blockchain with proper state management"""
+    # Bail out early if a sync is already running — don't raise an exception.
+    if security.sync_state_manager.is_syncing:
+        logger.debug("[SYNC] Skipping: another sync operation is already in progress.")
+        return
+
     try:
         async with security.sync_state_manager.acquire_sync():
             logger.info('[SYNC] Starting blockchain synchronization process...')
@@ -2133,7 +2231,21 @@ async def startup():
     app.state.dht_rpc_module = dht_rpc_module
     app.state.rpc_server = rpc_server
 
-    logger.info(f"✅ JSON-RPC server initialized (dht_* always-on): {len(rpc_server.get_methods())} methods")
+    # ---- Wire P2P RPC module with live node context ----
+    p2p_rpc_module.set_node_context(
+        db=db,
+        security=security,
+        propagate_fn=propagate,
+        process_and_create_block=process_and_create_block,
+        create_block=create_block,
+        block_processing_lock=block_processing_lock,
+        nodes_manager=NodesManager,
+        self_node_id=self_node_id,
+        sync_blockchain=_sync_blockchain,
+        follow_up_sync=_follow_up_sync,
+    )
+
+    logger.info(f"✅ JSON-RPC server initialized (dht_* + p2p_* always-on): {len(rpc_server.get_methods())} methods")
     logger.info(f"   RPC endpoint: http://{DENARO_NODE_HOST}:{DENARO_NODE_PORT}/rpc")
 
     # ---- Optional EVM / chain RPC modules (gated by QRDX_RPC_ENABLED) ----
@@ -2777,7 +2889,7 @@ async def push_block(
 
 
 @app.post("/submit_block")
-@limiter.limit("20/minute")
+@limiter.limit("2/second")
 async def submit_block(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -2845,6 +2957,52 @@ async def submit_block(
         
         await security.block_cache.put(block_identifier, True)
         
+        # --- PoS fast-path: if the body includes a validator_address & block_hash,
+        # this is a PoS block produced by a validator.  Store it directly. ---
+        block_hash = body.get('block_hash')
+        validator_address = body.get('validator_address')
+        if block_hash and validator_address:
+            # Security: validate block_hash is well-formed hex
+            if not security.input_validator.validate_hex(block_hash, min_length=16, max_length=128):
+                await security.reputation_manager.record_violation(
+                    verified_sender, 'malformed_block_hash', severity=5
+                )
+                return {'ok': False, 'error': 'Invalid block hash format'}
+
+            # Security: block_no must be exactly the next expected height
+            if block_no != next_block_id:
+                return {'ok': False, 'error': 'Block height does not match expected next block'}
+
+            # Security: verify the claimed validator is registered
+            validator_info = await db.get_validator_info(validator_address)
+            if not validator_info:
+                await security.reputation_manager.record_violation(
+                    verified_sender, 'unknown_validator', severity=6
+                )
+                return {'ok': False, 'error': 'Validator address not registered'}
+
+            try:
+                await db.add_block(
+                    block_hash=block_hash,
+                    block_height=block_no,
+                    block_content=block_content or '',
+                    validator_address=validator_address,
+                    timestamp=body.get('timestamp', 0),
+                )
+                await security.reputation_manager.record_good_behavior(verified_sender, points=5)
+                logger.info(f"Accepted PoS block {block_no} from {verified_sender}. Propagating...")
+                background_tasks.add_task(
+                    propagate, 'submit_block', body,
+                    ignore_node_id=verified_sender, db=db
+                )
+                # Immediate follow-up: check if we're still behind and need more blocks
+                background_tasks.add_task(_follow_up_sync, verified_sender)
+                return {'ok': True, 'result': f'Block {block_no} accepted.'}
+            except Exception as e:
+                logger.error(f"Failed to store PoS block {block_no}: {e}")
+                return {'ok': False, 'error': 'Failed to store block'}
+
+        # --- Legacy PoW path ---
         # Process transactions with validation
         txs_data = body.get('txs', [])
         final_transactions = []
@@ -2889,11 +3047,13 @@ async def submit_block(
             propagate, 'submit_block', body, 
             ignore_node_id=verified_sender, db=db
         )
+        # Immediate follow-up: check if we're still behind and need more blocks
+        background_tasks.add_task(_follow_up_sync, verified_sender)
         return {'ok': True, 'result': f'Block {block_no} accepted.'}
         
 
 @app.post("/submit_blocks")
-@limiter.limit("5/minute")
+@limiter.limit("30/minute")
 async def submit_blocks(
     request: Request,
     body: list = Body(...),
@@ -4296,7 +4456,7 @@ async def get_transaction(request: Request, tx_hash: str, verify: bool = False, 
 
 
 @app.get("/get_block")
-@limiter.limit("30/minute")
+@limiter.limit("8/second")
 async def get_block(request: Request, block: str, full_transactions: bool = False, pretty: bool = False):
     # Validate block parameter
     block_info = None
@@ -4334,7 +4494,7 @@ async def get_block(request: Request, block: str, full_transactions: bool = Fals
 
 
 @app.get("/get_blocks")
-@limiter.limit("10/minute")
+@limiter.limit("4/second")
 async def get_blocks(
     request: Request, 
     offset: int = Query(default=..., ge=0), 
@@ -4346,7 +4506,19 @@ async def get_blocks(
     await security.query_calculator.check_and_update_cost(client_ip, offset, limit)
 
     blocks = await db.get_blocks(offset, limit)
-    result = {'ok': True, 'result': blocks}
+
+    # Return structured block data including transactions so that
+    # syncing peers can reconstruct the chain.
+    structured_blocks = []
+    for block in blocks:
+        block_hash = block.get('hash') or block.get('block_hash')
+        txs = await db.get_block_transactions(block_hash, hex_only=True) if block_hash else []
+        structured_blocks.append({
+            'block': block,
+            'transactions': txs or []
+        })
+
+    result = {'ok': True, 'result': structured_blocks}
     
     if pretty:
         return Response(content=json.dumps(result, indent=4, cls=CustomJSONEncoder), media_type="application/json")

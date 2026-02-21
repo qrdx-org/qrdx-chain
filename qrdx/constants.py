@@ -106,7 +106,7 @@ MAX_TX_FETCH_LIMIT = 512  # Maximum transactions to fetch in a single request
 MAX_MEMPOOL_SIZE = 8192  # Maximum transactions in mempool
 
 # Network timeouts
-CONNECTION_TIMEOUT = 10.0  # 10 seconds
+CONNECTION_TIMEOUT = 5.0  # 5 seconds – fast failover on unresponsive peers
 
 # Peer activity tracking
 ACTIVE_NODES_DELTA = 60 * 60 * 24 * 7  # peers inactive longer than 7 days are considered stale

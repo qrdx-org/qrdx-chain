@@ -12,6 +12,22 @@ from .logger import get_logger
 
 logger = get_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Column-alias SELECT for the blocks table.
+#
+# The original PostgreSQL schema used short column names (id, hash, address).
+# The SQLite schema uses qualified names (block_height, block_hash, ...).
+# By selecting both forms we keep compatibility with every call-site in
+# manager.py and node/main.py without touching those files.
+# ---------------------------------------------------------------------------
+_BLOCK_COLS = (
+    "block_hash, block_hash  AS hash, "
+    "block_height, block_height AS id, "
+    "prev_block_hash, merkle_root, timestamp, difficulty, nonce, "
+    "validator_address, validator_address AS address, "
+    "validator_signature, content, created_at"
+)
+
 
 class DatabaseSQLite:
     """Simplified SQLite database for testnet"""
@@ -361,7 +377,7 @@ class DatabaseSQLite:
     async def get_latest_block(self):
         """Get latest block (stub)"""
         cursor = await self.connection.execute(
-            "SELECT * FROM blocks ORDER BY block_height DESC LIMIT 1"
+            f"SELECT {_BLOCK_COLS} FROM blocks ORDER BY block_height DESC LIMIT 1"
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
@@ -379,36 +395,152 @@ class DatabaseSQLite:
         height = await self.get_block_height()
         return height + 1
         
-    async def add_block(self, **kwargs):
-        """Add block to database"""
-        # Extract parameters with defaults
-        block_id = kwargs.get('block_id', kwargs.get('block_height', 0))
-        block_hash = kwargs.get('block_hash', '')
-        block_content = kwargs.get('block_content', kwargs.get('content', ''))
-        address = kwargs.get('address', kwargs.get('validator_address', ''))
-        timestamp = kwargs.get('timestamp', datetime.now(timezone.utc))
+    async def add_block(self, block_id_or_kw=None, block_hash=None,
+                        block_content=None, address=None, random_value=None,
+                        difficulty=None, reward=None, timestamp=None, **kwargs):
+        """Add block to database.
+        
+        Accepts both positional args (matching the PostgreSQL API used by
+        manager.py's create_block) and keyword args (used by genesis_init
+        and node_integration).
+        """
+        # Merge positional & keyword sources so every caller works.
+        _id = (block_id_or_kw if block_id_or_kw is not None
+               else kwargs.get('block_id', kwargs.get('block_height', 0)))
+        _hash = (block_hash or kwargs.get('block_hash', ''))
+        _content = (block_content if block_content is not None
+                    else kwargs.get('content', ''))
+        _addr = (address or kwargs.get('validator_address', ''))
+        _ts = (timestamp if timestamp is not None
+               else kwargs.get('timestamp', datetime.now(timezone.utc)))
         
         # Insert block
         await self.connection.execute("""
             INSERT INTO blocks (block_hash, block_height, validator_address, content, timestamp)
             VALUES (?, ?, ?, ?, ?)
-        """, (block_hash, block_id, address, block_content, timestamp))
+        """, (_hash, _id, _addr, _content, _ts))
         await self.connection.commit()
-        logger.info(f"Block {block_id} added: {block_hash[:16]}...")
+        logger.info(f"Block {_id} added: {_hash[:16]}...")
         return True
     
-    async def add_transaction(self, **kwargs):
-        """Add transaction to database"""
-        tx_hash = kwargs.get('tx_hash', '')
-        tx_hex = kwargs.get('tx_hex', '')
-        block_hash = kwargs.get('block_hash', '')
+    async def add_transaction(self, transaction_or_kw=None, block_hash_arg=None, **kwargs):
+        """Add transaction to database.
+        
+        Supports both:
+          - Positional: add_transaction(Transaction, block_hash_str)
+          - Keyword: add_transaction(tx_hash=..., tx_hex=..., block_hash=...)
+        """
+        if transaction_or_kw is not None and not isinstance(transaction_or_kw, dict):
+            # Positional call from manager.py: (Transaction, block_hash)
+            tx = transaction_or_kw
+            tx_hash = tx.hash()
+            tx_hex = tx.hex()
+            block_hash = block_hash_arg or ''
+        else:
+            # Keyword call
+            kw = transaction_or_kw if isinstance(transaction_or_kw, dict) else kwargs
+            tx_hash = kw.get('tx_hash', kwargs.get('tx_hash', ''))
+            tx_hex = kw.get('tx_hex', kwargs.get('tx_hex', ''))
+            block_hash = kw.get('block_hash', kwargs.get('block_hash', block_hash_arg or ''))
         
         await self.connection.execute("""
-            INSERT INTO transactions (tx_hash, tx_hex, block_hash)
+            INSERT OR IGNORE INTO transactions (tx_hash, tx_hex, block_hash)
             VALUES (?, ?, ?)
         """, (tx_hash, tx_hex, block_hash))
         await self.connection.commit()
         return True
+
+    async def add_transactions(self, transactions, block_hash: str):
+        """Add multiple transactions to database (matches PostgreSQL API)."""
+        for tx in transactions:
+            await self.add_transaction(tx, block_hash)
+
+    async def add_unspent_transactions_outputs(self, transactions):
+        """Create UTXO entries for all outputs of the given transactions."""
+        for tx in transactions:
+            for idx, output in enumerate(tx.outputs):
+                await self.connection.execute("""
+                    INSERT OR IGNORE INTO unspent_outputs (tx_hash, output_index, address, amount)
+                    VALUES (?, ?, ?, ?)
+                """, (tx.hash(), idx, output.address, output.amount))
+        await self.connection.commit()
+
+    async def remove_pending_transactions_by_hash(self, hashes: list):
+        """Remove specific pending transactions by hash."""
+        if not hashes:
+            return
+        placeholders = ','.join('?' for _ in hashes)
+        await self.connection.execute(
+            f"DELETE FROM pending_transactions WHERE tx_hash IN ({placeholders})",
+            hashes
+        )
+        await self.connection.commit()
+
+    async def remove_unspent_outputs(self, transactions):
+        """Remove spent inputs from the UTXO set."""
+        for tx in transactions:
+            for tx_input in tx.inputs:
+                await self.connection.execute(
+                    "DELETE FROM unspent_outputs WHERE tx_hash = ? AND output_index = ?",
+                    (tx_input.tx_hash, tx_input.index)
+                )
+        await self.connection.commit()
+
+    async def remove_pending_spent_outputs(self, transactions):
+        """Remove pending spent outputs after block confirmation."""
+        for tx in transactions:
+            for tx_input in tx.inputs:
+                await self.connection.execute(
+                    "DELETE FROM pending_spent_outputs WHERE tx_hash = ? AND index_spent = ?",
+                    (tx_input.tx_hash, tx_input.index)
+                )
+        await self.connection.commit()
+
+    async def delete_block(self, block_id: int):
+        """Delete a block and its transactions (for rollback)."""
+        # Get the block hash first
+        block = await self.get_block_by_id(block_id)
+        if block:
+            block_hash = block.get('hash') or block.get('block_hash')
+            if block_hash:
+                await self.connection.execute(
+                    "DELETE FROM transactions WHERE block_hash = ?", (block_hash,)
+                )
+            await self.connection.execute(
+                "DELETE FROM blocks WHERE block_height = ?", (block_id,)
+            )
+            await self.connection.commit()
+
+    async def get_unspent_outputs(self, inputs):
+        """Get unspent outputs matching the given (tx_hash, index) pairs."""
+        result = set()
+        for tx_hash, idx in inputs:
+            cursor = await self.connection.execute(
+                "SELECT tx_hash, output_index FROM unspent_outputs WHERE tx_hash = ? AND output_index = ?",
+                (tx_hash, idx)
+            )
+            row = await cursor.fetchone()
+            if row:
+                result.add((row[0], row[1]))
+        return result
+
+    async def clear_duplicate_pending_transactions(self):
+        """Remove duplicate pending transactions (no-op for SQLite with UNIQUE)."""
+        pass
+
+    async def remove_pending_transactions(self):
+        """Remove all pending transactions."""
+        await self.connection.execute("DELETE FROM pending_transactions")
+        await self.connection.commit()
+
+    async def remove_pending_transactions_by_contains(self, patterns: list):
+        """Remove pending transactions matching patterns."""
+        for pattern in patterns:
+            await self.connection.execute(
+                "DELETE FROM pending_transactions WHERE tx_hex LIKE ?",
+                (f'%{pattern}%',)
+            )
+        await self.connection.commit()
     
     async def add_unspent_output(self, **kwargs):
         """Add unspent output to database"""
@@ -743,7 +875,7 @@ class DatabaseSQLite:
     async def get_block_by_id(self, block_id: int):
         """Get block by ID"""
         cursor = await self.connection.execute(
-            "SELECT * FROM blocks WHERE block_height = ?",
+            f"SELECT {_BLOCK_COLS} FROM blocks WHERE block_height = ?",
             (block_id,)
         )
         row = await cursor.fetchone()
@@ -752,7 +884,7 @@ class DatabaseSQLite:
     async def get_block(self, block_hash: str):
         """Get block by hash"""
         cursor = await self.connection.execute(
-            "SELECT * FROM blocks WHERE block_hash = ?",
+            f"SELECT {_BLOCK_COLS} FROM blocks WHERE block_hash = ?",
             (block_hash,)
         )
         row = await cursor.fetchone()
@@ -812,10 +944,14 @@ class DatabaseSQLite:
         await self.connection.commit()
     
     async def get_blocks(self, offset: int, limit: int):
-        """Get blocks with pagination"""
+        """Get blocks starting from a given height, ascending.
+        
+        'offset' is treated as a starting block_height (inclusive) so
+        that the sync protocol can request ``get_blocks(start_height, count)``.
+        """
         cursor = await self.connection.execute(
-            "SELECT * FROM blocks ORDER BY block_height DESC LIMIT ? OFFSET ?",
-            (limit, offset)
+            f"SELECT {_BLOCK_COLS} FROM blocks WHERE block_height >= ? ORDER BY block_height ASC LIMIT ?",
+            (offset, limit)
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
