@@ -1083,10 +1083,20 @@ async def _push_sync_to_peer(peer_info: dict, start_block: int, db_conn: Databas
             payload_batch = []
             current_batch_bytes = 0
 
-            for structured_block in structured_blocks_to_send:
-                block_record = structured_block['block']
-                tx_list = structured_block['transactions']
-                block_size_estimate = len(block_record.get('content','')) + sum(len(tx) for tx in tx_list)
+            for raw_block in structured_blocks_to_send:
+                # db.get_blocks() returns raw row dicts — normalise into
+                # the {block, transactions} structure the rest of the code expects.
+                if isinstance(raw_block, dict) and 'block' in raw_block:
+                    block_record = raw_block['block']
+                    tx_list = raw_block.get('transactions', [])
+                else:
+                    block_record = raw_block
+                    block_hash = block_record.get('hash') or block_record.get('block_hash')
+                    try:
+                        tx_list = await db_conn.get_block_transactions(block_hash, hex_only=True) if block_hash else []
+                    except Exception:
+                        tx_list = []
+                block_size_estimate = len(block_record.get('content','')) + sum(len(str(tx)) for tx in tx_list)
 
                 if payload_batch and current_batch_bytes + block_size_estimate > MAX_BATCH_BYTES:
                     break

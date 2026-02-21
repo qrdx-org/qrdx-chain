@@ -407,9 +407,11 @@ class P2PModule(RPCModule):
         """Return hashes of all pending transactions."""
         self._require_db()
 
-        pending = await self._db.get_pending_transactions()
-        hashes = [tx.hash() for tx in (pending or [])]
-        return {'ok': True, 'result': {'hashes': hashes}}
+        try:
+            hashes = await self._db.get_all_pending_transaction_hashes()
+        except Exception:
+            hashes = []
+        return {'ok': True, 'result': {'hashes': hashes or []}}
 
     @rpc_method
     async def getTransactionsByHash(self, hashes: List[str]) -> Dict:
