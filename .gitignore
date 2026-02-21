@@ -27,6 +27,8 @@ testnet/
 *.priv
 *.key
 *.pem
+*.pq
+*.pub
 *private_key*
 *secret_key*
 *_privkey*

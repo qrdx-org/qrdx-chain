@@ -104,21 +104,18 @@ generate_validator_wallet() {
     local wallet_path="${WALLETS_DIR}/validator_${validator_id}.json"
     local password="testnet_validator_${validator_id}"
     
-    log_info "Generating PQ wallet for validator ${validator_id}..."
+    log_info "Generating PQ wallet for validator ${validator_id}..." >&2
     
-    # Create wallet using QRDX wallet CLI
-    python3 << EOF
-import sys
-import json
-import os
+    # Create wallet using QRDX crypto module (suppress liboqs warnings)
+    OQS_FAULTHANDLER=0 PYTHONWARNINGS=ignore python3 -W ignore 2>/dev/null << EOF
+import sys, os, json, warnings
+warnings.filterwarnings('ignore')
 sys.path.insert(0, '${PROJECT_DIR}')
 
 from qrdx.crypto.pq.dilithium import generate_keypair
 from qrdx.crypto.address import public_key_to_address, AddressType
-from decimal import Decimal
-import hashlib
 
-# Generate PQ keypair (Dilithium3)
+# Generate PQ keypair (ML-DSA-65 / Dilithium3)
 private_key, public_key = generate_keypair()
 
 # Generate address from public key bytes
@@ -141,7 +138,7 @@ os.makedirs(os.path.dirname('${wallet_path}'), exist_ok=True)
 with open('${wallet_path}', 'w') as f:
     json.dump(wallet, f, indent=2)
 
-# Output address for shell script
+# Output address for shell script (stdout only)
 print(address)
 EOF
 }
@@ -161,17 +158,16 @@ generate_master_controller_wallet() {
     
     log_info "Generating Master Controller PQ wallet..."
     
-    # Create master controller wallet using QRDX wallet CLI
-    python3 << EOF
-import sys
-import json
-import os
+    # Create master controller wallet (suppress liboqs warnings)
+    PYTHONWARNINGS=ignore python3 -W ignore 2>/dev/null << EOF
+import sys, os, json, warnings
+warnings.filterwarnings('ignore')
+os.environ['OQS_FAULTHANDLER'] = '0'
 sys.path.insert(0, '${PROJECT_DIR}')
 
 from qrdx.crypto.pq.dilithium import PQPrivateKey
-from decimal import Decimal
 
-# Generate PQ keypair (Dilithium/ML-DSA-65)
+# Generate PQ keypair (ML-DSA-65 / Dilithium3)
 private_key = PQPrivateKey.generate()
 public_key = private_key.public_key
 address = public_key.to_address()
@@ -194,7 +190,7 @@ os.makedirs(os.path.dirname('${wallet_path}'), exist_ok=True)
 with open('${wallet_path}', 'w') as f:
     json.dump(wallet, f, indent=2)
 
-# Output address for shell script
+# Output address for shell script (stdout only)
 print(address)
 EOF
 }
@@ -232,12 +228,17 @@ create_genesis_config() {
         log_info "Validator $i: ${address:0:20}..."
     done
     
-    # Create genesis configuration
-    python3 << EOF
-import sys
-import json
+    # Create genesis configuration (suppress liboqs warnings, capture output)
+    local genesis_output
+    genesis_output=$(OQS_FAULTHANDLER=0 PYTHONWARNINGS=ignore python3 -W ignore 2>/dev/null << EOF
+import sys, os, json, warnings
+warnings.filterwarnings('ignore')
 from decimal import Decimal
 sys.path.insert(0, '${PROJECT_DIR}')
+
+# Redirect all logging to stderr so JSON comes cleanly on stdout
+import logging
+logging.basicConfig(stream=sys.stderr)
 
 from qrdx.validator.genesis import GenesisCreator, GenesisConfig
 
@@ -267,16 +268,13 @@ for i, addr in enumerate(validator_addresses):
 # Add test account for contract deployment (derived from private key 0x01)
 test_account = "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
 config.pre_allocations[test_account] = Decimal("1000000000")  # 1B QRDX for testing
-print(f"Added test account: {test_account} balance=1000000000", file=sys.stderr)
 
 creator = GenesisCreator(config)
 
 # Add validators
 for i, (addr, pubkey) in enumerate(zip(validator_addresses, validator_pubkeys)):
     stake = Decimal("100000")  # 100K QRDX stake
-    success = creator.add_validator(addr, pubkey, stake)
-    if success:
-        print(f"Added validator {i}: {addr[:20]}... stake={stake}", file=sys.stderr)
+    creator.add_validator(addr, pubkey, stake)
 
 # Create genesis
 state, block = creator.create_genesis()
@@ -294,6 +292,24 @@ print(json.dumps({
     'total_prefunded': str(sum(Decimal(v) for v in config.pre_allocations.values()))
 }))
 EOF
+    )
+
+    # Parse and display genesis summary
+    if [ -n "$genesis_output" ]; then
+        # Extract the JSON line (last line that starts with {)
+        local genesis_json
+        genesis_json=$(echo "$genesis_output" | grep '^{' | tail -1)
+        if [ -n "$genesis_json" ] && command_exists jq; then
+            local genesis_hash validators sys_wallets total_prefunded
+            genesis_hash=$(echo "$genesis_json" | jq -r '.genesis_hash // "unknown"')
+            validators=$(echo "$genesis_json" | jq -r '.validators // 0')
+            sys_wallets=$(echo "$genesis_json" | jq -r '.system_wallets // 0')
+            total_prefunded=$(echo "$genesis_json" | jq -r '.total_prefunded // "0"')
+            log_info "Genesis hash: ${genesis_hash:0:16}..."
+            log_info "Validators: ${validators}, System wallets: ${sys_wallets}"
+            log_info "Total prefunded: ${total_prefunded} QRDX"
+        fi
+    fi
 
     log_success "Genesis configuration created: ${genesis_file}"
 }
@@ -354,6 +370,10 @@ create_node_config() {
         bootstrap_nodes="http://127.0.0.1:${DEFAULT_BASE_PORT}"
     fi
     
+    # Create per-node identity directory
+    local key_dir="${DATA_DIR}/node${node_id}/keys"
+    mkdir -p "$key_dir"
+    
     # Create .env file
     cat > "$config_file" << EOF
 # QRDX Testnet Node ${node_id} Configuration
@@ -370,10 +390,17 @@ QRDX_NODE_PORT=${node_port}
 QRDX_SELF_URL=http://127.0.0.1:${node_port}
 
 # Bootstrap configuration
+QRDX_BOOTSTRAP_NODE=${bootstrap_nodes}
 QRDX_BOOTSTRAP_NODES=${bootstrap_nodes}
 
 # Database (SQLite)
 QRDX_DATABASE_PATH=${TESTNET_DIR}/databases/node${node_id}.db
+
+# Per-node identity key directory (avoids key collision in multi-node testnet)
+QRDX_NODE_KEY_DIR=${key_dir}
+
+# Testnet validator set override (allow < 4 validators)
+QRDX_MIN_VALIDATORS=1
 
 # RPC
 QRDX_RPC_ENABLED=true
@@ -384,6 +411,9 @@ QRDX_WS_PORT=${ws_port}
 # Logging
 LOG_LEVEL=INFO
 LOG_DIR=${LOGS_DIR}/node${node_id}
+
+# Suppress liboqs version warnings
+PYTHONWARNINGS=ignore
 
 # Validator settings
 EOF
@@ -422,21 +452,22 @@ start_node() {
     source "$config_file"
     set +a
     
-    # Start node
+    # Start node with env vars and suppressed warnings
     cd "${PROJECT_DIR}"
-    nohup python3 run_node.py > "$log_file" 2>&1 &
+    nohup python3 -W ignore run_node.py > "$log_file" 2>&1 &
     local pid=$!
     
     echo "$pid" > "$pid_file"
     
-    log_info "Started node ${node_id} (PID: ${pid})"
+    log_info "Started node ${node_id} (PID: ${pid}, Port: ${QRDX_NODE_PORT})"
     
-    # Wait a moment for startup
-    sleep 1
+    # Wait for startup
+    sleep 2
     
     # Check if still running
     if ! kill -0 "$pid" 2>/dev/null; then
         log_error "Node ${node_id} failed to start. Check logs: ${log_file}"
+        tail -5 "$log_file" 2>/dev/null
         return 1
     fi
 }
@@ -454,7 +485,9 @@ stop_node() {
     
     if kill -0 "$pid" 2>/dev/null; then
         log_info "Stopping node ${node_id} (PID: ${pid})..."
-        kill "$pid"
+        
+        # Send SIGTERM for graceful shutdown
+        kill -TERM "$pid" 2>/dev/null
         
         # Wait for graceful shutdown
         local timeout=10
@@ -463,10 +496,17 @@ stop_node() {
             timeout=$((timeout - 1))
         done
         
-        # Force kill if still running
+        # Send SIGINT if still running
+        if kill -0 "$pid" 2>/dev/null; then
+            log_warn "Sending SIGINT to node ${node_id}"
+            kill -INT "$pid" 2>/dev/null
+            sleep 2
+        fi
+        
+        # Force kill as last resort
         if kill -0 "$pid" 2>/dev/null; then
             log_warn "Force killing node ${node_id}"
-            kill -9 "$pid"
+            kill -9 "$pid" 2>/dev/null
         fi
         
         rm -f "$pid_file"
@@ -528,7 +568,8 @@ cmd_start() {
     
     # Generate master controller wallet
     log_step "Generating master controller wallet"
-    local controller_address=$(generate_master_controller_wallet)
+    local controller_address
+    controller_address=$(generate_master_controller_wallet | tail -1)
     log_success "Master Controller: ${controller_address}"
     log_info "  Controls 10 system wallets (75M QRDX total)"
     log_info "  Wallet saved: ${WALLETS_DIR}/master_controller.json"
@@ -537,7 +578,7 @@ cmd_start() {
     # Generate validator wallets
     log_step "Generating validator wallets"
     for i in $(seq 0 $((num_validators - 1))); do
-        generate_validator_wallet "$i"
+        generate_validator_wallet "$i" | tail -1 > /dev/null
         local wallet_path="${WALLETS_DIR}/validator_${i}.json"
         local address=$(get_wallet_address "$wallet_path")
         log_success "Validator ${i} wallet: ${address}"
@@ -570,11 +611,23 @@ cmd_start() {
         create_node_config "$i" "$num_nodes" "$is_bootstrap" "$is_validator" "$validator_id"
     done
     
-    # Start nodes
+    # Start nodes (bootstrap first, then others with staggered delay)
     log_step "Starting nodes"
     for i in $(seq 0 $((num_nodes - 1))); do
         start_node "$i"
-        sleep 2  # Stagger startup
+        if [ "$i" -eq 0 ]; then
+            # Give bootstrap node extra time to fully initialize
+            sleep 3
+            # Verify bootstrap node is accepting connections
+            if curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${DEFAULT_BASE_PORT}/get_nodes" 2>/dev/null | grep -q '200'; then
+                log_success "Bootstrap node is accepting connections"
+            else
+                log_warn "Bootstrap node may still be initializing..."
+                sleep 2
+            fi
+        else
+            sleep 3  # Stagger non-bootstrap nodes
+        fi
     done
     
     # Summary
@@ -669,8 +722,15 @@ cmd_status() {
             local pid=$(cat "$pid_file")
             local port=$((DEFAULT_BASE_PORT + node_id))
             
+            local rpc=$((8545 + node_id))
             if kill -0 "$pid" 2>/dev/null; then
-                echo -e "${GREEN}●${NC} Node ${node_id} - ${BOLD}RUNNING${NC} (PID: ${pid}, Port: ${port})"
+                local health=""
+                if curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/get_nodes" 2>/dev/null | grep -q '200'; then
+                    health="${GREEN}[healthy]${NC}"
+                else
+                    health="${YELLOW}[starting]${NC}"
+                fi
+                echo -e "${GREEN}●${NC} Node ${node_id} - ${BOLD}RUNNING${NC} (PID: ${pid}, Port: ${port}, RPC: ${rpc}) ${health}"
                 running=$((running + 1))
             else
                 echo -e "${RED}●${NC} Node ${node_id} - ${BOLD}STOPPED${NC}"
@@ -720,6 +780,15 @@ cmd_clean() {
         if [[ $REPLY == "yes" ]]; then
             rm -rf "${TESTNET_DIR}"
             log_success "Testnet directory removed"
+            
+            # Also clean up any stale node identity keys from shared location
+            local shared_key="${PROJECT_DIR}/qrdx/node/node_key.pq"
+            local shared_pub="${PROJECT_DIR}/qrdx/node/node_key.pq.pub"
+            if [ -f "$shared_key" ] || [ -f "$shared_pub" ]; then
+                log_info "Removing shared node identity keys..."
+                rm -f "$shared_key" "$shared_pub"
+                log_success "Shared node keys removed"
+            fi
         else
             log_info "Cleanup cancelled"
         fi
@@ -733,8 +802,7 @@ cmd_clean() {
 # =============================================================================
 
 show_usage() {
-    cat << EOF
-${BOLD}QRDX Local Testnet Manager${NC}
+    echo -e "${BOLD}QRDX Local Testnet Manager${NC}
 
 ${BOLD}USAGE:${NC}
     $0 <command> [options]
@@ -776,8 +844,7 @@ ${BOLD}CONFIGURATION:${NC}
     Testnet Directory: ${TESTNET_DIR}
     Base Port:         ${DEFAULT_BASE_PORT}
     Genesis Balance:   ${DEFAULT_GENESIS_BALANCE} QRDX per validator
-
-EOF
+"
 }
 
 main() {

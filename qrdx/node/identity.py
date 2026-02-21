@@ -35,8 +35,11 @@ def _resolve_sig_algorithm() -> str:
     raise RuntimeError('No supported PQ signature algorithm found in liboqs')
 
 PQ_ALGORITHM = _resolve_sig_algorithm()  # NIST Level 3 — CRYSTALS-Dilithium / ML-DSA-65
-KEY_FILE_PATH = os.path.join(os.path.dirname(__file__), 'node_key.pq')
-PUBKEY_FILE_PATH = os.path.join(os.path.dirname(__file__), 'node_key.pq.pub')
+
+# Allow per-node key directory via env var (for testnet multi-node on same machine)
+_key_dir = os.environ.get('QRDX_NODE_KEY_DIR', os.path.dirname(__file__))
+KEY_FILE_PATH = os.path.join(_key_dir, 'node_key.pq')
+PUBKEY_FILE_PATH = os.path.join(_key_dir, 'node_key.pq.pub')
 
 # @-schema regex: dilithium3@qx<hex40>@host:port
 _AT_SCHEMA_RE = re.compile(
