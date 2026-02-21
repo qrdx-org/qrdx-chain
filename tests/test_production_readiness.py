@@ -851,7 +851,10 @@ class TestWebSocketManager:
 
     @pytest.mark.asyncio
     async def test_publish_newheads(self, ws_manager):
-        conn = ws_manager.connect()
+        async def mock_send(data):
+            pass  # Simulate real WS transport
+
+        conn = ws_manager.connect(send_fn=mock_send)
         ws_manager.subscribe(conn.id, "newHeads")
 
         sent = await ws_manager.publish(
@@ -896,7 +899,8 @@ class TestWebSocketManager:
 
     @pytest.mark.asyncio
     async def test_publish_logs_with_filter(self, ws_manager):
-        conn = ws_manager.connect()
+        async def mock_send(data): pass
+        conn = ws_manager.connect(send_fn=mock_send)
         ws_manager.subscribe(
             conn.id, "logs",
             filter_params={"address": "0xABC"},
@@ -918,7 +922,8 @@ class TestWebSocketManager:
 
     @pytest.mark.asyncio
     async def test_publish_logs_topic_filter(self, ws_manager):
-        conn = ws_manager.connect()
+        async def mock_send(data): pass
+        conn = ws_manager.connect(send_fn=mock_send)
         ws_manager.subscribe(
             conn.id, "logs",
             filter_params={"topics": ["0xTransfer", None, "0xRecipient"]},
@@ -940,7 +945,8 @@ class TestWebSocketManager:
 
     @pytest.mark.asyncio
     async def test_publish_logs_topic_or_match(self, ws_manager):
-        conn = ws_manager.connect()
+        async def mock_send(data): pass
+        conn = ws_manager.connect(send_fn=mock_send)
         ws_manager.subscribe(
             conn.id, "logs",
             filter_params={"topics": [["0xA", "0xB"]]},
@@ -1595,9 +1601,10 @@ class TestConfigIntegration:
     async def test_ws_manager_full_lifecycle(self):
         """Full lifecycle: connect → subscribe → publish → unsubscribe → disconnect."""
         manager = WebSocketManager(max_connections=10, max_subscriptions_per_conn=5)
+        async def mock_send(data): pass
 
         # Connect
-        conn = manager.connect()
+        conn = manager.connect(send_fn=mock_send)
         assert manager.active_connections == 1
 
         # Subscribe to 2 channels
@@ -1632,10 +1639,11 @@ class TestConfigIntegration:
     async def test_multiple_connections_publish(self):
         """Events are dispatched to all matching subscribers across connections."""
         manager = WebSocketManager(max_connections=10, max_subscriptions_per_conn=5)
+        async def mock_send(data): pass
 
-        conn1 = manager.connect()
-        conn2 = manager.connect()
-        conn3 = manager.connect()
+        conn1 = manager.connect(send_fn=mock_send)
+        conn2 = manager.connect(send_fn=mock_send)
+        conn3 = manager.connect(send_fn=mock_send)
 
         manager.subscribe(conn1.id, "newHeads")
         manager.subscribe(conn2.id, "newHeads")

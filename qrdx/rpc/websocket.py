@@ -291,8 +291,13 @@ class WebSocketManager:
                     logger.warning("Failed to send to conn %s, disconnecting", conn_id)
                     self.disconnect(conn_id)
             else:
-                # No transport bound — used in testing
-                sent += 1
+                # No transport bound — this is an error in production.
+                # The connection was created without a send function.
+                logger.warning(
+                    "WS conn %s has no send_fn — event dropped. "
+                    "Bind a transport via connect(send_fn=...).",
+                    conn_id,
+                )
 
         self.total_events_dispatched += sent
         return sent

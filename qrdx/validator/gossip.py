@@ -398,10 +398,17 @@ class GossipHandler:
         node_id: str,
         genesis_time: int,
         fork_digest: bytes = b'\x00\x00\x00\x01',
+        p2p_broadcast_fn: Optional[Callable] = None,
     ):
         self.node_id = node_id
         self.genesis_time = genesis_time
         self.fork_digest = fork_digest
+        
+        # P2P transport layer broadcast callback.
+        # Must be an async callable: broadcast_fn(topic_name: str, data: bytes) -> int
+        # Returns number of peers message was sent to.
+        # Set via set_broadcast_fn() after P2P layer is initialized.
+        self._broadcast_fn: Optional[Callable] = p2p_broadcast_fn
         
         # Subscriptions: topic -> list of handlers
         self._subscriptions: Dict[GossipTopic, List[MessageHandler]] = defaultdict(list)
@@ -418,6 +425,21 @@ class GossipHandler:
         # Running state
         self._running = False
         self._processor_task: Optional[asyncio.Task] = None
+    
+    def set_broadcast_fn(self, fn: Callable) -> None:
+        """
+        Bind the P2P transport broadcast function.
+        
+        This must be called before publish() will propagate messages
+        to the network. The callable signature is:
+        
+            async def broadcast(topic_name: str, data: bytes) -> int
+        
+        Args:
+            fn: Async broadcast callable from the P2P transport layer
+        """
+        self._broadcast_fn = fn
+        logger.info("Gossip handler: P2P broadcast function bound")
     
     def get_current_slot(self) -> int:
         """Get current slot based on genesis time."""
@@ -441,9 +463,14 @@ class GossipHandler:
     
     async def publish(self, topic: GossipTopic, data: bytes) -> bool:
         """
-        Publish a message to a topic.
+        Publish a message to a topic via the P2P transport layer.
         
-        In production, this would broadcast to P2P network.
+        Messages are first validated locally, then broadcast to connected
+        peers via the bound P2P transport function, and finally queued for
+        local processing.
+        
+        Raises:
+            RuntimeError: If no P2P broadcast function has been bound.
         """
         message = GossipMessage(
             topic=topic,
@@ -457,7 +484,25 @@ class GossipHandler:
             logger.warning(f"Own message rejected: {validation.reason}")
             return False
         
-        # Queue for processing
+        # Broadcast to P2P network
+        if self._broadcast_fn is not None:
+            topic_name = get_topic_name(topic, self.fork_digest)
+            try:
+                peers_reached = await self._broadcast_fn(topic_name, data)
+                logger.debug(
+                    f"Broadcast {topic.value} to {peers_reached} peers"
+                )
+            except Exception as e:
+                logger.error(f"P2P broadcast failed for {topic.value}: {e}")
+                return False
+        else:
+            logger.warning(
+                f"No P2P broadcast function bound — message {message.message_id} "
+                f"will only be processed locally. Call set_broadcast_fn() to enable "
+                f"network propagation."
+            )
+        
+        # Queue for local processing
         await self._message_queue.put(message)
         
         logger.debug(f"Published to {topic.value}: {message.message_id}")
@@ -584,14 +629,21 @@ class BeaconGossip:
         self,
         node_id: str,
         genesis_time: int,
+        p2p_broadcast_fn: Optional[Callable] = None,
     ):
-        self.handler = GossipHandler(node_id, genesis_time)
+        self.handler = GossipHandler(
+            node_id, genesis_time, p2p_broadcast_fn=p2p_broadcast_fn
+        )
         
         # Callbacks for received messages
         self.on_block: Optional[Callable[[BeaconBlockMessage], asyncio.coroutine]] = None
         self.on_attestation: Optional[Callable[[AttestationMessage], asyncio.coroutine]] = None
         self.on_exit: Optional[Callable[[VoluntaryExitMessage], asyncio.coroutine]] = None
         self.on_slashing: Optional[Callable[[SlashingMessage], asyncio.coroutine]] = None
+    
+    def set_broadcast_fn(self, fn: Callable) -> None:
+        """Bind P2P transport broadcast function."""
+        self.handler.set_broadcast_fn(fn)
     
     async def start(self):
         """Start gossip and subscribe to topics."""

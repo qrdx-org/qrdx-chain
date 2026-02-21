@@ -163,17 +163,55 @@ class SlashingExecutor:
     - Collect and verify slashing evidence
     - Execute slashing penalties
     - Report slashing to network
+    - Persist detection state via SlashingProtectionDB
     """
     
-    def __init__(self):
-        """Initialize slashing executor."""
+    def __init__(self, protection_db: Optional['SlashingProtectionDB'] = None):
+        """
+        Initialize slashing executor.
+        
+        Args:
+            protection_db: Optional SlashingProtectionDB for persistent
+                tracking. If provided, proposals and attestations are
+                cross-checked against the DB so that detection state
+                survives node restarts.
+        """
         self._pending_evidence: List[SlashingEvidence] = []
         self._processed_evidence: List[SlashingEvidence] = []
         self._lock = asyncio.Lock()
+        self._protection_db = protection_db
         
-        # Track proposals and attestations for detection
+        # In-memory tracking mirrors (fast lookup, DB is authority)
         self._proposals: Dict[Tuple[str, int], List[str]] = {}  # (validator, slot) -> [block_hashes]
         self._attestations: Dict[Tuple[str, int], List[Tuple[int, int]]] = {}  # (validator, epoch) -> [(source, target)]
+    
+    def set_protection_db(self, db: 'SlashingProtectionDB') -> None:
+        """Bind a SlashingProtectionDB for persistent tracking."""
+        self._protection_db = db
+    
+    async def _record_block_to_db(
+        self, validator_address: str, slot: int, block_hash: str
+    ) -> None:
+        """Persist a block signing record to the protection DB."""
+        if self._protection_db:
+            try:
+                await self._protection_db.record_block_signature(
+                    validator_address, slot, block_hash
+                )
+            except Exception as e:
+                logger.error(f"Failed to record block to protection DB: {e}")
+    
+    async def _record_attestation_to_db(
+        self, validator_address: str, source_epoch: int, target_epoch: int
+    ) -> None:
+        """Persist an attestation record to the protection DB."""
+        if self._protection_db:
+            try:
+                await self._protection_db.record_attestation_signature(
+                    validator_address, source_epoch, target_epoch
+                )
+            except Exception as e:
+                logger.error(f"Failed to record attestation to protection DB: {e}")
     
     # =========================================================================
     # EVIDENCE DETECTION
@@ -228,10 +266,11 @@ class SlashingExecutor:
                         self._pending_evidence.append(evidence)
                         return evidence
             
-            # Record this proposal
+            # Record this proposal (memory + DB)
             if key not in self._proposals:
                 self._proposals[key] = []
             self._proposals[key].append(block_hash)
+            await self._record_block_to_db(validator_address, slot, block_hash)
             
             return None
     
@@ -326,10 +365,13 @@ class SlashingExecutor:
                         self._pending_evidence.append(evidence)
                         return evidence
             
-            # Record this attestation
+            # Record this attestation (memory + DB)
             if key not in self._attestations:
                 self._attestations[key] = []
             self._attestations[key].append((source_epoch, target_epoch))
+            await self._record_attestation_to_db(
+                validator_address, source_epoch, target_epoch
+            )
             
             return None
     
@@ -383,6 +425,129 @@ class SlashingExecutor:
         
         return None
     
+    async def check_bridge_fraud(
+        self,
+        validator_address: str,
+        source_chain: str,
+        claimed_tx_hash: str,
+        claimed_amount: int,
+        bridge_adapter,
+        slot: int,
+        epoch: int,
+    ) -> Optional[SlashingEvidence]:
+        """
+        Verify a bridge lock claim against the source chain.
+
+        A validator relaying a cross-chain lock must provide a transaction hash
+        on the source chain. This method fetches the real transaction via the
+        appropriate chain adapter and checks:
+          1. The transaction actually exists on the source chain.
+          2. The transaction is confirmed (included in a block).
+          3. The claimed amount matches the on-chain amount.
+
+        If any check fails the validator is slashed for 100 % of their stake
+        (``SlashingConditions.BRIDGE_FRAUD``).
+
+        Args:
+            validator_address: Address of the validator that submitted the claim.
+            source_chain: Chain identifier (e.g. ``"ethereum"``, ``"bitcoin"``).
+            claimed_tx_hash: The transaction hash the validator claims as proof.
+            claimed_amount: The amount (in smallest denomination) the validator
+                claims was locked.
+            bridge_adapter: A connected ``BaseChainAdapter`` for *source_chain*.
+            slot: Current slot for evidence timestamping.
+            epoch: Current epoch for evidence timestamping.
+
+        Returns:
+            ``SlashingEvidence`` if fraud is detected, else ``None``.
+        """
+        try:
+            tx_data = await bridge_adapter.get_transaction(claimed_tx_hash)
+        except Exception as exc:
+            logger.error(
+                f"Bridge fraud check: failed to fetch tx {claimed_tx_hash} "
+                f"on {source_chain}: {exc}"
+            )
+            # Network errors are NOT proof of fraud – skip, do not slash.
+            return None
+
+        # --- Check 1: tx must exist ------------------------------------------
+        if tx_data is None:
+            logger.warning(
+                f"Bridge fraud: tx {claimed_tx_hash} does not exist on "
+                f"{source_chain} (claimed by {validator_address})"
+            )
+            evidence = SlashingEvidence(
+                condition=SlashingConditions.BRIDGE_FRAUD,
+                validator_address=validator_address,
+                slot=slot,
+                epoch=epoch,
+                evidence_data={
+                    'source_chain': source_chain,
+                    'claimed_tx_hash': claimed_tx_hash,
+                    'claimed_amount': claimed_amount,
+                    'reason': 'transaction_not_found',
+                },
+            )
+            self._pending_evidence.append(evidence)
+            return evidence
+
+        # --- Check 2: tx must be confirmed (have a block height) --------------
+        block_height = tx_data.get('block_height')
+        if block_height is None:
+            logger.warning(
+                f"Bridge fraud: tx {claimed_tx_hash} on {source_chain} is "
+                f"unconfirmed (claimed by {validator_address})"
+            )
+            evidence = SlashingEvidence(
+                condition=SlashingConditions.BRIDGE_FRAUD,
+                validator_address=validator_address,
+                slot=slot,
+                epoch=epoch,
+                evidence_data={
+                    'source_chain': source_chain,
+                    'claimed_tx_hash': claimed_tx_hash,
+                    'claimed_amount': claimed_amount,
+                    'reason': 'transaction_unconfirmed',
+                    'tx_data': tx_data,
+                },
+            )
+            self._pending_evidence.append(evidence)
+            return evidence
+
+        # --- Check 3: amount must match ---------------------------------------
+        on_chain_amount = tx_data.get('amount', tx_data.get('value', 0))
+        if isinstance(on_chain_amount, str):
+            on_chain_amount = int(on_chain_amount, 16) if on_chain_amount.startswith('0x') else int(on_chain_amount)
+
+        if int(on_chain_amount) != int(claimed_amount):
+            logger.warning(
+                f"Bridge fraud: amount mismatch for tx {claimed_tx_hash} on "
+                f"{source_chain}: on-chain={on_chain_amount}, "
+                f"claimed={claimed_amount} (validator {validator_address})"
+            )
+            evidence = SlashingEvidence(
+                condition=SlashingConditions.BRIDGE_FRAUD,
+                validator_address=validator_address,
+                slot=slot,
+                epoch=epoch,
+                evidence_data={
+                    'source_chain': source_chain,
+                    'claimed_tx_hash': claimed_tx_hash,
+                    'claimed_amount': claimed_amount,
+                    'on_chain_amount': int(on_chain_amount),
+                    'reason': 'amount_mismatch',
+                },
+            )
+            self._pending_evidence.append(evidence)
+            return evidence
+
+        logger.debug(
+            f"Bridge claim verified: tx {claimed_tx_hash} on {source_chain} "
+            f"amount={on_chain_amount} (validator {validator_address})"
+        )
+        return None
+
     async def submit_evidence(self, evidence: SlashingEvidence) -> bool:
         """
         Submit external slashing evidence.

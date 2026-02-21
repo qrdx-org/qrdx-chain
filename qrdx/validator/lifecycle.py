@@ -330,17 +330,69 @@ class LifecycleManager:
     Comprehensive validator lifecycle manager.
     
     Coordinates deposits, activations, exits, and withdrawals.
+    All state is persisted to an aiosqlite database so that restarts
+    do not lose in-flight deposits, exits, or withdrawal requests.
     """
     
+    # SQLite schema for lifecycle persistence
+    _SCHEMA = """
+    CREATE TABLE IF NOT EXISTS lifecycle_validators (
+        address TEXT PRIMARY KEY,
+        public_key TEXT NOT NULL,
+        state TEXT NOT NULL,
+        deposit_amount TEXT NOT NULL DEFAULT '0',
+        effective_balance TEXT NOT NULL DEFAULT '0',
+        withdrawable_balance TEXT NOT NULL DEFAULT '0',
+        deposit_epoch INTEGER,
+        activation_eligibility_epoch INTEGER,
+        activation_epoch INTEGER,
+        exit_epoch INTEGER,
+        withdrawable_epoch INTEGER,
+        activation_queue_position INTEGER,
+        exit_queue_position INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS lifecycle_deposits (
+        validator_address TEXT PRIMARY KEY,
+        public_key TEXT NOT NULL,
+        amount TEXT NOT NULL,
+        withdrawal_address TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        submitted_at TEXT NOT NULL,
+        included_slot INTEGER,
+        included_epoch INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS lifecycle_exits (
+        validator_address TEXT PRIMARY KEY,
+        exit_epoch INTEGER NOT NULL,
+        signature TEXT NOT NULL,
+        submitted_at TEXT NOT NULL,
+        processed INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS lifecycle_withdrawals (
+        validator_address TEXT PRIMARY KEY,
+        withdrawal_address TEXT NOT NULL,
+        amount TEXT NOT NULL,
+        withdrawable_epoch INTEGER NOT NULL,
+        requested_at TEXT NOT NULL,
+        processed INTEGER NOT NULL DEFAULT 0,
+        tx_hash TEXT
+    );
+    """
+
     def __init__(
         self,
         min_stake: Decimal = MIN_VALIDATOR_STAKE,
         max_validators: int = MAX_VALIDATORS,
         churn_limit: int = 4,
+        db_path: Optional[str] = None,
     ):
         self.min_stake = min_stake
         self.max_validators = max_validators
         self.churn_limit = churn_limit
+        self._db_path = db_path
+        self._db = None  # aiosqlite connection, set by open_db()
         
         # Queues
         self.activation_queue = ValidatorActivationQueue(churn_limit)
@@ -356,6 +408,241 @@ class LifecycleManager:
         
         # Current counts
         self._active_count = 0
+    
+    # =========================================================================
+    # DATABASE PERSISTENCE
+    # =========================================================================
+
+    async def open_db(self, db_path: Optional[str] = None):
+        """
+        Open the lifecycle SQLite database and create tables if needed.
+
+        Args:
+            db_path: Optional override for database path.
+        """
+        import aiosqlite
+
+        path = db_path or self._db_path
+        if not path:
+            logger.warning("No db_path provided – lifecycle state is in-memory only")
+            return
+
+        self._db = await aiosqlite.connect(path)
+        self._db.row_factory = aiosqlite.Row
+        for stmt in self._SCHEMA.strip().split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                await self._db.execute(stmt)
+        await self._db.commit()
+        logger.info(f"Lifecycle DB opened: {path}")
+
+    async def close_db(self):
+        """Close the lifecycle database."""
+        if self._db:
+            await self._db.close()
+            self._db = None
+
+    async def load_from_db(self):
+        """
+        Restore full in-memory state from the lifecycle database.
+
+        Must be called after ``open_db()`` and before processing any epochs.
+        """
+        if not self._db:
+            logger.warning("load_from_db called with no database connection")
+            return
+
+        # -- validators -------------------------------------------------------
+        cursor = await self._db.execute("SELECT * FROM lifecycle_validators")
+        rows = await cursor.fetchall()
+        for r in rows:
+            lc = ValidatorLifecycle(
+                address=r["address"],
+                public_key=r["public_key"],
+                state=LifecycleState[r["state"]],
+                deposit_amount=Decimal(r["deposit_amount"]),
+                effective_balance=Decimal(r["effective_balance"]),
+                withdrawable_balance=Decimal(r["withdrawable_balance"]),
+                deposit_epoch=r["deposit_epoch"],
+                activation_eligibility_epoch=r["activation_eligibility_epoch"],
+                activation_epoch=r["activation_epoch"],
+                exit_epoch=r["exit_epoch"],
+                withdrawable_epoch=r["withdrawable_epoch"],
+                activation_queue_position=r["activation_queue_position"],
+                exit_queue_position=r["exit_queue_position"],
+                created_at=datetime.fromisoformat(r["created_at"]),
+                updated_at=datetime.fromisoformat(r["updated_at"]),
+            )
+            self._validators[lc.address] = lc
+
+            if lc.state == LifecycleState.ACTIVE:
+                self._active_count += 1
+            elif lc.state == LifecycleState.PENDING_ACTIVATION:
+                self.activation_queue._pending[lc.address] = lc
+                self.activation_queue._queue.append(
+                    (lc.activation_eligibility_epoch, lc.address)
+                )
+            elif lc.state == LifecycleState.PENDING_EXIT:
+                self.exit_queue._pending[lc.address] = lc
+                self.exit_queue._queue.append((lc.exit_epoch, lc.address))
+
+        # Sort queues after bulk insert
+        self.activation_queue._queue.sort()
+        self.exit_queue._queue.sort()
+
+        # -- pending deposits -------------------------------------------------
+        cursor = await self._db.execute("SELECT * FROM lifecycle_deposits")
+        rows = await cursor.fetchall()
+        for r in rows:
+            dep = DepositRequest(
+                validator_address=r["validator_address"],
+                public_key=r["public_key"],
+                amount=Decimal(r["amount"]),
+                withdrawal_address=r["withdrawal_address"],
+                signature=r["signature"],
+                submitted_at=datetime.fromisoformat(r["submitted_at"]),
+                included_slot=r["included_slot"],
+                included_epoch=r["included_epoch"],
+            )
+            self._pending_deposits[dep.validator_address] = dep
+
+        # -- pending exits ----------------------------------------------------
+        cursor = await self._db.execute(
+            "SELECT * FROM lifecycle_exits WHERE processed = 0"
+        )
+        rows = await cursor.fetchall()
+        for r in rows:
+            ex = ExitRequest(
+                validator_address=r["validator_address"],
+                exit_epoch=r["exit_epoch"],
+                signature=r["signature"],
+                submitted_at=datetime.fromisoformat(r["submitted_at"]),
+                processed=bool(r["processed"]),
+            )
+            self._pending_exits[ex.validator_address] = ex
+
+        # -- pending withdrawals ----------------------------------------------
+        cursor = await self._db.execute(
+            "SELECT * FROM lifecycle_withdrawals WHERE processed = 0"
+        )
+        rows = await cursor.fetchall()
+        for r in rows:
+            wr = WithdrawalRequest(
+                validator_address=r["validator_address"],
+                withdrawal_address=r["withdrawal_address"],
+                amount=Decimal(r["amount"]),
+                withdrawable_epoch=r["withdrawable_epoch"],
+                requested_at=datetime.fromisoformat(r["requested_at"]),
+                processed=bool(r["processed"]),
+                tx_hash=r["tx_hash"],
+            )
+            self._pending_withdrawals[wr.validator_address] = wr
+
+        logger.info(
+            f"Lifecycle state restored: {len(self._validators)} validators, "
+            f"{len(self._pending_deposits)} pending deposits, "
+            f"{len(self._pending_exits)} pending exits, "
+            f"{len(self._pending_withdrawals)} pending withdrawals"
+        )
+
+    async def _persist_validator(self, lc: ValidatorLifecycle):
+        """Upsert a single validator lifecycle record."""
+        if not self._db:
+            return
+        await self._db.execute("""
+            INSERT INTO lifecycle_validators (
+                address, public_key, state, deposit_amount, effective_balance,
+                withdrawable_balance, deposit_epoch, activation_eligibility_epoch,
+                activation_epoch, exit_epoch, withdrawable_epoch,
+                activation_queue_position, exit_queue_position,
+                created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(address) DO UPDATE SET
+                state=excluded.state,
+                effective_balance=excluded.effective_balance,
+                withdrawable_balance=excluded.withdrawable_balance,
+                activation_eligibility_epoch=excluded.activation_eligibility_epoch,
+                activation_epoch=excluded.activation_epoch,
+                exit_epoch=excluded.exit_epoch,
+                withdrawable_epoch=excluded.withdrawable_epoch,
+                activation_queue_position=excluded.activation_queue_position,
+                exit_queue_position=excluded.exit_queue_position,
+                updated_at=excluded.updated_at
+        """, (
+            lc.address, lc.public_key, lc.state.name,
+            str(lc.deposit_amount), str(lc.effective_balance),
+            str(lc.withdrawable_balance),
+            lc.deposit_epoch, lc.activation_eligibility_epoch,
+            lc.activation_epoch, lc.exit_epoch, lc.withdrawable_epoch,
+            lc.activation_queue_position, lc.exit_queue_position,
+            lc.created_at.isoformat(), lc.updated_at.isoformat(),
+        ))
+        await self._db.commit()
+
+    async def _persist_deposit(self, dep: DepositRequest):
+        """Upsert a pending deposit request."""
+        if not self._db:
+            return
+        await self._db.execute("""
+            INSERT INTO lifecycle_deposits (
+                validator_address, public_key, amount, withdrawal_address,
+                signature, submitted_at, included_slot, included_epoch
+            ) VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(validator_address) DO UPDATE SET
+                included_slot=excluded.included_slot,
+                included_epoch=excluded.included_epoch
+        """, (
+            dep.validator_address, dep.public_key, str(dep.amount),
+            dep.withdrawal_address, dep.signature,
+            dep.submitted_at.isoformat(),
+            dep.included_slot, dep.included_epoch,
+        ))
+        await self._db.commit()
+
+    async def _remove_deposit(self, validator_address: str):
+        """Remove a deposit record after inclusion."""
+        if not self._db:
+            return
+        await self._db.execute(
+            "DELETE FROM lifecycle_deposits WHERE validator_address = ?",
+            (validator_address,)
+        )
+        await self._db.commit()
+
+    async def _persist_exit(self, ex: ExitRequest):
+        """Upsert a pending exit request."""
+        if not self._db:
+            return
+        await self._db.execute("""
+            INSERT INTO lifecycle_exits (
+                validator_address, exit_epoch, signature, submitted_at, processed
+            ) VALUES (?,?,?,?,?)
+            ON CONFLICT(validator_address) DO UPDATE SET
+                processed=excluded.processed
+        """, (
+            ex.validator_address, ex.exit_epoch, ex.signature,
+            ex.submitted_at.isoformat(), int(ex.processed),
+        ))
+        await self._db.commit()
+
+    async def _persist_withdrawal(self, wr: WithdrawalRequest):
+        """Upsert a pending withdrawal request."""
+        if not self._db:
+            return
+        await self._db.execute("""
+            INSERT INTO lifecycle_withdrawals (
+                validator_address, withdrawal_address, amount,
+                withdrawable_epoch, requested_at, processed, tx_hash
+            ) VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(validator_address) DO UPDATE SET
+                processed=excluded.processed,
+                tx_hash=excluded.tx_hash
+        """, (
+            wr.validator_address, wr.withdrawal_address, str(wr.amount),
+            wr.withdrawable_epoch, wr.requested_at.isoformat(),
+            int(wr.processed), wr.tx_hash,
+        ))
+        await self._db.commit()
     
     @property
     def active_validator_count(self) -> int:
@@ -411,6 +698,7 @@ class LifecycleManager:
         )
         
         self._pending_deposits[validator_address] = deposit
+        await self._persist_deposit(deposit)
         
         logger.info(f"Deposit submitted for {validator_address[:16]}: {amount} QRDX")
         
@@ -448,6 +736,8 @@ class LifecycleManager:
         # Store
         self._validators[validator_address] = lifecycle
         del self._pending_deposits[validator_address]
+        await self._persist_validator(lifecycle)
+        await self._remove_deposit(validator_address)
         
         logger.info(
             f"Deposit included for {validator_address[:16]} at slot {inclusion_slot}"
@@ -489,11 +779,13 @@ class LifecycleManager:
         )
         
         self._pending_exits[validator_address] = exit_request
+        await self._persist_exit(exit_request)
         
         # Add to exit queue
         self.exit_queue.request_exit(lifecycle, exit_epoch)
         
         self._active_count -= 1
+        await self._persist_validator(lifecycle)
         
         logger.info(f"Voluntary exit requested for {validator_address[:16]}")
         
@@ -516,13 +808,15 @@ class LifecycleManager:
             return
         
         # Immediate exit
+        was_active = lifecycle.state == LifecycleState.ACTIVE
         lifecycle.exit_epoch = current_epoch
         lifecycle.state = LifecycleState.EXITED
         lifecycle.withdrawable_epoch = current_epoch + WITHDRAWAL_DELAY_EPOCHS
         
-        if lifecycle.state == LifecycleState.ACTIVE:
+        if was_active:
             self._active_count -= 1
         
+        await self._persist_validator(lifecycle)
         logger.warning(f"Validator {validator_address[:16]} force-exited: {reason}")
     
     async def process_epoch(self, current_epoch: int):
@@ -537,12 +831,16 @@ class LifecycleManager:
         if to_activate:
             self.activation_queue.activate_validators(to_activate, activation_epoch)
             self._active_count += len(to_activate)
+            for v in to_activate:
+                await self._persist_validator(v)
         
         # Process exits
         to_exit = self.exit_queue.get_validators_to_exit(current_epoch)
         
         if to_exit:
             self.exit_queue.process_exits(to_exit, current_epoch)
+            for v in to_exit:
+                await self._persist_validator(v)
         
         # Check for withdrawable validators
         for lifecycle in self._validators.values():
@@ -551,6 +849,7 @@ class LifecycleManager:
                 lifecycle.withdrawable_epoch <= current_epoch):
                 lifecycle.state = LifecycleState.WITHDRAWABLE
                 lifecycle.withdrawable_balance = lifecycle.effective_balance
+                await self._persist_validator(lifecycle)
                 logger.info(
                     f"Validator {lifecycle.address[:16]} now withdrawable"
                 )
@@ -582,6 +881,7 @@ class LifecycleManager:
         lifecycle.withdrawable_balance = Decimal("0")
         lifecycle.effective_balance = Decimal("0")
         lifecycle.state = LifecycleState.WITHDRAWN
+        await self._persist_validator(lifecycle)
         
         logger.info(
             f"Withdrawal processed for {validator_address[:16]}: {amount} QRDX"

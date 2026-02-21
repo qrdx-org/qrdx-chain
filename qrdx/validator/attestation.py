@@ -493,11 +493,16 @@ class AttestationPool:
 
 class AttestationAggregator:
     """
-    Aggregates attestations for efficient block inclusion.
+    Groups attestations for efficient block inclusion.
     
-    In the future, this can implement BLS signature aggregation
-    for more efficient verification. Currently uses individual
-    Dilithium signatures.
+    Dilithium (ML-DSA-65) does not support BLS-style signature
+    aggregation. Each attestation retains its individual Dilithium
+    signature and must be verified independently. This is a fundamental
+    property of lattice-based PQ signatures, not a stub.
+    
+    Grouping by (slot, block_hash, source_epoch, target_epoch)
+    enables the block proposer to include a compact set of attestation
+    bundles rather than an unsorted list.
     """
     
     @staticmethod
@@ -505,17 +510,17 @@ class AttestationAggregator:
         attestations: List[Attestation]
     ) -> List[Attestation]:
         """
-        Aggregate attestations for the same target.
+        Group attestations by target and return in bundle order.
         
-        Currently returns attestations as-is since Dilithium
-        doesn't support aggregation. Future versions may use
-        BLS or other aggregatable signatures.
+        Since Dilithium does not support aggregation, each attestation
+        keeps its own signature. This method groups by common target
+        and returns them in deterministic order for block inclusion.
         
         Args:
             attestations: List of attestations
             
         Returns:
-            Aggregated attestations (currently same as input)
+            Attestations sorted by group for inclusion
         """
         # Group by (slot, block_hash, source_epoch, target_epoch)
         groups: Dict[Tuple, List[Attestation]] = defaultdict(list)
@@ -529,10 +534,12 @@ class AttestationAggregator:
             )
             groups[key].append(attestation)
         
-        # For now, return all attestations
-        # Future: aggregate signatures within each group
+        # Return grouped attestations in deterministic key order
         result = []
-        for group in groups.values():
+        for key in sorted(groups.keys()):
+            group = groups[key]
+            # Within each group, sort by validator index for determinism
+            group.sort(key=lambda a: a.validator_index)
             result.extend(group)
         
         return result

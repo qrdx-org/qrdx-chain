@@ -18,7 +18,7 @@ import time
 import sys
 import os
 from decimal import Decimal
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -479,51 +479,90 @@ class TestEthereumAdapter:
 
     def test_connect_with_url(self):
         adapter = EthereumAdapter(rpc_url="http://localhost:8545")
-        assert adapter.connect() is True
-        assert adapter.is_connected is True
+        with patch.object(adapter, '_json_rpc_call', return_value="Geth/v1.0"):
+            assert adapter.connect() is True
+            assert adapter.is_connected is True
 
     def test_disconnect(self):
         adapter = EthereumAdapter(rpc_url="http://localhost:8545")
-        adapter.connect()
+        with patch.object(adapter, '_json_rpc_call', return_value="Geth/v1.0"):
+            adapter.connect()
         adapter.disconnect()
         assert adapter.is_connected is False
 
     def test_get_latest_block(self):
         adapter = EthereumAdapter(rpc_url="http://localhost:8545")
-        adapter.connect()
-        block = adapter.get_latest_block()
+        with patch.object(adapter, '_json_rpc_call', side_effect=[
+            "Geth/v1.0",  # connect
+            {  # eth_getBlockByNumber
+                'number': '0x1234',
+                'hash': '0x' + 'ab' * 32,
+                'timestamp': '0x60000000',
+            },
+        ]):
+            adapter.connect()
+            block = adapter.get_latest_block()
         assert block.chain_id == ChainId.ETHEREUM
         assert block.block_height > 0
-        assert len(block.block_hash) == 64  # SHA-256 hex
+        assert len(block.block_hash.replace('0x', '')) == 64  # 32 bytes hex
 
     def test_get_block_by_height(self):
         adapter = EthereumAdapter(rpc_url="http://localhost:8545")
-        adapter.connect()
-        block = adapter.get_block_by_height(18000000)
+        with patch.object(adapter, '_json_rpc_call', side_effect=[
+            "Geth/v1.0",  # connect
+            {  # eth_getBlockByNumber
+                'number': '0x112A880',
+                'hash': '0x' + 'cc' * 32,
+                'timestamp': '0x60000000',
+            },
+        ]):
+            adapter.connect()
+            block = adapter.get_block_by_height(18000000)
         assert block is not None
         assert block.block_height == 18000000
 
     def test_get_transaction(self):
         adapter = EthereumAdapter(rpc_url="http://localhost:8545")
-        adapter.connect()
-        tx = adapter.get_transaction("0xabcdef")
+        with patch.object(adapter, '_json_rpc_call', side_effect=[
+            "Geth/v1.0",  # connect
+            {  # eth_getTransactionByHash
+                'hash': '0xabcdef',
+                'blockNumber': '0x100',
+                'from': '0x1111',
+                'to': '0x2222',
+                'value': '0xde0b6b3a7640000',
+            },
+        ]):
+            adapter.connect()
+            tx = adapter.get_transaction("0xabcdef")
         assert tx is not None
         assert tx["hash"] == "0xabcdef"
 
     def test_verify_valid_proof(self):
-        adapter = EthereumAdapter()
-        proof = InclusionProof(
-            chain_id=ChainId.ETHEREUM,
-            tx_hash="0x" + "aa" * 32,
-            block_hash="0x" + "bb" * 32,
-            block_height=18000000,
-            proof_data="cc" * 32,
-            root_hash="dd" * 32,
-        )
-        assert adapter.verify_inclusion_proof(proof) is True
+        adapter = EthereumAdapter(rpc_url="http://localhost:8545")
+        with patch.object(adapter, '_json_rpc_call', side_effect=[
+            "Geth/v1.0",  # connect
+            {  # eth_getTransactionReceipt
+                'blockHash': '0x' + 'bb' * 32,
+                'blockNumber': '0x112A880',
+                'status': '0x1',
+            },
+        ]):
+            adapter.connect()
+            proof = InclusionProof(
+                chain_id=ChainId.ETHEREUM,
+                tx_hash="0x" + "aa" * 32,
+                block_hash="0x" + "bb" * 32,
+                block_height=18000000,
+                proof_data="cc" * 32,
+                root_hash="dd" * 32,
+            )
+            assert adapter.verify_inclusion_proof(proof) is True
 
     def test_verify_wrong_chain_proof(self):
-        adapter = EthereumAdapter()
+        adapter = EthereumAdapter(rpc_url="http://localhost:8545")
+        with patch.object(adapter, '_json_rpc_call', return_value="Geth/v1.0"):
+            adapter.connect()
         proof = InclusionProof(
             chain_id=ChainId.BITCOIN,
             tx_hash="0x" + "aa" * 32,
@@ -535,7 +574,9 @@ class TestEthereumAdapter:
         assert adapter.verify_inclusion_proof(proof) is False
 
     def test_verify_empty_proof(self):
-        adapter = EthereumAdapter()
+        adapter = EthereumAdapter(rpc_url="http://localhost:8545")
+        with patch.object(adapter, '_json_rpc_call', return_value="Geth/v1.0"):
+            adapter.connect()
         proof = InclusionProof(
             chain_id=ChainId.ETHEREUM,
             tx_hash="",
@@ -553,16 +594,29 @@ class TestEthereumAdapter:
 
     def test_generate_attestation(self):
         adapter = EthereumAdapter(rpc_url="http://localhost:8545")
-        adapter.connect()
-        att = adapter.generate_attestation("0xValidator")
+        with patch.object(adapter, '_json_rpc_call', side_effect=[
+            "Geth/v1.0",  # connect
+            {  # eth_getBlockByNumber (called by get_latest_block inside generate_attestation)
+                'number': '0x1234',
+                'hash': '0x' + 'ab' * 32,
+                'timestamp': '0x60000000',
+            },
+        ]):
+            adapter.connect()
+            att = adapter.generate_attestation("0xValidator")
         assert att is not None
         assert att.chain_id == ChainId.ETHEREUM
         assert att.validator_address == "0xValidator"
         assert att.block_height > 0
 
     def test_detect_lock_events_empty(self):
-        adapter = EthereumAdapter()
-        events = adapter.detect_lock_events(0, 100)
+        adapter = EthereumAdapter(rpc_url="http://localhost:8545")
+        with patch.object(adapter, '_json_rpc_call', side_effect=[
+            "Geth/v1.0",  # connect
+            [],  # eth_getLogs
+        ]):
+            adapter.connect()
+            events = adapter.detect_lock_events(0, 100)
         assert events == []
 
 
@@ -577,25 +631,38 @@ class TestBitcoinAdapter:
 
     def test_get_latest_block(self):
         adapter = BitcoinAdapter(rpc_url="http://localhost:18443")
-        adapter.connect()
-        block = adapter.get_latest_block()
+        with patch.object(adapter, '_json_rpc_call', side_effect=[
+            "Bitcoin Core",  # connect
+            {'blocks': 800123, 'bestblockhash': 'ab' * 32},  # getblockchaininfo
+            {'height': 800123, 'hash': 'ab' * 32, 'time': 1700000000},  # getblockheader
+        ]):
+            adapter.connect()
+            block = adapter.get_latest_block()
         assert block.chain_id == ChainId.BITCOIN
         assert block.block_height > 0
 
     def test_verify_valid_proof(self):
-        adapter = BitcoinAdapter()
-        proof = InclusionProof(
-            chain_id=ChainId.BITCOIN,
-            tx_hash="0x" + "aa" * 32,
-            block_hash="0x" + "bb" * 32,
-            block_height=800000,
-            proof_data="cc" * 32,
-            root_hash="dd" * 32,
-        )
-        assert adapter.verify_inclusion_proof(proof) is True
+        adapter = BitcoinAdapter(rpc_url="http://localhost:18443")
+        tx_hash = "0x" + "aa" * 32
+        with patch.object(adapter, '_json_rpc_call', side_effect=[
+            "Bitcoin Core",  # connect
+            [tx_hash],  # verifytxoutproof returns a list of txids
+        ]):
+            adapter.connect()
+            proof = InclusionProof(
+                chain_id=ChainId.BITCOIN,
+                tx_hash=tx_hash,
+                block_hash="0x" + "bb" * 32,
+                block_height=800000,
+                proof_data="cc" * 32,
+                root_hash="dd" * 32,
+            )
+            assert adapter.verify_inclusion_proof(proof) is True
 
     def test_verify_wrong_chain(self):
-        adapter = BitcoinAdapter()
+        adapter = BitcoinAdapter(rpc_url="http://localhost:18443")
+        with patch.object(adapter, '_json_rpc_call', return_value="Bitcoin Core"):
+            adapter.connect()
         proof = InclusionProof(
             chain_id=ChainId.ETHEREUM,
             tx_hash="tx",
@@ -618,22 +685,40 @@ class TestSolanaAdapter:
 
     def test_get_latest_block(self):
         adapter = SolanaAdapter(rpc_url="http://localhost:8899")
-        adapter.connect()
-        block = adapter.get_latest_block()
+        with patch.object(adapter, '_json_rpc_call', side_effect=[
+            "Solana/v1.0",  # connect
+            200000123,  # getSlot
+            {  # getBlock
+                'blockhash': 'dd' * 32,
+                'blockTime': 1700000000,
+                'blockHeight': 200000123,
+            },
+        ]):
+            adapter.connect()
+            block = adapter.get_latest_block()
         assert block.chain_id == ChainId.SOLANA
         assert block.block_height > 0
 
     def test_verify_valid_proof(self):
-        adapter = SolanaAdapter()
-        proof = InclusionProof(
-            chain_id=ChainId.SOLANA,
-            tx_hash="0x" + "aa" * 32,
-            block_hash="0x" + "bb" * 32,
-            block_height=200000000,
-            proof_data="cc" * 32,
-            root_hash="dd" * 32,
-        )
-        assert adapter.verify_inclusion_proof(proof) is True
+        adapter = SolanaAdapter(rpc_url="http://localhost:8899")
+        with patch.object(adapter, '_json_rpc_call', side_effect=[
+            "Solana/v1.0",  # connect
+            {  # getTransaction
+                'slot': 200000000,
+                'transaction': {'signatures': ['aa' * 32]},
+                'meta': {'err': None},
+            },
+        ]):
+            adapter.connect()
+            proof = InclusionProof(
+                chain_id=ChainId.SOLANA,
+                tx_hash="0x" + "aa" * 32,
+                block_hash="0x" + "bb" * 32,
+                block_height=200000000,
+                proof_data="cc" * 32,
+                root_hash="dd" * 32,
+            )
+            assert adapter.verify_inclusion_proof(proof) is True
 
 
 class TestInclusionProof:
@@ -1486,14 +1571,28 @@ class TestEndToEndBridge:
     def test_eth_adapter_to_oracle_consensus(self):
         """Adapter generates attestation → OracleConsensus reaches quorum."""
         adapter = EthereumAdapter(rpc_url="http://localhost:8545")
-        adapter.connect()
 
-        oc = OracleConsensus(total_validators=3)
-        # 3 validators all use the adapter
-        for i in range(3):
-            att = adapter.generate_attestation(f"0xValidator{i}")
-            assert att is not None
-            oc.submit_attestation(att)
+        # Mock RPC: connect + 3 × get_latest_block (one per validator attestation)
+        rpc_responses = [
+            "Geth/v1.0",  # connect
+        ]
+        for _ in range(3):
+            rpc_responses.append({  # eth_getBlockByNumber
+                'number': '0x112A880',
+                'hash': '0x' + 'ab' * 32,
+                'timestamp': '0x60000000',
+                'stateRoot': '0x' + 'cd' * 32,
+            })
+
+        with patch.object(adapter, '_json_rpc_call', side_effect=rpc_responses):
+            adapter.connect()
+
+            oc = OracleConsensus(total_validators=3)
+            # 3 validators all use the adapter
+            for i in range(3):
+                att = adapter.generate_attestation(f"0xValidator{i}")
+                assert att is not None
+                oc.submit_attestation(att)
 
         rec = oc.get_finalized_height(ChainId.ETHEREUM)
         assert rec is not None
@@ -1581,15 +1680,32 @@ class TestEndToEndBridge:
         """Track multiple chains simultaneously."""
         tracker = BlockHeightTracker()
 
-        adapters = [
-            EthereumAdapter(rpc_url="http://eth"),
-            BitcoinAdapter(rpc_url="http://btc"),
-            SolanaAdapter(rpc_url="http://sol"),
-        ]
-        for adapter in adapters:
-            adapter.connect()
-            block = adapter.get_latest_block()
-            tracker.update_height(block)
+        eth_adapter = EthereumAdapter(rpc_url="http://eth")
+        btc_adapter = BitcoinAdapter(rpc_url="http://btc")
+        sol_adapter = SolanaAdapter(rpc_url="http://sol")
+
+        with patch.object(eth_adapter, '_json_rpc_call', side_effect=[
+            "Geth/v1.0",
+            {'number': '0x1234', 'hash': '0x' + 'ab' * 32, 'timestamp': '0x60000000'},
+        ]):
+            eth_adapter.connect()
+            tracker.update_height(eth_adapter.get_latest_block())
+
+        with patch.object(btc_adapter, '_json_rpc_call', side_effect=[
+            "Bitcoin Core",
+            {'blocks': 800123, 'bestblockhash': 'cc' * 32},
+            {'height': 800123, 'hash': 'cc' * 32, 'time': 1700000000},
+        ]):
+            btc_adapter.connect()
+            tracker.update_height(btc_adapter.get_latest_block())
+
+        with patch.object(sol_adapter, '_json_rpc_call', side_effect=[
+            "Solana/v1.0",
+            200000123,
+            {'blockhash': 'dd' * 32, 'blockTime': 1700000000, 'blockHeight': 200000123},
+        ]):
+            sol_adapter.connect()
+            tracker.update_height(sol_adapter.get_latest_block())
 
         heights = tracker.get_all_heights()
         assert ChainId.ETHEREUM in heights

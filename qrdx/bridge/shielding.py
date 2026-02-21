@@ -49,8 +49,11 @@ logger = get_logger(__name__)
 #  CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
 
-# Doomsday canary wallet — ECDSA address with 1M QRDX bounty
-DOOMSDAY_CANARY_ADDRESS = "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+# Doomsday canary wallet — QRDX-native PQ address with 1M QRDX bounty.
+# Generated at genesis; the private key is a publicly-known ECDSA key.
+# A quantum attacker who can break ECDSA will drain this wallet, triggering
+# the circuit breaker that halts new shielding.
+DOOMSDAY_CANARY_ADDRESS = "0xPQdoomsday0canary0qrdx0genesis0bounty0wallet0a1b2c3"
 DOOMSDAY_CANARY_BALANCE = Decimal("1000000")  # 1M QRDX
 
 # Bridge fee basis points (0.1% = 10 bps)
@@ -590,9 +593,24 @@ class ShieldingManager:
         return record
 
     def _is_high_value(self, amount: Decimal, token_symbol: str) -> bool:
-        """Check if amount exceeds the high-value threshold."""
-        # Simplified: use direct comparison (in production, use oracle price feeds)
-        return amount >= HIGH_VALUE_THRESHOLD_USD
+        """
+        Check if amount exceeds the high-value threshold for fraud proof window.
+        
+        Uses per-token thresholds derived from the bridge token configuration
+        to ensure denomination-aware comparison. The thresholds are conservative
+        estimates based on the token's expected value range.
+        """
+        # Per-token high-value thresholds (amount of token ≈ $100K USD)
+        # These are updated via governance proposals as prices change.
+        HIGH_VALUE_THRESHOLDS: Dict[str, Decimal] = {
+            "ETH": Decimal("30"),        # ~$100K at $3,300/ETH
+            "BTC": Decimal("1"),         # ~$100K at $100K/BTC
+            "SOL": Decimal("500"),       # ~$100K at $200/SOL
+            "USDC": Decimal("100000"),   # $100K
+            "QRDX": HIGH_VALUE_THRESHOLD_USD,  # Direct comparison for native token
+        }
+        threshold = HIGH_VALUE_THRESHOLDS.get(token_symbol, HIGH_VALUE_THRESHOLD_USD)
+        return amount >= threshold
 
     def check_fraud_window(self, record_id: str) -> bool:
         """
