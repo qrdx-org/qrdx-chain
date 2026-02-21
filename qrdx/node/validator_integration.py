@@ -34,6 +34,11 @@ from ..validator import (
     NotPQWalletError,
     InsufficientStakeError,
 )
+from ..validator.gossip import (
+    BeaconGossip,
+    BeaconBlockMessage,
+    AttestationMessage,
+)
 from ..consensus import is_pos_active
 from ..constants import (
     MIN_VALIDATOR_STAKE,
@@ -67,6 +72,7 @@ class ValidatorNode:
         self.config = config or {}
         self._manager: Optional[ValidatorManager] = None
         self._wallet: Optional[PQWallet] = None
+        self._gossip: Optional[BeaconGossip] = None
         self._running = False
         self._slot_task: Optional[asyncio.Task] = None
         
@@ -193,6 +199,14 @@ class ValidatorNode:
                     self.slashing_protection_db
                 )
                 await self._manager.slashing_protection.initialize()
+            
+            # Initialize gossip layer for block/attestation propagation
+            import time
+            genesis_time = int(time.time())  # Will be overridden by chain genesis
+            self._gossip = BeaconGossip(
+                node_id=self._wallet.address,
+                genesis_time=genesis_time,
+            )
             
             logger.info("Validator initialized successfully")
             return True
@@ -392,14 +406,65 @@ class ValidatorNode:
             logger.error(f"Error creating attestation: {e}")
     
     async def _propagate_block(self, block_data: dict):
-        """Propagate a proposed block to peers."""
-        # This would be integrated with the node's P2P layer
-        pass
+        """Propagate a proposed block to peers via gossip."""
+        if not self._gossip:
+            logger.warning("Gossip layer not initialized — block not propagated")
+            return
+
+        try:
+            block_msg = BeaconBlockMessage(
+                slot=block_data.get('slot', 0),
+                proposer_index=block_data.get('proposer_index', 0),
+                parent_root=block_data.get('parent_hash', ''),
+                state_root=block_data.get('state_root', ''),
+                block_hash=block_data.get('hash', ''),
+                signature=block_data.get('signature', ''),
+                body={
+                    'transactions': block_data.get('transactions', []),
+                    'graffiti': block_data.get('graffiti', ''),
+                },
+            )
+            published = await self._gossip.publish_block(block_msg)
+            if published:
+                logger.debug(
+                    f"Block propagated via gossip: slot={block_msg.slot}, "
+                    f"hash={block_msg.block_hash[:16]}..."
+                )
+            else:
+                logger.warning(
+                    f"Block gossip publish returned False for slot={block_msg.slot}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to propagate block via gossip: {e}")
     
     async def _propagate_attestation(self, attestation):
-        """Propagate an attestation to peers."""
-        # This would be integrated with the node's P2P layer
-        pass
+        """Propagate an attestation to peers via gossip."""
+        if not self._gossip:
+            logger.warning("Gossip layer not initialized — attestation not propagated")
+            return
+
+        try:
+            att_msg = AttestationMessage(
+                slot=getattr(attestation, 'slot', 0),
+                committee_index=getattr(attestation, 'committee_index', 0),
+                beacon_block_root=getattr(attestation, 'block_hash',
+                                          getattr(attestation, 'beacon_block_root', '')),
+                source_epoch=getattr(attestation, 'source_epoch', 0),
+                source_root=getattr(attestation, 'source_root', ''),
+                target_epoch=getattr(attestation, 'target_epoch', 0),
+                target_root=getattr(attestation, 'target_root', ''),
+                aggregation_bits=getattr(attestation, 'aggregation_bits', ''),
+                signature=getattr(attestation, 'signature', ''),
+            )
+            published = await self._gossip.publish_attestation(att_msg)
+            if published:
+                logger.debug(f"Attestation propagated via gossip: slot={att_msg.slot}")
+            else:
+                logger.warning(
+                    f"Attestation gossip publish returned False for slot={att_msg.slot}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to propagate attestation via gossip: {e}")
     
     async def get_status(self) -> Dict[str, Any]:
         """Get validator status information."""

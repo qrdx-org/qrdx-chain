@@ -27,10 +27,12 @@ Doomsday Protocol (§8.5):
 """
 
 import hashlib
+import json
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
 from .types import (
     BridgeOperationType,
@@ -40,6 +42,16 @@ from .types import (
     ChainId,
     ValidatorProof,
 )
+from ..constants import (
+    BRIDGE_FEE_BPS,
+    DOOMSDAY_CANARY_ADDRESS,
+    DOOMSDAY_CANARY_BOUNTY,
+    FRAUD_PROOF_WINDOW_SECONDS,
+    HIGH_VALUE_THRESHOLD_USD,
+    ORACLE_ATTESTATION_QUORUM_NUMERATOR,
+    ORACLE_ATTESTATION_QUORUM_DENOMINATOR,
+)
+from ..crypto.hashing import keccak256
 from ..logger import get_logger
 
 logger = get_logger(__name__)
@@ -49,21 +61,11 @@ logger = get_logger(__name__)
 #  CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
 
-# Doomsday canary wallet — QRDX-native PQ address with 1M QRDX bounty.
-# Generated at genesis; the private key is a publicly-known ECDSA key.
-# A quantum attacker who can break ECDSA will drain this wallet, triggering
-# the circuit breaker that halts new shielding.
-DOOMSDAY_CANARY_ADDRESS = "0xPQdoomsday0canary0qrdx0genesis0bounty0wallet0a1b2c3"
-DOOMSDAY_CANARY_BALANCE = Decimal("1000000")  # 1M QRDX
+# Re-export canary bounty under the legacy alias used by bridge __init__
+DOOMSDAY_CANARY_BALANCE = DOOMSDAY_CANARY_BOUNTY
 
-# Bridge fee basis points (0.1% = 10 bps)
-BRIDGE_FEE_BPS = 10
-
-# Fraud proof window for high-value unshields (7 days in seconds)
-FRAUD_PROOF_WINDOW_SECONDS = 7 * 24 * 3600  # 604800
-
-# Threshold above which fraud proof window applies (in USD)
-HIGH_VALUE_THRESHOLD_USD = Decimal("100000")
+# Domain separator for doomsday proof signing (EIP-712 style)
+DOOMSDAY_DOMAIN = b"QRDX-DOOMSDAY-PROTOCOL-v1"
 
 # Default token configurations
 DEFAULT_TOKEN_CONFIGS = {
@@ -115,6 +117,203 @@ DEFAULT_TOKEN_CONFIGS = {
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  DOOMSDAY BRIDGE INTERFACE  (for notification callbacks)
+# ══════════════════════════════════════════════════════════════════════
+
+@runtime_checkable
+class DoomsdayAware(Protocol):
+    """
+    Interface for bridge contracts that need doomsday notification.
+
+    Matches Whitepaper §8.5: IDoomsdayAware(bridge).onDoomsday()
+    Any registered bridge must implement on_doomsday().
+    """
+
+    def on_doomsday(self, block_height: int, timestamp: int) -> None:
+        """Called when doomsday protocol is activated."""
+        ...
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  DOOMSDAY ATTESTATION  (validator vote for canary drain)
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DoomsdayAttestation:
+    """
+    A single validator's attestation that the canary wallet has been
+    drained, proving a quantum computer has broken ECDSA.
+
+    Attributes:
+        validator_address: PQ address of the attesting validator
+        canary_address: The canary address being monitored
+        observed_balance: Balance the validator observed
+        observed_block_height: Block height of the observation
+        observed_block_hash: Block hash of the observation
+        timestamp: When the attestation was created
+        signature: Dilithium signature over the attestation contents
+    """
+    validator_address: str
+    canary_address: str
+    observed_balance: Decimal
+    observed_block_height: int
+    observed_block_hash: str
+    timestamp: int
+    signature: str = ""
+
+    def attestation_hash(self) -> str:
+        """Compute deterministic hash of attestation contents for signing."""
+        data = (
+            DOOMSDAY_DOMAIN
+            + self.validator_address.encode("utf-8")
+            + self.canary_address.encode("utf-8")
+            + str(self.observed_balance).encode("utf-8")
+            + self.observed_block_height.to_bytes(8, "big")
+            + bytes.fromhex(self.observed_block_hash.replace("0x", ""))
+            + self.timestamp.to_bytes(8, "big")
+        )
+        return hashlib.sha256(data).hexdigest()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "validator_address": self.validator_address,
+            "canary_address": self.canary_address,
+            "observed_balance": str(self.observed_balance),
+            "observed_block_height": self.observed_block_height,
+            "observed_block_hash": self.observed_block_hash,
+            "timestamp": self.timestamp,
+            "signature": self.signature,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "DoomsdayAttestation":
+        return cls(
+            validator_address=d["validator_address"],
+            canary_address=d["canary_address"],
+            observed_balance=Decimal(d["observed_balance"]),
+            observed_block_height=d["observed_block_height"],
+            observed_block_hash=d["observed_block_hash"],
+            timestamp=d["timestamp"],
+            signature=d.get("signature", ""),
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  DOOMSDAY PROOF  (aggregated quorum proof)
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DoomsdayProof:
+    """
+    Aggregated proof that the canary has been drained, containing
+    ≥ 2/3+1 validator attestations plus (optionally) an on-chain
+    ECDSA signature from the canary address itself.
+
+    Two trigger paths are supported (Whitepaper §8.5):
+
+    Path A — Canary Self-Trigger:
+        The canary private key holder calls triggerDoomsday() directly.
+        This requires canary_signature to be set (proves ECDSA was broken).
+
+    Path B — Validator Consensus:
+        ≥ 2/3+1 validators attest that the canary balance is zero.
+        This covers the case where the attacker drains but doesn't call
+        the trigger function.
+
+    Attributes:
+        attestations: Validator attestations observing canary drain
+        canary_signature: Optional ECDSA signature from the canary address
+                          proving the private key was derived
+        canary_signed_message: Message signed by canary (if canary_signature set)
+        trigger_block_height: Block height when trigger was initiated
+        verification_hash: SHA-256 of the full proof for on-chain recording
+    """
+    attestations: List[DoomsdayAttestation] = field(default_factory=list)
+    canary_signature: str = ""
+    canary_signed_message: str = ""
+    trigger_block_height: int = 0
+    verification_hash: str = ""
+
+    def compute_verification_hash(self) -> str:
+        """Compute SHA-256 over the entire proof for immutable recording."""
+        parts = [DOOMSDAY_DOMAIN]
+        for att in sorted(self.attestations, key=lambda a: a.validator_address):
+            parts.append(att.attestation_hash().encode("utf-8"))
+        if self.canary_signature:
+            parts.append(self.canary_signature.encode("utf-8"))
+        parts.append(self.trigger_block_height.to_bytes(8, "big"))
+        return hashlib.sha256(b"".join(parts)).hexdigest()
+
+    @property
+    def has_canary_signature(self) -> bool:
+        return bool(self.canary_signature)
+
+    @property
+    def attestation_count(self) -> int:
+        return len(self.attestations)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "attestations": [a.to_dict() for a in self.attestations],
+            "canary_signature": self.canary_signature,
+            "canary_signed_message": self.canary_signed_message,
+            "trigger_block_height": self.trigger_block_height,
+            "verification_hash": self.verification_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "DoomsdayProof":
+        return cls(
+            attestations=[
+                DoomsdayAttestation.from_dict(a) for a in d.get("attestations", [])
+            ],
+            canary_signature=d.get("canary_signature", ""),
+            canary_signed_message=d.get("canary_signed_message", ""),
+            trigger_block_height=d.get("trigger_block_height", 0),
+            verification_hash=d.get("verification_hash", ""),
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  STATE PERSISTENCE INTERFACE
+# ══════════════════════════════════════════════════════════════════════
+
+@runtime_checkable
+class DoomsdayStateStore(Protocol):
+    """
+    Persistence backend for doomsday state.
+
+    Implementations should write to the chain's state trie or a
+    dedicated database table so that doomsday state survives node
+    restarts and is replicated across all validators.
+    """
+
+    def save_doomsday_state(self, state: Dict[str, Any]) -> bool:
+        """Persist doomsday state atomically."""
+        ...
+
+    def load_doomsday_state(self) -> Optional[Dict[str, Any]]:
+        """Load doomsday state from persistent storage."""
+        ...
+
+
+class InMemoryDoomsdayStateStore:
+    """
+    In-memory fallback for tests. NOT suitable for production.
+    """
+
+    def __init__(self):
+        self._state: Optional[Dict[str, Any]] = None
+
+    def save_doomsday_state(self, state: Dict[str, Any]) -> bool:
+        self._state = dict(state)
+        return True
+
+    def load_doomsday_state(self) -> Optional[Dict[str, Any]]:
+        return dict(self._state) if self._state else None
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  DOOMSDAY PROTOCOL  (Whitepaper §8.5)
 # ══════════════════════════════════════════════════════════════════════
 
@@ -125,6 +324,15 @@ class DoomsdayProtocol:
     If the canary is drained (indicating a quantum attacker can break
     classical crypto), all new shield operations are BLOCKED while
     unshields remain permitted so users can withdraw to safety.
+
+    Security properties (Whitepaper §8.5):
+        1. Trigger requires cryptographic proof:
+           - Path A: ECDSA signature from the canary address, OR
+           - Path B: ≥ 2/3+1 validator attestations of canary drain
+        2. Activation is irreversible (survives restarts via state store)
+        3. All registered bridges are notified on activation
+        4. 1M QRDX bounty is tracked for the trigger caller
+        5. State is persisted: block height, timestamp, verification hash
 
     Whitepaper §8.5 post-doomsday behaviour table:
         ┌──────────────────────┬─────────────┐
@@ -137,12 +345,66 @@ class DoomsdayProtocol:
         └──────────────────────┴─────────────┘
     """
 
-    def __init__(self):
-        self._doomsday_active: bool = False
-        self._triggered_at: int = 0
-        self._trigger_proof: str = ""
+    def __init__(
+        self,
+        total_validators: int = 1,
+        state_store: Optional[DoomsdayStateStore] = None,
+        verify_ecdsa_fn: Optional[Callable[[str, bytes, str], bool]] = None,
+    ):
+        """
+        Args:
+            total_validators: Total validators in the active set
+                              (used to compute 2/3+1 quorum threshold)
+            state_store: Persistent storage backend. If None, uses
+                         InMemoryDoomsdayStateStore (test only).
+            verify_ecdsa_fn: Callable(address, message_hash, signature) → bool
+                             that verifies an ECDSA signature recovers to the
+                             given address. If None, canary self-trigger (Path A)
+                             is disabled; only validator quorum (Path B) works.
+        """
+        # ── quorum parameters ──
+        if total_validators < 1:
+            raise ValueError("total_validators must be >= 1")
+        self._total_validators = total_validators
+        self._threshold = (
+            (total_validators * ORACLE_ATTESTATION_QUORUM_NUMERATOR)
+            // ORACLE_ATTESTATION_QUORUM_DENOMINATOR
+        ) + 1
+
+        # ── canary identity (from constants — single source of truth) ──
         self._canary_address: str = DOOMSDAY_CANARY_ADDRESS
         self._canary_expected_balance: Decimal = DOOMSDAY_CANARY_BALANCE
+
+        # ── state (loaded from store if available) ──
+        self._doomsday_active: bool = False
+        self._triggered_at: int = 0
+        self._trigger_block_height: int = 0
+        self._verification_hash: str = ""
+        self._trigger_address: str = ""  # who triggered (canary addr or first attester)
+        self._bounty_recipient: str = ""
+        self._bounty_amount: Decimal = DOOMSDAY_CANARY_BOUNTY
+        self._bounty_paid: bool = False
+
+        # ── attestation buffer (pre-trigger) ──
+        self._attestations: List[DoomsdayAttestation] = []
+        self._attesting_validators: set = set()  # dedup
+
+        # ── bridge notification registry (Whitepaper §8.5) ──
+        self._registered_bridges: List[DoomsdayAware] = []
+        self._registered_bridge_ids: set = set()
+
+        # ── persistence ──
+        self._state_store: DoomsdayStateStore = (
+            state_store or InMemoryDoomsdayStateStore()
+        )
+
+        # ── ECDSA verification for Path A ──
+        self._verify_ecdsa_fn = verify_ecdsa_fn
+
+        # ── attempt to restore state from store ──
+        self._load_state()
+
+    # ── Properties ──────────────────────────────────────────────────
 
     @property
     def canary_address(self) -> str:
@@ -153,58 +415,334 @@ class DoomsdayProtocol:
         """Check if doomsday mode is currently active."""
         return self._doomsday_active
 
-    def trigger_doomsday(self, proof: str) -> bool:
+    @property
+    def threshold(self) -> int:
+        """Validator attestation quorum threshold (≥ 2/3+1)."""
+        return self._threshold
+
+    @property
+    def total_validators(self) -> int:
+        return self._total_validators
+
+    # ── Path A: Canary Self-Trigger (§8.5) ──────────────────────────
+
+    def trigger_by_canary_signature(
+        self,
+        message: bytes,
+        signature: str,
+        block_height: int = 0,
+    ) -> bool:
         """
-        Trigger the doomsday circuit breaker.
+        Trigger doomsday via ECDSA signature from the canary address.
+
+        This is the primary trigger path: if anyone can sign a message
+        with the canary's private key, they've proven quantum capability.
+
+        Whitepaper §8.5:
+            ``if (msg.sender != CANARY_ADDRESS) revert InvalidCaller();``
 
         Args:
-            proof: Cryptographic proof that the canary has been drained.
-                   In production: signed transaction showing canary balance
-                   below threshold, attested by ≥ 2/3+1 validators.
+            message: The signed message bytes
+            signature: Hex-encoded ECDSA signature (65 bytes: r + s + v)
+            block_height: Block height at time of trigger
 
         Returns:
-            True if doomsday was triggered, False if already active
+            True if doomsday was triggered, False if rejected
+        """
+        if self._doomsday_active:
+            logger.warning("Doomsday already active — ignoring canary trigger")
+            return False
+
+        if self._verify_ecdsa_fn is None:
+            logger.error(
+                "Canary self-trigger (Path A) unavailable: "
+                "no ECDSA verification function configured"
+            )
+            return False
+
+        # Compute message hash for recovery
+        msg_hash = keccak256(DOOMSDAY_DOMAIN + message)
+
+        # Verify the signature recovers to the canary address
+        if not self._verify_ecdsa_fn(self._canary_address, msg_hash, signature):
+            logger.warning(
+                "Doomsday trigger REJECTED — signature does not recover "
+                f"to canary address {self._canary_address}"
+            )
+            return False
+
+        # Build proof
+        proof = DoomsdayProof(
+            canary_signature=signature,
+            canary_signed_message=message.hex(),
+            trigger_block_height=block_height,
+        )
+        proof.verification_hash = proof.compute_verification_hash()
+
+        # Activate
+        self._activate(
+            proof=proof,
+            trigger_address=self._canary_address,
+            bounty_recipient=self._canary_address,
+            block_height=block_height,
+        )
+        return True
+
+    # ── Path B: Validator Consensus (§8.5) ──────────────────────────
+
+    def submit_canary_attestation(self, attestation: DoomsdayAttestation) -> bool:
+        """
+        Submit a validator's attestation that the canary has been drained.
+
+        Once ≥ 2/3+1 validators attest, doomsday is triggered automatically.
+
+        Args:
+            attestation: DoomsdayAttestation from a validator
+
+        Returns:
+            True if this attestation caused doomsday to trigger
+        """
+        if self._doomsday_active:
+            return False
+
+        # Validate attestation target
+        if attestation.canary_address != self._canary_address:
+            logger.warning(
+                f"Attestation rejected: wrong canary address "
+                f"{attestation.canary_address} != {self._canary_address}"
+            )
+            return False
+
+        # Validate balance observation (must show drain)
+        if attestation.observed_balance >= self._canary_expected_balance:
+            logger.debug(
+                f"Attestation from {attestation.validator_address[:16]}... "
+                f"shows balance {attestation.observed_balance} >= expected "
+                f"{self._canary_expected_balance} — canary safe"
+            )
+            return False
+
+        # Reject duplicate from same validator
+        if attestation.validator_address in self._attesting_validators:
+            logger.debug(
+                f"Duplicate attestation from {attestation.validator_address[:16]}..."
+            )
+            return False
+
+        # Accept attestation
+        self._attestations.append(attestation)
+        self._attesting_validators.add(attestation.validator_address)
+
+        logger.info(
+            f"Doomsday attestation {len(self._attestations)}/{self._threshold} "
+            f"from {attestation.validator_address[:16]}... "
+            f"(observed balance: {attestation.observed_balance})"
+        )
+
+        # Check if quorum is reached
+        if len(self._attestations) >= self._threshold:
+            proof = DoomsdayProof(
+                attestations=list(self._attestations),
+                trigger_block_height=attestation.observed_block_height,
+            )
+            proof.verification_hash = proof.compute_verification_hash()
+
+            self._activate(
+                proof=proof,
+                trigger_address=attestation.validator_address,
+                bounty_recipient=self._attestations[0].validator_address,
+                block_height=attestation.observed_block_height,
+            )
+            return True
+
+        return False
+
+    # ── Legacy API (backward-compatible) ────────────────────────────
+
+    def trigger_doomsday(self, proof: str) -> bool:
+        """
+        Legacy trigger method — requires structured JSON proof.
+
+        For backward compatibility with existing callers. The proof string
+        must be a JSON-encoded DoomsdayProof with either a valid canary
+        signature or ≥ threshold validator attestations.
+
+        Args:
+            proof: JSON-encoded DoomsdayProof string
+
+        Returns:
+            True if doomsday was triggered, False if rejected
         """
         if self._doomsday_active:
             return False
 
         if not proof:
+            logger.warning("Doomsday trigger rejected: empty proof")
             return False
 
-        self._doomsday_active = True
-        self._triggered_at = int(time.time())
-        self._trigger_proof = proof
-        logger.critical(
-            "DOOMSDAY PROTOCOL ACTIVATED — Shield operations BLOCKED. "
-            "Unshield operations remain ALLOWED."
+        # Parse structured proof
+        try:
+            proof_data = json.loads(proof)
+            doomsday_proof = DoomsdayProof.from_dict(proof_data)
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            logger.warning(f"Doomsday trigger rejected: malformed proof — {exc}")
+            return False
+
+        # Path A check: canary signature present
+        if doomsday_proof.has_canary_signature:
+            if self._verify_ecdsa_fn is None:
+                logger.error("Cannot verify canary signature — no ECDSA fn")
+                return False
+
+            msg_bytes = bytes.fromhex(doomsday_proof.canary_signed_message)
+            msg_hash = keccak256(DOOMSDAY_DOMAIN + msg_bytes)
+
+            if not self._verify_ecdsa_fn(
+                self._canary_address, msg_hash, doomsday_proof.canary_signature
+            ):
+                logger.warning("Doomsday proof rejected: invalid canary signature")
+                return False
+
+            doomsday_proof.verification_hash = doomsday_proof.compute_verification_hash()
+            self._activate(
+                proof=doomsday_proof,
+                trigger_address=self._canary_address,
+                bounty_recipient=self._canary_address,
+                block_height=doomsday_proof.trigger_block_height,
+            )
+            return True
+
+        # Path B check: validator quorum
+        if doomsday_proof.attestation_count >= self._threshold:
+            # Verify all attestations target the right canary and show drain
+            seen_validators: set = set()
+            valid_count = 0
+            for att in doomsday_proof.attestations:
+                if att.canary_address != self._canary_address:
+                    continue
+                if att.observed_balance >= self._canary_expected_balance:
+                    continue
+                if att.validator_address in seen_validators:
+                    continue
+                seen_validators.add(att.validator_address)
+                valid_count += 1
+
+            if valid_count < self._threshold:
+                logger.warning(
+                    f"Doomsday proof rejected: only {valid_count} valid "
+                    f"attestations, need {self._threshold}"
+                )
+                return False
+
+            doomsday_proof.verification_hash = doomsday_proof.compute_verification_hash()
+            first_attester = doomsday_proof.attestations[0].validator_address
+            self._activate(
+                proof=doomsday_proof,
+                trigger_address=first_attester,
+                bounty_recipient=first_attester,
+                block_height=doomsday_proof.trigger_block_height,
+            )
+            return True
+
+        logger.warning(
+            f"Doomsday proof rejected: insufficient evidence "
+            f"(attestations={doomsday_proof.attestation_count}, "
+            f"threshold={self._threshold}, has_sig={doomsday_proof.has_canary_signature})"
         )
-        return True
+        return False
 
     def check_canary(self, current_balance: Decimal) -> bool:
         """
         Check the canary wallet balance.
 
-        If balance has been drained (< expected), automatically trigger
-        doomsday.
+        If balance has been drained (< expected), log a WARNING.
+        Doomsday is NOT automatically triggered — that requires
+        validator quorum (Path B) or canary signature (Path A)
+        to prevent single-node false positives.
 
         Args:
             current_balance: Current balance of the canary wallet
 
         Returns:
-            True if canary is safe, False if doomsday was triggered
+            True if canary is safe, False if balance is below expected
         """
         if self._doomsday_active:
             return False
 
         if current_balance < self._canary_expected_balance:
-            proof = (
-                f"canary_balance_drop:"
-                f"{current_balance}<{self._canary_expected_balance}:"
-                f"ts={int(time.time())}"
+            logger.warning(
+                f"CANARY ALERT: balance {current_balance} < expected "
+                f"{self._canary_expected_balance} — validators should submit "
+                f"DoomsdayAttestations to confirm"
             )
-            self.trigger_doomsday(proof)
             return False
         return True
+
+    # ── Bridge Registration (§8.5) ──────────────────────────────────
+
+    def register_bridge(self, bridge: DoomsdayAware, bridge_id: str = "") -> bool:
+        """
+        Register a bridge for doomsday notification.
+
+        Matches Whitepaper §8.5:
+            ``function registerBridge(address bridge) external``
+
+        Args:
+            bridge: Object implementing DoomsdayAware protocol
+            bridge_id: Unique identifier (defaults to id(bridge))
+
+        Returns:
+            True if registered, False if already registered
+        """
+        bid = bridge_id or str(id(bridge))
+        if bid in self._registered_bridge_ids:
+            logger.warning(f"Bridge {bid} already registered for doomsday")
+            return False
+        self._registered_bridges.append(bridge)
+        self._registered_bridge_ids.add(bid)
+        logger.info(f"Bridge registered for doomsday notification: {bid}")
+        return True
+
+    def unregister_bridge(self, bridge_id: str) -> bool:
+        """Remove a bridge from doomsday notifications."""
+        if bridge_id not in self._registered_bridge_ids:
+            return False
+        self._registered_bridge_ids.discard(bridge_id)
+        # Remove from list (linear scan — small list in practice)
+        self._registered_bridges = [
+            b for i, b in enumerate(self._registered_bridges)
+            if str(id(b)) != bridge_id
+        ]
+        return True
+
+    # ── Bounty (§8.5) ──────────────────────────────────────────────
+
+    def get_bounty_info(self) -> Dict[str, Any]:
+        """Get bounty status for the doomsday trigger."""
+        return {
+            "amount": str(self._bounty_amount),
+            "recipient": self._bounty_recipient,
+            "paid": self._bounty_paid,
+        }
+
+    def mark_bounty_paid(self) -> bool:
+        """
+        Mark the bounty as paid (called by treasury/token system
+        after the actual transfer is executed on-chain).
+        """
+        if not self._doomsday_active:
+            return False
+        if self._bounty_paid:
+            return False
+        self._bounty_paid = True
+        self._persist_state()
+        logger.info(
+            f"Doomsday bounty {self._bounty_amount} QRDX marked paid "
+            f"to {self._bounty_recipient}"
+        )
+        return True
+
+    # ── Shield/Unshield Gates ───────────────────────────────────────
 
     def can_shield(self) -> bool:
         """Check if shielding is permitted (blocked during doomsday)."""
@@ -214,15 +752,162 @@ class DoomsdayProtocol:
         """Unshield is ALWAYS allowed, even during doomsday."""
         return True
 
+    # ── Status / Queries ────────────────────────────────────────────
+
     def get_status(self) -> Dict[str, Any]:
+        """
+        Full doomsday status (matches Whitepaper getDoomsdayStatus()).
+
+        Returns dict with:
+            doomsday_active, triggered_at, trigger_block_height,
+            verification_hash, trigger_address, canary_address,
+            shield_allowed, unshield_allowed, bounty info,
+            attestation progress.
+        """
         return {
             "doomsday_active": self._doomsday_active,
             "triggered_at": self._triggered_at,
-            "trigger_proof": self._trigger_proof,
+            "trigger_block_height": self._trigger_block_height,
+            "verification_hash": self._verification_hash,
+            "trigger_address": self._trigger_address,
             "canary_address": self._canary_address,
             "shield_allowed": self.can_shield(),
             "unshield_allowed": self.can_unshield(),
+            "bounty": self.get_bounty_info(),
+            "attestation_progress": {
+                "received": len(self._attestations),
+                "threshold": self._threshold,
+                "total_validators": self._total_validators,
+            },
+            "registered_bridges": len(self._registered_bridges),
         }
+
+    def get_attestation_progress(self) -> Dict[str, Any]:
+        """Get current attestation count vs threshold."""
+        return {
+            "received": len(self._attestations),
+            "threshold": self._threshold,
+            "total_validators": self._total_validators,
+            "validators_attested": list(self._attesting_validators),
+        }
+
+    # ── Internal ────────────────────────────────────────────────────
+
+    def _activate(
+        self,
+        proof: DoomsdayProof,
+        trigger_address: str,
+        bounty_recipient: str,
+        block_height: int,
+    ) -> None:
+        """
+        Activate doomsday protocol (internal, called after validation).
+
+        This method is irreversible — once called, the node MUST persist
+        the state and notify all registered bridges.
+        """
+        self._doomsday_active = True
+        self._triggered_at = int(time.time())
+        self._trigger_block_height = block_height
+        self._verification_hash = proof.verification_hash
+        self._trigger_address = trigger_address
+        self._bounty_recipient = bounty_recipient
+
+        # Persist state BEFORE notifying bridges (crash safety)
+        self._persist_state()
+
+        logger.critical(
+            "══════════════════════════════════════════════════════════\n"
+            "  DOOMSDAY PROTOCOL ACTIVATED\n"
+            "  Shield operations: BLOCKED\n"
+            "  Unshield operations: ALLOWED\n"
+            "  QRDX native trading: NORMAL\n"
+            f"  Triggered by: {trigger_address}\n"
+            f"  Block height: {block_height}\n"
+            f"  Verification: {proof.verification_hash[:32]}...\n"
+            f"  Bounty recipient: {bounty_recipient}\n"
+            "══════════════════════════════════════════════════════════"
+        )
+
+        # Notify all registered bridges (§8.5 _notifyBridges)
+        self._notify_bridges(block_height)
+
+    def _notify_bridges(self, block_height: int) -> None:
+        """
+        Notify all registered bridges that doomsday is active.
+
+        Matches Whitepaper §8.5:
+            ``for (uint256 i = 0; i < registeredBridges.length; i++)``
+        """
+        timestamp = self._triggered_at
+        for bridge in self._registered_bridges:
+            try:
+                bridge.on_doomsday(block_height, timestamp)
+            except Exception as exc:
+                logger.error(
+                    f"Failed to notify bridge of doomsday: {exc}",
+                    exc_info=True,
+                )
+
+    def _persist_state(self) -> None:
+        """Persist doomsday state to the state store."""
+        state = {
+            "doomsday_active": self._doomsday_active,
+            "triggered_at": self._triggered_at,
+            "trigger_block_height": self._trigger_block_height,
+            "verification_hash": self._verification_hash,
+            "trigger_address": self._trigger_address,
+            "bounty_recipient": self._bounty_recipient,
+            "bounty_paid": self._bounty_paid,
+        }
+        try:
+            if not self._state_store.save_doomsday_state(state):
+                logger.error("Failed to persist doomsday state")
+        except Exception as exc:
+            logger.error(f"State store error: {exc}", exc_info=True)
+
+    def _load_state(self) -> None:
+        """Restore doomsday state from the state store on startup."""
+        try:
+            state = self._state_store.load_doomsday_state()
+        except Exception as exc:
+            logger.error(f"Failed to load doomsday state: {exc}", exc_info=True)
+            return
+
+        if state is None:
+            return  # Fresh start
+
+        self._doomsday_active = state.get("doomsday_active", False)
+        self._triggered_at = state.get("triggered_at", 0)
+        self._trigger_block_height = state.get("trigger_block_height", 0)
+        self._verification_hash = state.get("verification_hash", "")
+        self._trigger_address = state.get("trigger_address", "")
+        self._bounty_recipient = state.get("bounty_recipient", "")
+        self._bounty_paid = state.get("bounty_paid", False)
+
+        if self._doomsday_active:
+            logger.warning(
+                "Doomsday state RESTORED from store — shield operations remain BLOCKED"
+            )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """
+        Guard against accidental reset of doomsday state after activation.
+
+        Once _doomsday_active is True, it cannot be set back to False
+        except through _load_state (which checks the persisted state).
+        """
+        if (
+            name == "_doomsday_active"
+            and hasattr(self, "_doomsday_active")
+            and self._doomsday_active
+            and value is False
+        ):
+            raise RuntimeError(
+                "SECURITY: Doomsday activation is IRREVERSIBLE. "
+                "Cannot set _doomsday_active back to False."
+            )
+        super().__setattr__(name, value)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -382,17 +1067,56 @@ class ShieldingManager:
 
     Coordinates between chain adapters, oracle consensus, doomsday
     protocol, and the bridge minter.
+
+    Implements DoomsdayAware so that doomsday activation automatically
+    disables shielding and logs the event for audit.
     """
 
     def __init__(
         self,
         minter: Optional[BridgeMinter] = None,
         doomsday: Optional[DoomsdayProtocol] = None,
+        bridge_id: str = "shielding-manager",
     ):
         self.minter = minter or BridgeMinter()
         self.doomsday = doomsday or DoomsdayProtocol()
         self._records: Dict[str, BridgeRecord] = {}
         self._fraud_windows: Dict[str, int] = {}  # record_id → expiry timestamp
+        self._doomsday_block_height: int = 0
+        self._doomsday_timestamp: int = 0
+
+        # Register self for doomsday notifications (§8.5)
+        self.doomsday.register_bridge(self, bridge_id=bridge_id)
+
+    # ── DoomsdayAware implementation ────────────────────────────────
+
+    def on_doomsday(self, block_height: int, timestamp: int) -> None:
+        """
+        Called by DoomsdayProtocol when doomsday is activated.
+
+        Records the activation metadata and logs a critical warning.
+        Shield operations are already blocked via ``self.doomsday.can_shield()``,
+        but this callback allows the manager to take additional defensive
+        action (e.g. rejecting in-flight records, emitting events).
+        """
+        self._doomsday_block_height = block_height
+        self._doomsday_timestamp = timestamp
+
+        # Fail any PENDING/CONFIRMING shield records immediately
+        failed_count = 0
+        for record in self._records.values():
+            if (
+                record.operation == BridgeOperationType.SHIELD
+                and record.status in (BridgeStatus.PENDING, BridgeStatus.CONFIRMING)
+            ):
+                record.status = BridgeStatus.FAILED
+                failed_count += 1
+
+        logger.critical(
+            f"ShieldingManager: doomsday callback received — "
+            f"block={block_height}, timestamp={timestamp}, "
+            f"failed {failed_count} in-flight shield record(s)"
+        )
 
     # ── Shield Operations (§8.1) ────────────────────────────────────
 

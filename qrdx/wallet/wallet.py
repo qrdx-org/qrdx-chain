@@ -67,12 +67,12 @@ async def main():
         message = args.message
 
         tx = await create_transaction(db.get('private_keys'), receiver, amount, string_to_bytes(message))
+        node_url = os.environ.get('QRDX_NODE_URL', 'http://localhost:3006')
         try:
-            requests.get('http://localhost:3006/push_tx', {'tx_hex': tx.hex()}, timeout=10)
+            requests.get(f'{node_url}/push_tx', {'tx_hex': tx.hex()}, timeout=10)
         except Exception as e:
-            print(f'Could not push transaction to local node: {e}')
+            print(f'Could not push transaction to node ({node_url}): {e}')
             await denaro_database.add_pending_transaction(tx)
-            requests.get('https://denaro-node.gaetano.eu.org/push_tx', {'tx_hex': tx.hex()}, timeout=10)
         print(f'Transaction pushed. Transaction hash: {sha256(tx.hex())}')
 
 

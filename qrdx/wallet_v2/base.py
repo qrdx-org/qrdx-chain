@@ -337,21 +337,10 @@ def encrypt_key(key_bytes: bytes, password: str) -> Dict[str, Any]:
             'cipher': 'fernet',
         }
     except ImportError:
-        # Fallback: simple XOR with derived key (NOT SECURE - for testing only)
-        salt = os.urandom(16)
-        derived = derive_key_from_password(password, salt)
-        
-        # Extend derived key to match key_bytes length
-        extended_key = (derived * ((len(key_bytes) // 32) + 1))[:len(key_bytes)]
-        encrypted = bytes(a ^ b for a, b in zip(key_bytes, extended_key))
-        
-        return {
-            'ciphertext': encrypted.hex(),
-            'salt': salt.hex(),
-            'iterations': 100000,
-            'kdf': 'pbkdf2-sha256',
-            'cipher': 'xor-fallback',  # Indicates insecure fallback
-        }
+        raise ImportError(
+            "The 'cryptography' package is required for wallet encryption. "
+            "Install with: pip install cryptography"
+        )
 
 
 def decrypt_key(encrypted: Dict[str, Any], password: str) -> bytes:
@@ -395,10 +384,11 @@ def decrypt_key(encrypted: Dict[str, Any], password: str) -> bytes:
                 raise WalletDecryptionError("Invalid password")
         
         elif encrypted['cipher'] == 'xor-fallback':
-            derived = derive_key_from_password(password, salt, encrypted['iterations'])
-            ciphertext = bytes.fromhex(encrypted['ciphertext'])
-            extended_key = (derived * ((len(ciphertext) // 32) + 1))[:len(ciphertext)]
-            return bytes(a ^ b for a, b in zip(ciphertext, extended_key))
+            raise WalletDecryptionError(
+                "This wallet was encrypted with the insecure XOR-fallback cipher "
+                "which is no longer supported.  Re-create the wallet with the "
+                "'cryptography' package installed: pip install cryptography"
+            )
         
         else:
             raise WalletDecryptionError(f"Unknown cipher: {encrypted['cipher']}")

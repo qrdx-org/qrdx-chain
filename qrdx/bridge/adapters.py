@@ -30,6 +30,7 @@ from .types import (
     OracleAttestation,
     ValidatorProof,
 )
+from ..constants import DOOMSDAY_CANARY_ADDRESS
 from ..logger import get_logger
 
 logger = get_logger(__name__)
@@ -495,6 +496,81 @@ class EthereumAdapter(BaseChainAdapter):
 
     def _get_state_root(self, block: BlockHeightRecord) -> str:
         return self._state_roots.get(block.block_height, "")
+
+    # ── Canary Monitoring (Doomsday §8.5) ───────────────────────────
+
+    def check_canary_balance(
+        self,
+        canary_address: str = "",
+        block_tag: str = "latest",
+    ) -> Optional[Decimal]:
+        """
+        Query the canary wallet balance on Ethereum via ``eth_getBalance``.
+
+        Args:
+            canary_address: Address to check.  Defaults to the canonical
+                            DOOMSDAY_CANARY_ADDRESS from constants.
+            block_tag: Block tag ("latest", "finalized", etc.)
+
+        Returns:
+            Balance in **ether** (Decimal), or None on RPC failure.
+        """
+        address = canary_address or DOOMSDAY_CANARY_ADDRESS
+        try:
+            result = self._json_rpc_call(
+                "eth_getBalance", [address, block_tag]
+            )
+            if result is None:
+                return None
+            # Result is hex-encoded wei — convert to ether
+            wei = int(result, 16)
+            return Decimal(wei) / Decimal(10 ** 18)
+        except (ConnectionError, RuntimeError, ValueError) as exc:
+            logger.warning(f"Failed to check canary balance: {exc}")
+            return None
+
+    def generate_doomsday_attestation(
+        self,
+        validator_address: str,
+    ) -> Optional["DoomsdayAttestation"]:
+        """
+        Check the canary balance and, if drained, generate a
+        ``DoomsdayAttestation`` that can be submitted to the
+        ``DoomsdayProtocol``.
+
+        Args:
+            validator_address: This validator's PQ address (for signing)
+
+        Returns:
+            DoomsdayAttestation if canary appears drained, None if safe
+            or on RPC error.
+        """
+        from .shielding import DoomsdayAttestation
+
+        block = self.get_latest_block()
+        balance = self.check_canary_balance(block_tag="finalized")
+        if balance is None:
+            return None  # RPC error — cannot attest
+
+        # Import expected balance for comparison
+        from ..constants import DOOMSDAY_CANARY_BOUNTY
+
+        if balance >= DOOMSDAY_CANARY_BOUNTY:
+            return None  # Canary is safe
+
+        logger.warning(
+            f"CANARY DRAINED: balance {balance} < expected "
+            f"{DOOMSDAY_CANARY_BOUNTY} — generating attestation"
+        )
+
+        return DoomsdayAttestation(
+            validator_address=validator_address,
+            canary_address=DOOMSDAY_CANARY_ADDRESS,
+            observed_balance=balance,
+            observed_block_height=block.block_height,
+            observed_block_hash=block.block_hash,
+            timestamp=int(time.time()),
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════

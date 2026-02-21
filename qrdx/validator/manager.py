@@ -248,6 +248,20 @@ class ValidatorManager:
         return manager
     
     # =========================================================================
+    # BROADCAST BINDING
+    # =========================================================================
+
+    def set_attestation_broadcast_fn(self, fn) -> None:
+        """Bind a coroutine that will be called to propagate each new
+        attestation to the P2P network.  Called by the node integration
+        layer once the gossip transport is ready.
+
+        Args:
+            fn: ``async def fn(attestation) -> None``
+        """
+        self._attestation_broadcast_fn = fn
+
+    # =========================================================================
     # LIFECYCLE
     # =========================================================================
     
@@ -923,8 +937,17 @@ class ValidatorManager:
         )
         
         if accepted:
-            # Broadcast to network (would be handled by node)
-            pass
+            # Broadcast to network via gossip callback
+            if hasattr(self, '_attestation_broadcast_fn') and self._attestation_broadcast_fn:
+                try:
+                    await self._attestation_broadcast_fn(attestation)
+                except Exception as e:
+                    logger.warning(f"Attestation broadcast failed: {e}")
+            else:
+                logger.warning(
+                    "No attestation broadcast function bound — attestation "
+                    "stays local.  Bind via set_attestation_broadcast_fn()."
+                )
         
         return accepted
     

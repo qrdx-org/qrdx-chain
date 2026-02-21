@@ -694,7 +694,8 @@ class ValidatorShuffling:
         
         total_balance = sum(effective_balances.get(v, Decimal("0")) for v in validators)
         if total_balance == 0:
-            # Fallback to uniform random
+            # Fallback to deterministic seed-based selection (no economic
+            # guarantee when all validators have zero balance).
             slot_seed = hashlib.sha256(seed + slot.to_bytes(8, 'little')).digest()
             index = int.from_bytes(slot_seed[:8], 'little') % len(validators)
             return validators[index]
@@ -719,5 +720,11 @@ class ValidatorShuffling:
             if candidate_random < int(threshold):
                 return validator
         
-        # Fallback to first validator (should not reach here normally)
-        return validators[0]
+        # Weighted loop exhausted without selecting — use seed-derived index
+        # to avoid deterministic bias toward the first validator.
+        fallback_seed = hashlib.sha256(
+            seed + slot.to_bytes(8, 'little') + b'fallback'
+        ).digest()
+        return validators[
+            int.from_bytes(fallback_seed[:8], 'little') % len(validators)
+        ]

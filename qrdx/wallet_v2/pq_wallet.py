@@ -207,10 +207,9 @@ class PQWallet(BaseWallet):
             New PQWallet instance
         """
         if not pq_available():
-            import warnings
-            warnings.warn(
-                f"liboqs not available ({get_liboqs_error()}). "
-                "Using fallback mode - NOT SECURE for production!"
+            raise WalletError(
+                f"liboqs-python is required for PQ wallets but is not available: "
+                f"{get_liboqs_error()}. Install with: pip install liboqs-python"
             )
         
         private_key = PQPrivateKey.generate()

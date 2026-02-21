@@ -2,7 +2,8 @@
 QRDX Validator Node Integration
 
 This module integrates the PoS consensus validator into the node lifecycle.
-It handles validator initialization, block production, attestation, and epoch processing.
+It handles validator initialization, block production, attestation, epoch processing,
+and canary wallet monitoring for the Doomsday Protocol (§8.5).
 """
 import asyncio
 import json
@@ -60,6 +61,11 @@ class ValidatorNode:
         self._block_production_task: Optional[asyncio.Task] = None
         self._attestation_task: Optional[asyncio.Task] = None
         self._epoch_processing_task: Optional[asyncio.Task] = None
+        self._canary_monitor_task: Optional[asyncio.Task] = None
+
+        # ── Doomsday / canary monitoring (§8.5) ──
+        self._eth_adapter = None       # Set via set_eth_adapter()
+        self._doomsday_protocol = None  # Set via set_doomsday_protocol()
         
         logger.info(f"ValidatorNode initialized for wallet: {validator_wallet_path}")
     
@@ -209,6 +215,11 @@ class ValidatorNode:
         self._block_production_task = asyncio.create_task(self._block_production_loop())
         self._attestation_task = asyncio.create_task(self._attestation_loop())
         self._epoch_processing_task = asyncio.create_task(self._epoch_processing_loop())
+
+        # Start canary monitor if adapter & doomsday are configured
+        if self._eth_adapter is not None and self._doomsday_protocol is not None:
+            self._canary_monitor_task = asyncio.create_task(self._canary_monitor_loop())
+            logger.info("🔍 Canary monitor started (Doomsday §8.5)")
         
         logger.info("✅ Validator tasks started")
     
@@ -224,6 +235,8 @@ class ValidatorNode:
             self._attestation_task.cancel()
         if self._epoch_processing_task:
             self._epoch_processing_task.cancel()
+        if self._canary_monitor_task:
+            self._canary_monitor_task.cancel()
         
         logger.info("Validator stopped")
     
@@ -383,6 +396,94 @@ class ValidatorNode:
                 await asyncio.sleep(SLOT_DURATION_SECONDS)
         
         logger.info("Epoch processing loop stopped")
+
+    # ── Canary / Doomsday Monitoring (§8.5) ─────────────────────────
+
+    def set_eth_adapter(self, adapter) -> None:
+        """
+        Attach an EthereumAdapter for canary balance monitoring.
+
+        Args:
+            adapter: EthereumAdapter instance
+        """
+        self._eth_adapter = adapter
+        logger.info("ValidatorNode: EthereumAdapter attached for canary monitoring")
+
+    def set_doomsday_protocol(self, doomsday) -> None:
+        """
+        Attach a DoomsdayProtocol for submitting canary attestations.
+
+        Args:
+            doomsday: DoomsdayProtocol instance
+        """
+        self._doomsday_protocol = doomsday
+        logger.info("ValidatorNode: DoomsdayProtocol attached for canary monitoring")
+
+    async def _canary_monitor_loop(self):
+        """
+        Periodically poll the Ethereum canary wallet balance.
+
+        Runs once per epoch (SLOTS_PER_EPOCH × SLOT_DURATION seconds).
+        If the canary balance has dropped below expected, generates a
+        DoomsdayAttestation and submits it to the DoomsdayProtocol.
+
+        Once doomsday is triggered, the loop exits.
+        """
+        epoch_seconds = SLOTS_PER_EPOCH * SLOT_DURATION_SECONDS
+        logger.info(
+            f"Canary monitor: polling every {epoch_seconds}s (1 epoch)"
+        )
+
+        while self._running:
+            try:
+                # Skip if doomsday already active
+                if self._doomsday_protocol and self._doomsday_protocol.is_active:
+                    logger.info(
+                        "Canary monitor: doomsday already active — stopping"
+                    )
+                    break
+
+                if self._eth_adapter is None or self._doomsday_protocol is None:
+                    await asyncio.sleep(epoch_seconds)
+                    continue
+
+                if self.wallet is None:
+                    await asyncio.sleep(epoch_seconds)
+                    continue
+
+                # Generate attestation (returns None if canary is safe)
+                attestation = self._eth_adapter.generate_doomsday_attestation(
+                    validator_address=self.wallet.address,
+                )
+
+                if attestation is not None:
+                    logger.warning(
+                        f"Canary monitor: drain detected — submitting attestation "
+                        f"(balance={attestation.observed_balance}, "
+                        f"block={attestation.observed_block_height})"
+                    )
+                    triggered = self._doomsday_protocol.submit_canary_attestation(
+                        attestation
+                    )
+                    if triggered:
+                        logger.critical(
+                            "Canary monitor: DOOMSDAY TRIGGERED by validator quorum"
+                        )
+                        break
+                else:
+                    logger.debug("Canary monitor: canary is safe")
+
+                await asyncio.sleep(epoch_seconds)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error(
+                    f"Error in canary monitor loop: {exc}", exc_info=True
+                )
+                await asyncio.sleep(epoch_seconds)
+
+        logger.info("Canary monitor loop stopped")
     
     async def _get_current_slot(self) -> int:
         """

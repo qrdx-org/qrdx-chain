@@ -27,13 +27,17 @@ class Database:
     is_indexed = False
 
     @staticmethod
-    async def create(user='denaro', password='', database='denaro', host='127.0.0.1', ignore: bool = False):
+    async def create(user=None, password=None, database=None, host=None, ignore: bool = False):
         self = Database()
+        _user = str(user or os.environ.get('QRDX_DB_USER', 'denaro'))
+        _password = str(password if password is not None else os.environ.get('QRDX_DB_PASSWORD', ''))
+        _database = str(database or os.environ.get('QRDX_DB_NAME', 'denaro'))
+        _host = str(host or os.environ.get('QRDX_DB_HOST', '127.0.0.1'))
         self.pool = await asyncpg.create_pool(
-            user=str(user),
-            password=str(password),
-            database=str(database),
-            host=str(host),
+            user=_user,
+            password=_password,
+            database=_database,
+            host=_host,
             command_timeout=30,
             min_size=3
         )

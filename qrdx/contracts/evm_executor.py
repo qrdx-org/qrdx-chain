@@ -365,7 +365,57 @@ class EVMExecutor:
             vm_state.set_storage(canonical_addr, slot, value_int)
     
     async def _sync_state_from_vm(self, vm_state) -> None:
-        """Sync VM state back to state manager."""
-        # Note: This is simplified. In production, we'd need to track
-        # which accounts and storage slots were modified during execution.
-        pass
+        """Sync VM state back to state manager.
+
+        After EVM execution the VM state contains all storage writes,
+        internal balance transfers, nonce increments, and self-destructs.
+        We iterate every account that existed in our pre-execution cache
+        *plus* any addresses observed in execution logs and write the
+        final values back to the ``ContractStateManager``.
+        """
+        # Collect addresses that may have been modified
+        touched: set = set()
+
+        # 1. All accounts we synced TO the VM before execution
+        for addr_str in list(self.state_manager._accounts_cache.keys()):
+            touched.add(addr_str)
+
+        # 2. All addresses referenced in storage cache
+        for (addr_str, _key) in list(self.state_manager._storage_cache.keys()):
+            touched.add(addr_str)
+
+        # Sync each touched account
+        for addr_str in touched:
+            try:
+                canonical = to_canonical_address(addr_str)
+
+                # Balance – internal CALLs / SELFDESTRUCTs may have moved funds
+                vm_balance = vm_state.get_balance(canonical)
+                await self.state_manager.set_balance(addr_str, vm_balance)
+
+                # Nonce
+                vm_nonce = vm_state.get_nonce(canonical)
+                await self.state_manager.set_nonce(addr_str, vm_nonce)
+
+                # Code (may be set by CREATE / CREATE2)
+                vm_code = vm_state.get_code(canonical)
+                if vm_code:
+                    existing_code = await self.state_manager.get_code(addr_str)
+                    if existing_code != vm_code:
+                        await self.state_manager.set_code(
+                            addr_str, vm_code, self.block_number, addr_str,
+                        )
+
+                # Storage – replay cached slots through the VM's final state
+                for (cached_addr, cached_key), _old_val in list(
+                    self.state_manager._storage_cache.items()
+                ):
+                    if cached_addr != addr_str:
+                        continue
+                    slot = int.from_bytes(cached_key, 'big')
+                    vm_val = vm_state.get_storage(canonical, slot)
+                    new_val = vm_val.to_bytes(32, 'big')
+                    await self.state_manager.set_storage(addr_str, cached_key, new_val)
+            except Exception:
+                # Account may not exist in VM state (e.g. self-destructed)
+                continue

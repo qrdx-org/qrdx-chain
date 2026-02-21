@@ -232,7 +232,13 @@ class ValidatorSelector:
         total_stake = sum(v.effective_stake for v in validators)
         
         if total_stake == 0:
-            # Fallback to uniform selection
+            # All validators have zero effective stake — degrade to uniform
+            # selection as a safety net, but log a warning.
+            logger.warning(
+                "Total effective stake is 0 across %d validators — falling "
+                "back to uniform selection (no economic security guarantee)",
+                len(validators),
+            )
             index = int.from_bytes(seed[:4], 'little') % len(validators)
             return validators[index]
         

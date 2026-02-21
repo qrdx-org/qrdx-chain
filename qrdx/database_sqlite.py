@@ -375,7 +375,7 @@ class DatabaseSQLite:
             return True
         
     async def get_latest_block(self):
-        """Get latest block (stub)"""
+        """Get the latest block from the database."""
         cursor = await self.connection.execute(
             f"SELECT {_BLOCK_COLS} FROM blocks ORDER BY block_height DESC LIMIT 1"
         )
@@ -576,8 +576,16 @@ class DatabaseSQLite:
         return [{'tx_hash': row[0], 'tx_hex': row[1]} for row in rows]
     
     async def update_pending_transactions_propagation_time(self, tx_hashes: list):
-        """Update propagation time for transactions"""
-        pass
+        """Update propagation time for transactions so they are not re-propagated."""
+        if not tx_hashes:
+            return
+        placeholders = ','.join('?' for _ in tx_hashes)
+        await self.connection.execute(
+            f"UPDATE pending_transactions SET propagation_time = datetime('now') "
+            f"WHERE tx_hash IN ({placeholders})",
+            tx_hashes,
+        )
+        await self.connection.commit()
     
     async def get_unspent_outputs_hash(self):
         """Get deterministic hash of unspent outputs for state root computation."""

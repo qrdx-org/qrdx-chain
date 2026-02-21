@@ -6,7 +6,10 @@ Chain-specific JSON-RPC methods.
 
 from typing import Any, Dict, List, Optional
 from decimal import Decimal
+import logging
 from ..server import RPCModule, rpc_method, rpc_admin_method, RPCError, RPCErrorCode
+
+logger = logging.getLogger(__name__)
 
 
 class QRDXModule(RPCModule):
@@ -218,8 +221,8 @@ class QRDXModule(RPCModule):
                         }
                         for peer in self.context.p2p.peers
                     ]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("getPeers failed: %s", e)
         
         return []
     
@@ -243,8 +246,8 @@ class QRDXModule(RPCModule):
                 if hasattr(self.context.p2p, 'add_peer'):
                     await self.context.p2p.add_peer(uri)
                     return True
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("addPeer failed for %s: %s", uri, e)
         
         return False
     
@@ -268,8 +271,8 @@ class QRDXModule(RPCModule):
                 if hasattr(self.context.p2p, 'remove_peer'):
                     await self.context.p2p.remove_peer(node_id)
                     return True
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("removePeer failed for %s: %s", node_id, e)
         
         return False
     

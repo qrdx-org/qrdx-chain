@@ -62,11 +62,32 @@ from qrdx.bridge.shielding import (
     BridgeMinter,
     DEFAULT_TOKEN_CONFIGS,
     DOOMSDAY_CANARY_ADDRESS,
+    DoomsdayAttestation,
+    DoomsdayProof,
     DoomsdayProtocol,
     FRAUD_PROOF_WINDOW_SECONDS,
     HIGH_VALUE_THRESHOLD_USD,
     ShieldingManager,
 )
+
+
+def _make_doomsday_attestation(validator_id: int = 0) -> DoomsdayAttestation:
+    """Helper to build a valid DoomsdayAttestation for testing."""
+    return DoomsdayAttestation(
+        validator_address=f"0xvalidator_{validator_id}",
+        canary_address=DOOMSDAY_CANARY_ADDRESS,
+        observed_balance=Decimal("0"),
+        observed_block_height=100,
+        observed_block_hash="aa" * 32,
+        timestamp=1000 + validator_id,
+    )
+
+
+def _trigger_doomsday(dp: DoomsdayProtocol) -> bool:
+    """Helper to trigger doomsday on a DoomsdayProtocol using validator quorum."""
+    for i in range(dp.total_validators):
+        result = dp.submit_canary_attestation(_make_doomsday_attestation(i))
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -903,8 +924,8 @@ class TestDoomsdayProtocol:
         assert dp.canary_address == DOOMSDAY_CANARY_ADDRESS
 
     def test_trigger_doomsday(self):
-        dp = DoomsdayProtocol()
-        result = dp.trigger_doomsday("canary_drained_proof_xyz")
+        dp = DoomsdayProtocol(total_validators=1)
+        result = _trigger_doomsday(dp)
         assert result is True
         assert dp.is_active is True
         assert dp.can_shield() is False
@@ -916,9 +937,11 @@ class TestDoomsdayProtocol:
         assert dp.is_active is False
 
     def test_double_trigger_rejected(self):
-        dp = DoomsdayProtocol()
-        dp.trigger_doomsday("proof1")
-        assert dp.trigger_doomsday("proof2") is False
+        dp = DoomsdayProtocol(total_validators=1)
+        _trigger_doomsday(dp)
+        # Second trigger is rejected
+        att = _make_doomsday_attestation(99)
+        assert dp.submit_canary_attestation(att) is False
 
     def test_check_canary_safe(self):
         dp = DoomsdayProtocol()
@@ -928,7 +951,9 @@ class TestDoomsdayProtocol:
     def test_check_canary_drained(self):
         dp = DoomsdayProtocol()
         assert dp.check_canary(Decimal("0")) is False
-        assert dp.is_active is True
+        # check_canary warns but does NOT auto-trigger (prevents false positives)
+        # Requires validator quorum via submit_canary_attestation()
+        assert dp.is_active is False
 
     def test_status_dict(self):
         dp = DoomsdayProtocol()
@@ -939,8 +964,8 @@ class TestDoomsdayProtocol:
 
     def test_post_doomsday_behavior(self):
         """Whitepaper §8.5: shields BLOCKED, unshields ALLOWED, QRDX normal."""
-        dp = DoomsdayProtocol()
-        dp.trigger_doomsday("quantum_attack_proof")
+        dp = DoomsdayProtocol(total_validators=1)
+        _trigger_doomsday(dp)
         status = dp.get_status()
         assert status["doomsday_active"] is True
         assert status["shield_allowed"] is False
@@ -1053,7 +1078,7 @@ class TestShieldFlow:
 
     def test_shield_blocked_during_doomsday(self):
         mgr = self._make_manager()
-        mgr.doomsday.trigger_doomsday("quantum_proof")
+        _trigger_doomsday(mgr.doomsday)
         record = mgr.initiate_shield(
             source_chain=ChainId.ETHEREUM,
             source_tx_hash="0xtx",
@@ -1152,7 +1177,7 @@ class TestUnshieldFlow:
     def test_unshield_allowed_during_doomsday(self):
         """Whitepaper §8.5: unshield ALWAYS allowed."""
         mgr = self._setup_with_minted()
-        mgr.doomsday.trigger_doomsday("quantum_proof")
+        _trigger_doomsday(mgr.doomsday)
         record = mgr.initiate_unshield(
             dest_chain=ChainId.ETHEREUM,
             amount=Decimal("5"),

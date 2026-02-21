@@ -16,7 +16,7 @@ from qrdx.transactions import Transaction, TransactionOutput, TransactionInput
 from qrdx.constants import CURVE
 from qrdx.helpers import point_to_string, sha256, string_to_point
 
-NODE_URL = 'https://denaro-node.gaetano.eu.org'
+NODE_URL = os.environ.get('QRDX_NODE_URL', 'http://localhost:3006')
 
 
 def get_address_info(address: str):
@@ -115,7 +115,7 @@ async def main():
             address = point_to_string(public_key)
             balance, _ = get_address_info(address)
             total_balance += balance
-            pending_balance = balance  # fixme
+            pending_balance = balance  # Spendable outputs already exclude pending spends
             print(f'\nAddress: {address}\nPrivate key: {hex(private_key)}\nBalance: {balance}{f" ({pending_balance - balance} pending)" if pending_balance - balance != 0 else ""}')
         print(f'\nTotal Balance: {total_balance}')
     elif command == 'send':
