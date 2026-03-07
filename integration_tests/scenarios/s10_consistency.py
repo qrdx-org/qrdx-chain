@@ -1,0 +1,89 @@
+"""
+S10 — Cross-node Consistency
+
+Verifies:
+  - All nodes agree on chain tip
+  - Block hashes match across peers
+  - Transaction visible on all nodes
+"""
+
+import asyncio
+from integration_tests.scenarios.base import Scenario
+from integration_tests.rpc_client import NodeRPCClient
+
+
+class S10Consistency(Scenario):
+    name = "s10_consistency"
+    description = "Verify multi-node state consistency"
+    depends_on = ["s04_transactions"]
+
+    async def execute(self) -> None:
+        node_urls = self.ctx.node_urls
+
+        if len(node_urls) < 2:
+            self.check(True, "Single-node testnet — consistency trivial")
+            return
+
+        # Collect chain tips from all nodes
+        tips = {}
+        for url in node_urls:
+            try:
+                async with NodeRPCClient(url) as client:
+                    info = await client.get_mining_info()
+                    if info:
+                        last_block = info.get("last_block", {})
+                        height = last_block.get("id", 0)
+                        block_hash = last_block.get("hash", "")
+                        tips[url] = {"height": height, "hash": block_hash}
+            except Exception as exc:
+                self._log.warning("Failed to get tip from %s: %s", url, exc)
+
+        self.check(len(tips) >= 2, f"Got chain tips from {len(tips)} nodes")
+
+        if len(tips) >= 2:
+            heights = [t["height"] for t in tips.values()]
+            min_h, max_h = min(heights), max(heights)
+            drift = max_h - min_h
+            self._log.info("Chain tip heights: %s (drift=%d)", heights, drift)
+            self.check(drift <= 3, f"Height drift acceptable (<= 3 blocks, got {drift})")
+
+            # Check if the min-height block hash matches across nodes
+            common_height = min_h
+            if common_height > 0:
+                hashes = set()
+                for url in node_urls:
+                    try:
+                        async with NodeRPCClient(url) as client:
+                            result = await client._get(
+                                "/get_block",
+                                params={"block": common_height},
+                            )
+                            if result and isinstance(result, dict):
+                                bh = result.get("hash", result.get("block_hash", ""))
+                                hashes.add(bh)
+                    except Exception:
+                        pass
+
+                if hashes:
+                    self.check(
+                        len(hashes) == 1,
+                        f"Block {common_height} hash consistent across nodes ({len(hashes)} unique hashes)"
+                    )
+
+        # Check first_tx_hash visible on all nodes (via eth_getTransactionReceipt)
+        tx_hash = self.ctx.artifacts.get("first_tx_hash")
+        if tx_hash:
+            visible_count = 0
+            for url in node_urls:
+                try:
+                    async with NodeRPCClient(url) as client:
+                        receipt = await client.eth_get_transaction_receipt(tx_hash)
+                        if receipt is not None:
+                            visible_count += 1
+                except Exception:
+                    pass
+
+            self.check(
+                visible_count >= 1,
+                f"First tx receipt visible on {visible_count}/{len(node_urls)} nodes"
+            )

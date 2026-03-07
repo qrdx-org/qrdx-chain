@@ -1,0 +1,142 @@
+# QRDX Integration Testnet — Docker Compose
+# Runs 4 nodes (3 validators + 1 full node) with monitoring
+#
+# Usage:
+#   docker compose -f docker/docker-compose.testnet.yml up --build
+#   docker compose -f docker/docker-compose.testnet.yml down -v
+
+x-node-base: &node-base
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  restart: unless-stopped
+  environment: &node-env
+    QRDX_CHAIN_ID: "9999"
+    QRDX_NETWORK_NAME: "qrdx-integration-testnet"
+    QRDX_MIN_VALIDATORS: "1"
+    PYTHONWARNINGS: "ignore"
+    LOG_LEVEL: "INFO"
+  networks:
+    - testnet
+  healthcheck:
+    test: ["CMD", "python3", "docker/docker-healthcheck.py"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 30s
+
+services:
+  # ── Bootstrap Node (Validator 0) ──────────────────────────────
+  node0:
+    <<: *node-base
+    container_name: qrdx-testnet-node0
+    hostname: node0
+    ports:
+      - "3007:3007"
+      - "8545:8545"
+    environment:
+      <<: *node-env
+      QRDX_NODE_HOST: "0.0.0.0"
+      QRDX_NODE_PORT: "3007"
+      QRDX_SELF_URL: "http://node0:3007"
+      QRDX_DATABASE_PATH: "/data/node0.db"
+      QRDX_NODE_KEY_DIR: "/data/keys/node0"
+      QRDX_BOOTSTRAP_NODE: ""
+      QRDX_BOOTSTRAP_NODES: ""
+      QRDX_VALIDATOR_ENABLED: "true"
+      QRDX_VALIDATOR_WALLET: "/wallets/validator_0.json"
+      QRDX_VALIDATOR_PASSWORD: "testnet_validator_0"
+    volumes:
+      - node0-data:/data
+      - ./testnet-wallets:/wallets:ro
+
+  # ── Validator 1 ───────────────────────────────────────────────
+  node1:
+    <<: *node-base
+    container_name: qrdx-testnet-node1
+    hostname: node1
+    ports:
+      - "3008:3008"
+      - "8546:8546"
+    environment:
+      <<: *node-env
+      QRDX_NODE_HOST: "0.0.0.0"
+      QRDX_NODE_PORT: "3008"
+      QRDX_SELF_URL: "http://node1:3008"
+      QRDX_DATABASE_PATH: "/data/node1.db"
+      QRDX_NODE_KEY_DIR: "/data/keys/node1"
+      QRDX_BOOTSTRAP_NODE: "http://node0:3007"
+      QRDX_BOOTSTRAP_NODES: "http://node0:3007"
+      QRDX_VALIDATOR_ENABLED: "true"
+      QRDX_VALIDATOR_WALLET: "/wallets/validator_1.json"
+      QRDX_VALIDATOR_PASSWORD: "testnet_validator_1"
+    volumes:
+      - node1-data:/data
+      - ./testnet-wallets:/wallets:ro
+    depends_on:
+      node0:
+        condition: service_healthy
+
+  # ── Validator 2 ───────────────────────────────────────────────
+  node2:
+    <<: *node-base
+    container_name: qrdx-testnet-node2
+    hostname: node2
+    ports:
+      - "3009:3009"
+      - "8547:8547"
+    environment:
+      <<: *node-env
+      QRDX_NODE_HOST: "0.0.0.0"
+      QRDX_NODE_PORT: "3009"
+      QRDX_SELF_URL: "http://node2:3009"
+      QRDX_DATABASE_PATH: "/data/node2.db"
+      QRDX_NODE_KEY_DIR: "/data/keys/node2"
+      QRDX_BOOTSTRAP_NODE: "http://node0:3007"
+      QRDX_BOOTSTRAP_NODES: "http://node0:3007"
+      QRDX_VALIDATOR_ENABLED: "true"
+      QRDX_VALIDATOR_WALLET: "/wallets/validator_2.json"
+      QRDX_VALIDATOR_PASSWORD: "testnet_validator_2"
+    volumes:
+      - node2-data:/data
+      - ./testnet-wallets:/wallets:ro
+    depends_on:
+      node0:
+        condition: service_healthy
+
+  # ── Full Node (Non-Validator) ─────────────────────────────────
+  node3:
+    <<: *node-base
+    container_name: qrdx-testnet-node3
+    hostname: node3
+    ports:
+      - "3010:3010"
+      - "8548:8548"
+    environment:
+      <<: *node-env
+      QRDX_NODE_HOST: "0.0.0.0"
+      QRDX_NODE_PORT: "3010"
+      QRDX_SELF_URL: "http://node3:3010"
+      QRDX_DATABASE_PATH: "/data/node3.db"
+      QRDX_NODE_KEY_DIR: "/data/keys/node3"
+      QRDX_BOOTSTRAP_NODE: "http://node0:3007"
+      QRDX_BOOTSTRAP_NODES: "http://node0:3007"
+      QRDX_VALIDATOR_ENABLED: "false"
+    volumes:
+      - node3-data:/data
+    depends_on:
+      node0:
+        condition: service_healthy
+
+networks:
+  testnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  node0-data:
+  node1-data:
+  node2-data:
+  node3-data:

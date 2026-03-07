@@ -31,7 +31,10 @@ _BLOCK_COLS = (
 
 class DatabaseSQLite:
     """Simplified SQLite database for testnet"""
-    
+
+    instance = None
+    credentials = {}
+
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.connection: Optional[aiosqlite.Connection] = None
@@ -56,8 +59,18 @@ class DatabaseSQLite:
         # Initialize schema
         await self._init_schema()
         
+        # Set singleton instance (matching Database pattern for manager.py etc.)
+        DatabaseSQLite.instance = self
+        
         logger.info(f"SQLite database initialized: {db_path}")
         return self
+
+    @staticmethod
+    async def get():
+        """Get the singleton instance, matching Database.get() interface."""
+        if DatabaseSQLite.instance is None:
+            raise RuntimeError("DatabaseSQLite not initialized — call create() first")
+        return DatabaseSQLite.instance
         
     async def _init_schema(self):
         """Initialize database schema"""
@@ -991,7 +1004,48 @@ class DatabaseSQLite:
             outputs.append(Output(address, amount, tx_hash, output_index))
         
         return outputs
-    
+
+    async def get_address_balance(self, address: str, check_pending_txs: bool = False) -> 'Decimal':
+        """Get total balance for an address.
+
+        Checks account_state first (ETH/EVM accounts populated at genesis),
+        then falls back to the UTXO unspent_outputs table.
+        Returns balance in QRDX (not micro-QRDX, not wei).
+        Uses case-insensitive matching for 0x addresses.
+        """
+        from decimal import Decimal
+
+        addr_lower = address.lower()
+
+        # 1. Check account_state (ETH/EVM accounts — balance stored as wei string)
+        try:
+            cursor = await self.connection.execute(
+                "SELECT balance FROM account_state WHERE LOWER(address) = ?",
+                (addr_lower,),
+            )
+            row = await cursor.fetchone()
+            if row and row[0]:
+                bal_wei = int(row[0])
+                if bal_wei > 0:
+                    return Decimal(bal_wei) / Decimal(10**18)
+        except Exception:
+            pass
+
+        # 2. Fallback: sum unspent_outputs (stored as micro-QRDX)
+        try:
+            cursor = await self.connection.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM unspent_outputs WHERE LOWER(address) = ?",
+                (addr_lower,),
+            )
+            row = await cursor.fetchone()
+            micro = int(row[0]) if row and row[0] else 0
+            if micro > 0:
+                return Decimal(micro) / Decimal(10**6)
+        except Exception:
+            pass
+
+        return Decimal(0)
+
     async def get_address_transactions(self, address: str, limit: int = 100, offset: int = 0, check_signatures: bool = False):
         """Get transactions for address from the transactions table."""
         cursor = await self.connection.execute("""

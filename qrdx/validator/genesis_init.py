@@ -465,15 +465,26 @@ class GenesisInitializer:
         
         for v in validators:
             try:
-                await self.db.execute("""
-                    INSERT INTO validators (
-                        address, public_key, stake, effective_stake,
-                        status, activation_epoch, created_at
-                    ) VALUES ($1, $2, $3, $3, 'active', 0, NOW())
-                    ON CONFLICT (address) DO NOTHING
-                """, v['address'], v['public_key'], Decimal(v['stake']))
-                
-                logger.debug(f"Initialized validator: {v['address'][:20]}...")
+                # Try PostgreSQL syntax first
+                try:
+                    await self.db.execute("""
+                        INSERT INTO validators (
+                            address, public_key, stake, effective_stake,
+                            status, activation_epoch, created_at
+                        ) VALUES ($1, $2, $3, $3, 'active', 0, NOW())
+                        ON CONFLICT (address) DO NOTHING
+                    """, v['address'], v['public_key'], Decimal(v['stake']))
+                    logger.debug(f"Initialized validator (PostgreSQL): {v['address'][:20]}...")
+                except Exception as pg_err:
+                    # Fall back to SQLite syntax
+                    logger.debug(f"PostgreSQL insert failed: {pg_err}, trying SQLite syntax")
+                    await self.db.execute("""
+                        INSERT OR IGNORE INTO validators (
+                            address, public_key, stake, effective_stake,
+                            status, activation_epoch, created_at
+                        ) VALUES (?, ?, ?, ?, 'active', 0, datetime('now'))
+                    """, v['address'], v['public_key'], Decimal(v['stake']), Decimal(v['stake']))
+                    logger.debug(f"Initialized validator (SQLite): {v['address'][:20]}...")
                 
             except Exception as e:
                 logger.error(f"Failed to initialize validator {v['address']}: {e}")
@@ -507,14 +518,23 @@ class GenesisInitializer:
         
         # Try to store in a metadata table if it exists
         try:
+            # Try PostgreSQL syntax first
             await self.db.execute("""
                 INSERT INTO chain_metadata (key, value)
                 VALUES ('genesis', $1)
                 ON CONFLICT (key) DO UPDATE SET value = $1
             """, json.dumps(metadata))
-        except Exception as e:
-            # Table might not exist, log and continue
-            logger.debug(f"Could not store genesis metadata in DB: {e}")
+        except Exception:
+            try:
+                # Fall back to SQLite syntax
+                meta_json = json.dumps(metadata)
+                await self.db.execute("""
+                    INSERT OR REPLACE INTO chain_metadata (key, value)
+                    VALUES ('genesis', ?)
+                """, meta_json)
+            except Exception as e:
+                # Table might not exist, log and continue
+                logger.debug(f"Could not store genesis metadata in DB: {e}")
             
             # Fallback: write to file
             try:

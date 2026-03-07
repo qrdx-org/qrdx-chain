@@ -2502,9 +2502,11 @@ async def startup():
                     
                     # Get current block for determinism
                     current_block = await db.get_last_block()
-                    block_height = current_block.block_height
-                    block_hash = current_block.block_hash
-                    block_timestamp = current_block.timestamp
+                    block_height = (current_block or {}).get('id') or (current_block or {}).get('block_height') or 0
+                    block_hash = (current_block or {}).get('hash') or (current_block or {}).get('block_hash') or ''
+                    block_timestamp = (current_block or {}).get('timestamp') or 0
+                    if hasattr(block_timestamp, 'timestamp'):
+                        block_timestamp = int(block_timestamp.timestamp())
                     
                     # Create sync manager and ensure tables exist
                     sync_manager = StateSyncManager(db, state_manager)
