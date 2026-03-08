@@ -1,11 +1,15 @@
 """
-S05 — QRC-20 Token lifecycle
+S05 - QRC-20 Token Lifecycle
 
-Verifies:
-  - Token registration via QRC20Registry
-  - Mint tokens to an address
-  - Transfer tokens between addresses
-  - Balance tracking
+Deploys four qRC20 tokens via the real QRC20Token + QRC20Registry + TokenPersistence
+stack, then exercises:
+  1. Deploy 4 tokens (qETH, qUSDC, qBTC, GOV) with initial supply
+  2. Direct transfer between addresses
+  3. Approve + transferFrom flow
+  4. Balance verification (in-memory + DB persistence consistency)
+
+Every operation hits the real QRC20Token in-memory logic AND persists
+to SQLite via TokenPersistence. No stubs.
 """
 
 from decimal import Decimal
@@ -19,45 +23,88 @@ class S05Tokens(Scenario):
     depends_on = ["s03_block_production"]
 
     async def execute(self) -> None:
-        node_url = self.ctx.node_urls[0]
+        db_path = self.ctx.db_paths[0]
         wallets = self.ctx.wallets
 
         deployer_wallet = wallets.get("Token Deployer")
         user0 = wallets.get("Test User 0")
+        user1 = wallets.get("Test User 1")
 
-        if not deployer_wallet:
-            self.check(False, "Token deployer wallet available")
+        if not deployer_wallet or not user0:
+            self.check(False, "Required wallets available")
             return
 
-        deployer = TokenDeployer(node_url)
+        deployer_addr = deployer_wallet["address"]
+        user0_addr = user0["address"]
+        user1_addr = user1["address"] if user1 else user0_addr
 
-        # Deploy a test token
-        try:
-            token_info = await deployer.deploy_qrc20(
-                name="TestCoin",
-                symbol="TST",
-                total_supply=Decimal("1000000"),
-                deployer_address=deployer_wallet["address"],
+        # --- Deploy 4 tokens ---
+        async with TokenDeployer(db_path) as deployer:
+            tokens = await deployer.deploy_standard_tokens(deployer_addr)
+            deployed = list(tokens.keys())
+            self._log.info("Deployed %d tokens: %s", len(deployed), deployed)
+            self.check(len(deployed) == 4, f"4 tokens deployed ({len(deployed)})")
+
+            # Save artifacts for S06
+            self.ctx.artifacts["token_deployer_address"] = deployer_addr
+            self.ctx.artifacts["deployed_tokens"] = deployed
+            self.ctx.artifacts["token_db_path"] = db_path
+
+            # --- Verify deployer owns full supply for each token ---
+            for symbol in deployed:
+                bal = await deployer.get_balance(symbol, deployer_addr)
+                self._log.info("  %s deployer balance: %s", symbol, bal)
+            self.check(
+                await deployer.get_balance("qETH", deployer_addr) == Decimal("1000000"),
+                "qETH deployer balance = 1M",
             )
-            self.check(token_info is not None, "QRC-20 token deployed")
-            if token_info:
-                self.ctx.artifacts["test_token"] = token_info
-                self._log.info("Token deployed: %s", token_info)
-        except Exception as exc:
-            self._log.warning("QRC-20 deploy failed (expected if persistence not wired): %s", exc)
-            self.check(True, "QRC-20 deploy attempted (graceful skip)")
-            return
 
-        # Transfer tokens
-        if user0 and token_info:
-            try:
-                tx = await deployer.transfer_qrc20(
-                    token_id=token_info.get("token_id", "TST"),
-                    from_address=deployer_wallet["address"],
-                    to_address=user0["address"],
-                    amount=Decimal("500"),
-                )
-                self.check(tx is not None, "QRC-20 transfer submitted")
-            except Exception as exc:
-                self._log.warning("QRC-20 transfer failed: %s", exc)
-                self.check(True, "QRC-20 transfer attempted (graceful skip)")
+            # --- Transfer: deployer -> user0 ---
+            tx = await deployer.transfer("qETH", deployer_addr, user0_addr, Decimal("5000"))
+            self.check(tx["ok"], "qETH transfer 5000 deployer->user0")
+            self._log.info("  Transfer: %s qETH -> %s", tx["amount"], user0_addr[:16])
+
+            self.check(
+                await deployer.get_balance("qETH", user0_addr) == Decimal("5000"),
+                "user0 qETH balance = 5000 after transfer",
+            )
+            self.check(
+                await deployer.get_balance("qETH", deployer_addr) == Decimal("995000"),
+                "deployer qETH balance = 995000 after transfer",
+            )
+
+            # --- Transfer a second token ---
+            tx2 = await deployer.transfer("qUSDC", deployer_addr, user0_addr, Decimal("100000"))
+            self.check(tx2["ok"], "qUSDC transfer 100K deployer->user0")
+
+            # --- Approve + TransferFrom flow ---
+            await deployer.approve("qETH", user0_addr, user1_addr, Decimal("2000"))
+            self.check(True, "qETH approve user0->user1 allowance=2000")
+
+            tx3 = await deployer.transfer_from(
+                "qETH", spender=user1_addr, sender=user0_addr,
+                recipient=deployer_addr, amount=Decimal("1000"),
+            )
+            self.check(tx3["ok"], "qETH transferFrom 1000 (user1 spends user0->deployer)")
+
+            self.check(
+                await deployer.get_balance("qETH", user0_addr) == Decimal("4000"),
+                "user0 qETH = 4000 after transferFrom",
+            )
+            self.check(
+                await deployer.get_balance("qETH", deployer_addr) == Decimal("996000"),
+                "deployer qETH = 996000 after transferFrom",
+            )
+
+            # --- Persistence consistency ---
+            consistent_deployer = await deployer.verify_consistency("qETH", deployer_addr)
+            consistent_user0 = await deployer.verify_consistency("qETH", user0_addr)
+            consistent_usdc = await deployer.verify_consistency("qUSDC", user0_addr)
+            self.check(
+                consistent_deployer and consistent_user0 and consistent_usdc,
+                "Memory-DB balance consistency verified",
+            )
+
+            # --- Summary ---
+            summary = await deployer.get_deployment_summary()
+            self._log.info("Token summary: %s", list(summary.keys()))

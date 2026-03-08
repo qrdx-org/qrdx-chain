@@ -179,9 +179,11 @@ class ExchangePersistence:
         initial_sqrt_price: Decimal,
         initial_tick: int,
         creator_address: str,
+        pool_id: str | None = None,
     ) -> str:
         """Create a new AMM pool. Returns pool_id."""
-        pool_id = _make_pool_id(token_a, token_b, fee_tier)
+        if pool_id is None:
+            pool_id = _make_pool_id(token_a, token_b, fee_tier)
         now = int(time.time())
         
         # Check for duplicate

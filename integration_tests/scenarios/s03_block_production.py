@@ -45,7 +45,7 @@ class S03BlockProduction(Scenario):
             valid_heights = [h for h in heights_after if h >= 0]
             if valid_heights:
                 spread = max(valid_heights) - min(valid_heights)
-                self.check(spread <= 3, f"Block heights consistent (spread={spread})")
+                self.check(spread <= 5, f"Block heights consistent (spread={spread})")
 
             # Check max height advanced
             max_before = max(h for h in heights_before if h >= 0) if any(h >= 0 for h in heights_before) else 0

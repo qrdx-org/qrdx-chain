@@ -1,59 +1,72 @@
 """
-Transaction Sender — Build and broadcast Ethereum-style transactions.
+Transaction Sender — Build and broadcast real UTXO transactions.
 
-Uses the eth_sendRawTransaction JSON-RPC endpoint on the QRDX node.
-Signing uses eth-account (secp256k1) — the native key system for
-traditional QRDX wallets (0x addresses).
+Uses the actual QRDX transaction classes:
+  - TransactionInput  (qrdx.transactions.transaction_input)
+  - TransactionOutput (qrdx.transactions.transaction_output)
+  - Transaction       (qrdx.transactions.transaction)
+
+Signing uses fastecdsa P256 (classical wallets) — the same curve
+as the node's Transaction.sign() method.
 
 Workflow:
-  1. Query nonce via eth_getTransactionCount
-  2. Build an EIP-155 transaction dict
-  3. Sign with eth-account (secp256k1 private key)
-  4. Submit RLP-encoded raw tx via POST /rpc → eth_sendRawTransaction
-  5. Optionally wait for receipt via eth_getTransactionReceipt
+  1. Query node for spendable UTXOs via /get_address_info
+  2. Build TransactionInput/Output objects
+  3. Serialize to hex via Transaction.hex()
+  4. Sign with wallet private key via Transaction.sign()
+  5. Submit via /submit_tx  (no signed-request auth needed)
+  6. Optionally wait for confirmation
 
-No stubs — every transaction is a real, verifiable QRDX/ETH transaction.
+No stubs — every transaction is a real, verifiable QRDX transaction.
 """
 
 import asyncio
+import json
 import logging
 import time
 from decimal import Decimal
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from qrdx.constants import SMALLEST, ENDIAN, CURVE
+from qrdx.transactions.transaction_input import TransactionInput
+from qrdx.transactions.transaction_output import TransactionOutput
+from qrdx.transactions.transaction import Transaction
 from integration_tests.rpc_client import NodeRPCClient
 
 logger = logging.getLogger(__name__)
 
-# 1 QRDX = 10^6 micro-QRDX in native layer, but 10^18 wei in ETH compat.
-# The eth_getBalance converts micro-QRDX → wei via ×10^12.
-WEI_PER_QRDX = 10 ** 18
-MICRO_QRDX_PER_QRDX = 10 ** 6
-WEI_PER_MICRO = 10 ** 12  # conversion factor used by eth module
 
-# Default gas settings (simple value transfer)
-DEFAULT_GAS = 21000
-DEFAULT_GAS_PRICE = 1_000_000_000  # 1 gwei
+class UTXO:
+    """Unspent transaction output descriptor."""
+    __slots__ = ("tx_hash", "index", "amount")
+
+    def __init__(self, tx_hash: str, index: int, amount: Decimal):
+        self.tx_hash = tx_hash
+        self.index = index
+        self.amount = amount
+
+    def __repr__(self):
+        return f"UTXO({self.tx_hash[:16]}..., idx={self.index}, amt={self.amount})"
 
 
 class TransactionSender:
     """
-    Builds and sends real QRDX transactions via the Ethereum JSON-RPC.
+    Builds and sends real QRDX transactions.
 
     Usage:
         sender = TransactionSender(node_url="http://127.0.0.1:3007")
         async with sender:
             tx_hash = await sender.send(
-                from_address="0x1234...",
-                to_address="0xabcd...",
+                from_address="DKxyz...",
+                to_address="DLabc...",
                 amount=Decimal("10.5"),
-                private_key_hex="aabbcc...",  # secp256k1 hex key
+                private_key=12345678...,  # int (fastecdsa P256 key)
             )
     """
 
-    def __init__(self, node_url: str, chain_id: int = 9999):
+    def __init__(self, node_url: str):
         self.node_url = node_url
-        self.chain_id = chain_id
         self._client: Optional[NodeRPCClient] = None
 
     async def __aenter__(self):
@@ -66,140 +79,203 @@ class TransactionSender:
             await self._client.__aexit__(*exc)
             self._client = None
 
-    # ─────────── Balance Queries ───────────
+    # ─────────── UTXO Management ───────────
+
+    async def get_utxos(self, address: str) -> List[UTXO]:
+        """Fetch spendable UTXOs for an address from the node."""
+        result = await self._client._get("/get_address_info", params={"address": address})
+        if not result or not result.get("ok"):
+            return []
+
+        raw_outputs = result.get("result", {}).get("spendable_outputs", [])
+        utxos = []
+        for out in raw_outputs:
+            utxos.append(UTXO(
+                tx_hash=out["tx_hash"],
+                index=out["index"],
+                amount=Decimal(out["amount"]),
+            ))
+        return utxos
 
     async def get_balance(self, address: str) -> Decimal:
-        """Get balance in QRDX (converted from wei)."""
-        wei = await self._client.eth_get_balance(address)
-        return Decimal(wei) / Decimal(WEI_PER_QRDX)
+        """Get confirmed balance for an address."""
+        utxos = await self.get_utxos(address)
+        return sum(u.amount for u in utxos)
 
-    async def get_balance_wei(self, address: str) -> int:
-        """Get balance in wei."""
-        return await self._client.eth_get_balance(address)
+    def select_utxos(
+        self,
+        utxos: List[UTXO],
+        target: Decimal,
+        fee: Decimal = Decimal("0.001"),
+    ) -> Tuple[List[UTXO], Decimal]:
+        """
+        Greedy UTXO selection: largest first until target+fee is met.
 
-    async def get_nonce(self, address: str) -> int:
-        """Get next nonce for address."""
-        return await self._client.eth_get_transaction_count(address)
+        Returns (selected_utxos, change_amount).
+        Raises ValueError if insufficient funds.
+        """
+        total_needed = target + fee
+        # Sort by amount descending for fewer inputs
+        sorted_utxos = sorted(utxos, key=lambda u: u.amount, reverse=True)
 
-    # ─────────── Transaction Building & Sending ───────────
+        selected = []
+        accumulated = Decimal("0")
+        for utxo in sorted_utxos:
+            selected.append(utxo)
+            accumulated += utxo.amount
+            if accumulated >= total_needed:
+                break
+
+        if accumulated < total_needed:
+            raise ValueError(
+                f"Insufficient funds: have {accumulated}, need {total_needed} "
+                f"(amount={target} + fee={fee})"
+            )
+
+        change = accumulated - total_needed
+        return selected, change
+
+    # ─────────── Transaction Building ───────────
+
+    def build_transaction(
+        self,
+        utxos: List[UTXO],
+        to_address: str,
+        amount: Decimal,
+        change_address: str,
+        change_amount: Decimal,
+        message: bytes = None,
+    ) -> Transaction:
+        """
+        Build a real Transaction object from UTXOs.
+
+        Creates TransactionInput objects from UTXOs and TransactionOutput
+        objects for the recipient (and change if any).
+        """
+        # Build inputs
+        inputs = []
+        for utxo in utxos:
+            tx_input = TransactionInput(
+                input_tx_hash=utxo.tx_hash,
+                index=utxo.index,
+                amount=utxo.amount,
+            )
+            inputs.append(tx_input)
+
+        # Build outputs
+        outputs = [TransactionOutput(to_address, amount)]
+        if change_amount > 0:
+            outputs.append(TransactionOutput(change_address, change_amount))
+
+        tx = Transaction(inputs, outputs, message=message)
+        return tx
+
+    def sign_transaction(self, tx: Transaction, private_key: int) -> Transaction:
+        """
+        Sign a transaction with a P256 private key (int).
+        Uses the real Transaction.sign() method (fastecdsa ECDSA).
+        """
+        tx.sign(private_keys=[private_key])
+        return tx
+
+    # ─────────── Send Flow ───────────
 
     async def send(
         self,
         from_address: str,
         to_address: str,
         amount: Decimal,
-        private_key_hex: str,
-        gas: int = DEFAULT_GAS,
-        gas_price: int = DEFAULT_GAS_PRICE,
-        data: bytes = b"",
+        private_key: int,
+        fee: Decimal = Decimal("0.001"),
+        message: bytes = None,
         wait_confirm: bool = False,
         confirm_timeout: float = 30.0,
     ) -> Optional[str]:
         """
-        Full send flow: get nonce → build tx → sign → broadcast.
+        Full send flow: fetch UTXOs → select → build → sign → broadcast.
 
         Args:
-            from_address:    Sender's 0x address
-            to_address:      Recipient's 0x address
-            amount:          Amount to send in QRDX
-            private_key_hex: Sender's secp256k1 private key (hex, no 0x prefix)
-            gas:             Gas limit
-            gas_price:       Gas price in wei
-            data:            Optional calldata
-            wait_confirm:    Whether to wait for receipt
-            confirm_timeout: Max seconds to wait
+            from_address: Sender's address string (base58 compressed)
+            to_address:   Recipient's address string
+            amount:       Amount to send in QRDX
+            private_key:  Sender's P256 private key (int)
+            fee:          Transaction fee in QRDX
+            message:      Optional transaction message
+            wait_confirm: Whether to wait for block confirmation
+            confirm_timeout: Max time to wait for confirmation
 
         Returns:
             Transaction hash if submitted, None on failure.
         """
-        from eth_account import Account
+        logger.info("Building tx: %s → %s, amount=%s QRDX", from_address[:20], to_address[:20], amount)
 
-        logger.info(
-            "Building ETH tx: %s → %s, amount=%s QRDX",
-            from_address[:16], to_address[:16], amount,
-        )
-
-        # Ensure private key has 0x prefix for eth-account
-        if not private_key_hex.startswith("0x"):
-            private_key_hex = "0x" + private_key_hex
-
-        try:
-            # Step 1: Get nonce
-            nonce = await self.get_nonce(from_address)
-            logger.debug("  Nonce: %d", nonce)
-
-            # Step 2: Convert QRDX to wei
-            value_wei = int(amount * WEI_PER_QRDX)
-
-            # Step 3: Build transaction dict
-            tx = {
-                "nonce": nonce,
-                "gasPrice": gas_price,
-                "gas": gas,
-                "to": to_address,
-                "value": value_wei,
-                "data": data,
-                "chainId": self.chain_id,
-            }
-
-            # Step 4: Sign
-            signed = Account.sign_transaction(tx, private_key_hex)
-            raw_hex = "0x" + signed.raw_transaction.hex()
-            tx_hash = "0x" + signed.hash.hex()
-
-            logger.info("  TX hash: %s, raw_len=%d", tx_hash, len(raw_hex))
-
-            # Step 5: Submit via JSON-RPC eth_sendRawTransaction
-            result = await self._client.eth_send_raw_transaction(raw_hex)
-            if result is None:
-                logger.error("  Submit failed: no result from eth_sendRawTransaction")
-                return None
-
-            logger.info("  ✓ TX submitted: %s", tx_hash)
-
-            # Step 6: Optionally wait for receipt
-            if wait_confirm:
-                confirmed = await self.wait_for_receipt(tx_hash, timeout=confirm_timeout)
-                if confirmed:
-                    logger.info("  ✓ TX receipt received: %s", tx_hash)
-                else:
-                    logger.warning(
-                        "  ⚠ TX receipt not available within %ss: %s",
-                        confirm_timeout, tx_hash,
-                    )
-
-            return tx_hash
-
-        except Exception as e:
-            logger.error("  TX failed: %s", e, exc_info=True)
+        # Step 1: Get UTXOs
+        utxos = await self.get_utxos(from_address)
+        if not utxos:
+            logger.error("No UTXOs for %s", from_address)
             return None
 
-    async def wait_for_receipt(self, tx_hash: str, timeout: float = 30.0) -> bool:
-        """Wait for transaction receipt to be available."""
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
-            try:
-                receipt = await self._client.eth_get_transaction_receipt(tx_hash)
-                if receipt is not None:
-                    return True
-            except Exception:
-                pass
-            await asyncio.sleep(1.0)
-        return False
+        logger.debug("  Found %d UTXOs, total=%s", len(utxos), sum(u.amount for u in utxos))
+
+        # Step 2: Select UTXOs
+        try:
+            selected, change = self.select_utxos(utxos, amount, fee)
+        except ValueError as e:
+            logger.error("  UTXO selection failed: %s", e)
+            return None
+
+        logger.debug("  Selected %d UTXOs, change=%s", len(selected), change)
+
+        # Step 3: Build transaction
+        tx = self.build_transaction(
+            utxos=selected,
+            to_address=to_address,
+            amount=amount,
+            change_address=from_address,
+            change_amount=change,
+            message=message,
+        )
+
+        # Step 4: Sign
+        self.sign_transaction(tx, private_key)
+        tx_hex = tx.hex()
+        tx_hash = tx.hash()
+
+        logger.info("  TX hash: %s, hex_len=%d", tx_hash, len(tx_hex))
+
+        # Step 5: Submit via /submit_tx
+        result = await self._client._post("/submit_tx", data={"tx_hex": tx_hex})
+        if not result or not result.get("ok"):
+            error = result.get("error", "unknown") if result else "no response"
+            logger.error("  Submit failed: %s", error)
+            return None
+
+        logger.info("  ✓ TX submitted: %s", tx_hash)
+
+        # Step 6: Optionally wait for confirmation
+        if wait_confirm:
+            confirmed = await self._client.wait_tx_confirmed(tx_hash, timeout=confirm_timeout)
+            if confirmed:
+                logger.info("  ✓ TX confirmed: %s", tx_hash)
+            else:
+                logger.warning("  ⚠ TX not confirmed within %ss: %s", confirm_timeout, tx_hash)
+
+        return tx_hash
 
     async def send_batch(
         self,
         from_address: str,
-        private_key_hex: str,
+        private_key: int,
         recipients: List[Tuple[str, Decimal]],
+        fee: Decimal = Decimal("0.001"),
         delay: float = 0.5,
     ) -> List[Optional[str]]:
         """
         Send multiple transactions sequentially.
 
         Args:
-            recipients: List of (to_address, amount_qrdx) tuples.
-            delay: Seconds between transactions.
+            recipients: List of (to_address, amount) tuples.
+            delay: Seconds between transactions (avoid mempool flooding).
         """
         results = []
         for to_addr, amount in recipients:
@@ -207,7 +283,8 @@ class TransactionSender:
                 from_address=from_address,
                 to_address=to_addr,
                 amount=amount,
-                private_key_hex=private_key_hex,
+                private_key=private_key,
+                fee=fee,
             )
             results.append(tx_hash)
             if delay > 0:
@@ -222,14 +299,13 @@ class MultiSenderCoordinator:
     Useful for stress testing and multi-party scenarios.
     """
 
-    def __init__(self, node_urls: List[str], chain_id: int = 9999):
+    def __init__(self, node_urls: List[str]):
         self.node_urls = node_urls
-        self.chain_id = chain_id
         self._senders: List[TransactionSender] = []
 
     async def __aenter__(self):
         for url in self.node_urls:
-            sender = TransactionSender(url, chain_id=self.chain_id)
+            sender = TransactionSender(url)
             await sender.__aenter__()
             self._senders.append(sender)
         return self
@@ -261,7 +337,7 @@ class MultiSenderCoordinator:
                 from_address=wallet["address"],
                 to_address=target_address,
                 amount=amount_each,
-                private_key_hex=wallet["private_key"],
+                private_key=wallet["private_key_int"],
             )
             results.append(result)
             if delay > 0:
@@ -275,7 +351,7 @@ class MultiSenderCoordinator:
     ) -> List[Optional[str]]:
         """
         Chain transfers: wallet[0]→wallet[1]→wallet[2]→...→wallet[0].
-        Tests transaction propagation through the network.
+        Tests UTXO propagation through the network.
         """
         hashes = []
         sender = self._pick_sender(0)
@@ -286,7 +362,7 @@ class MultiSenderCoordinator:
                 from_address=src["address"],
                 to_address=dst["address"],
                 amount=amount,
-                private_key_hex=src["private_key"],
+                private_key=src["private_key_int"],
                 wait_confirm=True,
                 confirm_timeout=20.0,
             )

@@ -191,7 +191,14 @@ class TestnetOrchestrator:
         # Create key directory
         os.makedirs(spec.key_dir, exist_ok=True)
 
-        bootstrap_url = f"http://127.0.0.1:{BASE_NODE_PORT}" if not spec.is_bootstrap else ""
+        # Every node should know about ALL other nodes as bootstrap peers.
+        # This ensures the peer mesh forms quickly and no node is orphaned.
+        other_ports = [
+            s.node_port for s in self.node_specs if s.node_id != spec.node_id
+        ]
+        bootstrap_urls = ",".join(
+            f"http://127.0.0.1:{p}" for p in other_ports
+        )
 
         env = {
             "QRDX_NODE_HOST": "127.0.0.1",
@@ -199,14 +206,15 @@ class TestnetOrchestrator:
             "QRDX_SELF_URL": f"http://127.0.0.1:{spec.node_port}",
             "QRDX_DATABASE_PATH": spec.db_path,
             "QRDX_NODE_KEY_DIR": spec.key_dir,
-            "QRDX_BOOTSTRAP_NODE": bootstrap_url,
-            "QRDX_BOOTSTRAP_NODES": bootstrap_url,
+            "QRDX_BOOTSTRAP_NODE": f"http://127.0.0.1:{BASE_NODE_PORT}",
+            "QRDX_BOOTSTRAP_NODES": bootstrap_urls,
             "QRDX_MIN_VALIDATORS": "1",
             "QRDX_CHAIN_ID": str(CHAIN_ID),
             "QRDX_NETWORK_NAME": NETWORK_NAME,
             "LOG_LEVEL": "DEBUG",
             "PYTHONWARNINGS": "ignore",
             "QRDX_RPC_ENABLED": "true",
+            "QRDX_DISABLE_RATE_LIMIT": "true",
         }
 
         if spec.is_validator and spec.validator_index is not None:
@@ -321,13 +329,21 @@ class TestnetOrchestrator:
                 if all(c >= 1 for c in counts):
                     mesh_ok = True
                     break
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
 
             if mesh_ok:
                 counts = await clients.get_peer_counts()
                 logger.info("✓ Peer mesh formed: %s", counts)
             else:
+                counts = await clients.get_peer_counts()
                 logger.warning("⚠ Peer mesh incomplete: %s", counts)
+
+            # Wait extra time for block sync convergence after mesh forms
+            # Node-3 (last started) needs at least one periodic_update_fetcher cycle (8s)
+            # to pull the blockchain from peers.
+            if mesh_ok:
+                logger.info("Waiting for block sync convergence...")
+                await asyncio.sleep(12)
 
             # Check block production
             logger.info("Checking block production...")

@@ -130,16 +130,20 @@ class PoolOperator:
         self.db_path = db_path
         self._persistence: Optional[ExchangePersistence] = None
         self._pool_manager = PoolManager()
+        self._db: Optional[aiosqlite.Connection] = None
 
     async def initialize(self) -> None:
         """Initialize persistence layer."""
-        self._persistence = ExchangePersistence(self.db_path)
+        import aiosqlite as _aiosqlite
+        self._db = await _aiosqlite.connect(self.db_path)
+        self._db.row_factory = _aiosqlite.Row
+        self._persistence = ExchangePersistence(self._db)
         await self._persistence.initialize()
         logger.info("Pool operator initialized (db=%s)", self.db_path)
 
     async def close(self) -> None:
-        if self._persistence:
-            await self._persistence.close()
+        if self._db:
+            await self._db.close()
 
     async def __aenter__(self):
         await self.initialize()
@@ -201,16 +205,16 @@ class PoolOperator:
             initial_price, creator, stake_amount,
         )
 
-        # Persist
+        # Persist — pass the in-memory pool_id so DB uses the same key
         await self._persistence.create_pool(
-            pool_id=pool.state.id,
-            token0=pool.state.token0,
-            token1=pool.state.token1,
+            token_a=pool.state.token0,
+            token_b=pool.state.token1,
             fee_tier=int(pool.state.fee_tier),
-            pool_type=int(pool.state.pool_type),
-            sqrt_price=str(pool.state.sqrt_price),
-            tick=pool.state.tick,
-            creator=creator,
+            pool_type=pool.state.pool_type.name,
+            initial_sqrt_price=pool.state.sqrt_price,
+            initial_tick=pool.state.tick,
+            creator_address=creator,
+            pool_id=pool.state.id,
         )
 
         return pool
@@ -285,13 +289,22 @@ class PoolOperator:
         position = self.add_liquidity(pool_id, owner, tick_lower, tick_upper, amount)
 
         await self._persistence.add_position(
-            position_id=position.id,
             pool_id=pool_id,
-            owner=owner,
+            owner_address=owner,
             tick_lower=tick_lower,
             tick_upper=tick_upper,
-            liquidity=str(amount),
+            liquidity=amount,
         )
+
+        # Sync in-memory pool state to DB
+        pool = self._pool_manager.get_pool(pool_id)
+        if pool:
+            await self._persistence.update_pool_state(
+                pool_id=pool_id,
+                sqrt_price=pool.state.sqrt_price,
+                tick=pool.state.tick,
+                liquidity=pool.state.liquidity,
+            )
 
         return position
 
@@ -357,15 +370,26 @@ class PoolOperator:
         amount_out, fee = self.swap(pool_id, amount_in, zero_for_one, min_amount_out)
 
         pool = self._pool_manager.get_pool(pool_id)
+        token_in = pool.state.token0 if zero_for_one else pool.state.token1
+        token_out = pool.state.token1 if zero_for_one else pool.state.token0
         await self._persistence.record_swap(
             pool_id=pool_id,
-            sender=sender,
-            amount_in=str(amount_in),
-            amount_out=str(amount_out),
-            fee_amount=str(fee),
-            zero_for_one=zero_for_one,
-            sqrt_price_after=str(pool.state.sqrt_price),
+            sender_address=sender,
+            token_in=token_in,
+            token_out=token_out,
+            amount_in=amount_in,
+            amount_out=amount_out,
+            fee_amount=fee,
+            sqrt_price_after=pool.state.sqrt_price,
             tick_after=pool.state.tick,
+        )
+
+        # Sync in-memory pool state to DB
+        await self._persistence.update_pool_state(
+            pool_id=pool_id,
+            sqrt_price=pool.state.sqrt_price,
+            tick=pool.state.tick,
+            liquidity=pool.state.liquidity,
         )
 
         return amount_out, fee
@@ -438,8 +462,8 @@ class PoolOperator:
             "volume_0": str(s.total_volume_0),
             "volume_1": str(s.total_volume_1),
             "positions": len(s.positions),
-            "protocol_fees_0": str(s.protocol_fee_0),
-            "protocol_fees_1": str(s.protocol_fee_1),
+            "protocol_fees_0": str(s.protocol_fees_0),
+            "protocol_fees_1": str(s.protocol_fees_1),
         }
 
     def list_pools(self) -> List[str]:

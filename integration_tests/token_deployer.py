@@ -96,10 +96,14 @@ class TokenDeployer:
         self._persistence: Optional[TokenPersistence] = None
         self._registry = QRC20Registry()
         self._client: Optional[NodeRPCClient] = None
+        self._db: Optional[aiosqlite.Connection] = None
 
     async def initialize(self) -> None:
         """Initialize persistence layer and optionally connect to node."""
-        self._persistence = TokenPersistence(self.db_path)
+        import aiosqlite as _aiosqlite
+        self._db = await _aiosqlite.connect(self.db_path)
+        self._db.row_factory = _aiosqlite.Row
+        self._persistence = TokenPersistence(self._db)
         await self._persistence.initialize()
         logger.info("Token deployer initialized (db=%s)", self.db_path)
 
@@ -109,10 +113,10 @@ class TokenDeployer:
 
     async def close(self) -> None:
         """Clean up resources."""
-        if self._persistence:
-            await self._persistence.close()
         if self._client:
             await self._client.__aexit__(None, None, None)
+        if self._db:
+            await self._db.close()
 
     async def __aenter__(self):
         await self.initialize()
@@ -169,18 +173,11 @@ class TokenDeployer:
             name=name,
             symbol=symbol,
             decimals=decimals,
-            total_supply=str(initial_supply),
-            deployer=deployer_address,
+            total_supply=initial_supply,
+            owner_address=deployer_address,
         )
 
         # If there's initial supply, credit deployer
-        if initial_supply > 0 and deployer_address:
-            await self._persistence.transfer(
-                token_address=token_address,
-                sender="0x0000000000000000000000000000000000000000",  # mint from zero
-                recipient=deployer_address,
-                amount=str(initial_supply),
-            )
 
         logger.info("  ✓ Token deployed: %s at %s", symbol, token_address)
         return token
@@ -241,15 +238,14 @@ class TokenDeployer:
             recipient=recipient,
             amount=amount,
             signature=signature,
-            proof_hash=proof_hash,
         )
 
         # Persist to database
         await self._persistence.transfer(
             token_address=token_address,
-            sender=sender,
-            recipient=recipient,
-            amount=str(amount),
+            from_address=sender,
+            to_address=recipient,
+            amount=amount,
         )
 
         result = {
@@ -329,16 +325,15 @@ class TokenDeployer:
             recipient=recipient,
             amount=amount,
             signature=signature,
-            proof_hash=proof_hash,
         )
 
         # Persist transfer
         await self._persistence.transfer_from(
             token_address=token_address,
             spender=spender,
-            owner=sender,
-            recipient=recipient,
-            amount=str(amount),
+            from_address=sender,
+            to_address=recipient,
+            amount=amount,
         )
 
         return {"ok": True, "symbol": symbol, "from": sender, "to": recipient, "amount": str(amount)}

@@ -37,7 +37,7 @@ class S01GenesisBootstrap(Scenario):
             # Check height consistency
             if heights:
                 spread = max(heights) - min(heights)
-                self.check(spread <= 10, f"Block heights consistent (spread={spread})")
+                self.check(spread <= 5, f"Block heights consistent (spread={spread})")
 
         # Check validator wallets have balances
         async with NodeRPCClient(node_urls[0]) as client:

@@ -67,6 +67,7 @@ class S04Transactions(Scenario):
 
             if tx_hash:
                 self.ctx.artifacts["first_tx_hash"] = tx_hash
+                self.ctx.artifacts["first_tx_recipient"] = recipient_addr
 
                 # Wait for confirmation
                 await asyncio.sleep(4)  # 2 slots

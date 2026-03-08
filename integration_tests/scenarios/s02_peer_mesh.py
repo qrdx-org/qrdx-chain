@@ -2,15 +2,10 @@
 S02 — P2P Network Mesh
 
 Verifies:
-  - All nodes discover each other (DHT bootstrap completes)
+  - All nodes have actual peer connections (not 0 peers)
   - Block heights are in sync across nodes (proving block propagation)
-  - Peer list endpoint is reachable
-  - No node is stuck at block 0 while others advance (would indicate isolation)
-
-NOTE: In a local testnet (all nodes on 127.0.0.1), the /get_nodes endpoint
-only returns "public" peers.  Since local-address nodes are classified as
-"private", the public peer list will be empty.  We therefore use block-height
-convergence as the primary proof that the P2P mesh is functional.
+  - Heights converge over time (proves gossip + sync is working)
+  - No node is isolated with its own independent chain
 """
 
 import asyncio
@@ -27,35 +22,67 @@ class S02PeerMesh(Scenario):
         node_urls = self.ctx.node_urls
 
         async with MultiNodeClient(node_urls) as clients:
-            # Check that all nodes are producing / syncing blocks
+            # Give peer discovery time to complete (bootstrap + gossip)
+            # Nodes start peer discovery 5s after boot, bootstrap takes ~1s per peer.
+            await asyncio.sleep(6)
+
+            # ── 1. Verify actual peer connections (with retry for transient drops) ──
+            total_peers = 0
+            nodes_with_peers = 0
+            for i, client in enumerate(clients._clients):
+                count = 0
+                for attempt in range(3):
+                    try:
+                        nodes = await client.get_nodes()
+                        count = len(nodes) if nodes else 0
+                        if count >= 1:
+                            break
+                        if attempt < 2:
+                            await asyncio.sleep(2)
+                    except Exception:
+                        if attempt < 2:
+                            await asyncio.sleep(2)
+                total_peers += count
+                if count >= 1:
+                    nodes_with_peers += 1
+                self._log.info("Node %d: %d peers connected", i, count)
+
+            # Allow at most 1 node with 0 peers (bootstrap can be transiently empty)
+            min_nodes = max(len(node_urls) - 1, 1)
+            self.check(
+                nodes_with_peers >= min_nodes,
+                f"Enough nodes have peers ({nodes_with_peers}/{len(node_urls)}, need {min_nodes})",
+            )
+
+            self.check(
+                total_peers >= len(node_urls),
+                f"Network has sufficient peer connections (total={total_peers})"
+            )
+
+            # ── 2. Block heights should be in sync ──
             heights = await clients.get_block_heights()
             self._log.info("Block heights: %s", heights)
 
-            # All nodes should have advanced past block 0
             for i, h in enumerate(heights):
-                self.check(h >= 1, f"Node {i} advanced past genesis (height={h})")
+                self.check(h >= 1, f"Node {i} past genesis (height={h})")
 
-            # Height spread should be small (proves sync is working)
             if heights:
                 spread = max(heights) - min(heights)
-                self.check(spread <= 5,
-                           f"Block heights in sync (spread={spread}, heights={heights})")
+                self.check(spread <= 3,
+                           f"Heights in sync (spread={spread}, heights={heights})")
 
-            # Verify the /get_nodes endpoint is reachable on all nodes
-            for i, client in enumerate(clients._clients):
-                try:
-                    nodes = await client.get_nodes()
-                    self.check(nodes is not None, f"Node {i} /get_nodes reachable")
-                    if nodes:
-                        self._log.info("Node %d public peers: %d", i, len(nodes))
-                except Exception as exc:
-                    self._log.warning("Node %d /get_nodes failed: %s", i, exc)
-                    self.check(True, f"Node {i} /get_nodes attempted")
-
-            # Wait a bit and check heights again — they should advance
-            await asyncio.sleep(4)
+            # ── 3. Wait and verify continued convergence ──
+            # Nodes that started later need time for periodic_update_fetcher (8s cycle)
+            # to pull blocks from peers.  Give 12s for at least one sync cycle.
+            await asyncio.sleep(12)
             heights_after = await clients.get_block_heights()
-            self._log.info("Block heights after 4s: %s", heights_after)
-            advancing = sum(1 for h1, h2 in zip(heights, heights_after) if h2 > h1)
-            self.check(advancing >= 1,
-                       f"At least 1 node advancing ({advancing}/{len(node_urls)})")
+            self._log.info("Heights after 12s: %s", heights_after)
+
+            if heights_after:
+                spread_after = max(heights_after) - min(heights_after)
+                # After 12s every node should have synced via periodic_update_fetcher
+                self.check(spread_after <= 3,
+                           f"Heights still converging (spread={spread_after})")
+                advancing = sum(1 for h1, h2 in zip(heights, heights_after) if h2 > h1)
+                self.check(advancing >= 1,
+                           f"At least 1 node advancing ({advancing}/{len(node_urls)})")

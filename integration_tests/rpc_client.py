@@ -3,6 +3,10 @@ Async RPC Client — Typed HTTP Client for QRDX Node API
 
 Wraps httpx.AsyncClient with methods for every REST endpoint
 used by the testnet scenarios. No stubs — every call hits a real node.
+
+All HTTP calls include automatic retry with exponential backoff for
+429 (rate limit) responses, so scenarios don't need individual rate-limit
+handling.
 """
 
 import httpx
@@ -14,6 +18,8 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 10.0
+MAX_RETRIES = 4          # max retry attempts on 429
+RETRY_BASE_DELAY = 1.0   # base delay in seconds (doubles each retry)
 
 
 class NodeRPCClient:
@@ -45,12 +51,32 @@ class NodeRPCClient:
             raise RuntimeError("Use 'async with NodeRPCClient(...)' context manager")
         return self._client
 
+    # ─────────── Rate-limit-aware HTTP helpers ───────────
+
+    async def _request_with_retry(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """
+        Execute an HTTP request with automatic retry on 429 Too Many Requests.
+
+        Uses exponential backoff: 1s → 2s → 4s → 8s.
+        All public methods should use this instead of self.client.get/post directly.
+        """
+        for attempt in range(MAX_RETRIES + 1):
+            resp = await self.client.request(method, path, **kwargs)
+            if resp.status_code != 429:
+                return resp
+            delay = RETRY_BASE_DELAY * (2 ** attempt)
+            logger.debug("429 on %s %s (attempt %d/%d), retrying in %.1fs",
+                         method, path, attempt + 1, MAX_RETRIES + 1, delay)
+            await asyncio.sleep(delay)
+        # Return the last 429 response so caller can raise_for_status
+        return resp
+
     # ─────────── Low-level helpers ───────────
 
     async def _get(self, path: str, params: dict = None) -> Optional[dict]:
         """GET request, returns parsed JSON or None on error."""
         try:
-            resp = await self.client.get(path, params=params)
+            resp = await self._request_with_retry("GET", path, params=params)
             if resp.status_code == 200:
                 return resp.json()
             return None
@@ -62,9 +88,9 @@ class NodeRPCClient:
         """POST request, returns parsed JSON or None on error."""
         try:
             if json_data is not None:
-                resp = await self.client.post(path, json=json_data)
+                resp = await self._request_with_retry("POST", path, json=json_data)
             else:
-                resp = await self.client.post(path, json=data)
+                resp = await self._request_with_retry("POST", path, json=data)
             if resp.status_code == 200:
                 return resp.json()
             return None
@@ -82,7 +108,7 @@ class NodeRPCClient:
         at the root endpoint. There is no /health route.
         """
         try:
-            resp = await self.client.get("/")
+            resp = await self._request_with_retry("GET", "/")
             if resp.status_code == 200:
                 data = resp.json()
                 return "node_version" in data
@@ -103,7 +129,7 @@ class NodeRPCClient:
 
     async def get_mining_info(self) -> dict:
         """Get current mining/block info — unwraps the {ok, result} envelope."""
-        resp = await self.client.get("/get_mining_info")
+        resp = await self._request_with_retry("GET", "/get_mining_info")
         resp.raise_for_status()
         data = resp.json()
         # The endpoint returns {"ok": true, "result": {difficulty, last_block, ...}}
@@ -111,13 +137,13 @@ class NodeRPCClient:
 
     async def get_block(self, block_hash: str) -> dict:
         """Get block by hash."""
-        resp = await self.client.get("/get_block", params={"block_hash": block_hash})
+        resp = await self._request_with_retry("GET", "/get_block", params={"block_hash": block_hash})
         resp.raise_for_status()
         return resp.json()
 
     async def get_block_by_id(self, block_id: int) -> dict:
         """Get block by height."""
-        resp = await self.client.get("/get_block", params={"block": block_id})
+        resp = await self._request_with_retry("GET", "/get_block", params={"block": block_id})
         resp.raise_for_status()
         return resp.json()
 
@@ -135,7 +161,7 @@ class NodeRPCClient:
 
     async def get_address_info(self, address: str) -> dict:
         """Get address balance and UTXO info — unwraps {ok, result} envelope."""
-        resp = await self.client.get("/get_address_info", params={"address": address})
+        resp = await self._request_with_retry("GET", "/get_address_info", params={"address": address})
         resp.raise_for_status()
         data = resp.json()
         return data.get("result", data)
@@ -152,20 +178,20 @@ class NodeRPCClient:
 
     async def push_tx(self, tx_hex: str) -> dict:
         """Submit a raw transaction via GET /push_tx."""
-        resp = await self.client.get("/push_tx", params={"tx_hex": tx_hex})
+        resp = await self._request_with_retry("GET", "/push_tx", params={"tx_hex": tx_hex})
         resp.raise_for_status()
         return resp.json()
 
     async def submit_tx(self, tx_hex: str) -> dict:
         """Submit a raw transaction via POST /submit_tx."""
-        resp = await self.client.post("/submit_tx", json={"tx_hex": tx_hex})
+        resp = await self._request_with_retry("POST", "/submit_tx", json={"tx_hex": tx_hex})
         resp.raise_for_status()
         return resp.json()
 
     async def get_transaction(self, tx_hash: str) -> Optional[dict]:
         """Get transaction by hash."""
         try:
-            resp = await self.client.get("/get_transaction", params={"tx_hash": tx_hash})
+            resp = await self._request_with_retry("GET", "/get_transaction", params={"tx_hash": tx_hash})
             if resp.status_code == 200:
                 return resp.json()
             return None
@@ -174,7 +200,7 @@ class NodeRPCClient:
 
     async def get_pending_transactions(self) -> List[dict]:
         """Get pending transactions in mempool."""
-        resp = await self.client.get("/get_pending_transactions")
+        resp = await self._request_with_retry("GET", "/get_pending_transactions")
         resp.raise_for_status()
         return resp.json().get("pending_transactions", [])
 
@@ -182,7 +208,7 @@ class NodeRPCClient:
 
     async def get_nodes(self) -> List[str]:
         """Get connected peer nodes. Returns list from the /get_nodes endpoint."""
-        resp = await self.client.get("/get_nodes")
+        resp = await self._request_with_retry("GET", "/get_nodes")
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, dict):
@@ -192,7 +218,7 @@ class NodeRPCClient:
 
     async def add_node(self, node_url: str) -> dict:
         """Add a peer node."""
-        resp = await self.client.get("/add_node", params={"url": node_url})
+        resp = await self._request_with_retry("GET", "/add_node", params={"url": node_url})
         resp.raise_for_status()
         return resp.json()
 
@@ -200,7 +226,7 @@ class NodeRPCClient:
 
     async def get_validators(self) -> List[dict]:
         """Get registered validators."""
-        resp = await self.client.get("/get_validators")
+        resp = await self._request_with_retry("GET", "/get_validators")
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, dict):
@@ -212,7 +238,7 @@ class NodeRPCClient:
     async def get_pq_peer_info(self) -> dict:
         """Get PQ identity information."""
         try:
-            resp = await self.client.get("/pq/peer_info")
+            resp = await self._request_with_retry("GET", "/pq/peer_info")
             resp.raise_for_status()
             return resp.json()
         except Exception:
@@ -223,7 +249,7 @@ class NodeRPCClient:
     async def get_system_wallets(self) -> dict:
         """Get system wallet info."""
         try:
-            resp = await self.client.get("/system_wallets")
+            resp = await self._request_with_retry("GET", "/system_wallets")
             resp.raise_for_status()
             return resp.json()
         except Exception:
@@ -239,7 +265,7 @@ class NodeRPCClient:
             "params": params or [],
             "id": 1,
         }
-        resp = await self.client.post("/rpc", json=payload)
+        resp = await self._request_with_retry("POST", "/rpc", json=payload)
         resp.raise_for_status()
         result = resp.json()
         if "error" in result:
@@ -282,7 +308,7 @@ class NodeRPCClient:
 
     async def push_block(self, block_data: dict) -> dict:
         """Submit a block to the node."""
-        resp = await self.client.post("/push_block", json=block_data)
+        resp = await self._request_with_retry("POST", "/push_block", json=block_data)
         resp.raise_for_status()
         return resp.json()
 

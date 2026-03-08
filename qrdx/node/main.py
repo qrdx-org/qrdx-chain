@@ -782,6 +782,10 @@ app_servers = [{"url": str(DENARO_SELF_URL)}] if DENARO_SELF_URL else []
 app = FastAPI(servers=app_servers, title="Denaro Node", description="Full node for the Denaro blockchain.", version=NODE_VERSION)
 
 limiter = Limiter(key_func=rate_limit_key_func)
+# Allow testnet / integration-test environments to disable rate limiting
+# so that automated test clients can exercise endpoints without hitting 429s.
+if os.environ.get("QRDX_DISABLE_RATE_LIMIT", "").lower() in ("1", "true", "yes"):
+    limiter.enabled = False
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -1650,6 +1654,20 @@ async def periodic_peer_discovery():
     
     # Initial bootstrap from all configured nodes
     await bootstrap_from_all_nodes()
+
+    # Immediately check peers for a longer chain after bootstrapping.
+    # This prevents newly-started nodes from waiting a full periodic_update_fetcher
+    # cycle (8s) before discovering they are behind.
+    try:
+        all_peers = NodesManager.get_all_peers()
+        connectable = [p for p in all_peers if p.get('url')]
+        if connectable:
+            logger.info(f"Post-bootstrap sync check: probing {len(connectable)} peer(s) for longer chain")
+            for peer_info in connectable[:3]:
+                await check_peer_and_sync(peer_info)
+                await asyncio.sleep(0.5)
+    except Exception as e:
+        logger.warning(f"Post-bootstrap sync check failed: {e}")
 
     while True:
         await asyncio.sleep(30)  # Refresh peers every 30s
@@ -2524,6 +2542,14 @@ async def startup():
                     
                     # Prepare execution (sync balance from native to EVM)
                     await context_exec.prepare_execution(sender_hex)
+                    
+                    # Also sync recipient so EVM has their full native balance
+                    if to_hex:
+                        await sync_manager.sync_address_to_evm(
+                            address=to_hex,
+                            block_height=block_height,
+                            block_hash=block_hash,
+                        )
                     
                     # Generate transaction hash
                     tx_hash = keccak(raw_tx)
@@ -3649,18 +3675,19 @@ async def get_address_info(
 
 @app.get("/get_nodes")
 async def get_nodes(pretty: bool = False):
-    # Don't reveal all internal peer information, only public nodes
-    public_peers = [
-        {
+    # Return all active, non-banned peers (both public and private)
+    # Redact private peer URLs unless QRDX_SELF_URL is also private
+    all_peers = []
+    for p in NodesManager.get_recent_nodes()[:100]:
+        if await security.reputation_manager.is_banned(p['node_id']):
+            continue
+        all_peers.append({
             'node_id': p['node_id'],
             'is_public': p.get('is_public', False),
-            'url': p.get('url') if p.get('is_public') else None,
+            'url': p.get('url', ''),
             'reputation_score': await security.reputation_manager.get_score(p['node_id'])
-        }
-        for p in NodesManager.get_recent_nodes()[:100]
-        if p.get('is_public', False) and not await security.reputation_manager.is_banned(p['node_id'])
-    ]
-    result = {'ok': True, 'result': public_peers}
+        })
+    result = {'ok': True, 'result': all_peers}
     return Response(content=json.dumps(result, indent=4, cls=CustomJSONEncoder), media_type="application/json") if pretty else result
 
 

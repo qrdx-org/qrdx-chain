@@ -435,16 +435,24 @@ class P2PModule(RPCModule):
 
     @rpc_method
     async def getPeers(self) -> Dict:
-        """Return known peer list."""
+        """Return known peer list for peer exchange.
+
+        Returns ALL peers that have a reachable URL, regardless of
+        public/private status.  Peer exchange is how the network
+        forms its mesh — filtering to public-only breaks gossip in
+        any deployment where nodes use private IPs (testnet, LAN,
+        Docker, etc.).
+        """
         if self._nodes_manager is None:
             return {'ok': False, 'error': 'Not ready'}
 
         peers_list = []
         for nid, pdata in self._nodes_manager.peers.items():
-            if pdata.get('is_public') and pdata.get('url'):
+            if pdata.get('url'):
                 peers_list.append({
                     'node_id': nid,
                     'url': pdata['url'],
+                    'is_public': pdata.get('is_public', False),
                 })
         return {'ok': True, 'result': {'peers': peers_list}}
 
@@ -457,6 +465,7 @@ class P2PModule(RPCModule):
         self._require_db()
 
         from ...node.identity import get_public_key_hex
+        from ...constants import DENARO_SELF_URL
 
         challenge = await self._security.handshake_manager.create_challenge()
         height = await self._db.get_next_block_id() - 1
@@ -468,7 +477,7 @@ class P2PModule(RPCModule):
                 'node_id': self._self_node_id,
                 'pubkey': get_public_key_hex(),
                 'is_public': self._nodes_manager.self_is_public if self._nodes_manager else False,
-                'url': None,  # filled by caller from env
+                'url': DENARO_SELF_URL or None,
                 'height': height,
             },
         }
