@@ -17,12 +17,15 @@ No stubs — every pool is a real ConcentratedLiquidityPool with
 full tick math, fee accrual, and reentrancy protection.
 """
 
+from __future__ import annotations
+
 import asyncio
+import hashlib
 import logging
 import math
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from qrdx.exchange.amm import (
     ConcentratedLiquidityPool,
@@ -42,6 +45,9 @@ from qrdx.exchange.amm import (
 from qrdx.exchange.persistence import ExchangePersistence
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from integration_tests.token_deployer import TokenDeployer
 
 
 # Default testnet pool configurations
@@ -126,11 +132,12 @@ class PoolOperator:
         )
     """
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, token_deployer: Optional[TokenDeployer] = None):
         self.db_path = db_path
         self._persistence: Optional[ExchangePersistence] = None
         self._pool_manager = PoolManager()
         self._db: Optional[aiosqlite.Connection] = None
+        self._token_deployer: Optional[TokenDeployer] = token_deployer
 
     async def initialize(self) -> None:
         """Initialize persistence layer."""
@@ -151,6 +158,12 @@ class PoolOperator:
 
     async def __aexit__(self, *exc):
         await self.close()
+
+    @staticmethod
+    def _pool_vault_address(pool_id: str) -> str:
+        """Deterministic vault address for a pool's escrowed tokens."""
+        raw = hashlib.blake2b(f"pool-vault:{pool_id}".encode(), digest_size=20).hexdigest()
+        return f"0xVAULT{raw}"
 
     # ─────────── Pool Creation ───────────
 
@@ -277,6 +290,49 @@ class PoolOperator:
         logger.debug("  ✓ Position %s created, active=%s", position.id, position.is_active)
         return position
 
+    def calculate_token_amounts(
+        self,
+        pool_id: str,
+        tick_lower: int,
+        tick_upper: int,
+        liquidity: Decimal,
+    ) -> Tuple[Decimal, Decimal]:
+        """
+        Calculate token0 and token1 amounts required for a liquidity position.
+
+        Uses Uniswap V3 formulas:
+          If current_tick < tick_lower  → only token0 needed
+          If current_tick >= tick_upper → only token1 needed
+          Otherwise                    → both tokens needed
+        """
+        pool = self._pool_manager.get_pool(pool_id)
+        if not pool:
+            raise ValueError(f"Pool {pool_id} not found")
+
+        sqrt_p = pool.state.sqrt_price
+        sqrt_a = tick_to_sqrt_price(tick_lower)
+        sqrt_b = tick_to_sqrt_price(tick_upper)
+        current_tick = pool.state.tick
+
+        token0_amount = ZERO
+        token1_amount = ZERO
+
+        if current_tick < tick_lower:
+            # Entirely above current price — only token0
+            token0_amount = liquidity * Q96 * (sqrt_b - sqrt_a) / (sqrt_a * sqrt_b)
+        elif current_tick >= tick_upper:
+            # Entirely below current price — only token1
+            token1_amount = liquidity * (sqrt_b - sqrt_a) / Q96
+        else:
+            # Current price in range — both tokens
+            token0_amount = liquidity * Q96 * (sqrt_b - sqrt_p) / (sqrt_p * sqrt_b)
+            token1_amount = liquidity * (sqrt_p - sqrt_a) / Q96
+
+        # Quantize to 8 decimal places
+        token0_amount = abs(token0_amount).quantize(Decimal("0.00000001"))
+        token1_amount = abs(token1_amount).quantize(Decimal("0.00000001"))
+        return token0_amount, token1_amount
+
     async def add_liquidity_persisted(
         self,
         pool_id: str,
@@ -285,7 +341,33 @@ class PoolOperator:
         tick_upper: int,
         amount: Decimal,
     ) -> Position:
-        """Add liquidity and persist to database."""
+        """
+        Add liquidity and persist to database.
+
+        If a token_deployer is attached, this also escrows the required
+        token0/token1 amounts from the LP's balance into the pool vault.
+        """
+        pool = self._pool_manager.get_pool(pool_id)
+        if not pool:
+            raise ValueError(f"Pool {pool_id} not found")
+
+        # Calculate required token deposits BEFORE modifying pool state
+        token0_needed, token1_needed = self.calculate_token_amounts(
+            pool_id, tick_lower, tick_upper, amount,
+        )
+
+        # Transfer tokens from LP → pool vault (if token_deployer wired)
+        if self._token_deployer:
+            vault = self._pool_vault_address(pool_id)
+            t0, t1 = pool.state.token0, pool.state.token1
+            if token0_needed > 0:
+                await self._token_deployer.transfer(t0, owner, vault, token0_needed)
+                logger.debug("  escrow %s %s → vault %s", token0_needed, t0, vault[:16])
+            if token1_needed > 0:
+                await self._token_deployer.transfer(t1, owner, vault, token1_needed)
+                logger.debug("  escrow %s %s → vault %s", token1_needed, t1, vault[:16])
+
+        # Now add liquidity in the AMM engine
         position = self.add_liquidity(pool_id, owner, tick_lower, tick_upper, amount)
 
         await self._persistence.add_position(
@@ -297,14 +379,12 @@ class PoolOperator:
         )
 
         # Sync in-memory pool state to DB
-        pool = self._pool_manager.get_pool(pool_id)
-        if pool:
-            await self._persistence.update_pool_state(
-                pool_id=pool_id,
-                sqrt_price=pool.state.sqrt_price,
-                tick=pool.state.tick,
-                liquidity=pool.state.liquidity,
-            )
+        await self._persistence.update_pool_state(
+            pool_id=pool_id,
+            sqrt_price=pool.state.sqrt_price,
+            tick=pool.state.tick,
+            liquidity=pool.state.liquidity,
+        )
 
         return position
 
@@ -366,12 +446,30 @@ class PoolOperator:
         sender: str,
         min_amount_out: Decimal = ZERO,
     ) -> Tuple[Decimal, Decimal]:
-        """Execute swap and persist to database."""
-        amount_out, fee = self.swap(pool_id, amount_in, zero_for_one, min_amount_out)
+        """
+        Execute swap, transfer real token balances, and persist to database.
 
+        If a token_deployer is attached:
+          1. Debit amount_in of token_in from sender
+          2. Credit amount_out of token_out to sender
+          (fees remain in the pool vault as LP revenue)
+        """
         pool = self._pool_manager.get_pool(pool_id)
         token_in = pool.state.token0 if zero_for_one else pool.state.token1
         token_out = pool.state.token1 if zero_for_one else pool.state.token0
+        vault = self._pool_vault_address(pool_id)
+
+        # Transfer token_in from sender → pool vault BEFORE executing swap
+        if self._token_deployer:
+            await self._token_deployer.transfer(token_in, sender, vault, amount_in)
+
+        # Execute the AMM swap (updates prices, fees, volumes)
+        amount_out, fee = self.swap(pool_id, amount_in, zero_for_one, min_amount_out)
+
+        # Transfer token_out from pool vault → sender
+        if self._token_deployer:
+            await self._token_deployer.transfer(token_out, vault, sender, amount_out)
+
         await self._persistence.record_swap(
             pool_id=pool_id,
             sender_address=sender,

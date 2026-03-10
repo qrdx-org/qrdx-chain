@@ -201,6 +201,44 @@ class TokenDeployer:
             tokens[spec["symbol"]] = token
         return tokens
 
+    async def load_existing_tokens(self) -> Dict[str, QRC20Token]:
+        """
+        Reload tokens from the database into the in-memory registry.
+
+        Use this when another session (e.g. S05) already deployed tokens
+        and you need to operate on them without re-deploying.
+        """
+        db_tokens = await self._persistence.list_tokens()
+        loaded = {}
+        for row in db_tokens:
+            symbol = row["symbol"]
+            if self._registry.get(symbol):
+                loaded[symbol] = self._registry.get(symbol)
+                continue
+
+            # Reconstruct the in-memory token
+            token = QRC20Token(
+                name=row["name"],
+                symbol=symbol,
+                decimals=row["decimals"],
+                total_supply=Decimal(str(row["total_supply"])),
+                deployer=row["owner_address"],
+                verify_signature_fn=None,  # no sig check in integration tests
+            )
+
+            # Restore all balances from DB
+            token_address = self._generate_token_address(symbol)
+            balances = await self._persistence.get_all_balances(token_address)
+            for addr, bal in balances.items():
+                token._balances[addr] = bal
+
+            self._registry.deploy(token)
+            loaded[symbol] = token
+            logger.info("  ↻ Loaded token from DB: %s (%s holders)",
+                        symbol, len(balances))
+
+        return loaded
+
     # ─────────── Transfer Operations ───────────
 
     async def transfer(
