@@ -60,7 +60,7 @@ class S04Transactions(Scenario):
                 from_address=sender_addr,
                 to_address=recipient_addr,
                 amount=amount,
-                private_key_hex=private_key_hex,
+                private_key=int(private_key_hex, 16),
             )
 
             self.check_not_none(tx_hash, "Transaction submitted successfully")

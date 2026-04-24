@@ -39,6 +39,8 @@ class S11Stress(Scenario):
             self.check(False, "Sender private key available")
             return
 
+        private_key_int = int(private_key_hex, 16)
+
         async with TransactionSender(node_url) as sender:
             # Check sender has enough funds
             balance = await sender.get_balance(sender_addr)
@@ -62,7 +64,7 @@ class S11Stress(Scenario):
                         from_address=sender_addr,
                         to_address=recipient_addr,
                         amount=Decimal("0.001"),
-                        private_key_hex=private_key_hex,
+                        private_key=private_key_int,
                     )
                     if tx_hash:
                         submitted.append(tx_hash)
