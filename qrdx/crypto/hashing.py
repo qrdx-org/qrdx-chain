@@ -134,13 +134,56 @@ def sha256_hex(data: Union[bytes, str]) -> str:
 def double_sha256(data: Union[bytes, str]) -> bytes:
     """
     Compute double SHA-256 hash (SHA-256(SHA-256(data))).
-    
+
     Used in Bitcoin-style protocols.
-    
+
     Args:
         data: Input bytes or hex string
-        
+
     Returns:
         32-byte hash
     """
     return sha256(sha256(data))
+
+
+# ---------------------------------------------------------------------------
+# BLAKE3 — quantum-resistant state hashing (Whitepaper §3.6)
+# ---------------------------------------------------------------------------
+# The whitepaper specifies the State Root Hash as BLAKE3 with a 256-bit core
+# output extended to 512-bit for quantum (Grover) resistance. BLAKE3 is an XOF,
+# so the output length is a parameter.
+
+# Bytes produced for a consensus state root (512-bit per Whitepaper §3.6).
+STATE_ROOT_SIZE = 64
+
+
+def _to_bytes(data: Union[bytes, str]) -> bytes:
+    return data if isinstance(data, (bytes, bytearray)) else str(data).encode("utf-8")
+
+
+def blake3_hash(data: Union[bytes, str], size: int = 32) -> bytes:
+    """
+    BLAKE3 digest of ``data`` with ``size`` output bytes (default 256-bit).
+
+    Args:
+        data: Input bytes or string.
+        size: Output length in bytes (BLAKE3 is extendable-output).
+
+    Returns:
+        ``size``-byte BLAKE3 digest.
+    """
+    import blake3
+    return blake3.blake3(_to_bytes(data)).digest(length=size)
+
+
+def state_root_hash(data: Union[bytes, str]) -> bytes:
+    """
+    Quantum-resistant consensus state-root hash (Whitepaper §3.6):
+    BLAKE3 with 512-bit output.
+    """
+    return blake3_hash(data, STATE_ROOT_SIZE)
+
+
+def state_root_hex(data: Union[bytes, str]) -> str:
+    """``state_root_hash`` as a lowercase hex string (128 chars)."""
+    return state_root_hash(data).hex()

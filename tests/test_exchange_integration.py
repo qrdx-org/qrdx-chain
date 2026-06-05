@@ -276,7 +276,7 @@ class TestExchangeStateManagerLifecycle:
         mgr.begin_block(1, 1000.0)
         root = mgr.finalize_block()
         assert isinstance(root, str)
-        assert len(root) == 64  # blake2b-256 hex
+        assert len(root) == 128  # BLAKE3-512 hex (Whitepaper §3.6)
 
     def test_state_root_deterministic(self, mgr):
         mgr.begin_block(1, 1000.0)
@@ -575,14 +575,14 @@ class TestBlockProcessor:
         success, error, root = process_exchange_transactions(1, 1000.0, [])
         assert success
         assert error == ""
-        assert len(root) == 64
+        assert len(root) == 128  # BLAKE3-512 hex (Whitepaper §3.6)
 
     def test_single_oracle_update(self):
         tx = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=VALIDATOR, nonce=0,
                       params={"pair": "TEST:USD", "price": "42"})
         success, error, root = process_exchange_transactions(1, 1000.0, [tx])
         assert success
-        assert len(root) == 64
+        assert len(root) == 128  # BLAKE3-512 hex (Whitepaper §3.6)
 
     def test_multiple_transactions(self):
         txs = [
@@ -832,7 +832,7 @@ class TestFullBlockLifecycle:
 
         # Finalize
         root = mgr.finalize_block()
-        assert len(root) == 64
+        assert len(root) == 128  # BLAKE3-512 hex (Whitepaper §3.6)
 
         # Stats updated
         assert mgr._total_pools == 1

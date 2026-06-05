@@ -101,6 +101,13 @@ node rebuilt from chain history reconstructs identical account/exchange state.
   already invariant under `getcontext().prec ∈ {28,50,78}` — the engine quantizes
   deterministically, so this is not currently a divergence risk; a regression
   test should still pin it.)*
+- B3. ✅ **State-root hashing now matches Whitepaper §3.6: BLAKE3, 512-bit.**
+  Added `state_root_hash`/`blake3_hash` (`qrdx/crypto/hashing.py`) and migrated
+  the exchange `compute_state_root` (now 128-hex BLAKE3-512) and the block-body
+  canonical digest off blake2b. `blake3` is a declared dependency
+  (`requirements-v3.txt`). Pinned by `tests/test_state_root_hash_standard.py`.
+  *(Remaining: the UTXO/PoW block `state_root` in `manager.py` still uses
+  SHA-256; migrate when the unified state root is bound into the header — D4.)*
 
 **Phase C — Reconcile to one block path (remove PG remnants). ✅ done (this change)**
 - C1. ✅ Removed the dead PostgreSQL duplicate path: deleted

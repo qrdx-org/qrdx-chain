@@ -546,9 +546,12 @@ class ExchangeStateManager:
         state at each block boundary.
 
         Returns:
-            64-char hex string (blake2b-256)
+            128-char hex string (BLAKE3-512, Whitepaper §3.6 quantum-resistant
+            state root). Internal per-component digests use blake2b as a
+            deterministic compression step; the committed root is BLAKE3.
         """
-        hasher = hashlib.blake2b(digest_size=32)
+        import blake3
+        hasher = blake3.blake3()
 
         # 1. Pool state hashes (sorted by pool ID)
         pool_ids = sorted(self.pool_manager._pools.keys())
@@ -599,7 +602,8 @@ class ExchangeStateManager:
         # 6. Block metadata
         hasher.update(self._current_block_height.to_bytes(8, "big"))
 
-        return hasher.hexdigest()
+        from ..crypto.hashing import STATE_ROOT_SIZE
+        return hasher.digest(length=STATE_ROOT_SIZE).hex()
 
     # =====================================================================
     #  Snapshot / restore (for revert)

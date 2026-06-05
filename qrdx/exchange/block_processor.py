@@ -301,13 +301,13 @@ def exchange_txs_canonical_bytes(txs: List[ExchangeTransaction]) -> bytes:
 
     Two validators with the same ordered transaction list MUST produce identical
     bytes. Uses each transaction's consensus-critical ``tx_hash`` in order, so
-    any reordering or mutation changes the result.
+    any reordering or mutation changes the result. BLAKE3 per Whitepaper §3.6.
     """
-    import hashlib
-    h = hashlib.blake2b(digest_size=32)
+    import blake3
+    h = blake3.blake3()
     for tx in txs:
         h.update(bytes.fromhex(tx.tx_hash()))
-    return h.digest()
+    return h.digest(length=32)
 
 
 def extract_exchange_transactions_from_dict(block: Dict[str, Any]) -> List[ExchangeTransaction]:
