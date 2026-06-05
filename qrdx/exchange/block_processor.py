@@ -260,6 +260,69 @@ def extract_exchange_transactions(block: Any) -> List[ExchangeTransaction]:
 
 
 # ---------------------------------------------------------------------------
+# Block-body codec for exchange transactions  (Phase D2, sub-step 1)
+# ---------------------------------------------------------------------------
+#
+# Exchange transactions ride in a dedicated, backward-compatible block-body
+# section: ``block["exchange_transactions"] = [tx.to_dict(), ...]`` in the
+# canonical order chosen by the proposer (ExchangeMempool.select_for_block).
+# A block with no exchange activity simply omits the key. These helpers are the
+# wire codec that the proposer (D2) and importing nodes (D3) will share; they do
+# NOT yet touch live block production.
+
+BLOCK_EXCHANGE_TXS_KEY = "exchange_transactions"
+
+
+def encode_exchange_txs(txs: List[ExchangeTransaction]) -> List[Dict[str, Any]]:
+    """
+    Encode an ordered list of exchange transactions for the block body.
+
+    Order is preserved exactly (it is consensus-relevant — the proposer's
+    canonical selection order). Per-tx ``to_dict`` already serializes the PQ
+    signature + public key, so authentication survives the round trip.
+    """
+    return [tx.to_dict() for tx in txs]
+
+
+def decode_exchange_txs(items: Optional[List[Dict[str, Any]]]) -> List[ExchangeTransaction]:
+    """
+    Decode the block-body exchange section back into transactions.
+
+    Backward compatible: a missing/empty section yields an empty list.
+    """
+    if not items:
+        return []
+    return [ExchangeTransaction.from_dict(d) for d in items]
+
+
+def exchange_txs_canonical_bytes(txs: List[ExchangeTransaction]) -> bytes:
+    """
+    Deterministic byte encoding of the exchange section, for hashing / equality.
+
+    Two validators with the same ordered transaction list MUST produce identical
+    bytes. Uses each transaction's consensus-critical ``tx_hash`` in order, so
+    any reordering or mutation changes the result.
+    """
+    import hashlib
+    h = hashlib.blake2b(digest_size=32)
+    for tx in txs:
+        h.update(bytes.fromhex(tx.tx_hash()))
+    return h.digest()
+
+
+def extract_exchange_transactions_from_dict(block: Dict[str, Any]) -> List[ExchangeTransaction]:
+    """
+    Recover exchange transactions from a serialized block dict (the wire form).
+
+    Reads ``block[BLOCK_EXCHANGE_TXS_KEY]``; absent ⇒ empty list. Counterpart to
+    ``extract_exchange_transactions`` (which scans an in-memory block object).
+    """
+    if not isinstance(block, dict):
+        return []
+    return decode_exchange_txs(block.get(BLOCK_EXCHANGE_TXS_KEY))
+
+
+# ---------------------------------------------------------------------------
 # Validator duty: build oracle update transactions
 # ---------------------------------------------------------------------------
 

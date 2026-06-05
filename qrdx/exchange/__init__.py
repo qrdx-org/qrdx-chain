@@ -73,6 +73,11 @@ from .block_processor import (
     build_oracle_update_tx,
     get_validator_fee_share,
     verify_exchange_tx,
+    encode_exchange_txs,
+    decode_exchange_txs,
+    exchange_txs_canonical_bytes,
+    extract_exchange_transactions_from_dict,
+    BLOCK_EXCHANGE_TXS_KEY,
 )
 from .mempool import ExchangeMempool
 
@@ -101,6 +106,10 @@ __all__ = [
     "process_exchange_transactions", "validate_exchange_state_root",
     "extract_exchange_transactions", "build_oracle_update_tx",
     "get_validator_fee_share", "verify_exchange_tx",
+    # Block-body codec (Phase D2)
+    "encode_exchange_txs", "decode_exchange_txs",
+    "exchange_txs_canonical_bytes", "extract_exchange_transactions_from_dict",
+    "BLOCK_EXCHANGE_TXS_KEY",
     # Mempool (admission)
     "ExchangeMempool",
 ]
