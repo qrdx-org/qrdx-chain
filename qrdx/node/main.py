@@ -837,6 +837,38 @@ async def rpc_endpoint(body: dict = Body(...)):
 LAST_PENDING_TRANSACTIONS_CLEAN = [0]
 block_processing_lock = asyncio.Lock()
 
+# Seen-cache for EVM / account-model transactions (keyed by keccak(raw_tx)).
+# Prevents double execution and terminates gossip loops in Phase 1 cross-node
+# convergence. See docs/EVM_STATE_CONSENSUS_INTEGRATION.md.
+EVM_TX_CACHE = TimeBasedCache(max_size=4096, ttl_seconds=600)
+
+
+async def _gossip_evm_raw_tx(raw_tx_hex: str):
+    """
+    Best-effort propagate a signed EVM raw transaction to peers.
+
+    Each peer runs the identical deterministic ``eth_sendRawTransaction``
+    execution, so all live nodes converge on the same ``account_state``. The
+    peer's own EVM_TX_CACHE stops the gossip from looping. This is Phase 1
+    (live convergence) only — it does not make EVM state durable across resync;
+    block-level inclusion is the documented Phase 2 follow-up.
+    """
+    try:
+        peers = NodesManager.get_propagate_peers()
+    except Exception as e:
+        logger.debug("EVM gossip: could not list peers: %s", e)
+        return
+    for peer in peers:
+        url = peer.get('url')
+        if not url:
+            continue
+        try:
+            ni = NodeInterface(url, client=http_client, db=db)
+            # _propagated=True so the receiving peer does not re-broadcast on our behalf.
+            await ni._rpc_call('eth_sendRawTransaction', [raw_tx_hex, True])
+        except Exception as e:
+            logger.debug("EVM tx gossip to %s failed: %s", url, e)
+
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
@@ -2465,8 +2497,15 @@ async def startup():
                 
                 return encode_hex(result.output)
             
-            async def eth_sendRawTransaction_handler(raw_tx_hex):
-                """Send a pre-signed raw transaction with full state synchronization."""
+            async def eth_sendRawTransaction_handler(raw_tx_hex, _propagated=False):
+                """
+                Send a pre-signed raw transaction with full state synchronization.
+
+                ``_propagated`` is set True when the transaction arrived via peer
+                gossip rather than an originating client, so the node executes it
+                but does not re-broadcast (the EVM_TX_CACHE seen-check is the primary
+                loop guard; this is a belt-and-suspenders second guard).
+                """
                 try:
                     from eth_utils import decode_hex, encode_hex
                     from eth_keys import keys
@@ -2474,10 +2513,17 @@ async def startup():
                     import rlp
                     from eth_hash.auto import keccak
                     from ..contracts.state_sync import StateSyncManager, ExecutionContext
-                    
+
                     # Decode raw transaction
                     raw_tx = decode_hex(raw_tx_hex)
-                    
+
+                    # Phase 1 convergence: skip if we've already seen this tx
+                    # (idempotent; prevents double execution and gossip loops).
+                    _evm_tx_hash = encode_hex(keccak(raw_tx))
+                    if await EVM_TX_CACHE.contains(_evm_tx_hash):
+                        return _evm_tx_hash
+                    await EVM_TX_CACHE.put(_evm_tx_hash, True)
+
                     # Parse RLP-encoded signed transaction
                     tx_data = rlp.decode(raw_tx)
                     
@@ -2581,7 +2627,15 @@ async def startup():
                         if not result.success:
                             logger.error(f"EVM execution failed: {result.error}")
                             raise Exception(f"Execution failed: {result.error}")
-                        
+
+                        # Phase 1 cross-node convergence: gossip the signed raw tx to
+                        # peers so every live node applies the same deterministic EVM
+                        # state transition. The EVM_TX_CACHE seen-check above makes this
+                        # idempotent and terminates gossip loops.
+                        # See docs/EVM_STATE_CONSENSUS_INTEGRATION.md.
+                        if not _propagated:
+                            asyncio.create_task(_gossip_evm_raw_tx(raw_tx_hex))
+
                         if result.created_address:
                             contract_addr = encode_hex(result.created_address)
                             logger.info(f"✅ Contract deployed at: {contract_addr}")

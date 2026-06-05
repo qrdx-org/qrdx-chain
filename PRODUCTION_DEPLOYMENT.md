@@ -691,16 +691,29 @@ No core/protocol change was needed; the harness was simply built against the wro
    **Fix:** bind the stake as `str(Decimal(...))`. Genesis now correctly registers the validator
    set. **Result:** S07 (7/7) and S08 governance (8/8) pass. ✅
 
-### 14.8 Multi-node height drift / account-state propagation (observed, non-blocking)
+### 14.8 EVM/account-model state was out-of-consensus — Phase 1 fixed; Phase 2 required
 
-**Note:** The `eth_sendRawTransaction` handler applies the transfer to the receiving node's
-`account_state` synchronously and does not yet propagate that account-state delta to peers via
-block production/gossip — cross-node `account_state` consistency relies on block sync. In testing,
-cross-node *balance* and *block-hash* consistency held; only instantaneous *height drift* between
-freshly-started nodes occasionally exceeded a tight threshold (a late-joining node lagging a few
-blocks). The S10 consistency check now polls for convergence rather than asserting on a single
-snapshot. For production, validate account-state propagation under sustained multi-node load before
-relying on read-your-writes across arbitrary nodes.
+**Issue (as found):** `eth_sendRawTransaction` applied EVM transfers to the receiving node's
+`account_state` only — no mempool, no gossip, no block inclusion — and block import never re-executes
+EVM transactions. So account-model state was single-node and not durable across resync. See the full
+analysis and design in [docs/EVM_STATE_CONSENSUS_INTEGRATION.md](docs/EVM_STATE_CONSENSUS_INTEGRATION.md).
+
+**Phase 1 (implemented):** `eth_sendRawTransaction` now gossips the signed raw tx to peers, which run
+the identical deterministic execution, so all **live** nodes converge on the same `account_state`. A
+seen-cache (`EVM_TX_CACHE`) makes this idempotent and terminates gossip loops. Verified at the DB
+level — after a transfer, all 4 testnet nodes hold a byte-identical recipient `account_state` row;
+S10 now asserts cross-node `eth_getBalance` consistency (not the unchanged UTXO balance).
+
+**Phase 2 (required before mainnet):** make EVM txs first-class consensus objects — mempool →
+block inclusion → deterministic replay on import → unified state root. Until then, EVM state is
+**not durable across a full resync** and **not consensus-final**; a node rebuilt from chain history
+will not have post-genesis account-model state. Do not rely on this for mainnet value custody.
+
+**Separately — testnet startup flakiness (pre-existing, non-blocking):** node bootstrap / peer-mesh
+formation is timing-sensitive; roughly 1 in 5 fresh multi-node starts has a node miss the initial
+mesh and cascade scenario skips. This predates these changes and is a harness/orchestration timing
+issue, not a protocol fault. The S10 height-drift check polls for convergence rather than asserting
+on a single snapshot. Harden node-startup readiness/retry before relying on the suite in CI gating.
 
 > **Integration test status (run June 2026, post-fix):** `test_full_integration_suite` →
 > **11 passed, 0 failed, 0 skipped (100%)**, stable across consecutive runs. All scenarios pass:

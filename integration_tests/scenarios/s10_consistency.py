@@ -105,30 +105,45 @@ class S10Consistency(Scenario):
                         f"Block {common_height} hash consistent across nodes ({len(hashes)} unique hashes)"
                     )
 
-        # Check first_tx_hash visible on all nodes.
-        # ETH-path transactions may not be stored in the UTXO transaction table
-        # or have ETH receipts.  Verify the effect instead: check that the
-        # recipient address balance is consistent across all nodes.
+        # Verify the S04 transfer propagated across nodes at the ACCOUNT-MODEL
+        # layer (eth_getBalance), not the UTXO layer. The transfer mutates
+        # account_state; without cross-node propagation (Phase 1 gossip — see
+        # docs/EVM_STATE_CONSENSUS_INTEGRATION.md) only the receiving node would
+        # reflect it. Reading the UTXO balance would hide the gap because it is
+        # unchanged by EVM transfers, so this check uses eth_getBalance.
         tx_hash = self.ctx.artifacts.get("first_tx_hash")
         recipient_addr = self.ctx.artifacts.get("first_tx_recipient")
         if recipient_addr:
-            # Verify balance consistency across nodes
-            balances = {}
-            for url in node_urls:
-                try:
-                    await asyncio.sleep(0.3)
-                    async with NodeRPCClient(url) as client:
-                        bal = await client.get_balance(recipient_addr)
-                        balances[url] = bal
-                except Exception:
-                    pass
+            # Poll for convergence, then assert account-model balance is identical
+            # on every node (and non-zero — the recipient was funded + received).
+            eth_balances = {}
+            for _ in range(5):
+                eth_balances = {}
+                for url in node_urls:
+                    try:
+                        await asyncio.sleep(0.3)
+                        async with NodeRPCClient(url) as client:
+                            eth_balances[url] = await client.eth_get_balance(recipient_addr)
+                    except Exception:
+                        pass
+                if eth_balances and len(set(eth_balances.values())) == 1:
+                    break
+                await asyncio.sleep(2)
 
-            if balances:
-                unique_balances = set(balances.values())
+            if eth_balances:
+                unique = set(eth_balances.values())
+                self._log.info(
+                    "Recipient account-model balances (wei): %s",
+                    {u: b for u, b in eth_balances.items()},
+                )
                 self.check(
-                    len(unique_balances) == 1,
-                    f"Recipient balance consistent across {len(balances)} nodes "
-                    f"(unique={len(unique_balances)})"
+                    len(unique) == 1,
+                    f"Recipient account balance consistent across {len(eth_balances)} nodes "
+                    f"(unique={len(unique)})",
+                )
+                self.check(
+                    all(b > 0 for b in eth_balances.values()),
+                    "Recipient account balance reflects funding/transfer (> 0 on all nodes)",
                 )
             else:
                 self.check(True, "Balance consistency (no balance data, graceful skip)")
