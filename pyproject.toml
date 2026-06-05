@@ -148,4 +148,18 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short"
+pythonpath = ["."]
+addopts = "-v --tb=short -m 'not integration'"
+timeout = 60
+markers = [
+    "integration: marks tests that launch real nodes and require network ports (deselect with '-m not integration')",
+    "slow: marks tests that take more than 10 seconds",
+]
+filterwarnings = [
+    "error::RuntimeWarning",
+    "error::pytest.PytestReturnNotNoneWarning",
+    "ignore::DeprecationWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+    "ignore::pytest.PytestCollectionWarning",
+    "ignore::UserWarning:oqs",
+]

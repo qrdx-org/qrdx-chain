@@ -340,7 +340,7 @@ class TestNothingAtStake:
 class TestLongRangeAttack:
     """Step 3.1: Long-range attack — finalized blocks must be immutable."""
 
-    def test_finalized_block_cannot_be_reverted(self):
+    async def test_finalized_block_cannot_be_reverted(self):
         """Fork choice must reject blocks that conflict with finalized checkpoint."""
         from qrdx.validator.fork_choice import ForkChoiceStore, BlockNode, Checkpoint
 
@@ -369,7 +369,7 @@ class TestLongRangeAttack:
                 proposer_address="0xPQ" + "01" * 32,
                 state_root="0x" + "aa" * 32,
             )
-            store.on_block(node)
+            await store.on_block(node)
             parent = bh
 
         # Finalize epoch 1
@@ -388,7 +388,7 @@ class TestLongRangeAttack:
         # Fork choice should not allow a block from before finalized epoch
         # to become the head
         try:
-            store.on_block(attacker_block)
+            await store.on_block(attacker_block)
         except (ValueError, Exception):
             pass  # Rejected — expected
         head = store.get_head()

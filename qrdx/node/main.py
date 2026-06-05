@@ -3697,6 +3697,24 @@ async def get_pending_transactions(pretty: bool = False):
     return Response(content=json.dumps(result, indent=4, cls=CustomJSONEncoder), media_type="application/json") if pretty else result
 
 
+@app.get("/get_validators")
+async def get_validators(status: str = None, pretty: bool = False):
+    """
+    Return the PoS validator set from the validators table.
+
+    Validators are populated at genesis and updated through the staking
+    lifecycle. The ``validators`` key is included alongside the standard
+    ``{ok, result}`` envelope for client compatibility.
+    """
+    try:
+        validators = await db.get_validators(status=status)
+    except Exception as e:
+        logger.error(f"get_validators error: {e}")
+        validators = []
+    result = {'ok': True, 'result': validators, 'validators': validators}
+    return Response(content=json.dumps(result, indent=4, cls=CustomJSONEncoder), media_type="application/json") if pretty else result
+
+
 @app.get("/get_address_tokens")
 @limiter.limit("8/second")
 async def get_address_tokens(

@@ -88,61 +88,43 @@ def test_component_1_executor():
     """Test 1: EVM Executor Functionality"""
     print("TEST 1: EVM Executor (Component Verification)")
     print("-" * 80)
-    
+
     db = MockDB()
     state_manager = ContractStateManager(db)
     evm = QRDXEVMExecutor(state_manager)
-    
-    # SimpleStorage contract bytecode (from working test)
+
     bytecode_hex = "608060405234801561000f575f80fd5b506101438061001d5f395ff3fe608060405234801561000f575f80fd5b5060043610610034575f3560e01c806320965255146100385780635524107714610056575b5f80fd5b610040610072565b60405161004d919061009b565b60405180910390f35b610070600480360381019061006b91906100e2565b61007a565b005b5f8054905090565b805f8190555050565b5f819050919050565b61009581610083565b82525050565b5f6020820190506100ae5f83018461008c565b92915050565b5f80fd5b6100c181610083565b81146100cb575f80fd5b50565b5f813590506100dc816100b8565b92915050565b5f602082840312156100f7576100f66100b4565b5b5f610104848285016100ce565b9150509291505056fea2646970667358221220e9b9c1f8c6c8f0c8c2c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c864736f6c63430008180033"
     bytecode = bytes.fromhex(bytecode_hex)
-    
-    # Use canonical address (bytes, not hex string)
+
     from eth_utils import to_canonical_address, to_checksum_address
     sender_canonical = to_canonical_address("0x1234567890123456789012345678901234567890")
     sender = to_checksum_address(sender_canonical)
-    
-    # Fund sender
+
     state_manager.set_balance_sync(sender, 10**20)
-    
-    # Deploy contract
+
     result = evm.execute(sender=sender_canonical, to=None, value=0, data=bytecode, gas=500000, gas_price=1)
-    
-    if not result.success:
-        print(f"❌ FAILED: Contract deployment failed: {result.error}")
-        return False
-    
+    assert result.success, f"Contract deployment failed: {result.error}"
+
     contract_address = result.created_address
     print(f"✅ Contract deployed: {contract_address}")
     print(f"   Gas used: {result.gas_used:,}")
-    
-    # Call setValue(42)
+
     set_value_data = bytes.fromhex("55241077") + (42).to_bytes(32, 'big')
     result = evm.execute(sender=sender_canonical, to=contract_address, value=0, data=set_value_data, gas=100000, gas_price=1)
-    
-    if not result.success:
-        print(f"❌ FAILED: setValue failed: {result.error}")
-        return False
-    
+    assert result.success, f"setValue failed: {result.error}"
+
     print(f"✅ setValue(42) executed")
     print(f"   Gas used: {result.gas_used:,}")
-    
-    # Read getValue()
+
     get_value_data = bytes.fromhex("20965255")
     result = evm.call(sender=sender_canonical, to=contract_address, data=get_value_data, value=0, gas=100000)
-    
-    if not result.success:
-        print(f"❌ FAILED: getValue failed: {result.error}")
-        return False
-    
+    assert result.success, f"getValue failed: {result.error}"
+
     value = int.from_bytes(result.output, 'big')
-    if value != 42:
-        print(f"❌ FAILED: Expected 42, got {value}")
-        return False
-    
+    assert value == 42, f"Expected 42, got {value}"
+
     print(f"✅ getValue() returned: {value}")
     print()
-    return True
 
 
 async def test_component_2_consensus():
@@ -164,94 +146,63 @@ async def test_component_2_consensus():
     # Execute contracts in block
     is_valid, error = await execute_and_validate_contracts(block, db)
     
-    if not is_valid:
-        print(f"❌ FAILED: Block validation failed: {error}")
-        return False
-    
+    assert is_valid, f"Block validation failed: {error}"
+
     print(f"✅ Block validation passed")
     print(f"   Contracts executed: 1")
     print(f"   Deployment validated: ✓")
     print()
-    return True
 
 
 def test_component_3_transaction_handling():
     """Test 3: Transaction Type Handling"""
     print("TEST 3: Transaction Type Handling (Network Layer)")
     print("-" * 80)
-    
-    # Verify ContractTransaction is properly defined
-    try:
-        from qrdx.transactions.contract_transaction import ContractTransaction
-        print("✅ ContractTransaction imported successfully")
-    except ImportError as e:
-        print(f"❌ FAILED: Cannot import ContractTransaction: {e}")
-        return False
-    
-    # Verify it has required attributes (not all need to be methods)
-    required_attrs = ['sender', 'to', 'data', 'value']
-    for attr in required_attrs:
-        # Check if it's a valid class that can have these attributes
-        print(f"✅ ContractTransaction defined properly")
-        break
-    
+
+    from qrdx.transactions.contract_transaction import ContractTransaction
+    print("✅ ContractTransaction imported successfully")
+
     print(f"✅ ContractTransaction ready for network use")
     print()
-    return True
 
 
 def test_component_4_state_management():
     """Test 4: State Management"""
     print("TEST 4: State Management (Persistence)")
     print("-" * 80)
-    
+
     db = MockDB()
     state_manager = ContractStateManager(db)
-    
-    # Create account
+
     address = "0x1234567890123456789012345678901234567890"
     state_manager.set_balance_sync(address, 1000000)
     state_manager.set_nonce_sync(address, 5)
-    
+
     balance = state_manager.get_balance_sync(address)
     nonce = state_manager.get_nonce_sync(address)
-    
-    if balance != 1000000:
-        print(f"❌ FAILED: Balance mismatch: expected 1000000, got {balance}")
-        return False
-    
-    if nonce != 5:
-        print(f"❌ FAILED: Nonce mismatch: expected 5, got {nonce}")
-        return False
-    
+
+    assert balance == 1000000, f"Balance mismatch: expected 1000000, got {balance}"
+    assert nonce == 5, f"Nonce mismatch: expected 5, got {nonce}"
+
     print(f"✅ Account state management working")
     print(f"   Balance: {balance:,}")
     print(f"   Nonce: {nonce}")
-    
-    # Test storage
+
     key = b'\x00' * 32
     value = b'\x42' * 32
     state_manager.set_storage_sync(address, key, value)
     stored = state_manager.get_storage_sync(address, key)
-    
-    if stored != value:
-        print(f"❌ FAILED: Storage mismatch")
-        return False
-    
+    assert stored == value, "Storage mismatch"
+
     print(f"✅ Contract storage working")
-    
-    # Test code
+
     code = bytes.fromhex("608060405234801561001057600080fd5b50")
     state_manager.set_code_sync(address, code)
     retrieved = state_manager.get_code_sync(address)
-    
-    if retrieved != code:
-        print(f"❌ FAILED: Code mismatch")
-        return False
-    
+    assert retrieved == code, "Code mismatch"
+
     print(f"✅ Contract code storage working")
     print()
-    return True
 
 
 def test_component_5_rpc_api():
@@ -262,69 +213,82 @@ def test_component_5_rpc_api():
     try:
         from qrdx.rpc.modules.contracts import ContractRPCModule
         print("✅ ContractRPCModule imported successfully")
-    except ImportError as e:
-        print(f"⚠️  WARNING: Cannot import ContractRPCModule: {e}")
-        print("   (This is OK if RPC server isn't fully configured)")
-        return True
-    
-    # Verify QRDXEVMExecutor is used
+    except ImportError:
+        print("   (ContractRPCModule not available — RPC server not fully configured)")
+        print()
+        return
+
     from qrdx.contracts import QRDXEVMExecutor
     print(f"✅ QRDXEVMExecutor available for RPC")
-    
-    # Check for required RPC methods
+
     required_methods = [
         'eth_sendTransaction',
-        'eth_call', 
+        'eth_call',
         'eth_estimateGas',
         'eth_getBalance',
         'eth_getCode',
         'eth_getStorageAt'
     ]
-    
+
     module = ContractRPCModule
     found_methods = [m for m in required_methods if hasattr(module, m)]
-    
+
     if len(found_methods) == len(required_methods):
         print(f"✅ All RPC methods implemented")
         print(f"   Methods: {', '.join(found_methods)}")
     else:
         missing = set(required_methods) - set(found_methods)
         print(f"⚠️  Some RPC methods not found: {', '.join(missing)}")
-    
+
     print()
-    return True
 
 
 async def run_all_tests():
     """Run all integration tests"""
     results = []
     
+    def _run(name, fn, *args, **kwargs):
+        try:
+            fn(*args, **kwargs)
+            return (name, True)
+        except Exception as e:
+            print(f"❌ FAILED {name}: {e}")
+            return (name, False)
+
+    async def _run_async(name, coro):
+        try:
+            await coro
+            return (name, True)
+        except Exception as e:
+            print(f"❌ FAILED {name}: {e}")
+            return (name, False)
+
     # Component tests
-    results.append(("EVM Executor", test_component_1_executor()))
-    results.append(("Consensus Integration", await test_component_2_consensus()))
-    results.append(("Transaction Handling", test_component_3_transaction_handling()))
-    results.append(("State Management", test_component_4_state_management()))
-    results.append(("RPC API", test_component_5_rpc_api()))
-    
+    results.append(_run("EVM Executor", test_component_1_executor))
+    results.append(await _run_async("Consensus Integration", test_component_2_consensus()))
+    results.append(_run("Transaction Handling", test_component_3_transaction_handling))
+    results.append(_run("State Management", test_component_4_state_management))
+    results.append(_run("RPC API", test_component_5_rpc_api))
+
     # Summary
     print("=" * 80)
     print("TEST SUMMARY")
     print("=" * 80)
     print()
-    
+
     passed = sum(1 for _, result in results if result)
     total = len(results)
-    
+
     for name, result in results:
         status = "✅ PASS" if result else "❌ FAIL"
         print(f"{status:10} {name}")
-    
+
     print()
     print(f"Results: {passed}/{total} tests passed")
     print()
-    
+
     if passed == total:
-        print("🎉 ALL INTEGRATION TESTS PASSED! 🎉")
+        print("ALL INTEGRATION TESTS PASSED!")
         print()
         print("QRDX blockchain smart contract integration is:")
         print("  ✅ 100% Ethereum EVM compatible (Shanghai fork)")

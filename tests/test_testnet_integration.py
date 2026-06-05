@@ -13,6 +13,8 @@ import os
 
 import pytest
 
+pytestmark = pytest.mark.integration
+
 from integration_tests.config import build_node_specs, DATABASES_DIR
 from integration_tests.orchestrator import TestnetOrchestrator
 from integration_tests.scenarios.base import ScenarioContext, ScenarioRunner

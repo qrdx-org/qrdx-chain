@@ -476,14 +476,17 @@ class GenesisInitializer:
                     """, v['address'], v['public_key'], Decimal(v['stake']))
                     logger.debug(f"Initialized validator (PostgreSQL): {v['address'][:20]}...")
                 except Exception as pg_err:
-                    # Fall back to SQLite syntax
+                    # Fall back to SQLite syntax.
+                    # SQLite cannot bind Decimal objects, and stake/effective_stake
+                    # are TEXT columns, so the stake must be passed as a string.
                     logger.debug(f"PostgreSQL insert failed: {pg_err}, trying SQLite syntax")
+                    stake_str = str(Decimal(v['stake']))
                     await self.db.execute("""
                         INSERT OR IGNORE INTO validators (
                             address, public_key, stake, effective_stake,
                             status, activation_epoch, created_at
                         ) VALUES (?, ?, ?, ?, 'active', 0, datetime('now'))
-                    """, v['address'], v['public_key'], Decimal(v['stake']), Decimal(v['stake']))
+                    """, v['address'], v['public_key'], stake_str, stake_str)
                     logger.debug(f"Initialized validator (SQLite): {v['address'][:20]}...")
                 
             except Exception as e:

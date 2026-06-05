@@ -2150,7 +2150,7 @@ class TestConsensusIntegration:
         proposer = selector.select_proposer(0, validators, randao)
         assert proposer is not None
 
-    def test_rewards_with_real_constants(self):
+    async def test_rewards_with_real_constants(self):
         """Rewards calculator uses actual protocol constants."""
         from qrdx.constants import BASE_REWARD_FACTOR
         calc = RewardsCalculator()

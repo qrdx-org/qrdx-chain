@@ -826,10 +826,44 @@ class DatabaseSQLite:
             FROM validators
             WHERE address = ?
         """, (validator_address,))
-        
+
         row = await cursor.fetchone()
         return dict(row) if row else None
-    
+
+    async def get_validators(self, status: str = None):
+        """
+        Return the validator set, ordered by effective stake (descending).
+
+        Args:
+            status: Optional status filter (e.g. 'active'). None returns all.
+
+        Returns:
+            List of validator dicts.
+        """
+        if status:
+            cursor = await self.connection.execute("""
+                SELECT address, public_key, stake, effective_stake,
+                       status, activation_epoch, exit_epoch, slashed
+                FROM validators
+                WHERE status = ?
+                ORDER BY CAST(effective_stake AS REAL) DESC
+            """, (status,))
+        else:
+            cursor = await self.connection.execute("""
+                SELECT address, public_key, stake, effective_stake,
+                       status, activation_epoch, exit_epoch, slashed
+                FROM validators
+                ORDER BY CAST(effective_stake AS REAL) DESC
+            """)
+
+        rows = await cursor.fetchall()
+        validators = []
+        for row in rows:
+            entry = dict(row)
+            entry['slashed'] = bool(entry.get('slashed'))
+            validators.append(entry)
+        return validators
+
     async def get_attestations_filtered(self, filters: dict, limit: int, offset: int):
         """Get attestations with filters"""
         where_clauses = []

@@ -27,31 +27,59 @@ class S10Consistency(Scenario):
         # Brief pause to avoid rate-limit collisions from prior scenarios
         await asyncio.sleep(2)
 
-        # Collect chain tips from all nodes (with retry for rate limiting)
+        # Collect chain tips from all nodes, polling for convergence.
+        #
+        # In a live multi-node PoS network a single instantaneous snapshot can
+        # catch transient sync lag (a node that bootstrapped slightly later may
+        # be a few blocks behind). Rather than assert on one snapshot, poll a
+        # few times and keep the *best* (smallest) drift observed — this
+        # verifies that the nodes do converge within a short window.
+        MAX_DRIFT = 3
+        CONVERGE_ATTEMPTS = 5
+        CONVERGE_DELAY = 2.0  # ~1 slot
+
         tips = {}
-        for url in node_urls:
-            for attempt in range(3):
-                try:
-                    async with NodeRPCClient(url) as client:
-                        info = await client.get_mining_info()
-                        if info:
-                            last_block = info.get("last_block", {})
-                            height = last_block.get("id", 0)
-                            block_hash = last_block.get("hash", "")
-                            tips[url] = {"height": height, "hash": block_hash}
-                            break
-                except Exception as exc:
-                    self._log.warning("Tip query attempt %d failed for %s: %s", attempt + 1, url, exc)
-                    await asyncio.sleep(1)
+        best_drift = None
+        best_heights = []
+        for converge_attempt in range(CONVERGE_ATTEMPTS):
+            tips = {}
+            for url in node_urls:
+                for attempt in range(3):
+                    try:
+                        async with NodeRPCClient(url) as client:
+                            info = await client.get_mining_info()
+                            if info:
+                                last_block = info.get("last_block", {})
+                                height = last_block.get("id", 0)
+                                block_hash = last_block.get("hash", "")
+                                tips[url] = {"height": height, "hash": block_hash}
+                                break
+                    except Exception as exc:
+                        self._log.warning("Tip query attempt %d failed for %s: %s", attempt + 1, url, exc)
+                        await asyncio.sleep(1)
+
+            if len(tips) >= 2:
+                heights = [t["height"] for t in tips.values()]
+                drift = max(heights) - min(heights)
+                if best_drift is None or drift < best_drift:
+                    best_drift, best_heights = drift, heights
+                self._log.info(
+                    "Chain tip heights: %s (drift=%d, attempt %d/%d)",
+                    heights, drift, converge_attempt + 1, CONVERGE_ATTEMPTS,
+                )
+                if drift <= MAX_DRIFT:
+                    break
+            if converge_attempt < CONVERGE_ATTEMPTS - 1:
+                await asyncio.sleep(CONVERGE_DELAY)
 
         self.check(len(tips) >= 2, f"Got chain tips from {len(tips)} nodes")
 
         if len(tips) >= 2:
-            heights = [t["height"] for t in tips.values()]
-            min_h, max_h = min(heights), max(heights)
-            drift = max_h - min_h
-            self._log.info("Chain tip heights: %s (drift=%d)", heights, drift)
-            self.check(drift <= 3, f"Height drift acceptable (<= 3 blocks, got {drift})")
+            min_h = min(t["height"] for t in tips.values())
+            self.check(
+                best_drift is not None and best_drift <= MAX_DRIFT,
+                f"Height drift converges (<= {MAX_DRIFT} blocks, best={best_drift}, heights={best_heights})",
+            )
 
             # Check if the min-height block hash matches across nodes
             common_height = min_h
