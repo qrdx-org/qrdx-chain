@@ -25,6 +25,33 @@ logger = get_logger(__name__)
 SLOT_DURATION_SECONDS = SLOT_DURATION if isinstance(SLOT_DURATION, int) else 12
 
 
+def assemble_pos_block_data(block, height: int, exchange_txs=None) -> dict:
+    """
+    Build the broadcast/storage payload for a proposed PoS block (Phase D2.2).
+
+    The exchange section is **additive**: present only when the proposer included
+    exchange transactions, and ignored by importers that don't yet understand it
+    (backward compatible). It is encoded with the canonical D2.1 codec so it
+    round-trips and authenticates on the receiving side.
+
+    Pure function (no I/O) so it is unit-testable in isolation.
+    """
+    block_content = str(block.to_dict())
+    data = {
+        'id': height,
+        'block_content': block_content,
+        'block_hash': block.hash,
+        'validator_address': block.proposer_address,
+        'timestamp': getattr(block, 'timestamp', 0),
+    }
+    if exchange_txs:
+        # Imported lazily to avoid a hard dependency when the exchange module
+        # is not in use.
+        from ..exchange.block_processor import encode_exchange_txs, BLOCK_EXCHANGE_TXS_KEY
+        data[BLOCK_EXCHANGE_TXS_KEY] = encode_exchange_txs(exchange_txs)
+    return data
+
+
 class ValidatorNode:
     """
     Integrates PoS validator consensus into the node.
@@ -66,6 +93,11 @@ class ValidatorNode:
         # ── Doomsday / canary monitoring (§8.5) ──
         self._eth_adapter = None       # Set via set_eth_adapter()
         self._doomsday_protocol = None  # Set via set_doomsday_protocol()
+
+        # ── Exchange tx inclusion (Phase D2.2) ──
+        # An object exposing select_for_block(limit) -> [ExchangeTransaction]
+        # (the node's ExchangeMempool). Set via set_exchange_tx_source().
+        self._exchange_tx_source = None
         
         logger.info(f"ValidatorNode initialized for wallet: {validator_wallet_path}")
     
@@ -274,30 +306,44 @@ class ValidatorNode:
                 
                 if block:
                     logger.info(f"📦 Proposed block #{next_height} at slot {current_slot}: {block.hash[:16]}...")
-                    
+
+                    # Phase D2.2: include exchange transactions from the mempool
+                    # in the block body (additive — receivers that don't yet
+                    # understand the section ignore it). Conservatively, we do NOT
+                    # drain the mempool here: durable removal-on-inclusion waits
+                    # for receiver-side storage + replay (D2.2b/D3) so txs cannot
+                    # be lost before they are consensus-final.
+                    exchange_txs = []
+                    if self._exchange_tx_source is not None:
+                        try:
+                            exchange_txs = self._exchange_tx_source.select_for_block() or []
+                            if exchange_txs:
+                                logger.info(
+                                    f"📦 Including {len(exchange_txs)} exchange tx(s) in block #{next_height}"
+                                )
+                        except Exception as e:
+                            logger.warning(f"Exchange tx selection failed: {e}")
+                            exchange_txs = []
+
+                    block_data = assemble_pos_block_data(block, next_height, exchange_txs)
+
                     # Add block to database with sequential height
                     await self.db.add_block(
                         block_hash=block.hash,
                         block_height=next_height,
-                        block_content=str(block.to_dict()),
+                        block_content=block_data['block_content'],
                         validator_address=block.proposer_address,
                         timestamp=block.timestamp
                     )
-                    
+
                     # Broadcast block to network peers
                     if self.broadcast_callback:
                         try:
-                            block_data = {
-                                'id': next_height,
-                                'block_content': str(block.to_dict()),
-                                'block_hash': block.hash,
-                                'validator_address': block.proposer_address
-                            }
                             await self.broadcast_callback('submit_block', block_data, ignore_node_id=None, db=self.db)
                             logger.info(f"📡 Broadcast block #{next_height} to peers")
                         except Exception as e:
                             logger.warning(f"Failed to broadcast block: {e}")
-                    
+
                     logger.info(f"✅ Block {block.hash[:16]}... added to chain")
                 
                 # Wait for next slot
@@ -418,6 +464,17 @@ class ValidatorNode:
         """
         self._doomsday_protocol = doomsday
         logger.info("ValidatorNode: DoomsdayProtocol attached for canary monitoring")
+
+    def set_exchange_tx_source(self, source) -> None:
+        """
+        Attach the exchange mempool the proposer pulls transactions from.
+
+        Args:
+            source: object with ``select_for_block(limit) -> [ExchangeTransaction]``
+                    (the node's ``ExchangeMempool``).
+        """
+        self._exchange_tx_source = source
+        logger.info("ValidatorNode: exchange tx source attached for block inclusion")
 
     async def _canary_monitor_loop(self):
         """

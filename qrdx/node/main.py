@@ -2293,6 +2293,11 @@ async def startup():
                     logger.info(f"✅ Validator node started: {validator_node.wallet.address}")
                     # Store globally for access in endpoints
                     app.state.validator = validator_node
+                    # Phase D2.2: let the proposer include admitted exchange txs.
+                    try:
+                        validator_node.set_exchange_tx_source(_get_exchange_mempool())
+                    except Exception as e:
+                        logger.warning(f"Could not attach exchange tx source: {e}")
                 else:
                     logger.error("❌ Failed to initialize validator node")
             except Exception as e:

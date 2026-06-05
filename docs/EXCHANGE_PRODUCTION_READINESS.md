@@ -142,15 +142,26 @@ node rebuilt from chain history reconstructs identical account/exchange state.
     and order/tamper-sensitive, and backward compatible (blocks without the
     `exchange_transactions` section decode to empty). 10 tests in
     `tests/test_exchange_block_codec.py`. Pure functions — no live-path change.
-  - D2.2. *(next)* Proposer pulls `select_for_block()` from the node mempool and
-    writes the encoded section into the block body.
-  - **Blocker found (must fix in D2.2):** the live PoS proposer stores/broadcasts
-    blocks as `block_content = str(block.to_dict())` (a Python `repr`, not JSON)
-    and `to_dict()` omits transactions entirely (`validator/manager.py` +
-    `validator/node_integration.py`). Transactions are carried out-of-band via
-    the pending mempool, so the block body is not a faithful, parseable record.
-    A real JSON block body (carrying UTXO + exchange [+ EVM] txs) is a
-    prerequisite for D2.2/D3 and must replace the `str(dict)` serialization.
+  - D2.2a. ✅ **done (this change).** The proposer now includes the exchange
+    section in the broadcast/stored block body. `assemble_pos_block_data`
+    (`validator/node_integration.py`, pure + unit-tested) adds
+    `block[exchange_transactions]` from the node mempool's `select_for_block()`;
+    `ValidatorNode.set_exchange_tx_source(...)` wires the live mempool in
+    `node/main.py`. The section is **additive** (importers that don't understand
+    it ignore it) and authenticated txs survive the round trip. Conservatively,
+    the mempool is **not drained** on inclusion yet — durable removal waits for
+    receiver-side storage + replay (D2.2b/D3) so txs can't be lost before they
+    are consensus-final. Tests: `tests/test_pos_block_assembly.py` (4). Verified:
+    unit 1700; integration 11/11 (live proposer loop unchanged in behavior — the
+    section is empty when no exchange txs are queued).
+  - D2.2b. *(next)* Receiver (`/submit_block` + `process_and_create_block`)
+    recovers `block[exchange_transactions]` and persists it per block (new DB
+    table), and the proposer then drains the mempool on inclusion.
+  - **Known live-serialization debt (address in D2.2b/D3):** PoS blocks still
+    store `block_content = str(block.to_dict())` (a Python `repr`) with `to_dict`
+    omitting UTXO transactions; the block body is not yet a faithful parseable
+    record for *all* domains. The exchange section is a clean JSON list; the UTXO
+    body should be migrated to the same faithful form before D3 replay.
 - D3. Importing nodes re-execute all domains, recompute roots, reject on mismatch.
 - D4. `account_state_root` + `exchange_state_root` added to header + signing root.
 
