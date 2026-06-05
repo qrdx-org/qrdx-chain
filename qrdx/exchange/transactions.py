@@ -118,6 +118,47 @@ class ExchangeTransaction:
         """Bytes that the sender must sign."""
         return self._canonical_bytes()
 
+    # -- Authentication -----------------------------------------------------
+
+    def verify(self) -> bool:
+        """
+        Verify the transaction's post-quantum signature and sender binding.
+
+        Security-critical: this is the only thing standing between a submitted
+        exchange transaction and execution as ``self.sender``. It enforces two
+        properties:
+
+          1. **Authenticity** — the Dilithium signature over ``signing_bytes()``
+             is valid for the embedded ``public_key``.
+          2. **Binding** — ``public_key`` actually derives to ``sender``, so a
+             valid signature for some *other* key cannot be replayed against a
+             victim's address.
+
+        Returns:
+            True iff both hold. Never raises — callers branch on the bool.
+
+        Note:
+            This is an *admission/validation* check (mempool + block validation),
+            deliberately kept out of the deterministic execution core
+            (``ExchangeStateManager.process_transaction``), which assumes
+            already-admitted transactions.
+        """
+        if not self.signature or not self.public_key:
+            return False
+        try:
+            from ..crypto.pq.dilithium import PQPublicKey, PQSignature, verify as pq_verify
+
+            pub = PQPublicKey.from_bytes(self.public_key)
+
+            # Binding: the key must derive to the claimed sender address.
+            if pub.to_address().lower() != str(self.sender).lower():
+                return False
+
+            return pq_verify(pub, self.signing_bytes(), PQSignature.from_bytes(self.signature))
+        except Exception:
+            # Malformed key/signature material → unauthenticated.
+            return False
+
     # -- Serialization ------------------------------------------------------
 
     def to_dict(self) -> Dict[str, Any]:

@@ -72,6 +72,7 @@ from .block_processor import (
     extract_exchange_transactions,
     build_oracle_update_tx,
     get_validator_fee_share,
+    verify_exchange_tx,
 )
 
 __all__ = [
@@ -98,5 +99,5 @@ __all__ = [
     # Block Processor (consensus integration)
     "process_exchange_transactions", "validate_exchange_state_root",
     "extract_exchange_transactions", "build_oracle_update_tx",
-    "get_validator_fee_share",
+    "get_validator_fee_share", "verify_exchange_tx",
 ]

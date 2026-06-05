@@ -39,6 +39,35 @@ FUNDING_SETTLEMENT_INTERVAL = 32  # slots
 
 
 # ---------------------------------------------------------------------------
+# Admission: authenticate exchange transactions
+# ---------------------------------------------------------------------------
+
+def verify_exchange_tx(tx: ExchangeTransaction) -> Tuple[bool, str]:
+    """
+    Authenticate an exchange transaction for mempool admission / block validation.
+
+    The deterministic execution core (``ExchangeStateManager.process_transaction``)
+    trusts ``tx.sender`` and does NOT verify signatures, so this MUST be enforced
+    before a transaction is admitted to the mempool and again when validating a
+    received block — otherwise any party can act as any address.
+
+    Checks, in order:
+      1. structural validity (``validate_basic``),
+      2. post-quantum signature + sender-address binding (``tx.verify()``).
+
+    Returns:
+        (ok, error). ``error`` is empty on success.
+    """
+    try:
+        tx.validate_basic()
+    except ValueError as e:
+        return False, f"invalid structure: {e}"
+    if not tx.verify():
+        return False, "signature verification failed (bad signature or sender mismatch)"
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
 # Block-level exchange processing
 # ---------------------------------------------------------------------------
 
