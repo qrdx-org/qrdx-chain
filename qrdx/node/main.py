@@ -842,6 +842,19 @@ block_processing_lock = asyncio.Lock()
 # convergence. See docs/EVM_STATE_CONSENSUS_INTEGRATION.md.
 EVM_TX_CACHE = TimeBasedCache(max_size=4096, ttl_seconds=600)
 
+# Exchange-transaction admission mempool (Phase D1). Lazily created so the
+# exchange module is only imported when an exchange tx is actually submitted.
+# See docs/EXCHANGE_PRODUCTION_READINESS.md §4 Phase D1.
+EXCHANGE_MEMPOOL = None
+
+
+def _get_exchange_mempool():
+    global EXCHANGE_MEMPOOL
+    if EXCHANGE_MEMPOOL is None:
+        from qrdx.exchange import ExchangeMempool
+        EXCHANGE_MEMPOOL = ExchangeMempool()
+    return EXCHANGE_MEMPOOL
+
 
 async def _gossip_evm_raw_tx(raw_tx_hex: str):
     """
@@ -2895,6 +2908,34 @@ async def submit_tx(
         return {'ok': False, 'error': 'Transaction already present in pending pool'}
     except Exception as e:
         return {'ok': False, 'error': 'Transaction rejected'}
+
+
+@app.post("/submit_exchange_tx")
+@limiter.limit("30/minute")
+async def submit_exchange_tx(request: Request, body: dict = Body(...)):
+    """
+    Admit an exchange transaction to the local admission mempool (Phase D1).
+
+    Authentication (PQ signature + sender binding), nonce window, dedup, and
+    capacity are enforced by ``ExchangeMempool.admit`` before the transaction is
+    queued. This endpoint does NOT yet include the transaction in a block or
+    gossip it to peers — block inclusion + deterministic import replay are
+    Phase D2/D3 (see docs/EXCHANGE_PRODUCTION_READINESS.md).
+    """
+    tx_hex = body.get('tx_hex')
+    if not tx_hex:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="'tx_hex' not found in body.")
+
+    try:
+        mempool = _get_exchange_mempool()
+        ok, error, tx_hash = mempool.admit_hex(tx_hex)
+    except Exception as e:
+        logger.error(f"submit_exchange_tx error: {e}")
+        return {'ok': False, 'error': 'Exchange transaction rejected'}
+
+    if not ok:
+        return {'ok': False, 'error': error}
+    return {'ok': True, 'result': {'tx_hash': tx_hash, 'mempool_size': mempool.size()}}
 
 
 @app.post("/push_block")

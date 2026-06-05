@@ -121,10 +121,20 @@ node rebuilt from chain history reconstructs identical account/exchange state.
   `grep -rn 'database.pool\|\$1' qrdx/ --include=*.py`.
 
 **Phase D — Mempool → block inclusion → import replay.**
-- D1. Admit exchange + EVM txs to the mempool (sig-verified, nonce-checked,
-  deduplicated), tagged by domain.
-- D2. Proposer selects and includes them; block body serializes them
-  (round-trippable `to_dict`/`from_dict` already exist for exchange txs).
+- D1. ✅ **done (this change).** Exchange-transaction admission gate:
+  `qrdx/exchange/mempool.py::ExchangeMempool`. Enforces authentication (PQ
+  signature + sender binding via `verify_exchange_tx`), replay/dedup (per tx hash
+  and per `(sender, nonce)`), a nonce window (reject stale + far-future), and
+  global/per-sender capacity caps. `select_for_block()` yields a deterministic,
+  gap-free, per-sender-ordered executable set (the canonical ordering D2 will
+  use). Reachable on a live node via `POST /submit_exchange_tx`
+  (`node/main.py`), which admits only — no block effect yet. 15 unit tests in
+  `tests/test_exchange_mempool.py`; unit suite 1686 passed, integration 11/11.
+  *Remaining for D1: EVM-tx admission already recovers the sender in
+  `eth_sendRawTransaction`; add the same explicit nonce-window/dedup guard there;
+  and cross-node gossip of admitted exchange txs (folds naturally into D2).*
+- D2. Proposer selects (`select_for_block`) and includes them; block body
+  serializes them (round-trippable `to_dict`/`from_dict` already exist).
 - D3. Importing nodes re-execute all domains, recompute roots, reject on mismatch.
 - D4. `account_state_root` + `exchange_state_root` added to header + signing root.
 
