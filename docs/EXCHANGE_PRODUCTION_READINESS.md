@@ -97,13 +97,28 @@ node rebuilt from chain history reconstructs identical account/exchange state.
   *(done, §6)*
 - B2. Cross-validator determinism: pin Decimal precision/rounding
   (`getcontext().prec`) and canonical ordering; add differential test across two
-  fresh engine instances.
+  fresh engine instances. *(measured: the exchange `exchange_state_root` is
+  already invariant under `getcontext().prec ∈ {28,50,78}` — the engine quantizes
+  deterministically, so this is not currently a divergence risk; a regression
+  test should still pin it.)*
 
-**Phase C — Reconcile to one block path (remove PG remnants).**
-- C1. Delete or port `create_pos_block`/`commit_pos_block` PG code to SQLite, or
-  fold their exchange wiring into the live `ValidatorManager` + `node/main.py`
-  path. Exactly one block-commit function may exist.
-- C2. Remove `database.pool`/`$1` usages chain-wide (audit: `grep -rn 'database.pool\|\\$1'`).
+**Phase C — Reconcile to one block path (remove PG remnants). ✅ done (this change)**
+- C1. ✅ Removed the dead PostgreSQL duplicate path: deleted
+  `qrdx/node/validator_integration.py` (547 lines, provably unimported) and the
+  `create_pos_block` / `commit_pos_block` functions in `qrdx/manager.py` (broken
+  on SQLite: `database.pool` / `$1`). The exchange-wiring design they contained
+  is preserved in §3–§4 of this document. Verified dead first: zero references
+  repo-wide (incl. tests/scripts/dynamic imports). The live path is unchanged:
+  `node/main.py::process_and_create_block` → `manager.create_block`.
+- C2. ✅ Ported the one reachable PG remnant (`get_pos_chain_head`, called by the
+  validator RPC module) to SQLite; `manager.py` now has **zero** `database.pool`
+  / `$N` usages. Pinned by `tests/test_block_path_single_source.py`.
+- Verified: unit suite 1671 passed; integration testnet 11/11 (block production
+  + multi-node sync intact).
+- Remaining chain-wide: the legacy `qrdx/database.py` (asyncpg) is still present
+  but only referenced by a docstring; the live node uses `DatabaseSQLite`. Its
+  removal is deferred (low risk, separate cleanup) — track with
+  `grep -rn 'database.pool\|\$1' qrdx/ --include=*.py`.
 
 **Phase D — Mempool → block inclusion → import replay.**
 - D1. Admit exchange + EVM txs to the mempool (sig-verified, nonce-checked,
