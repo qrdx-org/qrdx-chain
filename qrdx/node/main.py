@@ -1983,6 +1983,14 @@ async def process_and_create_block(block_info: dict) -> bool:
                     await db.add_transaction(tx, block_hash)
                 except Exception:
                     pass  # Non-critical during sync
+            # D2.2b: persist the exchange-transaction section during sync too, so a
+            # node rebuilt from peers carries the same protocol-level state (D3).
+            ex_section = block.get('exchange_transactions') or block_info.get('exchange_transactions')
+            if ex_section:
+                try:
+                    await db.add_block_exchange_txs(block_hash, ex_section)
+                except Exception as e:
+                    logger.warning(f"[SYNC] Failed to store exchange section for block {block_height}: {e}")
             logger.debug(f"[SYNC] Stored PoS block {block_height} ({block_hash[:16]}...) validator={validator_address[:20]}")
             return True
         except Exception as e:
@@ -3127,6 +3135,14 @@ async def submit_block(
                     validator_address=validator_address,
                     timestamp=body.get('timestamp', 0),
                 )
+                # D2.2b: persist the exchange-transaction section (if any) so it is
+                # durable and replayable on import (D3). Storage only — no execution.
+                ex_section = body.get('exchange_transactions')
+                if ex_section:
+                    try:
+                        await db.add_block_exchange_txs(block_hash, ex_section)
+                    except Exception as e:
+                        logger.warning(f"Failed to store exchange section for block {block_no}: {e}")
                 await security.reputation_manager.record_good_behavior(verified_sender, points=5)
                 logger.info(f"Accepted PoS block {block_no} from {verified_sender}. Propagating...")
                 background_tasks.add_task(

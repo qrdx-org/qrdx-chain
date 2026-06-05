@@ -161,9 +161,19 @@ node rebuilt from chain history reconstructs identical account/exchange state.
     are consensus-final. Tests: `tests/test_pos_block_assembly.py` (4). Verified:
     unit 1700; integration 11/11 (live proposer loop unchanged in behavior — the
     section is empty when no exchange txs are queued).
-  - D2.2b. *(next)* Receiver (`/submit_block` + `process_and_create_block`)
-    recovers `block[exchange_transactions]` and persists it per block (new DB
-    table), and the proposer then drains the mempool on inclusion.
+  - D2.2b. ✅ **done (this change).** The exchange section is now persisted as
+    protocol-level state on every node: new `block_exchange_transactions` table +
+    `add_block_exchange_txs` / `get_block_exchange_txs`
+    (`database_sqlite.py`). Receivers store it on both block paths
+    (`/submit_block` PoS fast-path and `process_and_create_block` sync path); the
+    proposer persists it locally and now **drains the mempool on inclusion**
+    (safe, because the section is included + stored). Storage only — no execution
+    yet (that is D3). Tests: `tests/test_block_exchange_storage.py` (4: round-trip
+    with order + authentication, empty no-op, idempotent insert, per-block
+    isolation). Verified: unit 1708; integration 11/11.
+    *Caveat: drain-on-inclusion does not yet handle reorgs (a dropped block would
+    lose its txs from the proposer's mempool); reorg-safe re-queue lands with D3
+    replay + fork-choice over the unified root.*
   - **Known live-serialization debt (address in D2.2b/D3):** PoS blocks still
     store `block_content = str(block.to_dict())` (a Python `repr`) with `to_dict`
     omitting UTXO transactions; the block body is not yet a faithful parseable

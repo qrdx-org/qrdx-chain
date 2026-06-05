@@ -309,10 +309,7 @@ class ValidatorNode:
 
                     # Phase D2.2: include exchange transactions from the mempool
                     # in the block body (additive — receivers that don't yet
-                    # understand the section ignore it). Conservatively, we do NOT
-                    # drain the mempool here: durable removal-on-inclusion waits
-                    # for receiver-side storage + replay (D2.2b/D3) so txs cannot
-                    # be lost before they are consensus-final.
+                    # understand the section ignore it).
                     exchange_txs = []
                     if self._exchange_tx_source is not None:
                         try:
@@ -335,6 +332,20 @@ class ValidatorNode:
                         validator_address=block.proposer_address,
                         timestamp=block.timestamp
                     )
+
+                    # D2.2b: persist the exchange section locally (so it is durable
+                    # and replayable on this node too) and drain the mempool now
+                    # that the txs are included + stored.
+                    if exchange_txs:
+                        try:
+                            from ..exchange.block_processor import BLOCK_EXCHANGE_TXS_KEY
+                            section = block_data.get(BLOCK_EXCHANGE_TXS_KEY)
+                            if section:
+                                await self.db.add_block_exchange_txs(block.hash, section)
+                            if self._exchange_tx_source is not None:
+                                self._exchange_tx_source.remove([t.tx_hash() for t in exchange_txs])
+                        except Exception as e:
+                            logger.warning(f"Failed to persist/drain exchange section: {e}")
 
                     # Broadcast block to network peers
                     if self.broadcast_callback:

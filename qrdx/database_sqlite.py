@@ -323,7 +323,17 @@ class DatabaseSQLite:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         
+        CREATE TABLE IF NOT EXISTS block_exchange_transactions (
+            block_hash TEXT NOT NULL,
+            tx_index INTEGER NOT NULL,
+            tx_hash TEXT NOT NULL,
+            tx_data TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (block_hash, tx_index)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(block_height);
+        CREATE INDEX IF NOT EXISTS idx_block_exchange_txs ON block_exchange_transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_transactions_block ON transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_unspent_address ON unspent_outputs(address);
         CREATE INDEX IF NOT EXISTS idx_validator_epoch ON validator_states(epoch);
@@ -829,6 +839,37 @@ class DatabaseSQLite:
 
         row = await cursor.fetchone()
         return dict(row) if row else None
+
+    async def add_block_exchange_txs(self, block_hash: str, items: list):
+        """
+        Persist a block's exchange-transaction section (Phase D2.2b).
+
+        ``items`` is the encoded list (each an ``ExchangeTransaction.to_dict()``)
+        in the proposer's canonical order. Idempotent per (block_hash, tx_index).
+        Stored as protocol-level state (Whitepaper §3.6) for deterministic replay
+        during block import (D3).
+        """
+        if not items:
+            return
+        import json
+        for idx, item in enumerate(items):
+            await self.connection.execute(
+                "INSERT OR IGNORE INTO block_exchange_transactions "
+                "(block_hash, tx_index, tx_hash, tx_data) VALUES (?, ?, ?, ?)",
+                (block_hash, idx, item.get("tx_hash", ""), json.dumps(item, sort_keys=True)),
+            )
+        await self.connection.commit()
+
+    async def get_block_exchange_txs(self, block_hash: str) -> list:
+        """Return a block's exchange-transaction section in canonical order."""
+        import json
+        cursor = await self.connection.execute(
+            "SELECT tx_data FROM block_exchange_transactions "
+            "WHERE block_hash = ? ORDER BY tx_index ASC",
+            (block_hash,),
+        )
+        rows = await cursor.fetchall()
+        return [json.loads(r[0]) for r in rows]
 
     async def get_validators(self, status: str = None):
         """
