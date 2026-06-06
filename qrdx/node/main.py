@@ -2089,14 +2089,31 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
 
     logger.info(f"[REORG] Collecting transactions from orphaned blocks between {last_common_block_id + 1} and {local_height}.")
     orphaned_txs = []
+    orphaned_exchange_sections = []
     for height in range(last_common_block_id + 1, local_height + 1):
         block = await db.get_block_by_id(height)
         if block:
             block_txs = await db.get_block_transactions(block['hash'], hex_only=False)
             orphaned_txs.extend([tx for tx in block_txs if not isinstance(tx, CoinbaseTransaction)])
+            # Capture orphaned exchange sections so their txs can be re-queued.
+            try:
+                section = await db.get_block_exchange_txs(block['hash'])
+                if section:
+                    orphaned_exchange_sections.append(section)
+            except Exception:
+                pass
 
     logger.info(f"[REORG] Rolling back local chain to block {last_common_block_id}.")
     await db.remove_blocks(last_common_block_id + 1)
+
+    # D3 reorg safety: rebuild exchange state to the new canonical tip so the
+    # orphaned blocks' exchange effects are dropped; the subsequent re-sync
+    # re-applies the canonical sections.
+    try:
+        from ..exchange.block_processor import rebuild_exchange_state_from_chain
+        await rebuild_exchange_state_from_chain(db)
+    except Exception as e:
+        logger.error(f"[REORG] Exchange state rebuild failed: {e}")
 
     logger.info(f"[REORG] Re-adding {len(orphaned_txs)} orphaned transactions to the pending pool.")
     for tx in orphaned_txs:
@@ -2104,6 +2121,22 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
             await security.transaction_pool.add_transaction(tx.hash(), tx, db)
         except Exception as e:
             logger.error(f"[REORG] Could not re-add orphaned transaction {tx.hash()}: {e}")
+
+    # Re-queue orphaned exchange txs to the exchange mempool (re-verified on admit)
+    # so they can be re-included on the new canonical chain.
+    if orphaned_exchange_sections:
+        try:
+            from ..exchange.block_processor import decode_exchange_txs
+            mp = _get_exchange_mempool()
+            requeued = 0
+            for section in orphaned_exchange_sections:
+                for tx in decode_exchange_txs(section):
+                    ok, _err = mp.admit(tx)
+                    if ok:
+                        requeued += 1
+            logger.info(f"[REORG] Re-queued {requeued} orphaned exchange tx(s)")
+        except Exception as e:
+            logger.error(f"[REORG] Could not re-queue orphaned exchange txs: {e}")
 
     return last_common_block_id
 
@@ -2294,7 +2327,16 @@ async def startup():
         logger.info("Genesis block created for PoS network")
     else:
         logger.info("Genesis block already exists")
-    
+
+    # D3 durability: rebuild exchange state from the stored canonical block
+    # sections so it survives a restart / fresh resync (no-op on a fresh chain).
+    try:
+        from ..exchange.block_processor import rebuild_exchange_state_from_chain
+        root = await rebuild_exchange_state_from_chain(db)
+        logger.info(f"Exchange state initialized from chain (root={root[:16]}...)")
+    except Exception as e:
+        logger.warning(f"Exchange state rebuild on startup skipped: {e}")
+
     # Initialize PoS validator if enabled
     validator_node = None
     validator_enabled = os.getenv('QRDX_VALIDATOR_ENABLED', 'false').lower() == 'true'

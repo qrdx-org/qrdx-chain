@@ -74,6 +74,7 @@ from .block_processor import (
     get_validator_fee_share,
     verify_exchange_tx,
     apply_block_exchange_section,
+    rebuild_exchange_state_from_chain,
     encode_exchange_txs,
     decode_exchange_txs,
     exchange_txs_canonical_bytes,
@@ -107,7 +108,7 @@ __all__ = [
     "process_exchange_transactions", "validate_exchange_state_root",
     "extract_exchange_transactions", "build_oracle_update_tx",
     "get_validator_fee_share", "verify_exchange_tx",
-    "apply_block_exchange_section",
+    "apply_block_exchange_section", "rebuild_exchange_state_from_chain",
     # Block-body codec (Phase D2)
     "encode_exchange_txs", "decode_exchange_txs",
     "exchange_txs_canonical_bytes", "extract_exchange_transactions_from_dict",

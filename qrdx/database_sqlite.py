@@ -1006,10 +1006,16 @@ class DatabaseSQLite:
         return await self.get_block_transactions(block_hash, hex_only=True)
     
     async def remove_blocks(self, start_id: int):
-        """Remove blocks starting from ID"""
+        """Remove blocks starting from ID (rollback / reorg)."""
         await self.connection.execute(
             "DELETE FROM blocks WHERE block_height >= ?",
             (start_id,)
+        )
+        # Drop exchange sections for blocks no longer on the canonical chain so
+        # no stale protocol-level state lingers after a reorg rollback.
+        await self.connection.execute(
+            "DELETE FROM block_exchange_transactions "
+            "WHERE block_hash NOT IN (SELECT block_hash FROM blocks)"
         )
         await self.connection.commit()
     

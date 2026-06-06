@@ -175,6 +175,66 @@ def validate_exchange_state_root(
     return True, ""
 
 
+async def rebuild_exchange_state_from_chain(db, state_manager: Optional[ExchangeStateManager] = None) -> str:
+    """
+    Reconstruct exchange state by replaying every canonical block's exchange
+    section in height order (Phase D3 — reorg safety + restart durability).
+
+    Exchange state is thereby a deterministic function of the canonical chain:
+      - **Restart durability:** on node startup, rebuild from the stored sections
+        so account/exchange state survives a process restart or fresh resync.
+      - **Reorg safety:** after the base layer rolls back to a common ancestor,
+        rebuild to the new canonical tip — orphaned-block effects vanish and the
+        canonical effects are re-applied, with no stale state left behind.
+
+    Resets the singleton (when ``state_manager`` is None) and replays from
+    genesis. O(total exchange txs); checkpointing is a future optimization.
+
+    Returns the resulting exchange_state_root.
+    """
+    if state_manager is None:
+        ExchangeStateManager.reset_instance()
+        mgr = ExchangeStateManager.get_instance()
+    else:
+        mgr = state_manager
+
+    try:
+        tip = (await db.get_next_block_id()) - 1
+    except Exception as e:
+        logger.warning("rebuild_exchange_state: cannot read chain tip: %s", e)
+        return mgr.compute_state_root()
+
+    applied = 0
+    for height in range(0, tip + 1):
+        try:
+            block = await db.get_block_by_id(height)
+        except Exception:
+            block = None
+        if not block:
+            continue
+        block_hash = block.get("hash") or block.get("block_hash")
+        if not block_hash:
+            continue
+        try:
+            section = await db.get_block_exchange_txs(block_hash)
+        except Exception:
+            section = None
+        if not section:
+            continue
+        txs = decode_exchange_txs(section)
+        ts = float(block.get("timestamp", 0) or 0)
+        ok, err, _root = process_exchange_transactions(height, ts, txs, mgr)
+        if ok:
+            mgr.commit_block()
+            applied += 1
+        else:
+            logger.error("rebuild_exchange_state: block %d section failed: %s", height, err)
+
+    if applied:
+        logger.info("Rebuilt exchange state from %d canonical block section(s)", applied)
+    return mgr.compute_state_root()
+
+
 def apply_block_exchange_section(
     block_height: int,
     block_timestamp: float,

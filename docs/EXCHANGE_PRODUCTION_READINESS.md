@@ -208,20 +208,23 @@ node rebuilt from chain history reconstructs identical account/exchange state.
     **live peer path** `p2p.submitBlock` (not only the REST `/submit_block` +
     sync paths). Also hardened S03/S10 height checks to tolerate one lagging
     non-validator (quorum drift), removing pre-existing snapshot flakiness.
-  - 🔎 **Finding (gates full cross-node convergence): reorg-safe exchange
-    state.** The base PoS converges on a single chain at settled heights (block
-    hashes identical across nodes at h−k), but at the tip multiple validators
-    propose competing blocks for the same height. A tx-bearing block can be
-    orphaned *after* its proposer already advanced its exchange state — and that
-    state is **not reverted on reorg**, so the proposer's exchange state diverges
-    from the canonical chain. Consequence: an exchange tx only becomes canonical
-    if the winning block carried it, and orphaned exchange state must be rolled
-    back. **Required next:** drive exchange state from the canonical chain — on a
-    tip reorg, revert the orphaned block's exchange section (we have
-    `revert_block`) and replay the canonical block's section; re-queue dropped
-    txs to the mempool (the deferred drain-reorg caveat). Until then S12 asserts
-    the per-node pipeline (admit→include→execute→root) and the determinism guard
-    (no two nodes report different roots), not full N-node convergence.
+  - ✅ **Reorg safety + restart durability (addresses the finding above).**
+    `rebuild_exchange_state_from_chain(db)` (`block_processor.py`) makes exchange
+    state a deterministic function of the canonical chain: it resets the manager
+    and replays every canonical block's stored section in height order. Wired in:
+    - **startup** (`node/main.py` after genesis) → exchange state survives a
+      restart / fresh resync (Phase D3b durability);
+    - **reorg** (`handle_reorganization` after `db.remove_blocks`) → rebuild to
+      the new canonical tip so orphaned-block effects vanish, plus **re-queue**
+      orphaned exchange txs to the mempool for re-inclusion.
+    `remove_blocks` now also deletes orphaned `block_exchange_transactions` rows.
+    Tests: `tests/test_exchange_reorg_rebuild.py` (3): deterministic rebuild,
+    rolled-back effect disappears, empty chain → empty root. Unit 1719;
+    integration 12/12.
+  - *Remaining: per-reorg full-chain replay is O(all exchange txs) — add
+    checkpointing for scale; and strengthen S12 to assert full N-node
+    convergence now that orphaned state self-heals (currently asserts per-node
+    pipeline + determinism guard).*
 - D4. `account_state_root` + `exchange_state_root` added to header + signing root.
 
 **Phase E — Economic integrity.**
