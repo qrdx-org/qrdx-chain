@@ -225,7 +225,23 @@ node rebuilt from chain history reconstructs identical account/exchange state.
     checkpointing for scale; and strengthen S12 to assert full N-node
     convergence now that orphaned state self-heals (currently asserts per-node
     pipeline + determinism guard).*
-- D4. `account_state_root` + `exchange_state_root` added to header + signing root.
+- D4. `account_state_root` + `exchange_state_root` unified into the header root.
+  - D4.1. ✅ **done (this change) — primitives.** `db.get_account_state_root()`
+    (deterministic BLAKE3-512 over `account_state`, canonical by address) and
+    `crypto.hashing.unified_state_root(utxo, account, exchange)` (one BLAKE3-512
+    commitment over all domains, Whitepaper §3.6), exposed at
+    `GET /get_unified_state_root` (with `enforced: false`). Tests:
+    `tests/test_unified_state_root.py` (6). Unit 1982; integration 12/12.
+  - D4.2. *(blocked)* Bind the unified root into the block **signing root** and
+    **enforce** it on import (recompute + reject). **Prerequisite:** every
+    committed domain must be deterministically re-executed on import. Exchange is
+    (D3); UTXO is consistent (blocks carry no UTXO txs in practice); the
+    **account/EVM domain is NOT** — `eth_sendRawTransaction` applies via gossip,
+    not consensus replay, so its root differs across nodes. Enforcing a unified
+    root that includes the account domain therefore requires giving the EVM/
+    account domain the same D1–D3 treatment the exchange domain received
+    (mempool admission → block inclusion → deterministic import replay). That
+    EVM-domain consensus integration is the gating work for D4.2 **and** Phase E.
 
 **Phase E — Economic integrity.**
 - ⚠️ **Coupling found: E1/E2 depend on D4 (unified balances).** Today the

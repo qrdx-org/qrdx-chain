@@ -3031,6 +3031,38 @@ async def get_exchange_state_root():
         return {'ok': False, 'error': str(e)}
 
 
+@app.get("/get_unified_state_root")
+async def get_unified_state_root():
+    """
+    Return the unified block state root (Whitepaper §3.6): a BLAKE3-512 commitment
+    over all state domains — UTXO set, account/EVM state, and exchange state.
+
+    Phase D4 primitive. NOTE: this is computed/observable but not yet *enforced*
+    in consensus. Enforcing it requires every committed domain to be
+    deterministically re-executed on import; the exchange domain is (D3), but the
+    account/EVM domain still applies via gossip rather than consensus replay, so
+    its root can differ across nodes until the EVM domain receives the same D1–D3
+    treatment. See docs/EXCHANGE_PRODUCTION_READINESS.md.
+    """
+    try:
+        from qrdx.exchange import ExchangeStateManager
+        from qrdx.crypto.hashing import unified_state_root
+        utxo_root = await db.get_unspent_outputs_hash()
+        account_root = await db.get_account_state_root()
+        exchange_root = ExchangeStateManager.get_instance().compute_state_root()
+        root = unified_state_root(utxo_root, account_root, exchange_root)
+        return {'ok': True, 'result': {
+            'unified_state_root': root,
+            'utxo_root': utxo_root,
+            'account_root': account_root,
+            'exchange_root': exchange_root,
+            'enforced': False,
+        }}
+    except Exception as e:
+        logger.error(f"get_unified_state_root error: {e}")
+        return {'ok': False, 'error': str(e)}
+
+
 @app.post("/push_block")
 @limiter.limit("12/minute")
 async def push_block(

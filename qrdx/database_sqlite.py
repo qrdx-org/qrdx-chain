@@ -626,6 +626,31 @@ class DatabaseSQLite:
             hasher.update(f"{row[0]}:{row[1]}:{row[2]}:{row[3]}".encode())
         return hasher.hexdigest()
     
+    async def get_account_state_root(self) -> str:
+        """
+        Deterministic BLAKE3-512 root of the account/EVM state (Whitepaper §3.6).
+
+        Hashes every account_state row in a canonical order (by address) over its
+        consensus-relevant fields. Empty state → all-zero root. This is the
+        account-domain component of the unified block state root (Phase D4).
+        """
+        cursor = await self.connection.execute("""
+            SELECT address, balance, nonce, code_hash, storage_root
+            FROM account_state
+            ORDER BY address ASC
+        """)
+        rows = await cursor.fetchall()
+        if not rows:
+            return "0" * 128  # BLAKE3-512 width
+        import blake3
+        hasher = blake3.blake3()
+        for r in rows:
+            addr, balance, nonce, code_hash, storage_root = r[0], r[1], r[2], r[3], r[4]
+            hasher.update(
+                f"{addr}:{balance}:{nonce}:{code_hash or ''}:{storage_root or ''}".encode()
+            )
+        return hasher.digest(length=64).hex()
+
     async def get_pending_transaction_count(self):
         """Get count of pending transactions"""
         cursor = await self.connection.execute("SELECT COUNT(*) FROM pending_transactions")

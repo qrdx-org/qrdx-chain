@@ -187,3 +187,24 @@ def state_root_hash(data: Union[bytes, str]) -> bytes:
 def state_root_hex(data: Union[bytes, str]) -> str:
     """``state_root_hash`` as a lowercase hex string (128 chars)."""
     return state_root_hash(data).hex()
+
+
+def unified_state_root(utxo_root: str, account_root: str, exchange_root: str) -> str:
+    """
+    Combine the per-domain state roots into one block state root (Whitepaper §3.6).
+
+    The unified root commits to every state domain — the UTXO set, the
+    account/EVM state, and the protocol-level exchange state — under a single
+    BLAKE3-512 hash. Domain order is fixed (utxo, account, exchange) and must be
+    identical on every validator.
+
+    Args:
+        utxo_root: hex digest of the UTXO set.
+        account_root: hex digest of account/EVM state.
+        exchange_root: hex digest of exchange state.
+
+    Returns:
+        128-char hex BLAKE3-512 unified state root.
+    """
+    payload = f"{utxo_root}|{account_root}|{exchange_root}".encode("utf-8")
+    return state_root_hex(payload)
