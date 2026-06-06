@@ -1967,6 +1967,23 @@ async def process_and_create_block(block_info: dict) -> bool:
             )
             return False
 
+        # D3: securely validate + replay the exchange section (if any) before
+        # storing, so a syncing node rebuilds identical protocol-level state and
+        # rejects any block whose section doesn't match its declared root.
+        ex_section = block.get('exchange_transactions') or block_info.get('exchange_transactions')
+        if ex_section:
+            try:
+                from ..exchange.block_processor import apply_block_exchange_section
+                declared = block.get('exchange_state_root') or block_info.get('exchange_state_root')
+                ok, verr = apply_block_exchange_section(
+                    block_height, float(block.get('timestamp', 0) or 0), ex_section, declared,
+                )
+            except Exception as e:
+                ok, verr = False, f"exchange validation error: {e}"
+            if not ok:
+                logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr}")
+                return False
+
         try:
             timestamp_val = block.get('timestamp', 0)
             await db.add_block(
@@ -1983,9 +2000,8 @@ async def process_and_create_block(block_info: dict) -> bool:
                     await db.add_transaction(tx, block_hash)
                 except Exception:
                     pass  # Non-critical during sync
-            # D2.2b: persist the exchange-transaction section during sync too, so a
-            # node rebuilt from peers carries the same protocol-level state (D3).
-            ex_section = block.get('exchange_transactions') or block_info.get('exchange_transactions')
+            # D2.2b: persist the (now-validated) exchange section so a node rebuilt
+            # from peers carries the same protocol-level state.
             if ex_section:
                 try:
                     await db.add_block_exchange_txs(block_hash, ex_section)
@@ -3127,6 +3143,26 @@ async def submit_block(
                 )
                 return {'ok': False, 'error': 'Validator address not registered'}
 
+            # D3: if the block carries an exchange section, securely validate +
+            # replay it (verify signatures, re-execute, match declared root)
+            # BEFORE storing. Reject the block on any mismatch — local exchange
+            # state is left untouched by a rejected block.
+            ex_section = body.get('exchange_transactions')
+            if ex_section:
+                try:
+                    from ..exchange.block_processor import apply_block_exchange_section
+                    ok, verr = apply_block_exchange_section(
+                        block_no, float(body.get('timestamp', 0) or 0),
+                        ex_section, body.get('exchange_state_root'),
+                    )
+                except Exception as e:
+                    ok, verr = False, f"exchange validation error: {e}"
+                if not ok:
+                    await security.reputation_manager.record_violation(
+                        verified_sender, 'invalid_exchange_section', severity=6
+                    )
+                    return {'ok': False, 'error': f'Invalid exchange section: {verr}'}
+
             try:
                 await db.add_block(
                     block_hash=block_hash,
@@ -3135,9 +3171,7 @@ async def submit_block(
                     validator_address=validator_address,
                     timestamp=body.get('timestamp', 0),
                 )
-                # D2.2b: persist the exchange-transaction section (if any) so it is
-                # durable and replayable on import (D3). Storage only — no execution.
-                ex_section = body.get('exchange_transactions')
+                # D2.2b: persist the (now-validated) exchange section for durability.
                 if ex_section:
                     try:
                         await db.add_block_exchange_txs(block_hash, ex_section)

@@ -203,6 +203,16 @@ class ExchangeStateManager:
                 self._current_block_height,
             )
 
+    def commit_block(self) -> None:
+        """
+        Accept the current block's state changes as final.
+
+        Discards the pre-block revert snapshot so a later ``revert_block`` cannot
+        undo committed state. Called once a block (its exchange section) has been
+        validated and accepted by consensus.
+        """
+        self._snapshot = None
+
     # =====================================================================
     #  Transaction processing (consensus-critical)
     # =====================================================================
@@ -611,74 +621,33 @@ class ExchangeStateManager:
 
     def take_snapshot(self) -> Dict[str, Any]:
         """
-        Capture current state for potential revert.
-
-        MUST deep-copy ALL consensus-critical state so that revert_block()
-        can restore the exact pre-block state.  This includes:
-          - Nonces
-          - Counters
-          - Pool manager pools (precompile pools + native pools metadata)
-          - Order books (precompile + native)
-          - Oracle observations
-          - Perp positions & markets
-          - Precompile EVM pools/orderbooks
+        Capture a COMPLETE deep copy of all consensus-critical state so that
+        revert_block() restores the exact pre-block state — including entities
+        CREATED during the block (new pools, order books, oracles, perp markets
+        and positions), which a field-level snapshot cannot remove. Correctness
+        over speed: a rejected block must leave local state byte-identical.
         """
         import copy
-
-        # Deep-copy pool states from PoolManager
-        pool_snapshots: Dict[str, dict] = {}
-        for pool_id, pool in self.pool_manager._pools.items():
-            pool_snapshots[pool_id] = {
-                "sqrt_price": pool.state.sqrt_price,
-                "tick": pool.state.tick,
-                "liquidity": pool.state.liquidity,
-                "fee_growth_global_0": pool.state.fee_growth_global_0,
-                "fee_growth_global_1": pool.state.fee_growth_global_1,
-                "protocol_fees_0": pool.state.protocol_fees_0,
-                "protocol_fees_1": pool.state.protocol_fees_1,
-                "total_volume_0": pool.state.total_volume_0,
-                "total_volume_1": pool.state.total_volume_1,
-            }
-
-        # Deep-copy order book states
-        book_snapshots: Dict[str, dict] = {}
-        for pair_key, book in self._order_books.items():
-            book_snapshots[pair_key] = {
-                "total_trades": book.total_trades,
-                "total_volume": book.total_volume,
-            }
-
-        # Deep-copy oracle states (snapshot the observations list length)
-        oracle_snapshots: Dict[str, dict] = {}
-        for pair_key, oracle in self._oracles.items():
-            oracle_snapshots[pair_key] = {
-                "observations_count": oracle.observation_count,
-            }
-
-        # Deep-copy perp market states
-        perp_snapshots: Dict[str, dict] = {}
-        for market_id, market in self.perp_engine._markets.items():
-            perp_snapshots[market_id] = {
-                "index_price": market.index_price,
-                "mark_price": market.mark_price,
-                "open_interest_long": market.open_interest_long,
-                "open_interest_short": market.open_interest_short,
-                "insurance_fund": market.insurance_fund,
-            }
 
         snapshot = {
             "nonces": dict(self._nonces),
             "block_height": self._current_block_height,
+            "block_timestamp": self._current_block_timestamp,
             "total_swaps": self._total_swaps,
             "total_orders": self._total_orders,
             "total_pools": self._total_pools,
             "total_positions": self._total_positions,
-            # Deep-copied engine state
-            "pool_snapshots": pool_snapshots,
-            "book_snapshots": book_snapshots,
-            "oracle_snapshots": oracle_snapshots,
-            "perp_snapshots": perp_snapshots,
-            # Precompile EVM state (deep copy)
+            # Full deep copies of the mutable engine containers.
+            "pools": copy.deepcopy(self.pool_manager._pools),
+            "pair_index": copy.deepcopy(self.pool_manager._pair_index),
+            "pool_sequence": self.pool_manager._pool_sequence,
+            "order_books": copy.deepcopy(self._order_books),
+            "oracles": copy.deepcopy(self._oracles),
+            "perp_markets": copy.deepcopy(self.perp_engine._markets),
+            "perp_positions": copy.deepcopy(self.perp_engine._positions),
+            "perp_owner_positions": copy.deepcopy(self.perp_engine._owner_positions),
+            "perp_pos_sequence": self.perp_engine._pos_sequence,
+            "perp_paused": self.perp_engine._paused,
             "precompile_pools": copy.deepcopy(self._precompile_pools),
             "precompile_orderbooks": copy.deepcopy(self._precompile_orderbooks),
         }
@@ -687,59 +656,54 @@ class ExchangeStateManager:
 
     def _restore_snapshot(self, snapshot: Dict[str, Any]) -> None:
         """
-        Restore state from snapshot on revert.
+        Restore the EXACT pre-block state from a snapshot.
 
-        Restores ALL consensus-critical fields captured in take_snapshot().
+        Containers are restored IN PLACE (clear + repopulate) so external
+        references stay valid — notably the router's order-book/oracle registries
+        and its handle to ``pool_manager``.
         """
         import copy
 
-        self._nonces = snapshot["nonces"]
+        self._nonces = dict(snapshot["nonces"])
+        self._current_block_height = snapshot["block_height"]
+        self._current_block_timestamp = snapshot["block_timestamp"]
         self._total_swaps = snapshot["total_swaps"]
         self._total_orders = snapshot["total_orders"]
         self._total_pools = snapshot["total_pools"]
         self._total_positions = snapshot["total_positions"]
 
-        # Restore pool states
-        for pool_id, pstate in snapshot.get("pool_snapshots", {}).items():
-            pool = self.pool_manager._pools.get(pool_id)
-            if pool:
-                pool.state.sqrt_price = pstate["sqrt_price"]
-                pool.state.tick = pstate["tick"]
-                pool.state.liquidity = pstate["liquidity"]
-                pool.state.fee_growth_global_0 = pstate["fee_growth_global_0"]
-                pool.state.fee_growth_global_1 = pstate["fee_growth_global_1"]
-                pool.state.protocol_fees_0 = pstate["protocol_fees_0"]
-                pool.state.protocol_fees_1 = pstate["protocol_fees_1"]
-                pool.state.total_volume_0 = pstate["total_volume_0"]
-                pool.state.total_volume_1 = pstate["total_volume_1"]
+        # Pools (in place; the router shares this pool_manager).
+        self.pool_manager._pools.clear()
+        self.pool_manager._pools.update(copy.deepcopy(snapshot["pools"]))
+        self.pool_manager._pair_index.clear()
+        self.pool_manager._pair_index.update(copy.deepcopy(snapshot["pair_index"]))
+        self.pool_manager._pool_sequence = snapshot["pool_sequence"]
 
-        # Restore order book states
-        for pair_key, bstate in snapshot.get("book_snapshots", {}).items():
-            book = self._order_books.get(pair_key)
-            if book:
-                book.total_trades = bstate["total_trades"]
-                book.total_volume = bstate["total_volume"]
+        # Order books + oracles: put the SAME restored objects into both the
+        # manager and the router registries so they remain consistent.
+        restored_books = copy.deepcopy(snapshot["order_books"])
+        self._order_books.clear()
+        self._order_books.update(restored_books)
+        self.router._order_books.clear()
+        self.router._order_books.update(restored_books)
 
-        # Restore oracle states (truncate observations to snapshot length)
-        for pair_key, ostate in snapshot.get("oracle_snapshots", {}).items():
-            oracle = self._oracles.get(pair_key)
-            if oracle:
-                target_count = ostate["observations_count"]
-                # Trim any observations added after the snapshot
-                while oracle.observation_count > target_count:
-                    oracle._observations.pop()
+        restored_oracles = copy.deepcopy(snapshot["oracles"])
+        self._oracles.clear()
+        self._oracles.update(restored_oracles)
+        self.router._oracles.clear()
+        self.router._oracles.update(restored_oracles)
 
-        # Restore perp states
-        for market_id, mstate in snapshot.get("perp_snapshots", {}).items():
-            market = self.perp_engine._markets.get(market_id)
-            if market:
-                market.index_price = mstate["index_price"]
-                market.mark_price = mstate["mark_price"]
-                market.open_interest_long = mstate["open_interest_long"]
-                market.open_interest_short = mstate["open_interest_short"]
-                market.insurance_fund = mstate["insurance_fund"]
+        # Perp engine.
+        self.perp_engine._markets.clear()
+        self.perp_engine._markets.update(copy.deepcopy(snapshot["perp_markets"]))
+        self.perp_engine._positions.clear()
+        self.perp_engine._positions.update(copy.deepcopy(snapshot["perp_positions"]))
+        self.perp_engine._owner_positions.clear()
+        self.perp_engine._owner_positions.update(copy.deepcopy(snapshot["perp_owner_positions"]))
+        self.perp_engine._pos_sequence = snapshot["perp_pos_sequence"]
+        self.perp_engine._paused = snapshot["perp_paused"]
 
-        # Restore precompile EVM state
+        # Precompile EVM state.
         self._precompile_pools = copy.deepcopy(snapshot.get("precompile_pools", {}))
         self._precompile_orderbooks = copy.deepcopy(snapshot.get("precompile_orderbooks", {}))
 

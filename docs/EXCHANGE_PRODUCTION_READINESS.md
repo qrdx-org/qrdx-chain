@@ -179,7 +179,29 @@ node rebuilt from chain history reconstructs identical account/exchange state.
     omitting UTXO transactions; the block body is not yet a faithful parseable
     record for *all* domains. The exchange section is a clean JSON list; the UTXO
     body should be migrated to the same faithful form before D3 replay.
-- D3. Importing nodes re-execute all domains, recompute roots, reject on mismatch.
+- D3. ✅ **done (this change) for the exchange domain.** Importing nodes
+  re-execute the exchange section, verify it, and reject on mismatch:
+  - `apply_block_exchange_section` (`block_processor.py`): (1) authenticate every
+    tx (`verify_exchange_tx`) BEFORE touching state; (2) require a declared
+    `exchange_state_root`; (3) execute + recompute; (4) **revert on any
+    mismatch/failure**; (5) commit on success. Wired into both importer paths
+    (`/submit_block` PoS fast-path and `process_and_create_block` sync path) —
+    block is rejected if validation fails. Proposer declares the root
+    (`assemble_pos_block_data` + the production loop execute/commit).
+  - **Security fix (revert correctness):** `take_snapshot`/`_restore_snapshot`
+    were incomplete — they updated existing entities' fields but did not remove
+    entities *created* during a block (new pools/order books/oracles/perp
+    markets/positions), so a rejected block that created a pool would corrupt
+    state. Replaced with a complete deep-copy snapshot restored **in place**
+    (router references preserved). Added `commit_block()` to discard the revert
+    point on accept.
+  - Tests: `tests/test_exchange_block_replay.py` (8): accept+advance, proposer↔
+    importer determinism, forged/tampered tx rejected with state untouched,
+    wrong root rejected **and reverted**, section-without-root rejected, empty
+    no-op, commit-blocks-later-revert. Unit 1716; integration 11/11.
+  - *Remaining for D3: EVM/UTXO domains are not yet re-executed/validated on
+    import the same way (exchange is); reorg-safe mempool re-queue; and an
+    integration scenario submitting a real exchange tx end-to-end across nodes.*
 - D4. `account_state_root` + `exchange_state_root` added to header + signing root.
 
 **Phase E — Economic integrity.**

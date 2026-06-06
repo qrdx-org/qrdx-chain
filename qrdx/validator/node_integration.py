@@ -25,14 +25,17 @@ logger = get_logger(__name__)
 SLOT_DURATION_SECONDS = SLOT_DURATION if isinstance(SLOT_DURATION, int) else 12
 
 
-def assemble_pos_block_data(block, height: int, exchange_txs=None) -> dict:
+def assemble_pos_block_data(block, height: int, exchange_txs=None,
+                            exchange_state_root: str = None) -> dict:
     """
-    Build the broadcast/storage payload for a proposed PoS block (Phase D2.2).
+    Build the broadcast/storage payload for a proposed PoS block (Phase D2.2/D3).
 
     The exchange section is **additive**: present only when the proposer included
-    exchange transactions, and ignored by importers that don't yet understand it
+    exchange transactions, and ignored by importers that don't understand it
     (backward compatible). It is encoded with the canonical D2.1 codec so it
-    round-trips and authenticates on the receiving side.
+    round-trips and authenticates on the receiving side. When a section is
+    present the proposer also declares ``exchange_state_root`` (D3) so importers
+    can re-execute and verify it.
 
     Pure function (no I/O) so it is unit-testable in isolation.
     """
@@ -49,6 +52,8 @@ def assemble_pos_block_data(block, height: int, exchange_txs=None) -> dict:
         # is not in use.
         from ..exchange.block_processor import encode_exchange_txs, BLOCK_EXCHANGE_TXS_KEY
         data[BLOCK_EXCHANGE_TXS_KEY] = encode_exchange_txs(exchange_txs)
+        if exchange_state_root:
+            data['exchange_state_root'] = exchange_state_root
     return data
 
 
@@ -311,18 +316,41 @@ class ValidatorNode:
                     # in the block body (additive — receivers that don't yet
                     # understand the section ignore it).
                     exchange_txs = []
+                    exchange_state_root = None
                     if self._exchange_tx_source is not None:
                         try:
                             exchange_txs = self._exchange_tx_source.select_for_block() or []
-                            if exchange_txs:
-                                logger.info(
-                                    f"📦 Including {len(exchange_txs)} exchange tx(s) in block #{next_height}"
-                                )
                         except Exception as e:
                             logger.warning(f"Exchange tx selection failed: {e}")
                             exchange_txs = []
+                        if exchange_txs:
+                            # D3: execute the section to obtain the exchange state
+                            # root the proposer declares. Commit on success; on
+                            # failure drop the section rather than ship a bad block.
+                            try:
+                                from ..exchange.block_processor import process_exchange_transactions
+                                from ..exchange.state_manager import ExchangeStateManager
+                                mgr = ExchangeStateManager.get_instance()
+                                ok, err, root = process_exchange_transactions(
+                                    next_height, float(block.timestamp), exchange_txs, mgr,
+                                )
+                                if ok:
+                                    mgr.commit_block()
+                                    exchange_state_root = root
+                                    logger.info(
+                                        f"📦 Including {len(exchange_txs)} exchange tx(s) in "
+                                        f"block #{next_height} (root={root[:16]}...)"
+                                    )
+                                else:
+                                    logger.warning(f"Exchange execution failed, dropping section: {err}")
+                                    exchange_txs = []
+                            except Exception as e:
+                                logger.warning(f"Exchange execution error, dropping section: {e}")
+                                exchange_txs = []
 
-                    block_data = assemble_pos_block_data(block, next_height, exchange_txs)
+                    block_data = assemble_pos_block_data(
+                        block, next_height, exchange_txs, exchange_state_root,
+                    )
 
                     # Add block to database with sequential height
                     await self.db.add_block(

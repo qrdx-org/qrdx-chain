@@ -175,6 +175,71 @@ def validate_exchange_state_root(
     return True, ""
 
 
+def apply_block_exchange_section(
+    block_height: int,
+    block_timestamp: float,
+    section_items: Optional[List[Dict[str, Any]]],
+    declared_state_root: Optional[str],
+    state_manager: Optional[ExchangeStateManager] = None,
+) -> Tuple[bool, str]:
+    """
+    Securely validate and apply a block's exchange section on import (Phase D3).
+
+    This is the consensus enforcement an importing node runs before accepting a
+    block. It is intentionally stricter than ``validate_exchange_state_root``:
+
+      1. **Authenticate first** — every transaction must pass ``verify_exchange_tx``
+         (PQ signature + sender binding) BEFORE any state is touched, so a
+         malicious proposer cannot smuggle forged exchange txs into a block.
+      2. **Require a declared root** — a section without a declared
+         ``exchange_state_root`` is unverifiable and therefore rejected.
+      3. **Execute + compare** — replay deterministically and compute the root.
+      4. **Revert on any mismatch/failure** — restore the pre-block snapshot so a
+         rejected block leaves the local exchange state untouched (the existing
+         ``validate_exchange_state_root`` commits before comparing, which would
+         corrupt state on a bad block).
+      5. **Commit on success** — the replayed state is kept and finalized.
+
+    An empty/absent section is a no-op success (nothing to apply).
+
+    Returns:
+        (ok, error). On ``False`` the block MUST be rejected and local exchange
+        state is unchanged.
+    """
+    if not section_items:
+        return True, ""
+
+    if not declared_state_root:
+        return False, "exchange section present but block declares no exchange_state_root"
+
+    mgr = state_manager or ExchangeStateManager.get_instance()
+
+    # 1. Authenticate every tx before mutating any state.
+    txs = decode_exchange_txs(section_items)
+    for i, tx in enumerate(txs):
+        ok, err = verify_exchange_tx(tx)
+        if not ok:
+            return False, f"exchange tx {i} in block {block_height} failed verification: {err}"
+
+    # 2–4. Execute (snapshots internally), compare, revert on mismatch.
+    success, error, computed_root = process_exchange_transactions(
+        block_height, block_timestamp, txs, mgr,
+    )
+    if not success:
+        # process_exchange_transactions already reverted on critical failure.
+        return False, error
+    if computed_root != declared_state_root:
+        mgr.revert_block()  # undo the wrongly-applied state
+        return False, (
+            f"exchange_state_root mismatch at block {block_height}: "
+            f"declared {declared_state_root[:16]}..., computed {computed_root[:16]}..."
+        )
+
+    # 5. Accept: keep the replayed state, discard the revert point.
+    mgr.commit_block()
+    return True, ""
+
+
 # ---------------------------------------------------------------------------
 # Block boundary duties (executed by every validator)
 # ---------------------------------------------------------------------------
