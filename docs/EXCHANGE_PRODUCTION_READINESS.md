@@ -228,8 +228,16 @@ node rebuilt from chain history reconstructs identical account/exchange state.
 - D4. `account_state_root` + `exchange_state_root` added to header + signing root.
 
 **Phase E — Economic integrity.**
-- E1. Charge exchange gas/fees against the sender's `account_state` balance
-  (capital), not just accumulate `_block_fees`. Reject if underfunded.
+- ⚠️ **Coupling found: E1/E2 depend on D4 (unified balances).** Today the
+  exchange engine has NO balance ledger and no access to `account_state` — it
+  accumulates `_block_fees` but debits no payer, so an account with zero QRDX can
+  create pools / open positions without paying gas, stake, or real margin. True
+  economic integrity requires the exchange to debit the **same** QRDX the account
+  layer tracks; a separate parallel ledger would double-count. So E1/E2 must
+  follow **D4** (unify account + exchange state under one root + one balance).
+  Sequence D4 before E.
+- E1. Charge exchange gas/fees against the sender's unified account balance
+  (post-D4). Reject if underfunded.
 - E2. Margin/collateral debited from and returned to account balances on
   open/close/liquidation (today margin lives only inside the perp engine).
 - E3. Schedule block-boundary duties every block: funding settlement
@@ -240,7 +248,14 @@ node rebuilt from chain history reconstructs identical account/exchange state.
 - F1. Per-market circuit breakers / price-band checks on order placement.
 - F2. Oracle manipulation resistance (TWAP windows, staleness already present).
 - F3. Rate limits + mempool DoS protection for exchange ops.
-- F4. Fuzz/property suite for AMM math, liquidation, funding (overflow, rounding).
+- F4. ✅ **done (this change).** Adversarial property/fuzz suite for the exchange
+  math: `tests/test_exchange_invariants.py` (257 seeded cases). Asserts AMM swap
+  value-conservation (no free-mint round trip), non-negative liquidity, and
+  bad-input rejection; perp PnL sign-correctness, open-interest conservation,
+  margin-ratio monotonicity, leverage/size/price bounds; order-book matched-
+  quantity conservation, self-trade rejection, taker≥maker fees (§7.6), and
+  non-crossing orders resting. No invariant violations found — pinned as
+  regression guards.
 
 ---
 
