@@ -157,6 +157,23 @@ class P2PModule(RPCModule):
                 if not validator_info:
                     return {'ok': False, 'error': 'Validator not registered'}
 
+                # D3: securely validate + replay the exchange section (verify
+                # signatures, re-execute, match the declared exchange_state_root)
+                # BEFORE storing. Reject the block on any mismatch — local
+                # exchange state is left untouched.
+                ex_section = block_data.get('exchange_transactions')
+                if ex_section:
+                    try:
+                        from ...exchange.block_processor import apply_block_exchange_section
+                        ok_ex, verr = apply_block_exchange_section(
+                            block_no, float(block_data.get('timestamp', 0) or 0),
+                            ex_section, block_data.get('exchange_state_root'),
+                        )
+                    except Exception as e:
+                        ok_ex, verr = False, f"exchange validation error: {e}"
+                    if not ok_ex:
+                        return {'ok': False, 'error': f'Invalid exchange section: {verr}'}
+
                 try:
                     await self._db.add_block(
                         block_hash=block_hash,
@@ -165,6 +182,12 @@ class P2PModule(RPCModule):
                         validator_address=validator_address,
                         timestamp=block_data.get('timestamp', 0),
                     )
+                    # Persist the (validated) exchange section for durability.
+                    if ex_section:
+                        try:
+                            await self._db.add_block_exchange_txs(block_hash, ex_section)
+                        except Exception as e:
+                            logger.warning(f"Failed to store exchange section for block {block_no}: {e}")
                     logger.info(f"Accepted PoS block {block_no} via RPC. Propagating...")
                     asyncio.create_task(
                         self._propagate_fn(

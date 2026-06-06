@@ -199,9 +199,29 @@ node rebuilt from chain history reconstructs identical account/exchange state.
     importer determinism, forged/tampered tx rejected with state untouched,
     wrong root rejected **and reverted**, section-without-root rejected, empty
     no-op, commit-blocks-later-revert. Unit 1716; integration 11/11.
-  - *Remaining for D3: EVM/UTXO domains are not yet re-executed/validated on
-    import the same way (exchange is); reorg-safe mempool re-queue; and an
-    integration scenario submitting a real exchange tx end-to-end across nodes.*
+  - D3 live e2e (S12): ✅ added `integration_tests/scenarios/s12_exchange_consensus.py`
+    and the read endpoint `GET /get_exchange_state_root`. A real PQ-signed
+    ExchangeTransaction is submitted to a running node, admitted, selected by the
+    validator proposer, executed through the consensus state machine, and the
+    BLAKE3 `exchange_state_root` advances with the new pool present — observed
+    live (full suite 12/12). The D3 import-validation was also wired into the
+    **live peer path** `p2p.submitBlock` (not only the REST `/submit_block` +
+    sync paths). Also hardened S03/S10 height checks to tolerate one lagging
+    non-validator (quorum drift), removing pre-existing snapshot flakiness.
+  - 🔎 **Finding (gates full cross-node convergence): reorg-safe exchange
+    state.** The base PoS converges on a single chain at settled heights (block
+    hashes identical across nodes at h−k), but at the tip multiple validators
+    propose competing blocks for the same height. A tx-bearing block can be
+    orphaned *after* its proposer already advanced its exchange state — and that
+    state is **not reverted on reorg**, so the proposer's exchange state diverges
+    from the canonical chain. Consequence: an exchange tx only becomes canonical
+    if the winning block carried it, and orphaned exchange state must be rolled
+    back. **Required next:** drive exchange state from the canonical chain — on a
+    tip reorg, revert the orphaned block's exchange section (we have
+    `revert_block`) and replay the canonical block's section; re-queue dropped
+    txs to the mempool (the deferred drain-reorg caveat). Until then S12 asserts
+    the per-node pipeline (admit→include→execute→root) and the determinism guard
+    (no two nodes report different roots), not full N-node convergence.
 - D4. `account_state_root` + `exchange_state_root` added to header + signing root.
 
 **Phase E — Economic integrity.**

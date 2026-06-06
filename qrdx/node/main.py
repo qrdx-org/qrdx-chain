@@ -2967,6 +2967,28 @@ async def submit_exchange_tx(request: Request, body: dict = Body(...)):
     return {'ok': True, 'result': {'tx_hash': tx_hash, 'mempool_size': mempool.size()}}
 
 
+@app.get("/get_exchange_state_root")
+async def get_exchange_state_root():
+    """
+    Return this node's current exchange state root (Whitepaper §3.6 BLAKE3-512).
+
+    Read-only view of the protocol-level exchange state. All honest nodes that
+    have imported the same blocks must report an identical root — the cross-node
+    consistency guarantee enforced by D3 import replay.
+    """
+    try:
+        from qrdx.exchange import ExchangeStateManager
+        mgr = ExchangeStateManager.get_instance()
+        return {'ok': True, 'result': {
+            'exchange_state_root': mgr.compute_state_root(),
+            'pools': mgr.pool_count,
+            'pairs': mgr.pair_count,
+        }}
+    except Exception as e:
+        logger.error(f"get_exchange_state_root error: {e}")
+        return {'ok': False, 'error': str(e)}
+
+
 @app.post("/push_block")
 @limiter.limit("12/minute")
 async def push_block(

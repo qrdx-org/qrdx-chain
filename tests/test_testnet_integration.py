@@ -31,6 +31,7 @@ from integration_tests.scenarios.s08_governance import S08Governance
 from integration_tests.scenarios.s09_bridge import S09Bridge
 from integration_tests.scenarios.s10_consistency import S10Consistency
 from integration_tests.scenarios.s11_stress import S11Stress
+from integration_tests.scenarios.s12_exchange_consensus import S12ExchangeConsensus
 
 
 @pytest.fixture(scope="module")
@@ -166,6 +167,15 @@ async def test_s11_stress(scenario_ctx):
     runner.register(S11Stress)
     results = await runner.run_all()
     assert results[0].passed, f"S11 failed: {results[0].error_message}"
+
+
+@pytest.mark.asyncio
+async def test_s12_exchange_consensus(scenario_ctx):
+    """S12: Exchange tx submit→block→replay→cross-node consistency."""
+    runner = ScenarioRunner(scenario_ctx)
+    runner.register(S12ExchangeConsensus)
+    results = await runner.run_all()
+    assert results[0].passed, f"S12 failed: {results[0].error_message}"
 
 
 # ── Full Suite Test ───────────────────────────────────────────────────
