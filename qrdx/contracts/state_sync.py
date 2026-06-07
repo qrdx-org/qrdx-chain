@@ -499,18 +499,26 @@ class ExecutionContext:
         success: bool,
         gas_used: int,
         gas_price: int,
-        value: int
+        value: int,
+        defer_commit: bool = False,
     ) -> None:
         """
         Finalize execution and update state.
-        
+
         If successful: commits EVM state and records changes
         If failed: reverts EVM state to pre-execution snapshot
+
+        ``defer_commit`` (E-D3b prerequisite): when True, a successful tx's state
+        changes are kept in the EVM cache and NOT flushed to the DB, so a caller
+        can execute a whole block's EVM section and then atomically commit once
+        (root matches) or discard (reject-on-mismatch) via a block-start
+        snapshot. Default False preserves the per-tx commit behavior of the live
+        RPC path exactly.
         """
         sender = to_checksum_address(sender)
-        
+
         if success:
-            if self._evm_snapshot_id is not None:
+            if self._evm_snapshot_id is not None and not defer_commit:
                 await self.evm_state.commit(self.block_height)
             
             balance_after = await self.evm_state.get_balance(sender)
