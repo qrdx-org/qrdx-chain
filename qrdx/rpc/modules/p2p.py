@@ -53,6 +53,7 @@ class P2PModule(RPCModule):
         self._handshake_manager = None        # same object as security.handshake_manager
         self._sync_blockchain = None
         self._follow_up_sync = None
+        self._evm_apply_section = None         # E-D3b importer hook (main._apply_evm_section_on_import)
 
     # ---- wiring (called once at startup from main.py) --------------------
 
@@ -69,6 +70,7 @@ class P2PModule(RPCModule):
         self_node_id: str,
         sync_blockchain,
         follow_up_sync=None,
+        evm_apply_section=None,
     ):
         self._db = db
         self._security = security
@@ -80,6 +82,7 @@ class P2PModule(RPCModule):
         self._self_node_id = self_node_id
         self._sync_blockchain = sync_blockchain
         self._follow_up_sync = follow_up_sync
+        self._evm_apply_section = evm_apply_section
 
     def _require_db(self):
         if self._db is None:
@@ -174,6 +177,21 @@ class P2PModule(RPCModule):
                     if not ok_ex:
                         return {'ok': False, 'error': f'Invalid exchange section: {verr}'}
 
+                # E-D3b: validate + replay the EVM section (execute-on-mine) before
+                # storing; reject on account_state_root mismatch. The apply hook is
+                # injected from main.py (shares the live executor + state manager).
+                evm_section = block_data.get('evm_transactions')
+                if evm_section and self._evm_apply_section is not None:
+                    try:
+                        ok_evm, verr_evm = await self._evm_apply_section(
+                            block_no, block_hash, int(block_data.get('timestamp', 0) or 0),
+                            evm_section, block_data.get('account_state_root'),
+                        )
+                    except Exception as e:
+                        ok_evm, verr_evm = False, f"evm validation error: {e}"
+                    if not ok_evm:
+                        return {'ok': False, 'error': f'Invalid EVM section: {verr_evm}'}
+
                 try:
                     await self._db.add_block(
                         block_hash=block_hash,
@@ -188,6 +206,12 @@ class P2PModule(RPCModule):
                             await self._db.add_block_exchange_txs(block_hash, ex_section)
                         except Exception as e:
                             logger.warning(f"Failed to store exchange section for block {block_no}: {e}")
+                    # Persist the (validated) EVM section for durability/rebuild.
+                    if evm_section:
+                        try:
+                            await self._db.add_block_evm_txs(block_hash, evm_section)
+                        except Exception as e:
+                            logger.warning(f"Failed to store EVM section for block {block_no}: {e}")
                     logger.info(f"Accepted PoS block {block_no} via RPC. Propagating...")
                     asyncio.create_task(
                         self._propagate_fn(

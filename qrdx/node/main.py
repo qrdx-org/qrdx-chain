@@ -965,15 +965,62 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
                 "sender": sender_hex, "nonce": nonce}
 
 
+def _evm_defer_execute():
+    """An execute_tx callable bound to the live executor, deferring per-tx commit."""
+    async def _execute(raw, h, bh, bt):
+        return await _execute_evm_raw_tx(raw, h, bh, bt, defer_commit=True)
+    return _execute
+
+
+async def _produce_evm_section(block_height, block_hash, block_timestamp, raw_txs):
+    """
+    Proposer hook (E-D3b execute-on-mine): execute the selected EVM section
+    against live EVM state and return ``(account_state_root, included_raw_txs)``.
+
+    ``(None, [])`` when EVM is disabled, there are no txs, or the section could
+    not be produced (the proposer then ships the block without an EVM section).
+    """
+    if EVM_STATE_MANAGER is None or not raw_txs:
+        return None, []
+    from ..contracts.evm_block_apply import produce_block_evm_section
+    return await produce_block_evm_section(
+        block_height, block_hash, block_timestamp, raw_txs,
+        db, EVM_STATE_MANAGER, _evm_defer_execute(),
+    )
+
+
+async def _apply_evm_section_on_import(block_height, block_hash, block_timestamp,
+                                       evm_section, declared_root):
+    """
+    Importer hook (E-D3b): validate + replay a block's EVM section, rejecting on
+    any mismatch (local state left untouched). Returns ``(ok, error)``.
+
+    Backward-compatible: an empty/absent section is accepted. If this node does
+    not run the EVM system, it cannot validate the section, so it accepts the
+    block WITHOUT applying EVM state (the section is still stored for a later
+    rebuild) — consistent with the additive-section design.
+    """
+    if not evm_section:
+        return True, ""
+    if EVM_STATE_MANAGER is None:
+        logger.warning("EVM section present but EVM disabled on this node — storing without applying")
+        return True, ""
+    from ..contracts.evm_block_apply import apply_block_evm_section
+    return await apply_block_evm_section(
+        block_height, block_hash, block_timestamp, evm_section, declared_root,
+        db, EVM_STATE_MANAGER, _evm_defer_execute(),
+    )
+
+
 async def _gossip_evm_raw_tx(raw_tx_hex: str):
     """
-    Best-effort propagate a signed EVM raw transaction to peers.
+    Best-effort propagate a signed EVM raw transaction to peers' mempools.
 
-    Each peer runs the identical deterministic ``eth_sendRawTransaction``
-    execution, so all live nodes converge on the same ``account_state``. The
-    peer's own EVM_TX_CACHE stops the gossip from looping. This is Phase 1
-    (live convergence) only — it does not make EVM state durable across resync;
-    block-level inclusion is the documented Phase 2 follow-up.
+    Under execute-on-mine (E-D3b) ``eth_sendRawTransaction`` is admit-only, so
+    this gossip is **mempool propagation**: each peer admits the tx to its own
+    EVM mempool so whichever node proposes the next block can include it. The
+    peer's EVM_TX_CACHE stops the gossip from looping. (Previously this drove
+    Phase-1 live execution convergence; that role is retired.)
     """
     try:
         peers = NodesManager.get_propagate_peers()
@@ -2093,6 +2140,21 @@ async def process_and_create_block(block_info: dict) -> bool:
                 logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr}")
                 return False
 
+        # E-D3b: validate + replay the EVM section (execute-on-mine) before
+        # storing — reject any block whose account_state_root doesn't match.
+        evm_section = block.get('evm_transactions') or block_info.get('evm_transactions')
+        if evm_section:
+            ts_evm = block.get('timestamp', 0) or 0
+            if hasattr(ts_evm, 'timestamp'):
+                ts_evm = int(ts_evm.timestamp())
+            declared_acc = block.get('account_state_root') or block_info.get('account_state_root')
+            ok_evm, verr_evm = await _apply_evm_section_on_import(
+                block_height, block_hash, int(ts_evm), evm_section, declared_acc,
+            )
+            if not ok_evm:
+                logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr_evm}")
+                return False
+
         try:
             timestamp_val = block.get('timestamp', 0)
             await db.add_block(
@@ -2116,6 +2178,12 @@ async def process_and_create_block(block_info: dict) -> bool:
                     await db.add_block_exchange_txs(block_hash, ex_section)
                 except Exception as e:
                     logger.warning(f"[SYNC] Failed to store exchange section for block {block_height}: {e}")
+            # E-D3b: persist the (now-validated) EVM section for durability/rebuild.
+            if evm_section:
+                try:
+                    await db.add_block_evm_txs(block_hash, evm_section)
+                except Exception as e:
+                    logger.warning(f"[SYNC] Failed to store EVM section for block {block_height}: {e}")
             logger.debug(f"[SYNC] Stored PoS block {block_height} ({block_hash[:16]}...) validator={validator_address[:20]}")
             return True
         except Exception as e:
@@ -2199,6 +2267,7 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
     logger.info(f"[REORG] Collecting transactions from orphaned blocks between {last_common_block_id + 1} and {local_height}.")
     orphaned_txs = []
     orphaned_exchange_sections = []
+    orphaned_evm_sections = []
     for height in range(last_common_block_id + 1, local_height + 1):
         block = await db.get_block_by_id(height)
         if block:
@@ -2209,6 +2278,13 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
                 section = await db.get_block_exchange_txs(block['hash'])
                 if section:
                     orphaned_exchange_sections.append(section)
+            except Exception:
+                pass
+            # Capture orphaned EVM sections so their txs can be re-queued (E-D3b).
+            try:
+                evm_sec = await db.get_block_evm_txs(block['hash'])
+                if evm_sec:
+                    orphaned_evm_sections.append(evm_sec)
             except Exception:
                 pass
 
@@ -2223,6 +2299,17 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
         await rebuild_exchange_state_from_chain(db)
     except Exception as e:
         logger.error(f"[REORG] Exchange state rebuild failed: {e}")
+
+    # E-D3b reorg safety: account_state is durable, so a rolled-back block's
+    # account changes remain committed — rebuild EVM/account state to the new
+    # canonical tip (clears + replays canonical EVM sections). Incoming canonical
+    # blocks then re-apply normally as they sync in.
+    if EVM_STATE_MANAGER is not None:
+        try:
+            from ..contracts.evm_block_apply import rebuild_account_state_from_chain
+            await rebuild_account_state_from_chain(db, EVM_STATE_MANAGER, _evm_defer_execute())
+        except Exception as e:
+            logger.error(f"[REORG] EVM/account state rebuild failed: {e}")
 
     logger.info(f"[REORG] Re-adding {len(orphaned_txs)} orphaned transactions to the pending pool.")
     for tx in orphaned_txs:
@@ -2246,6 +2333,22 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
             logger.info(f"[REORG] Re-queued {requeued} orphaned exchange tx(s)")
         except Exception as e:
             logger.error(f"[REORG] Could not re-queue orphaned exchange txs: {e}")
+
+    # Re-queue orphaned EVM txs to the EVM mempool (re-verified on admit) so they
+    # can be re-included on the new canonical chain (E-D3b).
+    if orphaned_evm_sections:
+        try:
+            from ..contracts.evm_block import decode_evm_txs
+            mp = _get_evm_mempool()
+            requeued = 0
+            for section in orphaned_evm_sections:
+                for raw in decode_evm_txs(section):
+                    ok, _err, _h = mp.admit(raw)
+                    if ok:
+                        requeued += 1
+            logger.info(f"[REORG] Re-queued {requeued} orphaned EVM tx(s)")
+        except Exception as e:
+            logger.error(f"[REORG] Could not re-queue orphaned EVM txs: {e}")
 
     return last_common_block_id
 
@@ -2473,6 +2576,14 @@ async def startup():
                         validator_node.set_exchange_tx_source(_get_exchange_mempool())
                     except Exception as e:
                         logger.warning(f"Could not attach exchange tx source: {e}")
+                    # E-D3b: let the proposer include admitted EVM txs (execute-on-
+                    # mine). The producer reads the EVM globals lazily, so it works
+                    # once the EVM system finishes initializing below.
+                    try:
+                        validator_node.set_evm_tx_source(_get_evm_mempool())
+                        validator_node.set_evm_section_producer(_produce_evm_section)
+                    except Exception as e:
+                        logger.warning(f"Could not attach EVM tx source/producer: {e}")
                 else:
                     logger.error("❌ Failed to initialize validator node")
             except Exception as e:
@@ -2496,6 +2607,7 @@ async def startup():
         self_node_id=self_node_id,
         sync_blockchain=_sync_blockchain,
         follow_up_sync=_follow_up_sync,
+        evm_apply_section=_apply_evm_section_on_import,  # E-D3b importer hook
     )
 
     logger.info(f"✅ JSON-RPC server initialized (dht_* + p2p_* always-on): {len(rpc_server.get_methods())} methods")
@@ -2698,12 +2810,18 @@ async def startup():
             
             async def eth_sendRawTransaction_handler(raw_tx_hex, _propagated=False):
                 """
-                Submit a pre-signed raw EVM transaction.
+                Submit a pre-signed raw EVM transaction (E-D3b: execute-on-mine).
 
-                Executes against EVM/account state via the shared
-                ``_execute_evm_raw_tx`` core (also used by block production + import
-                replay, E-D3), then gossips for Phase-1 live convergence.
-                ``_propagated`` suppresses re-broadcast.
+                Web3-standard semantics: this ADMITS the tx to the EVM mempool and
+                returns its hash immediately — it does NOT execute it. Execution
+                happens when a proposer includes the tx in a block (the section is
+                executed + the account_state_root declared), and every node applies
+                it deterministically on import. Account balances therefore change on
+                block inclusion, not at RPC time; clients poll
+                ``eth_getTransactionReceipt`` for the result.
+
+                The tx is gossiped to peers' mempools so whichever node proposes
+                next can include it. ``_propagated`` suppresses re-broadcast.
                 """
                 try:
                     from eth_utils import decode_hex, encode_hex
@@ -2711,49 +2829,28 @@ async def startup():
 
                     raw_tx = decode_hex(raw_tx_hex)
                     _evm_tx_hash = encode_hex(keccak(raw_tx))
-                    # Idempotent: skip txs already applied (also stops gossip loops).
+                    # Idempotent: skip txs already admitted (also stops gossip loops).
                     if await EVM_TX_CACHE.contains(_evm_tx_hash):
                         return _evm_tx_hash
                     await EVM_TX_CACHE.put(_evm_tx_hash, True)
 
                     # Admission control (standard mempool semantics): recover the
-                    # sender, enforce the nonce window + DoS caps before doing any
-                    # work. A stale-nonce / unrecoverable / far-future tx is
-                    # rejected here. (The mempool entry is transient — the tx is
-                    # removed once executed below; full execute-on-mine is the
-                    # E-D3b flip.)
+                    # sender, enforce the nonce window + DoS caps. A stale-nonce /
+                    # unrecoverable / far-future tx is rejected here. The tx then
+                    # waits in the mempool to be included by a proposer.
                     mp = _get_evm_mempool()
                     admit_ok, admit_err, _ = mp.admit(raw_tx_hex)
                     if not admit_ok and "duplicate" not in (admit_err or ""):
                         raise Exception(f"rejected: {admit_err}")
 
-                    # Execute against the latest block context for determinism.
-                    current_block = await db.get_last_block()
-                    block_height = (current_block or {}).get('id') or (current_block or {}).get('block_height') or 0
-                    block_hash = (current_block or {}).get('hash') or (current_block or {}).get('block_hash') or ''
-                    block_timestamp = (current_block or {}).get('timestamp') or 0
-                    if hasattr(block_timestamp, 'timestamp'):
-                        block_timestamp = int(block_timestamp.timestamp())
-
-                    res = await _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timestamp)
-                    if not res.get('success'):
-                        try:
-                            mp.remove([_evm_tx_hash])
-                        except Exception:
-                            pass
-                        raise Exception(f"Execution failed: {res.get('error')}")
-
-                    # Executed — clear the transient mempool entry.
-                    try:
-                        mp.remove([_evm_tx_hash])
-                    except Exception:
-                        pass
-
-                    # Phase 1 cross-node convergence (retired in the E-D3b flip).
+                    # Propagate to peers' mempools so the next proposer (which may be
+                    # any node) can include it.
                     if not _propagated:
                         asyncio.create_task(_gossip_evm_raw_tx(raw_tx_hex))
 
-                    return res.get('created_address') or res.get('tx_hash')
+                    # Web3 contract: always return the tx hash (the receipt — incl.
+                    # any created contract address — is available after inclusion).
+                    return _evm_tx_hash
                 except Exception as e:
                     logger.error(f"eth_sendRawTransaction error: {e}", exc_info=True)
                     raise Exception(f"Transaction failed: {str(e)}")
@@ -3273,6 +3370,20 @@ async def submit_block(
                     )
                     return {'ok': False, 'error': f'Invalid exchange section: {verr}'}
 
+            # E-D3b: validate + replay the EVM section (execute-on-mine) before
+            # storing; reject on account_state_root mismatch.
+            evm_section = body.get('evm_transactions')
+            if evm_section:
+                ok_evm, verr_evm = await _apply_evm_section_on_import(
+                    block_no, block_hash, int(body.get('timestamp', 0) or 0),
+                    evm_section, body.get('account_state_root'),
+                )
+                if not ok_evm:
+                    await security.reputation_manager.record_violation(
+                        verified_sender, 'invalid_evm_section', severity=6
+                    )
+                    return {'ok': False, 'error': f'Invalid EVM section: {verr_evm}'}
+
             try:
                 await db.add_block(
                     block_hash=block_hash,
@@ -3287,6 +3398,12 @@ async def submit_block(
                         await db.add_block_exchange_txs(block_hash, ex_section)
                     except Exception as e:
                         logger.warning(f"Failed to store exchange section for block {block_no}: {e}")
+                # E-D3b: persist the (now-validated) EVM section for durability/rebuild.
+                if evm_section:
+                    try:
+                        await db.add_block_evm_txs(block_hash, evm_section)
+                    except Exception as e:
+                        logger.warning(f"Failed to store EVM section for block {block_no}: {e}")
                 await security.reputation_manager.record_good_behavior(verified_sender, points=5)
                 logger.info(f"Accepted PoS block {block_no} from {verified_sender}. Propagating...")
                 background_tasks.add_task(

@@ -82,3 +82,46 @@ def test_core_fields_match_legacy_shape():
     data = assemble_pos_block_data(block, 12, None)
     assert set(data) >= {"id", "block_content", "block_hash", "validator_address"}
     assert data["block_content"] == str(block.to_dict())
+
+
+# ── E-D3b: EVM section in the proposer payload ──────────────────────────────
+
+def _signed_evm_raw(i, nonce=0):
+    from eth_account import Account as EthAccount
+    key = "0x" + f"{i:064x}"
+    acct = EthAccount.from_key(key)
+    tx = {"nonce": nonce, "gasPrice": 10 ** 9, "gas": 21000,
+          "to": acct.address, "value": 1, "data": b"", "chainId": 1}
+    signed = EthAccount.sign_transaction(tx, key)
+    raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+    return "0x" + bytes(raw).hex()
+
+
+def test_no_evm_section_when_empty():
+    from qrdx.contracts.evm_block import BLOCK_EVM_TXS_KEY
+    block = _FakeBlock("ba" * 32, "0xPQ" + "55" * 32)
+    data = assemble_pos_block_data(block, 4, None, None, evm_txs=None, account_state_root=None)
+    assert BLOCK_EVM_TXS_KEY not in data
+    assert "account_state_root" not in data
+
+
+def test_evm_section_present_and_recoverable_with_root():
+    from qrdx.contracts.evm_block import BLOCK_EVM_TXS_KEY, extract_evm_transactions_from_dict
+    block = _FakeBlock("bb" * 32, "0xPQ" + "66" * 32)
+    raws = [_signed_evm_raw(1), _signed_evm_raw(2)]
+    data = assemble_pos_block_data(block, 8, None, None,
+                                   evm_txs=raws, account_state_root="d" * 128)
+    assert BLOCK_EVM_TXS_KEY in data
+    assert data["account_state_root"] == "d" * 128
+    assert extract_evm_transactions_from_dict(data) == raws
+
+
+def test_exchange_and_evm_sections_coexist():
+    from qrdx.contracts.evm_block import BLOCK_EVM_TXS_KEY
+    block = _FakeBlock("bc" * 32, "0xPQ" + "77" * 32)
+    ex = [_signed_tx(0)]
+    raws = [_signed_evm_raw(3)]
+    data = assemble_pos_block_data(block, 5, ex, "e" * 128, raws, "f" * 128)
+    assert BLOCK_EXCHANGE_TXS_KEY in data and BLOCK_EVM_TXS_KEY in data
+    assert data["exchange_state_root"] == "e" * 128
+    assert data["account_state_root"] == "f" * 128

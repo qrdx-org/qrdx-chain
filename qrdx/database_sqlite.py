@@ -660,6 +660,18 @@ class DatabaseSQLite:
             )
         return hasher.digest(length=64).hex()
 
+    async def clear_account_state(self) -> None:
+        """
+        Clear all EVM/account state rows (E-D3b reorg rebuild).
+
+        Used by ``rebuild_account_state_from_chain`` before replaying the
+        canonical EVM sections, so orphaned-block account changes do not survive
+        a reorg. ``account_state`` is otherwise durable across restarts.
+        """
+        await self.connection.execute("DELETE FROM account_state")
+        await self.connection.execute("DELETE FROM contract_storage")
+        await self.connection.commit()
+
     async def get_pending_transaction_count(self):
         """Get count of pending transactions"""
         cursor = await self.connection.execute("SELECT COUNT(*) FROM pending_transactions")

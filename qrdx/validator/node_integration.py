@@ -26,16 +26,19 @@ SLOT_DURATION_SECONDS = SLOT_DURATION if isinstance(SLOT_DURATION, int) else 12
 
 
 def assemble_pos_block_data(block, height: int, exchange_txs=None,
-                            exchange_state_root: str = None) -> dict:
+                            exchange_state_root: str = None,
+                            evm_txs=None, account_state_root: str = None) -> dict:
     """
-    Build the broadcast/storage payload for a proposed PoS block (Phase D2.2/D3).
+    Build the broadcast/storage payload for a proposed PoS block (Phase D2.2/D3,
+    E-D3b).
 
-    The exchange section is **additive**: present only when the proposer included
-    exchange transactions, and ignored by importers that don't understand it
-    (backward compatible). It is encoded with the canonical D2.1 codec so it
-    round-trips and authenticates on the receiving side. When a section is
-    present the proposer also declares ``exchange_state_root`` (D3) so importers
-    can re-execute and verify it.
+    Both the exchange section and the EVM section are **additive**: present only
+    when the proposer included transactions of that kind, and ignored by importers
+    that don't understand them (backward compatible). Each is encoded with its
+    canonical codec so it round-trips and authenticates on the receiving side.
+    When a section is present the proposer also declares its state root
+    (``exchange_state_root`` / ``account_state_root``) so importers can re-execute
+    and verify it (reject-on-mismatch).
 
     Pure function (no I/O) so it is unit-testable in isolation.
     """
@@ -54,6 +57,11 @@ def assemble_pos_block_data(block, height: int, exchange_txs=None,
         data[BLOCK_EXCHANGE_TXS_KEY] = encode_exchange_txs(exchange_txs)
         if exchange_state_root:
             data['exchange_state_root'] = exchange_state_root
+    if evm_txs:
+        from ..contracts.evm_block import encode_evm_txs, BLOCK_EVM_TXS_KEY
+        data[BLOCK_EVM_TXS_KEY] = encode_evm_txs(evm_txs)
+        if account_state_root:
+            data['account_state_root'] = account_state_root
     return data
 
 
@@ -103,6 +111,15 @@ class ValidatorNode:
         # An object exposing select_for_block(limit) -> [ExchangeTransaction]
         # (the node's ExchangeMempool). Set via set_exchange_tx_source().
         self._exchange_tx_source = None
+
+        # ── EVM tx inclusion (E-D3b execute-on-mine) ──
+        # _evm_tx_source: the node's EVMMempool (select_for_block / remove).
+        # _evm_section_producer: async (height, hash, ts, raw_txs) ->
+        #   (account_state_root or None, included_raw_txs) — executes the section
+        #   against EVM state and declares the root. Both set from main.py once
+        #   the EVM system is initialized.
+        self._evm_tx_source = None
+        self._evm_section_producer = None
         
         logger.info(f"ValidatorNode initialized for wallet: {validator_wallet_path}")
     
@@ -348,8 +365,40 @@ class ValidatorNode:
                                 logger.warning(f"Exchange execution error, dropping section: {e}")
                                 exchange_txs = []
 
+                    # E-D3b: execute-on-mine for the EVM/account section. Select
+                    # admitted EVM txs, execute them against EVM state, and declare
+                    # the resulting account_state_root. On any failure the producer
+                    # drops the section (ships no EVM txs) rather than a bad block.
+                    evm_txs = []
+                    account_state_root = None
+                    if self._evm_tx_source is not None and self._evm_section_producer is not None:
+                        try:
+                            evm_raws = self._evm_tx_source.select_for_block() or []
+                        except Exception as e:
+                            logger.warning(f"EVM tx selection failed: {e}")
+                            evm_raws = []
+                        if evm_raws:
+                            try:
+                                account_state_root, evm_txs = await self._evm_section_producer(
+                                    next_height, block.hash, int(block.timestamp or 0), evm_raws,
+                                )
+                                evm_txs = evm_txs or []
+                                if account_state_root and evm_txs:
+                                    logger.info(
+                                        f"📦 Including {len(evm_txs)} EVM tx(s) in "
+                                        f"block #{next_height} (root={account_state_root[:16]}...)"
+                                    )
+                                else:
+                                    evm_txs = []
+                                    account_state_root = None
+                            except Exception as e:
+                                logger.warning(f"EVM section production failed, dropping section: {e}")
+                                evm_txs = []
+                                account_state_root = None
+
                     block_data = assemble_pos_block_data(
                         block, next_height, exchange_txs, exchange_state_root,
+                        evm_txs, account_state_root,
                     )
 
                     # Add block to database with sequential height
@@ -374,6 +423,26 @@ class ValidatorNode:
                                 self._exchange_tx_source.remove([t.tx_hash() for t in exchange_txs])
                         except Exception as e:
                             logger.warning(f"Failed to persist/drain exchange section: {e}")
+
+                    # E-D3b: persist the (now-executed) EVM section so it is durable
+                    # + replayable, and drain the included txs from the mempool.
+                    if evm_txs:
+                        try:
+                            from ..contracts.evm_block import BLOCK_EVM_TXS_KEY
+                            from ..contracts.evm_mempool import parse_eth_raw_tx
+                            evm_section = block_data.get(BLOCK_EVM_TXS_KEY)
+                            if evm_section:
+                                await self.db.add_block_evm_txs(block.hash, evm_section)
+                            if self._evm_tx_source is not None:
+                                hashes = []
+                                for raw in evm_txs:
+                                    try:
+                                        hashes.append(parse_eth_raw_tx(raw)["tx_hash"])
+                                    except Exception:
+                                        pass
+                                self._evm_tx_source.remove(hashes)
+                        except Exception as e:
+                            logger.warning(f"Failed to persist/drain EVM section: {e}")
 
                     # Broadcast block to network peers
                     if self.broadcast_callback:
@@ -514,6 +583,23 @@ class ValidatorNode:
         """
         self._exchange_tx_source = source
         logger.info("ValidatorNode: exchange tx source attached for block inclusion")
+
+    def set_evm_tx_source(self, source) -> None:
+        """Attach the EVM mempool the proposer pulls account-model txs from."""
+        self._evm_tx_source = source
+        logger.info("ValidatorNode: EVM tx source attached for block inclusion")
+
+    def set_evm_section_producer(self, producer) -> None:
+        """
+        Attach the async EVM section producer (E-D3b execute-on-mine).
+
+        ``producer(height, block_hash, timestamp, raw_txs)`` executes the section
+        against EVM/account state and returns
+        ``(account_state_root or None, included_raw_txs)``. Defined in main.py so
+        it shares the live executor + state manager.
+        """
+        self._evm_section_producer = producer
+        logger.info("ValidatorNode: EVM section producer attached")
 
     async def _canary_monitor_loop(self):
         """

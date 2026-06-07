@@ -95,6 +95,67 @@ async def produce_block_evm_section(
     return root, list(raw_txs)
 
 
+async def rebuild_account_state_from_chain(
+    db: Any,
+    state_manager: ContractStateManager,
+    execute_tx: ExecuteTx,
+) -> str:
+    """
+    Reconstruct EVM/account state by replaying every canonical block's EVM
+    section in height order (E-D3b — reorg safety).
+
+    Unlike the in-memory exchange state, ``account_state`` is **durable in
+    SQLite**, so a plain restart needs NO rebuild (the table is already correct).
+    This is for **reorg safety**: after the base layer rolls back to a common
+    ancestor, the orphaned blocks' account changes are still committed in the
+    table, so we clear EVM state and replay the canonical sections up to the
+    current (rolled-back) tip. Incoming canonical blocks then re-apply normally
+    via ``apply_block_evm_section`` as they sync in.
+
+    Clears ``account_state`` + ``contract_storage`` and the manager cache, then
+    replays. O(total EVM txs); checkpointing is a future optimization. Returns the
+    resulting canonical ``account_state_root``.
+    """
+    # Clear durable EVM tables + in-memory cache so the replay is authoritative.
+    await db.clear_account_state()
+    state_manager._accounts_cache.clear()
+    state_manager._storage_cache.clear()
+    state_manager._code_cache.clear()
+    state_manager._dirty_accounts.clear()
+    state_manager._dirty_storage.clear()
+    state_manager._snapshots.clear()
+
+    try:
+        tip = (await db.get_next_block_id()) - 1
+    except Exception:
+        return await db.get_account_state_root()
+
+    applied = 0
+    for height in range(0, tip + 1):
+        try:
+            block = await db.get_block_by_id(height)
+        except Exception:
+            block = None
+        if not block:
+            continue
+        block_hash = block.get("hash") or block.get("block_hash")
+        if not block_hash:
+            continue
+        try:
+            section = await db.get_block_evm_txs(block_hash)
+        except Exception:
+            section = None
+        if not section:
+            continue
+        ts = int(block.get("timestamp", 0) or 0)
+        root, _included = await produce_block_evm_section(
+            height, block_hash, ts, section, db, state_manager, execute_tx,
+        )
+        if root is not None:
+            applied += 1
+    return await db.get_account_state_root()
+
+
 async def apply_block_evm_section(
     block_height: int,
     block_hash: str,
