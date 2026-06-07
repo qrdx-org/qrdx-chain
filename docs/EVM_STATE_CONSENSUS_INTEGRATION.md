@@ -132,3 +132,51 @@ reading the unchanged UTXO balance. Run:
 PYTHONPATH=. pytest tests/test_testnet_integration.py::test_full_integration_suite \
   -m integration -s --timeout=520
 ```
+
+---
+
+## 6. Phase 2 — EVM/account consensus integration (the gating work)
+
+Phase 1 gives *live* convergence but EVM state is still not durable, not
+consensus-final, and not part of an enforced state root. The exchange domain
+already received full consensus integration (see
+`EXCHANGE_PRODUCTION_READINESS.md`, Phases D1–D3 + reorg safety); the EVM/account
+domain must receive the **same treatment**, and doing so is the prerequisite for
+**D4.2** (enforcing the unified block state root) **and Phase E** (charging
+gas/margin against real balances). It mirrors the exchange work step for step:
+
+- **E-D1 — admission gate.** An EVM-tx mempool: decode the RLP tx, recover the
+  sender (ECDSA — recovery itself binds the sender, so no separate signature
+  check is needed), enforce a nonce window vs the account nonce, dedup by tx
+  hash, and cap per-sender/global for DoS. `select_for_block` yields a canonical,
+  gap-free, per-sender ordering. *(Mirrors `ExchangeMempool`; first step,
+  self-contained + unit-testable, no behavior change — built standalone before
+  wiring, exactly as the exchange mempool was.)*
+- **E-D2 — block inclusion.** The proposer selects admitted EVM txs and writes a
+  canonical `evm_transactions` section into the block body (codec mirroring the
+  exchange one), and declares the resulting `account_state_root`
+  (`db.get_account_state_root()`, already added in D4.1).
+- **E-D3 — deterministic import replay.** Importing nodes re-execute the EVM
+  section against the parent account state (the EVM executor is deterministic),
+  recompute `account_state_root`, and **reject on mismatch**, reverting on
+  failure. Replace Phase-1 gossip with this consensus path; persist the section
+  for durability; rebuild from the canonical chain on startup/reorg (mirroring
+  `rebuild_exchange_state_from_chain`).
+- **E-D4 — unify + enforce.** With UTXO, exchange, **and** account all
+  deterministically replayed on import, bind `unified_state_root` into the block
+  signing root and enforce it (recompute + reject). This is **D4.2**.
+- **E-E — economic integrity (Phase E).** Once account balances are a single
+  consensus-replayed ledger, debit gas/stake/margin from the sender's real
+  balance in both the exchange and EVM execution paths; reject if underfunded.
+
+**Risk note.** This is base-layer, consensus-critical work; each step must be
+verified against the integration testnet (12/12) and unit suite, landed
+incrementally, and ultimately covered by the external audit + ≥30-day
+multi-validator soak (the `QRDX_IMPLEMENTATION_CHECKLIST.md` Production-Ready
+gate). No in-repo code substitutes for those process gates.
+
+### 6.1 Status
+- **E-D1 admission gate: ✅ implemented (this change)** — `qrdx/contracts/evm_mempool.py`
+  (`EVMMempool` + `parse_eth_raw_tx`), tests in `tests/test_evm_mempool.py`.
+  Standalone, not yet wired into the live `eth_sendRawTransaction` path.
+- E-D2 … E-E: pending, in the order above.
