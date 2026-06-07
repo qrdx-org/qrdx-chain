@@ -371,12 +371,23 @@ class ContractStateManager:
         # Remove newer snapshots
         self._snapshots = self._snapshots[:snapshot_id]
     
-    async def commit(self, block_number: int) -> None:
+    async def commit(self, block_number: int, flush_only: bool = False) -> None:
         """
         Commit cached state changes to database.
-        
+
         Args:
             block_number: Current block number
+            flush_only: E-D3b atomic block boundary. When True, the dirty
+                account/storage rows are WRITTEN to the DB tables but the
+                connection-level ``conn.commit()`` is NOT issued and the dirty
+                sets / snapshots are NOT cleared. This lets a block validator
+                flush the cache, read back the canonical
+                ``db.get_account_state_root()`` (which sees these uncommitted
+                same-connection writes), and then atomically either
+                ``conn.commit()`` (accept) or ``conn.rollback()`` + ``revert``
+                (reject-on-mismatch). ``account_state`` has a single writer (this
+                method), so no other mid-block ``conn.commit()`` can prematurely
+                persist a rejected block's account changes.
         """
         conn = self.db.connection
 
@@ -443,13 +454,18 @@ class ContractStateManager:
                         (address, key.hex(), value.hex(), block_number)
                     )
 
+        if flush_only:
+            # Rows are written but NOT committed and dirty/snapshots are kept,
+            # so the caller can read the root and decide commit-or-rollback.
+            return
+
         await conn.commit()
 
         # Clear dirty sets
         self._dirty_accounts.clear()
         self._dirty_storage.clear()
         self._snapshots.clear()
-    
+
     async def get_state_root(self) -> bytes:
         """
         Compute state root (Merkle Patricia Trie root).

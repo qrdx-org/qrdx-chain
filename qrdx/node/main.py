@@ -875,13 +875,20 @@ def _get_evm_mempool():
     return EVM_MEMPOOL
 
 
-async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timestamp):
+async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timestamp,
+                              defer_commit=False):
     """
     Execute a signed raw EVM transaction against EVM/account state (E-D3 core).
 
     Shared by the RPC handler, the block proposer, and import replay so all three
     apply the identical deterministic state transition. Commits or reverts
     atomically via ExecutionContext.
+
+    ``defer_commit`` (E-D3b): when True, a successful tx's account changes are
+    kept in the EVM cache instead of being flushed to the DB per-tx, so a block
+    validator can execute the whole EVM section and then flush-read-decide the
+    block's ``account_state_root`` atomically (see
+    ``qrdx.contracts.evm_block_apply.apply_block_evm_section``).
 
     Returns a dict: {success, tx_hash, sender, nonce, created_address, error}.
     """
@@ -941,6 +948,7 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
         await context_exec.finalize_execution(
             sender=sender_hex, tx_hash=tx_hash_hex, success=result.success,
             gas_used=result.gas_used, gas_price=gas_price_wei, value=value_wei,
+            defer_commit=defer_commit,
         )
         if not result.success:
             return {"success": False, "error": result.error, "tx_hash": tx_hash_hex,
