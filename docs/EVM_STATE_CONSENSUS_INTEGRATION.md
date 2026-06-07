@@ -219,19 +219,28 @@ gate). No in-repo code substitutes for those process gates.
   5. Retire the Phase-1 gossip execution role.
   6. Rework S04/S10/S11 for execute-on-mine timing (balance changes on inclusion).
 
-  **🔎 Newly-identified prerequisite (gates step 3's safe reject-on-mismatch):
-  the EVM state has two uncoordinated write paths.** `ContractStateManager`
-  has `snapshot()`/`revert()`/`commit()` over its **in-memory cache**, but the
-  live execution path `StateSyncManager`/`ExecutionContext.finalize_execution`
-  writes `account_state` **directly and calls `conn.commit()` per tx**. A bad
-  block would therefore commit before the root is compared, and a DB SAVEPOINT
-  around the replay would be defeated by that inner commit — so import-replay
-  cannot safely *revert* a mismatched block today. Before step 3, the EVM write
-  paths must be unified under one snapshot/commit boundary (route execution
-  through the `ContractStateManager` cache and commit once per block, or defer
-  `finalize_execution`'s commit and wrap the replay in a savepoint). This is the
-  EVM analog of the exchange `take_snapshot`/`revert_block` fix done in D3 —
-  necessary, intricate, and consensus-critical.
+  **🔎 Prerequisite (gates step 3's safe reject-on-mismatch): atomic EVM block
+  commit.** Progress + precise structure:
+  - ✅ `ContractStateManager` has cache `snapshot()`/`revert()`/`commit()`, and
+    `ExecutionContext.finalize_execution(defer_commit=True)` now keeps a
+    successful tx's changes in the cache instead of flushing per-tx
+    (`tests/test_evm_defer_commit.py`).
+  - ⚠️ Still required: the canonical account root is `db.get_account_state_root()`
+    (full table, **BLAKE3-512**) — `ContractStateManager.get_state_root()` is
+    cache-only + keccak + a partial set, so it is NOT usable as the consensus
+    root. Validating the root therefore means flushing the cache to the DB and
+    reading it back **before** deciding to keep or discard the block.
+  - ⚠️ That flush-read-decide must be one DB transaction with commit-or-rollback,
+    but the execution path calls `conn.commit()` at **multiple** points
+    (`finalize_execution`, `sync_address_to_evm`, `record_balance_change`), each
+    of which would prematurely end the transaction. So the atomic boundary
+    requires coordinating *all* of these under a single per-block transaction
+    (e.g. thread a `defer_commit`/transaction handle through the state-sync path
+    and commit/rollback once per block) — an invasive, consensus-critical change
+    to EVM commit semantics, and the natural unit of the focused flip effort
+    rather than another standalone primitive. Also delete DB rows for accounts
+    *created* during a rolled-back block (the same "remove created entities"
+    correctness point as the exchange snapshot fix).
 
   **Determinism note:** EVM execution syncs the sender's *native* balance in
   (`prepare_execution`); deterministic only while native balances are themselves

@@ -17,6 +17,7 @@ testing
 logs/
 ref/
 testnet/
+testnet*
 *.db
 *.log
 *.env
