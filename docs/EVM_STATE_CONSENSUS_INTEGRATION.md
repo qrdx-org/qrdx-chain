@@ -179,4 +179,13 @@ gate). No in-repo code substitutes for those process gates.
 - **E-D1 admission gate: ✅ implemented (this change)** — `qrdx/contracts/evm_mempool.py`
   (`EVMMempool` + `parse_eth_raw_tx`), tests in `tests/test_evm_mempool.py`.
   Standalone, not yet wired into the live `eth_sendRawTransaction` path.
-- E-D2 … E-E: pending, in the order above.
+- **E-D2 block-body codec: ✅ implemented (this change)** — `qrdx/contracts/evm_block.py`
+  (`encode_evm_txs`/`decode_evm_txs`/`evm_txs_canonical_bytes`/
+  `extract_evm_transactions_from_dict`, key `evm_transactions`), tests in
+  `tests/test_evm_block_codec.py`. Pure codec; round-trips raw txs (authenticity
+  preserved — sender re-recovers), JSON-safe, deterministic, order/tamper
+  sensitive, backward compatible. Proposer *inclusion* of the section is bundled
+  into E-D3, because for EVM it is entangled with replacing the Phase-1 gossip
+  path (the section would be an empty no-op until `eth_sendRawTransaction` routes
+  through the mempool + replay).
+- E-D3 … E-E: pending, in the order above.
