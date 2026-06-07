@@ -875,6 +875,88 @@ def _get_evm_mempool():
     return EVM_MEMPOOL
 
 
+async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timestamp):
+    """
+    Execute a signed raw EVM transaction against EVM/account state (E-D3 core).
+
+    Shared by the RPC handler, the block proposer, and import replay so all three
+    apply the identical deterministic state transition. Commits or reverts
+    atomically via ExecutionContext.
+
+    Returns a dict: {success, tx_hash, sender, nonce, created_address, error}.
+    """
+    from eth_utils import decode_hex, encode_hex
+    from eth_keys import keys
+    import rlp
+    from eth_hash.auto import keccak
+    from ..contracts.state_sync import StateSyncManager, ExecutionContext
+
+    evm_executor = EVM_EXECUTOR
+    state_manager = EVM_STATE_MANAGER
+    if evm_executor is None or state_manager is None:
+        return {"success": False, "error": "EVM system not initialized", "tx_hash": None}
+
+    # Decode + recover sender (recovery binds the sender).
+    try:
+        raw_tx = decode_hex(raw_tx_hex)
+        tx_data = rlp.decode(raw_tx)
+        nonce = int.from_bytes(tx_data[0], 'big') if tx_data[0] else 0
+        gas_price_wei = int.from_bytes(tx_data[1], 'big') if tx_data[1] else 0
+        gas = int.from_bytes(tx_data[2], 'big') if tx_data[2] else 21000
+        to_bytes = tx_data[3]
+        value_wei = int.from_bytes(tx_data[4], 'big') if tx_data[4] else 0
+        data = tx_data[5]
+        v_int = int.from_bytes(tx_data[6], 'big')
+        r_int = int.from_bytes(tx_data[7], 'big')
+        s_int = int.from_bytes(tx_data[8], 'big')
+        if v_int >= 35:  # EIP-155
+            chain_id = (v_int - 35) // 2
+            recovery_id = v_int - (chain_id * 2 + 35)
+            unsigned_data = [tx_data[i] for i in range(6)] + [
+                chain_id.to_bytes((chain_id.bit_length() + 7) // 8, 'big'), b'', b'']
+        else:
+            recovery_id = v_int - 27
+            unsigned_data = [tx_data[i] for i in range(6)]
+        message_hash = keccak(rlp.encode(unsigned_data))
+        signature = keys.Signature(r_int.to_bytes(32, 'big') + s_int.to_bytes(32, 'big') + bytes([recovery_id]))
+        sender = signature.recover_public_key_from_msg_hash(message_hash).to_canonical_address()
+        sender_hex = encode_hex(sender)
+        to_hex = encode_hex(to_bytes) if to_bytes else None
+        tx_hash_hex = encode_hex(keccak(raw_tx))
+    except Exception as e:
+        return {"success": False, "error": f"decode/recover failed: {e}", "tx_hash": None}
+
+    sync_manager = StateSyncManager(db, state_manager)
+    await sync_manager.ensure_tables_exist()
+    context_exec = ExecutionContext(
+        block_height=block_height, block_hash=block_hash, block_timestamp=block_timestamp,
+        db=db, evm_state=state_manager, sync_manager=sync_manager,
+    )
+    await context_exec.prepare_execution(sender_hex)
+    if to_hex:
+        await sync_manager.sync_address_to_evm(address=to_hex, block_height=block_height, block_hash=block_hash)
+
+    try:
+        result = evm_executor.execute(sender, to_bytes if to_bytes else None, value_wei, data, gas, gas_price_wei)
+        await context_exec.finalize_execution(
+            sender=sender_hex, tx_hash=tx_hash_hex, success=result.success,
+            gas_used=result.gas_used, gas_price=gas_price_wei, value=value_wei,
+        )
+        if not result.success:
+            return {"success": False, "error": result.error, "tx_hash": tx_hash_hex,
+                    "sender": sender_hex, "nonce": nonce}
+        created = encode_hex(result.created_address) if result.created_address else None
+        EVM_PENDING_NONCE[sender_hex.lower()] = max(EVM_PENDING_NONCE.get(sender_hex.lower(), 0), nonce + 1)
+        return {"success": True, "tx_hash": tx_hash_hex, "sender": sender_hex,
+                "nonce": nonce, "created_address": created}
+    except Exception as e:
+        await context_exec.finalize_execution(
+            sender=sender_hex, tx_hash=tx_hash_hex, success=False, gas_used=0, gas_price=0, value=0,
+        )
+        return {"success": False, "error": str(e), "tx_hash": tx_hash_hex,
+                "sender": sender_hex, "nonce": nonce}
+
+
 async def _gossip_evm_raw_tx(raw_tx_hex: str):
     """
     Best-effort propagate a signed EVM raw transaction to peers.
@@ -2608,163 +2690,41 @@ async def startup():
             
             async def eth_sendRawTransaction_handler(raw_tx_hex, _propagated=False):
                 """
-                Send a pre-signed raw transaction with full state synchronization.
+                Submit a pre-signed raw EVM transaction.
 
-                ``_propagated`` is set True when the transaction arrived via peer
-                gossip rather than an originating client, so the node executes it
-                but does not re-broadcast (the EVM_TX_CACHE seen-check is the primary
-                loop guard; this is a belt-and-suspenders second guard).
+                Executes against EVM/account state via the shared
+                ``_execute_evm_raw_tx`` core (also used by block production + import
+                replay, E-D3), then gossips for Phase-1 live convergence.
+                ``_propagated`` suppresses re-broadcast.
                 """
                 try:
                     from eth_utils import decode_hex, encode_hex
-                    from eth_keys import keys
-                    from decimal import Decimal
-                    import rlp
                     from eth_hash.auto import keccak
-                    from ..contracts.state_sync import StateSyncManager, ExecutionContext
 
-                    # Decode raw transaction
                     raw_tx = decode_hex(raw_tx_hex)
-
-                    # Phase 1 convergence: skip if we've already seen this tx
-                    # (idempotent; prevents double execution and gossip loops).
                     _evm_tx_hash = encode_hex(keccak(raw_tx))
+                    # Idempotent: skip txs already applied (also stops gossip loops).
                     if await EVM_TX_CACHE.contains(_evm_tx_hash):
                         return _evm_tx_hash
                     await EVM_TX_CACHE.put(_evm_tx_hash, True)
 
-                    # Parse RLP-encoded signed transaction
-                    tx_data = rlp.decode(raw_tx)
-                    
-                    # Extract fields (nonce, gasPrice, gas, to, value, data, v, r, s)
-                    nonce = int.from_bytes(tx_data[0], 'big') if tx_data[0] else 0
-                    gas_price_wei = int.from_bytes(tx_data[1], 'big') if tx_data[1] else 0
-                    gas = int.from_bytes(tx_data[2], 'big') if tx_data[2] else 21000
-                    to_bytes = tx_data[3]
-                    value_wei = int.from_bytes(tx_data[4], 'big') if tx_data[4] else 0
-                    data = tx_data[5]
-                    v_int = int.from_bytes(tx_data[6], 'big')
-                    r_int = int.from_bytes(tx_data[7], 'big')
-                    s_int = int.from_bytes(tx_data[8], 'big')
-                    
-                    # Recover chain ID and recovery_id from v
-                    if v_int >= 35:
-                        # EIP-155
-                        chain_id = (v_int - 35) // 2
-                        recovery_id = v_int - (chain_id * 2 + 35)
-                        # Build message hash with EIP-155
-                        unsigned_data = [tx_data[i] for i in range(6)] + [chain_id.to_bytes((chain_id.bit_length() + 7) // 8, 'big'), b'', b'']
-                        message_hash = keccak(rlp.encode(unsigned_data))
-                    else:
-                        # Legacy (pre-EIP-155)
-                        recovery_id = v_int - 27
-                        # Build message hash without chain_id
-                        unsigned_data = [tx_data[i] for i in range(6)]
-                        message_hash = keccak(rlp.encode(unsigned_data))
-                    
-                    # Recover sender from signature
-                    signature_bytes = r_int.to_bytes(32, 'big') + s_int.to_bytes(32, 'big') + bytes([recovery_id])
-                    signature = keys.Signature(signature_bytes=signature_bytes)
-                    public_key = signature.recover_public_key_from_msg_hash(message_hash)
-                    sender = public_key.to_canonical_address()
-                    sender_hex = encode_hex(sender)
-                    
-                    to_hex = encode_hex(to_bytes) if to_bytes else None
-                    
-                    logger.info(f"eth_sendRawTransaction: from={sender_hex}, to={to_hex}, nonce={nonce}, signed=True")
-                    
-                    # Get current block for determinism
+                    # Execute against the latest block context for determinism.
                     current_block = await db.get_last_block()
                     block_height = (current_block or {}).get('id') or (current_block or {}).get('block_height') or 0
                     block_hash = (current_block or {}).get('hash') or (current_block or {}).get('block_hash') or ''
                     block_timestamp = (current_block or {}).get('timestamp') or 0
                     if hasattr(block_timestamp, 'timestamp'):
                         block_timestamp = int(block_timestamp.timestamp())
-                    
-                    # Create sync manager and ensure tables exist
-                    sync_manager = StateSyncManager(db, state_manager)
-                    await sync_manager.ensure_tables_exist()
-                    
-                    # Create execution context for atomic state management
-                    context_exec = ExecutionContext(
-                        block_height=block_height,
-                        block_hash=block_hash,
-                        block_timestamp=block_timestamp,
-                        db=db,
-                        evm_state=state_manager,
-                        sync_manager=sync_manager
-                    )
-                    
-                    # Prepare execution (sync balance from native to EVM)
-                    await context_exec.prepare_execution(sender_hex)
-                    
-                    # Also sync recipient so EVM has their full native balance
-                    if to_hex:
-                        await sync_manager.sync_address_to_evm(
-                            address=to_hex,
-                            block_height=block_height,
-                            block_hash=block_hash,
-                        )
-                    
-                    # Generate transaction hash
-                    tx_hash = keccak(raw_tx)
-                    tx_hash_hex = encode_hex(tx_hash)
-                    
-                    # Execute transaction
-                    try:
-                        result = evm_executor.execute(
-                            sender,
-                            to_bytes if to_bytes else None,
-                            value_wei,
-                            data,
-                            gas,
-                            gas_price_wei
-                        )
-                        
-                        # Finalize execution (commit or revert)
-                        await context_exec.finalize_execution(
-                            sender=sender_hex,
-                            tx_hash=tx_hash_hex,
-                            success=result.success,
-                            gas_used=result.gas_used,
-                            gas_price=gas_price_wei,
-                            value=value_wei
-                        )
-                        
-                        logger.info(f"EVM result: success={result.success}, gas_used={result.gas_used}")
-                        
-                        if not result.success:
-                            logger.error(f"EVM execution failed: {result.error}")
-                            raise Exception(f"Execution failed: {result.error}")
 
-                        # Phase 1 cross-node convergence: gossip the signed raw tx to
-                        # peers so every live node applies the same deterministic EVM
-                        # state transition. The EVM_TX_CACHE seen-check above makes this
-                        # idempotent and terminates gossip loops.
-                        # See docs/EVM_STATE_CONSENSUS_INTEGRATION.md.
-                        if not _propagated:
-                            asyncio.create_task(_gossip_evm_raw_tx(raw_tx_hex))
+                    res = await _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timestamp)
+                    if not res.get('success'):
+                        raise Exception(f"Execution failed: {res.get('error')}")
 
-                        if result.created_address:
-                            contract_addr = encode_hex(result.created_address)
-                            logger.info(f"✅ Contract deployed at: {contract_addr}")
-                            return contract_addr
-                        else:
-                            # Return transaction hash for regular transactions
-                            return tx_hash_hex
-                    
-                    except Exception as e:
-                        # Ensure rollback on any exception
-                        await context_exec.finalize_execution(
-                            sender=sender_hex,
-                            tx_hash=tx_hash_hex,
-                            success=False,
-                            gas_used=0,
-                            gas_price=0,
-                            value=0
-                        )
-                        raise
-                        
+                    # Phase 1 cross-node convergence (retired in the E-D3b flip).
+                    if not _propagated:
+                        asyncio.create_task(_gossip_evm_raw_tx(raw_tx_hex))
+
+                    return res.get('created_address') or res.get('tx_hash')
                 except Exception as e:
                     logger.error(f"eth_sendRawTransaction error: {e}", exc_info=True)
                     raise Exception(f"Transaction failed: {str(e)}")
