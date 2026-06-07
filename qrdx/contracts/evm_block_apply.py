@@ -46,6 +46,55 @@ from .state import ContractStateManager
 ExecuteTx = Callable[[str, int, str, int], Awaitable[Optional[dict]]]
 
 
+async def produce_block_evm_section(
+    block_height: int,
+    block_hash: str,
+    block_timestamp: int,
+    raw_txs: Optional[List[str]],
+    db: Any,
+    state_manager: ContractStateManager,
+    execute_tx: ExecuteTx,
+) -> Tuple[Optional[str], List[str]]:
+    """
+    Proposer-side execution of a block's EVM section (E-D3b).
+
+    The symmetric counterpart of ``apply_block_evm_section``: the proposer
+    executes the selected txs to obtain the ``account_state_root`` it will declare
+    in the block. So the proposer ships exactly what an importer would accept, the
+    flush-read-**commit** here is byte-identical to the importer's
+    flush-read-**decide**, just without a pre-declared root to compare against.
+
+    On ANY tx that cannot execute, the whole section is reverted and dropped
+    (returns ``(None, [])``) so the proposer ships a block *without* an EVM section
+    rather than one importers would reject — mirroring the exchange proposer's
+    "drop the section rather than ship a bad block" policy.
+
+    Returns ``(account_state_root, included_raw_txs)``. When no section is
+    produced, returns ``(None, [])`` and local state is untouched.
+    """
+    if not raw_txs:
+        return None, []
+
+    block_snap = await state_manager.snapshot()
+    try:
+        for i, raw in enumerate(raw_txs):
+            res = await execute_tx(raw, block_height, block_hash, block_timestamp)
+            if res is None or res.get("tx_hash") is None:
+                await state_manager.revert(block_snap)
+                return None, []
+    except Exception:
+        await state_manager.revert(block_snap)
+        return None, []
+
+    await state_manager.commit(block_height, flush_only=True)
+    root = await db.get_account_state_root()
+    await db.connection.commit()
+    state_manager._dirty_accounts.clear()
+    state_manager._dirty_storage.clear()
+    state_manager._snapshots.clear()
+    return root, list(raw_txs)
+
+
 async def apply_block_evm_section(
     block_height: int,
     block_hash: str,

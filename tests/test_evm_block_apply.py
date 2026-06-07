@@ -28,7 +28,10 @@ from eth_utils import to_checksum_address
 
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.contracts.state import ContractStateManager, Account
-from qrdx.contracts.evm_block_apply import apply_block_evm_section
+from qrdx.contracts.evm_block_apply import (
+    apply_block_evm_section,
+    produce_block_evm_section,
+)
 
 
 def _raw(i, nonce=0, value=1):
@@ -171,6 +174,41 @@ async def test_empty_section_is_noop_success():
         assert ok and err == ""
         ok2, err2 = await apply_block_evm_section(1, "h", 0, None, None, db, sm, _make_executor(sm, 1))
         assert ok2 and err2 == ""
+        assert await _db_account_count(db) == 0
+    finally:
+        await db.close(); os.remove(path)
+
+
+async def test_proposer_produce_then_importer_apply_agree():
+    """A block the proposer produces is always importable: produce → apply round-trip."""
+    db_p, sm_p, pp = await _setup()   # proposer node
+    db_i, sm_i, pi = await _setup()   # importer node
+    try:
+        txs = [_raw(10), _raw(11), _raw(12)]
+        raws = [t[0] for t in txs]
+
+        # Proposer executes + declares the root and the included section.
+        root, included = await produce_block_evm_section(
+            5, "h5", 0, raws, db_p, sm_p, _make_executor(sm_p, 7777))
+        assert root is not None
+        assert included == raws  # all txs executed cleanly ⇒ whole section shipped
+
+        # Importer replays the declared section + root and must accept.
+        ok, err = await apply_block_evm_section(
+            5, "h5", 0, included, root, db_i, sm_i, _make_executor(sm_i, 7777))
+        assert ok, err
+        # Both nodes hold identical committed account state.
+        assert await _db_root(db_p) == await _db_root(db_i) == root
+    finally:
+        await db_p.close(); os.remove(pp)
+        await db_i.close(); os.remove(pi)
+
+
+async def test_produce_empty_is_noop():
+    db, sm, path = await _setup()
+    try:
+        root, included = await produce_block_evm_section(1, "h", 0, [], db, sm, _make_executor(sm, 1))
+        assert root is None and included == []
         assert await _db_account_count(db) == 0
     finally:
         await db.close(); os.remove(path)
