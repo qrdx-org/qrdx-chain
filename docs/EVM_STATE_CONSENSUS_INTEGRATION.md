@@ -201,26 +201,42 @@ gate). No in-repo code substitutes for those process gates.
   recover → native↔EVM sync → execute → atomic finalize) now used by the RPC
   handler; the proposer + import paths will call the same function. Behavior-
   neutral (integration 12/12, unit 2009).
-- **E-D3b (2/2): the execute-on-mine flip — pending (atomic, highest-risk).**
-  Precise remaining steps:
-  1. `eth_sendRawTransaction`: admit to `EVM_MEMPOOL` only — remove immediate
-     execute + gossip (return the tx hash).
-  2. Proposer (`validator/node_integration.py`, via a `set_evm_tx_source` /
-     `set_evm_executor_fn` setter wired from `main.py`): `select_for_block()` →
-     execute each via `_execute_evm_raw_tx` → `db.get_account_state_root()` →
-     write `evm_transactions` section + declare `account_state_root` →
-     `db.add_block_evm_txs` → drain mempool.
-  3. Import (`p2p.submitBlock`, `process_and_create_block`, `submit_block`):
-     replay the section via `_execute_evm_raw_tx`, recompute `account_state_root`,
-     reject on mismatch, persist.
-  4. Extend `rebuild_*_from_chain` to also replay EVM sections (startup + reorg).
-  5. Retire the Phase-1 gossip (`_gossip_evm_raw_tx`, `EVM_TX_CACHE` exec path).
-  6. Rework S04/S10/S11 for execute-on-mine timing (balance changes on inclusion,
-     not on submit — poll for it).
+- **E-D3b (live admission): ✅ done.** `eth_sendRawTransaction` now passes through
+  the EVM mempool admission gate (recover sender, nonce window, dedup, DoS caps)
+  before execution — standard Ethereum mempool semantics. Mempool entry transient
+  (removed on execute) pending the full flip. Integration 12/12, unit 2009.
+- **E-D3b (final flip): pending (atomic, highest-risk).** Remaining steps:
+  1. `eth_sendRawTransaction`: admit-only — remove immediate execute; return the
+     tx hash always (web3 standard: contract address comes from the receipt);
+     gossip becomes mempool propagation (peers admit, not execute).
+  2. Proposer (`validator/node_integration.py`, wired from `main.py`):
+     `select_for_block()` → execute each via `_execute_evm_raw_tx` →
+     `db.get_account_state_root()` → write `evm_transactions` section + declare
+     `account_state_root` → `db.add_block_evm_txs` → drain mempool.
+  3. Import (`p2p.submitBlock`, `process_and_create_block`): replay the section,
+     recompute `account_state_root`, **reject on mismatch**, persist.
+  4. Extend `rebuild_*_from_chain` to replay EVM sections (startup + reorg).
+  5. Retire the Phase-1 gossip execution role.
+  6. Rework S04/S10/S11 for execute-on-mine timing (balance changes on inclusion).
+
+  **🔎 Newly-identified prerequisite (gates step 3's safe reject-on-mismatch):
+  the EVM state has two uncoordinated write paths.** `ContractStateManager`
+  has `snapshot()`/`revert()`/`commit()` over its **in-memory cache**, but the
+  live execution path `StateSyncManager`/`ExecutionContext.finalize_execution`
+  writes `account_state` **directly and calls `conn.commit()` per tx**. A bad
+  block would therefore commit before the root is compared, and a DB SAVEPOINT
+  around the replay would be defeated by that inner commit — so import-replay
+  cannot safely *revert* a mismatched block today. Before step 3, the EVM write
+  paths must be unified under one snapshot/commit boundary (route execution
+  through the `ContractStateManager` cache and commit once per block, or defer
+  `finalize_execution`'s commit and wrap the replay in a savepoint). This is the
+  EVM analog of the exchange `take_snapshot`/`revert_block` fix done in D3 —
+  necessary, intricate, and consensus-critical.
+
   **Determinism note:** EVM execution syncs the sender's *native* balance in
-  (`prepare_execution`); this stays deterministic only while native balances are
-  themselves a deterministic function of the chain (genesis + replayed sections).
-  Production hardening of the native↔EVM coupling is the balance-unification work
-  shared with Phase E. This flip is consensus-critical and must be verified
-  against the full integration suite over multiple runs + the audit/soak gate.
+  (`prepare_execution`); deterministic only while native balances are themselves
+  a deterministic function of the chain. Production hardening of the native↔EVM
+  coupling is the balance-unification work shared with Phase E. The flip is
+  consensus-critical — verify against the full suite over multiple runs + the
+  audit/soak gate.
 - E-D4 / E-E: pending, in the order above.
