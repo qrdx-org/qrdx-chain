@@ -196,11 +196,31 @@ gate). No in-repo code substitutes for those process gates.
   handler; node `EVM_MEMPOOL` + `EVM_PENDING_NONCE` provider. Nothing consumes
   these yet (E-D3b), so behavior is unchanged (integration 12/12). Tests:
   `tests/test_block_evm_storage.py` (4).
-- **E-D3b (next, atomic): execute-on-mine + import replay.** Factor the EVM
-  execution core out of `eth_sendRawTransaction_handler`; `eth_sendRawTransaction`
-  admits to `EVM_MEMPOOL` (no immediate execute, no gossip); the proposer pulls +
-  executes the EVM section, declares `account_state_root`, persists + drains;
-  importers replay + validate the root; extend `rebuild_*_from_chain` to the EVM
-  domain; retire the Phase-1 gossip. Adjust S04/S10/S11 for execute-on-mine
-  timing. This is the consensus-critical flip — verified against the full suite.
+- **E-D3b (1/2): execution core factored — ✅ done.** `_execute_evm_raw_tx(...)`
+  (`node/main.py`) is the shared, deterministic EVM execution core (decode →
+  recover → native↔EVM sync → execute → atomic finalize) now used by the RPC
+  handler; the proposer + import paths will call the same function. Behavior-
+  neutral (integration 12/12, unit 2009).
+- **E-D3b (2/2): the execute-on-mine flip — pending (atomic, highest-risk).**
+  Precise remaining steps:
+  1. `eth_sendRawTransaction`: admit to `EVM_MEMPOOL` only — remove immediate
+     execute + gossip (return the tx hash).
+  2. Proposer (`validator/node_integration.py`, via a `set_evm_tx_source` /
+     `set_evm_executor_fn` setter wired from `main.py`): `select_for_block()` →
+     execute each via `_execute_evm_raw_tx` → `db.get_account_state_root()` →
+     write `evm_transactions` section + declare `account_state_root` →
+     `db.add_block_evm_txs` → drain mempool.
+  3. Import (`p2p.submitBlock`, `process_and_create_block`, `submit_block`):
+     replay the section via `_execute_evm_raw_tx`, recompute `account_state_root`,
+     reject on mismatch, persist.
+  4. Extend `rebuild_*_from_chain` to also replay EVM sections (startup + reorg).
+  5. Retire the Phase-1 gossip (`_gossip_evm_raw_tx`, `EVM_TX_CACHE` exec path).
+  6. Rework S04/S10/S11 for execute-on-mine timing (balance changes on inclusion,
+     not on submit — poll for it).
+  **Determinism note:** EVM execution syncs the sender's *native* balance in
+  (`prepare_execution`); this stays deterministic only while native balances are
+  themselves a deterministic function of the chain (genesis + replayed sections).
+  Production hardening of the native↔EVM coupling is the balance-unification work
+  shared with Phase E. This flip is consensus-critical and must be verified
+  against the full integration suite over multiple runs + the audit/soak gate.
 - E-D4 / E-E: pending, in the order above.
