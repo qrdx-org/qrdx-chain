@@ -2708,6 +2708,17 @@ async def startup():
                         return _evm_tx_hash
                     await EVM_TX_CACHE.put(_evm_tx_hash, True)
 
+                    # Admission control (standard mempool semantics): recover the
+                    # sender, enforce the nonce window + DoS caps before doing any
+                    # work. A stale-nonce / unrecoverable / far-future tx is
+                    # rejected here. (The mempool entry is transient — the tx is
+                    # removed once executed below; full execute-on-mine is the
+                    # E-D3b flip.)
+                    mp = _get_evm_mempool()
+                    admit_ok, admit_err, _ = mp.admit(raw_tx_hex)
+                    if not admit_ok and "duplicate" not in (admit_err or ""):
+                        raise Exception(f"rejected: {admit_err}")
+
                     # Execute against the latest block context for determinism.
                     current_block = await db.get_last_block()
                     block_height = (current_block or {}).get('id') or (current_block or {}).get('block_height') or 0
@@ -2718,7 +2729,17 @@ async def startup():
 
                     res = await _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timestamp)
                     if not res.get('success'):
+                        try:
+                            mp.remove([_evm_tx_hash])
+                        except Exception:
+                            pass
                         raise Exception(f"Execution failed: {res.get('error')}")
+
+                    # Executed — clear the transient mempool entry.
+                    try:
+                        mp.remove([_evm_tx_hash])
+                    except Exception:
+                        pass
 
                     # Phase 1 cross-node convergence (retired in the E-D3b flip).
                     if not _propagated:
