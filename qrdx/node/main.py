@@ -965,6 +965,41 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
                 "sender": sender_hex, "nonce": nonce}
 
 
+async def _apply_exchange_section_on_import(block_height, block_timestamp,
+                                            ex_section, declared_root):
+    """
+    Importer hook for the exchange section, with the same strict/trust split as
+    the EVM one (E-D3b). Strict (declared root present, live broadcast): validate
+    + reject-on-mismatch. Trust-replay (no root, sync of canonical history):
+    replay + adopt, like ``rebuild_exchange_state_from_chain``. Returns
+    ``(ok, error)``; trust-replay never halts sync of a canonical block.
+    """
+    if not ex_section:
+        return True, ""
+    if declared_root:
+        from ..exchange.block_processor import apply_block_exchange_section
+        return apply_block_exchange_section(
+            block_height, float(block_timestamp or 0), ex_section, declared_root,
+        )
+    # Trust-replay (sync): adopt the canonical section's computed root.
+    try:
+        from ..exchange.block_processor import decode_exchange_txs, process_exchange_transactions
+        from ..exchange.state_manager import ExchangeStateManager
+        mgr = ExchangeStateManager.get_instance()
+        txs = decode_exchange_txs(ex_section)
+        ok, err, _root = process_exchange_transactions(
+            block_height, float(block_timestamp or 0), txs, mgr,
+        )
+        if ok:
+            mgr.commit_block()
+        else:
+            logger.warning(f"Exchange section trust-replay failed at block {block_height}: {err}")
+        return True, ""
+    except Exception as e:
+        logger.warning(f"Exchange section trust-replay error at block {block_height}: {e}")
+        return True, ""
+
+
 def _evm_defer_execute():
     """An execute_tx callable bound to the live executor, deferring per-tx commit."""
     async def _execute(raw, h, bh, bt):
@@ -995,21 +1030,44 @@ async def _apply_evm_section_on_import(block_height, block_hash, block_timestamp
     Importer hook (E-D3b): validate + replay a block's EVM section, rejecting on
     any mismatch (local state left untouched). Returns ``(ok, error)``.
 
+    Two modes:
+      - **Strict (live broadcast):** a declared ``account_state_root`` is present,
+        so replay and REJECT on mismatch — real-time defense against a malicious
+        proposer.
+      - **Trust-replay (sync):** no root is bound to the block (the sync-serving
+        endpoints attach the section but not a root, and pre-D4 the root is not
+        bound into the block hash). The block is canonical history already
+        accepted by the network, so replay and ADOPT the computed root, exactly
+        like ``rebuild_account_state_from_chain``. Best-effort: a replay failure
+        is logged but does not halt sync of a canonical block.
+
     Backward-compatible: an empty/absent section is accepted. If this node does
-    not run the EVM system, it cannot validate the section, so it accepts the
-    block WITHOUT applying EVM state (the section is still stored for a later
-    rebuild) — consistent with the additive-section design.
+    not run the EVM system it accepts without applying (stored for later rebuild).
     """
     if not evm_section:
         return True, ""
     if EVM_STATE_MANAGER is None:
         logger.warning("EVM section present but EVM disabled on this node — storing without applying")
         return True, ""
-    from ..contracts.evm_block_apply import apply_block_evm_section
-    return await apply_block_evm_section(
-        block_height, block_hash, block_timestamp, evm_section, declared_root,
-        db, EVM_STATE_MANAGER, _evm_defer_execute(),
-    )
+    if declared_root:
+        from ..contracts.evm_block_apply import apply_block_evm_section
+        return await apply_block_evm_section(
+            block_height, block_hash, block_timestamp, evm_section, declared_root,
+            db, EVM_STATE_MANAGER, _evm_defer_execute(),
+        )
+    # Trust-replay (sync): adopt the canonical section's computed root.
+    from ..contracts.evm_block_apply import produce_block_evm_section
+    try:
+        root, included = await produce_block_evm_section(
+            block_height, block_hash, block_timestamp, evm_section,
+            db, EVM_STATE_MANAGER, _evm_defer_execute(),
+        )
+        if root is None:
+            logger.warning(f"EVM section trust-replay produced no root at block {block_height}")
+        return True, ""
+    except Exception as e:
+        logger.warning(f"EVM section trust-replay failed at block {block_height}: {e}")
+        return True, ""
 
 
 async def _gossip_evm_raw_tx(raw_tx_hex: str):
@@ -1305,12 +1363,29 @@ async def _push_sync_to_peer(peer_info: dict, start_block: int, db_conn: Databas
 
                 if payload_batch and current_batch_bytes + block_size_estimate > MAX_BATCH_BYTES:
                     break
-                
-                payload_batch.append({
+
+                payload_item = {
                     'id': block_record['id'],
                     'block_content': block_record['content'],
                     'txs': tx_list
-                })
+                }
+                # Attach protocol sections so the syncing peer reconstructs
+                # exchange + EVM/account state (E-D3b). Trust-replayed there.
+                _bh = block_record.get('hash') or block_record.get('block_hash')
+                if _bh:
+                    try:
+                        _ex = await db_conn.get_block_exchange_txs(_bh)
+                        if _ex:
+                            payload_item['exchange_transactions'] = _ex
+                    except Exception:
+                        pass
+                    try:
+                        _evm = await db_conn.get_block_evm_txs(_bh)
+                        if _evm:
+                            payload_item['evm_transactions'] = _evm
+                    except Exception:
+                        pass
+                payload_batch.append(payload_item)
                 current_batch_bytes += block_size_estimate
             
             if not payload_batch:
@@ -2123,19 +2198,15 @@ async def process_and_create_block(block_info: dict) -> bool:
             )
             return False
 
-        # D3: securely validate + replay the exchange section (if any) before
-        # storing, so a syncing node rebuilds identical protocol-level state and
-        # rejects any block whose section doesn't match its declared root.
+        # D3/E-D3b: replay the exchange section (if any) before storing. Strict
+        # (reject-on-mismatch) when a root is declared (live broadcast); trust-
+        # replay (adopt) when syncing canonical history with no bound root.
         ex_section = block.get('exchange_transactions') or block_info.get('exchange_transactions')
         if ex_section:
-            try:
-                from ..exchange.block_processor import apply_block_exchange_section
-                declared = block.get('exchange_state_root') or block_info.get('exchange_state_root')
-                ok, verr = apply_block_exchange_section(
-                    block_height, float(block.get('timestamp', 0) or 0), ex_section, declared,
-                )
-            except Exception as e:
-                ok, verr = False, f"exchange validation error: {e}"
+            declared = block.get('exchange_state_root') or block_info.get('exchange_state_root')
+            ok, verr = await _apply_exchange_section_on_import(
+                block_height, block.get('timestamp', 0) or 0, ex_section, declared,
+            )
             if not ok:
                 logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr}")
                 return False
@@ -4947,6 +5018,21 @@ async def get_blocks(
     for block in blocks:
         block_hash = block.get('hash') or block.get('block_hash')
         txs = await db.get_block_transactions(block_hash, hex_only=True) if block_hash else []
+        # Attach protocol sections so a syncing node reconstructs exchange + EVM/
+        # account state (E-D3b); trust-replayed on the consume side.
+        if block_hash:
+            try:
+                ex_section = await db.get_block_exchange_txs(block_hash)
+                if ex_section:
+                    block['exchange_transactions'] = ex_section
+            except Exception:
+                pass
+            try:
+                evm_section = await db.get_block_evm_txs(block_hash)
+                if evm_section:
+                    block['evm_transactions'] = evm_section
+            except Exception:
+                pass
         structured_blocks.append({
             'block': block,
             'transactions': txs or []

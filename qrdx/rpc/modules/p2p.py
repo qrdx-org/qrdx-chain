@@ -320,6 +320,12 @@ class P2PModule(RPCModule):
                     },
                     'transactions': block_data.get('txs', []),
                 }
+                # Carry the protocol sections (+ any declared roots) through to the
+                # consumer so a push-synced node reconstructs exchange + EVM state.
+                for _k in ('exchange_transactions', 'exchange_state_root',
+                           'evm_transactions', 'account_state_root'):
+                    if block_data.get(_k):
+                        block_info['block'][_k] = block_data[_k]
 
                 if not await self._process_and_create_block(block_info):
                     return {
@@ -413,6 +419,25 @@ class P2PModule(RPCModule):
                 if block_hash
                 else []
             )
+            # Attach the protocol-level sections so a syncing node reconstructs
+            # the exchange + EVM/account state (E-D3b). Without this a node that
+            # syncs (rather than receiving the live broadcast) would never apply
+            # the EVM section and would diverge. The roots are not bound into the
+            # block hash pre-D4, so the syncing node trust-replays these canonical
+            # sections (adopts the computed root).
+            if block_hash:
+                try:
+                    ex_section = await self._db.get_block_exchange_txs(block_hash)
+                    if ex_section:
+                        block['exchange_transactions'] = ex_section
+                except Exception:
+                    pass
+                try:
+                    evm_section = await self._db.get_block_evm_txs(block_hash)
+                    if evm_section:
+                        block['evm_transactions'] = evm_section
+                except Exception:
+                    pass
             structured.append({'block': block, 'transactions': txs or []})
 
         return {'ok': True, 'result': structured}
