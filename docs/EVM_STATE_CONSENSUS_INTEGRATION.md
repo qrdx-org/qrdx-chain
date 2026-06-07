@@ -188,4 +188,19 @@ gate). No in-repo code substitutes for those process gates.
   into E-D3, because for EVM it is entangled with replacing the Phase-1 gossip
   path (the section would be an empty no-op until `eth_sendRawTransaction` routes
   through the mempool + replay).
-- E-D3 … E-E: pending, in the order above.
+- **E-D3a foundation: ✅ implemented (this change)** — additive, behavior-neutral.
+  `block_evm_transactions` table + `add_block_evm_txs`/`get_block_evm_txs`
+  (per-block EVM section storage, with `remove_blocks` cleanup); module globals
+  `EVM_EXECUTOR`/`EVM_STATE_MANAGER` exposed at contract-system init so block
+  production + import can execute EVM txs with the same executor/state as the RPC
+  handler; node `EVM_MEMPOOL` + `EVM_PENDING_NONCE` provider. Nothing consumes
+  these yet (E-D3b), so behavior is unchanged (integration 12/12). Tests:
+  `tests/test_block_evm_storage.py` (4).
+- **E-D3b (next, atomic): execute-on-mine + import replay.** Factor the EVM
+  execution core out of `eth_sendRawTransaction_handler`; `eth_sendRawTransaction`
+  admits to `EVM_MEMPOOL` (no immediate execute, no gossip); the proposer pulls +
+  executes the EVM section, declares `account_state_root`, persists + drains;
+  importers replay + validate the root; extend `rebuild_*_from_chain` to the EVM
+  domain; retire the Phase-1 gossip. Adjust S04/S10/S11 for execute-on-mine
+  timing. This is the consensus-critical flip — verified against the full suite.
+- E-D4 / E-E: pending, in the order above.

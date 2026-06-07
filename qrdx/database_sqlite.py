@@ -332,8 +332,17 @@ class DatabaseSQLite:
             PRIMARY KEY (block_hash, tx_index)
         );
 
+        CREATE TABLE IF NOT EXISTS block_evm_transactions (
+            block_hash TEXT NOT NULL,
+            tx_index INTEGER NOT NULL,
+            raw_tx TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (block_hash, tx_index)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(block_height);
         CREATE INDEX IF NOT EXISTS idx_block_exchange_txs ON block_exchange_transactions(block_hash);
+        CREATE INDEX IF NOT EXISTS idx_block_evm_txs ON block_evm_transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_transactions_block ON transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_unspent_address ON unspent_outputs(address);
         CREATE INDEX IF NOT EXISTS idx_validator_epoch ON validator_states(epoch);
@@ -896,6 +905,32 @@ class DatabaseSQLite:
         rows = await cursor.fetchall()
         return [json.loads(r[0]) for r in rows]
 
+    async def add_block_evm_txs(self, block_hash: str, raw_txs: list):
+        """
+        Persist a block's EVM-transaction section (E-D3): the ordered list of raw
+        signed eth txs included in the block, for deterministic replay on import
+        and rebuild. Idempotent per (block_hash, tx_index).
+        """
+        if not raw_txs:
+            return
+        for idx, raw in enumerate(raw_txs):
+            await self.connection.execute(
+                "INSERT OR IGNORE INTO block_evm_transactions "
+                "(block_hash, tx_index, raw_tx) VALUES (?, ?, ?)",
+                (block_hash, idx, raw),
+            )
+        await self.connection.commit()
+
+    async def get_block_evm_txs(self, block_hash: str) -> list:
+        """Return a block's EVM-transaction section (raw hex) in canonical order."""
+        cursor = await self.connection.execute(
+            "SELECT raw_tx FROM block_evm_transactions "
+            "WHERE block_hash = ? ORDER BY tx_index ASC",
+            (block_hash,),
+        )
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
+
     async def get_validators(self, status: str = None):
         """
         Return the validator set, ordered by effective stake (descending).
@@ -1036,10 +1071,14 @@ class DatabaseSQLite:
             "DELETE FROM blocks WHERE block_height >= ?",
             (start_id,)
         )
-        # Drop exchange sections for blocks no longer on the canonical chain so
-        # no stale protocol-level state lingers after a reorg rollback.
+        # Drop exchange/EVM sections for blocks no longer on the canonical chain
+        # so no stale protocol-level state lingers after a reorg rollback.
         await self.connection.execute(
             "DELETE FROM block_exchange_transactions "
+            "WHERE block_hash NOT IN (SELECT block_hash FROM blocks)"
+        )
+        await self.connection.execute(
+            "DELETE FROM block_evm_transactions "
             "WHERE block_hash NOT IN (SELECT block_hash FROM blocks)"
         )
         await self.connection.commit()

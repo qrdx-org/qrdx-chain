@@ -855,6 +855,25 @@ def _get_exchange_mempool():
         EXCHANGE_MEMPOOL = ExchangeMempool()
     return EXCHANGE_MEMPOOL
 
+# EVM/account consensus path (Phase 2 / E-D3). The executor + state manager are
+# set when the contract RPC system initializes; the mempool admits eth txs for
+# block inclusion. EVM_PENDING_NONCE tracks each sender's next expected account
+# nonce for mempool admission (updated as txs are applied).
+EVM_EXECUTOR = None
+EVM_STATE_MANAGER = None
+EVM_MEMPOOL = None
+EVM_PENDING_NONCE = {}
+
+
+def _get_evm_mempool():
+    global EVM_MEMPOOL
+    if EVM_MEMPOOL is None:
+        from qrdx.contracts.evm_mempool import EVMMempool
+        EVM_MEMPOOL = EVMMempool(
+            nonce_provider=lambda addr: EVM_PENDING_NONCE.get(addr.lower(), 0)
+        )
+    return EVM_MEMPOOL
+
 
 async def _gossip_evm_raw_tx(raw_tx_hex: str):
     """
@@ -2406,6 +2425,12 @@ async def startup():
             logger.info("Initializing contract execution system...")
             state_manager = ContractStateManager(db)
             evm_executor = QRDXEVMExecutor(state_manager)
+            # Expose for the EVM consensus path (proposer inclusion + import replay,
+            # E-D3) so block production / import can execute EVM txs with the same
+            # executor + state manager as the live RPC handler.
+            global EVM_EXECUTOR, EVM_STATE_MANAGER
+            EVM_EXECUTOR = evm_executor
+            EVM_STATE_MANAGER = state_manager
             logger.info("✅ Contract system initialized")
             
             # Create context for modules
