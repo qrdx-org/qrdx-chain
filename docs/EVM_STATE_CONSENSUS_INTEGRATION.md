@@ -1,7 +1,11 @@
 # EVM / Account-Model State — Consensus Integration
 
-> **Status:** Phase 1 implemented (live gossip convergence). Phase 2 (block-level
-> inclusion + replay) is required before mainnet.  
+> **Status:** Phase 2 implemented — EVM/account **execute-on-mine** is live
+> (admit-only RPC → proposer execute + declare `account_state_root` → import
+> replay with reject-on-mismatch → reorg rebuild → sync propagation). At parity
+> with the exchange domain. Next: E-D4 (bind state roots into the signed header,
+> upgrading sync from trust-replay to full verification). Verified: integration
+> 12/12, unit 2023.  
 > **Date:** June 2026  
 > **Related:** `PRODUCTION_DEPLOYMENT.md` §14.8, `QRDX_IMPLEMENTATION_CHECKLIST.md`
 
@@ -205,47 +209,55 @@ gate). No in-repo code substitutes for those process gates.
   the EVM mempool admission gate (recover sender, nonce window, dedup, DoS caps)
   before execution — standard Ethereum mempool semantics. Mempool entry transient
   (removed on execute) pending the full flip. Integration 12/12, unit 2009.
-- **E-D3b (final flip): pending (atomic, highest-risk).** Remaining steps:
-  1. `eth_sendRawTransaction`: admit-only — remove immediate execute; return the
-     tx hash always (web3 standard: contract address comes from the receipt);
-     gossip becomes mempool propagation (peers admit, not execute).
-  2. Proposer (`validator/node_integration.py`, wired from `main.py`):
-     `select_for_block()` → execute each via `_execute_evm_raw_tx` →
-     `db.get_account_state_root()` → write `evm_transactions` section + declare
+- **E-D3b (final flip — execute-on-mine): ✅ done.** The account/EVM domain now
+  has the same consensus integration as the exchange domain. All landed together
+  so a tx applies exactly once (at block inclusion):
+  1. `eth_sendRawTransaction` is **admit-only** (web3 standard): admit to the EVM
+     mempool, gossip for mempool propagation, return the tx hash immediately — no
+     synchronous execution. Balances change on inclusion; clients poll the
+     receipt. Phase-1 gossip-execution role retired.
+  2. Proposer (`validator/node_integration.py`, producer wired from `main.py`):
+     `select_for_block()` → `produce_block_evm_section` (defer-execute → flush →
+     `db.get_account_state_root()`) → write `evm_transactions` + declare
      `account_state_root` → `db.add_block_evm_txs` → drain mempool.
-  3. Import (`p2p.submitBlock`, `process_and_create_block`): replay the section,
-     recompute `account_state_root`, **reject on mismatch**, persist.
-  4. Extend `rebuild_*_from_chain` to replay EVM sections (startup + reorg).
-  5. Retire the Phase-1 gossip execution role.
-  6. Rework S04/S10/S11 for execute-on-mine timing (balance changes on inclusion).
+  3. Import (sync, REST `/submit_block`, `p2p.submitBlock`):
+     `apply_block_evm_section` replays + **rejects on `account_state_root`
+     mismatch** (local state untouched), then persists.
+  4. `rebuild_account_state_from_chain` (clear + replay) on reorg; orphaned EVM
+     txs re-queued. `account_state` is durable so restart needs no rebuild.
+  5. Sync propagation: `/get_blocks`, p2p `getBlocks`, and push-sync attach both
+     protocol sections; the consumer **trust-replays** them when no root is bound
+     (canonical history), strict-validates when a root is declared (live).
 
-  **🔎 Prerequisite (gates step 3's safe reject-on-mismatch): atomic EVM block
-  commit.** Progress + precise structure:
-  - ✅ `ContractStateManager` has cache `snapshot()`/`revert()`/`commit()`, and
-    `ExecutionContext.finalize_execution(defer_commit=True)` now keeps a
-    successful tx's changes in the cache instead of flushing per-tx
-    (`tests/test_evm_defer_commit.py`).
-  - ⚠️ Still required: the canonical account root is `db.get_account_state_root()`
-    (full table, **BLAKE3-512**) — `ContractStateManager.get_state_root()` is
-    cache-only + keccak + a partial set, so it is NOT usable as the consensus
-    root. Validating the root therefore means flushing the cache to the DB and
-    reading it back **before** deciding to keep or discard the block.
-  - ⚠️ That flush-read-decide must be one DB transaction with commit-or-rollback,
-    but the execution path calls `conn.commit()` at **multiple** points
-    (`finalize_execution`, `sync_address_to_evm`, `record_balance_change`), each
-    of which would prematurely end the transaction. So the atomic boundary
-    requires coordinating *all* of these under a single per-block transaction
-    (e.g. thread a `defer_commit`/transaction handle through the state-sync path
-    and commit/rollback once per block) — an invasive, consensus-critical change
-    to EVM commit semantics, and the natural unit of the focused flip effort
-    rather than another standalone primitive. Also delete DB rows for accounts
-    *created* during a rolled-back block (the same "remove created entities"
-    correctness point as the exchange snapshot fix).
+  **Atomic boundary — how it was made safe (was flagged "invasive"):** the key
+  realization is that `account_state` (and `contract_storage`) has a **single
+  writer**, `ContractStateManager.commit()`. The other mid-execution
+  `conn.commit()` points (balance-sync registry, balance-change audit, content-
+  addressed `contract_code`) never touch the consensus tables, so they cannot
+  persist a rejected block's account changes. The boundary therefore only needs
+  to wrap the final **flush-read-decide**, not every commit:
+  - `finalize_execution(defer_commit=True)` accumulates successful txs in cache;
+  - `commit(block, flush_only=True)` writes the dirty rows WITHOUT `conn.commit()`
+    and keeps the dirty/snapshot bookkeeping;
+  - `db.get_account_state_root()` reads those same-connection, uncommitted rows;
+  - match → `conn.commit()`; mismatch → `conn.rollback()` + cache `revert` (which
+    also drops accounts *created* in the rejected block).
+
+  Tests: `test_evm_defer_commit.py` (3), `test_evm_block_apply.py` (8, incl.
+  produce→apply round-trip + two-node determinism), `test_block_evm_storage.py`
+  (4), `test_pos_block_assembly.py` (EVM-section cases). Verified live:
+  **integration 12/12** (S04 transfer, S10 cross-node balance `unique=1`, S11
+  stress, S12 exchange), **unit 2023**.
 
   **Determinism note:** EVM execution syncs the sender's *native* balance in
   (`prepare_execution`); deterministic only while native balances are themselves
   a deterministic function of the chain. Production hardening of the native↔EVM
-  coupling is the balance-unification work shared with Phase E. The flip is
-  consensus-critical — verify against the full suite over multiple runs + the
-  audit/soak gate.
-- E-D4 / E-E: pending, in the order above.
+  coupling is the balance-unification work shared with Phase E.
+- **E-D4 (next): bind both state roots into the signed block header.** Today the
+  declared roots ride alongside the block but are not bound into the block hash,
+  so on sync a node trust-replays canonical sections (it cannot cryptographically
+  reject a tampered section from a sync peer until the root is in the signed
+  header). D4 binds `account_state_root` + `exchange_state_root` (+ UTXO root)
+  into the unified header root (`crypto/hashing.unified_state_root`) the proposer
+  signs, upgrading sync from trust-replay to full verification.
+- E-E: pending, after D4.
