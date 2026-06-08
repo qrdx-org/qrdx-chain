@@ -48,8 +48,33 @@
 3. **Finality / fork-choice maturity.** Residual reorgs are longest-chain
    catch-up from propagation latency (block-time ≈ propagation-time). A finality
    gadget (justified/finalized checkpoints from attestations) would (a) give item
-   1 its settled boundary and (b) bound reorg depth. Attestation aggregation
-   exists (`AttestationPool`); wiring it into a finality decision is the work.
+   1 its settled boundary and (b) bound reorg depth.
+
+   **Scoped (investigated June 2026) — it is an unwired SUBSYSTEM, not a small
+   wiring job.** The scaffolding exists but the whole chain is disconnected:
+   - **Attestation propagation is not wired.** `ValidatorManager.submit_attestation`
+     looks for `self._attestation_broadcast_fn`, which is **never bound** (no
+     `set_attestation_broadcast` caller); `qrdx/validator/gossip.py` (which has
+     attestation topics) is **not imported by the running node**. So each
+     validator holds only its OWN attestations and never sees peers'.
+   - **No cross-validator aggregation/inclusion.** Consequently proposed blocks
+     carry ~0 attestations (`attestations=0` in logs), so the 2/3-stake finality
+     threshold can never be met.
+   - **Finality computation is dead code.** `consensus.compute_epoch_state`
+     (computes `is_finalized` from attesting-stake ratio ≥ `ATTESTATION_THRESHOLD`)
+     has **no callers**.
+   - **Epoch-finalize persistence is PostgreSQL-only.**
+     `epoch_processing._persist_*` uses `database.pool.acquire()` / `$1` / `NOW()`,
+     so on the SQLite testnet the `epochs.finalized/justified` columns are never
+     written; `get_pos_chain_head` always reports finalized_epoch=0.
+
+   **Build order:** (a) attestation broadcast (bind a propagate fn) + a receive
+   path (p2p method/REST) into peers' `AttestationPool`; (b) deterministic
+   inclusion + aggregation of attestations in blocks; (c) call `compute_epoch_state`
+   at epoch boundaries; (d) persist justified/finalized to SQLite (add a SQLite
+   writer alongside the PG one); (e) only then consume the finalized boundary in
+   fork-choice (bound reorg depth) and item 1 (E-D4 sync enforcement). Each link is
+   useless without the next, so this is a dedicated effort, not an increment.
 
 4. **Validator lifecycle convergence.** The `validators` table is genesis-seeded
    and consistent, but runtime validator set changes (activation/exit queues,
