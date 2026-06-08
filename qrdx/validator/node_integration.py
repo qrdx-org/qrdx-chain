@@ -158,11 +158,25 @@ class ValidatorNode:
             # Extract keys and address
             address = wallet_data['address']
             private_key_hex = wallet_data['private_key']
-            
-            # Load PQ wallet from hex private key
-            private_key = PrivateKey.from_hex(private_key_hex)
+            public_key_hex = wallet_data.get('public_key')
+
+            # Load PQ wallet from hex private key. CRITICAL: the stored public key
+            # MUST be passed — a Dilithium secret key cannot re-derive its public
+            # key, so restoring without it makes PQPrivateKey generate a RANDOM new
+            # keypair (see dilithium._restore_from_bytes), yielding a wrong address.
+            # That made each validator propose under an identity that didn't match
+            # its genesis registration → validators never converged on a common set
+            # → every node thought it was the sole proposer → reorg churn.
+            private_key = PrivateKey.from_hex(private_key_hex, public_key_hex=public_key_hex)
             self.wallet = PQWallet(private_key=private_key)
-            logger.info(f"Wallet loaded: {address}")
+
+            # Fail fast if the restored identity does not match the wallet file.
+            if public_key_hex and self.wallet.address != address:
+                raise Exception(
+                    f"validator wallet identity mismatch: file address {address} != "
+                    f"restored {self.wallet.address} (public key not preserved on load)"
+                )
+            logger.info(f"Wallet loaded: {self.wallet.address}")
             
             # Create validator configuration (use defaults)
             self.config = ValidatorConfig(enabled=True)
@@ -219,41 +233,50 @@ class ValidatorNode:
                 index=0
             )
             
-            # Create validator set with ALL active validators from database
-            # This enables proper proposer selection across multiple validators
-            all_validators = [self.manager._validator]
-            
-            # Load other validators from database
+            # Build the validator set from the CONSISTENT `validators` table
+            # (seeded identically on every node from the shared genesis), NOT from
+            # `validator_stakes` (which holds only each node's own self-deposit and
+            # so differs per node). Using the consistent set is what lets every
+            # node derive the SAME proposer per slot → one proposer per slot
+            # instead of every node believing it is the sole proposer.
+            all_validators = []
             try:
-                cursor = await self.db.connection.execute(
-                    "SELECT validator_address, stake FROM validator_stakes WHERE status = 'PENDING' OR status = 'ACTIVE'"
-                )
-                rows = await cursor.fetchall()
-                
-                logger.info(f"Found {len(rows)} validators in database")
-                
-                for row in rows:
-                    other_address = row[0]
-                    if other_address != self.wallet.address:
-                        # Create validator object for other validators
-                        from decimal import Decimal
-                        other_stake = Decimal(str(row[1])) / Decimal("100000000")
-                        other_validator = Validator(
-                            address=other_address,
-                            public_key=b'',  # Unknown for remote validators
-                            stake=other_stake,
-                            effective_stake=other_stake,
-                            status=ValidatorStatus.ACTIVE,
-                            activation_epoch=0,
-                            slashed=False,
-                            uptime_score=1.0,
-                            index=len(all_validators)
-                        )
-                        all_validators.append(other_validator)
-                        logger.info(f"Added validator to set: {other_address[:30]}... (stake: {other_stake} QRDX)")
+                validator_rows = await self.db.get_validators()
             except Exception as e:
-                logger.warning(f"Could not load other validators: {e}")
-            
+                logger.warning(f"Could not load validators table: {e}")
+                validator_rows = []
+
+            for vr in validator_rows:
+                addr = vr.get('address')
+                if not addr:
+                    continue
+                status_str = str(vr.get('status', 'active')).upper()
+                if status_str not in ('ACTIVE', 'PENDING'):
+                    continue
+                eff = Decimal(str(vr.get('effective_stake') or vr.get('stake') or 0))
+                is_self = (addr == self.wallet.address)
+                all_validators.append(Validator(
+                    address=addr,
+                    public_key=self.wallet.public_key if is_self else b'',
+                    stake=eff,
+                    effective_stake=eff,
+                    status=ValidatorStatus.ACTIVE,
+                    activation_epoch=0,
+                    slashed=bool(vr.get('slashed')),
+                    uptime_score=1.0,
+                    index=len(all_validators),
+                ))
+
+            # Safety net: if the table didn't include us yet, add self so we can
+            # still participate (single-validator bootstrap).
+            if not any(v.address == self.wallet.address for v in all_validators):
+                all_validators.append(self.manager._validator)
+
+            logger.info(
+                f"Validator set built from validators table: {len(all_validators)} "
+                f"members: {[v.address[:16] + '...' for v in all_validators]}"
+            )
+
             # Calculate total stake
             total_stake = sum(v.stake for v in all_validators)
             

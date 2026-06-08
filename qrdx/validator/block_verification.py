@@ -114,9 +114,10 @@ async def verify_proposer_eligibility(
     """
     Verify the block's proposer is the validator selected for its slot.
 
-    Reconstructs the proposer's validator set from ``validator_stakes`` (the exact
-    source `node_integration` builds from: active/pending rows, ``stake / 1e8``),
-    derives the deterministic slot proposer, and compares to the block's claimed
+    Reconstructs the proposer's validator set from the ``validators`` table (the
+    exact source `node_integration` builds from — seeded identically on every node
+    from genesis, with ``effective_stake`` already in QRDX), derives the
+    deterministic slot proposer, and compares to the block's claimed
     ``proposer_address``. This catches a registered validator proposing
     out-of-turn (signature-valid but not its slot).
 
@@ -140,12 +141,12 @@ async def verify_proposer_eligibility(
         return True, ""
 
     try:
-        cur = await db.connection.execute(
-            "SELECT validator_address, stake FROM validator_stakes "
-            "WHERE status = 'PENDING' OR status = 'ACTIVE'"
-        )
-        rows = await cur.fetchall()
-        validators = [(r[0], Decimal(str(r[1])) / Decimal("100000000")) for r in rows]
+        rows = await db.get_validators()
+        validators = [
+            (r["address"], Decimal(str(r.get("effective_stake") or r.get("stake") or 0)))
+            for r in rows
+            if r.get("address") and str(r.get("status", "active")).upper() in ("ACTIVE", "PENDING")
+        ]
     except Exception as e:
         logger.debug("eligibility: could not load validator set: %s", e)
         return True, ""
