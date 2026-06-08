@@ -253,11 +253,25 @@ gate). No in-repo code substitutes for those process gates.
   (`prepare_execution`); deterministic only while native balances are themselves
   a deterministic function of the chain. Production hardening of the native↔EVM
   coupling is the balance-unification work shared with Phase E.
+- **Proposer-signature verification on import: ✅ done (prerequisite for E-D4).**
+  The import paths previously accepted any height-correct block from a *registered
+  proposer address* without verifying the proposer's Dilithium signature
+  (`validate_pos_block` was dead code). `verify_pos_block_proposer`
+  (`qrdx/validator/block_verification.py`) now runs in all three importers (sync,
+  REST, p2p): it binds the carried `proposer_public_key` to `proposer_address`
+  (0xPQ derivation) and verifies the Dilithium signature over the reconstructed
+  `signing_root`. Authenticity only — slot-proposer **eligibility** is still
+  deferred (the network produces validly-signed competing tip blocks; strict
+  eligibility risks liveness). Tests: `test_block_proposer_verification.py` (6);
+  integration 12/12, unit 2029. Without this, binding roots into the signed header
+  (E-D4) would be moot — see memory `pos-import-signature-gap`.
 - **E-D4 (next): bind both state roots into the signed block header.** Today the
   declared roots ride alongside the block but are not bound into the block hash,
   so on sync a node trust-replays canonical sections (it cannot cryptographically
   reject a tampered section from a sync peer until the root is in the signed
   header). D4 binds `account_state_root` + `exchange_state_root` (+ UTXO root)
   into the unified header root (`crypto/hashing.unified_state_root`) the proposer
-  signs, upgrading sync from trust-replay to full verification.
+  signs — which the now-wired proposer-signature check then enforces — upgrading
+  sync from trust-replay to full verification. Requires reordering the proposer to
+  execute sections *before* signing (so post-block roots are known at sign time).
 - E-E: pending, after D4.
