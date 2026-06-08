@@ -68,10 +68,11 @@ from qrdx.node.identity import (
 )
 from qrdx.validator.block_verification import verify_pos_block_proposer, verify_proposer_eligibility
 
-# Observe-first gate for slot-proposer eligibility on import. Phase A (False):
-# warn on out-of-turn proposals (proves the importer reconstructs the proposer
-# identically). Phase B (True): reject them.
-_ENFORCE_PROPOSER_ELIGIBILITY = False
+# Slot-proposer eligibility gate. Enabled after the validator-set convergence fix:
+# with a consistent validator set + correct identities, every node reconstructs the
+# same slot proposer — observed 0 mismatches across a 3-run soak (all import paths,
+# incl. sync) — so out-of-turn proposals are now rejected.
+_ENFORCE_PROPOSER_ELIGIBILITY = True
 
 # Kademlia DHT integration
 from qrdx.p2p.node import Node as P2PNode, Address as P2PAddress, hex_to_node_id as p2p_hex_to_node_id
