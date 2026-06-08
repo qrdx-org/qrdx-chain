@@ -160,6 +160,14 @@ class P2PModule(RPCModule):
                 if not validator_info:
                     return {'ok': False, 'error': 'Validator not registered'}
 
+                # Security: authenticate the proposer (pubkey↔address binding +
+                # Dilithium signature over the signed header). Registration alone
+                # does not prove the block was produced by that validator.
+                from ...validator.block_verification import verify_pos_block_proposer
+                ok_prop, prop_err = verify_pos_block_proposer(block_content, validator_address)
+                if not ok_prop:
+                    return {'ok': False, 'error': f'Proposer authentication failed: {prop_err}'}
+
                 # D3: securely validate + replay the exchange section (verify
                 # signatures, re-execute, match the declared exchange_state_root)
                 # BEFORE storing. Reject the block on any mismatch — local

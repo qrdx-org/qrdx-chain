@@ -62,10 +62,11 @@ from qrdx.constants import (
     BOOTSTRAP_NODES
 )
 from qrdx.node.identity import (
-    initialize_identity, get_node_id, get_public_key_hex, 
+    initialize_identity, get_node_id, get_public_key_hex,
     verify_signature, get_canonical_json_bytes, sign_message,
     get_public_key_bytes,
 )
+from qrdx.validator.block_verification import verify_pos_block_proposer
 
 # Kademlia DHT integration
 from qrdx.p2p.node import Node as P2PNode, Address as P2PAddress, hex_to_node_id as p2p_hex_to_node_id
@@ -2198,6 +2199,16 @@ async def process_and_create_block(block_info: dict) -> bool:
             )
             return False
 
+        # Security: authenticate the proposer — verify the carried public key
+        # derives to the claimed validator address (identity binding) and the
+        # Dilithium signature over the signed header is valid. Without this an
+        # imported block is only "from a registered address", not proven to be
+        # produced by that validator.
+        ok_prop, prop_err = verify_pos_block_proposer(block_content, validator_address)
+        if not ok_prop:
+            logger.warning(f"[SYNC] Rejecting PoS block {block_height}: proposer auth failed: {prop_err}")
+            return False
+
         # D3/E-D3b: replay the exchange section (if any) before storing. Strict
         # (reject-on-mismatch) when a root is declared (live broadcast); trust-
         # replay (adopt) when syncing canonical history with no bound root.
@@ -3420,6 +3431,16 @@ async def submit_block(
                     verified_sender, 'unknown_validator', severity=6
                 )
                 return {'ok': False, 'error': 'Validator address not registered'}
+
+            # Security: authenticate the proposer (pubkey↔address binding +
+            # Dilithium signature over the signed header). Registration alone does
+            # not prove the block was produced by that validator.
+            ok_prop, prop_err = verify_pos_block_proposer(block_content, validator_address)
+            if not ok_prop:
+                await security.reputation_manager.record_violation(
+                    verified_sender, 'invalid_proposer_signature', severity=8
+                )
+                return {'ok': False, 'error': f'Proposer authentication failed: {prop_err}'}
 
             # D3: if the block carries an exchange section, securely validate +
             # replay it (verify signatures, re-execute, match declared root)
