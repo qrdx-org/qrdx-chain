@@ -64,6 +64,27 @@ def test_node_local_first_ordering_agrees():
         assert len(set(per_node)) == 1, f"slot {slot}: nodes disagree: {per_node}"
 
 
+def test_expected_proposer_matches_selector_and_is_order_independent():
+    """The importer-side reconstruction agrees with the selector for every slot
+    and is independent of the (address, stake) tuple ordering."""
+    from qrdx.validator.block_verification import expected_proposer_for_slot
+    sel = ValidatorSelector()
+    randao = b"\x00" * 32
+    base = _set()
+    tuples = [(v.address, v.effective_stake) for v in base]
+    import itertools as _it
+    for slot in range(0, 48):
+        via_selector = sel.select_proposer(slot, base, randao).address
+        # Every ordering of the reconstructed tuples yields the selector's choice.
+        for perm in _it.permutations(tuples):
+            assert expected_proposer_for_slot(slot, list(perm), randao) == via_selector
+
+
+def test_expected_proposer_empty_set_is_none():
+    from qrdx.validator.block_verification import expected_proposer_for_slot
+    assert expected_proposer_for_slot(5, []) is None
+
+
 def test_weighting_still_reflects_stake():
     """Determinism must not flatten the stake weighting — the heaviest validator
     should win a clear plurality of slots."""

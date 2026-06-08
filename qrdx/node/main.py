@@ -66,7 +66,12 @@ from qrdx.node.identity import (
     verify_signature, get_canonical_json_bytes, sign_message,
     get_public_key_bytes,
 )
-from qrdx.validator.block_verification import verify_pos_block_proposer
+from qrdx.validator.block_verification import verify_pos_block_proposer, verify_proposer_eligibility
+
+# Observe-first gate for slot-proposer eligibility on import. Phase A (False):
+# warn on out-of-turn proposals (proves the importer reconstructs the proposer
+# identically). Phase B (True): reject them.
+_ENFORCE_PROPOSER_ELIGIBILITY = False
 
 # Kademlia DHT integration
 from qrdx.p2p.node import Node as P2PNode, Address as P2PAddress, hex_to_node_id as p2p_hex_to_node_id
@@ -2260,6 +2265,15 @@ async def process_and_create_block(block_info: dict) -> bool:
             logger.warning(f"[SYNC] Rejecting PoS block {block_height}: proposer auth failed: {prop_err}")
             return False
 
+        # Security: verify the proposer is the validator selected for this slot
+        # (catches signature-valid but out-of-turn proposals). Observe-first.
+        ok_elig, elig_err = await verify_proposer_eligibility(
+            db, block_content, enforce=_ENFORCE_PROPOSER_ELIGIBILITY,
+        )
+        if not ok_elig:
+            logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {elig_err}")
+            return False
+
         # D3/E-D3b: replay the exchange section (if any) before storing. Strict
         # (reject-on-mismatch) when a root is declared (live broadcast); trust-
         # replay (adopt) when syncing canonical history with no bound root.
@@ -2750,6 +2764,7 @@ async def startup():
         follow_up_sync=_follow_up_sync,
         evm_apply_section=_apply_evm_section_on_import,  # E-D3b importer hook
         verify_unified_root=_verify_unified_state_root,  # E-D4 importer hook
+        enforce_proposer_eligibility=_ENFORCE_PROPOSER_ELIGIBILITY,  # slot-eligibility gate
     )
 
     logger.info(f"✅ JSON-RPC server initialized (dht_* + p2p_* always-on): {len(rpc_server.get_methods())} methods")
@@ -3501,6 +3516,16 @@ async def submit_block(
                     verified_sender, 'invalid_proposer_signature', severity=8
                 )
                 return {'ok': False, 'error': f'Proposer authentication failed: {prop_err}'}
+
+            # Security: proposer must be eligible for the block's slot. Observe-first.
+            ok_elig, elig_err = await verify_proposer_eligibility(
+                db, block_content, enforce=_ENFORCE_PROPOSER_ELIGIBILITY,
+            )
+            if not ok_elig:
+                await security.reputation_manager.record_violation(
+                    verified_sender, 'ineligible_proposer', severity=8
+                )
+                return {'ok': False, 'error': f'Proposer ineligible: {elig_err}'}
 
             # D3: if the block carries an exchange section, securely validate +
             # replay it (verify signatures, re-execute, match declared root)

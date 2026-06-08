@@ -55,6 +55,7 @@ class P2PModule(RPCModule):
         self._follow_up_sync = None
         self._evm_apply_section = None         # E-D3b importer hook (main._apply_evm_section_on_import)
         self._verify_unified_root = None       # E-D4 importer hook (main._verify_unified_state_root)
+        self._enforce_proposer_eligibility = False  # slot-eligibility gate (observe-first)
 
     # ---- wiring (called once at startup from main.py) --------------------
 
@@ -73,6 +74,7 @@ class P2PModule(RPCModule):
         follow_up_sync=None,
         evm_apply_section=None,
         verify_unified_root=None,
+        enforce_proposer_eligibility=False,
     ):
         self._db = db
         self._security = security
@@ -86,6 +88,7 @@ class P2PModule(RPCModule):
         self._follow_up_sync = follow_up_sync
         self._evm_apply_section = evm_apply_section
         self._verify_unified_root = verify_unified_root
+        self._enforce_proposer_eligibility = enforce_proposer_eligibility
 
     def _require_db(self):
         if self._db is None:
@@ -166,10 +169,20 @@ class P2PModule(RPCModule):
                 # Security: authenticate the proposer (pubkey↔address binding +
                 # Dilithium signature over the signed header). Registration alone
                 # does not prove the block was produced by that validator.
-                from ...validator.block_verification import verify_pos_block_proposer
+                from ...validator.block_verification import (
+                    verify_pos_block_proposer, verify_proposer_eligibility,
+                )
                 ok_prop, prop_err = verify_pos_block_proposer(block_content, validator_address)
                 if not ok_prop:
                     return {'ok': False, 'error': f'Proposer authentication failed: {prop_err}'}
+
+                # Proposer must be eligible for the block's slot. Observe-first
+                # (the _enforce_proposer_eligibility flag is injected from main.py).
+                ok_elig, elig_err = await verify_proposer_eligibility(
+                    self._db, block_content, enforce=bool(self._enforce_proposer_eligibility),
+                )
+                if not ok_elig:
+                    return {'ok': False, 'error': f'Proposer ineligible: {elig_err}'}
 
                 # D3: securely validate + replay the exchange section (verify
                 # signatures, re-execute, match the declared exchange_state_root)

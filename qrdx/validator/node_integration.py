@@ -25,6 +25,25 @@ logger = get_logger(__name__)
 SLOT_DURATION_SECONDS = SLOT_DURATION if isinstance(SLOT_DURATION, int) else 12
 
 
+def parse_block_timestamp(ts) -> Optional[datetime]:
+    """
+    Parse a block timestamp into a tz-aware UTC datetime, or None.
+
+    Handles BOTH stored forms: an integer/float Unix timestamp (later blocks) and
+    an ISO-8601 TEXT string (the genesis block, e.g. "2026-06-08 13:57:09+00:00").
+    Returning the wrong thing here pins the slot clock — see ``_get_current_slot``.
+    """
+    if ts is None:
+        return None
+    try:
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        parsed = datetime.fromisoformat(str(ts))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
 def assemble_pos_block_data(block, height: int, exchange_txs=None,
                             exchange_state_root: str = None,
                             evm_txs=None, account_state_root: str = None) -> dict:
@@ -714,23 +733,27 @@ class ValidatorNode:
         """
         # Get genesis time from database or use a default
         now = datetime.now(timezone.utc)
-        
-        # Try to get genesis block timestamp
+
+        # Derive genesis time from the genesis block's timestamp. CRITICAL: the
+        # genesis block stores its timestamp as an ISO-8601 TEXT string (e.g.
+        # "2026-06-08 13:57:09+00:00"), unlike later blocks which use integer Unix
+        # timestamps. The previous code called datetime.fromtimestamp() on that
+        # string, which raised and fell back to `now` on EVERY call — pinning the
+        # slot to 0 forever and degenerating the whole PoS proposer rotation
+        # (every validator thought it was the slot-0 proposer → competing blocks →
+        # reorg churn). Parse both forms robustly.
+        genesis_time = now  # fallback only if genesis is genuinely unavailable
         try:
             genesis_block = await self.db.get_block_by_id(0)
-            if genesis_block and 'timestamp' in genesis_block:
-                genesis_time = datetime.fromtimestamp(genesis_block['timestamp'], tz=timezone.utc)
-            else:
-                # Fallback: genesis is NOW (start of chain)
-                genesis_time = now
-        except Exception:
-            # Fallback: genesis is NOW
+            parsed = parse_block_timestamp(genesis_block.get('timestamp') if genesis_block else None)
+            if parsed is not None:
+                genesis_time = parsed
+        except Exception as e:
+            logger.debug(f"slot: could not read genesis timestamp, using now: {e}")
             genesis_time = now
-        
+
         elapsed = (now - genesis_time).total_seconds()
-        current_slot = int(elapsed // SLOT_DURATION_SECONDS)
-        # Ensure slot is at least 0
-        return max(0, current_slot)
+        return max(0, int(elapsed // SLOT_DURATION_SECONDS))
 
 
 async def initialize_validator_node(db, wallet_path: str, password: str = "", broadcast_callback=None) -> Optional[ValidatorNode]:

@@ -29,11 +29,51 @@ from __future__ import annotations
 
 import ast
 import hashlib
-from typing import Any, Dict, Tuple
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..logger import get_logger
 
 logger = get_logger(__name__)
+
+# RANDAO mix used for proposer selection. The validator manager keeps this at
+# all-zeros network-wide (it is never reassigned), so importers must use the
+# same value to reproduce the proposer. If RANDAO accumulation is ever turned on,
+# the importer must track the identical mix per slot/epoch.
+PROPOSER_RANDAO_MIX = b"\x00" * 32
+
+
+def expected_proposer_for_slot(
+    slot: int,
+    validators: List[Tuple[str, Decimal]],
+    randao_mix: bytes = PROPOSER_RANDAO_MIX,
+) -> Optional[str]:
+    """
+    Deterministically reproduce the eligible proposer address for ``slot``.
+
+    ``validators`` is ``[(address, effective_stake), ...]`` reconstructed the same
+    way the proposer builds its set (every active/pending validator from
+    ``validator_stakes``, ``effective_stake = stake / 1e8``, all proposable). The
+    selection is order-independent (canonicalised by address in
+    ``ValidatorSelector``), so every node derives the same proposer. Returns the
+    address, or ``None`` if no eligible validators.
+    """
+    from .selection import ValidatorSelector
+    from .types import Validator, ValidatorStatus
+
+    vals = [
+        Validator(
+            address=addr,
+            public_key=b"",
+            stake=stake,
+            effective_stake=stake,
+            status=ValidatorStatus.ACTIVE,
+            activation_epoch=0,
+        )
+        for addr, stake in validators
+    ]
+    chosen = ValidatorSelector().select_proposer(slot, vals, randao_mix)
+    return chosen.address if chosen else None
 
 # Header fields the proposer signs (see manager.PoSBlock.signing_root).
 _SIGNING_FIELDS = (
@@ -64,6 +104,63 @@ def reconstruct_signing_root(bc: Dict[str, Any]) -> bytes:
         bytes.fromhex(bc["randao_reveal"])
     )
     return hashlib.sha256(data).digest()
+
+
+async def verify_proposer_eligibility(
+    db: Any,
+    block_content: Any,
+    enforce: bool = False,
+) -> Tuple[bool, str]:
+    """
+    Verify the block's proposer is the validator selected for its slot.
+
+    Reconstructs the proposer's validator set from ``validator_stakes`` (the exact
+    source `node_integration` builds from: active/pending rows, ``stake / 1e8``),
+    derives the deterministic slot proposer, and compares to the block's claimed
+    ``proposer_address``. This catches a registered validator proposing
+    out-of-turn (signature-valid but not its slot).
+
+    Safe for liveness: a propagation-latency fork block still carries a *valid*
+    (slot, proposer) pair, so it passes — only genuinely out-of-turn blocks fail.
+
+    ``enforce=False`` (observe): a mismatch only warns and returns ``ok=True``.
+    Returns ``(True, "")`` when the set can't be reconstructed (never reject a
+    block we can't check).
+    """
+    try:
+        bc = _parse_block_content(block_content)
+    except Exception:
+        return True, ""
+    try:
+        slot = int(bc["slot"])
+        proposer = bc.get("proposer_address")
+    except Exception:
+        return True, ""
+    if not proposer:
+        return True, ""
+
+    try:
+        cur = await db.connection.execute(
+            "SELECT validator_address, stake FROM validator_stakes "
+            "WHERE status = 'PENDING' OR status = 'ACTIVE'"
+        )
+        rows = await cur.fetchall()
+        validators = [(r[0], Decimal(str(r[1])) / Decimal("100000000")) for r in rows]
+    except Exception as e:
+        logger.debug("eligibility: could not load validator set: %s", e)
+        return True, ""
+    if not validators:
+        return True, ""
+
+    expected = expected_proposer_for_slot(slot, validators)
+    if expected and expected != proposer:
+        msg = (f"proposer {str(proposer)[:20]}... not eligible for slot {slot} "
+               f"(expected {expected[:20]}...)")
+        if enforce:
+            return False, msg
+        logger.warning(f"[eligibility observe] {msg}")
+        return True, ""
+    return True, ""
 
 
 def verify_pos_block_proposer(
