@@ -317,84 +317,95 @@ class ValidatorNode:
                 
                 # Get pending transactions
                 pending_txs = await self.db.get_need_propagate_transactions() or []
-                
-                # Attempt to propose block (ValidatorManager checks if we're the proposer)
+
+                # E-D4: only the eligible slot proposer executes the protocol
+                # sections (which mutate state) and proposes. Checking eligibility
+                # BEFORE section execution lets us compute the post-block unified
+                # state root and bind it into the block's signed header. propose_block
+                # re-checks eligibility identically (deterministic for the slot).
+                if not await self.manager.is_proposer(current_slot):
+                    await asyncio.sleep(SLOT_DURATION_SECONDS)
+                    continue
+
+                # Timestamp/parent used as the (non-consensus) execution context for
+                # the sections — they affect only audit tables, never the state roots.
+                block_timestamp = int(datetime.now(timezone.utc).timestamp())
+
+                # Exchange section: select + execute (commit on success). Drop on
+                # failure rather than ship a bad block.
+                exchange_txs = []
+                exchange_state_root = None
+                if self._exchange_tx_source is not None:
+                    try:
+                        exchange_txs = self._exchange_tx_source.select_for_block() or []
+                    except Exception as e:
+                        logger.warning(f"Exchange tx selection failed: {e}")
+                        exchange_txs = []
+                    if exchange_txs:
+                        try:
+                            from ..exchange.block_processor import process_exchange_transactions
+                            from ..exchange.state_manager import ExchangeStateManager
+                            mgr = ExchangeStateManager.get_instance()
+                            ok, err, root = process_exchange_transactions(
+                                next_height, float(block_timestamp), exchange_txs, mgr,
+                            )
+                            if ok:
+                                mgr.commit_block()
+                                exchange_state_root = root
+                                logger.info(
+                                    f"📦 Including {len(exchange_txs)} exchange tx(s) in "
+                                    f"block #{next_height} (root={root[:16]}...)"
+                                )
+                            else:
+                                logger.warning(f"Exchange execution failed, dropping section: {err}")
+                                exchange_txs = []
+                        except Exception as e:
+                            logger.warning(f"Exchange execution error, dropping section: {e}")
+                            exchange_txs = []
+
+                # EVM/account section: execute-on-mine.
+                evm_txs = []
+                account_state_root = None
+                if self._evm_tx_source is not None and self._evm_section_producer is not None:
+                    try:
+                        evm_raws = self._evm_tx_source.select_for_block() or []
+                    except Exception as e:
+                        logger.warning(f"EVM tx selection failed: {e}")
+                        evm_raws = []
+                    if evm_raws:
+                        try:
+                            account_state_root, evm_txs = await self._evm_section_producer(
+                                next_height, parent_hash, block_timestamp, evm_raws,
+                            )
+                            evm_txs = evm_txs or []
+                            if account_state_root and evm_txs:
+                                logger.info(
+                                    f"📦 Including {len(evm_txs)} EVM tx(s) in "
+                                    f"block #{next_height} (root={account_state_root[:16]}...)"
+                                )
+                            else:
+                                evm_txs = []
+                                account_state_root = None
+                        except Exception as e:
+                            logger.warning(f"EVM section production failed, dropping section: {e}")
+                            evm_txs = []
+                            account_state_root = None
+
+                # E-D4: compute the post-block unified state root (UTXO + account +
+                # exchange) and bind it into the block's signed header. The importer
+                # recomputes it after replaying the sections and verifies it matches
+                # this signed root — full cryptographic binding of all state domains.
+                unified_root = await self._compute_unified_state_root()
+
                 block = await self.manager.propose_block(
                     slot=current_slot,
                     parent_hash=parent_hash,
                     transactions=pending_txs[:100],  # Limit to 100 txs per block
-                    state_root=None  # Will compute if needed
+                    state_root=unified_root,
                 )
-                
+
                 if block:
                     logger.info(f"📦 Proposed block #{next_height} at slot {current_slot}: {block.hash[:16]}...")
-
-                    # Phase D2.2: include exchange transactions from the mempool
-                    # in the block body (additive — receivers that don't yet
-                    # understand the section ignore it).
-                    exchange_txs = []
-                    exchange_state_root = None
-                    if self._exchange_tx_source is not None:
-                        try:
-                            exchange_txs = self._exchange_tx_source.select_for_block() or []
-                        except Exception as e:
-                            logger.warning(f"Exchange tx selection failed: {e}")
-                            exchange_txs = []
-                        if exchange_txs:
-                            # D3: execute the section to obtain the exchange state
-                            # root the proposer declares. Commit on success; on
-                            # failure drop the section rather than ship a bad block.
-                            try:
-                                from ..exchange.block_processor import process_exchange_transactions
-                                from ..exchange.state_manager import ExchangeStateManager
-                                mgr = ExchangeStateManager.get_instance()
-                                ok, err, root = process_exchange_transactions(
-                                    next_height, float(block.timestamp), exchange_txs, mgr,
-                                )
-                                if ok:
-                                    mgr.commit_block()
-                                    exchange_state_root = root
-                                    logger.info(
-                                        f"📦 Including {len(exchange_txs)} exchange tx(s) in "
-                                        f"block #{next_height} (root={root[:16]}...)"
-                                    )
-                                else:
-                                    logger.warning(f"Exchange execution failed, dropping section: {err}")
-                                    exchange_txs = []
-                            except Exception as e:
-                                logger.warning(f"Exchange execution error, dropping section: {e}")
-                                exchange_txs = []
-
-                    # E-D3b: execute-on-mine for the EVM/account section. Select
-                    # admitted EVM txs, execute them against EVM state, and declare
-                    # the resulting account_state_root. On any failure the producer
-                    # drops the section (ships no EVM txs) rather than a bad block.
-                    evm_txs = []
-                    account_state_root = None
-                    if self._evm_tx_source is not None and self._evm_section_producer is not None:
-                        try:
-                            evm_raws = self._evm_tx_source.select_for_block() or []
-                        except Exception as e:
-                            logger.warning(f"EVM tx selection failed: {e}")
-                            evm_raws = []
-                        if evm_raws:
-                            try:
-                                account_state_root, evm_txs = await self._evm_section_producer(
-                                    next_height, block.hash, int(block.timestamp or 0), evm_raws,
-                                )
-                                evm_txs = evm_txs or []
-                                if account_state_root and evm_txs:
-                                    logger.info(
-                                        f"📦 Including {len(evm_txs)} EVM tx(s) in "
-                                        f"block #{next_height} (root={account_state_root[:16]}...)"
-                                    )
-                                else:
-                                    evm_txs = []
-                                    account_state_root = None
-                            except Exception as e:
-                                logger.warning(f"EVM section production failed, dropping section: {e}")
-                                evm_txs = []
-                                account_state_root = None
 
                     block_data = assemble_pos_block_data(
                         block, next_height, exchange_txs, exchange_state_root,
@@ -588,6 +599,33 @@ class ValidatorNode:
         """Attach the EVM mempool the proposer pulls account-model txs from."""
         self._evm_tx_source = source
         logger.info("ValidatorNode: EVM tx source attached for block inclusion")
+
+    async def _compute_unified_state_root(self) -> str:
+        """
+        E-D4: the post-block unified state root bound into the block's signed
+        header — BLAKE3-512 over (UTXO root, account/EVM root, exchange root) in
+        fixed domain order (`crypto.hashing.unified_state_root`).
+
+        Computed at the "after sections, before native add_block" point so an
+        importer reproduces it identically after replaying the sections (its UTXO
+        is likewise pre-native-apply, and account/exchange reflect the replayed
+        sections). Each domain falls back to its empty root if unavailable.
+        """
+        from ..crypto.hashing import unified_state_root
+        try:
+            utxo_root = await self.db.get_unspent_outputs_hash()
+        except Exception:
+            utxo_root = "0" * 64
+        try:
+            account_root = await self.db.get_account_state_root()
+        except Exception:
+            account_root = "0" * 128
+        try:
+            from ..exchange.state_manager import ExchangeStateManager
+            exchange_root = ExchangeStateManager.get_instance().compute_state_root()
+        except Exception:
+            exchange_root = "0" * 128
+        return unified_state_root(utxo_root or "0" * 64, account_root, exchange_root)
 
     def set_evm_section_producer(self, producer) -> None:
         """

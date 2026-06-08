@@ -1001,6 +1001,57 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
         return True, ""
 
 
+# E-D4 rollout flag. Phase A (False): recompute the unified state root on import
+# and WARN on mismatch (proves cross-node determinism without risking liveness).
+# Phase B (True): reject blocks whose recomputed unified root != the signed root.
+_ED4_ENFORCE_UNIFIED_ROOT = False
+
+
+async def _verify_unified_state_root(block_content) -> Tuple[bool, str]:
+    """
+    E-D4: recompute the post-block unified state root (UTXO + account + exchange)
+    and compare it to the block's signed ``state_root`` (in block_content).
+
+    Must be called AFTER the block's protocol sections have been replayed but
+    BEFORE the native block is applied — the same point the proposer computed it
+    (UTXO pre-native-apply, account/exchange post-section). Returns ``(ok, err)``;
+    in Phase A a mismatch only warns (``ok=True``).
+    """
+    from ..crypto.hashing import unified_state_root
+    from ..validator.block_verification import _parse_block_content
+    try:
+        bc = _parse_block_content(block_content)
+        declared = bc.get("state_root")
+    except Exception:
+        return True, ""  # malformed content is the proposer-sig check's job
+    if not declared:
+        return True, ""
+
+    try:
+        utxo_root = await db.get_unspent_outputs_hash()
+    except Exception:
+        utxo_root = "0" * 64
+    try:
+        account_root = await db.get_account_state_root()
+    except Exception:
+        account_root = "0" * 128
+    try:
+        from ..exchange.state_manager import ExchangeStateManager
+        exchange_root = ExchangeStateManager.get_instance().compute_state_root()
+    except Exception:
+        exchange_root = "0" * 128
+
+    computed = unified_state_root(utxo_root or "0" * 64, account_root, exchange_root)
+    if computed != declared:
+        msg = (f"unified state root mismatch: declared {str(declared)[:16]}..., "
+               f"computed {computed[:16]}...")
+        if _ED4_ENFORCE_UNIFIED_ROOT:
+            return False, msg
+        logger.warning(f"[E-D4 observe] {msg}")
+        return True, ""
+    return True, ""
+
+
 def _evm_defer_execute():
     """An execute_tx callable bound to the live executor, deferring per-tx commit."""
     async def _execute(raw, h, bh, bt):
@@ -2237,6 +2288,14 @@ async def process_and_create_block(block_info: dict) -> bool:
                 logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr_evm}")
                 return False
 
+        # E-D4 NOTE: the unified-state-root check is intentionally NOT run on this
+        # bulk-sync path. It recomputes three full state roots (UTXO + account +
+        # exchange) per block, which throttles a lagging full node's catch-up; and
+        # during catch-up the node transiently reorgs, so its recomputed root
+        # legitimately differs from the canonical signed root until it settles.
+        # The check runs on the live-broadcast paths (p2p/REST) where state is
+        # stable. Enforcement on sync awaits consensus-maturity (reorg reduction).
+
         try:
             timestamp_val = block.get('timestamp', 0)
             await db.add_block(
@@ -2690,6 +2749,7 @@ async def startup():
         sync_blockchain=_sync_blockchain,
         follow_up_sync=_follow_up_sync,
         evm_apply_section=_apply_evm_section_on_import,  # E-D3b importer hook
+        verify_unified_root=_verify_unified_state_root,  # E-D4 importer hook
     )
 
     logger.info(f"✅ JSON-RPC server initialized (dht_* + p2p_* always-on): {len(rpc_server.get_methods())} methods")
@@ -3475,6 +3535,14 @@ async def submit_block(
                         verified_sender, 'invalid_evm_section', severity=6
                     )
                     return {'ok': False, 'error': f'Invalid EVM section: {verr_evm}'}
+
+            # E-D4: verify the recomputed unified state root against the signed root.
+            ok_root, root_err = await _verify_unified_state_root(block_content)
+            if not ok_root:
+                await security.reputation_manager.record_violation(
+                    verified_sender, 'invalid_state_root', severity=8
+                )
+                return {'ok': False, 'error': f'Invalid state root: {root_err}'}
 
             try:
                 await db.add_block(

@@ -54,6 +54,7 @@ class P2PModule(RPCModule):
         self._sync_blockchain = None
         self._follow_up_sync = None
         self._evm_apply_section = None         # E-D3b importer hook (main._apply_evm_section_on_import)
+        self._verify_unified_root = None       # E-D4 importer hook (main._verify_unified_state_root)
 
     # ---- wiring (called once at startup from main.py) --------------------
 
@@ -71,6 +72,7 @@ class P2PModule(RPCModule):
         sync_blockchain,
         follow_up_sync=None,
         evm_apply_section=None,
+        verify_unified_root=None,
     ):
         self._db = db
         self._security = security
@@ -83,6 +85,7 @@ class P2PModule(RPCModule):
         self._sync_blockchain = sync_blockchain
         self._follow_up_sync = follow_up_sync
         self._evm_apply_section = evm_apply_section
+        self._verify_unified_root = verify_unified_root
 
     def _require_db(self):
         if self._db is None:
@@ -199,6 +202,16 @@ class P2PModule(RPCModule):
                         ok_evm, verr_evm = False, f"evm validation error: {e}"
                     if not ok_evm:
                         return {'ok': False, 'error': f'Invalid EVM section: {verr_evm}'}
+
+                # E-D4: verify the recomputed unified state root against the signed
+                # root (after section replay, before storing).
+                if self._verify_unified_root is not None:
+                    try:
+                        ok_root, root_err = await self._verify_unified_root(block_content)
+                    except Exception as e:
+                        ok_root, root_err = True, f"unified root check error: {e}"
+                    if not ok_root:
+                        return {'ok': False, 'error': f'Invalid state root: {root_err}'}
 
                 try:
                     await self._db.add_block(

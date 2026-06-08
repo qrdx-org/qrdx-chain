@@ -454,6 +454,26 @@ class ValidatorManager:
     # BLOCK PROPOSAL
     # =========================================================================
     
+    async def is_proposer(self, slot: int) -> bool:
+        """
+        Whether this validator is the eligible proposer for ``slot``.
+
+        Pure check (no side effects): active validator able to propose, meets the
+        minimum stake, and is the deterministic slot proposer (selector + RANDAO).
+        Lets the caller decide whether to do proposer-only work (E-D4: execute the
+        protocol sections to compute the unified state root) BEFORE calling
+        ``propose_block``, which re-checks this identically.
+        """
+        if not self._validator or not self._validator.can_propose:
+            return False
+        current_stake = await self.stake_manager.get_effective_stake(self.wallet.address)
+        if current_stake < self.config.staking.min_validator_stake:
+            return False
+        validators = self._validator_set.validators if self._validator_set else [self._validator]
+        return self.selector.is_proposer(
+            slot, self.wallet.address, validators, self._randao_mix,
+        )
+
     async def propose_block(
         self,
         slot: int,
@@ -463,6 +483,12 @@ class ValidatorManager:
     ) -> Optional[PoSBlock]:
         """
         Propose a block if selected for this slot.
+
+        ``state_root`` (E-D4): when provided, it is used verbatim as the block's
+        signed state root — the caller computes the unified post-block root
+        (UTXO + account + exchange) after executing the protocol sections and
+        passes it here so it is bound into ``signing_root``. When omitted, a root
+        is computed from current consensus state (legacy path).
         
         Args:
             slot: Slot number
@@ -473,29 +499,9 @@ class ValidatorManager:
         Returns:
             Proposed block or None if not selected
         """
-        if not self._validator or not self._validator.can_propose:
+        if not await self.is_proposer(slot):
             return None
-        
-        # Enforce minimum stake requirement (Ethereum-grade security)
-        current_stake = await self.stake_manager.get_effective_stake(self.wallet.address)
-        min_required = self.config.staking.min_validator_stake
-        if current_stake < min_required:
-            logger.error(f"Insufficient stake for block proposal: {current_stake} < {min_required} QRDX")
-            return None
-        
-        # Check if we're the proposer for this slot
         validators = self._validator_set.validators if self._validator_set else [self._validator]
-        
-        logger.info(f"Checking proposer for slot {slot}: validator_set has {len(validators)} validators")
-        
-        if not self.selector.is_proposer(
-            slot, 
-            self.wallet.address, 
-            validators,
-            self._randao_mix
-        ):
-            logger.info(f"Not proposer for slot {slot} - selected another validator")
-            return None
         
         logger.info(f"🎯 Selected as proposer for slot {slot}!")
         
