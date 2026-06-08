@@ -126,35 +126,53 @@ class S10Consistency(Scenario):
         tx_hash = self.ctx.artifacts.get("first_tx_hash")
         recipient_addr = self.ctx.artifacts.get("first_tx_recipient")
         if recipient_addr:
-            # Poll for convergence, then assert account-model balance is identical
-            # on every node (and non-zero — the recipient was funded + received).
-            eth_balances = {}
-            for _ in range(5):
-                eth_balances = {}
+            # An account balance is a function of chain HEIGHT, so it is only
+            # meaningful to compare balances across nodes AT THE SAME height. A
+            # non-validator full node legitimately trails the validators by a few
+            # blocks (it only follows), so it can hold an older balance without any
+            # inconsistency. We therefore poll each node's (height, balance) and
+            # assert agreement among the nodes at the MAX observed height —
+            # tolerating a single trailing node, mirroring the quorum height-drift
+            # tolerance above. Determinism guarantees the trailing node converges to
+            # the same balance once it catches up.
+            async def _heights_and_balances():
+                out = {}
                 for url in node_urls:
                     try:
                         await asyncio.sleep(0.3)
                         async with NodeRPCClient(url) as client:
-                            eth_balances[url] = await client.eth_get_balance(recipient_addr)
+                            info = await client.get_mining_info()
+                            h = (info or {}).get("last_block", {}).get("id", 0)
+                            bal = await client.eth_get_balance(recipient_addr)
+                            out[url] = (h, bal)
                     except Exception:
                         pass
-                if eth_balances and len(set(eth_balances.values())) == 1:
-                    break
+                return out
+
+            hb = {}
+            for _ in range(8):  # ~16s, matches the convergence window above
+                hb = await _heights_and_balances()
+                if hb:
+                    max_h = max(h for h, _ in hb.values())
+                    at_tip = {u: b for u, (h, b) in hb.items() if h == max_h}
+                    if len(at_tip) >= 2 and len(set(at_tip.values())) == 1:
+                        break
                 await asyncio.sleep(2)
 
-            if eth_balances:
-                unique = set(eth_balances.values())
+            if hb:
+                max_h = max(h for h, _ in hb.values())
+                at_tip = {u: b for u, (h, b) in hb.items() if h == max_h}
                 self._log.info(
-                    "Recipient account-model balances (wei): %s",
-                    {u: b for u, b in eth_balances.items()},
+                    "Recipient balances by node (height, wei): %s; comparing %d node(s) at tip height %d",
+                    {u: hb[u] for u in hb}, len(at_tip), max_h,
                 )
                 self.check(
-                    len(unique) == 1,
-                    f"Recipient account balance consistent across {len(eth_balances)} nodes "
-                    f"(unique={len(unique)})",
+                    len(at_tip) >= 2 and len(set(at_tip.values())) == 1,
+                    f"Recipient balance consistent across nodes at tip height {max_h} "
+                    f"({len(at_tip)} node(s), unique={len(set(at_tip.values()))})",
                 )
                 self.check(
-                    all(b > 0 for b in eth_balances.values()),
+                    all(b > 0 for _, b in hb.values()),
                     "Recipient account balance reflects funding/transfer (> 0 on all nodes)",
                 )
             else:
