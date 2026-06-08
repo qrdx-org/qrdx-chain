@@ -35,14 +35,15 @@
    at/under the finalized boundary (where state can no longer reorg), not at the
    churning tip. Prereq: a usable finality marker (see item 3).
 
-2. **Full-node import performance / S10 flake.** S10 (cross-node consistency)
-   intermittently fails because the non-validator full node lags ~2 blocks at the
-   balance-check moment. Each imported block now does Dilithium signature
-   verification + eligibility reconstruction (+ live unified-root recompute), all
-   serially during bulk catch-up. Investigate whether per-block PQ verification is
-   the bottleneck and, if so, batch/parallelize or cache the validator set;
-   separately make S10's convergence poll more tolerant. Decide which is cause vs
-   test-strictness before just loosening the test.
+2. **Full-node import performance / S10 flake. — ✅ RESOLVED (was a test bug).**
+   S10's balance check compared `eth_getBalance` across all nodes without
+   requiring equal height; a balance is a function of height, so a full node a few
+   blocks behind was compared against caught-up validators and intermittently
+   "failed" despite consistent state. Fixed to compare only among nodes at the max
+   height (3-run soak: 12/12, full height convergence). The soak's full
+   convergence also showed the full node DOES keep up — per-block PQ verification
+   is NOT a bottleneck at this scale, so no import-perf work is needed now (revisit
+   only if larger validator sets / higher tx rates surface real catch-up lag).
 
 3. **Finality / fork-choice maturity.** Residual reorgs are longest-chain
    catch-up from propagation latency (block-time ≈ propagation-time). A finality
@@ -61,11 +62,15 @@
    Accumulate RANDAO reveals into the mix (kept consistent across nodes) for
    unbiased/unpredictable proposer selection.
 
-6. **`from_hex`/`from_bytes` caller audit (low).** Core primitive is hardened
-   (raises rather than inventing identity). Two `pq_wallet.py` paths
-   (`from_private_key`, legacy keystore) still construct address-less wallets;
-   confirm no runtime path calls `.address` on them (unit+integration currently
-   green, so none tested do).
+6. **`from_hex`/`from_bytes` caller audit. — ✅ DONE.** Core primitive hardened
+   (raises rather than inventing identity), with an actionable error message.
+   Audited callers: the consensus/validator path passes the public key; the only
+   address-less constructors are `PQWallet.from_private_key` / `from_hex` (CLI
+   "import private key", `cli/wallet.py`) and legacy keystores lacking
+   `public_key` — these now fail loudly + clearly on `.address` (previously
+   returned a silent random address). Sign-only use still works. Follow-up
+   (cosmetic): the CLI import-PQ-key-from-private-only flow should prompt for /
+   require the public key, since Dilithium cannot recover it.
 
 ## ⏳ Remaining — economic integrity (Phase E)
 

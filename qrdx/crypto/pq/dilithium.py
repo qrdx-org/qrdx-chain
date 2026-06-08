@@ -296,7 +296,13 @@ class PQPrivateKey:
     def public_key(self) -> PQPublicKey:
         """Get corresponding public key."""
         if self._public_key is None:
-            raise PQCryptoError("Public key not initialized")
+            raise PQCryptoError(
+                "Public key unavailable: this key was restored from secret-key "
+                "bytes without its public key, which a Dilithium secret key cannot "
+                "re-derive. Provide it via from_bytes/from_hex(..., public_key=...) "
+                "(or load a keystore/wallet file that stores 'public_key'). The key "
+                "can still sign, but its address/public key are unknown."
+            )
         return self._public_key
 
     @property
