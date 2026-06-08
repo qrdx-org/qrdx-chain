@@ -26,14 +26,30 @@ def test_roundtrip_with_public_key_preserves_address():
     assert restored.public_key.to_hex() == pub_hex
 
 
-def test_roundtrip_without_public_key_does_not_preserve_address():
-    """Documents the footgun: omitting the public key yields a different address."""
+def test_roundtrip_without_public_key_raises_on_address():
+    """Without the public key, the identity is unknown — accessing the address
+    must RAISE (never silently return a random/wrong address)."""
+    import pytest
+    from qrdx.crypto.pq.dilithium import PQCryptoError
     k = PQPrivateKey.generate()
     restored = PQPrivateKey.from_hex(k.to_hex())  # no public key
-    assert restored.address != k.address, (
-        "restoring without the public key unexpectedly preserved the address — "
-        "if this ever holds, the from_hex public-key requirement can be relaxed"
-    )
+    with pytest.raises(PQCryptoError):
+        _ = restored.address
+    with pytest.raises(PQCryptoError):
+        _ = restored.public_key
+
+
+def test_restored_key_without_public_key_still_signs_correctly():
+    """A key restored from secret bytes (no public key) must sign with the REAL
+    key — its signature verifies against the ORIGINAL public key. (Previously the
+    harmful generate_keypair() overwrote the secret key with a random one.)"""
+    k = PQPrivateKey.generate()
+    orig_pub = k.public_key
+    restored = PQPrivateKey.from_hex(k.to_hex())  # secret only
+    msg = b"consensus-critical message"
+    sig = restored.sign(msg)
+    from qrdx.crypto.pq import verify as pq_verify
+    assert pq_verify(orig_pub, msg, sig), "restored key must sign as the original identity"
 
 
 def test_pqwallet_loaded_with_public_key_matches_stored_address():

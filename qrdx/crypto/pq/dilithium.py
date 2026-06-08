@@ -224,15 +224,25 @@ class PQPrivateKey:
             raise PQCryptoError(f"Key generation failed: {e}")
 
     def _restore_from_bytes(self, key_bytes: bytes):
-        """Restore keypair from private key bytes."""
+        """
+        Restore a keypair from secret-key bytes.
+
+        CRITICAL: do NOT call ``generate_keypair()`` here. Constructing
+        ``oqs.Signature(alg, secret_key)`` already loads the restored secret key
+        and it can sign directly (verified). ``generate_keypair()`` would instead
+        OVERWRITE that secret key with a brand-new random one — silently changing
+        both the signing identity AND the derived address. That footgun caused
+        validators to load their wallets and propose under random addresses that
+        never matched their genesis registration (validator-set non-convergence).
+
+        A Dilithium public key cannot be re-derived from the secret key alone, so
+        callers MUST supply it (``from_bytes/from_hex(..., public_key=...)``) to
+        get a usable address. If it is absent, ``_public_key`` stays None and
+        ``.public_key`` / ``.address`` raise a clear error — far safer than
+        returning a random identity. Signing still works either way.
+        """
         try:
             self._signer = oqs.Signature(_WORKING_ALGORITHM, key_bytes)
-            if self._public_key is None:
-                # OQS API: when restoring from secret key, we must call
-                # generate_keypair() to initialize internal state.
-                # Callers SHOULD provide public_key for proper restoration.
-                pub_bytes = self._signer.generate_keypair()
-                self._public_key = PQPublicKey(pub_bytes)
         except Exception as e:
             raise PQCryptoError(f"Key restoration failed: {e}")
 
