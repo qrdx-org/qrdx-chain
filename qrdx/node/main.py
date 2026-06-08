@@ -1007,10 +1007,14 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
         return True, ""
 
 
-# E-D4 rollout flag. Phase A (False): recompute the unified state root on import
-# and WARN on mismatch (proves cross-node determinism without risking liveness).
-# Phase B (True): reject blocks whose recomputed unified root != the signed root.
-_ED4_ENFORCE_UNIFIED_ROOT = False
+# E-D4 rollout flag. Enabled after validator-set convergence: the live-broadcast
+# paths (p2p/REST) recompute the unified state root and observed 0 mismatches
+# across a 3-run soak (reorgs now ~0, so no transient divergence). With True, a
+# live-broadcast block whose recomputed unified root != the signed root is
+# REJECTED. NOTE: the check is intentionally NOT run on the bulk-sync path (a
+# catching-up node can still transiently differ mid-reorg), only on stable
+# live-broadcast import — see _verify_unified_state_root.
+_ED4_ENFORCE_UNIFIED_ROOT = True
 
 
 async def _verify_unified_state_root(block_content) -> Tuple[bool, str]:
