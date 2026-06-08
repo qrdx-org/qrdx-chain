@@ -2,10 +2,11 @@
 
 > **Status:** Phase 2 implemented — EVM/account **execute-on-mine** is live
 > (admit-only RPC → proposer execute + declare `account_state_root` → import
-> replay with reject-on-mismatch → reorg rebuild → sync propagation). At parity
-> with the exchange domain. Next: E-D4 (bind state roots into the signed header,
-> upgrading sync from trust-replay to full verification). Verified: integration
-> 12/12, unit 2023.  
+> replay with reject-on-mismatch → reorg rebuild → sync propagation), plus
+> proposer-signature verification on import and **E-D4 binding** (unified state
+> root in the signed header, observe-verified on the live path). E-D4 enforcement
+> + slot-proposer eligibility are deferred on consensus-maturity (reorg churn).
+> Verified: integration 12/12, unit 2029.  
 > **Date:** June 2026  
 > **Related:** `PRODUCTION_DEPLOYMENT.md` §14.8, `QRDX_IMPLEMENTATION_CHECKLIST.md`
 
@@ -265,13 +266,26 @@ gate). No in-repo code substitutes for those process gates.
   eligibility risks liveness). Tests: `test_block_proposer_verification.py` (6);
   integration 12/12, unit 2029. Without this, binding roots into the signed header
   (E-D4) would be moot — see memory `pos-import-signature-gap`.
-- **E-D4 (next): bind both state roots into the signed block header.** Today the
-  declared roots ride alongside the block but are not bound into the block hash,
-  so on sync a node trust-replays canonical sections (it cannot cryptographically
-  reject a tampered section from a sync peer until the root is in the signed
-  header). D4 binds `account_state_root` + `exchange_state_root` (+ UTXO root)
-  into the unified header root (`crypto/hashing.unified_state_root`) the proposer
-  signs — which the now-wired proposer-signature check then enforces — upgrading
-  sync from trust-replay to full verification. Requires reordering the proposer to
-  execute sections *before* signing (so post-block roots are known at sign time).
-- E-E: pending, after D4.
+- **E-D4 (binding ✅ done; enforcement deferred).** The proposer now **binds**
+  the post-block unified root — BLAKE3-512 over (UTXO, account/EVM, exchange),
+  `crypto/hashing.unified_state_root` — into the block's Dilithium-signed
+  `signing_root` (via `ValidatorManager.is_proposer` + a reordered loop that
+  executes the sections, computes the root, then `propose_block(state_root=...)`).
+  The now-verified proposer signature therefore cryptographically commits to all
+  state domains. Live-broadcast importers (p2p/REST) recompute the root after
+  replaying the sections and **observe-verify** it (`_verify_unified_state_root`,
+  gated by `_ED4_ENFORCE_UNIFIED_ROOT`, currently `False`).
+
+  **Why enforcement is deferred (the finding from running it):** on the bulk-sync
+  path a lagging full node transiently reorgs (competing tip blocks), so its
+  recomputed root legitimately differs from the canonical signed root until it
+  settles — enforcing would break sync. The recomputation was therefore removed
+  from the bulk-sync path entirely (it also recomputed three full state roots per
+  block, throttling catch-up and regressing S10 consistency) and kept only on the
+  stable live-broadcast paths, where it observes **0 mismatches** across
+  validators — confirming the binding is correct and deterministic. **Phase B**
+  (flip `_ED4_ENFORCE_UNIFIED_ROOT` → reject-on-mismatch on the live paths, then
+  re-introduce a settled-state check on sync) is blocked on **consensus-maturity**:
+  reducing reorg churn / making full-node sync converge deterministically. See
+  memory `pos-import-signature-gap` for the related signature-path context.
+- E-E: pending, after D4 enforcement.
