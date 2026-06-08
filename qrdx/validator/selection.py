@@ -62,15 +62,25 @@ class ValidatorSelector:
             logger.warning(f"No validators available for slot {slot}")
             return None
         
-        # Filter to only eligible validators
-        eligible = [v for v in validators if v.can_propose]
+        # Filter to only eligible validators, in a CANONICAL order (by address).
+        # Consensus-critical: ``_weighted_selection`` walks the list in order to
+        # build the cumulative-stake distribution, so its result depends on input
+        # order. Callers build the validator set in node-local order (each node
+        # lists itself first), so without canonicalisation different nodes would
+        # select DIFFERENT proposers for the same slot → competing tip blocks →
+        # reorg churn. Sorting by address makes the selection identical on every
+        # node.
+        eligible = sorted(
+            (v for v in validators if v.can_propose),
+            key=lambda v: v.address,
+        )
         if not eligible:
             logger.warning(f"No eligible validators for slot {slot}")
             return None
-        
+
         # Compute selection seed for this slot
         seed = self._compute_slot_seed(slot, randao_mix)
-        
+
         # Select proposer based on stake weight
         proposer = self._weighted_selection(eligible, seed)
         
@@ -103,11 +113,16 @@ class ValidatorSelector:
         if not validators:
             return []
         
-        # Filter to eligible validators
-        eligible = [v for v in validators if v.can_attest]
+        # Filter to eligible validators in CANONICAL order (by address) so the
+        # deterministic shuffle below yields the same committee on every node
+        # regardless of the caller's node-local list order.
+        eligible = sorted(
+            (v for v in validators if v.can_attest),
+            key=lambda v: v.address,
+        )
         if not eligible:
             return []
-        
+
         # Limit committee size
         actual_size = min(committee_size, len(eligible))
         
