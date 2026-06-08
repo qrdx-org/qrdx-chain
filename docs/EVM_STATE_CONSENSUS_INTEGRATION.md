@@ -2,11 +2,13 @@
 
 > **Status:** Phase 2 implemented — EVM/account **execute-on-mine** is live
 > (admit-only RPC → proposer execute + declare `account_state_root` → import
-> replay with reject-on-mismatch → reorg rebuild → sync propagation), plus
-> proposer-signature verification on import and **E-D4 binding** (unified state
-> root in the signed header, observe-verified on the live path). E-D4 enforcement
-> + slot-proposer eligibility are deferred on consensus-maturity (reorg churn).
-> Verified: integration 12/12, unit 2029.  
+> replay with reject-on-mismatch → reorg rebuild → sync propagation). Proposer
+> authentication on import is complete: Dilithium signature + pubkey↔address +
+> **slot-proposer eligibility (ENFORCED)**. **E-D4 unified state root is ENFORCED**
+> on live-broadcast import (bulk-sync stays trust-replay). The keystone enabler
+> was fixing validator-set convergence (a Dilithium key-identity load bug): reorg
+> churn collapsed ~40→~0, which made the consensus deterministic enough to enforce
+> these gates. Verified: integration 12/12 (0 false rejections), unit 2042.  
 > **Date:** June 2026  
 > **Related:** `PRODUCTION_DEPLOYMENT.md` §14.8, `QRDX_IMPLEMENTATION_CHECKLIST.md`
 
@@ -261,31 +263,30 @@ gate). No in-repo code substitutes for those process gates.
   (`qrdx/validator/block_verification.py`) now runs in all three importers (sync,
   REST, p2p): it binds the carried `proposer_public_key` to `proposer_address`
   (0xPQ derivation) and verifies the Dilithium signature over the reconstructed
-  `signing_root`. Authenticity only — slot-proposer **eligibility** is still
-  deferred (the network produces validly-signed competing tip blocks; strict
-  eligibility risks liveness). Tests: `test_block_proposer_verification.py` (6);
-  integration 12/12, unit 2029. Without this, binding roots into the signed header
-  (E-D4) would be moot — see memory `pos-import-signature-gap`.
-- **E-D4 (binding ✅ done; enforcement deferred).** The proposer now **binds**
+  `signing_root`. Slot-proposer **eligibility is now ENFORCED** too
+  (`verify_proposer_eligibility`, `_ENFORCE_PROPOSER_ELIGIBILITY=True`): an
+  importer rejects a signature-valid but out-of-turn block. This became safe once
+  validator-set convergence was fixed (below). Tests:
+  `test_block_proposer_verification.py`, `test_proposer_selection_determinism.py`;
+  integration 12/12 with 0 false rejections.
+- **Validator-set convergence (the keystone fix).** The reorg churn that blocked
+  enforcement was a Dilithium **key-identity** bug: `PQPrivateKey.from_hex()`
+  without the public key generates a RANDOM keypair, so each validator loaded its
+  wallet and proposed under a wrong address that never matched genesis → no node
+  converged on a common set → every node thought it was the sole proposer. Fixed
+  by loading the stored public key, building the proposer set + eligibility from
+  the consistent `validators` table, and deterministic (address-sorted) selection.
+  Effect: reorgs ~40 → ~0, eligibility + E-D4 mismatches → 0 (3-run soak). See
+  memory `validator-set-convergence-gap`.
+- **E-D4 (binding ✅ done; ENFORCED on live-broadcast import).** The proposer binds
   the post-block unified root — BLAKE3-512 over (UTXO, account/EVM, exchange),
   `crypto/hashing.unified_state_root` — into the block's Dilithium-signed
-  `signing_root` (via `ValidatorManager.is_proposer` + a reordered loop that
-  executes the sections, computes the root, then `propose_block(state_root=...)`).
-  The now-verified proposer signature therefore cryptographically commits to all
-  state domains. Live-broadcast importers (p2p/REST) recompute the root after
-  replaying the sections and **observe-verify** it (`_verify_unified_state_root`,
-  gated by `_ED4_ENFORCE_UNIFIED_ROOT`, currently `False`).
-
-  **Why enforcement is deferred (the finding from running it):** on the bulk-sync
-  path a lagging full node transiently reorgs (competing tip blocks), so its
-  recomputed root legitimately differs from the canonical signed root until it
-  settles — enforcing would break sync. The recomputation was therefore removed
-  from the bulk-sync path entirely (it also recomputed three full state roots per
-  block, throttling catch-up and regressing S10 consistency) and kept only on the
-  stable live-broadcast paths, where it observes **0 mismatches** across
-  validators — confirming the binding is correct and deterministic. **Phase B**
-  (flip `_ED4_ENFORCE_UNIFIED_ROOT` → reject-on-mismatch on the live paths, then
-  re-introduce a settled-state check on sync) is blocked on **consensus-maturity**:
-  reducing reorg churn / making full-node sync converge deterministically. See
-  memory `pos-import-signature-gap` for the related signature-path context.
+  `signing_root` (via `ValidatorManager.is_proposer` + a reordered loop). The
+  live-broadcast importers (p2p/REST) recompute it after replay and **reject on
+  mismatch** (`_ED4_ENFORCE_UNIFIED_ROOT=True`) — cryptographic, signature-bound
+  verification of all state domains. The **bulk-sync path stays trust-replay** (a
+  catching-up node can transiently differ mid-reorg, and recomputing three roots
+  per block there throttles catch-up); a settled-state sync check (only at
+  finalized heights) is the remaining refinement. Verified: integration 12/12,
+  0 state-root rejections.
 - E-E: pending, after D4 enforcement.
