@@ -76,12 +76,23 @@
    **Verified:** integration 12/12, finality advances identically on all 4 nodes
    (observe). `get_pos_chain_head` now reports a real finalized boundary.
 
-   **Remaining — link 5 (behaviour-changing, do observe→soak→enforce):** consume
-   the finalized boundary — (a) fork-choice refuses to reorg below the finalized
-   height (bounds reorg depth); (b) extend E-D4 enforcement (item 1) to the
-   bulk-sync path but only at/under the finalized boundary. This is the only part
-   that changes consensus behaviour, so gate + soak it like the other enforcement
-   flips.
+   **Link 5(a) — fork-choice finality guard: ✅ DONE (enforced).**
+   `finality.finalized_block_height` = deepest height where ≥2/3 stake attested to
+   a canonical block at least that deep (stake-weighted DEPTH — same-block
+   supermajority was too strict, gave -1 since validators attest divergent heads).
+   `handle_reorganization` now REFUSES (returns None, keeps the local finalized
+   chain) any reorg below that height, bounding reorg depth to the finality lag.
+   Gated by `_ENFORCE_FINALITY_REORG_GUARD`. Verified: finalized_height
+   deterministic across nodes (=25 vs tip 34), integration 12/12 with 0 spurious
+   refusals.
+
+   **Link 5(b) — E-D4 sync-path enforcement at finalized boundary: remaining
+   (smaller refinement).** Extend E-D4 (item 1) to enforce the unified root on the
+   bulk-sync path for blocks at/under the finalized height (settled state). Note
+   the chicken-and-egg: during initial sync-from-genesis finality isn't yet
+   established (no attestations processed), so this mainly helps an already-running
+   node catching up a few blocks; sync already trust-replays correctly and the
+   live path already enforces, so this is lower priority.
 
 4. **Validator lifecycle convergence.** The `validators` table is genesis-seeded
    and consistent, but runtime validator set changes (activation/exit queues,
