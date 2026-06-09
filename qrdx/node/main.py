@@ -2344,6 +2344,13 @@ async def process_and_create_block(block_info: dict) -> bool:
                     await db.add_block_evm_txs(block_hash, evm_section)
                 except Exception as e:
                     logger.warning(f"[SYNC] Failed to store EVM section for block {block_height}: {e}")
+            # Finality (observe): record this block's attestation votes + recompute
+            # justified/finalized. Best-effort; never blocks block storage.
+            try:
+                from ..validator.finality import record_finality_from_block
+                await record_finality_from_block(db, block_content)
+            except Exception as e:
+                logger.debug(f"[SYNC] finality record skipped for block {block_height}: {e}")
             logger.debug(f"[SYNC] Stored PoS block {block_height} ({block_hash[:16]}...) validator={validator_address[:20]}")
             return True
         except Exception as e:
@@ -3594,6 +3601,12 @@ async def submit_block(
                         await db.add_block_evm_txs(block_hash, evm_section)
                     except Exception as e:
                         logger.warning(f"Failed to store EVM section for block {block_no}: {e}")
+                # Finality (observe): record attestation votes + recompute.
+                try:
+                    from ..validator.finality import record_finality_from_block
+                    await record_finality_from_block(db, block_content)
+                except Exception as e:
+                    logger.debug(f"finality record skipped for block {block_no}: {e}")
                 await security.reputation_manager.record_good_behavior(verified_sender, points=5)
                 logger.info(f"Accepted PoS block {block_no} from {verified_sender}. Propagating...")
                 background_tasks.add_task(

@@ -246,6 +246,12 @@ class P2PModule(RPCModule):
                             await self._db.add_block_evm_txs(block_hash, evm_section)
                         except Exception as e:
                             logger.warning(f"Failed to store EVM section for block {block_no}: {e}")
+                    # Finality (observe): record attestation votes + recompute.
+                    try:
+                        from ...validator.finality import record_finality_from_block
+                        await record_finality_from_block(self._db, block_content)
+                    except Exception as e:
+                        logger.debug(f"finality record skipped for block {block_no}: {e}")
                     logger.info(f"Accepted PoS block {block_no} via RPC. Propagating...")
                     asyncio.create_task(
                         self._propagate_fn(

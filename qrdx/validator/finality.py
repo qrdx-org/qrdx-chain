@@ -123,3 +123,21 @@ async def update_finality(db) -> Dict[str, int]:
     if max_f >= 0:
         logger.info(f"[finality] justified_epoch={max_j} finalized_epoch={max_f}")
     return {"justified_epoch": max_j, "finalized_epoch": max_f}
+
+
+async def record_finality_from_block(db, block_content) -> Dict[str, int]:
+    """
+    Convenience entry point for the block produce/import paths: parse a block's
+    serialized content (``str(PoSBlock.to_dict())``), record its attestation
+    votes, and recompute finality. Best-effort — never raises into the caller.
+    """
+    try:
+        from .block_verification import _parse_block_content
+        bc = _parse_block_content(block_content)
+        if not isinstance(bc, dict):
+            return {}
+        await record_block_attestations(db, bc)
+        return await update_finality(db)
+    except Exception as e:
+        logger.debug("finality: record_from_block skipped: %s", e)
+        return {}

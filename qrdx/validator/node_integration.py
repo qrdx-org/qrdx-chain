@@ -497,6 +497,14 @@ class ValidatorNode:
                         except Exception as e:
                             logger.warning(f"Failed to persist/drain EVM section: {e}")
 
+                    # Finality (observe): record this block's attestation votes +
+                    # recompute, so the proposer tracks finality like importers do.
+                    try:
+                        from .finality import record_finality_from_block
+                        await record_finality_from_block(self.db, block_data['block_content'])
+                    except Exception as e:
+                        logger.debug(f"finality record skipped for block #{next_height}: {e}")
+
                     # Broadcast block to network peers
                     if self.broadcast_callback:
                         try:
