@@ -118,10 +118,26 @@
 
 ## ⏳ Remaining — economic integrity (Phase E)
 
-7. **Native↔EVM balance unification.** Gas and exchange margin must debit *real*
-   balances. Today EVM execution syncs the sender's native balance in
-   (`prepare_execution`) but the account/native coupling isn't a single source of
-   truth. Unify so fees/margin/settlement move actual value, deterministically.
+7. **Exchange ↔ real-balance integration (the actual Phase E gap).**
+   **Scoped (investigated June 2026):** EVM gas IS real — py-evm debits gas+value
+   from the EVM balance and `ContractStateManager.commit` writes `account_state`.
+   The gap is the **exchange**: `_op_open_position` opens a leveraged perp with
+   `margin`/`leverage` but never checks or debits the trader's real `account_state`
+   balance; `_op_close_position` computes PnL but never credits/debits it; spot
+   `place_order` likewise doesn't lock/settle funds. The exchange engine
+   (`exchange/state_manager.py`, `perpetual.py`) is a self-contained simulation —
+   positions/margin/PnL are internal bookkeeping with NO connection to real
+   balances, so trades move no actual value and margin isn't collateralized.
+
+   **Build order (incremental, observe-first):** (a) a deterministic balance bridge
+   the exchange uses to read/lock/debit/credit `account_state` (wei), part of the
+   exchange state root + revertible with the block snapshot; (b) perp
+   open/add-margin: require + lock real collateral (debit account_state), reject if
+   insufficient; (c) close/liquidate/partial-close: settle PnL + release margin to
+   `account_state`; (d) spot orders: lock on place, settle on fill; (e) keep it all
+   deterministic and inside the exchange section replay so every node agrees.
+   Observe-first: log intended debits before enforcing. Large, economic-integrity
+   critical — its own dedicated effort.
 
 ## 🔒 Process gates (cannot be satisfied in-repo)
 
