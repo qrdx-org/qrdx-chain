@@ -340,9 +340,24 @@ class DatabaseSQLite:
             PRIMARY KEY (block_hash, tx_index)
         );
 
+        -- Finality: accumulated attestation VOTES (one per validator per target
+        -- epoch — Casper-style). Populated by every node from the attestations
+        -- carried in imported block bodies, so finality is computable by full
+        -- nodes too (not just validators with an in-memory pool).
+        CREATE TABLE IF NOT EXISTS attestation_votes (
+            validator_address TEXT NOT NULL,
+            target_epoch INTEGER NOT NULL,
+            source_epoch INTEGER NOT NULL DEFAULT 0,
+            slot INTEGER NOT NULL,
+            block_hash TEXT NOT NULL,
+            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (validator_address, target_epoch)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(block_height);
         CREATE INDEX IF NOT EXISTS idx_block_exchange_txs ON block_exchange_transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_block_evm_txs ON block_evm_transactions(block_hash);
+        CREATE INDEX IF NOT EXISTS idx_attestation_votes_target ON attestation_votes(target_epoch);
         CREATE INDEX IF NOT EXISTS idx_transactions_block ON transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_unspent_address ON unspent_outputs(address);
         CREATE INDEX IF NOT EXISTS idx_validator_epoch ON validator_states(epoch);
@@ -942,6 +957,53 @@ class DatabaseSQLite:
         )
         rows = await cursor.fetchall()
         return [r[0] for r in rows]
+
+    # ── Finality: attestation votes (link 2) ────────────────────────────
+
+    async def record_attestation_vote(self, validator_address: str, target_epoch: int,
+                                      source_epoch: int, slot: int, block_hash: str) -> None:
+        """
+        Record a validator's attestation vote for a target epoch (one per
+        validator per target — later/duplicate votes for the same target are
+        ignored). Idempotent; safe to call from every importer for the same
+        block-carried attestation.
+        """
+        await self.connection.execute(
+            "INSERT OR IGNORE INTO attestation_votes "
+            "(validator_address, target_epoch, source_epoch, slot, block_hash) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (validator_address, int(target_epoch), int(source_epoch), int(slot), block_hash),
+        )
+        await self.connection.commit()
+
+    async def get_epoch_attesters(self, target_epoch: int) -> list:
+        """Return the validator addresses that have voted for ``target_epoch``."""
+        cursor = await self.connection.execute(
+            "SELECT validator_address FROM attestation_votes WHERE target_epoch = ?",
+            (int(target_epoch),),
+        )
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
+
+    async def set_epoch_finality(self, epoch: int, start_slot: int, end_slot: int,
+                                 justified: bool, finalized: bool) -> None:
+        """
+        Persist an epoch's justified/finalized status (SQLite). The existing
+        epoch-processing writer is PostgreSQL-only, so this is the SQLite path the
+        finality computation uses; ``get_pos_chain_head`` reads it back.
+        """
+        await self.connection.execute(
+            "INSERT INTO epochs (epoch, start_slot, end_slot, justified, finalized) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(epoch) DO UPDATE SET "
+            "  justified = excluded.justified, "
+            "  finalized = excluded.finalized, "
+            "  finalized_at = CASE WHEN excluded.finalized THEN CURRENT_TIMESTAMP "
+            "                      ELSE epochs.finalized_at END",
+            (int(epoch), int(start_slot), int(end_slot), 1 if justified else 0,
+             1 if finalized else 0),
+        )
+        await self.connection.commit()
 
     async def get_validators(self, status: str = None):
         """
