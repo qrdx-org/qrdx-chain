@@ -1022,16 +1022,22 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
 _ED4_ENFORCE_UNIFIED_ROOT = True
 
 
-async def _verify_unified_state_root(block_content) -> Tuple[bool, str]:
+async def _verify_unified_state_root(block_content, enforce: Optional[bool] = None) -> Tuple[bool, str]:
     """
     E-D4: recompute the post-block unified state root (UTXO + account + exchange)
     and compare it to the block's signed ``state_root`` (in block_content).
 
     Must be called AFTER the block's protocol sections have been replayed but
     BEFORE the native block is applied — the same point the proposer computed it
-    (UTXO pre-native-apply, account/exchange post-section). Returns ``(ok, err)``;
-    in Phase A a mismatch only warns (``ok=True``).
+    (UTXO pre-native-apply, account/exchange post-section). Returns ``(ok, err)``.
+
+    ``enforce`` overrides the global gate: the live-broadcast paths use the global
+    ``_ED4_ENFORCE_UNIFIED_ROOT`` (enforce); the bulk-sync path passes
+    ``enforce=False`` (observe), because a catching-up node can transiently differ
+    mid-reorg and must not reject canonical history.
     """
+    if enforce is None:
+        enforce = _ED4_ENFORCE_UNIFIED_ROOT
     from ..crypto.hashing import unified_state_root
     from ..validator.block_verification import _parse_block_content
     try:
@@ -1060,7 +1066,7 @@ async def _verify_unified_state_root(block_content) -> Tuple[bool, str]:
     if computed != declared:
         msg = (f"unified state root mismatch: declared {str(declared)[:16]}..., "
                f"computed {computed[:16]}...")
-        if _ED4_ENFORCE_UNIFIED_ROOT:
+        if enforce:
             return False, msg
         logger.warning(f"[E-D4 observe] {msg}")
         return True, ""
@@ -2312,13 +2318,16 @@ async def process_and_create_block(block_info: dict) -> bool:
                 logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr_evm}")
                 return False
 
-        # E-D4 NOTE: the unified-state-root check is intentionally NOT run on this
-        # bulk-sync path. It recomputes three full state roots (UTXO + account +
-        # exchange) per block, which throttles a lagging full node's catch-up; and
-        # during catch-up the node transiently reorgs, so its recomputed root
-        # legitimately differs from the canonical signed root until it settles.
-        # The check runs on the live-broadcast paths (p2p/REST) where state is
-        # stable. Enforcement on sync awaits consensus-maturity (reorg reduction).
+        # E-D4 (link 5b): run the unified-state-root check on the bulk-sync path in
+        # OBSERVE mode (enforce=False) — warn on mismatch but never reject, because
+        # a catching-up node can transiently differ mid-reorg and must not drop
+        # canonical history. This gives visibility into sync-path state consistency
+        # (now that reorgs are ~0 + finality bounds them) to decide whether sync
+        # enforcement is safe; the live-broadcast paths still enforce.
+        try:
+            await _verify_unified_state_root(block_content, enforce=False)
+        except Exception as e:
+            logger.debug(f"[SYNC] E-D4 observe check skipped for block {block_height}: {e}")
 
         try:
             timestamp_val = block.get('timestamp', 0)
