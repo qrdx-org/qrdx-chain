@@ -129,15 +129,25 @@
    positions/margin/PnL are internal bookkeeping with NO connection to real
    balances, so trades move no actual value and margin isn't collateralized.
 
-   **Build order (incremental, observe-first):** (a) a deterministic balance bridge
-   the exchange uses to read/lock/debit/credit `account_state` (wei), part of the
-   exchange state root + revertible with the block snapshot; (b) perp
-   open/add-margin: require + lock real collateral (debit account_state), reject if
-   insufficient; (c) close/liquidate/partial-close: settle PnL + release margin to
-   `account_state`; (d) spot orders: lock on place, settle on fill; (e) keep it all
-   deterministic and inside the exchange section replay so every node agrees.
-   Observe-first: log intended debits before enforcing. Large, economic-integrity
-   critical — its own dedicated effort.
+   **Progress — the perp-margin path is BUILT (observe/gated-off), unit-verified.**
+   - ✅ (a) balance bridge: `ExchangeStateManager.set/available/clear_available_balance`
+     + per-block `_balance_deltas`; `preload_sender_balances` (async, both block
+     paths) loads real `account_state` balances before the sync section.
+   - ✅ (b) open: `_op_open_position` computes required margin, records a `-margin`
+     delta, and (when `enforce_collateral`) rejects under-collateralized opens;
+     `db.apply_account_balance_delta` (QRDX→wei) + `flush_exchange_balance_deltas`
+     apply the deltas to `account_state` before the unified root is computed.
+     All gated by `block_processor.ENFORCE_EXCHANGE_COLLATERAL` (default False).
+     Tests: `test_exchange_collateral_observe.py` (8), `test_account_balance_delta.py`
+     (3). Integration 12/12 (flag off = behaviour-neutral).
+   - ⏳ **Before flipping `ENFORCE_EXCHANGE_COLLATERAL`:** the live integration (s12)
+     only creates trading PAIRS — it never opens a perp, so enforce isn't exercised
+     live. Add a perp-collateral integration scenario (fund a trader in
+     `account_state` at genesis → submit OPEN_POSITION → assert the margin debit +
+     cross-node `account_state`/unified-root consistency), then flip + soak. Don't
+     flip on the current integration alone (it would be unverified in production).
+   - ⏳ (c) close/liquidate/partial-close: settle PnL + release margin (same
+     delta/flush pattern). (d) spot orders: lock on place, settle on fill.
 
 ## 🔒 Process gates (cannot be satisfied in-repo)
 
