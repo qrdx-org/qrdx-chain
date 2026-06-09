@@ -130,6 +130,13 @@ class ExchangeStateManager:
         # --- State snapshot for revert ---
         self._snapshot: Optional[Dict[str, Any]] = None
 
+        # --- Phase E: real-balance bridge (collateralization) ---
+        # Per-sender available QRDX balance, PRE-LOADED from account_state by the
+        # async block paths before the (sync) section is processed. None ⇒ not
+        # loaded (skip the check). These are inputs derived deterministically from
+        # account_state, not state-root state, so they are not snapshotted.
+        self._available_balances: Dict[str, Decimal] = {}
+
         # --- Counters ---
         self._total_swaps: int = 0
         self._total_orders: int = 0
@@ -477,6 +484,19 @@ class ExchangeStateManager:
         )
 
         self._total_positions += 1
+
+        # Phase E (OBSERVE-only): the position's margin must be backed by real
+        # collateral. Check the trader's pre-loaded account_state balance; only
+        # warn for now (the engine still opens uncollateralized positions) until
+        # the lock/debit path is wired + soaked.
+        avail = self.available_balance(tx.sender)
+        if avail is not None and avail < pos.margin:
+            logger.warning(
+                "[Phase E observe] open_position by %s: margin %s exceeds available "
+                "balance %s — would REJECT once collateral is enforced",
+                tx.sender[:20], pos.margin, avail,
+            )
+
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.OPEN_POSITION],
@@ -725,6 +745,21 @@ class ExchangeStateManager:
 
     def get_nonce(self, address: str) -> int:
         return self._nonces.get(address, 0)
+
+    # --- Phase E: real-balance bridge ---
+
+    def set_available_balance(self, address: str, qrdx: Decimal) -> None:
+        """Pre-load a sender's available QRDX balance (from account_state) for the
+        collateral check. Called by the async block paths before processing."""
+        self._available_balances[address] = Decimal(qrdx)
+
+    def available_balance(self, address: str) -> Optional[Decimal]:
+        """Pre-loaded available balance, or None if not loaded (check is skipped)."""
+        return self._available_balances.get(address)
+
+    def clear_available_balances(self) -> None:
+        """Reset the pre-loaded balances (call per block)."""
+        self._available_balances.clear()
 
     @property
     def pool_count(self) -> int:
