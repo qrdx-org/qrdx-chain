@@ -68,13 +68,20 @@
      so on the SQLite testnet the `epochs.finalized/justified` columns are never
      written; `get_pos_chain_head` always reports finalized_epoch=0.
 
-   **Build order:** (a) attestation broadcast (bind a propagate fn) + a receive
-   path (p2p method/REST) into peers' `AttestationPool`; (b) deterministic
-   inclusion + aggregation of attestations in blocks; (c) call `compute_epoch_state`
-   at epoch boundaries; (d) persist justified/finalized to SQLite (add a SQLite
-   writer alongside the PG one); (e) only then consume the finalized boundary in
-   fork-choice (bound reorg depth) and item 1 (E-D4 sync enforcement). Each link is
-   useless without the next, so this is a dedicated effort, not an increment.
+   **Status — links 1–4 BUILT (observe-only), link 5 remains.** Implemented via
+   the block-section pattern (attestations ride in block bodies; no separate
+   gossip transport): `attestation_block.py` codec, `attestation_votes` DB table +
+   SQLite epoch-finality writer, `finality.py` (record+verify votes; simplified
+   Casper FFG justified/finalized), wired into the proposer + all import paths.
+   **Verified:** integration 12/12, finality advances identically on all 4 nodes
+   (observe). `get_pos_chain_head` now reports a real finalized boundary.
+
+   **Remaining — link 5 (behaviour-changing, do observe→soak→enforce):** consume
+   the finalized boundary — (a) fork-choice refuses to reorg below the finalized
+   height (bounds reorg depth); (b) extend E-D4 enforcement (item 1) to the
+   bulk-sync path but only at/under the finalized boundary. This is the only part
+   that changes consensus behaviour, so gate + soak it like the other enforcement
+   flips.
 
 4. **Validator lifecycle convergence.** The `validators` table is genesis-seeded
    and consistent, but runtime validator set changes (activation/exit queues,
