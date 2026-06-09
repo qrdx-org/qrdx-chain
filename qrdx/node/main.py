@@ -988,6 +988,16 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
     """
     if not ex_section:
         return True, ""
+    from ..exchange.block_processor import decode_exchange_txs, preload_sender_balances
+    from ..exchange.state_manager import ExchangeStateManager
+    mgr = ExchangeStateManager.get_instance()
+    # Phase E: pre-load senders' real balances so the collateral check (observe)
+    # can read them during the sync section processing.
+    try:
+        await preload_sender_balances(db, decode_exchange_txs(ex_section), mgr)
+    except Exception as e:
+        logger.debug(f"exchange balance pre-load skipped at block {block_height}: {e}")
+
     if declared_root:
         from ..exchange.block_processor import apply_block_exchange_section
         return apply_block_exchange_section(
@@ -995,9 +1005,7 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
         )
     # Trust-replay (sync): adopt the canonical section's computed root.
     try:
-        from ..exchange.block_processor import decode_exchange_txs, process_exchange_transactions
-        from ..exchange.state_manager import ExchangeStateManager
-        mgr = ExchangeStateManager.get_instance()
+        from ..exchange.block_processor import process_exchange_transactions
         txs = decode_exchange_txs(ex_section)
         ok, err, _root = process_exchange_transactions(
             block_height, float(block_timestamp or 0), txs, mgr,

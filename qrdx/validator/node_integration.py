@@ -385,9 +385,12 @@ class ValidatorNode:
                         exchange_txs = []
                     if exchange_txs:
                         try:
-                            from ..exchange.block_processor import process_exchange_transactions
+                            from ..exchange.block_processor import process_exchange_transactions, preload_sender_balances
                             from ..exchange.state_manager import ExchangeStateManager
                             mgr = ExchangeStateManager.get_instance()
+                            # Phase E: pre-load senders' real balances for the
+                            # (observe) collateral check during processing.
+                            await preload_sender_balances(self.db, exchange_txs, mgr)
                             ok, err, root = process_exchange_transactions(
                                 next_height, float(block_timestamp), exchange_txs, mgr,
                             )

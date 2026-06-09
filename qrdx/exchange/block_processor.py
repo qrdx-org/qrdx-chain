@@ -34,6 +34,28 @@ logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
 
+
+async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:
+    """
+    Phase E: pre-load each exchange-tx sender's real account_state balance into the
+    state manager's balance bridge BEFORE the (sync) section is processed, so the
+    collateral check can read it. Called by the async block paths (proposer +
+    importer). Deterministic: ``db.get_address_balance`` reads the same
+    account_state every node has at this point in block application.
+    """
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    mgr.clear_available_balances()
+    seen = set()
+    for tx in txs or []:
+        sender = getattr(tx, "sender", None)
+        if not sender or sender in seen:
+            continue
+        seen.add(sender)
+        try:
+            mgr.set_available_balance(sender, await db.get_address_balance(sender))
+        except Exception as e:
+            logger.debug("preload_sender_balances: %s for %s", e, str(sender)[:20])
+
 # Funding settlement happens every epoch (32 slots × 12s = 384s ≈ 6.4 min)
 FUNDING_SETTLEMENT_INTERVAL = 32  # slots
 
