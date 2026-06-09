@@ -11,7 +11,7 @@ import os
 import tempfile
 
 from qrdx.database_sqlite import DatabaseSQLite
-from qrdx.validator.finality import update_finality
+from qrdx.validator.finality import update_finality, finalized_block_height
 
 
 async def _db_with_validators(n=3, stake="100000"):
@@ -86,6 +86,37 @@ async def test_consecutive_justification_finalizes_earlier_epoch():
         # Persisted to the epochs table.
         cur = await db.connection.execute("SELECT finalized FROM epochs WHERE epoch = 1")
         assert bool((await cur.fetchone())[0]) is True
+    finally:
+        await db.close(); os.remove(path)
+
+
+async def _add_block(db, h, bh):
+    await db.add_block(block_hash=bh, block_height=h, block_content="",
+                       validator_address="0xPQ" + "00" * 32, timestamp=1)
+
+
+async def test_finalized_block_height_requires_supermajority_on_the_block():
+    db, path, addrs = await _db_with_validators(4)
+    try:
+        await _add_block(db, 10, "blkA")
+        await _add_block(db, 11, "blkB")
+        # 3 of 4 (75%) attest specifically to blkA (height 10) → finalized.
+        for a in addrs[:3]:
+            await db.record_attestation_vote(a, target_epoch=1, source_epoch=0, slot=10, block_hash="blkA")
+        # Only 1 of 4 attests blkB → not finalized.
+        await db.record_attestation_vote(addrs[3], target_epoch=1, source_epoch=0, slot=11, block_hash="blkB")
+        assert await finalized_block_height(db) == 10
+    finally:
+        await db.close(); os.remove(path)
+
+
+async def test_finalized_block_height_none_below_threshold():
+    db, path, addrs = await _db_with_validators(4)
+    try:
+        await _add_block(db, 5, "blkX")
+        for a in addrs[:2]:  # 2 of 4 = 50%
+            await db.record_attestation_vote(a, target_epoch=1, source_epoch=0, slot=5, block_hash="blkX")
+        assert await finalized_block_height(db) == -1
     finally:
         await db.close(); os.remove(path)
 

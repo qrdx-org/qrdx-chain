@@ -125,6 +125,60 @@ async def update_finality(db) -> Dict[str, int]:
     return {"justified_epoch": max_j, "finalized_epoch": max_f}
 
 
+async def finalized_block_height(db) -> int:
+    """
+    Deepest block height that is irreversibly finalized: the greatest height H such
+    that validators holding ≥ 2/3 of total stake have each attested to a CANONICAL
+    block at height ≥ H. Reverting below H would require > 1/3 of stake to have
+    attested deeper than the canonical chain supports — i.e. to have equivocated
+    (slashable) — so it is safe for fork-choice to refuse reorgs below H (link 5).
+
+    Stake-weighted depth (not same-block supermajority): validators attest to their
+    own heads, which differ by propagation timing, so requiring ≥2/3 on the *same*
+    block_hash almost never holds. The 2/3-deep height is well-defined whenever
+    enough stake has attested to canonical blocks. Returns -1 if unreached.
+    OBSERVE foundation — only computes the boundary; nothing consumes it yet.
+    """
+    stakes, _keys = await _validator_stakes_and_keys(db)
+    total = sum(stakes.values()) if stakes else Decimal(0)
+    if total <= 0:
+        return -1
+
+    try:
+        cur = await db.connection.execute(
+            "SELECT validator_address, block_hash FROM attestation_votes")
+        rows = await cur.fetchall()
+    except Exception:
+        return -1
+
+    # Each validator's DEEPEST attested canonical height (skip non-canonical hashes).
+    height_cache: Dict[str, int] = {}
+    deepest: Dict[str, int] = {}
+    for addr, block_hash in rows:
+        if block_hash not in height_cache:
+            try:
+                c = await db.connection.execute(
+                    "SELECT block_height FROM blocks WHERE block_hash = ?", (block_hash,))
+                r = await c.fetchone()
+                height_cache[block_hash] = int(r[0]) if r and r[0] is not None else -1
+            except Exception:
+                height_cache[block_hash] = -1
+        h = height_cache[block_hash]
+        if h >= 0 and (addr not in deepest or h > deepest[addr]):
+            deepest[addr] = h
+    if not deepest:
+        return -1
+
+    # Walk validators from deepest height down, accumulating stake; the height at
+    # which cumulative stake first reaches ≥2/3 is the finalized boundary.
+    cumulative = Decimal(0)
+    for addr, h in sorted(deepest.items(), key=lambda kv: kv[1], reverse=True):
+        cumulative += stakes.get(addr, Decimal(0))
+        if (cumulative / total) >= ATTESTATION_THRESHOLD:
+            return h
+    return -1
+
+
 async def record_finality_from_block(db, block_content) -> Dict[str, int]:
     """
     Convenience entry point for the block produce/import paths: parse a block's

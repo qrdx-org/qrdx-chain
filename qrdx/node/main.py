@@ -2455,6 +2455,22 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
             except Exception:
                 pass
 
+    # Finality guard (link 5, OBSERVE-only): a reorg must never roll back below an
+    # irreversibly finalized block (>2/3 stake attested to it specifically). For
+    # now we only WARN — proving in soak that legitimate reorgs never cross
+    # finality — before flipping this to refuse the reorg.
+    try:
+        from ..validator.finality import finalized_block_height
+        _final_h = await finalized_block_height(db)
+        if _final_h >= 0 and last_common_block_id < _final_h:
+            logger.warning(
+                f"[REORG][finality] reorg would roll back to {last_common_block_id}, "
+                f"BELOW finalized height {_final_h} — this must not happen "
+                f"(would require >1/3 stake to equivocate)"
+            )
+    except Exception as e:
+        logger.debug(f"[REORG] finality guard check skipped: {e}")
+
     logger.info(f"[REORG] Rolling back local chain to block {last_common_block_id}.")
     await db.remove_blocks(last_common_block_id + 1)
 
