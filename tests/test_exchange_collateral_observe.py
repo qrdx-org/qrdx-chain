@@ -67,3 +67,48 @@ def test_no_check_when_balance_not_preloaded(caplog):
         res = mgr._op_open_position(_open_tx(sender, mid))
     assert res.success
     assert not any("Phase E observe" in r.message for r in caplog.records)
+
+
+def test_open_records_margin_as_balance_delta():
+    """The locked margin is recorded as a negative real-balance delta for the block."""
+    mgr, mid = _mgr_with_market()
+    sender = "0xPQ" + "44" * 16
+    mgr.set_available_balance(sender, Decimal("1000000"))
+    res = mgr._op_open_position(_open_tx(sender, mid))
+    margin = Decimal(res.data["margin"])
+    deltas = mgr.balance_deltas()
+    assert deltas[sender] == -margin
+    # Available balance is reduced in step so further ops see the lock.
+    assert mgr.available_balance(sender) == Decimal("1000000") - margin
+
+
+def test_deltas_reset_per_block():
+    mgr, mid = _mgr_with_market()
+    sender = "0xPQ" + "55" * 16
+    mgr.set_available_balance(sender, Decimal("1000000"))
+    mgr._op_open_position(_open_tx(sender, mid))
+    assert mgr.balance_deltas()  # non-empty
+    mgr.begin_block(2, 0.0)
+    assert mgr.balance_deltas() == {}  # reset
+
+
+def test_enforce_rejects_insufficient_collateral():
+    mgr, mid = _mgr_with_market()
+    sender = "0xPQ" + "66" * 16
+    mgr.enforce_collateral = True
+    mgr.set_available_balance(sender, Decimal("100"))  # margin ~3000
+    res = mgr._op_open_position(_open_tx(sender, mid))
+    assert not res.success
+    assert "insufficient collateral" in (res.error or "")
+    # No position opened, no delta recorded.
+    assert mgr.balance_deltas() == {}
+
+
+def test_enforce_allows_sufficient_collateral():
+    mgr, mid = _mgr_with_market()
+    sender = "0xPQ" + "77" * 16
+    mgr.enforce_collateral = True
+    mgr.set_available_balance(sender, Decimal("1000000"))
+    res = mgr._op_open_position(_open_tx(sender, mid))
+    assert res.success
+    assert mgr.balance_deltas()[sender] == -Decimal(res.data["margin"])

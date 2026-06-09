@@ -136,6 +136,16 @@ class ExchangeStateManager:
         # loaded (skip the check). These are inputs derived deterministically from
         # account_state, not state-root state, so they are not snapshotted.
         self._available_balances: Dict[str, Decimal] = {}
+        # Per-block net balance deltas (address -> QRDX; negative = debit) the
+        # block's exchange ops would apply to real account_state — e.g. margin
+        # locked on open. Deterministic (derived from the same txs + pre-loaded
+        # balances on every node). Reset per block; flushed to account_state
+        # atomically with the block by the async wrapper when collateral is
+        # enforced. Block-scoped, so not part of the exchange state root.
+        self._balance_deltas: Dict[str, Decimal] = {}
+        # Collateral enforcement gate (set by the node when enforcing): when True,
+        # open_position rejects if margin exceeds available balance.
+        self.enforce_collateral: bool = False
 
         # --- Counters ---
         self._total_swaps: int = 0
@@ -171,6 +181,7 @@ class ExchangeStateManager:
         self._block_exchange_txs = []
         self._block_results = []
         self._block_fees = ZERO
+        self._balance_deltas = {}  # Phase E: reset per-block balance deltas
 
         # Reset per-block rate limits on all order books
         for book in self._order_books.values():
@@ -475,27 +486,43 @@ class ExchangeStateManager:
         except ValueError:
             side = PerpSide[str(raw_side).upper()]
 
+        # Phase E: the position's margin must be backed by real collateral. We can
+        # only check/lock when balances are pre-loaded; compute the required margin
+        # the same way PerpEngine does so we can decide BEFORE opening.
+        avail = self.available_balance(tx.sender)
+        market = self.perp_engine.get_market(p["market_id"]) if hasattr(self.perp_engine, "get_market") else None
+        size = Decimal(str(p["size"]))
+        price = Decimal(str(p["price"]))
+        leverage = Decimal(str(p["leverage"]))
+        notional = size * price
+        req_margin = notional / leverage
+        if market is not None:
+            min_margin = notional * market.initial_margin_rate
+            if min_margin > req_margin:
+                req_margin = min_margin
+
+        if avail is not None and avail < req_margin:
+            if self.enforce_collateral:
+                return ExchangeExecResult(
+                    success=False,
+                    error=(f"insufficient collateral: need margin {req_margin}, "
+                           f"available {avail}"),
+                )
+            logger.warning(
+                "[Phase E observe] open_position by %s: margin %s exceeds available "
+                "balance %s — would REJECT once collateral is enforced",
+                tx.sender[:20], req_margin, avail,
+            )
+
         pos = self.perp_engine.open_position(
-            p["market_id"], tx.sender, side,
-            Decimal(str(p["size"])),
-            Decimal(str(p["leverage"])),
-            Decimal(str(p["price"])),
+            p["market_id"], tx.sender, side, size, leverage, price,
             reduce_only=p.get("reduce_only", False),
         )
 
         self._total_positions += 1
-
-        # Phase E (OBSERVE-only): the position's margin must be backed by real
-        # collateral. Check the trader's pre-loaded account_state balance; only
-        # warn for now (the engine still opens uncollateralized positions) until
-        # the lock/debit path is wired + soaked.
-        avail = self.available_balance(tx.sender)
-        if avail is not None and avail < pos.margin:
-            logger.warning(
-                "[Phase E observe] open_position by %s: margin %s exceeds available "
-                "balance %s — would REJECT once collateral is enforced",
-                tx.sender[:20], pos.margin, avail,
-            )
+        # Lock the margin as a real-balance debit for this block (flushed to
+        # account_state by the async wrapper when enforced).
+        self._record_balance_delta(tx.sender, -pos.margin)
 
         return ExchangeExecResult(
             success=True,
@@ -760,6 +787,18 @@ class ExchangeStateManager:
     def clear_available_balances(self) -> None:
         """Reset the pre-loaded balances (call per block)."""
         self._available_balances.clear()
+
+    def _record_balance_delta(self, address: str, delta_qrdx: Decimal) -> None:
+        """Accumulate a real-balance delta for this block (negative = debit) and
+        keep the in-memory available balance in step so later ops in the same
+        block see the locked amount."""
+        self._balance_deltas[address] = self._balance_deltas.get(address, ZERO) + delta_qrdx
+        if address in self._available_balances:
+            self._available_balances[address] = self._available_balances[address] + delta_qrdx
+
+    def balance_deltas(self) -> Dict[str, Decimal]:
+        """This block's accumulated per-address balance deltas (QRDX)."""
+        return dict(self._balance_deltas)
 
     @property
     def pool_count(self) -> int:
