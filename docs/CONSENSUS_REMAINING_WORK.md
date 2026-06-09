@@ -86,13 +86,14 @@
    deterministic across nodes (=25 vs tip 34), integration 12/12 with 0 spurious
    refusals.
 
-   **Link 5(b) — E-D4 sync-path enforcement at finalized boundary: remaining
-   (smaller refinement).** Extend E-D4 (item 1) to enforce the unified root on the
-   bulk-sync path for blocks at/under the finalized height (settled state). Note
-   the chicken-and-egg: during initial sync-from-genesis finality isn't yet
-   established (no attestations processed), so this mainly helps an already-running
-   node catching up a few blocks; sync already trust-replays correctly and the
-   live path already enforces, so this is lower priority.
+   **Link 5(b) — E-D4 on bulk-sync: ✅ DONE (observe-only, by design).** The
+   bulk-sync path now runs the unified-root check in OBSERVE mode (warn, never
+   reject); observed 0 mismatches on all nodes incl. the syncing full node (sync
+   state is consistent now that reorgs are ~0 + finality bounds them). Kept
+   observe-only deliberately: a node can reorg mid-catch-up and must not reject
+   canonical history, and the threat is already covered by live-path enforcement +
+   the finality reorg guard (refuses rewrites below finalized) + the sequential
+   height check. Full sync enforcement is unnecessary given those.
 
 4. **Validator lifecycle convergence.** The `validators` table is genesis-seeded
    and consistent, but runtime validator set changes (activation/exit queues,
