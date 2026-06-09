@@ -74,6 +74,11 @@ from qrdx.validator.block_verification import verify_pos_block_proposer, verify_
 # incl. sync) — so out-of-turn proposals are now rejected.
 _ENFORCE_PROPOSER_ELIGIBILITY = True
 
+# Finality reorg guard (link 5): refuse reorgs that would roll back below the
+# irreversibly finalized block height. Enabled after observe-mode showed
+# legitimate reorgs never cross finality (0 crossings; deterministic boundary).
+_ENFORCE_FINALITY_REORG_GUARD = True
+
 # Kademlia DHT integration
 from qrdx.p2p.node import Node as P2PNode, Address as P2PAddress, hex_to_node_id as p2p_hex_to_node_id
 from qrdx.p2p.routing import RoutingTable, KBucketEntry
@@ -2455,21 +2460,27 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
             except Exception:
                 pass
 
-    # Finality guard (link 5, OBSERVE-only): a reorg must never roll back below an
-    # irreversibly finalized block (>2/3 stake attested to it specifically). For
-    # now we only WARN — proving in soak that legitimate reorgs never cross
-    # finality — before flipping this to refuse the reorg.
-    try:
-        from ..validator.finality import finalized_block_height
-        _final_h = await finalized_block_height(db)
+    # Finality guard (link 5 — ENFORCED): a reorg must never roll back below an
+    # irreversibly finalized block (≥2/3 stake attested at least that deep).
+    # Refusing such a reorg bounds reorg depth to the finality lag and rejects any
+    # peer chain that conflicts with finality. Enabled after observe-mode soak
+    # showed legitimate reorgs never cross finality (0 crossings, deterministic
+    # boundary across nodes). Gated for revertibility.
+    if _ENFORCE_FINALITY_REORG_GUARD:
+        try:
+            from ..validator.finality import finalized_block_height
+            _final_h = await finalized_block_height(db)
+        except Exception as e:
+            logger.debug(f"[REORG] finality guard check skipped: {e}")
+            _final_h = -1
         if _final_h >= 0 and last_common_block_id < _final_h:
-            logger.warning(
-                f"[REORG][finality] reorg would roll back to {last_common_block_id}, "
-                f"BELOW finalized height {_final_h} — this must not happen "
-                f"(would require >1/3 stake to equivocate)"
+            logger.error(
+                f"[REORG][finality] REFUSING reorg: would roll back to "
+                f"{last_common_block_id}, below finalized height {_final_h}. The "
+                f"peer chain conflicts with finality (>1/3 stake would have "
+                f"equivocated) — keeping our finalized chain."
             )
-    except Exception as e:
-        logger.debug(f"[REORG] finality guard check skipped: {e}")
+            return None  # caller aborts the sync cycle; local finalized chain kept
 
     logger.info(f"[REORG] Rolling back local chain to block {last_common_block_id}.")
     await db.remove_blocks(last_common_block_id + 1)
