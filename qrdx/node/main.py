@@ -988,11 +988,15 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
     """
     if not ex_section:
         return True, ""
-    from ..exchange.block_processor import decode_exchange_txs, preload_sender_balances
+    from ..exchange.block_processor import (
+        decode_exchange_txs, preload_sender_balances, flush_exchange_balance_deltas,
+        ENFORCE_EXCHANGE_COLLATERAL,
+    )
     from ..exchange.state_manager import ExchangeStateManager
     mgr = ExchangeStateManager.get_instance()
-    # Phase E: pre-load senders' real balances so the collateral check (observe)
-    # can read them during the sync section processing.
+    mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
+    # Phase E: pre-load senders' real balances so the collateral check can read
+    # them during the sync section processing.
     try:
         await preload_sender_balances(db, decode_exchange_txs(ex_section), mgr)
     except Exception as e:
@@ -1000,9 +1004,13 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
 
     if declared_root:
         from ..exchange.block_processor import apply_block_exchange_section
-        return apply_block_exchange_section(
+        ok, err = apply_block_exchange_section(
             block_height, float(block_timestamp or 0), ex_section, declared_root,
         )
+        if ok:
+            # Phase E: flush margin debits to account_state (before E-D4 root check).
+            await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
+        return ok, err
     # Trust-replay (sync): adopt the canonical section's computed root.
     try:
         from ..exchange.block_processor import process_exchange_transactions
@@ -1012,6 +1020,7 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
         )
         if ok:
             mgr.commit_block()
+            await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
         else:
             logger.warning(f"Exchange section trust-replay failed at block {block_height}: {err}")
         return True, ""

@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
 
+# Phase E collateral rollout gate. False = OBSERVE (deltas computed/logged, not
+# applied; positions not rejected). True = ENFORCE (reject under-collateralized
+# opens + flush margin debits to account_state). Flip after observe-mode soak.
+ENFORCE_EXCHANGE_COLLATERAL = False
+
 
 async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:
     """
@@ -55,6 +60,33 @@ async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeState
             mgr.set_available_balance(sender, await db.get_address_balance(sender))
         except Exception as e:
             logger.debug("preload_sender_balances: %s for %s", e, str(sender)[:20])
+
+
+async def flush_exchange_balance_deltas(db, state_manager: Optional[ExchangeStateManager] = None,
+                                        enforce: bool = False) -> None:
+    """
+    Phase E: apply this block's accumulated exchange balance deltas (e.g. locked
+    margin) to real ``account_state``. Called by the async block paths AFTER the
+    section commits and BEFORE the unified state root is computed, so the root
+    reflects the moved funds on every node. Does not commit — the block's
+    ``add_block`` commits atomically.
+
+    ``enforce=False`` (default) is OBSERVE: deltas are computed/logged but NOT
+    applied, so there is no consensus impact during rollout.
+    """
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    deltas = mgr.balance_deltas()
+    if not deltas:
+        return
+    if not enforce:
+        logger.info("[Phase E observe] would apply %d balance delta(s): %s",
+                    len(deltas), {a[:12]: str(d) for a, d in deltas.items()})
+        return
+    for addr, delta in deltas.items():
+        try:
+            await db.apply_account_balance_delta(addr, delta)
+        except Exception as e:
+            logger.warning("flush_exchange_balance_deltas: %s for %s", e, str(addr)[:20])
 
 # Funding settlement happens every epoch (32 slots × 12s = 384s ≈ 6.4 min)
 FUNDING_SETTLEMENT_INTERVAL = 32  # slots

@@ -385,17 +385,25 @@ class ValidatorNode:
                         exchange_txs = []
                     if exchange_txs:
                         try:
-                            from ..exchange.block_processor import process_exchange_transactions, preload_sender_balances
+                            from ..exchange.block_processor import (
+                                process_exchange_transactions, preload_sender_balances,
+                                flush_exchange_balance_deltas, ENFORCE_EXCHANGE_COLLATERAL,
+                            )
                             from ..exchange.state_manager import ExchangeStateManager
                             mgr = ExchangeStateManager.get_instance()
+                            mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
                             # Phase E: pre-load senders' real balances for the
-                            # (observe) collateral check during processing.
+                            # collateral check during processing.
                             await preload_sender_balances(self.db, exchange_txs, mgr)
                             ok, err, root = process_exchange_transactions(
                                 next_height, float(block_timestamp), exchange_txs, mgr,
                             )
                             if ok:
                                 mgr.commit_block()
+                                # Phase E: flush margin debits to account_state
+                                # (before the unified root is computed below).
+                                await flush_exchange_balance_deltas(
+                                    self.db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
                                 exchange_state_root = root
                                 logger.info(
                                     f"📦 Including {len(exchange_txs)} exchange tx(s) in "

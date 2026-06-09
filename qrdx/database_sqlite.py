@@ -687,6 +687,42 @@ class DatabaseSQLite:
         await self.connection.execute("DELETE FROM contract_storage")
         await self.connection.commit()
 
+    async def apply_account_balance_delta(self, address: str, qrdx_delta) -> bool:
+        """
+        Phase E: apply a QRDX balance delta (negative = debit) to ``account_state``
+        in wei. Case-insensitive on address (matches ``get_address_balance``). A
+        debit clamps at 0 as a safety net (collateral enforcement should already
+        reject an over-debit). Returns True if a row was updated/created.
+
+        Does NOT commit — the caller commits atomically with the rest of the block.
+        """
+        from decimal import Decimal
+        wei_delta = int(Decimal(str(qrdx_delta)) * Decimal(10 ** 18))
+        if wei_delta == 0:
+            return False
+        cur = await self.connection.execute(
+            "SELECT address, balance FROM account_state WHERE LOWER(address) = LOWER(?)",
+            (address,),
+        )
+        row = await cur.fetchone()
+        if row:
+            new_bal = int(row[1] or 0) + wei_delta
+            if new_bal < 0:
+                new_bal = 0
+            await self.connection.execute(
+                "UPDATE account_state SET balance = ? WHERE LOWER(address) = LOWER(?)",
+                (str(new_bal), address),
+            )
+            return True
+        if wei_delta > 0:
+            await self.connection.execute(
+                "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, is_contract) "
+                "VALUES (?, ?, 0, 0, 0, 0)",
+                (address, str(wei_delta)),
+            )
+            return True
+        return False  # debit on a non-existent account — nothing to debit
+
     async def get_pending_transaction_count(self):
         """Get count of pending transactions"""
         cursor = await self.connection.execute("SELECT COUNT(*) FROM pending_transactions")
