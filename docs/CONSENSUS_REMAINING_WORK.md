@@ -143,15 +143,15 @@
    - ✅ Cross-node determinism of the enforce/flush path is proven
      (`test_exchange_collateral_determinism.py`): two nodes agree on the
      `account_state` debit AND the exchange root; rejection is deterministic.
-   - 🚧 **PREREQUISITE found — perps aren't reachable live.** There is NO consensus
-     path to create a perp market: no `CREATE_MARKET` op in `ExchangeOpType`, and
-     `PerpEngine()` starts with no markets. So `OPEN_POSITION` cannot succeed on the
-     live network (no market), and the collateral path can't be soaked live until a
-     market-creation path exists. Add a `CREATE_MARKET` exchange op (or governance/
-     genesis seeding), THEN the perp-collateral integration scenario (fund trader →
-     create market → OPEN_POSITION → assert debit + cross-node root consistency),
-     THEN flip `ENFORCE_EXCHANGE_COLLATERAL` + soak. (The margin mechanism itself is
-     built + determinism-verified; this is about making perps reachable to soak it.)
+   - ✅ **Perp reachability prerequisite DONE.** Added `ExchangeOpType.CREATE_MARKET`
+     (+ validation, gas, `_op_create_market`, tests) so a perp market can be created
+     via the consensus path; markets are in the exchange state root, so it flows
+     through the section pipeline. Perps (`OPEN_POSITION`) are now reachable.
+   - ⏳ **Remaining to flip enforce:** add the perp-collateral integration scenario
+     (fund a trader in `account_state` at genesis → CREATE_MARKET → OPEN_POSITION →
+     assert margin debit + cross-node `account_state`/unified-root consistency),
+     soak it, THEN flip `ENFORCE_EXCHANGE_COLLATERAL`. The mechanism + cross-node
+     determinism are already proven by unit tests; this is the live soak.
    - ⏳ (c) close/liquidate/partial-close: settle PnL + release margin (same
      delta/flush pattern). (d) **spot** orders/swaps move TOKEN balances, not QRDX
      margin — a different ledger from `account_state` (which is QRDX); unifying spot
