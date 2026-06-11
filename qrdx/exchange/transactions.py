@@ -58,6 +58,7 @@ class ExchangeOpType(IntEnum):
     PARTIAL_CLOSE = 9
     ADD_MARGIN = 10
     UPDATE_ORACLE = 11
+    CREATE_MARKET = 12
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +298,10 @@ class ExchangeTransaction:
                 if key not in p:
                     raise ValueError(f"UPDATE_ORACLE missing param: {key}")
 
+        elif op == ExchangeOpType.CREATE_MARKET:
+            if "base_token" not in p:
+                raise ValueError("CREATE_MARKET missing param: base_token")
+
     # -- Identification -----------------------------------------------------
 
     def is_exchange_transaction(self) -> bool:
@@ -324,4 +329,5 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.PARTIAL_CLOSE: 60_000,
     ExchangeOpType.ADD_MARGIN: 30_000,
     ExchangeOpType.UPDATE_ORACLE: 20_000,
+    ExchangeOpType.CREATE_MARKET: 100_000,
 }

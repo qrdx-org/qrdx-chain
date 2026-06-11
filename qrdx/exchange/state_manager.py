@@ -313,6 +313,7 @@ class ExchangeStateManager:
             ExchangeOpType.PARTIAL_CLOSE: self._op_partial_close,
             ExchangeOpType.ADD_MARGIN: self._op_add_margin,
             ExchangeOpType.UPDATE_ORACLE: self._op_update_oracle,
+            ExchangeOpType.CREATE_MARKET: self._op_create_market,
         }
         handler = handlers.get(tx.op_type)
         if handler is None:
@@ -477,6 +478,33 @@ class ExchangeStateManager:
                 )
 
         return ExchangeExecResult(success=False, error=f"Order {order_id} not found")
+
+    def _op_create_market(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Create a perpetual market so positions can be opened (consensus path).
+
+        Idempotent-on-conflict: a duplicate market_id is a non-critical failure
+        (the market already exists), not a block-breaking error.
+        """
+        p = tx.params
+        base = str(p["base_token"])
+        quote = str(p.get("quote_token", "QRDX"))
+        kwargs = {}
+        if "initial_margin_rate" in p:
+            kwargs["initial_margin_rate"] = Decimal(str(p["initial_margin_rate"]))
+        if "maintenance_margin_rate" in p:
+            kwargs["maintenance_margin_rate"] = Decimal(str(p["maintenance_margin_rate"]))
+        if "max_leverage" in p:
+            kwargs["max_leverage"] = Decimal(str(p["max_leverage"]))
+        try:
+            market = self.perp_engine.create_market(base, quote, **kwargs)
+        except ValueError as e:
+            return ExchangeExecResult(success=False, error=str(e))
+        self._total_positions += 0  # markets aren't positions
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.CREATE_MARKET],
+            data={"market_id": market.id},
+        )
 
     def _op_open_position(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
