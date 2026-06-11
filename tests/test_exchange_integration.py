@@ -867,7 +867,7 @@ class TestExchangeOpTypeEnum:
     """Tests for the operation type enum."""
 
     def test_all_types_defined(self):
-        assert len(ExchangeOpType) == 11
+        assert len(ExchangeOpType) == 12  # +CREATE_MARKET (Phase E)
 
     def test_values_unique(self):
         values = [e.value for e in ExchangeOpType]
