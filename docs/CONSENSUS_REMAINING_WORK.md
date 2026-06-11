@@ -140,14 +140,23 @@
      All gated by `block_processor.ENFORCE_EXCHANGE_COLLATERAL` (default False).
      Tests: `test_exchange_collateral_observe.py` (8), `test_account_balance_delta.py`
      (3). Integration 12/12 (flag off = behaviour-neutral).
-   - ⏳ **Before flipping `ENFORCE_EXCHANGE_COLLATERAL`:** the live integration (s12)
-     only creates trading PAIRS — it never opens a perp, so enforce isn't exercised
-     live. Add a perp-collateral integration scenario (fund a trader in
-     `account_state` at genesis → submit OPEN_POSITION → assert the margin debit +
-     cross-node `account_state`/unified-root consistency), then flip + soak. Don't
-     flip on the current integration alone (it would be unverified in production).
+   - ✅ Cross-node determinism of the enforce/flush path is proven
+     (`test_exchange_collateral_determinism.py`): two nodes agree on the
+     `account_state` debit AND the exchange root; rejection is deterministic.
+   - 🚧 **PREREQUISITE found — perps aren't reachable live.** There is NO consensus
+     path to create a perp market: no `CREATE_MARKET` op in `ExchangeOpType`, and
+     `PerpEngine()` starts with no markets. So `OPEN_POSITION` cannot succeed on the
+     live network (no market), and the collateral path can't be soaked live until a
+     market-creation path exists. Add a `CREATE_MARKET` exchange op (or governance/
+     genesis seeding), THEN the perp-collateral integration scenario (fund trader →
+     create market → OPEN_POSITION → assert debit + cross-node root consistency),
+     THEN flip `ENFORCE_EXCHANGE_COLLATERAL` + soak. (The margin mechanism itself is
+     built + determinism-verified; this is about making perps reachable to soak it.)
    - ⏳ (c) close/liquidate/partial-close: settle PnL + release margin (same
-     delta/flush pattern). (d) spot orders: lock on place, settle on fill.
+     delta/flush pattern). (d) **spot** orders/swaps move TOKEN balances, not QRDX
+     margin — a different ledger from `account_state` (which is QRDX); unifying spot
+     is a separate model (per-token balances) and is reachable live via the existing
+     pool/swap path, unlike perps.
 
 ## 🔒 Process gates (cannot be satisfied in-repo)
 
