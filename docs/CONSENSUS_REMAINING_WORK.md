@@ -149,21 +149,36 @@
      through the section pipeline. Perps (`OPEN_POSITION`) are now reachable.
    - ✅ s13 perp-collateral integration scenario built + soaked (CREATE_MARKET +
      OPEN_POSITION flow cross-node; convergence-polled; 13/13).
-   - 🚩 **CRUX (found flipping enforce in the s13 soak): the debit targets the
+   - 🚩 **CRUX (found flipping enforce in the s13 soak): the debit targeted the
      WRONG ledger.** Exchange txs are PQ-signed → traders are `0xPQ` addresses whose
-     funds live in the **UTXO ledger** (`unspent_outputs`), NOT `account_state`
-     (which holds only `0x`/EVM accounts). `get_address_balance` reads UTXO via
-     fallback so the collateral CHECK passes, but `flush_exchange_balance_deltas` →
-     `apply_account_balance_delta` only touch `account_state`, find no row for a PQ
-     trader, and debit NOTHING. So `ENFORCE_EXCHANGE_COLLATERAL=True` is a
-     deterministic NO-OP for real traders (13/13 but trader balance delta = 0) —
-     reverted to False. Mechanism is correct only for account_state-funded (0x).
-   - ⏳ **Real remaining work (b'):** debit the ledger that actually holds the
-     trader's funds — spend from the UTXO set for PQ traders (deterministically,
-     inside the exchange section), or unify the two ledgers so each address has one
-     balance — THEN flip enforce. (c) PnL settle on close/liquidate + release
-     margin. (d) **spot** orders/swaps move TOKEN balances (yet another ledger);
-     reachable live via the pool/swap path, separate model.
+     genesis funds lived in the **UTXO ledger** (`unspent_outputs`), NOT
+     `account_state`. The flush only touched `account_state`, found no row for a PQ
+     trader, and debited NOTHING — so `ENFORCE_EXCHANGE_COLLATERAL=True` was a
+     deterministic NO-OP for real traders.
+   - ✅ **RESOLVED (June 2026) — ledgers UNIFIED.** Genesis now funds `account_state`
+     for ALL addresses (PQ + 0x) in `genesis_init._create_genesis_outputs`, reorg-safe
+     via `seed_genesis_account_state` re-seed in `rebuild_account_state_from_chain`.
+     A PQ trader's collateral now lives in the same ledger the flush debits.
+     `ENFORCE_EXCHANGE_COLLATERAL = True`. Verified: trader = 497000 (500000 genesis −
+     3000 margin) on ALL 4 node DBs (no divergence), integration 13/13, 0 E-D4
+     rejections.
+   - ✅ **Consensus-divergence fix (same pass).** The margin flush ran only on the
+     proposer + bulk-sync paths; the live-broadcast paths (p2p `submitBlock`, REST
+     `submit_block`) called `apply_block_exchange_section` directly, bypassing
+     preload+flush → importers never debited → account_state split (proposer 497000,
+     others 500000), which E-D4 did not surface. Fixed by routing ALL import paths
+     through `_apply_exchange_section_on_import` (injected `exchange_apply_section`
+     hook on the p2p module, mirroring `evm_apply_section`; REST calls it directly).
+     Every path now preload→apply→flush BEFORE its E-D4 unified root is checked.
+   - ✅ **Reorg-safe.** `rebuild_exchange_state_from_chain(flush_to_account_state=True)`
+     re-applies each canonical block's collateral debits onto the freshly reseeded
+     account_state during a reorg rebuild (clear+reseed genesis FIRST, then exchange
+     re-flush on top). Default flag False keeps startup/restart unchanged (durable
+     ledger; flushing would double-debit). Verified: reseed → 500000, rebuild → 497000.
+   - ⏳ **Real remaining work:** (c) PnL settle on close/liquidate + release margin
+     (credit/debit `account_state` on `_op_close_position`/liquidation). (d) **spot**
+     orders/swaps move TOKEN balances (a separate token ledger), reachable live via
+     the pool/swap path. Same observe→soak→enforce discipline.
 
 ## 🔒 Process gates (cannot be satisfied in-repo)
 
