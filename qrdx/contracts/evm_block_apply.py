@@ -125,6 +125,17 @@ async def rebuild_account_state_from_chain(
     state_manager._dirty_storage.clear()
     state_manager._snapshots.clear()
 
+    # Phase E (unified ledger): re-seed the genesis allocations that form the
+    # durable BASE of account_state. They are not produced by any EVM section, so
+    # without this the clear above would wipe every genesis balance on a reorg.
+    try:
+        seeded = await db.seed_genesis_account_state()
+        await db.connection.commit()
+        if seeded:
+            logger.info("rebuild_account_state: re-seeded %d genesis account(s)", seeded)
+    except Exception as e:
+        logger.warning("rebuild_account_state: genesis re-seed failed: %s", e)
+
     try:
         tip = (await db.get_next_block_id()) - 1
     except Exception:

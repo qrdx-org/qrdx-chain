@@ -299,21 +299,27 @@ class GenesisInitializer:
         prefunded_accounts: Dict[str, Tuple[Decimal, str]],
     ):
         """
-        Create spendable outputs for genesis prefunded accounts.
-        
-        Each prefunded account receives a genesis coinbase transaction
-        that they can spend like any normal UTXO.
+        Fund genesis prefunded accounts in the UNIFIED ledger: ``account_state``
+        (balance in wei). This is the single source of truth for ALL addresses —
+        0x/EVM and 0xPQ alike — so EVM gas, exchange collateral, and balance reads
+        all operate on one ledger (previously 0xPQ funds went to the UTXO set and
+        0x funds were mirrored into account_state on demand, leaving the exchange
+        unable to debit PQ traders). The EVM native↔account sync becomes a no-op
+        because ``get_address_balance`` reads account_state first.
+
+        A genesis transaction record is still written for history/auditability; the
+        balance itself lives in account_state (no UTXO output → the UTXO ledger is
+        empty at genesis).
         """
         from ..crypto.hashing import sha256
-        
-        logger.info(f"Creating genesis outputs for {len(prefunded_accounts)} accounts")
-        
+        from decimal import Decimal as _D
+
+        logger.info(f"Funding {len(prefunded_accounts)} genesis accounts in account_state (unified ledger)")
+
         for idx, (address, (balance, label)) in enumerate(prefunded_accounts.items()):
-            # Create a deterministic transaction hash for genesis outputs
             tx_data = f"genesis:{idx}:{address}:{balance}".encode()
             tx_hash = sha256(tx_data)
-            
-            # Create genesis transaction
+
             tx_hex = json.dumps({
                 "type": "genesis_allocation",
                 "recipient": address,
@@ -321,29 +327,32 @@ class GenesisInitializer:
                 "label": label,
                 "index": idx,
             })
-            
-            # Insert transaction
+
+            # Genesis transaction record (history). No UTXO output — funds live in
+            # account_state below.
             await self.db.add_transaction(
                 block_hash=genesis_block_hash,
                 tx_hash=tx_hash,
                 tx_hex=tx_hex,
-                inputs_addresses=[],  # No inputs for genesis
+                inputs_addresses=[],
                 outputs_addresses=[address],
-                outputs_amounts=[int(balance * 1000000)],  # Convert to smallest unit
+                outputs_amounts=[int(balance * 1000000)],
                 fees=Decimal("0"),
             )
-            
-            # Create unspent output
-            await self.db.add_unspent_output(
-                tx_hash=tx_hash,
-                index=0,
-                address=address,
-                amount=int(balance * 1000000),  # Convert to smallest unit (microQRDX)
+
+            # Fund the unified ledger (account_state, wei).
+            wei = int(_D(str(balance)) * _D(10 ** 18))
+            await self.db.connection.execute(
+                "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, is_contract) "
+                "VALUES (?, ?, 0, 0, 0, 0) "
+                "ON CONFLICT(address) DO UPDATE SET balance = excluded.balance",
+                (address, str(wei)),
             )
-            
-            logger.debug(f"Created genesis output: {address[:20]}... = {balance} QRDX ({label})")
-        
-        logger.info(f"Created {len(prefunded_accounts)} genesis outputs")
+
+            logger.debug(f"Funded genesis account: {address[:20]}... = {balance} QRDX ({label})")
+
+        await self.db.connection.commit()
+        logger.info(f"Funded {len(prefunded_accounts)} genesis accounts in account_state")
     
     async def _init_system_wallets(
         self,

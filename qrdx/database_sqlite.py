@@ -723,6 +723,44 @@ class DatabaseSQLite:
             return True
         return False  # debit on a non-existent account — nothing to debit
 
+    async def seed_genesis_account_state(self) -> int:
+        """
+        Phase E (unified ledger): (re-)apply the genesis allocations to
+        ``account_state`` from block 0's ``genesis_allocation`` transactions. This
+        is the durable base of the single balance ledger; the EVM reorg rebuild
+        (`rebuild_account_state_from_chain`) clears account_state and replays only
+        EVM sections, so it must call this first to restore the genesis funding
+        that no EVM section produces. Idempotent (sets absolute balances). Returns
+        the number of accounts seeded. Does not commit.
+        """
+        import json as _json
+        from decimal import Decimal as _D
+        cur = await self.connection.execute(
+            "SELECT block_hash FROM blocks WHERE block_height = 0")
+        row = await cur.fetchone()
+        if not row:
+            return 0
+        genesis_hash = row[0]
+        cur = await self.connection.execute(
+            "SELECT tx_hex FROM transactions WHERE block_hash = ?", (genesis_hash,))
+        seeded = 0
+        for (tx_hex,) in await cur.fetchall():
+            try:
+                d = _json.loads(tx_hex)
+            except Exception:
+                continue
+            if d.get("type") != "genesis_allocation" or not d.get("recipient"):
+                continue
+            wei = int(_D(str(d["amount"])) * _D(10 ** 18))
+            await self.connection.execute(
+                "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, is_contract) "
+                "VALUES (?, ?, 0, 0, 0, 0) "
+                "ON CONFLICT(address) DO UPDATE SET balance = excluded.balance",
+                (d["recipient"], str(wei)),
+            )
+            seeded += 1
+        return seeded
+
     async def get_pending_transaction_count(self):
         """Get count of pending transactions"""
         cursor = await self.connection.execute("SELECT COUNT(*) FROM pending_transactions")
