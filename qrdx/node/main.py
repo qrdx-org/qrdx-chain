@@ -2828,6 +2828,7 @@ async def startup():
         sync_blockchain=_sync_blockchain,
         follow_up_sync=_follow_up_sync,
         evm_apply_section=_apply_evm_section_on_import,  # E-D3b importer hook
+        exchange_apply_section=_apply_exchange_section_on_import,  # D3/Phase E importer hook (flushes collateral)
         verify_unified_root=_verify_unified_state_root,  # E-D4 importer hook
         enforce_proposer_eligibility=_ENFORCE_PROPOSER_ELIGIBILITY,  # slot-eligibility gate
     )
@@ -3599,8 +3600,10 @@ async def submit_block(
             ex_section = body.get('exchange_transactions')
             if ex_section:
                 try:
-                    from ..exchange.block_processor import apply_block_exchange_section
-                    ok, verr = apply_block_exchange_section(
+                    # Phase E: route through the importer hook so the collateral
+                    # flush (margin debit → account_state) runs on this REST
+                    # live-broadcast path too, deterministically with proposer/sync.
+                    ok, verr = await _apply_exchange_section_on_import(
                         block_no, float(body.get('timestamp', 0) or 0),
                         ex_section, body.get('exchange_state_root'),
                     )

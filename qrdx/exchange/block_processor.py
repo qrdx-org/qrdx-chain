@@ -38,15 +38,16 @@ ZERO = Decimal("0")
 # applied; positions not rejected). True = ENFORCE (reject under-collateralized
 # opens + flush margin debits to account_state).
 #
-# KEPT OFF — dual-ledger gap found in the s13 soak: exchange txs are PQ-signed, so
-# traders are 0xPQ addresses whose funds live in the UTXO ledger (unspent_outputs),
-# NOT account_state (which holds only 0x/EVM accounts). The flush targets
-# account_state, so for a PQ trader it finds no row and debits NOTHING — enforce is
-# a deterministic no-op for the actual traders (13/13 but balance delta = 0). True
-# collateralization must debit the ledger that holds the trader's funds (UTXO for
-# PQ traders), or unify the ledgers. The mechanism here is correct for
-# account_state-funded (0x) traders; the UTXO path is the remaining Phase E work.
-ENFORCE_EXCHANGE_COLLATERAL = False
+# ENABLED after the ledger unification: genesis now funds account_state for ALL
+# addresses (PQ and 0x alike — see genesis_init._create_genesis_outputs), so a PQ
+# trader's collateral lives in the same ledger the flush debits. The earlier
+# dual-ledger no-op (flush found no account_state row for a PQ trader → debited
+# nothing) is resolved. The flush is now wired into EVERY import path — proposer,
+# bulk-sync, AND the live-broadcast paths (p2p submitBlock / REST submit_block via
+# _apply_exchange_section_on_import) — so the margin debit lands in account_state
+# before each node computes/verifies its E-D4 unified root, keeping account_state
+# convergent across nodes (a flush on only the proposer/sync paths would diverge).
+ENFORCE_EXCHANGE_COLLATERAL = True
 
 
 async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:

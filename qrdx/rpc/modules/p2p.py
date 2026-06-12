@@ -54,6 +54,7 @@ class P2PModule(RPCModule):
         self._sync_blockchain = None
         self._follow_up_sync = None
         self._evm_apply_section = None         # E-D3b importer hook (main._apply_evm_section_on_import)
+        self._exchange_apply_section = None    # D3/Phase E importer hook (main._apply_exchange_section_on_import)
         self._verify_unified_root = None       # E-D4 importer hook (main._verify_unified_state_root)
         self._enforce_proposer_eligibility = False  # slot-eligibility gate (observe-first)
 
@@ -73,6 +74,7 @@ class P2PModule(RPCModule):
         sync_blockchain,
         follow_up_sync=None,
         evm_apply_section=None,
+        exchange_apply_section=None,
         verify_unified_root=None,
         enforce_proposer_eligibility=False,
     ):
@@ -87,6 +89,7 @@ class P2PModule(RPCModule):
         self._sync_blockchain = sync_blockchain
         self._follow_up_sync = follow_up_sync
         self._evm_apply_section = evm_apply_section
+        self._exchange_apply_section = exchange_apply_section
         self._verify_unified_root = verify_unified_root
         self._enforce_proposer_eligibility = enforce_proposer_eligibility
 
@@ -191,11 +194,21 @@ class P2PModule(RPCModule):
                 ex_section = block_data.get('exchange_transactions')
                 if ex_section:
                     try:
-                        from ...exchange.block_processor import apply_block_exchange_section
-                        ok_ex, verr = apply_block_exchange_section(
-                            block_no, float(block_data.get('timestamp', 0) or 0),
-                            ex_section, block_data.get('exchange_state_root'),
-                        )
+                        if self._exchange_apply_section is not None:
+                            # Phase E: route through the importer hook so the
+                            # collateral flush (margin debit → account_state) runs
+                            # on this live-broadcast path too — otherwise only the
+                            # proposer/sync paths debit and account_state diverges.
+                            ok_ex, verr = await self._exchange_apply_section(
+                                block_no, float(block_data.get('timestamp', 0) or 0),
+                                ex_section, block_data.get('exchange_state_root'),
+                            )
+                        else:
+                            from ...exchange.block_processor import apply_block_exchange_section
+                            ok_ex, verr = apply_block_exchange_section(
+                                block_no, float(block_data.get('timestamp', 0) or 0),
+                                ex_section, block_data.get('exchange_state_root'),
+                            )
                     except Exception as e:
                         ok_ex, verr = False, f"exchange validation error: {e}"
                     if not ok_ex:
