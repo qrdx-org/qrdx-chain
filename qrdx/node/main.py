@@ -2511,25 +2511,36 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
     logger.info(f"[REORG] Rolling back local chain to block {last_common_block_id}.")
     await db.remove_blocks(last_common_block_id + 1)
 
-    # D3 reorg safety: rebuild exchange state to the new canonical tip so the
-    # orphaned blocks' exchange effects are dropped; the subsequent re-sync
-    # re-applies the canonical sections.
-    try:
-        from ..exchange.block_processor import rebuild_exchange_state_from_chain
-        await rebuild_exchange_state_from_chain(db)
-    except Exception as e:
-        logger.error(f"[REORG] Exchange state rebuild failed: {e}")
-
     # E-D3b reorg safety: account_state is durable, so a rolled-back block's
     # account changes remain committed — rebuild EVM/account state to the new
-    # canonical tip (clears + replays canonical EVM sections). Incoming canonical
-    # blocks then re-apply normally as they sync in.
+    # canonical tip (clears account_state, reseeds genesis, replays canonical EVM
+    # sections). This runs FIRST so the durable ledger is reset to a clean
+    # genesis+EVM base BEFORE the exchange rebuild below re-applies its collateral
+    # debits on top (a flush before this clear would be wiped). When EVM is
+    # disabled, clear+reseed genesis directly so the same clean base exists.
     if EVM_STATE_MANAGER is not None:
         try:
             from ..contracts.evm_block_apply import rebuild_account_state_from_chain
             await rebuild_account_state_from_chain(db, EVM_STATE_MANAGER, _evm_defer_execute())
         except Exception as e:
             logger.error(f"[REORG] EVM/account state rebuild failed: {e}")
+    else:
+        try:
+            await db.clear_account_state()
+            await db.seed_genesis_account_state()
+            await db.connection.commit()
+        except Exception as e:
+            logger.error(f"[REORG] account_state genesis reseed failed: {e}")
+
+    # D3 + Phase E reorg safety: rebuild exchange state to the new canonical tip so
+    # the orphaned blocks' exchange effects are dropped, AND re-flush each canonical
+    # block's collateral debits onto the freshly reseeded account_state ledger (it
+    # was just cleared above, so the live debits are gone and must be replayed).
+    try:
+        from ..exchange.block_processor import rebuild_exchange_state_from_chain
+        await rebuild_exchange_state_from_chain(db, flush_to_account_state=True)
+    except Exception as e:
+        logger.error(f"[REORG] Exchange state rebuild failed: {e}")
 
     logger.info(f"[REORG] Re-adding {len(orphaned_txs)} orphaned transactions to the pending pool.")
     for tx in orphaned_txs:

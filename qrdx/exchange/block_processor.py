@@ -239,7 +239,11 @@ def validate_exchange_state_root(
     return True, ""
 
 
-async def rebuild_exchange_state_from_chain(db, state_manager: Optional[ExchangeStateManager] = None) -> str:
+async def rebuild_exchange_state_from_chain(
+    db,
+    state_manager: Optional[ExchangeStateManager] = None,
+    flush_to_account_state: bool = False,
+) -> str:
     """
     Reconstruct exchange state by replaying every canonical block's exchange
     section in height order (Phase D3 — reorg safety + restart durability).
@@ -254,6 +258,17 @@ async def rebuild_exchange_state_from_chain(db, state_manager: Optional[Exchange
     Resets the singleton (when ``state_manager`` is None) and replays from
     genesis. O(total exchange txs); checkpointing is a future optimization.
 
+    ``flush_to_account_state`` (Phase E reorg safety): when True, each block's
+    accumulated collateral deltas (e.g. locked margin) are also flushed to the
+    durable ``account_state`` ledger, mirroring live import. This MUST be used
+    only when ``account_state`` has just been cleared + reseeded to genesis (the
+    reorg path), because the durable ledger already holds these debits on a plain
+    restart — flushing then would double-debit. ``begin_block`` (inside
+    ``process_exchange_transactions``) resets the per-block deltas, so each flush
+    applies exactly that block's debits; the per-block flush is uncommitted but
+    same-connection-visible, so a later block's collateral preload reads the
+    correct running balance. A single commit is issued at the end.
+
     Returns the resulting exchange_state_root.
     """
     if state_manager is None:
@@ -262,6 +277,9 @@ async def rebuild_exchange_state_from_chain(db, state_manager: Optional[Exchange
     else:
         mgr = state_manager
 
+    if flush_to_account_state:
+        mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
+
     try:
         tip = (await db.get_next_block_id()) - 1
     except Exception as e:
@@ -269,6 +287,7 @@ async def rebuild_exchange_state_from_chain(db, state_manager: Optional[Exchange
         return mgr.compute_state_root()
 
     applied = 0
+    flushed = 0
     for height in range(0, tip + 1):
         try:
             block = await db.get_block_by_id(height)
@@ -287,15 +306,36 @@ async def rebuild_exchange_state_from_chain(db, state_manager: Optional[Exchange
             continue
         txs = decode_exchange_txs(section)
         ts = float(block.get("timestamp", 0) or 0)
+        # Phase E reorg safety: preload senders' (running) account_state balances
+        # so the per-block collateral check reads the same view a live importer
+        # would at this height. Must run BEFORE process_exchange_transactions.
+        if flush_to_account_state:
+            try:
+                await preload_sender_balances(db, txs, mgr)
+            except Exception as e:
+                logger.debug("rebuild_exchange_state preload skipped at %d: %s", height, e)
         ok, err, _root = process_exchange_transactions(height, ts, txs, mgr)
         if ok:
             mgr.commit_block()
             applied += 1
+            if flush_to_account_state:
+                # Re-apply this block's collateral debits to the freshly reseeded
+                # account_state ledger (enforce mode applies; observe just logs).
+                await flush_exchange_balance_deltas(
+                    db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
+                flushed += 1
         else:
             logger.error("rebuild_exchange_state: block %d section failed: %s", height, err)
 
+    if flush_to_account_state and flushed:
+        try:
+            await db.connection.commit()
+        except Exception as e:
+            logger.warning("rebuild_exchange_state: account_state flush commit failed: %s", e)
+
     if applied:
-        logger.info("Rebuilt exchange state from %d canonical block section(s)", applied)
+        logger.info("Rebuilt exchange state from %d canonical block section(s)%s",
+                    applied, f"; re-flushed {flushed} to account_state" if flushed else "")
     return mgr.compute_state_root()
 
 
