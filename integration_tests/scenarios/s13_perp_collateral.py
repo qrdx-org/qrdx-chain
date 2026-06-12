@@ -72,9 +72,20 @@ class S13PerpCollateral(Scenario):
             tx.signature = key.sign(tx.signing_bytes()).to_bytes()
             return tx.to_hex()
 
+        async def _balances():
+            out = {}
+            for url in node_urls:
+                try:
+                    async with NodeRPCClient(url) as c:
+                        out[url] = await c.get_balance(sender)
+                except Exception:
+                    pass
+            return out
+
         base = await self._roots(node_urls)
         base_root = next(iter({v["exchange_state_root"] for v in base.values()}), None)
         self.check_not_none(base_root, "Baseline exchange root readable")
+        bal_before = await _balances()
 
         # 1. CREATE_MARKET (nonce 0).
         create = ExchangeTransaction(
@@ -98,14 +109,39 @@ class S13PerpCollateral(Scenario):
             root_after_market or base_root, "OPEN_POSITION")
         self.check_not_none(root_after_open, "Position opened (proposer root advanced)")
 
-        # 3. Cross-node determinism: any node that advanced past baseline must agree
-        #    with the proposer's final root (D3 determinism, now incl. perps).
-        final = await self._roots(node_urls)
-        advanced = {v["exchange_state_root"] for v in final.values()
-                    if v["exchange_state_root"] != base_root}
-        self.check(len(advanced) <= 1,
-                   f"All advanced nodes share one deterministic root ({len(advanced)} distinct)")
-        n_on_final = sum(1 for v in final.values()
-                         if v.get("exchange_state_root") == root_after_open)
+        # 3. Cross-node determinism: nodes CONVERGE on the proposer's final root.
+        #    Poll for convergence (nodes import the position block at slightly
+        #    different times); a quorum on one root proves D3 determinism for perps
+        #    without failing on transient propagation lag (a node still on the
+        #    market-block root, not yet the position-block root).
+        n_on_final = 0
+        final = {}
+        for _ in range(10):  # ~20s
+            final = await self._roots(node_urls)
+            n_on_final = sum(1 for v in final.values()
+                             if v.get("exchange_state_root") == root_after_open)
+            if n_on_final >= max(2, len(final) - 1):
+                break
+            await asyncio.sleep(2)
         self._log.info("Cross-node perp convergence: %d/%d nodes on the final root",
                        n_on_final, len(final))
+        self.check(n_on_final >= max(2, len(final) - 1),
+                   f"Nodes converge on the proposer's deterministic perp root "
+                   f"({n_on_final}/{len(final)})")
+
+        # 4. Consensus invariant (holds in BOTH observe + enforce modes): after the
+        #    position, the trader's balance must be IDENTICAL across all nodes. Under
+        #    ENFORCE_EXCHANGE_COLLATERAL the margin is debited from account_state; the
+        #    key safety property is that every node applies the SAME result.
+        bal_after = await _balances()
+        if bal_after:
+            uniq = set(bal_after.values())
+            before = next(iter(set(bal_before.values())), None) if bal_before else None
+            after = next(iter(uniq), None)
+            self._log.info("Trader balance: before=%s after=%s (delta=%s) across %d nodes",
+                           before, after,
+                           (after - before) if (before is not None and after is not None) else "?",
+                           len(bal_after))
+            self.check(len(uniq) == 1,
+                       f"Trader account balance consistent across nodes after open "
+                       f"(unique={len(uniq)})")

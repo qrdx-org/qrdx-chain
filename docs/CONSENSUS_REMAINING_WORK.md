@@ -147,16 +147,23 @@
      (+ validation, gas, `_op_create_market`, tests) so a perp market can be created
      via the consensus path; markets are in the exchange state root, so it flows
      through the section pipeline. Perps (`OPEN_POSITION`) are now reachable.
-   - ⏳ **Remaining to flip enforce:** add the perp-collateral integration scenario
-     (fund a trader in `account_state` at genesis → CREATE_MARKET → OPEN_POSITION →
-     assert margin debit + cross-node `account_state`/unified-root consistency),
-     soak it, THEN flip `ENFORCE_EXCHANGE_COLLATERAL`. The mechanism + cross-node
-     determinism are already proven by unit tests; this is the live soak.
-   - ⏳ (c) close/liquidate/partial-close: settle PnL + release margin (same
-     delta/flush pattern). (d) **spot** orders/swaps move TOKEN balances, not QRDX
-     margin — a different ledger from `account_state` (which is QRDX); unifying spot
-     is a separate model (per-token balances) and is reachable live via the existing
-     pool/swap path, unlike perps.
+   - ✅ s13 perp-collateral integration scenario built + soaked (CREATE_MARKET +
+     OPEN_POSITION flow cross-node; convergence-polled; 13/13).
+   - 🚩 **CRUX (found flipping enforce in the s13 soak): the debit targets the
+     WRONG ledger.** Exchange txs are PQ-signed → traders are `0xPQ` addresses whose
+     funds live in the **UTXO ledger** (`unspent_outputs`), NOT `account_state`
+     (which holds only `0x`/EVM accounts). `get_address_balance` reads UTXO via
+     fallback so the collateral CHECK passes, but `flush_exchange_balance_deltas` →
+     `apply_account_balance_delta` only touch `account_state`, find no row for a PQ
+     trader, and debit NOTHING. So `ENFORCE_EXCHANGE_COLLATERAL=True` is a
+     deterministic NO-OP for real traders (13/13 but trader balance delta = 0) —
+     reverted to False. Mechanism is correct only for account_state-funded (0x).
+   - ⏳ **Real remaining work (b'):** debit the ledger that actually holds the
+     trader's funds — spend from the UTXO set for PQ traders (deterministically,
+     inside the exchange section), or unify the two ledgers so each address has one
+     balance — THEN flip enforce. (c) PnL settle on close/liquidate + release
+     margin. (d) **spot** orders/swaps move TOKEN balances (yet another ledger);
+     reachable live via the pool/swap path, separate model.
 
 ## 🔒 Process gates (cannot be satisfied in-repo)
 

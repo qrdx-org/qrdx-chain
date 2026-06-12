@@ -36,7 +36,16 @@ ZERO = Decimal("0")
 
 # Phase E collateral rollout gate. False = OBSERVE (deltas computed/logged, not
 # applied; positions not rejected). True = ENFORCE (reject under-collateralized
-# opens + flush margin debits to account_state). Flip after observe-mode soak.
+# opens + flush margin debits to account_state).
+#
+# KEPT OFF — dual-ledger gap found in the s13 soak: exchange txs are PQ-signed, so
+# traders are 0xPQ addresses whose funds live in the UTXO ledger (unspent_outputs),
+# NOT account_state (which holds only 0x/EVM accounts). The flush targets
+# account_state, so for a PQ trader it finds no row and debits NOTHING — enforce is
+# a deterministic no-op for the actual traders (13/13 but balance delta = 0). True
+# collateralization must debit the ledger that holds the trader's funds (UTXO for
+# PQ traders), or unify the ledgers. The mechanism here is correct for
+# account_state-funded (0x) traders; the UTXO path is the remaining Phase E work.
 ENFORCE_EXCHANGE_COLLATERAL = False
 
 
