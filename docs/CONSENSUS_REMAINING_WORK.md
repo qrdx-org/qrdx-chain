@@ -175,10 +175,21 @@
      account_state during a reorg rebuild (clear+reseed genesis FIRST, then exchange
      re-flush on top). Default flag False keeps startup/restart unchanged (durable
      ledger; flushing would double-debit). Verified: reseed → 500000, rebuild → 497000.
-   - ⏳ **Real remaining work:** (c) PnL settle on close/liquidate + release margin
-     (credit/debit `account_state` on `_op_close_position`/liquidation). (d) **spot**
-     orders/swaps move TOKEN balances (a separate token ledger), reachable live via
-     the pool/swap path. Same observe→soak→enforce discipline.
+   - ✅ **(c) PnL settlement DONE (June 2026).** `_op_close_position` credits
+     `max(0, margin + pnl)`; `_op_partial_close` credits `max(0, margin_released +
+     pnl)`; liquidation (`check_liquidation` → block-boundary `_check_liquidations`)
+     credits `LiquidationResult.margin_returned = max(0, (margin − penalty) + pnl)` to
+     the owner — all via the same `_record_balance_delta` → flush path as margin (so
+     convergent + reorg-safe). `_settle_close` centralizes the clamp-at-zero rule.
+     With default rates (penalty 2.5% == maintenance 2.5%) the liquidation residual is
+     always 0; a positive residual needs maintenance > penalty. Also fixed
+     `/get_address_info` to report `get_address_balance` (account_state-first) — s13
+     now shows the trader 500000 → 497000 (−3000 margin) live. Tests:
+     `test_exchange_collateral_observe.py` (+5 close), `test_exchange_liquidation_settlement.py`
+     (4); exchange suite 500 passed, integration 13/13.
+   - ⏳ **Remaining (d): spot.** Spot orders/swaps move TOKEN balances (a separate
+     token ledger under `tokens/`, not the `account_state` QRDX ledger), reachable
+     live via the pool/swap path. Same observe→soak→enforce discipline.
 
 ## 🔒 Process gates (cannot be satisfied in-repo)
 
