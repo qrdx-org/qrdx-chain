@@ -112,3 +112,83 @@ def test_enforce_allows_sufficient_collateral():
     res = mgr._op_open_position(_open_tx(sender, mid))
     assert res.success
     assert mgr.balance_deltas()[sender] == -Decimal(res.data["margin"])
+
+
+# --- Phase E (c): PnL settlement + margin release on close ------------------
+
+def _close_tx(sender, position_id, price="30000"):
+    return SimpleNamespace(sender=sender, params={
+        "position_id": position_id, "price": price,
+    })
+
+
+def _partial_close_tx(sender, position_id, close_size, price="30000"):
+    return SimpleNamespace(sender=sender, params={
+        "position_id": position_id, "close_size": close_size, "price": price,
+    })
+
+
+def _open_and_get(mgr, mid, sender, **kw):
+    mgr.set_available_balance(sender, Decimal("1000000"))
+    res = mgr._op_open_position(_open_tx(sender, mid, **kw))
+    return res.data["position_id"], Decimal(res.data["margin"])
+
+
+def test_close_at_breakeven_releases_full_margin():
+    """Closing at entry price returns exactly the locked margin (net delta 0)."""
+    mgr, mid = _mgr_with_market()
+    sender = "0xPQ" + "88" * 16
+    pid, margin = _open_and_get(mgr, mid, sender)  # entry 30000
+    res = mgr._op_close_position(_close_tx(sender, pid, price="30000"))
+    assert res.success
+    assert Decimal(res.data["pnl"]) == Decimal("0")
+    assert Decimal(res.data["settled"]) == margin
+    # Net over open(-margin) + close(+margin) == 0.
+    assert mgr.balance_deltas()[sender] == Decimal("0")
+
+
+def test_close_at_profit_settles_margin_plus_pnl():
+    mgr, mid = _mgr_with_market()
+    sender = "0xPQ" + "99" * 16
+    pid, margin = _open_and_get(mgr, mid, sender, size="1", price="30000")
+    # long 1 @ 30000 closed at 31000 → pnl +1000.
+    res = mgr._op_close_position(_close_tx(sender, pid, price="31000"))
+    assert Decimal(res.data["pnl"]) == Decimal("1000")
+    assert Decimal(res.data["settled"]) == margin + Decimal("1000")
+    assert mgr.balance_deltas()[sender] == Decimal("1000")  # net = +pnl
+
+
+def test_close_at_loss_within_margin():
+    mgr, mid = _mgr_with_market()
+    sender = "0xPQ" + "ab" * 16
+    pid, margin = _open_and_get(mgr, mid, sender, size="1", price="30000")
+    # long closed at 29000 → pnl -1000 (within margin).
+    res = mgr._op_close_position(_close_tx(sender, pid, price="29000"))
+    assert Decimal(res.data["pnl"]) == Decimal("-1000")
+    assert Decimal(res.data["settled"]) == margin - Decimal("1000")
+    assert mgr.balance_deltas()[sender] == Decimal("-1000")  # net = pnl
+
+
+def test_close_at_loss_exceeding_margin_clamps_at_zero():
+    """A loss deeper than the locked margin never debits beyond it (clamp at 0)."""
+    mgr, mid = _mgr_with_market()
+    sender = "0xPQ" + "cd" * 16
+    pid, margin = _open_and_get(mgr, mid, sender, size="1", price="30000")
+    # long closed at 26000 → pnl -4000 < margin(~3000) → settle clamped to 0.
+    res = mgr._op_close_position(_close_tx(sender, pid, price="26000"))
+    assert Decimal(res.data["settled"]) == Decimal("0")
+    # Net = -margin (trader forfeits the full locked margin, no more).
+    assert mgr.balance_deltas()[sender] == -margin
+
+
+def test_partial_close_releases_proportional_margin_plus_pnl():
+    mgr, mid = _mgr_with_market()
+    sender = "0xPQ" + "ef" * 16
+    pid, margin = _open_and_get(mgr, mid, sender, size="2", price="30000")
+    # Close half (1 of 2) at 31000 → pnl +1000 on the closed half, half margin freed.
+    res = mgr._op_partial_close(_partial_close_tx(sender, pid, close_size="1", price="31000"))
+    assert Decimal(res.data["pnl"]) == Decimal("1000")
+    expected = margin / 2 + Decimal("1000")
+    assert Decimal(res.data["settled"]) == expected
+    # Net = +(margin/2 freed) + 1000 - margin(open) = 1000 - margin/2.
+    assert mgr.balance_deltas()[sender] == Decimal("1000") - margin / 2

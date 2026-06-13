@@ -560,27 +560,59 @@ class ExchangeStateManager:
 
     def _op_close_position(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
+        # Phase E: capture the (funding-adjusted) locked margin + owner BEFORE the
+        # close so we can release it and settle realized PnL to the real balance.
+        pos = self.perp_engine.get_position(p["position_id"])
+        margin_before = pos.margin if pos is not None else ZERO
+        owner = pos.owner if pos is not None else tx.sender
         pnl = self.perp_engine.close_position(
             p["position_id"], Decimal(str(p["price"])),
         )
+        # Release the locked margin + realized PnL back to the owner. Clamp at 0 so
+        # a close never returns less than nothing (debiting beyond the locked
+        # margin is the liquidation path, not a voluntary close).
+        settled = self._settle_close(owner, margin_before, pnl)
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.CLOSE_POSITION],
-            data={"pnl": str(pnl)},
+            data={"pnl": str(pnl), "settled": str(settled)},
         )
 
     def _op_partial_close(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
+        pos = self.perp_engine.get_position(p["position_id"])
+        margin_before = pos.margin if pos is not None else ZERO
+        owner = pos.owner if pos is not None else tx.sender
         pnl = self.perp_engine.partial_close(
             p["position_id"],
             Decimal(str(p["close_size"])),
             Decimal(str(p["price"])),
         )
+        # Margin released = the proportional margin freed by this partial close. If
+        # the close_size covered the whole position the engine delegates to a full
+        # close (margin untouched, position now CLOSED) → release all of it.
+        if pos is not None and pos.is_open:
+            margin_released = margin_before - pos.margin
+        else:
+            margin_released = margin_before
+        settled = self._settle_close(owner, margin_released, pnl)
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PARTIAL_CLOSE],
-            data={"pnl": str(pnl)},
+            data={"pnl": str(pnl), "settled": str(settled)},
         )
+
+    def _settle_close(self, owner: str, margin_released: Decimal, pnl: Decimal) -> Decimal:
+        """Phase E: credit (released margin + realized PnL) back to ``owner``'s real
+        balance, clamped at >= 0. Records a positive balance delta flushed to
+        account_state with the block (mirror of the ``-margin`` debit on open).
+        Returns the settled amount."""
+        settled = margin_released + pnl
+        if settled < ZERO:
+            settled = ZERO
+        if settled > ZERO:
+            self._record_balance_delta(owner, settled)
+        return settled
 
     def _op_add_margin(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
