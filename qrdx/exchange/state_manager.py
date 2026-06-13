@@ -147,6 +147,23 @@ class ExchangeStateManager:
         # open_position rejects if margin exceeds available balance.
         self.enforce_collateral: bool = False
 
+        # --- Phase E (spot): real token-balance bridge (settlement) ---
+        # Per-(holder, token_address) available token balance, PRE-LOADED from the
+        # token_balances ledger by the async block paths before the (sync) section
+        # is processed. Mirrors the QRDX bridge above but for QRC-20 holdings.
+        # None ⇒ not loaded (skip the sufficiency check).
+        self._available_token_balances: Dict[Tuple[str, str], Decimal] = {}
+        # Per-block net token deltas ((holder, token) -> amount; negative = debit)
+        # the block's spot ops (swap / liquidity) would apply to the real
+        # token_balances ledger. Deterministic (same txs + pre-loaded balances on
+        # every node), reset per block, flushed atomically with the block by the
+        # async wrapper when spot settlement is enforced. Block-scoped, so not part
+        # of the exchange state root.
+        self._token_balance_deltas: Dict[Tuple[str, str], Decimal] = {}
+        # Spot settlement enforcement gate (set by the node when enforcing): when
+        # True, a swap rejects if the trader lacks sufficient token_in balance.
+        self.enforce_spot_settlement: bool = False
+
         # --- Counters ---
         self._total_swaps: int = 0
         self._total_orders: int = 0
@@ -182,6 +199,7 @@ class ExchangeStateManager:
         self._block_results = []
         self._block_fees = ZERO
         self._balance_deltas = {}  # Phase E: reset per-block balance deltas
+        self._token_balance_deltas = {}  # Phase E (spot): reset per-block token deltas
 
         # Reset per-block rate limits on all order books
         for book in self._order_books.values():
@@ -859,6 +877,35 @@ class ExchangeStateManager:
     def balance_deltas(self) -> Dict[str, Decimal]:
         """This block's accumulated per-address balance deltas (QRDX)."""
         return dict(self._balance_deltas)
+
+    # --- Phase E (spot): token-balance bridge -----------------------------
+
+    def set_available_token_balance(self, holder: str, token: str, amount: Decimal) -> None:
+        """Pre-load a holder's available balance of ``token`` (from the
+        token_balances ledger) for the spot sufficiency check. Called by the async
+        block paths before processing."""
+        self._available_token_balances[(holder, token)] = Decimal(amount)
+
+    def available_token_balance(self, holder: str, token: str) -> Optional[Decimal]:
+        """Pre-loaded available token balance, or None if not loaded (check skipped)."""
+        return self._available_token_balances.get((holder, token))
+
+    def clear_available_token_balances(self) -> None:
+        """Reset the pre-loaded token balances (call per block)."""
+        self._available_token_balances.clear()
+
+    def _record_token_delta(self, holder: str, token: str, delta: Decimal) -> None:
+        """Accumulate a token-balance delta for this block (negative = debit) and
+        keep the in-memory available token balance in step so later ops in the same
+        block see the moved amount."""
+        key = (holder, token)
+        self._token_balance_deltas[key] = self._token_balance_deltas.get(key, ZERO) + delta
+        if key in self._available_token_balances:
+            self._available_token_balances[key] = self._available_token_balances[key] + delta
+
+    def token_balance_deltas(self) -> Dict[Tuple[str, str], Decimal]:
+        """This block's accumulated per-(holder, token) balance deltas."""
+        return dict(self._token_balance_deltas)
 
     @property
     def pool_count(self) -> int:
