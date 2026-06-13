@@ -354,6 +354,34 @@ class DatabaseSQLite:
             PRIMARY KEY (validator_address, target_epoch)
         );
 
+        -- QRC-20 token ledger (Phase E spot). Mirrors qrdx.tokens.persistence
+        -- TOKEN_SCHEMA so the node owns these tables natively (token state is a
+        -- consensus object: balances are bound into the unified state root and
+        -- moved only by replayed exchange-section ops). IF NOT EXISTS keeps it
+        -- compatible with a DB the token persistence layer also initialized.
+        CREATE TABLE IF NOT EXISTS token_registry (
+            token_address TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            decimals INTEGER NOT NULL DEFAULT 18,
+            total_supply TEXT NOT NULL,
+            owner_address TEXT NOT NULL,
+            is_frozen INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS token_balances (
+            token_address TEXT NOT NULL,
+            holder_address TEXT NOT NULL,
+            balance TEXT NOT NULL DEFAULT '0',
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (token_address, holder_address)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_token_balances_holder ON token_balances(holder_address);
+        CREATE INDEX IF NOT EXISTS idx_token_balances_token ON token_balances(token_address);
+
         CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(block_height);
         CREATE INDEX IF NOT EXISTS idx_block_exchange_txs ON block_exchange_transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_block_evm_txs ON block_evm_transactions(block_hash);
@@ -760,6 +788,87 @@ class DatabaseSQLite:
             )
             seeded += 1
         return seeded
+
+    async def apply_token_balance_delta(self, token_address: str, holder_address: str, delta) -> bool:
+        """
+        Phase E (spot): apply a token-balance delta (negative = debit) to the
+        ``token_balances`` ledger. Balances are stored as Decimal-string token
+        units (matching qrdx.tokens.persistence). A debit clamps at 0 as a safety
+        net (spot enforcement should already reject an over-debit). The token
+        analog of ``apply_account_balance_delta``. Returns True if a row was
+        updated/created. Does NOT commit — the caller commits with the block.
+        """
+        from decimal import Decimal
+        d = Decimal(str(delta))
+        if d == 0:
+            return False
+        now = 0  # deterministic (block-replayed); wall-clock would diverge per node
+        cur = await self.connection.execute(
+            "SELECT balance FROM token_balances WHERE token_address = ? AND holder_address = ?",
+            (token_address, holder_address),
+        )
+        row = await cur.fetchone()
+        cur_bal = Decimal(row[0]) if row and row[0] is not None else Decimal("0")
+        new_bal = cur_bal + d
+        if new_bal < 0:
+            new_bal = Decimal("0")
+        await self.connection.execute(
+            """INSERT INTO token_balances (token_address, holder_address, balance, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(token_address, holder_address) DO UPDATE SET balance = ?, updated_at = ?""",
+            (token_address, holder_address, str(new_bal), now, str(new_bal), now),
+        )
+        return True
+
+    async def get_token_balance(self, token_address: str, holder_address: str):
+        """Token-units balance for (token, holder); Decimal(0) if no row."""
+        from decimal import Decimal
+        cur = await self.connection.execute(
+            "SELECT balance FROM token_balances WHERE token_address = ? AND holder_address = ?",
+            (token_address, holder_address),
+        )
+        row = await cur.fetchone()
+        return Decimal(row[0]) if row and row[0] is not None else Decimal("0")
+
+    async def get_token_balances_root(self) -> str:
+        """
+        Deterministic BLAKE3-512 root of the QRC-20 token ledger (Whitepaper §3.6),
+        the token-domain component of the unified block state root (Phase E spot).
+
+        Hashes every non-zero ``token_balances`` row in canonical order
+        (token_address, holder_address) over (token, holder, balance). Zero-value
+        rows are skipped so a holder that nets to 0 does not change the root.
+        Empty ledger → all-zero root. Determinism comes from identical replay of
+        the same token deltas on every node (same as ``get_account_state_root``).
+        """
+        cursor = await self.connection.execute("""
+            SELECT token_address, holder_address, balance
+            FROM token_balances
+            ORDER BY token_address ASC, holder_address ASC
+        """)
+        rows = await cursor.fetchall()
+        from decimal import Decimal
+        import blake3
+        hasher = blake3.blake3()
+        any_row = False
+        for r in rows:
+            token, holder, balance = r[0], r[1], r[2]
+            try:
+                if Decimal(balance) == 0:
+                    continue
+            except Exception:
+                continue
+            any_row = True
+            hasher.update(f"{token}:{holder}:{balance}".encode())
+        if not any_row:
+            return "0" * 128  # BLAKE3-512 width
+        return hasher.digest(length=64).hex()
+
+    async def clear_token_balances(self) -> None:
+        """Clear the token ledger (Phase E spot reorg rebuild). Replayed exchange
+        sections re-apply the canonical token deltas afterwards. Commits."""
+        await self.connection.execute("DELETE FROM token_balances")
+        await self.connection.commit()
 
     async def get_pending_transaction_count(self):
         """Get count of pending transactions"""
