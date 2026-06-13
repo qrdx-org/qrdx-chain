@@ -450,9 +450,16 @@ def _check_liquidations(mgr: ExchangeStateManager) -> None:
         try:
             results = mgr.perp_engine.check_all_liquidations(market_id)
             for liq in results:
+                # Phase E: return the liquidated trader's residual equity to their
+                # real balance (the locked margin was debited on open). This is a
+                # deterministic protocol op — every validator computes the same
+                # residual — so the delta flushes to account_state with the block.
+                residual = getattr(liq, "margin_returned", ZERO)
+                if residual and residual > ZERO:
+                    mgr._record_balance_delta(liq.owner, residual)
                 logger.info(
-                    "Liquidation: %s pos=%s pnl=%s adl=%s",
-                    market_id, liq.position_id, liq.pnl, liq.adl_triggered,
+                    "Liquidation: %s pos=%s pnl=%s returned=%s adl=%s",
+                    market_id, liq.position_id, liq.pnl, residual, liq.adl_triggered,
                 )
         except Exception as e:
             logger.error("Liquidation check failed for %s: %s", market_id, e)

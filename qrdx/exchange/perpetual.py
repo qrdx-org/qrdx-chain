@@ -96,6 +96,7 @@ class LiquidationResult:
     pnl: Decimal
     insurance_used: Decimal
     adl_triggered: bool = False
+    margin_returned: Decimal = ZERO   # residual equity returned to the trader (>=0)
 
 
 @dataclass
@@ -601,6 +602,14 @@ class PerpEngine:
                 insurance_needed = market.insurance_fund
                 market.insurance_fund = ZERO
 
+        # Residual equity returned to the trader after the penalty + PnL. Clamped
+        # at 0 — a liquidation never returns negative (the shortfall was already
+        # covered by the insurance fund / ADL above). Phase E credits this back to
+        # the owner's real balance (the locked margin was debited on open).
+        margin_returned = remaining_margin + pnl
+        if margin_returned < ZERO:
+            margin_returned = ZERO
+
         result = LiquidationResult(
             position_id=pos.id,
             owner=pos.owner,
@@ -612,6 +621,7 @@ class PerpEngine:
             pnl=pnl,
             insurance_used=insurance_needed,
             adl_triggered=adl_triggered,
+            margin_returned=margin_returned,
         )
 
         # Close the position
