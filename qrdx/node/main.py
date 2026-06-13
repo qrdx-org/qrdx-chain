@@ -4286,8 +4286,13 @@ async def get_address_info(
     )
     
     outputs = await db.get_spendable_outputs(address)
-    balance = sum(output.amount for output in outputs)
-    
+    # Headline balance comes from the canonical reader (account_state first, UTXO
+    # fallback) — in the unified ledger genesis + exchange-settled funds live in
+    # account_state, so summing only the UTXO outputs would under-report (return 0
+    # for an account_state-funded address). ``spendable_outputs`` below still
+    # lists the UTXO entries available for legacy-style spends.
+    balance = await db.get_address_balance(address)
+
     transactions = await db.get_address_transactions(
         address, limit=transactions_count_limit, 
         offset=offset, check_signatures=True
