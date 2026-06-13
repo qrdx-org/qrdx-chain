@@ -1,11 +1,12 @@
 """
 Phase D4 (primitive) — unified block state root + account-state root.
 
-The unified state root commits to all state domains (UTXO, account/EVM, exchange)
-under one BLAKE3-512 hash (Whitepaper §3.6). These tests pin the primitives:
-deterministic account-state root, and a unified root that is sensitive to each
-domain. (Consensus *enforcement* of the unified root is gated on the account/EVM
-domain receiving deterministic import replay — see the readiness spec.)
+The unified state root commits to all state domains (UTXO, account/EVM, exchange,
+token) under one BLAKE3-512 hash (Whitepaper §3.6). These tests pin the
+primitives: deterministic account-state root, and a unified root that is
+sensitive to each domain. (Consensus *enforcement* of the unified root is gated
+on the account/EVM domain receiving deterministic import replay — see the
+readiness spec.)
 """
 
 import os
@@ -13,27 +14,33 @@ import tempfile
 
 import blake3
 
-from qrdx.crypto.hashing import unified_state_root, state_root_hex
+from qrdx.crypto.hashing import unified_state_root, state_root_hex, TOKEN_ZERO_ROOT
 from qrdx.database_sqlite import DatabaseSQLite
 
 
 def test_unified_root_is_blake3_512_and_order_fixed():
-    r = unified_state_root("aa", "bb", "cc")
+    r = unified_state_root("aa", "bb", "cc", "dd")
     assert len(r) == 128  # BLAKE3-512
-    assert r == state_root_hex("aa|bb|cc".encode())
-    # Domain order matters (utxo, account, exchange are positional).
-    assert unified_state_root("aa", "bb", "cc") != unified_state_root("bb", "aa", "cc")
+    assert r == state_root_hex("aa|bb|cc|dd".encode())
+    # Domain order matters (utxo, account, exchange, token are positional).
+    assert unified_state_root("aa", "bb", "cc", "dd") != unified_state_root("bb", "aa", "cc", "dd")
+
+
+def test_token_root_defaults_to_zero_domain():
+    # A 3-arg call binds the token domain at its empty (all-zero) root.
+    assert unified_state_root("u", "a", "e") == unified_state_root("u", "a", "e", TOKEN_ZERO_ROOT)
 
 
 def test_unified_root_sensitive_to_each_domain():
-    base = unified_state_root("u", "a", "e")
-    assert unified_state_root("U", "a", "e") != base, "must depend on UTXO root"
-    assert unified_state_root("u", "A", "e") != base, "must depend on account root"
-    assert unified_state_root("u", "a", "E") != base, "must depend on exchange root"
+    base = unified_state_root("u", "a", "e", "t")
+    assert unified_state_root("U", "a", "e", "t") != base, "must depend on UTXO root"
+    assert unified_state_root("u", "A", "e", "t") != base, "must depend on account root"
+    assert unified_state_root("u", "a", "E", "t") != base, "must depend on exchange root"
+    assert unified_state_root("u", "a", "e", "T") != base, "must depend on token root"
 
 
 def test_unified_root_deterministic():
-    assert unified_state_root("u", "a", "e") == unified_state_root("u", "a", "e")
+    assert unified_state_root("u", "a", "e", "t") == unified_state_root("u", "a", "e", "t")
 
 
 async def _db():

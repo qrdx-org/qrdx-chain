@@ -189,22 +189,36 @@ def state_root_hex(data: Union[bytes, str]) -> str:
     return state_root_hash(data).hex()
 
 
-def unified_state_root(utxo_root: str, account_root: str, exchange_root: str) -> str:
+TOKEN_ZERO_ROOT = "0" * 128
+
+
+def unified_state_root(
+    utxo_root: str,
+    account_root: str,
+    exchange_root: str,
+    token_root: str = TOKEN_ZERO_ROOT,
+) -> str:
     """
     Combine the per-domain state roots into one block state root (Whitepaper §3.6).
 
     The unified root commits to every state domain — the UTXO set, the
-    account/EVM state, and the protocol-level exchange state — under a single
-    BLAKE3-512 hash. Domain order is fixed (utxo, account, exchange) and must be
-    identical on every validator.
+    account/EVM state, the protocol-level exchange state, and the QRC-20 token
+    ledger — under a single BLAKE3-512 hash. Domain order is fixed
+    (utxo, account, exchange, token) and must be identical on every validator.
+
+    ``token_root`` is the newest domain (Phase E spot). It defaults to the
+    all-zero root so a node with an empty token ledger reproduces the same value
+    the rest of the network computes; it is always included in the payload, so the
+    domain is cryptographically bound on every block regardless of token activity.
 
     Args:
         utxo_root: hex digest of the UTXO set.
         account_root: hex digest of account/EVM state.
         exchange_root: hex digest of exchange state.
+        token_root: hex digest of the QRC-20 token ledger.
 
     Returns:
         128-char hex BLAKE3-512 unified state root.
     """
-    payload = f"{utxo_root}|{account_root}|{exchange_root}".encode("utf-8")
+    payload = f"{utxo_root}|{account_root}|{exchange_root}|{token_root}".encode("utf-8")
     return state_root_hex(payload)

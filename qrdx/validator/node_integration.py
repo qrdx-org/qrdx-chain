@@ -664,13 +664,19 @@ class ValidatorNode:
     async def _compute_unified_state_root(self) -> str:
         """
         E-D4: the post-block unified state root bound into the block's signed
-        header — BLAKE3-512 over (UTXO root, account/EVM root, exchange root) in
-        fixed domain order (`crypto.hashing.unified_state_root`).
+        header — BLAKE3-512 over (UTXO root, account/EVM root, exchange root,
+        token root) in fixed domain order (`crypto.hashing.unified_state_root`).
 
         Computed at the "after sections, before native add_block" point so an
         importer reproduces it identically after replaying the sections (its UTXO
         is likewise pre-native-apply, and account/exchange reflect the replayed
         sections). Each domain falls back to its empty root if unavailable.
+
+        NOTE: the token domain is currently bound at its EMPTY (zero) root —
+        ``unified_state_root`` defaults it — because token state is not yet a
+        consensus object (deployed out-of-band on one node), so a real token root
+        would diverge across nodes. It is wired to the live ``get_token_balances_root``
+        only once token deploy/transfer flow through consensus (Phase E spot inc4).
         """
         from ..crypto.hashing import unified_state_root
         try:

@@ -1079,6 +1079,8 @@ async def _verify_unified_state_root(block_content, enforce: Optional[bool] = No
     except Exception:
         exchange_root = "0" * 128
 
+    # Token domain bound at zero (default) until token state is a consensus object
+    # (Phase E spot inc4) — see _compute_unified_state_root for why.
     computed = unified_state_root(utxo_root or "0" * 64, account_root, exchange_root)
     if computed != declared:
         msg = (f"unified state root mismatch: declared {str(declared)[:16]}..., "
@@ -3380,7 +3382,8 @@ async def get_exchange_state_root():
 async def get_unified_state_root():
     """
     Return the unified block state root (Whitepaper §3.6): a BLAKE3-512 commitment
-    over all state domains — UTXO set, account/EVM state, and exchange state.
+    over all state domains — UTXO set, account/EVM state, exchange state, and the
+    QRC-20 token ledger.
 
     Phase D4 primitive. NOTE: this is computed/observable but not yet *enforced*
     in consensus. Enforcing it requires every committed domain to be
@@ -3395,12 +3398,17 @@ async def get_unified_state_root():
         utxo_root = await db.get_unspent_outputs_hash()
         account_root = await db.get_account_state_root()
         exchange_root = ExchangeStateManager.get_instance().compute_state_root()
+        # token_root is reported for visibility but bound at zero in the consensus
+        # root until token state is a consensus object (Phase E spot inc4).
+        token_root = await db.get_token_balances_root()
         root = unified_state_root(utxo_root, account_root, exchange_root)
         return {'ok': True, 'result': {
             'unified_state_root': root,
             'utxo_root': utxo_root,
             'account_root': account_root,
             'exchange_root': exchange_root,
+            'token_root': token_root,
+            'token_root_bound': False,
             'enforced': False,
         }}
     except Exception as e:
