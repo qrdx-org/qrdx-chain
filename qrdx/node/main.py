@@ -990,11 +990,12 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
         return True, ""
     from ..exchange.block_processor import (
         decode_exchange_txs, preload_sender_balances, flush_exchange_balance_deltas,
-        ENFORCE_EXCHANGE_COLLATERAL,
+        flush_token_balance_deltas, ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT,
     )
     from ..exchange.state_manager import ExchangeStateManager
     mgr = ExchangeStateManager.get_instance()
     mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
+    mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
     # Phase E: pre-load senders' real balances so the collateral check can read
     # them during the sync section processing.
     try:
@@ -1008,8 +1009,10 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
             block_height, float(block_timestamp or 0), ex_section, declared_root,
         )
         if ok:
-            # Phase E: flush margin debits to account_state (before E-D4 root check).
+            # Phase E: flush margin debits to account_state + token moves to the
+            # token ledger (before the E-D4 root check, so both domains reflect).
             await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
+            await flush_token_balance_deltas(db, mgr)
         return ok, err
     # Trust-replay (sync): adopt the canonical section's computed root.
     try:
@@ -1021,6 +1024,7 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
         if ok:
             mgr.commit_block()
             await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
+            await flush_token_balance_deltas(db, mgr)
         else:
             logger.warning(f"Exchange section trust-replay failed at block {block_height}: {err}")
         return True, ""
@@ -2534,10 +2538,20 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
         except Exception as e:
             logger.error(f"[REORG] account_state genesis reseed failed: {e}")
 
+    # Phase E spot reorg safety: clear the durable token ledger so the exchange
+    # rebuild below re-applies the canonical token deploys/transfers onto a clean
+    # base (the registry is re-created idempotently). Mirrors the account_state
+    # clear+reseed above.
+    try:
+        await db.clear_token_balances()
+    except Exception as e:
+        logger.error(f"[REORG] token ledger clear failed: {e}")
+
     # D3 + Phase E reorg safety: rebuild exchange state to the new canonical tip so
     # the orphaned blocks' exchange effects are dropped, AND re-flush each canonical
     # block's collateral debits onto the freshly reseeded account_state ledger (it
-    # was just cleared above, so the live debits are gone and must be replayed).
+    # was just cleared above, so the live debits are gone and must be replayed) +
+    # its token moves onto the freshly cleared token ledger.
     try:
         from ..exchange.block_processor import rebuild_exchange_state_from_chain
         await rebuild_exchange_state_from_chain(db, flush_to_account_state=True)

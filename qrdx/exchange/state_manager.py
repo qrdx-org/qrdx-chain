@@ -160,8 +160,12 @@ class ExchangeStateManager:
         # async wrapper when spot settlement is enforced. Block-scoped, so not part
         # of the exchange state root.
         self._token_balance_deltas: Dict[Tuple[str, str], Decimal] = {}
+        # Per-block QRC-20 registry creations (TOKEN_DEPLOY) to flush to the durable
+        # token_registry alongside the balance deltas. Deterministic metadata
+        # (replicated on every node); the value-bearing state is the balance root.
+        self._token_registry_ops: List[Dict[str, Any]] = []
         # Spot settlement enforcement gate (set by the node when enforcing): when
-        # True, a swap rejects if the trader lacks sufficient token_in balance.
+        # True, a transfer/swap rejects if the holder lacks sufficient balance.
         self.enforce_spot_settlement: bool = False
 
         # --- Counters ---
@@ -200,6 +204,7 @@ class ExchangeStateManager:
         self._block_fees = ZERO
         self._balance_deltas = {}  # Phase E: reset per-block balance deltas
         self._token_balance_deltas = {}  # Phase E (spot): reset per-block token deltas
+        self._token_registry_ops = []    # Phase E (spot): reset per-block registry creations
 
         # Reset per-block rate limits on all order books
         for book in self._order_books.values():
@@ -332,6 +337,8 @@ class ExchangeStateManager:
             ExchangeOpType.ADD_MARGIN: self._op_add_margin,
             ExchangeOpType.UPDATE_ORACLE: self._op_update_oracle,
             ExchangeOpType.CREATE_MARKET: self._op_create_market,
+            ExchangeOpType.TOKEN_DEPLOY: self._op_token_deploy,
+            ExchangeOpType.TOKEN_TRANSFER: self._op_token_transfer,
         }
         handler = handlers.get(tx.op_type)
         if handler is None:
@@ -523,6 +530,84 @@ class ExchangeStateManager:
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.CREATE_MARKET],
             data={"market_id": market.id},
         )
+
+    @staticmethod
+    def derive_token_address(sender: str, nonce: int, symbol: str) -> str:
+        """Deterministic QRC-20 token address from the deploy tx (consensus-stable:
+        every node derives the same address from the same tx)."""
+        seed = f"{sender}:{int(nonce)}:{symbol}".encode()
+        return "0x" + hashlib.blake2b(seed, digest_size=20).hexdigest()
+
+    def _op_token_deploy(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Deploy a QRC-20 token via consensus (Phase E spot): mint ``total_supply``
+        to the deployer in the real token ledger and record the registry metadata.
+        The token address is derived deterministically from the tx so every node
+        agrees. Recorded as a token-balance delta + a registry op, flushed to the
+        durable token tables with the block (so token state converges on every
+        node, unlike the old out-of-band deploy)."""
+        p = tx.params
+        name = str(p["name"])
+        symbol = str(p["symbol"])
+        decimals = int(p.get("decimals", 18))
+        try:
+            supply = Decimal(str(p["total_supply"]))
+        except Exception:
+            return ExchangeExecResult(success=False, error="TOKEN_DEPLOY: invalid total_supply")
+        if supply <= 0:
+            return ExchangeExecResult(success=False, error="TOKEN_DEPLOY: total_supply must be positive")
+
+        token_address = self.derive_token_address(tx.sender, tx.nonce, symbol)
+        self._token_registry_ops.append({
+            "token_address": token_address, "name": name, "symbol": symbol,
+            "decimals": decimals, "total_supply": str(supply), "owner_address": tx.sender,
+        })
+        # Credit the deployer the full supply in the token ledger.
+        self._record_token_delta(tx.sender, token_address, supply)
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_DEPLOY],
+            data={"token_address": token_address, "symbol": symbol, "total_supply": str(supply)},
+        )
+
+    def _op_token_transfer(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Transfer QRC-20 tokens via consensus (Phase E spot): debit the sender,
+        credit the recipient in the real token ledger. Under enforcement an
+        insufficient-balance transfer is rejected; in observe it warns. Recorded as
+        paired token deltas, flushed with the block."""
+        p = tx.params
+        token = str(p["token_address"])
+        to = str(p["to"])
+        try:
+            amount = Decimal(str(p["amount"]))
+        except Exception:
+            return ExchangeExecResult(success=False, error="TOKEN_TRANSFER: invalid amount")
+        if amount <= 0:
+            return ExchangeExecResult(success=False, error="TOKEN_TRANSFER: amount must be positive")
+
+        avail = self.available_token_balance(tx.sender, token)
+        if avail is not None and avail < amount:
+            if self.enforce_spot_settlement:
+                return ExchangeExecResult(
+                    success=False,
+                    error=f"insufficient token balance: need {amount}, available {avail}",
+                )
+            logger.warning(
+                "[Phase E observe] token_transfer by %s: amount %s exceeds available "
+                "%s — would REJECT once spot settlement is enforced",
+                tx.sender[:20], amount, avail,
+            )
+
+        self._record_token_delta(tx.sender, token, -amount)
+        self._record_token_delta(to, token, amount)
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER],
+            data={"token_address": token, "to": to, "amount": str(amount)},
+        )
+
+    def token_registry_ops(self) -> List[Dict[str, Any]]:
+        """This block's accumulated token registry creations (TOKEN_DEPLOY)."""
+        return list(self._token_registry_ops)
 
     def _op_open_position(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params

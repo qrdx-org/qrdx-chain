@@ -49,6 +49,14 @@ ZERO = Decimal("0")
 # convergent across nodes (a flush on only the proposer/sync paths would diverge).
 ENFORCE_EXCHANGE_COLLATERAL = True
 
+# Phase E spot-settlement rollout gate. False = OBSERVE (a TOKEN_TRANSFER / swap
+# that overspends warns but still executes). True = ENFORCE (reject the overspend).
+# This gate is independent of whether token balances MOVE: token deploy/transfer
+# always flush to the ledger (new consensus domain — see flush_token_balance_deltas);
+# the gate only governs rejection strictness. Flip to True after a soak once token
+# state is consensus-replicated and its root is bound (Phase E spot inc3-final/inc6).
+ENFORCE_SPOT_SETTLEMENT = False
+
 
 async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:
     """
@@ -97,6 +105,37 @@ async def flush_exchange_balance_deltas(db, state_manager: Optional[ExchangeStat
             await db.apply_account_balance_delta(addr, delta)
         except Exception as e:
             logger.warning("flush_exchange_balance_deltas: %s for %s", e, str(addr)[:20])
+
+
+async def flush_token_balance_deltas(db, state_manager: Optional[ExchangeStateManager] = None) -> None:
+    """
+    Phase E (spot): apply this block's QRC-20 registry creations + token-balance
+    deltas (from TOKEN_DEPLOY / TOKEN_TRANSFER, later spot swaps) to the durable
+    token ledger. Called by the async block paths AFTER the section commits and
+    BEFORE the unified state root is computed, so the token root reflects the moved
+    tokens on every node. Does not commit — the block's ``add_block`` commits.
+
+    Unlike the collateral flush this is NOT gated by an observe flag: token state
+    is a brand-new consensus domain (additive — there is no prior balance to
+    protect), so it always applies, which is what makes the ledger converge across
+    nodes. The ``enforce_spot_settlement`` gate lives on the op (reject an
+    over-spend), not here.
+    """
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    registry_ops = mgr.token_registry_ops()
+    deltas = mgr.token_balance_deltas()
+    if not registry_ops and not deltas:
+        return
+    for op in registry_ops:
+        try:
+            await db.apply_token_registry_op(op)
+        except Exception as e:
+            logger.warning("flush_token: registry %s for %s", e, str(op.get("token_address"))[:20])
+    for (holder, token), delta in deltas.items():
+        try:
+            await db.apply_token_balance_delta(token, holder, delta)
+        except Exception as e:
+            logger.warning("flush_token: delta %s for (%s,%s)", e, str(holder)[:16], str(token)[:16])
 
 # Funding settlement happens every epoch (32 slots × 12s = 384s ≈ 6.4 min)
 FUNDING_SETTLEMENT_INTERVAL = 32  # slots
@@ -320,9 +359,11 @@ async def rebuild_exchange_state_from_chain(
             applied += 1
             if flush_to_account_state:
                 # Re-apply this block's collateral debits to the freshly reseeded
-                # account_state ledger (enforce mode applies; observe just logs).
+                # account_state ledger (enforce mode applies; observe just logs)
+                # AND its token moves to the freshly cleared token ledger.
                 await flush_exchange_balance_deltas(
                     db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
+                await flush_token_balance_deltas(db, mgr)
                 flushed += 1
         else:
             logger.error("rebuild_exchange_state: block %d section failed: %s", height, err)

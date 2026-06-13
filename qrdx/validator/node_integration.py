@@ -387,11 +387,13 @@ class ValidatorNode:
                         try:
                             from ..exchange.block_processor import (
                                 process_exchange_transactions, preload_sender_balances,
-                                flush_exchange_balance_deltas, ENFORCE_EXCHANGE_COLLATERAL,
+                                flush_exchange_balance_deltas, flush_token_balance_deltas,
+                                ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT,
                             )
                             from ..exchange.state_manager import ExchangeStateManager
                             mgr = ExchangeStateManager.get_instance()
                             mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
+                            mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
                             # Phase E: pre-load senders' real balances for the
                             # collateral check during processing.
                             await preload_sender_balances(self.db, exchange_txs, mgr)
@@ -400,10 +402,12 @@ class ValidatorNode:
                             )
                             if ok:
                                 mgr.commit_block()
-                                # Phase E: flush margin debits to account_state
-                                # (before the unified root is computed below).
+                                # Phase E: flush margin debits to account_state +
+                                # token moves to the token ledger (before the unified
+                                # root is computed below).
                                 await flush_exchange_balance_deltas(
                                     self.db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
+                                await flush_token_balance_deltas(self.db, mgr)
                                 exchange_state_root = root
                                 logger.info(
                                     f"📦 Including {len(exchange_txs)} exchange tx(s) in "

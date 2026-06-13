@@ -59,6 +59,8 @@ class ExchangeOpType(IntEnum):
     ADD_MARGIN = 10
     UPDATE_ORACLE = 11
     CREATE_MARKET = 12
+    TOKEN_DEPLOY = 13
+    TOKEN_TRANSFER = 14
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +304,16 @@ class ExchangeTransaction:
             if "base_token" not in p:
                 raise ValueError("CREATE_MARKET missing param: base_token")
 
+        elif op == ExchangeOpType.TOKEN_DEPLOY:
+            for key in ("name", "symbol", "total_supply"):
+                if key not in p:
+                    raise ValueError(f"TOKEN_DEPLOY missing param: {key}")
+
+        elif op == ExchangeOpType.TOKEN_TRANSFER:
+            for key in ("token_address", "to", "amount"):
+                if key not in p:
+                    raise ValueError(f"TOKEN_TRANSFER missing param: {key}")
+
     # -- Identification -----------------------------------------------------
 
     def is_exchange_transaction(self) -> bool:
@@ -330,4 +342,6 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.ADD_MARGIN: 30_000,
     ExchangeOpType.UPDATE_ORACLE: 20_000,
     ExchangeOpType.CREATE_MARKET: 100_000,
+    ExchangeOpType.TOKEN_DEPLOY: 120_000,
+    ExchangeOpType.TOKEN_TRANSFER: 40_000,
 }

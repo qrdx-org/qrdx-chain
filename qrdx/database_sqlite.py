@@ -820,6 +820,23 @@ class DatabaseSQLite:
         )
         return True
 
+    async def apply_token_registry_op(self, op: dict) -> bool:
+        """
+        Phase E (spot): create a QRC-20 registry row from a TOKEN_DEPLOY op
+        (deterministic metadata; the value-bearing state is token_balances). Idem-
+        potent on token_address. Does NOT commit — the caller commits with the
+        block.
+        """
+        await self.connection.execute(
+            """INSERT INTO token_registry
+                 (token_address, name, symbol, decimals, total_supply, owner_address, is_frozen, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)
+               ON CONFLICT(token_address) DO NOTHING""",
+            (op["token_address"], op["name"], op["symbol"], int(op.get("decimals", 18)),
+             str(op["total_supply"]), op["owner_address"]),
+        )
+        return True
+
     async def get_token_balance(self, token_address: str, holder_address: str):
         """Token-units balance for (token, holder); Decimal(0) if no row."""
         from decimal import Decimal
