@@ -187,9 +187,34 @@
      now shows the trader 500000 → 497000 (−3000 margin) live. Tests:
      `test_exchange_collateral_observe.py` (+5 close), `test_exchange_liquidation_settlement.py`
      (4); exchange suite 500 passed, integration 13/13.
-   - ⏳ **Remaining (d): spot.** Spot orders/swaps move TOKEN balances (a separate
-     token ledger under `tokens/`, not the `account_state` QRDX ledger), reachable
-     live via the pool/swap path. Same observe→soak→enforce discipline.
+   - 🔱 **(d) SPOT — consensus token subsystem IN PROGRESS (June 2026).** Spot needs
+     real TOKEN balances, but tokens were ENTIRELY off-consensus (no node-side
+     handling, not in any root; the harness wrote `token_balances` directly to ONE
+     node's DB). So the token ledger is being made a consensus object first:
+     - ✅ inc1 token-balance bridge in `ExchangeStateManager` (mirror of the QRDX
+       collateral bridge: `_token_balance_deltas`, `_token_registry_ops`,
+       `enforce_spot_settlement`).
+     - ✅ inc2 DB layer: `token_registry`+`token_balances` in node `_init_schema`;
+       `apply_token_balance_delta`, `get_token_balances_root` (BLAKE3-512),
+       `clear_token_balances`, `apply_token_registry_op`.
+     - ✅ inc3 `unified_state_root()` gained a 4th TOKEN domain — BOUND AT ZERO for
+       now (binding the real per-node root while the harness writes tokens to one
+       node diverges → E-D4 stall; ordering fix).
+     - ✅ inc4 consensus ops `TOKEN_DEPLOY`/`TOKEN_TRANSFER` (deterministic address
+       `blake2b(sender:nonce:symbol)`, mint/registry/transfer deltas, observe/enforce
+       overspend) + `flush_token_balance_deltas` wired into proposer + bulk-sync +
+       both live importer branches + reorg rebuild. **Proven live (s14): importer
+       nodes 1–3 hold the identical consensus-replicated ledger (deployer 999000 +
+       recipient 1000) with matching token roots.** Tests: `test_token_ledger_db.py`
+       (7), `test_token_consensus_ops.py` (7), s14 (8); suite 14/14.
+     - ⏳ inc4b: migrate `token_deployer`/s05 to deploy via consensus `TOKEN_DEPLOY`
+       (removes the out-of-band single-node writes that still pollute the proposer).
+     - ⏳ inc3-final: bind the REAL `get_token_balances_root` into proposer/importer/
+       REST (safe once inc4b lands so every node has identical token state).
+     - ⏳ inc5: spot swap/liquidity settle trader↔pool token deltas (pool needs a
+       deterministic holder address; reconcile in-memory AMM reserves ↔ real
+       `token_balances`).
+     - ⏳ inc6: flip `ENFORCE_SPOT_SETTLEMENT=True` + soak.
 
 ## 🔒 Process gates (cannot be satisfied in-repo)
 
