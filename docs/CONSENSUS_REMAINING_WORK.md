@@ -123,10 +123,14 @@
    parent is `d8207a`, which node0 never stored). Fix:
    `main._check_parent_continuity` wired OBSERVE-only into the sync + p2p live paths
    (`_ENFORCE_PARENT_CONTINUITY=False`); verified it fires on exactly nodes 0/2/3.
-   **ENFORCE step** (reject on mismatch → reorg to the declared-parent chain) is the
-   gate: once block history converges to one canonical block per height, switch
-   RANDAO selection (proposer + the `block_verification` verifier) onto the live mix
-   together.
+   **ENFORCE was tried + reverted (naive reject is unsafe).** A 6-run enforce soak:
+   run5 rejected 2 fork blocks yet still ended with 2 RANDAO mixes at equal height
+   (didn't converge an equal-height equivalent fork); run6 had a node fall 3 blocks
+   behind with a scenario failure (relying on the periodic sync/reorg poll to heal
+   is too slow). **Safe enforce needs (1) the mismatch to ACTIVELY drive a reorg onto
+   the declared-parent chain immediately, and (2) a deterministic tie-break for
+   equal-height equivalent forks** — the real fork-choice work. Until then keep
+   observe; RANDAO selection stays on the zero constant (this is its gate).
 
 6. **`from_hex`/`from_bytes` caller audit. — ✅ DONE.** Core primitive hardened
    (raises rather than inventing identity), with an actionable error message.
