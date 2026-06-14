@@ -35,6 +35,7 @@ from .amm import (
     FeeTier,
     PoolManager,
     PoolType,
+    Q96,
     tick_to_sqrt_price,
 )
 from .hooks import CircuitBreaker, HookContext, HookRegistry
@@ -387,18 +388,29 @@ class ExchangeStateManager:
 
     def _op_add_liquidity(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
-        pool = self.pool_manager.get_pool(p["pool_id"])
+        # Resolve by pool_id, or by token pair (the pool_id is a hash of an internal
+        # sequence the submitter can't predict, so callers may reference the pool by
+        # its token0/token1 addresses instead).
+        pool = self.pool_manager.get_pool(p["pool_id"]) if p.get("pool_id") else None
+        if pool is None and p.get("token0") and p.get("token1"):
+            pool = self._find_pool_for_pair(str(p["token0"]), str(p["token1"]))
         if pool is None:
             return ExchangeExecResult(success=False, error="Pool not found")
 
-        position = pool.add_liquidity(
-            tx.sender, int(p["tick_lower"]), int(p["tick_upper"]),
-            Decimal(str(p["amount"])),
-        )
+        tick_lower, tick_upper = int(p["tick_lower"]), int(p["tick_upper"])
+        liquidity = Decimal(str(p["amount"]))
+        position = pool.add_liquidity(tx.sender, tick_lower, tick_upper, liquidity)
+        # Phase E spot: escrow the deposited token0/token1 from the LP into the pool
+        # holder so reserves are real, conserved token balances (sqrt_price/tick are
+        # unchanged by an LP add, so post-add amounts equal the deposited amounts).
+        amt0, amt1 = self._cl_token_amounts(pool, tick_lower, tick_upper, liquidity)
+        holder = self.pool_holder_address(pool.state.id)
+        self._settle_token_move(tx.sender, holder, pool.state.token0, amt0)
+        self._settle_token_move(tx.sender, holder, pool.state.token1, amt1)
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ADD_LIQUIDITY],
-            data={"position_id": position.id},
+            data={"position_id": position.id, "amount0": str(amt0), "amount1": str(amt1)},
         )
 
     def _op_remove_liquidity(self, tx: ExchangeTransaction) -> ExchangeExecResult:
@@ -409,23 +421,67 @@ class ExchangeStateManager:
 
         amount = Decimal(str(p.get("amount", "0")))
         removed = pool.remove_liquidity(p["position_id"], amount if amount > 0 else None)
+        # Phase E spot: return the withdrawn token0/token1 from the pool holder to the
+        # LP (remove_liquidity returns (amount0, amount1)).
+        try:
+            amt0, amt1 = removed
+        except (TypeError, ValueError):
+            amt0, amt1 = ZERO, ZERO
+        holder = self.pool_holder_address(pool.state.id)
+        self._settle_token_move(holder, tx.sender, pool.state.token0, Decimal(str(amt0)))
+        self._settle_token_move(holder, tx.sender, pool.state.token1, Decimal(str(amt1)))
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.REMOVE_LIQUIDITY],
             data={"removed": str(removed)},
         )
 
+    def _find_pool_for_pair(self, token_a: str, token_b: str):
+        """The AMM pool whose token pair == {token_a, token_b} (Phase E spot
+        settlement: identifies the holder of the reserves a swap moves)."""
+        pair = {token_a, token_b}
+        for pool in self.pool_manager._pools.values():
+            if {pool.state.token0, pool.state.token1} == pair:
+                return pool
+        return None
+
     def _op_swap(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
+        token_in = str(p["token_in"])
+        token_out = str(p["token_out"])
         amount_in = Decimal(str(p["amount_in"]))
         min_out = Decimal(str(p.get("min_amount_out", "0")))
         deadline = float(p.get("deadline", 0))
 
+        # Phase E spot: the trader must hold enough token_in (when balances are
+        # pre-loaded). Observe warns; enforce rejects before touching pool state.
+        avail = self.available_token_balance(tx.sender, token_in)
+        if avail is not None and avail < amount_in:
+            if self.enforce_spot_settlement:
+                return ExchangeExecResult(
+                    success=False,
+                    error=f"insufficient token_in: need {amount_in}, available {avail}",
+                )
+            logger.warning(
+                "[Phase E observe] swap by %s: amount_in %s exceeds available %s — "
+                "would REJECT once spot settlement is enforced",
+                tx.sender[:20], amount_in, avail,
+            )
+
         result = self.router.execute(
-            p["token_in"], p["token_out"], amount_in, tx.sender,
+            token_in, token_out, amount_in, tx.sender,
             min_amount_out=min_out,
             deadline=deadline,
         )
+
+        # Settle the swap against the pool holder: trader pays amount_in token_in,
+        # receives amount_out token_out (pool reserves move the opposite way), so the
+        # token ledger conserves. Only AMM-routed swaps have a pool holder.
+        pool = self._find_pool_for_pair(token_in, token_out)
+        if pool is not None:
+            holder = self.pool_holder_address(pool.state.id)
+            self._settle_token_move(tx.sender, holder, token_in, amount_in)
+            self._settle_token_move(holder, tx.sender, token_out, Decimal(str(result.amount_out)))
 
         self._total_swaps += 1
         return ExchangeExecResult(
@@ -537,6 +593,40 @@ class ExchangeStateManager:
         every node derives the same address from the same tx)."""
         seed = f"{sender}:{int(nonce)}:{symbol}".encode()
         return "0x" + hashlib.blake2b(seed, digest_size=20).hexdigest()
+
+    @staticmethod
+    def pool_holder_address(pool_id: str) -> str:
+        """Deterministic token-ledger holder address for an AMM pool's reserves
+        (Phase E spot). Liquidity providers' tokens move INTO this holder; swap
+        outputs move OUT of it — so pool reserves are real, conserved token balances."""
+        return "0xPOOL" + hashlib.blake2b(f"pool:{pool_id}".encode(), digest_size=18).hexdigest()
+
+    @staticmethod
+    def _cl_token_amounts(pool, tick_lower: int, tick_upper: int, liquidity: Decimal) -> Tuple[Decimal, Decimal]:
+        """token0/token1 amounts for a concentrated-liquidity position (Uniswap-V3
+        formula, deterministic from pool state). Mirrors the integration PoolOperator
+        so liquidity settlement moves the real deposited amounts."""
+        sqrt_p = pool.state.sqrt_price
+        sqrt_a = tick_to_sqrt_price(tick_lower)
+        sqrt_b = tick_to_sqrt_price(tick_upper)
+        cur = pool.state.tick
+        amt0 = ZERO
+        amt1 = ZERO
+        if cur < tick_lower:
+            amt0 = liquidity * Q96 * (sqrt_b - sqrt_a) / (sqrt_a * sqrt_b)
+        elif cur >= tick_upper:
+            amt1 = liquidity * (sqrt_b - sqrt_a) / Q96
+        else:
+            amt0 = liquidity * Q96 * (sqrt_b - sqrt_p) / (sqrt_p * sqrt_b)
+            amt1 = liquidity * (sqrt_p - sqrt_a) / Q96
+        q = Decimal("0.00000001")
+        return abs(amt0).quantize(q), abs(amt1).quantize(q)
+
+    def _settle_token_move(self, frm: str, to: str, token: str, amount: Decimal) -> None:
+        """Phase E spot: record a token move frm→to as paired deltas (no-op for 0)."""
+        if amount and amount > ZERO:
+            self._record_token_delta(frm, token, -amount)
+            self._record_token_delta(to, token, amount)
 
     def _op_token_deploy(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Deploy a QRC-20 token via consensus (Phase E spot): mint ``total_supply``

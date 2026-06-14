@@ -41,6 +41,7 @@ from integration_tests.scenarios.s11_stress import S11Stress
 from integration_tests.scenarios.s12_exchange_consensus import S12ExchangeConsensus
 from integration_tests.scenarios.s13_perp_collateral import S13PerpCollateral
 from integration_tests.scenarios.s14_token_consensus import S14TokenConsensus
+from integration_tests.scenarios.s15_spot_settlement import S15SpotSettlement
 
 
 ALL_SCENARIOS = [
@@ -58,6 +59,7 @@ ALL_SCENARIOS = [
     S12ExchangeConsensus,
     S13PerpCollateral,
     S14TokenConsensus,
+    S15SpotSettlement,
 ]
 
 
