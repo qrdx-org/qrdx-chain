@@ -113,16 +113,20 @@
    Selection is UNCHANGED (still the zero constant) → zero consensus risk. Tests:
    `test_randao_accumulation.py` (6).
 
-   **ENFORCE GATE found (observe phase): block-history must converge first.** The
+   **ENFORCE GATE found (observe phase) → root-caused to a real import bug.** The
    mix folds *every* block's reveal, so it surfaces block-level history divergence
    that cumulative *state* roots mask. A clean 4-node run that converged on ONE
-   unified state root still had one node on a different block at height 2 (an
-   equivalent-state genesis-slot fork that never reconciled) → it folds a different
-   reveal → different mix. RANDAO must not drive selection (eligibility is enforced)
-   until block history converges to one canonical block per height — a deterministic
-   canonical-block tie-break, or extending the finality reorg guard to reconcile
-   equivalent-state forks. Then switch selection (proposer + the
-   `block_verification` verifier) onto the live mix together.
+   unified state root still had nodes 0/2/3 on a different block at height 2 than
+   node1. **Root cause: the import path validates height-SEQUENTIALITY but never
+   checks a block's `parent_hash` against the local tip** — so a fork block is
+   appended on a parent the node never stored (node0 holds `9cb28d` at h2 but h3's
+   parent is `d8207a`, which node0 never stored). Fix:
+   `main._check_parent_continuity` wired OBSERVE-only into the sync + p2p live paths
+   (`_ENFORCE_PARENT_CONTINUITY=False`); verified it fires on exactly nodes 0/2/3.
+   **ENFORCE step** (reject on mismatch → reorg to the declared-parent chain) is the
+   gate: once block history converges to one canonical block per height, switch
+   RANDAO selection (proposer + the `block_verification` verifier) onto the live mix
+   together.
 
 6. **`from_hex`/`from_bytes` caller audit. — ✅ DONE.** Core primitive hardened
    (raises rather than inventing identity), with an actionable error message.
