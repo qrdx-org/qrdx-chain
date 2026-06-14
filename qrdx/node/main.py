@@ -1082,10 +1082,14 @@ async def _verify_unified_state_root(block_content, enforce: Optional[bool] = No
         exchange_root = ExchangeStateManager.get_instance().compute_state_root()
     except Exception:
         exchange_root = "0" * 128
+    try:
+        token_root = await db.get_token_balances_root()
+    except Exception:
+        token_root = "0" * 128
 
-    # Token domain bound at zero (default) until token state is a consensus object
-    # (Phase E spot inc4) — see _compute_unified_state_root for why.
-    computed = unified_state_root(utxo_root or "0" * 64, account_root, exchange_root)
+    # Token domain bound at the live token-ledger root — token state is now a
+    # consensus object that converges across nodes (Phase E spot inc4/inc4b).
+    computed = unified_state_root(utxo_root or "0" * 64, account_root, exchange_root, token_root)
     if computed != declared:
         msg = (f"unified state root mismatch: declared {str(declared)[:16]}..., "
                f"computed {computed[:16]}...")
@@ -3412,17 +3416,15 @@ async def get_unified_state_root():
         utxo_root = await db.get_unspent_outputs_hash()
         account_root = await db.get_account_state_root()
         exchange_root = ExchangeStateManager.get_instance().compute_state_root()
-        # token_root is reported for visibility but bound at zero in the consensus
-        # root until token state is a consensus object (Phase E spot inc4).
         token_root = await db.get_token_balances_root()
-        root = unified_state_root(utxo_root, account_root, exchange_root)
+        root = unified_state_root(utxo_root, account_root, exchange_root, token_root)
         return {'ok': True, 'result': {
             'unified_state_root': root,
             'utxo_root': utxo_root,
             'account_root': account_root,
             'exchange_root': exchange_root,
             'token_root': token_root,
-            'token_root_bound': False,
+            'token_root_bound': True,
             'enforced': False,
         }}
     except Exception as e:

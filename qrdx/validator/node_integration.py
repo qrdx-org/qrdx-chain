@@ -673,16 +673,15 @@ class ValidatorNode:
 
         Computed at the "after sections, before native add_block" point so an
         importer reproduces it identically after replaying the sections (its UTXO
-        is likewise pre-native-apply, and account/exchange reflect the replayed
-        sections). Each domain falls back to its empty root if unavailable.
+        is likewise pre-native-apply, and account/exchange/token reflect the
+        replayed sections). Each domain falls back to its empty root if unavailable.
 
-        NOTE: the token domain is currently bound at its EMPTY (zero) root —
-        ``unified_state_root`` defaults it — because token state is not yet a
-        consensus object (deployed out-of-band on one node), so a real token root
-        would diverge across nodes. It is wired to the live ``get_token_balances_root``
-        only once token deploy/transfer flow through consensus (Phase E spot inc4).
+        The token domain binds the live ``get_token_balances_root`` — token state is
+        now a consensus object (deploy/transfer flow through the exchange section and
+        flush to the ledger on every node, see Phase E spot inc4), so the per-node
+        token root converges and is safe to enforce.
         """
-        from ..crypto.hashing import unified_state_root
+        from ..crypto.hashing import unified_state_root, TOKEN_ZERO_ROOT
         try:
             utxo_root = await self.db.get_unspent_outputs_hash()
         except Exception:
@@ -696,7 +695,11 @@ class ValidatorNode:
             exchange_root = ExchangeStateManager.get_instance().compute_state_root()
         except Exception:
             exchange_root = "0" * 128
-        return unified_state_root(utxo_root or "0" * 64, account_root, exchange_root)
+        try:
+            token_root = await self.db.get_token_balances_root()
+        except Exception:
+            token_root = TOKEN_ZERO_ROOT
+        return unified_state_root(utxo_root or "0" * 64, account_root, exchange_root, token_root)
 
     def set_evm_section_producer(self, producer) -> None:
         """
