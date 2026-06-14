@@ -56,6 +56,7 @@ class P2PModule(RPCModule):
         self._evm_apply_section = None         # E-D3b importer hook (main._apply_evm_section_on_import)
         self._exchange_apply_section = None    # D3/Phase E importer hook (main._apply_exchange_section_on_import)
         self._verify_unified_root = None       # E-D4 importer hook (main._verify_unified_state_root)
+        self._check_parent_continuity = None   # parent-continuity hook (main._check_parent_continuity)
         self._enforce_proposer_eligibility = False  # slot-eligibility gate (observe-first)
 
     # ---- wiring (called once at startup from main.py) --------------------
@@ -76,6 +77,7 @@ class P2PModule(RPCModule):
         evm_apply_section=None,
         exchange_apply_section=None,
         verify_unified_root=None,
+        check_parent_continuity=None,
         enforce_proposer_eligibility=False,
     ):
         self._db = db
@@ -91,6 +93,7 @@ class P2PModule(RPCModule):
         self._evm_apply_section = evm_apply_section
         self._exchange_apply_section = exchange_apply_section
         self._verify_unified_root = verify_unified_root
+        self._check_parent_continuity = check_parent_continuity
         self._enforce_proposer_eligibility = enforce_proposer_eligibility
 
     def _require_db(self):
@@ -186,6 +189,17 @@ class P2PModule(RPCModule):
                 )
                 if not ok_elig:
                     return {'ok': False, 'error': f'Proposer ineligible: {elig_err}'}
+
+                # Parent-hash continuity (observe-first): the block's parent_hash
+                # must match the local tip, else it is on a fork. Injected hook
+                # (main._check_parent_continuity); observe-only for now.
+                if self._check_parent_continuity is not None:
+                    try:
+                        ok_par, par_err = await self._check_parent_continuity(block_no, block_content)
+                    except Exception as e:
+                        ok_par, par_err = True, f"parent-continuity check error: {e}"
+                    if not ok_par:
+                        return {'ok': False, 'error': f'Parent discontinuity: {par_err}'}
 
                 # D3: securely validate + replay the exchange section (verify
                 # signatures, re-execute, match the declared exchange_state_root)

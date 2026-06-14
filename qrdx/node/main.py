@@ -79,6 +79,17 @@ _ENFORCE_PROPOSER_ELIGIBILITY = True
 # legitimate reorgs never cross finality (0 crossings; deterministic boundary).
 _ENFORCE_FINALITY_REORG_GUARD = True
 
+# Parent-hash continuity on import (observe-first). The import path validates
+# height-sequentiality but NOT that a block's declared parent_hash matches the
+# local chain tip — so a fork block can be appended on a mismatched parent,
+# leaving a broken parent linkage (get_block_by_id(h) returns a non-canonical
+# block whose hash != the next block's parent_hash). This was found via the RANDAO
+# observe mix diverging on a node that had a stale block at height 2 whose child's
+# parent it never stored. OBSERVE = log the mismatch; ENFORCE (later) = reject so
+# the caller reorgs to the correct parent. Enforcing is also the gate for binding
+# RANDAO into proposer selection (needs one canonical block per height).
+_ENFORCE_PARENT_CONTINUITY = False
+
 # Kademlia DHT integration
 from qrdx.p2p.node import Node as P2PNode, Address as P2PAddress, hex_to_node_id as p2p_hex_to_node_id
 from qrdx.p2p.routing import RoutingTable, KBucketEntry
@@ -1044,6 +1055,44 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
 # catching-up node can still transiently differ mid-reorg), only on stable
 # live-broadcast import — see _verify_unified_state_root.
 _ED4_ENFORCE_UNIFIED_ROOT = True
+
+
+async def _check_parent_continuity(block_height, block_content, enforce: bool = False) -> Tuple[bool, str]:
+    """
+    Verify a block's declared ``parent_hash`` equals the local tip (the stored
+    block at ``block_height - 1``). The import path otherwise only checks that
+    heights are sequential, so a fork block can be appended on a mismatched parent
+    — leaving a broken linkage where ``get_block_by_id(h).hash`` != the next
+    block's ``parent_hash`` (a non-canonical block stranded at height h).
+
+    Genesis (height 0) has no parent → always ok. On mismatch: ``enforce`` rejects
+    (so the caller can reorg to the correct parent); otherwise it logs and accepts
+    (observe). Returns ``(ok, error)``.
+    """
+    if not block_height or block_height <= 0:
+        return True, ""
+    from ..validator.block_verification import _parse_block_content
+    try:
+        bc = _parse_block_content(block_content)
+        declared_parent = bc.get("parent_hash")
+    except Exception:
+        return True, ""  # unparseable content is the proposer-sig check's job
+    if not declared_parent:
+        return True, ""
+    try:
+        parent_block = await db.get_block_by_id(block_height - 1)
+    except Exception:
+        parent_block = None
+    local_tip = (parent_block.get("hash") or parent_block.get("block_hash")) if parent_block else None
+    if local_tip and declared_parent != local_tip:
+        msg = (f"parent_hash mismatch at height {block_height}: declared "
+               f"{str(declared_parent)[:16]}..., local tip {str(local_tip)[:16]}... "
+               f"(block is on a fork)")
+        if enforce:
+            return False, msg
+        logger.warning(f"[parent-continuity observe] {msg}")
+        return True, ""
+    return True, ""
 
 
 async def _verify_unified_state_root(block_content, enforce: Optional[bool] = None) -> Tuple[bool, str]:
@@ -2320,6 +2369,16 @@ async def process_and_create_block(block_info: dict) -> bool:
             logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {elig_err}")
             return False
 
+        # Parent-hash continuity (observe-first): the block's declared parent_hash
+        # must equal the local tip's hash, else this block is on a fork and
+        # appending it would break the height→block linkage. OBSERVE: warn only.
+        ok_par, par_err = await _check_parent_continuity(
+            block_height, block_content, enforce=_ENFORCE_PARENT_CONTINUITY,
+        )
+        if not ok_par:
+            logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {par_err}")
+            return False
+
         # D3/E-D3b: replay the exchange section (if any) before storing. Strict
         # (reject-on-mismatch) when a root is declared (live broadcast); trust-
         # replay (adopt) when syncing canonical history with no bound root.
@@ -2864,6 +2923,8 @@ async def startup():
         evm_apply_section=_apply_evm_section_on_import,  # E-D3b importer hook
         exchange_apply_section=_apply_exchange_section_on_import,  # D3/Phase E importer hook (flushes collateral)
         verify_unified_root=_verify_unified_state_root,  # E-D4 importer hook
+        check_parent_continuity=_check_parent_continuity,  # parent-continuity observe hook
+
         enforce_proposer_eligibility=_ENFORCE_PROPOSER_ELIGIBILITY,  # slot-eligibility gate
     )
 
