@@ -129,8 +129,10 @@
    behind with a scenario failure (relying on the periodic sync/reorg poll to heal
    is too slow). **Safe enforce needs (1) the mismatch to ACTIVELY drive a reorg onto
    the declared-parent chain immediately, and (2) a deterministic tie-break for
-   equal-height equivalent forks** — the real fork-choice work. Until then keep
-   observe; RANDAO selection stays on the zero constant (this is its gate).
+   equal-height equivalent forks** — the real fork-choice work, now designed in
+   **`docs/FORK_CHOICE_CONVERGENCE.md`** (two mechanisms + lowest-hash canonical
+   rule + observe→soak→enforce rollout + the RANDAO-mix convergence proof). Until
+   then keep observe; RANDAO selection stays on the zero constant (this is its gate).
 
 6. **`from_hex`/`from_bytes` caller audit. — ✅ DONE.** Core primitive hardened
    (raises rather than inventing identity), with an actionable error message.
