@@ -207,13 +207,20 @@
        nodes 1–3 hold the identical consensus-replicated ledger (deployer 999000 +
        recipient 1000) with matching token roots.** Tests: `test_token_ledger_db.py`
        (7), `test_token_consensus_ops.py` (7), s14 (8); suite 14/14.
-     - ⏳ inc4b: migrate `token_deployer`/s05 to deploy via consensus `TOKEN_DEPLOY`
-       (removes the out-of-band single-node writes that still pollute the proposer).
-     - ⏳ inc3-final: bind the REAL `get_token_balances_root` into proposer/importer/
-       REST (safe once inc4b lands so every node has identical token state).
-     - ⏳ inc5: spot swap/liquidity settle trader↔pool token deltas (pool needs a
-       deterministic holder address; reconcile in-memory AMM reserves ↔ real
-       `token_balances`).
+     - ✅ inc4b: s05/s06 are qRC-20/AMM **library** tests that wrote token_balances
+       out-of-band to node0 (polluting its root). Redirected both to a standalone
+       `token_lib.db`; node DBs now carry only consensus token state (all 4 nodes 1
+       identical token root).
+     - ✅ inc3-final: proposer + importer (E-D4 **enforced**) + REST now bind the REAL
+       `get_token_balances_root`. The token ledger is cryptographically committed and
+       enforced in every block. Verified: 14/14, after s14 all 4 nodes 1 unique token
+       root, 0 E-D4 mismatches. **→ token state is a real, enforced, convergent 4th
+       consensus domain.**
+     - ⏳ inc5 (last mile): spot swap + liquidity settle real token deltas. A swap
+       moves trader↔POOL (pool = deterministic holder); conservation requires the pool
+       be funded first, so `_op_add_liquidity`/`_op_create_pool` must settle (LP→pool)
+       before `_op_swap` (trader↔pool). Use token ADDRESSES on the consensus path (the
+       legacy AMM keys by symbol) — build a fresh s15, leave s06/s12 alone.
      - ⏳ inc6: flip `ENFORCE_SPOT_SETTLEMENT=True` + soak.
 
 ## 🔒 Process gates (cannot be satisfied in-repo)
