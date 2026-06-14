@@ -216,12 +216,21 @@
        enforced in every block. Verified: 14/14, after s14 all 4 nodes 1 unique token
        root, 0 E-D4 mismatches. **→ token state is a real, enforced, convergent 4th
        consensus domain.**
-     - ⏳ inc5 (last mile): spot swap + liquidity settle real token deltas. A swap
-       moves trader↔POOL (pool = deterministic holder); conservation requires the pool
-       be funded first, so `_op_add_liquidity`/`_op_create_pool` must settle (LP→pool)
-       before `_op_swap` (trader↔pool). Use token ADDRESSES on the consensus path (the
-       legacy AMM keys by symbol) — build a fresh s15, leave s06/s12 alone.
-     - ⏳ inc6: flip `ENFORCE_SPOT_SETTLEMENT=True` + soak.
+     - ✅ inc5: spot AMM settlement. `pool_holder_address` = deterministic token-ledger
+       holder of pool reserves; `_op_add_liquidity` escrows token0/token1 (V3 amount
+       formula) LP→pool, `_op_remove_liquidity` pool→LP, `_op_swap` trader↔pool (pool
+       resolved by token pair). New s15: deploy 2 tokens → pool over addresses → add
+       liquidity → swap. Verified: conservation (each token = its 1,000,000 supply),
+       pool holds real escrowed reserves.
+     - ✅ inc6: `ENFORCE_SPOT_SETTLEMENT=True`. `preload_token_balances` feeds the
+       sufficiency checks on every path; add_liquidity gained an LP-sufficiency check.
+       Verified: suite 15/15 enforced, all 4 nodes 1 unique token root, every token
+       conserves. **→ spot settlement is real, enforced, convergent.**
+
+   **✅ PHASE E COMPLETE.** Every economic operation now moves real, consensus-tracked
+   value: EVM gas (py-evm), perp margin + PnL (account_state — enforced, convergent,
+   reorg-safe), and spot deploy/transfer/swap/liquidity (the QRC-20 token ledger — an
+   enforced 4th unified-state-root domain). Only the process gates below remain.
 
 ## 🔒 Process gates (cannot be satisfied in-repo)
 
