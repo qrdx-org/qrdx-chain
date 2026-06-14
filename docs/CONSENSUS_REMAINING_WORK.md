@@ -106,6 +106,24 @@
    Accumulate RANDAO reveals into the mix (kept consistent across nodes) for
    unbiased/unpredictable proposer selection.
 
+   **OBSERVE primitive BUILT (June 2026).** `qrdx/validator/randao.py`
+   `compute_randao_mix(db, up_to_height)` folds every canonical block's reveal into
+   a mix — a pure, deterministic, reorg-safe function of the chain (so cross-node
+   convergence is automatic, no transport to wire). Exposed at `/get_randao_mix`.
+   Selection is UNCHANGED (still the zero constant) → zero consensus risk. Tests:
+   `test_randao_accumulation.py` (6).
+
+   **ENFORCE GATE found (observe phase): block-history must converge first.** The
+   mix folds *every* block's reveal, so it surfaces block-level history divergence
+   that cumulative *state* roots mask. A clean 4-node run that converged on ONE
+   unified state root still had one node on a different block at height 2 (an
+   equivalent-state genesis-slot fork that never reconciled) → it folds a different
+   reveal → different mix. RANDAO must not drive selection (eligibility is enforced)
+   until block history converges to one canonical block per height — a deterministic
+   canonical-block tie-break, or extending the finality reorg guard to reconcile
+   equivalent-state forks. Then switch selection (proposer + the
+   `block_verification` verifier) onto the live mix together.
+
 6. **`from_hex`/`from_bytes` caller audit. — ✅ DONE.** Core primitive hardened
    (raises rather than inventing identity), with an actionable error message.
    Audited callers: the consensus/validator path passes the public key; the only
