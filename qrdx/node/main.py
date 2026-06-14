@@ -3435,6 +3435,31 @@ async def get_unified_state_root():
         return {'ok': False, 'error': str(e)}
 
 
+@app.get("/get_randao_mix")
+async def get_randao_mix():
+    """
+    The accumulated RANDAO mix (observe-first) — a deterministic fold of every
+    canonical block's proposer reveal (see qrdx.validator.randao). All honest nodes
+    on the same chain MUST report an identical mix; this endpoint is how that
+    cross-node convergence is confirmed before the mix drives proposer selection.
+
+    NOTE: proposer selection still uses the constant zero mix today, so this is
+    observational — it does not yet affect consensus.
+    """
+    try:
+        from ..validator.randao import compute_randao_mix
+        tip = (await db.get_next_block_id()) - 1
+        mix = await compute_randao_mix(db, tip)
+        return {'ok': True, 'result': {
+            'randao_mix': mix.hex(),
+            'height': tip,
+            'drives_selection': False,
+        }}
+    except Exception as e:
+        logger.error(f"get_randao_mix error: {e}")
+        return {'ok': False, 'error': str(e)}
+
+
 @app.post("/push_block")
 @limiter.limit("12/minute")
 async def push_block(
