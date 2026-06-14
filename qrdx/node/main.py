@@ -989,17 +989,20 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
     if not ex_section:
         return True, ""
     from ..exchange.block_processor import (
-        decode_exchange_txs, preload_sender_balances, flush_exchange_balance_deltas,
-        flush_token_balance_deltas, ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT,
+        decode_exchange_txs, preload_sender_balances, preload_token_balances,
+        flush_exchange_balance_deltas, flush_token_balance_deltas,
+        ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT,
     )
     from ..exchange.state_manager import ExchangeStateManager
     mgr = ExchangeStateManager.get_instance()
     mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
     mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
-    # Phase E: pre-load senders' real balances so the collateral check can read
-    # them during the sync section processing.
+    # Phase E: pre-load senders' real QRDX + token balances so the collateral and
+    # spot-sufficiency checks can read them during the sync section processing.
     try:
-        await preload_sender_balances(db, decode_exchange_txs(ex_section), mgr)
+        _decoded = decode_exchange_txs(ex_section)
+        await preload_sender_balances(db, _decoded, mgr)
+        await preload_token_balances(db, _decoded, mgr)
     except Exception as e:
         logger.debug(f"exchange balance pre-load skipped at block {block_height}: {e}")
 

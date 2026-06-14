@@ -399,11 +399,21 @@ class ExchangeStateManager:
 
         tick_lower, tick_upper = int(p["tick_lower"]), int(p["tick_upper"])
         liquidity = Decimal(str(p["amount"]))
-        position = pool.add_liquidity(tx.sender, tick_lower, tick_upper, liquidity)
-        # Phase E spot: escrow the deposited token0/token1 from the LP into the pool
-        # holder so reserves are real, conserved token balances (sqrt_price/tick are
-        # unchanged by an LP add, so post-add amounts equal the deposited amounts).
+        # Phase E spot: the deposited token0/token1 amounts (sqrt_price/tick are
+        # unchanged by an LP add, so computing them pre-add equals the deposit).
         amt0, amt1 = self._cl_token_amounts(pool, tick_lower, tick_upper, liquidity)
+        # Under enforcement the LP must actually hold the tokens it escrows — else a
+        # clamp-at-0 debit on the flush would mint reserves from nothing.
+        if self.enforce_spot_settlement:
+            for tok, amt in ((pool.state.token0, amt0), (pool.state.token1, amt1)):
+                av = self.available_token_balance(tx.sender, tok)
+                if av is not None and av < amt:
+                    return ExchangeExecResult(
+                        success=False,
+                        error=f"insufficient {tok[:10]} for liquidity: need {amt}, available {av}",
+                    )
+        position = pool.add_liquidity(tx.sender, tick_lower, tick_upper, liquidity)
+        # Escrow the deposited tokens LP→pool holder (real, conserved balances).
         holder = self.pool_holder_address(pool.state.id)
         self._settle_token_move(tx.sender, holder, pool.state.token0, amt0)
         self._settle_token_move(tx.sender, holder, pool.state.token1, amt1)

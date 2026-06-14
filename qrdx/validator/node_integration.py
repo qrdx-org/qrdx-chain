@@ -387,16 +387,18 @@ class ValidatorNode:
                         try:
                             from ..exchange.block_processor import (
                                 process_exchange_transactions, preload_sender_balances,
-                                flush_exchange_balance_deltas, flush_token_balance_deltas,
+                                preload_token_balances, flush_exchange_balance_deltas,
+                                flush_token_balance_deltas,
                                 ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT,
                             )
                             from ..exchange.state_manager import ExchangeStateManager
                             mgr = ExchangeStateManager.get_instance()
                             mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
                             mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
-                            # Phase E: pre-load senders' real balances for the
-                            # collateral check during processing.
+                            # Phase E: pre-load senders' real QRDX + token balances for
+                            # the collateral + spot-sufficiency checks during processing.
                             await preload_sender_balances(self.db, exchange_txs, mgr)
+                            await preload_token_balances(self.db, exchange_txs, mgr)
                             ok, err, root = process_exchange_transactions(
                                 next_height, float(block_timestamp), exchange_txs, mgr,
                             )

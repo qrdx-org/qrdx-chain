@@ -53,9 +53,11 @@ ENFORCE_EXCHANGE_COLLATERAL = True
 # that overspends warns but still executes). True = ENFORCE (reject the overspend).
 # This gate is independent of whether token balances MOVE: token deploy/transfer
 # always flush to the ledger (new consensus domain — see flush_token_balance_deltas);
-# the gate only governs rejection strictness. Flip to True after a soak once token
-# state is consensus-replicated and its root is bound (Phase E spot inc3-final/inc6).
-ENFORCE_SPOT_SETTLEMENT = False
+# the gate only governs rejection strictness. ENABLED (inc6): token state is
+# consensus-replicated (inc4) with its root bound + enforced in the unified root
+# (inc3-final), and the spot-sufficiency checks read pre-loaded token balances
+# (preload_token_balances) on every path, so rejection is deterministic + convergent.
+ENFORCE_SPOT_SETTLEMENT = True
 
 
 async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:
@@ -78,6 +80,39 @@ async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeState
             mgr.set_available_balance(sender, await db.get_address_balance(sender))
         except Exception as e:
             logger.debug("preload_sender_balances: %s for %s", e, str(sender)[:20])
+
+
+async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:
+    """
+    Phase E (spot): pre-load the (holder, token) balances the block's spot ops will
+    spend, from the real token ledger, BEFORE the (sync) section runs — so the
+    sufficiency checks (swap token_in, transfer amount, add-liquidity token0/token1)
+    can read them. Deterministic: ``db.get_token_balance`` reads the same ledger on
+    every node at this point. Scans op params for the (sender, token) pairs to load.
+    """
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    mgr.clear_available_token_balances()
+    from .transactions import ExchangeOpType
+    wanted = set()
+    for tx in txs or []:
+        sender = getattr(tx, "sender", None)
+        p = getattr(tx, "params", None) or {}
+        op = getattr(tx, "op_type", None)
+        if not sender:
+            continue
+        if op == ExchangeOpType.SWAP and p.get("token_in"):
+            wanted.add((sender, str(p["token_in"])))
+        elif op == ExchangeOpType.TOKEN_TRANSFER and p.get("token_address"):
+            wanted.add((sender, str(p["token_address"])))
+        elif op == ExchangeOpType.ADD_LIQUIDITY:
+            for k in ("token0", "token1"):
+                if p.get(k):
+                    wanted.add((sender, str(p[k])))
+    for holder, token in wanted:
+        try:
+            mgr.set_available_token_balance(holder, token, await db.get_token_balance(token, holder))
+        except Exception as e:
+            logger.debug("preload_token_balances: %s for (%s,%s)", e, str(holder)[:16], str(token)[:16])
 
 
 async def flush_exchange_balance_deltas(db, state_manager: Optional[ExchangeStateManager] = None,
@@ -351,6 +386,7 @@ async def rebuild_exchange_state_from_chain(
         if flush_to_account_state:
             try:
                 await preload_sender_balances(db, txs, mgr)
+                await preload_token_balances(db, txs, mgr)
             except Exception as e:
                 logger.debug("rebuild_exchange_state preload skipped at %d: %s", height, e)
         ok, err, _root = process_exchange_transactions(height, ts, txs, mgr)
