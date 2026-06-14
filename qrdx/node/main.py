@@ -85,9 +85,17 @@ _ENFORCE_FINALITY_REORG_GUARD = True
 # leaving a broken parent linkage (get_block_by_id(h) returns a non-canonical
 # block whose hash != the next block's parent_hash). This was found via the RANDAO
 # observe mix diverging on a node that had a stale block at height 2 whose child's
-# parent it never stored. OBSERVE = log the mismatch; ENFORCE (later) = reject so
-# the caller reorgs to the correct parent. Enforcing is also the gate for binding
-# RANDAO into proposer selection (needs one canonical block per height).
+# parent it never stored. OBSERVE = log the mismatch; ENFORCE = reject the fork
+# block (never append it on a mismatched parent).
+#
+# KEPT OBSERVE — a 6-run enforce soak showed naive reject-on-mismatch is UNSAFE:
+# rejecting a fork block and relying on the *periodic* sync/reorg loop to heal is
+# too slow/incomplete. run5: 2 rejections fired yet block history still diverged
+# (2 RANDAO mixes at equal height); run6: a node fell 3 blocks behind and a
+# scenario FAILED (the heal didn't catch up in time). Safe enforce needs the
+# rejection to ACTIVELY + promptly drive a reorg onto the declared-parent chain
+# (not wait for the poll) AND resolve equal-height equivalent forks — the larger
+# fork-choice work. Until then keep observe (zero consensus impact).
 _ENFORCE_PARENT_CONTINUITY = False
 
 # Kademlia DHT integration
