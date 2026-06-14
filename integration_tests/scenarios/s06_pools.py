@@ -13,6 +13,7 @@ from decimal import Decimal
 from integration_tests.pool_operator import PoolOperator
 from integration_tests.scenarios.base import Scenario
 from integration_tests.token_deployer import TokenDeployer
+from integration_tests.scenarios.s05_tokens import token_lib_db_path
 
 
 class S06Pools(Scenario):
@@ -21,7 +22,8 @@ class S06Pools(Scenario):
     depends_on = ["s05_tokens"]
 
     async def execute(self) -> None:
-        db_path = self.ctx.db_paths[0]
+        # Same standalone scratch DB s05 used — NOT a node DB (see token_lib_db_path).
+        db_path = token_lib_db_path(self.ctx)
         wallets = self.ctx.wallets
 
         pool_creator = wallets.get("Pool Creator")

@@ -12,9 +12,22 @@ Every operation hits the real QRC20Token in-memory logic AND persists
 to SQLite via TokenPersistence. No stubs.
 """
 
+import os
 from decimal import Decimal
 from integration_tests.scenarios.base import Scenario
 from integration_tests.token_deployer import TokenDeployer
+
+
+def token_lib_db_path(ctx) -> str:
+    """Standalone scratch DB for the qRC-20 / AMM *library* tests (s05, s06).
+
+    Deliberately NOT a live node DB: token state written here must never leak into
+    a node's ``token_balances``, because tokens are now a CONSENSUS object (Phase E
+    spot) — out-of-band writes to a node would pollute its token-balances root and
+    diverge it from the rest of the network. Consensus token deploy/transfer is
+    exercised separately by s14. This isolates the library-semantics coverage.
+    """
+    return os.path.join(os.path.dirname(ctx.db_paths[0]), "token_lib.db")
 
 
 class S05Tokens(Scenario):
@@ -23,7 +36,14 @@ class S05Tokens(Scenario):
     depends_on = ["s03_block_production"]
 
     async def execute(self) -> None:
-        db_path = self.ctx.db_paths[0]
+        db_path = token_lib_db_path(self.ctx)
+        # Fresh scratch DB each run (deploy uses INSERT — a stale row would trip the
+        # UNIQUE constraint). The live node DBs are left untouched.
+        for p in (db_path, db_path + "-wal", db_path + "-shm"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
         wallets = self.ctx.wallets
 
         deployer_wallet = wallets.get("Token Deployer")
