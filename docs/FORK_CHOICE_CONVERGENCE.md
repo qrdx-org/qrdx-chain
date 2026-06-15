@@ -7,6 +7,19 @@
 > **Companion:** `CONSENSUS_REMAINING_WORK.md` items 3 (finality) & 5 (RANDAO);
 > memory `block-history-fork-vs-state-convergence`.
 
+## Update (2026-06-15): the primary reliability cause was a reorg bug, now fixed
+
+Characterizing the intermittent failures (below) first surfaced a **separate,
+dominant bug**: `rebuild_account_state_from_chain` raised `name 'logger' is not
+defined` (an undefined module logger in `evm_block_apply.py`, from a Phase E
+genesis-reseed addition), so **every reorg aborted mid-rebuild and the diverged node
+never healed**. That — not the fork-choice gaps below — caused most of the
+fork-correlated flakiness (12/13 runs with height spread 2-4). Fixed by defining the
+logger; a 6-run soak then passed cleanly with height spread ≤1. The fork-choice work
+below remains for the *rarer* residual case: an equal-height equivalent fork where
+both chains are the same length so the longest-chain reorg never fires — visible only
+through the RANDAO-mix probe, and the gate for RANDAO-driven selection.
+
 ## The problem
 
 Two valid blocks can exist at the **same height** when proposers at adjacent slots
