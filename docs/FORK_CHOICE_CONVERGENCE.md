@@ -79,6 +79,19 @@ pick the SAME one. Options:
 
 Pick lowest-hash. It is a pure function of the blocks, so all nodes agree.
 
+### Re-soak finding (2026-06-15): mechanism-1 enforce is safe but insufficient
+
+After the logger fix, `_ENFORCE_PARENT_CONTINUITY=True` was re-soaked: **6/6 runs
+pass** (one fired 15 parent-rejections and still fully converged), so rejecting a
+fork block heals cleanly once reorgs complete — the earlier "unsafe" verdict was the
+reorg bug, not the reject. **But it does not fully converge block history**: a
+genesis-era equal-height fork still persisted (a node held block1 from one fork +
+block2 from another → 1 broken link, 2 RANDAO mixes) on a node with **no reorg in its
+log** — so the fork block reached it via a path the import parent-check does NOT cover
+(genesis bootstrap and/or proposer self-build). Implications for the plan below:
+mechanism-1 must also (a) cover those paths, and (b) be paired with mechanism-2; only
+then enforce.
+
 ### Mechanism 1 — parent-continuity + active reorg (block at the next height)
 
 On import of a block at `next_block_id` whose `parent_hash != local_tip.hash`:
