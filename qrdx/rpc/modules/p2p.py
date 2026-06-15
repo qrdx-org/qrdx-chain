@@ -104,6 +104,36 @@ class P2PModule(RPCModule):
     # BLOCK ENDPOINTS
     # =====================================================================
 
+    async def _observe_equal_height_fork(self, block_no, block_data, block_content) -> None:
+        """Fork-choice convergence (mechanism-2, OBSERVE). Compare an incoming block
+        at an already-filled height to the one we stored: if they share a parent but
+        differ, it's an equal-height fork — log whether the incoming would WIN the
+        lowest-hash canonical rule. Pure logging; never mutates state."""
+        from ...validator.block_verification import _parse_block_content
+        stored = await self._db.get_block_by_id(block_no)
+        if not stored:
+            return
+        stored_hash = stored.get("hash") or stored.get("block_hash")
+        incoming_hash = block_data.get("block_hash")
+        if not stored_hash or not incoming_hash or stored_hash == incoming_hash:
+            return  # same block (a re-broadcast) — not a fork
+        try:
+            inc_parent = _parse_block_content(block_content).get("parent_hash")
+            stored_parent = _parse_block_content(
+                stored.get("content") or stored.get("block_content")).get("parent_hash")
+        except Exception:
+            inc_parent = stored_parent = None
+        if inc_parent and stored_parent and inc_parent != stored_parent:
+            return  # different parent → not an equal-height equivalent fork
+        incoming_wins = str(incoming_hash) < str(stored_hash)  # lowest-hash rule
+        logger.warning(
+            "[fork-choice observe] equal-height fork at h=%d: stored=%s incoming=%s "
+            "-> %s would win (lowest-hash); mechanism-2 reorg would %s",
+            block_no, str(stored_hash)[:12], str(incoming_hash)[:12],
+            "incoming" if incoming_wins else "stored",
+            "REPLACE" if incoming_wins else "keep",
+        )
+
     @rpc_method
     async def submitBlock(self, block_data: Dict) -> Dict:
         """
@@ -144,6 +174,18 @@ class P2PModule(RPCModule):
             next_block_id = await self._db.get_next_block_id()
 
             if next_block_id > block_no:
+                # Mechanism-2 observe (fork-choice convergence): a block at an
+                # already-filled height is dropped as "too old". When it is a
+                # COMPETING block at the just-filled tip (same parent, different
+                # hash), it's an equal-height fork — log whether it would WIN the
+                # lowest-hash canonical rule vs the block we stored. Observe-only
+                # (still dropped); gathers convergence data without touching
+                # consensus. See docs/FORK_CHOICE_CONVERGENCE.md.
+                if block_no == next_block_id - 1:
+                    try:
+                        await self._observe_equal_height_fork(block_no, block_data, block_content)
+                    except Exception:
+                        pass
                 return {'ok': False, 'error': 'Too old block'}
 
             if next_block_id < block_no:
