@@ -88,14 +88,15 @@ _ENFORCE_FINALITY_REORG_GUARD = True
 # parent it never stored. OBSERVE = log the mismatch; ENFORCE = reject the fork
 # block (never append it on a mismatched parent).
 #
-# KEPT OBSERVE — a 6-run enforce soak showed naive reject-on-mismatch is UNSAFE:
-# rejecting a fork block and relying on the *periodic* sync/reorg loop to heal is
-# too slow/incomplete. run5: 2 rejections fired yet block history still diverged
-# (2 RANDAO mixes at equal height); run6: a node fell 3 blocks behind and a
-# scenario FAILED (the heal didn't catch up in time). Safe enforce needs the
-# rejection to ACTIVELY + promptly drive a reorg onto the declared-parent chain
-# (not wait for the poll) AND resolve equal-height equivalent forks — the larger
-# fork-choice work. Until then keep observe (zero consensus impact).
+# Mechanism-1 enforce is now PROVEN SAFE (post-logger-fix re-soak: 6/6 pass, incl. a
+# run with 15 parent-rejections that still fully converged — so the first soak's run6
+# fall-behind was the reorg-abort bug, NOT the reject). BUT it is INSUFFICIENT alone:
+# a genesis-era equal-height fork still persists (a node ended with block1 from one
+# fork + block2 from another → 1 broken link, 2 RANDAO mixes, with NO reorg in its
+# log — the fork block reached it via a path the import check doesn't cover, i.e.
+# genesis bootstrap / proposer self-build). Full convergence needs mechanism-2
+# (equal-height tie-break) + covering that path. Kept OBSERVE (minimal footprint,
+# known-good) until both land and can be enforced together. See FORK_CHOICE_CONVERGENCE.md.
 _ENFORCE_PARENT_CONTINUITY = False
 
 # Kademlia DHT integration
