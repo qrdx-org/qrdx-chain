@@ -99,6 +99,15 @@ _ENFORCE_FINALITY_REORG_GUARD = True
 # known-good) until both land and can be enforced together. See FORK_CHOICE_CONVERGENCE.md.
 _ENFORCE_PARENT_CONTINUITY = False
 
+# Fork-choice mechanism-2 (equal-height tie-break). When a competing block arrives
+# at the just-filled tip (same parent, different hash) and WINS the lowest-hash
+# canonical rule, the p2p path rolls back the losing tip + rebuilds derived state
+# (via _tiebreak_rollback) then re-accepts the winner — converging block history to
+# one canonical block per height (the RANDAO-selection gate). Observe-first: with
+# this False the p2p path only logs the comparison and keeps the stored block.
+# Flip True only after the soak shows 1 unique RANDAO mix across nodes.
+_ENFORCE_EQUAL_HEIGHT_TIEBREAK = False
+
 # Kademlia DHT integration
 from qrdx.p2p.node import Node as P2PNode, Address as P2PAddress, hex_to_node_id as p2p_hex_to_node_id
 from qrdx.p2p.routing import RoutingTable, KBucketEntry
@@ -2495,8 +2504,53 @@ async def process_and_create_block(block_info: dict) -> bool:
     if not await create_block(block_content, transactions):
         logger.warning(f"Sync failed: Invalid block received from peer at height {block_height}.")
         return False
-        
+
     return True
+
+
+async def _rebuild_derived_state_after_rollback():
+    """Rebuild all derived state (account/EVM, token ledger, exchange) from the
+    canonical blocks up to the CURRENT tip — i.e. after a ``db.remove_blocks(...)``
+    rollback. Shared by ``handle_reorganization`` (longest-chain reorg) and the
+    equal-height tie-break (mechanism-2). Order matters: reset the durable
+    account_state to a clean genesis+EVM base FIRST, then clear the token ledger,
+    then let the exchange rebuild re-apply collateral debits + token moves on top.
+    Each step is best-effort + logged (a rebuild failure must not crash the caller)."""
+    if EVM_STATE_MANAGER is not None:
+        try:
+            from ..contracts.evm_block_apply import rebuild_account_state_from_chain
+            await rebuild_account_state_from_chain(db, EVM_STATE_MANAGER, _evm_defer_execute())
+        except Exception as e:
+            logger.error(f"[REORG] EVM/account state rebuild failed: {e}")
+    else:
+        try:
+            await db.clear_account_state()
+            await db.seed_genesis_account_state()
+            await db.connection.commit()
+        except Exception as e:
+            logger.error(f"[REORG] account_state genesis reseed failed: {e}")
+
+    try:
+        await db.clear_token_balances()
+    except Exception as e:
+        logger.error(f"[REORG] token ledger clear failed: {e}")
+
+    try:
+        from ..exchange.block_processor import rebuild_exchange_state_from_chain
+        await rebuild_exchange_state_from_chain(db, flush_to_account_state=True)
+    except Exception as e:
+        logger.error(f"[REORG] Exchange state rebuild failed: {e}")
+
+
+async def _tiebreak_rollback(block_no: int) -> None:
+    """Fork-choice mechanism-2: roll back the losing block at the contested tip
+    (height ``block_no``) and rebuild derived state to ``block_no - 1``, so the
+    p2p path can then re-accept the lowest-hash-winning competing block at that
+    height via its normal validated flow. Holds the block-processing lock at the
+    call site (p2p.submitBlock)."""
+    await db.remove_blocks(block_no)
+    await _rebuild_derived_state_after_rollback()
+    logger.warning("[fork-choice ENFORCE] rolled back contested tip h=%d for equal-height replacement", block_no)
 
 
 async def handle_reorganization(node_interface: NodeInterface, local_height: int):
@@ -2592,46 +2646,10 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
     logger.info(f"[REORG] Rolling back local chain to block {last_common_block_id}.")
     await db.remove_blocks(last_common_block_id + 1)
 
-    # E-D3b reorg safety: account_state is durable, so a rolled-back block's
-    # account changes remain committed — rebuild EVM/account state to the new
-    # canonical tip (clears account_state, reseeds genesis, replays canonical EVM
-    # sections). This runs FIRST so the durable ledger is reset to a clean
-    # genesis+EVM base BEFORE the exchange rebuild below re-applies its collateral
-    # debits on top (a flush before this clear would be wiped). When EVM is
-    # disabled, clear+reseed genesis directly so the same clean base exists.
-    if EVM_STATE_MANAGER is not None:
-        try:
-            from ..contracts.evm_block_apply import rebuild_account_state_from_chain
-            await rebuild_account_state_from_chain(db, EVM_STATE_MANAGER, _evm_defer_execute())
-        except Exception as e:
-            logger.error(f"[REORG] EVM/account state rebuild failed: {e}")
-    else:
-        try:
-            await db.clear_account_state()
-            await db.seed_genesis_account_state()
-            await db.connection.commit()
-        except Exception as e:
-            logger.error(f"[REORG] account_state genesis reseed failed: {e}")
-
-    # Phase E spot reorg safety: clear the durable token ledger so the exchange
-    # rebuild below re-applies the canonical token deploys/transfers onto a clean
-    # base (the registry is re-created idempotently). Mirrors the account_state
-    # clear+reseed above.
-    try:
-        await db.clear_token_balances()
-    except Exception as e:
-        logger.error(f"[REORG] token ledger clear failed: {e}")
-
-    # D3 + Phase E reorg safety: rebuild exchange state to the new canonical tip so
-    # the orphaned blocks' exchange effects are dropped, AND re-flush each canonical
-    # block's collateral debits onto the freshly reseeded account_state ledger (it
-    # was just cleared above, so the live debits are gone and must be replayed) +
-    # its token moves onto the freshly cleared token ledger.
-    try:
-        from ..exchange.block_processor import rebuild_exchange_state_from_chain
-        await rebuild_exchange_state_from_chain(db, flush_to_account_state=True)
-    except Exception as e:
-        logger.error(f"[REORG] Exchange state rebuild failed: {e}")
+    # E-D3b + Phase E reorg safety: rebuild all derived state (account/EVM, token
+    # ledger, exchange) from the canonical blocks up to the rolled-back tip. Shared
+    # with the equal-height tie-break path.
+    await _rebuild_derived_state_after_rollback()
 
     logger.info(f"[REORG] Re-adding {len(orphaned_txs)} orphaned transactions to the pending pool.")
     for tx in orphaned_txs:
@@ -2933,6 +2951,8 @@ async def startup():
         exchange_apply_section=_apply_exchange_section_on_import,  # D3/Phase E importer hook (flushes collateral)
         verify_unified_root=_verify_unified_state_root,  # E-D4 importer hook
         check_parent_continuity=_check_parent_continuity,  # parent-continuity observe hook
+        tiebreak_rollback=_tiebreak_rollback,  # fork-choice mechanism-2 rollback hook
+        enforce_equal_height_tiebreak=_ENFORCE_EQUAL_HEIGHT_TIEBREAK,  # mechanism-2 gate
 
         enforce_proposer_eligibility=_ENFORCE_PROPOSER_ELIGIBILITY,  # slot-eligibility gate
     )
