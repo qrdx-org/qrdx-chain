@@ -108,6 +108,16 @@ On import of a block at `next_block_id` whose `parent_hash != local_tip.hash`:
 3. If the declared-parent chain is not better under the canonical rule, reject and
    stay put (the local chain wins; the peer will reorg to us).
 
+### Mechanism 2 — confirmed firing (2026-06-15)
+
+A 4-run measurement counting both observe types: run1 logged **10 equal-height
+`fork-choice observe` hits** (+ 8 mechanism-1), the others 0 (no fork). So equal-height
+competing blocks genuinely reach nodes (~1/4 runs forky), and mechanism-2 is real, not
+hypothetical. Crucially every run still passed 15/15 — so mechanism-2 is NOT needed for
+height/state convergence (mechanism-1 + the working reorg handle that), only for
+**perfect block-history convergence**, i.e. the RANDAO-selection gate. This sets its
+priority: implement when RANDAO selection is wanted, not for general reliability.
+
 ### Mechanism 2 — equal-height replacement (block at a filled height)
 
 On import of a valid, eligible block at an *already-filled* height H (currently a
