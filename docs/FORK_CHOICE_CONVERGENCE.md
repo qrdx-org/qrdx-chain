@@ -146,6 +146,47 @@ fork-aware store could retain orphans for faster re-org, but is not required.)
 4. **Then** bind RANDAO into selection: switch `block_verification`'s verifier AND
    the proposer onto the live `compute_randao_mix` together (item 5).
 
+## Mechanism-2 enforce — ready-to-execute implementation spec
+
+The full trace is done; an implementer can follow this directly.
+
+**Reuse the rollback+rebuild sequence** at `main.handle_reorganization`
+(main.py ≈ L2592–2634): `db.remove_blocks(N+1)` → `rebuild_account_state_from_chain`
+(or clear+`seed_genesis_account_state` when EVM disabled) → `db.clear_token_balances`
+→ `rebuild_exchange_state_from_chain(db, flush_to_account_state=True)`. Extract these
+~40 lines into `async def _rebuild_derived_state_after_rollback()` and call it from
+BOTH `handle_reorganization` and the new path (refactor carefully — this is the
+just-fixed reorg path; keep behaviour identical, re-soak after extracting).
+
+**New gated hook** in main.py:
+```
+_ENFORCE_EQUAL_HEIGHT_TIEBREAK = False   # observe→soak→enforce, like the others
+
+async def _adopt_equal_height_winner(block_no, block_data) -> bool:
+    if not _ENFORCE_EQUAL_HEIGHT_TIEBREAK:
+        return False
+    await db.remove_blocks(block_no)                 # drop the losing tip block
+    await _rebuild_derived_state_after_rollback()    # roll state back to block_no-1
+    return await process_and_create_block(_to_block_info(block_data))  # import winner
+```
+Adapt `block_data` (p2p submitBlock shape) to the `block_info` dict
+`process_and_create_block` expects (see its callers). The winner shares parent H-1
+with the loser, so no chain fetch is needed — it imports cleanly on the rebuilt tip.
+
+**Wire** into `p2p.submitBlock._observe_equal_height_fork`: when `incoming_wins` and
+the flag is on, call the injected hook (mirror `check_parent_continuity` injection)
+instead of just logging; on success the "too old" return becomes an adoption.
+
+**Lowest-hash rule** is already implemented in `_observe_equal_height_fork`
+(`incoming_hash < stored_hash`) and is the deterministic canonical choice.
+
+**Soak gate before enabling:** flip the flag, run ≥6–8 `--force` rounds, require
+every round: suite green, `Final height spread == 0`, 0 broken parent links, and the
+decisive probe — **1 unique `compute_randao_mix` across all 4 nodes**. Only then leave
+the flag True. (Beware: the equal-height fork also reaches nodes via genesis bootstrap
+/ proposer self-build — paths the import hook doesn't cover — so confirm the RANDAO
+mix actually converges, not just that the suite passes.)
+
 ## Success criteria (the convergence proof)
 
 Across ≥6 clean `--force` runs with both mechanisms enforced:
