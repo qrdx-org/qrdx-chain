@@ -14,11 +14,12 @@ dominant bug**: `rebuild_account_state_from_chain` raised `name 'logger' is not
 defined` (an undefined module logger in `evm_block_apply.py`, from a Phase E
 genesis-reseed addition), so **every reorg aborted mid-rebuild and the diverged node
 never healed**. That — not the fork-choice gaps below — caused most of the
-fork-correlated flakiness (12/13 runs with height spread 2-4). Fixed by defining the
-logger; a 6-run soak then passed cleanly with height spread ≤1. The fork-choice work
-below remains for the *rarer* residual case: an equal-height equivalent fork where
-both chains are the same length so the longest-chain reorg never fires — visible only
-through the RANDAO-mix probe, and the gate for RANDAO-driven selection.
+fork-correlated flakiness (~⅓ of runs failing 12/13 with height spread 2-4). Fixed by
+defining the logger; the post-fix soak went to **10/11 runs passing** (height spread
+≤1, 0 reorg errors) — a major reliability gain. The fork-choice work below remains
+for the *rare* residual (~1/11): an equal-height equivalent fork where both chains are
+the same length so the longest-chain reorg never fires — visible through the
+RANDAO-mix probe, and the gate for RANDAO-driven selection.
 
 ## The problem
 
