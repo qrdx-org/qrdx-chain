@@ -3726,6 +3726,16 @@ async def submit_block(
                 )
                 return {'ok': False, 'error': f'Proposer ineligible: {elig_err}'}
 
+            # Parent-hash continuity (observe-first): also instrument the REST
+            # submit_block path — a fork block entering here (which has no parent
+            # check beyond height) is a candidate entry point for the genesis-era
+            # broken-linkage divergence seen with no reorg. Observe = log only.
+            ok_par, par_err = await _check_parent_continuity(
+                block_no, block_content, enforce=_ENFORCE_PARENT_CONTINUITY,
+            )
+            if not ok_par:
+                return {'ok': False, 'error': f'Parent discontinuity: {par_err}'}
+
             # D3: if the block carries an exchange section, securely validate +
             # replay it (verify signatures, re-execute, match declared root)
             # BEFORE storing. Reject the block on any mismatch — local exchange
