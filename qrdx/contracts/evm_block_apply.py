@@ -35,10 +35,13 @@ keeps this module unit-testable with a lightweight fake executor.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 from .evm_mempool import parse_eth_raw_tx
 from .state import ContractStateManager
+
+logger = logging.getLogger(__name__)
 
 # execute_tx(raw_tx_hex, block_height, block_hash, block_timestamp) -> result dict
 #   The callable MUST execute the tx with deferred commit (changes stay in the
