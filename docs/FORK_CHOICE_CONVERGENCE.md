@@ -16,10 +16,16 @@ genesis-reseed addition), so **every reorg aborted mid-rebuild and the diverged 
 never healed**. That — not the fork-choice gaps below — caused most of the
 fork-correlated flakiness (~⅓ of runs failing 12/13 with height spread 2-4). Fixed by
 defining the logger; the post-fix soak went to **10/11 runs passing** (height spread
-≤1, 0 reorg errors) — a major reliability gain. The fork-choice work below remains
-for the *rare* residual (~1/11): an equal-height equivalent fork where both chains are
-the same length so the longest-chain reorg never fires — visible through the
-RANDAO-mix probe, and the gate for RANDAO-driven selection.
+≤1, 0 reorg errors) — a major reliability gain. A follow-up 8-run diagnostic was even
+cleaner: **0 broken parent links in all 8 runs**, and the two runs that *did* fork
+(6 parent-continuity observe hits each) HEALED to zero broken links — i.e. import-path
+forks now reconcile via the working reorg. So the residual below is **rarer than
+1/11** and the practical reliability is high.
+
+The fork-choice work below is therefore **low-urgency hardening**, needed mainly as the
+**gate for RANDAO-driven proposer selection** (which folds every block's reveal and so
+requires perfect block-history convergence): an equal-height equivalent fork where both
+chains are the same length so the longest-chain reorg never fires.
 
 ## The problem
 
