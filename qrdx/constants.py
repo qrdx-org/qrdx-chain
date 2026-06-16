@@ -511,7 +511,11 @@ BOOTSTRAP_NODES = [node.url for node in BOOTSTRAP_NODES_PARSED]
 
 # --- Slot and Epoch Configuration ---
 SLOT_DURATION = 2                      # 2 seconds per slot
-SLOTS_PER_EPOCH = 32                   # 32 slots = 64 seconds per epoch
+# Network parameter: all nodes on a network MUST agree on this (it defines epoch
+# boundaries → finality + validator-lifecycle processing). Overridable via env for
+# test networks that want faster epochs (the integration harness sets it small so
+# epochs fire several times within a short run); production uses the default 32.
+SLOTS_PER_EPOCH = int(os.getenv("QRDX_SLOTS_PER_EPOCH", "32"))
 EPOCHS_PER_SYNC_COMMITTEE = 256        # ~4.5 hours per sync committee period
 
 # --- Sync Committee ---

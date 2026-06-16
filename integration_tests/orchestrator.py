@@ -215,6 +215,10 @@ class TestnetOrchestrator:
             "PYTHONWARNINGS": "ignore",
             "QRDX_RPC_ENABLED": "true",
             "QRDX_DISABLE_RATE_LIMIT": "true",
+            # Faster epochs so epoch-boundary processing (finality + validator
+            # lifecycle) fires several times within a short test run. All nodes get
+            # the same value → consensus-consistent.
+            "QRDX_SLOTS_PER_EPOCH": str(SLOTS_PER_EPOCH),
         }
 
         if spec.is_validator and spec.validator_index is not None:

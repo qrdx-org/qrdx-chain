@@ -656,34 +656,42 @@ class ValidatorNode:
         
         while self._running:
             try:
-                current_slot = await self._get_current_slot()
-                current_epoch = current_slot // SLOTS_PER_EPOCH
+                # Process epochs only once they are FINALIZED. A just-completed
+                # epoch's attestations are still propagating, so different nodes see
+                # different attester sets at that instant and would compute DIVERGENT
+                # reward/penalty deltas (observed: boundary epochs diverged across
+                # nodes while settled middle epochs converged). Gating on the
+                # finalized epoch guarantees every node processes the SAME, converged
+                # attester data → identical validators-table updates. Robust to the
+                # 2s-sampled loop stepping past a boundary (process the backlog in
+                # order up to the finalized epoch).
+                from .finality import update_finality
+                try:
+                    fin = await update_finality(self.db)
+                    finalized_epoch = int(fin.get("finalized_epoch", -1))
+                except Exception as e:
+                    logger.debug(f"epoch loop: finality read failed: {e}")
+                    finalized_epoch = -1
 
-                # Process each COMPLETED epoch exactly once. Keying off
-                # "entered a new epoch" (current_epoch-1 just completed) rather than
-                # the old `current_slot % SLOTS_PER_EPOCH == 0` is robust: the loop
-                # samples every SLOT_DURATION_SECONDS and can step past an exact
-                # slot multiple, which previously skipped the boundary entirely.
-                # Processing the COMPLETED epoch means its attestations are in.
-                completed_epoch = current_epoch - 1
-                if completed_epoch >= 0 and completed_epoch > last_processed_epoch:
-                    logger.info(f"🔄 Processing completed epoch {completed_epoch}")
+                while last_processed_epoch < finalized_epoch:
+                    ep = last_processed_epoch + 1
+                    logger.info(f"🔄 Processing finalized epoch {ep}")
 
                     if lifecycle_mgr is not None:
                         try:
-                            await lifecycle_mgr.process_epoch(completed_epoch)
-                            logger.info(f"✅ Epoch {completed_epoch} lifecycle processed")
+                            await lifecycle_mgr.process_epoch(ep)
+                            logger.info(f"✅ Epoch {ep} lifecycle processed")
                         except Exception as e:
-                            logger.error(f"Legacy lifecycle process_epoch failed for {completed_epoch}: {e}")
+                            logger.error(f"Legacy lifecycle process_epoch failed for {ep}: {e}")
 
                     # Validator-lifecycle unification: deterministic reward/penalty
                     # updates to the consensus validators table (observe-first).
                     try:
-                        await self._epoch_validator_updates(completed_epoch)
+                        await self._epoch_validator_updates(ep)
                     except Exception as e:
-                        logger.error(f"Epoch validator-update failed for epoch {completed_epoch}: {e}")
+                        logger.error(f"Epoch validator-update failed for epoch {ep}: {e}")
 
-                    last_processed_epoch = completed_epoch
+                    last_processed_epoch = ep
                 
                 await asyncio.sleep(SLOT_DURATION_SECONDS)
                 
