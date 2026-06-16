@@ -631,11 +631,25 @@ class ValidatorNode:
         Epoch boundary processing loop.
         Handles rewards, penalties, validator rotation, finalization.
 
-        Delegates to ValidatorLifecycleManager.process_epoch() which
-        handles activation queue, exit queue, and withdrawals.
+        Runs the consensus validator-updates (_epoch_validator_updates) on the
+        `validators` table each completed epoch, plus the legacy LifecycleManager
+        (activation/exit/withdrawal queues) when available.
         """
-        from .lifecycle import ValidatorLifecycleManager
-        lifecycle_mgr = ValidatorLifecycleManager()
+        # BUGFIX: this loop previously imported `ValidatorLifecycleManager`, which
+        # does not exist (the class is `LifecycleManager`) — the ImportError crashed
+        # the coroutine before its first log, so epoch processing NEVER ran and the
+        # validator set stayed frozen at genesis (the core of item 4). Import the
+        # correct name and tolerate its absence so the loop always starts and the
+        # consensus validator-updates below run regardless of the legacy
+        # lifecycle-tables path.
+        try:
+            from .lifecycle import LifecycleManager
+            lifecycle_mgr = LifecycleManager()
+        except Exception as e:
+            logger.warning(
+                "Legacy lifecycle manager unavailable (%s); epoch loop will run "
+                "consensus validator-updates only", e)
+            lifecycle_mgr = None
 
         logger.info("Epoch processing loop started")
         last_processed_epoch: int = -1
@@ -644,24 +658,32 @@ class ValidatorNode:
             try:
                 current_slot = await self._get_current_slot()
                 current_epoch = current_slot // SLOTS_PER_EPOCH
-                
-                # Check if we're at epoch boundary and haven't processed this epoch
-                if current_slot % SLOTS_PER_EPOCH == 0 and current_epoch > last_processed_epoch:
-                    logger.info(f"🔄 Processing epoch {current_epoch} boundary")
-                    
-                    try:
-                        await lifecycle_mgr.process_epoch(current_epoch)
-                        last_processed_epoch = current_epoch
-                        logger.info(f"✅ Epoch {current_epoch} processed: activations/exits applied")
-                    except Exception as e:
-                        logger.error(f"Failed to process epoch {current_epoch}: {e}", exc_info=True)
+
+                # Process each COMPLETED epoch exactly once. Keying off
+                # "entered a new epoch" (current_epoch-1 just completed) rather than
+                # the old `current_slot % SLOTS_PER_EPOCH == 0` is robust: the loop
+                # samples every SLOT_DURATION_SECONDS and can step past an exact
+                # slot multiple, which previously skipped the boundary entirely.
+                # Processing the COMPLETED epoch means its attestations are in.
+                completed_epoch = current_epoch - 1
+                if completed_epoch >= 0 and completed_epoch > last_processed_epoch:
+                    logger.info(f"🔄 Processing completed epoch {completed_epoch}")
+
+                    if lifecycle_mgr is not None:
+                        try:
+                            await lifecycle_mgr.process_epoch(completed_epoch)
+                            logger.info(f"✅ Epoch {completed_epoch} lifecycle processed")
+                        except Exception as e:
+                            logger.error(f"Legacy lifecycle process_epoch failed for {completed_epoch}: {e}")
 
                     # Validator-lifecycle unification: deterministic reward/penalty
                     # updates to the consensus validators table (observe-first).
                     try:
-                        await self._epoch_validator_updates(current_epoch)
+                        await self._epoch_validator_updates(completed_epoch)
                     except Exception as e:
-                        logger.error(f"Epoch validator-update failed for epoch {current_epoch}: {e}")
+                        logger.error(f"Epoch validator-update failed for epoch {completed_epoch}: {e}")
+
+                    last_processed_epoch = completed_epoch
                 
                 await asyncio.sleep(SLOT_DURATION_SECONDS)
                 
