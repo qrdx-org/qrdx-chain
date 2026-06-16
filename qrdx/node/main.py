@@ -105,7 +105,17 @@ _ENFORCE_PARENT_CONTINUITY = False
 # (via _tiebreak_rollback) then re-accepts the winner — converging block history to
 # one canonical block per height (the RANDAO-selection gate). Observe-first: with
 # this False the p2p path only logs the comparison and keeps the stored block.
-# Flip True only after the soak shows 1 unique RANDAO mix across nodes.
+#
+# KEPT OBSERVE — enforce soak (6 runs) showed reactive local replacement DOES NOT
+# converge block history: 4/6 runs still ended with 2 RANDAO mixes (incl. runs where
+# 3-4 replacements fired but the fork persisted, one that raised broken links to 2),
+# and one run failed a scenario. ROOT CAUSE (design limitation, not a bug): on-receipt
+# rollback+replace only converges nodes that actually RECEIVE the winning block — a
+# node that only ever saw the losing fork never triggers the tie-break, so the fork
+# persists network-wide. Global convergence needs ACTIVE reconciliation (gossip the
+# canonical per-height choice, or a periodic fork-choice pass that pulls + adopts the
+# lowest-hash block at contested heights), not passive replacement. The gated
+# implementation stays for that future approach. See FORK_CHOICE_CONVERGENCE.md.
 _ENFORCE_EQUAL_HEIGHT_TIEBREAK = False
 
 # Kademlia DHT integration
