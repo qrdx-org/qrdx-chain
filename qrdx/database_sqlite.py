@@ -1255,6 +1255,115 @@ class DatabaseSQLite:
             validators.append(entry)
         return validators
 
+    async def get_validators_table_hash(self) -> str:
+        """Deterministic hash of the consensus validator set (Validator-lifecycle
+        unification probe). Hashes every validator row in canonical address order
+        over its consensus-relevant fields, so the per-epoch processing can be
+        checked for cross-node convergence (the `validators` table must be identical
+        on every node — eligibility is enforced off it). Empty set → all-zero."""
+        cursor = await self.connection.execute("""
+            SELECT address, effective_stake, status, activation_epoch, exit_epoch,
+                   slashed, total_slashed, total_rewards
+            FROM validators ORDER BY address ASC
+        """)
+        rows = await cursor.fetchall()
+        if not rows:
+            return "0" * 64
+        import hashlib
+        h = hashlib.sha256()
+        for r in rows:
+            h.update(
+                f"{r[0]}:{r[1]}:{r[2]}:{r[3]}:{r[4]}:{int(bool(r[5]))}:{r[6]}:{r[7]}".encode()
+            )
+        return h.hexdigest()
+
+    async def apply_epoch_validator_updates(
+        self, rewards: dict, penalties: dict, activated: list, exited: list,
+        activation_epoch: int, max_effective_balance, enforce: bool = False,
+    ) -> dict:
+        """
+        Validator-lifecycle unification (SQLite port of the PostgreSQL
+        ``epoch_processing._persist_epoch_data`` validators-table writes):
+        deterministically apply an epoch's per-validator deltas to the consensus
+        ``validators`` table —
+          * reward  → effective_stake += reward (clamped to max_effective_balance),
+                      total_rewards += reward
+          * penalty → effective_stake -= penalty (clamped at 0), total_slashed += penalty
+          * activated → status='active', activation_epoch set
+          * exited    → status='exited'
+        All arithmetic is Decimal (the columns are TEXT Decimal strings), so the
+        result is identical on every node. ``enforce=False`` (OBSERVE) computes the
+        new effective_stake per touched validator and returns it WITHOUT writing —
+        for cross-node determinism checks during rollout. Does NOT commit; the
+        caller commits atomically at the epoch boundary. Returns a summary dict.
+        """
+        from decimal import Decimal
+        max_bal = Decimal(str(max_effective_balance)) if max_effective_balance is not None else None
+
+        async def _cur(addr):
+            c = await self.connection.execute(
+                "SELECT effective_stake, total_rewards, total_slashed FROM validators WHERE address = ?",
+                (addr,))
+            return await c.fetchone()
+
+        preview = {}
+        # Rewards
+        for addr, amt in (rewards or {}).items():
+            amt = Decimal(str(amt))
+            if amt <= 0:
+                continue
+            row = await _cur(addr)
+            if not row:
+                continue
+            new_stake = Decimal(str(row[0] or 0)) + amt
+            if max_bal is not None and new_stake > max_bal:
+                new_stake = max_bal
+            new_rewards = Decimal(str(row[1] or 0)) + amt
+            preview[addr] = str(new_stake)
+            if enforce:
+                await self.connection.execute(
+                    "UPDATE validators SET effective_stake = ?, total_rewards = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
+                    (str(new_stake), str(new_rewards), addr))
+        # Penalties
+        for addr, amt in (penalties or {}).items():
+            amt = Decimal(str(amt))
+            if amt <= 0:
+                continue
+            row = await _cur(addr)
+            if not row:
+                continue
+            new_stake = Decimal(str(row[0] or 0)) - amt
+            if new_stake < 0:
+                new_stake = Decimal(0)
+            new_slashed = Decimal(str(row[2] or 0)) + amt
+            preview[addr] = str(new_stake)
+            if enforce:
+                await self.connection.execute(
+                    "UPDATE validators SET effective_stake = ?, total_slashed = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
+                    (str(new_stake), str(new_slashed), addr))
+        # Activations
+        if enforce:
+            for addr in (activated or []):
+                await self.connection.execute(
+                    "UPDATE validators SET status = 'active', activation_epoch = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
+                    (int(activation_epoch), addr))
+            for addr in (exited or []):
+                await self.connection.execute(
+                    "UPDATE validators SET status = 'exited', exit_epoch = COALESCE(exit_epoch, ?), "
+                    "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
+                    (int(activation_epoch), addr))
+        return {
+            "rewarded": len([a for a, v in (rewards or {}).items() if Decimal(str(v)) > 0]),
+            "penalized": len([a for a, v in (penalties or {}).items() if Decimal(str(v)) > 0]),
+            "activated": len(activated or []),
+            "exited": len(exited or []),
+            "effective_stake_preview": preview,
+            "applied": enforce,
+        }
+
     async def get_attestations_filtered(self, filters: dict, limit: int, offset: int):
         """Get attestations with filters"""
         where_clauses = []
