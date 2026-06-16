@@ -24,6 +24,14 @@ logger = get_logger(__name__)
 # Slot duration in seconds (from SLOT_DURATION constant which is in int format)
 SLOT_DURATION_SECONDS = SLOT_DURATION if isinstance(SLOT_DURATION, int) else 12
 
+# Validator-lifecycle unification rollout gate. False = OBSERVE (each epoch the
+# reward/penalty deltas are computed + the would-be validators-table hash is logged,
+# but NOT written → zero consensus impact, used to confirm cross-node determinism).
+# True = ENFORCE (write the deltas to the consensus validators table at each epoch
+# boundary, so effective_stake evolves with participation). Flip only after a soak
+# shows the validators-table hash is identical across all nodes per epoch.
+_ENFORCE_EPOCH_VALIDATOR_UPDATES = False
+
 
 def parse_block_timestamp(ts) -> Optional[datetime]:
     """
@@ -588,7 +596,36 @@ class ValidatorNode:
                 await asyncio.sleep(SLOT_DURATION_SECONDS)
         
         logger.info("Attestation loop stopped")
-    
+
+    async def _epoch_validator_updates(self, epoch: int) -> None:
+        """Validator-lifecycle unification: deterministically reward/penalize the
+        active validator set in the consensus `validators` table based on this
+        epoch's attestation participation, then log the table hash so cross-node
+        convergence is observable. OBSERVE by default (`_ENFORCE_EPOCH_VALIDATOR_UPDATES`
+        False → computed + logged, not written); when enforced it writes + commits.
+        Pure deterministic inputs (validators table + epoch attesters), so every
+        node computes the same deltas → the table stays identical. See
+        docs/VALIDATOR_LIFECYCLE_UNIFICATION.md (Phase 1b/2)."""
+        from .epoch_rewards import compute_epoch_reward_deltas
+        from .epoch_processing import MAX_EFFECTIVE_BALANCE
+        active = await self.db.get_validators(status="active")
+        attesters = await self.db.get_epoch_attesters(epoch)
+        rewards, penalties = compute_epoch_reward_deltas(active, attesters)
+        res = await self.db.apply_epoch_validator_updates(
+            rewards, penalties, activated=[], exited=[], activation_epoch=epoch,
+            max_effective_balance=MAX_EFFECTIVE_BALANCE,
+            enforce=_ENFORCE_EPOCH_VALIDATOR_UPDATES,
+        )
+        if _ENFORCE_EPOCH_VALIDATOR_UPDATES:
+            await self.db.connection.commit()
+        vhash = await self.db.get_validators_table_hash()
+        logger.info(
+            "[epoch-validators %s] epoch=%d active=%d rewarded=%d penalized=%d "
+            "validators_hash=%s",
+            "ENFORCE" if _ENFORCE_EPOCH_VALIDATOR_UPDATES else "observe",
+            epoch, len(active), res["rewarded"], res["penalized"], vhash[:16],
+        )
+
     async def _epoch_processing_loop(self):
         """
         Epoch boundary processing loop.
@@ -618,6 +655,13 @@ class ValidatorNode:
                         logger.info(f"✅ Epoch {current_epoch} processed: activations/exits applied")
                     except Exception as e:
                         logger.error(f"Failed to process epoch {current_epoch}: {e}", exc_info=True)
+
+                    # Validator-lifecycle unification: deterministic reward/penalty
+                    # updates to the consensus validators table (observe-first).
+                    try:
+                        await self._epoch_validator_updates(current_epoch)
+                    except Exception as e:
+                        logger.error(f"Epoch validator-update failed for epoch {current_epoch}: {e}")
                 
                 await asyncio.sleep(SLOT_DURATION_SECONDS)
                 
