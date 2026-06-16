@@ -292,6 +292,8 @@ class DatabaseSQLite:
             activation_epoch INTEGER,
             exit_epoch INTEGER,
             slashed BOOLEAN NOT NULL DEFAULT 0,
+            total_slashed TEXT NOT NULL DEFAULT '0',
+            total_rewards TEXT NOT NULL DEFAULT '0',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -417,7 +419,21 @@ class DatabaseSQLite:
         
         await self.connection.executescript(schema)
         await self.connection.commit()
-        
+
+        # Idempotent additive migrations for columns added after a DB was first
+        # created (CREATE TABLE IF NOT EXISTS won't add them to an existing table).
+        # Each ADD COLUMN is wrapped so a re-run (column already present) is a no-op.
+        _migrations = [
+            "ALTER TABLE validators ADD COLUMN total_slashed TEXT NOT NULL DEFAULT '0'",
+            "ALTER TABLE validators ADD COLUMN total_rewards TEXT NOT NULL DEFAULT '0'",
+        ]
+        for stmt in _migrations:
+            try:
+                await self.connection.execute(stmt)
+            except Exception:
+                pass  # duplicate column — already migrated
+        await self.connection.commit()
+
     async def remove_all_pending_transactions(self):
         """Clear pending transaction pool"""
         await self.connection.execute("DELETE FROM pending_transactions")
