@@ -146,7 +146,35 @@ fork-aware store could retain orphans for faster re-org, but is not required.)
 4. **Then** bind RANDAO into selection: switch `block_verification`'s verifier AND
    the proposer onto the live `compute_randao_mix` together (item 5).
 
-## Mechanism-2 enforce — ready-to-execute implementation spec
+## Mechanism-2 enforce — IMPLEMENTED, SOAKED, FOUND INSUFFICIENT (2026-06-16)
+
+The spec below was implemented (gated `_ENFORCE_EQUAL_HEIGHT_TIEBREAK`, default OFF):
+extracted `_rebuild_derived_state_after_rollback`, added `_tiebreak_rollback`, and
+wired p2p `submitBlock` to roll back the losing tip + re-accept the lowest-hash winner.
+A 6-run enforce soak showed **passive on-receipt replacement does NOT converge block
+history**: only 2/6 runs reached 1 RANDAO mix (the no-fork runs); 4/6 stayed at 2 mixes
+even when 3–4 replacements fired, and one run failed a scenario.
+
+**Why (design limitation, not a bug):** a node only runs the tie-break for a competing
+block it actually RECEIVES. A node that only ever saw the *losing* fork never gets the
+winner, so it never replaces — the fork persists network-wide, and replacing on the
+nodes that *do* receive the winner just churns their state without global agreement.
+
+**Redirect — mechanism-2 needs ACTIVE reconciliation, not passive replacement:**
+- Option A (pull-based): a periodic fork-choice pass — each node, for recent
+  not-yet-finalized heights, asks peers for their block hash at that height and adopts
+  the lowest-hash one (rollback+re-accept via the existing `_tiebreak_rollback`). This
+  guarantees every node converges because every node actively queries, regardless of
+  what it received.
+- Option B (gossip-based): gossip a compact per-height canonical-hash vector; a node
+  behind the canonical choice triggers the same rollback+adopt.
+Both reuse the gated machinery already in place (`_tiebreak_rollback` +
+`_rebuild_derived_state_after_rollback`); only the TRIGGER changes from "on receipt of a
+competing block" to "active query/gossip". Soak gate unchanged: 1 unique RANDAO mix
+across all nodes. The on-receipt path can stay as an opportunistic fast-path under the
+same flag once reconciliation guarantees convergence.
+
+## Mechanism-2 enforce — ready-to-execute implementation spec (passive path; see redirect above)
 
 The full trace is done; an implementer can follow this directly.
 
