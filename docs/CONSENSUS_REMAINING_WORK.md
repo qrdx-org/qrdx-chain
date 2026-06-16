@@ -101,6 +101,30 @@
    into a single converged source. Until then the active set is effectively the
    genesis set. Needed before dynamic validator membership.
 
+   **Scoped (June 2026) — it is TWO disconnected data models, not a quick port.**
+   - Consensus reads the **`validators`** table: `db.get_validators()` →
+     `block_verification.expected_proposer_for_slot` (proposer selection +
+     eligibility, enforced) and `finality` (stake weights).
+   - The lifecycle subsystem (`validator/lifecycle.py` `ValidatorLifecycleManager`,
+     `validator/epoch_processing.py`) operates on SEPARATE tables
+     (`lifecycle_validators`, `lifecycle_deposits`) and is run by
+     `node_integration._epoch_processing_loop` → `process_epoch(epoch)` at each
+     epoch boundary. So even when it runs, it never touches the table consensus
+     reads → the active set stays at genesis.
+   - Worse, `epoch_processing.py` still has **PostgreSQL-only SQL** (`$1/$3`,
+     `pool.acquire()`, `NOW()`, `LEAST(...)`), so on the SQLite testnet
+     `process_epoch` raises and the loop swallows it (`logger.error("Failed to
+     process epoch ...")`) — the same PG-only issue fixed for finality earlier.
+   - **Work:** (a) port the lifecycle/epoch-processing SQL to SQLite; (b) UNIFY the
+     model so the lifecycle-managed set IS the `validators` table consensus reads
+     (either write activations/exits/stake-updates into `validators` at the epoch
+     boundary, or point `get_validators` at the lifecycle tables) — pick one
+     canonical source; (c) deposits/withdrawals must flow from real
+     staking transactions into that source; (d) observe→soak→enforce, since this
+     changes who may propose (eligibility is enforced — a divergent set halts a
+     node). Validator-set convergence + the Dilithium key-identity fix from the
+     earlier arc are the prerequisite that makes this safe to attempt.
+
 5. **RANDAO accumulation.** `_randao_mix` is constant (all-zeros) network-wide, so
    proposer selection is deterministic but NOT unpredictable — a known weakness.
    Accumulate RANDAO reveals into the mix (kept consistent across nodes) for
