@@ -2940,7 +2940,18 @@ async def startup():
                 logger.error(f"❌ Validator initialization error: {e}", exc_info=True)
         else:
             logger.warning(f"⚠️  Validator wallet not found: {validator_wallet_path}")
-    
+
+    # ---- Validator-lifecycle unification: consensus validator-set epoch processing ----
+    # Runs on EVERY node (validator or full) so the `validators` table converges
+    # network-wide as a deterministic function of finalized epochs (Phase 2d). A full
+    # node verifies proposer eligibility off this table, so it must evolve identically.
+    try:
+        from ..validator.epoch_loop import epoch_validator_update_loop
+        app.state.epoch_validator_task = asyncio.create_task(epoch_validator_update_loop(db))
+        logger.info("✅ Consensus epoch validator-update loop scheduled (all nodes)")
+    except Exception as e:
+        logger.warning(f"Could not start epoch validator-update loop: {e}")
+
     # ---- Wire module-level RPC server into app.state ----
     app.state.dht_rpc_module = dht_rpc_module
     app.state.rpc_server = rpc_server

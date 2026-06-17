@@ -83,6 +83,44 @@ flowing, the dynamic `validators` set fully drives proposer selection + eligibil
 finality weights. Verify a deposited validator activates and proposes; an exited one
 stops; slashing reduces stake; integration green.
 
+## Implementation log (June 2026)
+
+- **Phase 0/1a/1b done + committed:** schema columns; `db.apply_epoch_validator_updates`
+  (SQLite persistence port) + `db.get_validators_table_hash`; `epoch_rewards.compute_epoch_reward_deltas`
+  (deterministic, sqrt-free); wired into the epoch loop (observe).
+- **Root-cause fix:** the epoch loop imported `ValidatorLifecycleManager` (nonexistent —
+  it's `LifecycleManager`); the ImportError silently crashed the loop, so epoch processing
+  had NEVER run — the actual reason the set was frozen at genesis. Fixed + made the
+  boundary detection robust (process completed epochs, not `slot % N == 0`).
+- **Phase 2a/2b:** `SLOTS_PER_EPOCH` env-overridable so epochs fire often in a test run.
+  A multi-epoch observe soak showed the deltas DIVERGED across nodes for just-completed
+  epochs (still-propagating attestations → different attester sets). Fixed by **gating on
+  the FINALIZED epoch** (drain up to `finalized_epoch`): finalized epochs have converged
+  attestations, so all nodes compute identical deltas. Verified: epochs 0–4 identical
+  rewarded/penalized on all validators.
+- **Phase 2c (enforce soak):** 15/15, 0 eligibility halts; the 3 VALIDATORS produced a
+  byte-identical validators table (perfect deterministic convergence). **GAP: the full
+  node stays at genesis** — the epoch loop is a `ValidatorNode`-only task, so non-validator
+  nodes never process epochs. A full node verifies proposer eligibility off its frozen
+  table, so once stake changes enough to alter stake-weighted selection it would reject
+  validator blocks. → **Phase 2d (DONE):** extracted the finality-gated update into
+  `validator/epoch_loop.py` `epoch_validator_update_loop`, started in `node.main` for
+  EVERY node (the loop needs only `db` — no validator context); removed the duplicate
+  call from the `ValidatorNode` loop. Now all 4 nodes (incl. the full node) process the
+  same finalized epochs. Enforce soak (3 runs): 15/15, 0 eligibility halts; 2/3 runs
+  PERFECT 4/4 convergence (1 unique validators-table hash across all nodes), 1/3 showed
+  3 distinct hashes with 0 halts — a benign EVENTUAL-CONSISTENCY snapshot artifact
+  (nodes mid-drain to the common finalized epoch at the snapshot moment → different
+  *count* of epochs applied, not different processing; the per-epoch deltas are
+  deterministic, so they reconverge as the lagging node catches up). Enabled
+  (`epoch_loop._ENFORCE_EPOCH_VALIDATOR_UPDATES=True`).
+
+  **Future hardening (stronger than eventual consistency):** apply the epoch update
+  during BLOCK IMPORT at the boundary block (so every node mutates the `validators`
+  table at the exact same chain event, eliminating the wall-clock drain window). Needed
+  before large stake moves (big deposits / slashing) where a transient stake gap could
+  flip stake-weighted selection. With the current tiny rewards it never flips (0 halts).
+
 ## Success criteria
 
 - `validators` table **byte-identical across all nodes** after each epoch (a

@@ -684,12 +684,11 @@ class ValidatorNode:
                         except Exception as e:
                             logger.error(f"Legacy lifecycle process_epoch failed for {ep}: {e}")
 
-                    # Validator-lifecycle unification: deterministic reward/penalty
-                    # updates to the consensus validators table (observe-first).
-                    try:
-                        await self._epoch_validator_updates(ep)
-                    except Exception as e:
-                        logger.error(f"Epoch validator-update failed for epoch {ep}: {e}")
+                    # NOTE: the consensus validators-table update is NOT done here —
+                    # it runs in qrdx.validator.epoch_loop.epoch_validator_update_loop,
+                    # started for ALL nodes (validators + full) so the set converges
+                    # network-wide (Phase 2d). This loop keeps only the legacy
+                    # lifecycle-tables tracking.
 
                     last_processed_epoch = ep
                 
