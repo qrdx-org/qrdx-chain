@@ -67,6 +67,39 @@ async def test_get_validators_to_exit(db):
     assert await db.get_validators_to_exit(4) == ["0xE"]
 
 
+async def test_stake_deposit_op_records_and_flush_registers_pending(db):
+    """STAKE_DEPOSIT op records a deterministic deposit; the flush registers a
+    pending validator (the consensus join path)."""
+    from types import SimpleNamespace
+    from qrdx.exchange.state_manager import ExchangeStateManager
+    from qrdx.exchange.block_processor import flush_validator_lifecycle_deltas
+
+    mgr = ExchangeStateManager()
+    mgr.begin_block(1, 0.0)
+    tx = SimpleNamespace(sender="0xPQnewval", nonce=0,
+                         params={"validator_public_key": "pkNEW", "stake_amount": "100000"})
+    res = mgr._op_stake_deposit(tx)
+    assert res.success and res.data["status"] == "pending"
+    ops = mgr.validator_lifecycle_ops()
+    assert ops == [{"type": "deposit", "address": "0xPQnewval",
+                    "public_key": "pkNEW", "stake": "100000"}]
+
+    await flush_validator_lifecycle_deltas(db, mgr)
+    await db.connection.commit()
+    row = await _status(db, "0xPQnewval")
+    assert row[0] == "pending" and Decimal(row[1]) == Decimal("100000") and row[2] is None  # unscheduled
+
+
+async def test_stake_deposit_rejects_nonpositive(db):
+    from types import SimpleNamespace
+    from qrdx.exchange.state_manager import ExchangeStateManager
+    mgr = ExchangeStateManager()
+    mgr.begin_block(1, 0.0)
+    res = mgr._op_stake_deposit(SimpleNamespace(
+        sender="0xz", nonce=0, params={"validator_public_key": "pk", "stake_amount": "0"}))
+    assert not res.success and "positive" in res.error
+
+
 async def test_pending_activates_at_scheduled_epoch(db):
     # Full flow: register pending @ activation_epoch=2, then run the epoch update.
     await db.register_pending_validator("0xV1", "pk1", Decimal("5000"), activation_epoch=2)

@@ -396,7 +396,7 @@ class ValidatorNode:
                             from ..exchange.block_processor import (
                                 process_exchange_transactions, preload_sender_balances,
                                 preload_token_balances, flush_exchange_balance_deltas,
-                                flush_token_balance_deltas,
+                                flush_token_balance_deltas, flush_validator_lifecycle_deltas,
                                 ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT,
                             )
                             from ..exchange.state_manager import ExchangeStateManager
@@ -418,6 +418,7 @@ class ValidatorNode:
                                 await flush_exchange_balance_deltas(
                                     self.db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
                                 await flush_token_balance_deltas(self.db, mgr)
+                                await flush_validator_lifecycle_deltas(self.db, mgr)
                                 exchange_state_root = root
                                 logger.info(
                                     f"📦 Including {len(exchange_txs)} exchange tx(s) in "

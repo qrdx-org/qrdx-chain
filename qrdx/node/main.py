@@ -1030,6 +1030,7 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
     from ..exchange.block_processor import (
         decode_exchange_txs, preload_sender_balances, preload_token_balances,
         flush_exchange_balance_deltas, flush_token_balance_deltas,
+        flush_validator_lifecycle_deltas,
         ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT,
     )
     from ..exchange.state_manager import ExchangeStateManager
@@ -1055,6 +1056,7 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
             # token ledger (before the E-D4 root check, so both domains reflect).
             await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
             await flush_token_balance_deltas(db, mgr)
+            await flush_validator_lifecycle_deltas(db, mgr)
         return ok, err
     # Trust-replay (sync): adopt the canonical section's computed root.
     try:
@@ -1067,6 +1069,7 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
             mgr.commit_block()
             await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
             await flush_token_balance_deltas(db, mgr)
+            await flush_validator_lifecycle_deltas(db, mgr)
         else:
             logger.warning(f"Exchange section trust-replay failed at block {block_height}: {err}")
         return True, ""

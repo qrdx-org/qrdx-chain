@@ -61,6 +61,8 @@ class ExchangeOpType(IntEnum):
     CREATE_MARKET = 12
     TOKEN_DEPLOY = 13
     TOKEN_TRANSFER = 14
+    STAKE_DEPOSIT = 15
+    STAKE_EXIT = 16
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +316,14 @@ class ExchangeTransaction:
                 if key not in p:
                     raise ValueError(f"TOKEN_TRANSFER missing param: {key}")
 
+        elif op == ExchangeOpType.STAKE_DEPOSIT:
+            for key in ("validator_public_key", "stake_amount"):
+                if key not in p:
+                    raise ValueError(f"STAKE_DEPOSIT missing param: {key}")
+
+        elif op == ExchangeOpType.STAKE_EXIT:
+            pass  # the sender exits their own validator; no extra params
+
     # -- Identification -----------------------------------------------------
 
     def is_exchange_transaction(self) -> bool:
@@ -344,4 +354,6 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.CREATE_MARKET: 100_000,
     ExchangeOpType.TOKEN_DEPLOY: 120_000,
     ExchangeOpType.TOKEN_TRANSFER: 40_000,
+    ExchangeOpType.STAKE_DEPOSIT: 150_000,
+    ExchangeOpType.STAKE_EXIT: 80_000,
 }

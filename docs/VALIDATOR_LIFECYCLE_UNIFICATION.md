@@ -120,6 +120,27 @@ stops; slashing reduces stake; integration green.
   table at the exact same chain event, eliminating the wall-clock drain window). Needed
   before large stake moves (big deposits / slashing) where a transient stake gap could
   flip stake-weighted selection. With the current tiny rewards it never flips (0 halts).
+- **Phase 3a (DONE + committed):** membership machinery on the consensus table —
+  `db.register_pending_validator` (deposit → `'pending'` row), `db.get_validators_to_activate(epoch)`
+  / `get_validators_to_exit(epoch)` (schedule-respecting selection), and the end-to-end
+  pending→active activation via `apply_epoch_validator_updates` at the scheduled epoch.
+- **Phase 3b (DONE — deposit/JOIN path):** a consensus `STAKE_DEPOSIT` exchange op
+  (`ExchangeOpType.STAKE_DEPOSIT=15`, validated for `validator_public_key` + positive
+  `stake_amount`, gas 150k) records a deterministic `{type:'deposit', address, public_key,
+  stake}` entry in the per-block `_validator_lifecycle_ops` list. `block_processor.flush_validator_lifecycle_deltas`
+  (wired into every import path — `main._apply_exchange_section_on_import` both branches,
+  the proposer, and the reorg rebuild) calls `register_pending_validator(activation_epoch=None)`,
+  inserting the new validator as `'pending'` with an UNSCHEDULED activation. The epoch loop
+  then assigns the activation epoch deterministically at the FINALIZED epoch
+  (`schedule_pending_activations(epoch + ACTIVATION_DELAY_EPOCHS)`) so every node picks the
+  same activation epoch — never at deposit-import time (which would drift across nodes).
+  Activation/exit selection runs each finalized epoch via `get_validators_to_activate/_to_exit`.
+  Tests: `test_stake_deposit_op_records_and_flush_registers_pending`,
+  `test_stake_deposit_rejects_nonpositive` (+ existing membership suite, 7/7); op-count
+  integration assert 14→16. Clean `--force` integration run **15/15 (100%)**, 0 eligibility
+  halts; `STAKE_EXIT=16` op is defined but its flush is **DEFERRED to Phase 3c** (removing a
+  live validator at import opens a transient-window/halt risk — needs the deterministic
+  active→exiting transition at a finalized epoch, not at import).
 
 ## Success criteria
 

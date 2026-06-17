@@ -1364,8 +1364,34 @@ class DatabaseSQLite:
             "applied": enforce,
         }
 
+    async def schedule_pending_activations(self, activation_epoch: int) -> int:
+        """Phase 3: assign an activation epoch to any just-deposited PENDING validator
+        that has none yet (activation_epoch IS NULL). Called deterministically by the
+        all-nodes epoch loop at a finalized epoch, so every node schedules the same
+        validators to the same epoch. Returns the count scheduled. No commit."""
+        cur = await self.connection.execute(
+            "UPDATE validators SET activation_epoch = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE status = 'pending' AND activation_epoch IS NULL", (int(activation_epoch),))
+        return cur.rowcount if cur.rowcount is not None else 0
+
+    async def schedule_pending_exits(self, exit_epoch: int) -> int:
+        """Phase 3: assign an exit epoch to any validator marked 'exiting' without one
+        (exit_epoch IS NULL). Deterministic (epoch-loop driven). No commit."""
+        cur = await self.connection.execute(
+            "UPDATE validators SET exit_epoch = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE status = 'exiting' AND exit_epoch IS NULL", (int(exit_epoch),))
+        return cur.rowcount if cur.rowcount is not None else 0
+
+    async def mark_validator_exiting(self, address: str) -> bool:
+        """Phase 3 (voluntary exit): move an active validator to 'exiting' (exit_epoch
+        scheduled later by the epoch loop). No-op if not currently active. No commit."""
+        cur = await self.connection.execute(
+            "UPDATE validators SET status = 'exiting', updated_at = CURRENT_TIMESTAMP "
+            "WHERE address = ? AND status = 'active'", (address,))
+        return bool(cur.rowcount)
+
     async def register_pending_validator(self, address: str, public_key: str, stake,
-                                          activation_epoch: int) -> bool:
+                                          activation_epoch=None) -> bool:
         """
         Validator-lifecycle Phase 3 (staking deposit / join): insert a PENDING
         validator into the consensus ``validators`` table, scheduled to activate at
@@ -1390,7 +1416,8 @@ class DatabaseSQLite:
         await self.connection.execute(
             "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
             "activation_epoch) VALUES (?, ?, ?, ?, 'pending', ?)",
-            (address, public_key, s, s, int(activation_epoch)))
+            (address, public_key, s, s,
+             int(activation_epoch) if activation_epoch is not None else None))
         return True
 
     async def get_validators_to_activate(self, current_epoch: int) -> list:

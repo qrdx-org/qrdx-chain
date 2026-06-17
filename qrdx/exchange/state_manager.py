@@ -165,6 +165,10 @@ class ExchangeStateManager:
         # token_registry alongside the balance deltas. Deterministic metadata
         # (replicated on every node); the value-bearing state is the balance root.
         self._token_registry_ops: List[Dict[str, Any]] = []
+        # Per-block validator-lifecycle ops (STAKE_DEPOSIT / STAKE_EXIT) to flush to
+        # the consensus validators table. Deterministic (same txs on every node),
+        # reset per block. See qrdx.validator.epoch_loop for activation scheduling.
+        self._validator_lifecycle_ops: List[Dict[str, Any]] = []
         # Spot settlement enforcement gate (set by the node when enforcing): when
         # True, a transfer/swap rejects if the holder lacks sufficient balance.
         self.enforce_spot_settlement: bool = False
@@ -206,6 +210,7 @@ class ExchangeStateManager:
         self._balance_deltas = {}  # Phase E: reset per-block balance deltas
         self._token_balance_deltas = {}  # Phase E (spot): reset per-block token deltas
         self._token_registry_ops = []    # Phase E (spot): reset per-block registry creations
+        self._validator_lifecycle_ops = []  # Phase 3: reset per-block staking deposit/exit ops
 
         # Reset per-block rate limits on all order books
         for book in self._order_books.values():
@@ -340,6 +345,8 @@ class ExchangeStateManager:
             ExchangeOpType.CREATE_MARKET: self._op_create_market,
             ExchangeOpType.TOKEN_DEPLOY: self._op_token_deploy,
             ExchangeOpType.TOKEN_TRANSFER: self._op_token_transfer,
+            ExchangeOpType.STAKE_DEPOSIT: self._op_stake_deposit,
+            ExchangeOpType.STAKE_EXIT: self._op_stake_exit,
         }
         handler = handlers.get(tx.op_type)
         if handler is None:
@@ -708,6 +715,44 @@ class ExchangeStateManager:
     def token_registry_ops(self) -> List[Dict[str, Any]]:
         """This block's accumulated token registry creations (TOKEN_DEPLOY)."""
         return list(self._token_registry_ops)
+
+    def _op_stake_deposit(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Validator-lifecycle Phase 3: a staking deposit registers the SENDER as a
+        validator. Records a deterministic 'deposit' op (address=sender, the supplied
+        validator public key, stake) flushed to the consensus validators table as a
+        PENDING validator; the all-nodes epoch loop schedules + activates it (so every
+        node agrees on membership). Stake collateral-locking is a documented follow-on."""
+        p = tx.params
+        try:
+            stake = Decimal(str(p["stake_amount"]))
+        except Exception:
+            return ExchangeExecResult(success=False, error="STAKE_DEPOSIT: invalid stake_amount")
+        if stake <= 0:
+            return ExchangeExecResult(success=False, error="STAKE_DEPOSIT: stake must be positive")
+        self._validator_lifecycle_ops.append({
+            "type": "deposit", "address": tx.sender,
+            "public_key": str(p["validator_public_key"]), "stake": str(stake),
+        })
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.STAKE_DEPOSIT],
+            data={"validator": tx.sender, "stake": str(stake), "status": "pending"},
+        )
+
+    def _op_stake_exit(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Validator-lifecycle Phase 3: the sender signals a voluntary exit. Records a
+        deterministic 'exit' op; the all-nodes epoch loop schedules exit_epoch and moves
+        the validator exiting→exited."""
+        self._validator_lifecycle_ops.append({"type": "exit", "address": tx.sender})
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.STAKE_EXIT],
+            data={"validator": tx.sender, "status": "exiting"},
+        )
+
+    def validator_lifecycle_ops(self) -> List[Dict[str, Any]]:
+        """This block's accumulated staking deposit/exit ops (Phase 3)."""
+        return list(self._validator_lifecycle_ops)
 
     def _op_open_position(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params

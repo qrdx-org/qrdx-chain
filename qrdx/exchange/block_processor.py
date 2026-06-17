@@ -172,6 +172,40 @@ async def flush_token_balance_deltas(db, state_manager: Optional[ExchangeStateMa
         except Exception as e:
             logger.warning("flush_token: delta %s for (%s,%s)", e, str(holder)[:16], str(token)[:16])
 
+
+async def flush_validator_lifecycle_deltas(db, state_manager: Optional[ExchangeStateManager] = None) -> None:
+    """
+    Validator-lifecycle Phase 3: apply this block's staking ops to the consensus
+    ``validators`` table — a STAKE_DEPOSIT registers the sender as a PENDING validator
+    (unscheduled; the all-nodes epoch loop assigns activation_epoch deterministically),
+    a STAKE_EXIT marks an active validator 'exiting'. Called AFTER the section commits,
+    BEFORE the unified root, on every import path. Always applies (new additive
+    consensus domain, deterministic — same ops on every node). Does not commit.
+    """
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    ops = mgr.validator_lifecycle_ops()
+    if not ops:
+        return
+    for op in ops:
+        try:
+            if op.get("type") == "deposit":
+                await db.register_pending_validator(
+                    op["address"], op["public_key"], op["stake"], activation_epoch=None)
+            elif op.get("type") == "exit":
+                # DEFERRED (Phase 3c): a STAKE_EXIT removes the validator from the
+                # ACTIVE set, which — applied at live-import time — opens a cross-node
+                # transient window (some nodes have it active, some exiting) that could
+                # flip proposer selection and halt a node. Safe exit needs the
+                # active→exiting transition done deterministically at a finalized epoch
+                # boundary (like activation), not at flush. The op + machinery
+                # (mark_validator_exiting / schedule_pending_exits / get_validators_to_exit)
+                # are in place; only this trigger is held back.
+                logger.info("[Phase 3] STAKE_EXIT by %s recorded (active-set removal "
+                            "deferred to finalized-epoch processing — Phase 3c)",
+                            str(op.get("address"))[:20])
+        except Exception as e:
+            logger.warning("flush_validator_lifecycle: %s for %s", e, str(op.get("address"))[:20])
+
 # Funding settlement happens every epoch (32 slots × 12s = 384s ≈ 6.4 min)
 FUNDING_SETTLEMENT_INTERVAL = 32  # slots
 
