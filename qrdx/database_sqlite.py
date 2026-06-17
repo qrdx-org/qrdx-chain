@@ -1364,6 +1364,53 @@ class DatabaseSQLite:
             "applied": enforce,
         }
 
+    async def register_pending_validator(self, address: str, public_key: str, stake,
+                                          activation_epoch: int) -> bool:
+        """
+        Validator-lifecycle Phase 3 (staking deposit / join): insert a PENDING
+        validator into the consensus ``validators`` table, scheduled to activate at
+        ``activation_epoch``. Idempotent on address (a repeat deposit tops up stake).
+        Stake stored as a Decimal string (matching effective_stake). Does NOT commit
+        — the caller commits with the block/flush. Deterministic: every node that
+        replays the same deposit creates the identical row.
+        """
+        from decimal import Decimal
+        s = str(Decimal(str(stake)))
+        cur = await self.connection.execute(
+            "SELECT stake, effective_stake FROM validators WHERE address = ?", (address,))
+        row = await cur.fetchone()
+        if row:
+            new_stake = str(Decimal(str(row[0] or 0)) + Decimal(str(stake)))
+            new_eff = str(Decimal(str(row[1] or 0)) + Decimal(str(stake)))
+            await self.connection.execute(
+                "UPDATE validators SET stake = ?, effective_stake = ?, public_key = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
+                (new_stake, new_eff, public_key, address))
+            return False  # topped up an existing validator
+        await self.connection.execute(
+            "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
+            "activation_epoch) VALUES (?, ?, ?, ?, 'pending', ?)",
+            (address, public_key, s, s, int(activation_epoch)))
+        return True
+
+    async def get_validators_to_activate(self, current_epoch: int) -> list:
+        """Pending validators whose scheduled activation_epoch has arrived
+        (<= current_epoch). Deterministic, canonical address order."""
+        cur = await self.connection.execute(
+            "SELECT address FROM validators WHERE status = 'pending' "
+            "AND activation_epoch IS NOT NULL AND activation_epoch <= ? "
+            "ORDER BY address ASC", (int(current_epoch),))
+        return [r[0] for r in await cur.fetchall()]
+
+    async def get_validators_to_exit(self, current_epoch: int) -> list:
+        """Validators marked 'exiting' whose exit_epoch has arrived (<= current_epoch),
+        to be moved to 'exited'. Deterministic, canonical address order."""
+        cur = await self.connection.execute(
+            "SELECT address FROM validators WHERE status = 'exiting' "
+            "AND exit_epoch IS NOT NULL AND exit_epoch <= ? "
+            "ORDER BY address ASC", (int(current_epoch),))
+        return [r[0] for r in await cur.fetchall()]
+
     async def get_attestations_filtered(self, filters: dict, limit: int, offset: int):
         """Get attestations with filters"""
         where_clauses = []

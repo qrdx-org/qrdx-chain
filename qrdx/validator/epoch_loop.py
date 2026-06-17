@@ -40,8 +40,14 @@ async def apply_epoch_validator_update(db, epoch: int, enforce: bool) -> None:
     active = await db.get_validators(status="active")
     attesters = await db.get_epoch_attesters(epoch)
     rewards, penalties = compute_epoch_reward_deltas(active, attesters)
+    # Phase 3 membership: activate pending validators whose scheduled activation
+    # epoch has arrived, and finalize exits whose exit epoch has arrived. Both are
+    # deterministic (canonical-ordered DB reads keyed on the finalized epoch), so
+    # the membership change is identical on every node.
+    activated = await db.get_validators_to_activate(epoch)
+    exited = await db.get_validators_to_exit(epoch)
     res = await db.apply_epoch_validator_updates(
-        rewards, penalties, activated=[], exited=[], activation_epoch=epoch,
+        rewards, penalties, activated=activated, exited=exited, activation_epoch=epoch,
         max_effective_balance=MAX_EFFECTIVE_BALANCE, enforce=enforce,
     )
     if enforce:
