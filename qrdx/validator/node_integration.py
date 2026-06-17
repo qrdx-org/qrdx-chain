@@ -258,8 +258,11 @@ class ValidatorNode:
                 addr = vr.get('address')
                 if not addr:
                     continue
+                # EXITING is eligible: a validator that requested exit keeps proposing
+                # through unbonding (Phase 3c), leaving the set only at its finalized
+                # exit_epoch. No-op until exits exist (no row is 'exiting' yet).
                 status_str = str(vr.get('status', 'active')).upper()
-                if status_str not in ('ACTIVE', 'PENDING'):
+                if status_str not in ('ACTIVE', 'PENDING', 'EXITING'):
                     continue
                 eff = Decimal(str(vr.get('effective_stake') or vr.get('stake') or 0))
                 is_self = (addr == self.wallet.address)

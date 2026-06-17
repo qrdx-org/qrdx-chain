@@ -100,6 +100,80 @@ async def test_stake_deposit_rejects_nonpositive(db):
     assert not res.success and "positive" in res.error
 
 
+async def _seed_active(db, addr, stake="200000"):
+    await db.connection.execute(
+        "INSERT INTO validators (address, public_key, stake, effective_stake, status, activation_epoch) "
+        "VALUES (?, 'pk', ?, ?, 'active', 0)", (addr, stake, stake))
+    await db.connection.commit()
+
+
+async def test_stake_exit_op_records_and_flush_marks_exiting(db):
+    """STAKE_EXIT records a deterministic exit op; the flush moves an ACTIVE validator
+    to 'exiting' (still eligible through unbonding — the eligible set is unchanged at
+    import, so no proposer-selection flip)."""
+    from types import SimpleNamespace
+    from qrdx.exchange.state_manager import ExchangeStateManager
+    from qrdx.exchange.block_processor import flush_validator_lifecycle_deltas
+
+    await _seed_active(db, "0xPQleaver")
+    mgr = ExchangeStateManager()
+    mgr.begin_block(1, 0.0)
+    res = mgr._op_stake_exit(SimpleNamespace(sender="0xPQleaver", nonce=0, params={}))
+    assert res.success and res.data["status"] == "exiting"
+    assert mgr.validator_lifecycle_ops() == [{"type": "exit", "address": "0xPQleaver"}]
+
+    await flush_validator_lifecycle_deltas(db, mgr)
+    await db.connection.commit()
+    row = await _status(db, "0xPQleaver")
+    assert row[0] == "exiting"
+
+
+async def test_stake_exit_noop_when_not_active(db):
+    """Exit only affects an ACTIVE validator (you can only exit a validator you hold);
+    a pending/unknown address is a harmless no-op."""
+    from types import SimpleNamespace
+    from qrdx.exchange.state_manager import ExchangeStateManager
+    from qrdx.exchange.block_processor import flush_validator_lifecycle_deltas
+
+    await db.register_pending_validator("0xPend", "pk", Decimal("100000"), activation_epoch=None)
+    await db.connection.commit()
+    mgr = ExchangeStateManager()
+    mgr.begin_block(1, 0.0)
+    mgr._op_stake_exit(SimpleNamespace(sender="0xPend", nonce=0, params={}))
+    await flush_validator_lifecycle_deltas(db, mgr)
+    await db.connection.commit()
+    assert (await _status(db, "0xPend"))[0] == "pending"  # unchanged
+
+
+async def test_exiting_completes_at_finalized_exit_epoch(db):
+    """Full exit flow: active → (flush) exiting → (epoch loop schedules exit_epoch) →
+    at the finalized exit_epoch the validator is removed (status 'exited'). The
+    eligibility-removing transition happens only at the scheduled epoch."""
+    await _seed_active(db, "0xLeave")
+    assert await db.mark_validator_exiting("0xLeave") is True
+    await db.connection.commit()
+    assert (await _status(db, "0xLeave"))[0] == "exiting"
+
+    # Epoch loop assigns exit_epoch = E + UNBONDING (here UNBONDING small via the call).
+    await db.schedule_pending_exits(exit_epoch=3)
+    await db.connection.commit()
+    c = await db.connection.execute("SELECT exit_epoch FROM validators WHERE address='0xLeave'")
+    assert (await c.fetchone())[0] == 3  # exit_epoch now scheduled
+
+    # Before exit_epoch: not due.
+    assert await db.get_validators_to_exit(2) == []
+    await db.apply_epoch_validator_updates({}, {}, [], [], 2, Decimal("1000000"), enforce=True)
+    await db.connection.commit()
+    assert (await _status(db, "0xLeave"))[0] == "exiting"
+
+    # At exit_epoch: due → removed from the active set.
+    exited = await db.get_validators_to_exit(3)
+    assert exited == ["0xLeave"]
+    await db.apply_epoch_validator_updates({}, {}, [], exited, 3, Decimal("1000000"), enforce=True)
+    await db.connection.commit()
+    assert (await _status(db, "0xLeave"))[0] == "exited"
+
+
 async def test_pending_activates_at_scheduled_epoch(db):
     # Full flow: register pending @ activation_epoch=2, then run the epoch update.
     await db.register_pending_validator("0xV1", "pk1", Decimal("5000"), activation_epoch=2)

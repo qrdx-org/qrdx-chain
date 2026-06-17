@@ -178,7 +178,8 @@ async def flush_validator_lifecycle_deltas(db, state_manager: Optional[ExchangeS
     Validator-lifecycle Phase 3: apply this block's staking ops to the consensus
     ``validators`` table — a STAKE_DEPOSIT registers the sender as a PENDING validator
     (unscheduled; the all-nodes epoch loop assigns activation_epoch deterministically),
-    a STAKE_EXIT marks an active validator 'exiting'. Called AFTER the section commits,
+    a STAKE_EXIT marks an active validator 'exiting' (still eligible through unbonding;
+    the finalized-epoch loop completes exiting→exited). Called AFTER the section commits,
     BEFORE the unified root, on every import path. Always applies (new additive
     consensus domain, deterministic — same ops on every node). Does not commit.
     """
@@ -192,17 +193,20 @@ async def flush_validator_lifecycle_deltas(db, state_manager: Optional[ExchangeS
                 await db.register_pending_validator(
                     op["address"], op["public_key"], op["stake"], activation_epoch=None)
             elif op.get("type") == "exit":
-                # DEFERRED (Phase 3c): a STAKE_EXIT removes the validator from the
-                # ACTIVE set, which — applied at live-import time — opens a cross-node
-                # transient window (some nodes have it active, some exiting) that could
-                # flip proposer selection and halt a node. Safe exit needs the
-                # active→exiting transition done deterministically at a finalized epoch
-                # boundary (like activation), not at flush. The op + machinery
-                # (mark_validator_exiting / schedule_pending_exits / get_validators_to_exit)
-                # are in place; only this trigger is held back.
-                logger.info("[Phase 3] STAKE_EXIT by %s recorded (active-set removal "
-                            "deferred to finalized-epoch processing — Phase 3c)",
-                            str(op.get("address"))[:20])
+                # Phase 3c: a STAKE_EXIT moves an active validator to 'exiting'. This is
+                # SAFE at live-import because 'exiting' stays ELIGIBLE for proposer
+                # selection (it keeps validating through unbonding — see the ACTIVE/
+                # PENDING/EXITING filter in node_integration + block_verification), so
+                # the eligible SET is unchanged at import (only a status label flips;
+                # benign table-hash churn, no proposer-selection flip → no halt). The
+                # eligibility-REMOVING transition (exiting→exited) happens later,
+                # deterministically, at the FINALIZED exit_epoch in the all-nodes epoch
+                # loop (schedule_pending_exits → get_validators_to_exit → exited), so
+                # every node drops the validator at the same converged chain point.
+                moved = await db.mark_validator_exiting(op["address"])
+                logger.info("[Phase 3c] STAKE_EXIT by %s → %s",
+                            str(op.get("address"))[:20],
+                            "exiting" if moved else "no-op (not active)")
         except Exception as e:
             logger.warning("flush_validator_lifecycle: %s for %s", e, str(op.get("address"))[:20])
 

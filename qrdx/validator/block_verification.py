@@ -145,7 +145,7 @@ async def verify_proposer_eligibility(
         validators = [
             (r["address"], Decimal(str(r.get("effective_stake") or r.get("stake") or 0)))
             for r in rows
-            if r.get("address") and str(r.get("status", "active")).upper() in ("ACTIVE", "PENDING")
+            if r.get("address") and str(r.get("status", "active")).upper() in ("ACTIVE", "PENDING", "EXITING")
         ]
     except Exception as e:
         logger.debug("eligibility: could not load validator set: %s", e)

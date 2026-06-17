@@ -141,6 +141,31 @@ stops; slashing reduces stake; integration green.
   halts; `STAKE_EXIT=16` op is defined but its flush is **DEFERRED to Phase 3c** (removing a
   live validator at import opens a transient-window/halt risk — needs the deterministic
   active→exiting transition at a finalized epoch, not at import).
+- **Phase 3c (DONE — voluntary exit/LEAVE path):** the symmetry-breaker for exit is that
+  removing a validator from the eligible set is far more dangerous than adding one — if node
+  A drops an active proposer at import but node B hasn't, B still expects that proposer for
+  its slots → guaranteed halt in the window. The fix: split exit into a label flip (safe at
+  import) and an eligibility removal (only at a FINALIZED epoch). **`'exiting'` is now an
+  ELIGIBLE status** — added to the ACTIVE/PENDING filter in BOTH the proposer
+  (`node_integration`) and the verifier (`block_verification`), matching real-PoS semantics
+  (a validator keeps validating through unbonding). This filter change is a **no-op on the
+  current network** (no row is ever `'exiting'` until an exit flush runs), so it lands safely
+  ahead of use. The `STAKE_EXIT` flush now calls `mark_validator_exiting` (active→`'exiting'`)
+  at import: SAFE because the eligible SET is unchanged (only a label flips — benign
+  table-hash churn, no proposer-selection flip). The eligibility-REMOVING transition
+  (`exiting`→`exited`) runs in the all-nodes epoch loop, which assigns
+  `exit_epoch = finalized_epoch + UNBONDING_PERIOD_EPOCHS` (`schedule_pending_exits`) and at
+  the finalized `exit_epoch` moves the validator to `'exited'` (`get_validators_to_exit` →
+  `apply_epoch_validator_updates(exited=…)`) — so every node drops it at the same converged
+  chain point, no transient window. `UNBONDING_PERIOD_EPOCHS` + `ACTIVATION_DELAY_EPOCHS` made
+  env-overridable (`QRDX_UNBONDING_PERIOD_EPOCHS` / `QRDX_ACTIVATION_DELAY_EPOCHS`) so a short
+  soak can observe full `exiting→exited` completion. (Note: `compute_epoch_reward_deltas` still
+  rewards only `status='active'`, so an exiting validator proposes but stops earning — a
+  conservative, deterministic simplification; refine later if exiting validators should earn
+  through unbonding.) Tests: `test_stake_exit_op_records_and_flush_marks_exiting`,
+  `test_stake_exit_noop_when_not_active`, `test_exiting_completes_at_finalized_exit_epoch`
+  (membership suite 10/10; proposer-verification + selection-determinism + consensus-pos
+  206/206). Clean `--force` integration run **15/15 (100%)**, 0 eligibility halts.
 
 ## Success criteria
 

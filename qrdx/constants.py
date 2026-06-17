@@ -529,10 +529,12 @@ MIN_VALIDATOR_STAKE = Decimal('100000')  # 100,000 QRDX minimum stake
 MAX_EFFECTIVE_STAKE = Decimal('1000000')  # 1,000,000 QRDX max effective stake
 
 # --- Staking Parameters ---
-UNBONDING_PERIOD_EPOCHS = 5040         # ~7 days (5040 epochs * 64 sec)
+# Env-overridable (like SLOTS_PER_EPOCH) so an integration/Phase-4 run can observe the
+# full exiting→exited unbonding completion within a short soak; production default ~7 days.
+UNBONDING_PERIOD_EPOCHS = int(os.getenv("QRDX_UNBONDING_PERIOD_EPOCHS", "5040"))  # 5040 epochs * 64 sec
 MIN_DEPOSIT = Decimal('10000')         # Minimum deposit amount
 MAX_DEPOSIT = Decimal('10000000')      # Maximum single deposit
-ACTIVATION_DELAY_EPOCHS = 4            # Epochs until deposit becomes active
+ACTIVATION_DELAY_EPOCHS = int(os.getenv("QRDX_ACTIVATION_DELAY_EPOCHS", "4"))  # Epochs until deposit becomes active
 WITHDRAWAL_DELAY_EPOCHS = 256          # Epochs until withdrawal finalizes
 
 # --- Finality ---
