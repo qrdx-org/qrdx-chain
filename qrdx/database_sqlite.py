@@ -745,9 +745,23 @@ class DatabaseSQLite:
         Used by ``rebuild_account_state_from_chain`` before replaying the
         canonical EVM sections, so orphaned-block account changes do not survive
         a reorg. ``account_state`` is otherwise durable across restarts.
+
+        Also resets the EVM balance-sync registry: ``sync_address_to_evm`` dedups
+        account_state→EVM syncs by (address, block_height), so if the registry
+        survived the rebuild the replay would SKIP re-syncing (it looks already
+        synced for that height) and the freshly-cleared EVM balance would stay 0 —
+        the subsequent tx then OVERWRITES the reseeded genesis funding (a 0x-genesis
+        address loses its allocation; account_state root diverges from a node that
+        never rebuilt). Clearing it makes the replay re-sync exactly as the original
+        run did. Best-effort: the sync tables only exist once EVM has initialized.
         """
         await self.connection.execute("DELETE FROM account_state")
         await self.connection.execute("DELETE FROM contract_storage")
+        for tbl in ("evm_balance_sync_registry", "evm_balance_changes"):
+            try:
+                await self.connection.execute(f"DELETE FROM {tbl}")
+            except Exception:
+                pass  # table not created yet (EVM never initialized) — nothing to reset
         await self.connection.commit()
 
     async def apply_account_balance_delta(self, address: str, qrdx_delta) -> bool:
