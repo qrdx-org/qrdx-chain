@@ -1017,7 +1017,7 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
 
 
 async def _apply_exchange_section_on_import(block_height, block_timestamp,
-                                            ex_section, declared_root):
+                                            ex_section, declared_root, block_epoch=None):
     """
     Importer hook for the exchange section, with the same strict/trust split as
     the EVM one (E-D3b). Strict (declared root present, live broadcast): validate
@@ -1056,7 +1056,7 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
             # token ledger (before the E-D4 root check, so both domains reflect).
             await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
             await flush_token_balance_deltas(db, mgr)
-            await flush_validator_lifecycle_deltas(db, mgr)
+            await flush_validator_lifecycle_deltas(db, mgr, block_epoch=block_epoch)
         return ok, err
     # Trust-replay (sync): adopt the canonical section's computed root.
     try:
@@ -1069,7 +1069,7 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
             mgr.commit_block()
             await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
             await flush_token_balance_deltas(db, mgr)
-            await flush_validator_lifecycle_deltas(db, mgr)
+            await flush_validator_lifecycle_deltas(db, mgr, block_epoch=block_epoch)
         else:
             logger.warning(f"Exchange section trust-replay failed at block {block_height}: {err}")
         return True, ""
@@ -2416,8 +2416,10 @@ async def process_and_create_block(block_info: dict) -> bool:
         ex_section = block.get('exchange_transactions') or block_info.get('exchange_transactions')
         if ex_section:
             declared = block.get('exchange_state_root') or block_info.get('exchange_state_root')
+            from ..validator.block_verification import epoch_from_block
             ok, verr = await _apply_exchange_section_on_import(
                 block_height, block.get('timestamp', 0) or 0, ex_section, declared,
+                block_epoch=epoch_from_block(block) or epoch_from_block(block_info),
             )
             if not ok:
                 logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr}")
@@ -3790,9 +3792,11 @@ async def submit_block(
                     # Phase E: route through the importer hook so the collateral
                     # flush (margin debit → account_state) runs on this REST
                     # live-broadcast path too, deterministically with proposer/sync.
+                    from ..validator.block_verification import epoch_from_block
                     ok, verr = await _apply_exchange_section_on_import(
                         block_no, float(body.get('timestamp', 0) or 0),
                         ex_section, body.get('exchange_state_root'),
+                        block_epoch=epoch_from_block(body),
                     )
                 except Exception as e:
                     ok, verr = False, f"exchange validation error: {e}"

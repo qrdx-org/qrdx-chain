@@ -284,9 +284,11 @@ class P2PModule(RPCModule):
                             # collateral flush (margin debit → account_state) runs
                             # on this live-broadcast path too — otherwise only the
                             # proposer/sync paths debit and account_state diverges.
+                            from ...validator.block_verification import epoch_from_block
                             ok_ex, verr = await self._exchange_apply_section(
                                 block_no, float(block_data.get('timestamp', 0) or 0),
                                 ex_section, block_data.get('exchange_state_root'),
+                                epoch_from_block(block_data),
                             )
                         else:
                             from ...exchange.block_processor import apply_block_exchange_section

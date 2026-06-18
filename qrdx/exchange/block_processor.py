@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .state_manager import ExchangeExecResult, ExchangeStateManager
 from .transactions import ExchangeOpType, ExchangeTransaction
+from ..constants import ACTIVATION_DELAY_EPOCHS, UNBONDING_PERIOD_EPOCHS
 
 logger = logging.getLogger(__name__)
 
@@ -173,25 +174,37 @@ async def flush_token_balance_deltas(db, state_manager: Optional[ExchangeStateMa
             logger.warning("flush_token: delta %s for (%s,%s)", e, str(holder)[:16], str(token)[:16])
 
 
-async def flush_validator_lifecycle_deltas(db, state_manager: Optional[ExchangeStateManager] = None) -> None:
+async def flush_validator_lifecycle_deltas(
+    db, state_manager: Optional[ExchangeStateManager] = None, block_epoch: Optional[int] = None,
+) -> None:
     """
     Validator-lifecycle Phase 3: apply this block's staking ops to the consensus
-    ``validators`` table — a STAKE_DEPOSIT registers the sender as a PENDING validator
-    (unscheduled; the all-nodes epoch loop assigns activation_epoch deterministically),
-    a STAKE_EXIT marks an active validator 'exiting' (still eligible through unbonding;
-    the finalized-epoch loop completes exiting→exited). Called AFTER the section commits,
-    BEFORE the unified root, on every import path. Always applies (new additive
-    consensus domain, deterministic — same ops on every node). Does not commit.
+    ``validators`` table — a STAKE_DEPOSIT registers the sender as a PENDING validator,
+    a STAKE_EXIT marks an active validator 'exiting' (still eligible through unbonding).
+    Called AFTER the section commits, BEFORE the unified root, on every import path.
+
+    The activation/exit epoch is derived DETERMINISTICALLY from ``block_epoch`` — the
+    epoch of the block carrying the op (identical on every node that imports it):
+      * activation_epoch = block_epoch + ACTIVATION_DELAY_EPOCHS
+      * exit_epoch       = block_epoch + UNBONDING_PERIOD_EPOCHS
+    The all-nodes epoch loop then activates/removes the validator when the FINALIZED
+    epoch reaches that scheduled epoch. Computing the schedule from the block (not from
+    when the epoch loop happens to observe the pending validator) is what makes it
+    cross-node deterministic: an earlier loop-tick scheduler assigned different epochs
+    on different nodes depending on import timing. ``block_epoch=None`` leaves it
+    unscheduled (legacy/rebuild paths). Does not commit.
     """
     mgr = state_manager or ExchangeStateManager.get_instance()
     ops = mgr.validator_lifecycle_ops()
     if not ops:
         return
+    act_epoch = (int(block_epoch) + ACTIVATION_DELAY_EPOCHS) if block_epoch is not None else None
+    exit_epoch = (int(block_epoch) + UNBONDING_PERIOD_EPOCHS) if block_epoch is not None else None
     for op in ops:
         try:
             if op.get("type") == "deposit":
                 await db.register_pending_validator(
-                    op["address"], op["public_key"], op["stake"], activation_epoch=None)
+                    op["address"], op["public_key"], op["stake"], activation_epoch=act_epoch)
             elif op.get("type") == "exit":
                 # Phase 3c: a STAKE_EXIT moves an active validator to 'exiting'. This is
                 # SAFE at live-import because 'exiting' stays ELIGIBLE for proposer
@@ -199,14 +212,14 @@ async def flush_validator_lifecycle_deltas(db, state_manager: Optional[ExchangeS
                 # PENDING/EXITING filter in node_integration + block_verification), so
                 # the eligible SET is unchanged at import (only a status label flips;
                 # benign table-hash churn, no proposer-selection flip → no halt). The
-                # eligibility-REMOVING transition (exiting→exited) happens later,
-                # deterministically, at the FINALIZED exit_epoch in the all-nodes epoch
-                # loop (schedule_pending_exits → get_validators_to_exit → exited), so
-                # every node drops the validator at the same converged chain point.
-                moved = await db.mark_validator_exiting(op["address"])
-                logger.info("[Phase 3c] STAKE_EXIT by %s → %s",
+                # eligibility-REMOVING transition (exiting→exited) happens later, at the
+                # deterministic FINALIZED exit_epoch in the all-nodes epoch loop
+                # (get_validators_to_exit → exited), so every node drops the validator at
+                # the same converged chain point.
+                moved = await db.mark_validator_exiting(op["address"], exit_epoch=exit_epoch)
+                logger.info("[Phase 3c] STAKE_EXIT by %s → %s (exit_epoch=%s)",
                             str(op.get("address"))[:20],
-                            "exiting" if moved else "no-op (not active)")
+                            "exiting" if moved else "no-op (not active)", exit_epoch)
         except Exception as e:
             logger.warning("flush_validator_lifecycle: %s for %s", e, str(op.get("address"))[:20])
 

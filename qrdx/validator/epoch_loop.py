@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from ..constants import SLOT_DURATION, ACTIVATION_DELAY_EPOCHS, UNBONDING_PERIOD_EPOCHS
+from ..constants import SLOT_DURATION
 from .epoch_rewards import compute_epoch_reward_deltas
 from .epoch_processing import MAX_EFFECTIVE_BALANCE
 from .finality import update_finality
@@ -40,14 +40,12 @@ async def apply_epoch_validator_update(db, epoch: int, enforce: bool) -> None:
     active = await db.get_validators(status="active")
     attesters = await db.get_epoch_attesters(epoch)
     rewards, penalties = compute_epoch_reward_deltas(active, attesters)
-    # Phase 3 membership: deterministically SCHEDULE just-deposited pending
-    # validators (activation_epoch was left NULL by the deposit flush) to activate
-    # at epoch + ACTIVATION_DELAY_EPOCHS — done here at the finalized epoch so every
-    # node assigns the same activation epoch. Then activate those whose scheduled
-    # epoch has arrived (and finalize any due exits). All deterministic.
-    if enforce:
-        await db.schedule_pending_activations(epoch + ACTIVATION_DELAY_EPOCHS)
-        await db.schedule_pending_exits(epoch + UNBONDING_PERIOD_EPOCHS)
+    # Phase 3 membership: activation_epoch / exit_epoch were assigned DETERMINISTICALLY
+    # at deposit/exit-import time (block_epoch + delay; see flush_validator_lifecycle_deltas)
+    # — NOT scheduled here. Scheduling at the epoch-loop tick was non-deterministic: a
+    # node assigned the epoch based on when IT happened to observe the pending validator,
+    # so two nodes diverged. Now the loop only ACTIVATES / REMOVES validators whose
+    # pre-assigned epoch the FINALIZED epoch has reached — identical on every node.
     activated = await db.get_validators_to_activate(epoch)
     exited = await db.get_validators_to_exit(epoch)
     res = await db.apply_epoch_validator_updates(

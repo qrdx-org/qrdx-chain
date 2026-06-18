@@ -1382,12 +1382,17 @@ class DatabaseSQLite:
             "WHERE status = 'exiting' AND exit_epoch IS NULL", (int(exit_epoch),))
         return cur.rowcount if cur.rowcount is not None else 0
 
-    async def mark_validator_exiting(self, address: str) -> bool:
-        """Phase 3 (voluntary exit): move an active validator to 'exiting' (exit_epoch
-        scheduled later by the epoch loop). No-op if not currently active. No commit."""
+    async def mark_validator_exiting(self, address: str, exit_epoch=None) -> bool:
+        """Phase 3 (voluntary exit): move an active validator to 'exiting' and set its
+        ``exit_epoch`` (the finalized epoch at which the epoch loop removes it). The
+        caller passes a DETERMINISTIC exit_epoch derived from the exit block's epoch, so
+        every node assigns the same value. ``exit_epoch=None`` leaves it unscheduled.
+        No-op if not currently active. No commit."""
         cur = await self.connection.execute(
-            "UPDATE validators SET status = 'exiting', updated_at = CURRENT_TIMESTAMP "
-            "WHERE address = ? AND status = 'active'", (address,))
+            "UPDATE validators SET status = 'exiting', "
+            "exit_epoch = COALESCE(?, exit_epoch), updated_at = CURRENT_TIMESTAMP "
+            "WHERE address = ? AND status = 'active'",
+            (int(exit_epoch) if exit_epoch is not None else None, address))
         return bool(cur.rowcount)
 
     async def register_pending_validator(self, address: str, public_key: str, stake,

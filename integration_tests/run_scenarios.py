@@ -42,6 +42,7 @@ from integration_tests.scenarios.s12_exchange_consensus import S12ExchangeConsen
 from integration_tests.scenarios.s13_perp_collateral import S13PerpCollateral
 from integration_tests.scenarios.s14_token_consensus import S14TokenConsensus
 from integration_tests.scenarios.s15_spot_settlement import S15SpotSettlement
+from integration_tests.scenarios.s16_validator_membership import S16ValidatorMembership
 
 
 ALL_SCENARIOS = [
@@ -60,6 +61,7 @@ ALL_SCENARIOS = [
     S13PerpCollateral,
     S14TokenConsensus,
     S15SpotSettlement,
+    S16ValidatorMembership,
 ]
 
 

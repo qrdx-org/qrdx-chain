@@ -91,6 +91,44 @@ def _parse_block_content(block_content: Any) -> Dict[str, Any]:
     return ast.literal_eval(block_content)
 
 
+def epoch_from_block(block_like: Dict[str, Any]) -> Optional[int]:
+    """Robustly extract a PoS block's epoch from any of the dict shapes the import
+    paths carry: a parsed block dict (epoch/slot top-level), or a wire envelope whose
+    header fields live inside a ``block_content`` repr string. Returns the epoch as an
+    int, or ``None`` if it cannot be determined. Used to schedule validator
+    activation/exit DETERMINISTICALLY from the carrying block (identical on every node)
+    — see flush_validator_lifecycle_deltas."""
+    if not isinstance(block_like, dict):
+        return None
+    # 1. Top-level epoch (parsed block dict).
+    ep = block_like.get("epoch")
+    if ep is not None:
+        try:
+            return int(ep)
+        except (TypeError, ValueError):
+            pass
+    # 2. Header fields nested in a block_content repr (the p2p/REST wire envelope).
+    bc = block_like.get("block_content")
+    if bc is not None:
+        try:
+            content = _parse_block_content(bc)
+            if content.get("epoch") is not None:
+                return int(content["epoch"])
+            if content.get("slot") is not None:
+                from ..constants import SLOTS_PER_EPOCH
+                return int(content["slot"]) // SLOTS_PER_EPOCH
+        except Exception:
+            pass
+    # 3. Top-level slot fallback.
+    if block_like.get("slot") is not None:
+        try:
+            from ..constants import SLOTS_PER_EPOCH
+            return int(block_like["slot"]) // SLOTS_PER_EPOCH
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
 def reconstruct_signing_root(bc: Dict[str, Any]) -> bytes:
     """Reproduce ``PoSBlock.signing_root`` from a block-content dict."""
     data = (

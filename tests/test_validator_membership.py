@@ -34,6 +34,18 @@ async def _status(db, addr):
     return await c.fetchone()
 
 
+def test_epoch_from_block_handles_all_import_shapes():
+    """The deterministic activation/exit schedule keys off the block epoch, which the
+    import paths carry in different shapes; epoch_from_block must extract it from each."""
+    from qrdx.validator.block_verification import epoch_from_block
+    from qrdx.constants import SLOTS_PER_EPOCH
+    assert epoch_from_block({"epoch": 12}) == 12                                   # parsed block
+    assert epoch_from_block({"block_content": str({"slot": 96, "epoch": 12})}) == 12  # wire envelope
+    assert epoch_from_block({"block_content": str({"slot": 96})}) == 96 // SLOTS_PER_EPOCH  # slot fallback
+    assert epoch_from_block({"foo": 1}) is None
+    assert epoch_from_block(None) is None
+
+
 async def test_register_pending_validator(db):
     created = await db.register_pending_validator("0xV1", "pk1", Decimal("5000"), activation_epoch=3)
     assert created is True
@@ -88,6 +100,44 @@ async def test_stake_deposit_op_records_and_flush_registers_pending(db):
     await db.connection.commit()
     row = await _status(db, "0xPQnewval")
     assert row[0] == "pending" and Decimal(row[1]) == Decimal("100000") and row[2] is None  # unscheduled
+
+
+async def test_deposit_flush_schedules_activation_from_block_epoch(db):
+    """The deposit flush assigns activation_epoch = block_epoch + ACTIVATION_DELAY_EPOCHS
+    deterministically (derived from the carrying block, identical on every node) — not
+    left for a non-deterministic epoch-loop tick to schedule."""
+    from types import SimpleNamespace
+    from qrdx.exchange.state_manager import ExchangeStateManager
+    from qrdx.exchange.block_processor import flush_validator_lifecycle_deltas
+    from qrdx.constants import ACTIVATION_DELAY_EPOCHS
+
+    mgr = ExchangeStateManager()
+    mgr.begin_block(1, 0.0)
+    mgr._op_stake_deposit(SimpleNamespace(sender="0xPQjoin", nonce=0,
+        params={"validator_public_key": "pk", "stake_amount": "100000"}))
+    await flush_validator_lifecycle_deltas(db, mgr, block_epoch=5)
+    await db.connection.commit()
+    row = await _status(db, "0xPQjoin")
+    assert row[0] == "pending" and row[2] == 5 + ACTIVATION_DELAY_EPOCHS
+
+
+async def test_exit_flush_schedules_exit_from_block_epoch(db):
+    """The exit flush sets exit_epoch = block_epoch + UNBONDING_PERIOD_EPOCHS
+    deterministically when moving an active validator to 'exiting'."""
+    from types import SimpleNamespace
+    from qrdx.exchange.state_manager import ExchangeStateManager
+    from qrdx.exchange.block_processor import flush_validator_lifecycle_deltas
+    from qrdx.constants import UNBONDING_PERIOD_EPOCHS
+
+    await _seed_active(db, "0xPQgo")
+    mgr = ExchangeStateManager()
+    mgr.begin_block(1, 0.0)
+    mgr._op_stake_exit(SimpleNamespace(sender="0xPQgo", nonce=0, params={}))
+    await flush_validator_lifecycle_deltas(db, mgr, block_epoch=7)
+    await db.connection.commit()
+    row = await _status(db, "0xPQgo")
+    c = await db.connection.execute("SELECT exit_epoch FROM validators WHERE address='0xPQgo'")
+    assert row[0] == "exiting" and (await c.fetchone())[0] == 7 + UNBONDING_PERIOD_EPOCHS
 
 
 async def test_stake_deposit_rejects_nonpositive(db):

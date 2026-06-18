@@ -219,6 +219,11 @@ class TestnetOrchestrator:
             # lifecycle) fires several times within a short test run. All nodes get
             # the same value → consensus-consistent.
             "QRDX_SLOTS_PER_EPOCH": str(SLOTS_PER_EPOCH),
+            # Short activation/unbonding so the dynamic-membership scenario (S16) can
+            # observe a deposit→active→exit→exited round-trip within a short soak.
+            # Same value on every node → deterministic scheduling preserved.
+            "QRDX_ACTIVATION_DELAY_EPOCHS": "1",
+            "QRDX_UNBONDING_PERIOD_EPOCHS": "2",
         }
 
         if spec.is_validator and spec.validator_index is not None:

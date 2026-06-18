@@ -421,7 +421,8 @@ class ValidatorNode:
                                 await flush_exchange_balance_deltas(
                                     self.db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
                                 await flush_token_balance_deltas(self.db, mgr)
-                                await flush_validator_lifecycle_deltas(self.db, mgr)
+                                await flush_validator_lifecycle_deltas(
+                                    self.db, mgr, block_epoch=current_epoch)
                                 exchange_state_root = root
                                 logger.info(
                                     f"📦 Including {len(exchange_txs)} exchange tx(s) in "

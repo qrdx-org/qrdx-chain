@@ -166,6 +166,38 @@ stops; slashing reduces stake; integration green.
   `test_stake_exit_noop_when_not_active`, `test_exiting_completes_at_finalized_exit_epoch`
   (membership suite 10/10; proposer-verification + selection-determinism + consensus-pos
   206/206). Clean `--force` integration run **15/15 (100%)**, 0 eligibility halts.
+- **Phase 4 (live cross-node verification — scenario `s16_validator_membership`):** added a
+  live multi-node scenario (a non-validator account stakes in via `STAKE_DEPOSIT`, should
+  activate, then exit). Building it surfaced two issues and one hard external dependency:
+  - **Determinism bug (FIXED):** the activation/exit epoch was assigned by the epoch loop
+    when it *happened to observe* the pending validator (`schedule_pending_activations` /
+    `schedule_pending_exits` on a loop tick) — so two nodes assigned different epochs (saw
+    one node at `act=10`, others `NULL`). Fixed: the schedule is now derived
+    DETERMINISTICALLY from the carrying block's epoch at IMPORT
+    (`activation_epoch = block_epoch + ACTIVATION_DELAY_EPOCHS`,
+    `exit_epoch = block_epoch + UNBONDING_PERIOD_EPOCHS`), threaded through EVERY import path
+    (proposer uses `current_epoch`; the sync / REST / p2p importers + the hook use the new
+    `block_verification.epoch_from_block`, which extracts the epoch from either a parsed
+    block dict or a `block_content` wire envelope). The loop-tick schedulers were removed; the
+    epoch loop now only ACTIVATES/REMOVES validators whose pre-assigned epoch the FINALIZED
+    epoch has reached. Tests: `test_deposit_flush_schedules_activation_from_block_epoch`,
+    `test_exit_flush_schedules_exit_from_block_epoch`, `test_epoch_from_block_handles_all_import_shapes`.
+  - **Wiring gap (FIXED):** the p2p live-broadcast importer called the section hook without
+    the epoch, so peers registered with `activation_epoch=NULL`. Now all four import paths
+    pass it.
+  - **External blocker (fork-choice):** the FULL round-trip — a single agreed
+    `activation_epoch` across nodes AND the finality-gated `pending→active→exiting→exited`
+    completion — is gated by **block-history convergence**. A deposit/exit tx can be orphaned
+    + re-included at a different epoch on competing forked tips (→ different `block_epoch` →
+    different `activation_epoch`, and peers can miss it), and forked histories split the
+    per-epoch attestation quorum below 2/3 so **finality stalls** (observed: finalized frozen
+    at epoch 8 while the chain reached ~29). Both resolve with **fork-choice active
+    reconciliation** (the next item). So `s16` HARD-asserts what is robust today — the live
+    JOIN pipeline (admit→include→flush→register), a deterministic non-NULL schedule on the
+    submission node, and propagation to peers — and OBSERVES (non-failing) the
+    fork-choice-gated convergence/completion, to be flipped to hard asserts once fork-choice
+    lands. Clean `--force` integration run **16/16 (100%)** incl. `s16` 6/6; full unit suite
+    **2144 passed**.
 
 ## Success criteria
 

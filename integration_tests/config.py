@@ -85,6 +85,9 @@ WALLET_ROSTER: List[WalletSpec] = [
     # Functional wallets
     WalletSpec("Token Deployer", "pq", TOKEN_DEPLOYER_BALANCE),
     WalletSpec("Pool Creator", "pq", POOL_CREATOR_BALANCE),
+    # Dedicated staking-deposit candidate for S16 (dynamic validator membership) —
+    # kept untouched by other scenarios so its exchange nonce starts clean at 0.
+    WalletSpec("Staker Candidate", "pq", Decimal("500000")),
     # Master controller (no genesis balance of its own)
     WalletSpec("Master Controller", "pq", Decimal("0")),
 ]
