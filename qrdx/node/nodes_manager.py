@@ -576,6 +576,12 @@ class NodeInterface:
         resp = await self._rpc_call("p2p_pushTx", [tx_hex])
         return self._unwrap(resp)
 
+    async def push_attestation(self, attestation: dict):
+        # Tag the sender so the receiver excludes us from its re-gossip.
+        att = {**attestation, '_sender_node_id': get_node_id()}
+        resp = await self._rpc_call("p2p_pushAttestation", [att])
+        return self._unwrap(resp)
+
     async def submit_block(self, block_data: dict):
         # Tag the sender so the receiver can do a follow-up sync
         block_data_with_sender = {**block_data, '_sender_node_id': get_node_id()}

@@ -60,6 +60,7 @@ class P2PModule(RPCModule):
         self._tiebreak_rollback = None         # mechanism-2 rollback hook (main._tiebreak_rollback)
         self._enforce_equal_height_tiebreak = False  # mechanism-2 enforce gate (observe-first)
         self._enforce_proposer_eligibility = False  # slot-eligibility gate (observe-first)
+        self._add_remote_attestation = None    # attestation-gossip receive hook (main._add_remote_attestation)
 
     # ---- wiring (called once at startup from main.py) --------------------
 
@@ -83,6 +84,7 @@ class P2PModule(RPCModule):
         tiebreak_rollback=None,
         enforce_equal_height_tiebreak=False,
         enforce_proposer_eligibility=False,
+        add_remote_attestation=None,
     ):
         self._db = db
         self._security = security
@@ -101,6 +103,7 @@ class P2PModule(RPCModule):
         self._tiebreak_rollback = tiebreak_rollback
         self._enforce_equal_height_tiebreak = enforce_equal_height_tiebreak
         self._enforce_proposer_eligibility = enforce_proposer_eligibility
+        self._add_remote_attestation = add_remote_attestation
 
     def _require_db(self):
         if self._db is None:
@@ -613,6 +616,25 @@ class P2PModule(RPCModule):
             self._propagate_fn('push_tx', {'tx_hex': tx_hex}, db=self._db)
         )
         return {'ok': True, 'result': 'Transaction accepted'}
+
+    @rpc_method
+    async def pushAttestation(self, attestation: Dict) -> Dict:
+        """
+        Accept a gossiped validator attestation from a peer (finality-gossip). The
+        injected hook verifies the signature against the attester's registered pubkey,
+        adds it to this node's attestation pool (so a proposer includes it in its next
+        block → it reaches every node's attestation_votes → finality coverage), and
+        re-gossips it once. Idempotent + best-effort; an unknown/invalid/duplicate
+        attestation is simply not re-propagated.
+        """
+        if self._add_remote_attestation is None:
+            return {'ok': True, 'result': 'ignored (no handler)'}
+        try:
+            sender = attestation.pop('_sender_node_id', None) if isinstance(attestation, dict) else None
+            accepted = await self._add_remote_attestation(attestation, sender)
+            return {'ok': True, 'result': 'accepted' if accepted else 'duplicate/ignored'}
+        except Exception as e:
+            return {'ok': False, 'error': f'attestation rejected: {e}'}
 
     @rpc_method
     async def getMempoolHashes(self) -> Dict:

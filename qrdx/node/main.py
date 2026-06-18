@@ -134,6 +134,20 @@ _ENFORCE_FORK_CHOICE_RECONCILE = False
 # keeping the per-cycle peer-query cost small. Clamped to the finalized boundary.
 _FORK_CHOICE_WINDOW = 24
 
+# Attestation gossip. Validators sign one attestation per slot but the broadcast hook
+# was never bound, so attestations stayed LOCAL — each proposer could only include its
+# OWN attestation, making per-epoch attester coverage = distinct canonical proposers.
+# As tip races make production uneven, coverage drops below the 2/3 finality threshold
+# and justification stalls (the real cause of the long-run finality lag — NOT a
+# block-history fork, which converges). Binding the broadcast fn floods each signed
+# attestation to peers so every proposer's pool (and thus every block) carries the whole
+# validator set's votes → full per-epoch coverage → finality advances. Additive + signed
+# + deduped; no reject path, so no halt risk. Kill-switch, default ON.
+_ENABLE_ATTESTATION_GOSSIP = True
+# Bounded seen-set for gossip-flood dedup (re-propagate each attestation once).
+_SEEN_ATTESTATIONS: set = set()
+_SEEN_ATTESTATIONS_MAX = 20000
+
 # Kademlia DHT integration
 from qrdx.p2p.node import Node as P2PNode, Address as P2PAddress, hex_to_node_id as p2p_hex_to_node_id
 from qrdx.p2p.routing import RoutingTable, KBucketEntry
@@ -1479,6 +1493,8 @@ async def propagate(path: str, data: dict, ignore_node_id: str = None, db: Datab
                         response = await ni.submit_block(d)
                     elif p == 'push_tx':
                         response = await ni.push_tx(d['tx_hex'])
+                    elif p == 'push_attestation':
+                        response = await ni.push_attestation(d['attestation'])
                     
                     if response and response.get('error') == 'sync_required':
                         if not db:
@@ -1513,6 +1529,86 @@ async def propagate(path: str, data: dict, ignore_node_id: str = None, db: Datab
             tasks.append(communication_task(peer, path, data))
 
         await gather(*tasks)
+
+
+# ---------------------------------------------------------------------------
+# Attestation gossip (the missing finality wiring — see _ENABLE_ATTESTATION_GOSSIP)
+# ---------------------------------------------------------------------------
+
+def _attestation_seen_key(att_dict: dict) -> str:
+    """Dedup key for gossip flooding — one vote per (validator, slot, block)."""
+    return f"{att_dict.get('validator_address')}:{att_dict.get('slot')}:{att_dict.get('block_hash')}"
+
+
+def _mark_attestation_seen(key: str) -> bool:
+    """Record an attestation key; return True if it was NEW (first sighting)."""
+    if key in _SEEN_ATTESTATIONS:
+        return False
+    _SEEN_ATTESTATIONS.add(key)
+    if len(_SEEN_ATTESTATIONS) > _SEEN_ATTESTATIONS_MAX:
+        # Cheap bounded trim (drop ~half); dedup is best-effort, not security-critical.
+        for k in list(_SEEN_ATTESTATIONS)[: _SEEN_ATTESTATIONS_MAX // 2]:
+            _SEEN_ATTESTATIONS.discard(k)
+    return True
+
+
+async def _broadcast_attestation(attestation) -> None:
+    """Broadcast hook bound onto the validator manager: flood a freshly-created,
+    signed attestation to peers so every proposer's pool carries the whole validator
+    set's votes (→ full per-epoch attester coverage → finality advances). Fire-and-
+    forget; failures are non-fatal."""
+    if not _ENABLE_ATTESTATION_GOSSIP:
+        return
+    try:
+        att_dict = attestation.to_dict()
+        _mark_attestation_seen(_attestation_seen_key(att_dict))  # don't re-accept our own echo
+        await propagate('push_attestation', {'attestation': att_dict}, db=db)
+    except Exception as e:
+        logger.debug(f"attestation broadcast failed: {e}")
+
+
+async def _add_remote_attestation(att_dict: dict, sender_node_id: str = None) -> bool:
+    """Receive hook (p2p pushAttestation): verify a gossiped attestation against the
+    attester's pubkey from the validators table, add it to this node's attestation pool
+    (if this node is a validator → the proposer will include it), and re-gossip it once
+    (flood) to peers. Returns True if it was newly accepted (drives re-propagation).
+    Best-effort + idempotent; never raises."""
+    if not _ENABLE_ATTESTATION_GOSSIP:
+        return False
+    try:
+        key = _attestation_seen_key(att_dict)
+        if not _mark_attestation_seen(key):
+            return False  # already gossiped through here
+
+        from ..validator.attestation import Attestation
+        from ..validator.finality import _validator_stakes_and_keys
+        att = Attestation.from_dict(att_dict)
+
+        # Verify the signature against the attester's registered pubkey (same path the
+        # block-carried recorder uses). Drop unknown/invalid attesters.
+        _stakes, keys = await _validator_stakes_and_keys(db)
+        pub = keys.get(att.validator_address)
+        if not pub or not att.verify(pub):
+            return False
+
+        # Add to the local validator's pool so its next proposed block includes it.
+        v = getattr(app.state, "validator", None)
+        if v is not None and getattr(v, "manager", None) is not None:
+            try:
+                v.manager.attestation_pool.register_validator(att.validator_address, pub)
+                await v.manager.attestation_pool.add_attestation(att, verify_signature=False)
+            except Exception as e:
+                logger.debug(f"pool add (remote attestation) skipped: {e}")
+
+        # Re-gossip once to the rest of the mesh (flood), excluding the sender.
+        asyncio.create_task(
+            propagate('push_attestation', {'attestation': att_dict},
+                      ignore_node_id=sender_node_id, db=db)
+        )
+        return True
+    except Exception as e:
+        logger.debug(f"remote attestation handling failed: {e}")
+        return False
 
 
 async def _push_sync_to_peer(peer_info: dict, start_block: int, db_conn: Database, trigger_data: dict):
@@ -3049,6 +3145,16 @@ async def startup():
                     logger.info(f"✅ Validator node started: {validator_node.wallet.address}")
                     # Store globally for access in endpoints
                     app.state.validator = validator_node
+                    # Bind attestation gossip: without this the manager warns
+                    # "attestation stays local" and per-epoch attester coverage
+                    # collapses to the proposer set → finality stalls. See
+                    # _ENABLE_ATTESTATION_GOSSIP.
+                    try:
+                        if validator_node.manager is not None:
+                            validator_node.manager.set_attestation_broadcast_fn(_broadcast_attestation)
+                            logger.info("✅ Attestation gossip broadcast fn bound")
+                    except Exception as e:
+                        logger.warning(f"Could not bind attestation broadcast fn: {e}")
                     # Phase D2.2: let the proposer include admitted exchange txs.
                     try:
                         validator_node.set_exchange_tx_source(_get_exchange_mempool())
@@ -3104,6 +3210,7 @@ async def startup():
         enforce_equal_height_tiebreak=_ENFORCE_EQUAL_HEIGHT_TIEBREAK,  # mechanism-2 gate
 
         enforce_proposer_eligibility=_ENFORCE_PROPOSER_ELIGIBILITY,  # slot-eligibility gate
+        add_remote_attestation=_add_remote_attestation,  # attestation-gossip receive hook
     )
 
     logger.info(f"✅ JSON-RPC server initialized (dht_* + p2p_* always-on): {len(rpc_server.get_methods())} methods")
