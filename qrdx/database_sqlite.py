@@ -356,6 +356,25 @@ class DatabaseSQLite:
             PRIMARY KEY (validator_address, target_epoch)
         );
 
+        -- Slashing evidence (consensus security). A row is recorded when a node
+        -- detects a slashable offence on the import path — primarily DOUBLE_SIGN: the
+        -- slot-eligible proposer signed TWO different blocks for the SAME slot (seen as
+        -- an equal-height fork with identical proposer+slot but different hash). Keyed
+        -- by (validator, slot, condition) so the same offence is recorded once.
+        -- OBSERVE foundation: detection + durable evidence only; the deterministic
+        -- stake penalty (via the finalized-epoch validator-update path, total_slashed)
+        -- is a follow-up that consumes these rows.
+        CREATE TABLE IF NOT EXISTS slashing_events (
+            validator_address TEXT NOT NULL,
+            condition TEXT NOT NULL,
+            slot INTEGER NOT NULL,
+            epoch INTEGER NOT NULL,
+            evidence TEXT NOT NULL,
+            processed INTEGER NOT NULL DEFAULT 0,
+            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (validator_address, slot, condition)
+        );
+
         -- QRC-20 token ledger (Phase E spot). Mirrors qrdx.tokens.persistence
         -- TOKEN_SCHEMA so the node owns these tables natively (token state is a
         -- consensus object: balances are bound into the unified state root and
@@ -1191,6 +1210,34 @@ class DatabaseSQLite:
             (validator_address, int(target_epoch), int(source_epoch), int(slot), block_hash),
         )
         await self.connection.commit()
+
+    # ── Slashing evidence (consensus security) ──────────────────────────
+
+    async def record_slashing_event(self, validator_address: str, condition: str,
+                                    slot: int, epoch: int, evidence: str) -> bool:
+        """Persist a detected slashable offence (idempotent on
+        (validator, slot, condition)). Returns True if it was NEW. Commits."""
+        cur = await self.connection.execute(
+            "INSERT OR IGNORE INTO slashing_events "
+            "(validator_address, condition, slot, epoch, evidence) VALUES (?, ?, ?, ?, ?)",
+            (validator_address, str(condition), int(slot), int(epoch), str(evidence)),
+        )
+        await self.connection.commit()
+        return bool(cur.rowcount)
+
+    async def get_slashing_events(self, validator_address: str = None) -> list:
+        """Return recorded slashing evidence rows (optionally for one validator)."""
+        if validator_address:
+            cur = await self.connection.execute(
+                "SELECT validator_address, condition, slot, epoch, evidence, processed "
+                "FROM slashing_events WHERE validator_address = ? ORDER BY slot", (validator_address,))
+        else:
+            cur = await self.connection.execute(
+                "SELECT validator_address, condition, slot, epoch, evidence, processed "
+                "FROM slashing_events ORDER BY slot")
+        rows = await cur.fetchall()
+        return [{"validator_address": r[0], "condition": r[1], "slot": r[2],
+                 "epoch": r[3], "evidence": r[4], "processed": bool(r[5])} for r in rows]
 
     async def get_epoch_attesters(self, target_epoch: int) -> list:
         """Return the validator addresses that have voted for ``target_epoch``."""

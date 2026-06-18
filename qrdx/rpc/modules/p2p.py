@@ -23,8 +23,10 @@ Methods:
 
 from typing import Any, Dict, List, Optional
 import asyncio
+import json
 
 from ..server import RPCModule, rpc_method, RPCError, RPCErrorCode
+from ...constants import SLOTS_PER_EPOCH
 from ...logger import get_logger
 
 logger = get_logger(__name__)
@@ -146,7 +148,38 @@ class P2PModule(RPCModule):
             if self._enforce_equal_height_tiebreak else
             ("would REPLACE" if incoming_wins else "would keep stored"),
         )
+        # Slashing detection (observe): an equal-height fork whose two blocks share the
+        # SAME proposer + slot is a DOUBLE_SIGN (the eligible proposer signed two blocks
+        # for its slot) — distinct from the benign distinct-proposer race. Record durable
+        # evidence; the deterministic stake penalty is a follow-up.
+        try:
+            await self._detect_and_record_double_sign(
+                block_no, block_content, stored.get("content") or stored.get("block_content"))
+        except Exception as e:
+            logger.debug("double-sign detection skipped at h=%d: %s", block_no, e)
         return incoming_wins
+
+    async def _detect_and_record_double_sign(self, block_no, incoming_content, stored_content) -> bool:
+        """If the two competing blocks at ``block_no`` are a same-proposer/same-slot
+        DOUBLE_SIGN, persist slashing evidence (idempotent). Observe-only — records
+        evidence, applies no penalty. Returns True if evidence was newly recorded."""
+        from ...validator.block_verification import is_double_sign, _parse_block_content
+        if not is_double_sign(incoming_content, stored_content):
+            return False
+        c = _parse_block_content(incoming_content)
+        proposer = c.get("proposer_address")
+        slot = int(c.get("slot") or 0)
+        epoch = int(c.get("epoch") if c.get("epoch") is not None else slot // SLOTS_PER_EPOCH)
+        evidence = {
+            "slot": slot,
+            "block1_hash": (_parse_block_content(stored_content).get("hash")),
+            "block2_hash": c.get("hash"),
+        }
+        new = await self._db.record_slashing_event(
+            proposer, "double_sign", slot, epoch, json.dumps(evidence))
+        logger.warning("[slashing observe] DOUBLE_SIGN by %s at slot %d (h=%d) — evidence %s",
+                       str(proposer)[:20], slot, block_no, "recorded" if new else "already known")
+        return new
 
     @rpc_method
     async def submitBlock(self, block_data: Dict) -> Dict:

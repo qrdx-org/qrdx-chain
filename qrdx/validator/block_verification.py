@@ -91,6 +91,26 @@ def _parse_block_content(block_content: Any) -> Dict[str, Any]:
     return ast.literal_eval(block_content)
 
 
+def is_double_sign(block_content_a: Any, block_content_b: Any) -> bool:
+    """Slashing detection (DOUBLE_SIGN): True iff two blocks are a double-sign by the
+    SAME proposer — identical ``proposer_address`` AND ``slot`` but a different block
+    hash. Two DISTINCT proposers at adjacent slots producing a block at the same height
+    (the benign equal-height propagation race) is NOT a slashable offence, so the
+    proposer+slot identity is the discriminator. Pure; safe to call on any two parsed
+    block dicts or ``block_content`` reprs."""
+    try:
+        a = _parse_block_content(block_content_a)
+        b = _parse_block_content(block_content_b)
+    except Exception:
+        return False
+    pa, pb = a.get('proposer_address'), b.get('proposer_address')
+    if not pa or pa != pb:
+        return False
+    if a.get('slot') is None or a.get('slot') != b.get('slot'):
+        return False
+    return (a.get('hash') or a.get('block_hash')) != (b.get('hash') or b.get('block_hash'))
+
+
 def epoch_from_block(block_like: Dict[str, Any]) -> Optional[int]:
     """Robustly extract a PoS block's epoch from any of the dict shapes the import
     paths carry: a parsed block dict (epoch/slot top-level), or a wire envelope whose
