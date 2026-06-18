@@ -32,6 +32,14 @@ _SLEEP = SLOT_DURATION if isinstance(SLOT_DURATION, int) and SLOT_DURATION > 0 e
 # validators-table updates without writing; True = write them at each finalized epoch.
 _ENFORCE_EPOCH_VALIDATOR_UPDATES = True
 
+# Slashing penalty enforce gate. The deterministic slash (effective_stake reduction +
+# eject) at the finalized epoch keeps the validators table byte-identical across nodes
+# ONLY if every node holds the SAME slashing_events by then — which needs evidence to
+# ride the canonical chain (evidence-in-blocks) or robust gossip. Until that lands this
+# stays OBSERVE: compute + log the would-be slash, write nothing (so the table stays
+# convergent). The detection + evidence recording is already live (observe).
+_ENFORCE_SLASHING = False
+
 
 async def apply_epoch_validator_update(db, epoch: int, enforce: bool) -> None:
     """Apply (or, in observe, log) the deterministic reward/penalty deltas for one
@@ -52,6 +60,9 @@ async def apply_epoch_validator_update(db, epoch: int, enforce: bool) -> None:
         rewards, penalties, activated=activated, exited=exited, activation_epoch=epoch,
         max_effective_balance=MAX_EFFECTIVE_BALANCE, enforce=enforce,
     )
+    # Slashing penalties for offences in finalized epochs ≤ this one (own observe/enforce
+    # gate — see _ENFORCE_SLASHING; stays observe until evidence is cross-node deterministic).
+    await apply_epoch_slashings(db, epoch, enforce=(enforce and _ENFORCE_SLASHING))
     if enforce:
         await db.connection.commit()
     vhash = await db.get_validators_table_hash()
@@ -60,6 +71,43 @@ async def apply_epoch_validator_update(db, epoch: int, enforce: bool) -> None:
         "ENFORCE" if enforce else "observe", epoch, len(active),
         res["rewarded"], res["penalized"], vhash[:16],
     )
+
+
+async def apply_epoch_slashings(db, epoch: int, enforce: bool) -> None:
+    """Apply (or, in observe, log) deterministic slashing penalties for offences in
+    finalized epochs ≤ ``epoch``. Each offending validator is penalised by the WORST
+    applicable fraction of its current effective_stake (SLASHING_PENALTIES) and ejected
+    (status='slashed'); its evidence is then marked processed (penalty applied once).
+    Pure function of the recorded evidence — identical on every node that holds it."""
+    events = await db.get_unprocessed_slashing_events(up_to_epoch=epoch)
+    if not events:
+        return
+    from decimal import Decimal
+    from .slashing import SLASHING_PENALTIES, SlashingConditions
+    # Worst penalty fraction per offending validator across its recorded conditions.
+    worst: dict = {}
+    for ev in events:
+        try:
+            frac = SLASHING_PENALTIES.get(SlashingConditions(ev["condition"]), Decimal("0.10"))
+        except Exception:
+            frac = Decimal("0.10")
+        addr = ev["validator_address"]
+        if addr not in worst or frac > worst[addr]:
+            worst[addr] = frac
+    for addr, frac in worst.items():
+        c = await db.connection.execute(
+            "SELECT effective_stake FROM validators WHERE address = ?", (addr,))
+        row = await c.fetchone()
+        if not row:
+            continue
+        penalty = (Decimal(str(row[0] or 0)) * frac)
+        res = await db.apply_validator_slash(addr, penalty, enforce=enforce)
+        if enforce:
+            await db.mark_slashing_events_processed(addr, epoch)
+        logger.warning(
+            "[slashing %s] epoch=%d validator=%s penalty=%s new_stake=%s (ejected → 'slashed')",
+            "ENFORCE" if enforce else "observe", epoch, str(addr)[:20],
+            res["penalty"], res["new_stake"])
 
 
 async def epoch_validator_update_loop(db, enforce: bool = None) -> None:

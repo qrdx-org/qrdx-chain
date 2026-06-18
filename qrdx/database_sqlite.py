@@ -1239,6 +1239,51 @@ class DatabaseSQLite:
         return [{"validator_address": r[0], "condition": r[1], "slot": r[2],
                  "epoch": r[3], "evidence": r[4], "processed": bool(r[5])} for r in rows]
 
+    async def get_unprocessed_slashing_events(self, up_to_epoch: int) -> list:
+        """Unprocessed slashing evidence whose offence epoch is at or below
+        ``up_to_epoch`` (so the finalized-epoch loop applies penalties only for
+        offences in already-finalized epochs — deterministic ordering)."""
+        cur = await self.connection.execute(
+            "SELECT validator_address, condition, slot, epoch FROM slashing_events "
+            "WHERE processed = 0 AND epoch <= ? ORDER BY validator_address, slot",
+            (int(up_to_epoch),))
+        rows = await cur.fetchall()
+        return [{"validator_address": r[0], "condition": r[1], "slot": r[2], "epoch": r[3]}
+                for r in rows]
+
+    async def apply_validator_slash(self, address: str, penalty, enforce: bool = False) -> dict:
+        """Apply a slashing penalty to one validator: effective_stake -= penalty
+        (clamped at 0), total_slashed += penalty, status='slashed' (ejecting it from the
+        eligible set {active,pending,exiting}). Decimal arithmetic, identical on every
+        node given the same evidence. ``enforce=False`` previews without writing. No
+        commit. Returns {address, penalty, new_stake, applied}."""
+        from decimal import Decimal
+        c = await self.connection.execute(
+            "SELECT effective_stake, total_slashed FROM validators WHERE address = ?", (address,))
+        row = await c.fetchone()
+        if not row:
+            return {"address": address, "penalty": "0", "new_stake": None, "applied": False}
+        pen = Decimal(str(penalty))
+        cur_stake = Decimal(str(row[0] or 0))
+        new_stake = cur_stake - pen
+        if new_stake < 0:
+            new_stake = Decimal(0)
+        new_slashed = Decimal(str(row[1] or 0)) + pen
+        if enforce:
+            await self.connection.execute(
+                "UPDATE validators SET effective_stake = ?, total_slashed = ?, "
+                "slashed = 1, status = 'slashed', updated_at = CURRENT_TIMESTAMP WHERE address = ?",
+                (str(new_stake), str(new_slashed), address))
+        return {"address": address, "penalty": str(pen), "new_stake": str(new_stake),
+                "applied": bool(enforce)}
+
+    async def mark_slashing_events_processed(self, address: str, up_to_epoch: int) -> None:
+        """Mark a validator's slashing evidence (offence epoch ≤ up_to_epoch) processed,
+        so the penalty is applied exactly once. No commit."""
+        await self.connection.execute(
+            "UPDATE slashing_events SET processed = 1 WHERE validator_address = ? AND epoch <= ?",
+            (address, int(up_to_epoch)))
+
     async def get_epoch_attesters(self, target_epoch: int) -> list:
         """Return the validator addresses that have voted for ``target_epoch``."""
         cursor = await self.connection.execute(
