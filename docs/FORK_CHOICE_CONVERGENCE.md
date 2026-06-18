@@ -174,6 +174,37 @@ competing block" to "active query/gossip". Soak gate unchanged: 1 unique RANDAO 
 across all nodes. The on-receipt path can stay as an opportunistic fast-path under the
 same flag once reconciliation guarantees convergence.
 
+## Option-A active reconciliation — OBSERVE STAGE FINDING (2026-06-18): block history already converges
+
+Implemented the Option-A pull-based pass in OBSERVE mode (`main.fork_choice_reconcile_pass`,
+gated by `_ENFORCE_FORK_CHOICE_RECONCILE=False`, run every cycle from
+`periodic_update_fetcher`): for each recent unfinalized height (bounded window down from
+the tip, never below finalized) it pulls every peer's block hash, computes the lowest-hash
+canonical choice, logs the first height where local differs, and logs a **RANDAO-mix probe**.
+
+A clean `--force` run (16/16) plus a direct per-node `compute_randao_mix` comparison shows:
+- **At the common (min) height across all 4 nodes the RANDAO mix is BYTE-IDENTICAL** — i.e.
+  block history is CONVERGED up to the common prefix. The decisive convergence probe passes.
+- The only `fork-choice observe` divergence hits are **tip-local** (heights within ~0–4 of
+  the node's own max tip, e.g. h=85 with tips 88/89/91) — the expected equal-height
+  propagation race at the ragged tip, which resolves as blocks propagate. No deep/persistent
+  fork was observed.
+
+**Conclusion:** the determinism fixes + mechanism-1 (parent-continuity + the now-working
+reorg) already converge block history in practice. The earlier "persistent equal-height
+fork" is no longer reproduced; the equal-height race is transient tip-lag, not a stuck
+state. **Active enforce (rollback+re-adopt) is therefore NOT needed for convergence** and
+would only churn the tip — the observe pass stays as a lightweight monitor (divergence
+counter + RANDAO probe). Keep `_ENFORCE_FORK_CHOICE_RECONCILE=False`.
+
+**Corrected downstream claim:** the finality stall in long multi-node runs is NOT caused by
+a block-history fork (history converges). It is an **attestation-coverage degradation**: per
+the converged chain's `attestation_votes`, early epochs have all 3 validators attesting
+(≥2/3 → justified) but later epochs thin to 2/3 then below, so justification lags/stalls in
+long runs (short runs show a healthy ~2–3 epoch finality lag). The next finality/lifecycle
+unblock work belongs in the ATTESTATION subsystem (why per-epoch attester coverage decays),
+not in fork-choice. See memory `finality-stall-from-block-history-fork` (updated).
+
 ## Mechanism-2 enforce — ready-to-execute implementation spec (passive path; see redirect above)
 
 The full trace is done; an implementer can follow this directly.

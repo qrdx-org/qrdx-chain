@@ -118,6 +118,22 @@ _ENFORCE_PARENT_CONTINUITY = False
 # implementation stays for that future approach. See FORK_CHOICE_CONVERGENCE.md.
 _ENFORCE_EQUAL_HEIGHT_TIEBREAK = False
 
+# Fork-choice mechanism-2 via ACTIVE reconciliation (the redirect from the failed
+# passive soak above). A periodic, all-nodes pass that PULLS peers' block hash at each
+# recent unfinalized height, computes the deterministic canonical choice (lowest hash),
+# and — where the local block is not the canonical one — reorgs onto the peer holding
+# the winning chain (reusing the longest-chain reorg machinery). Unlike passive
+# replacement this converges every node, because every node actively queries regardless
+# of what it received. Observe-first: with this False the pass only MEASURES divergence
+# + logs the would-be canonical choice and a RANDAO-mix convergence probe; it never
+# rolls back. Never reconciles below the finalized height (the reorg guard). See the
+# active-reconciliation redirect in FORK_CHOICE_CONVERGENCE.md.
+_ENFORCE_FORK_CHOICE_RECONCILE = False
+# How many recent heights (down from the tip) the active pass inspects per cycle. Forks
+# are tip-local (block-time ≈ propagation-time), so a bounded window catches them while
+# keeping the per-cycle peer-query cost small. Clamped to the finalized boundary.
+_FORK_CHOICE_WINDOW = 24
+
 # Kademlia DHT integration
 from qrdx.p2p.node import Node as P2PNode, Address as P2PAddress, hex_to_node_id as p2p_hex_to_node_id
 from qrdx.p2p.routing import RoutingTable, KBucketEntry
@@ -2284,7 +2300,16 @@ async def periodic_update_fetcher():
                 for peer_info in peers_to_probe:
                     await check_peer_and_sync(peer_info)
                     await asyncio.sleep(1) # Small delay between probes
-        
+
+        # 1b. FORK-CHOICE ACTIVE RECONCILIATION (mechanism-2). After the longest-chain
+        #     check, actively reconcile equal-height block-history forks (which the
+        #     longest-chain sync cannot see). Observe-first via _ENFORCE_FORK_CHOICE_RECONCILE.
+        if not security.sync_state_manager.is_syncing:
+            try:
+                await fork_choice_reconcile_pass(enforce=_ENFORCE_FORK_CHOICE_RECONCILE)
+            except Exception as e:
+                logger.debug(f"fork-choice reconcile pass skipped: {e}")
+
         # 2. CHECK FOR NEW TRANSACTIONS (MEMPOOL SYNC)
         all_peers = NodesManager.get_all_peers()
         connectable_peers = [p for p in all_peers if p.get('url')]
@@ -2835,6 +2860,104 @@ async def handle_unreachable_peer(peer_id: str, peer_url: str, context: str):
     """
     logger.warning(f"Peer {peer_id} at {peer_url} is unreachable ({context}). Removing from active peer list.")
     NodesManager.remove_peer(peer_id)
+
+
+async def fork_choice_reconcile_pass(enforce: bool = False) -> dict:
+    """
+    Fork-choice mechanism-2 via ACTIVE reconciliation (Option A, pull-based).
+
+    For each recent UNFINALIZED height (a bounded window down from the tip, never below
+    the finalized boundary), PULL every peer's block hash at that height, union them
+    with the local hash, and compute the deterministic canonical choice — the LOWEST
+    hash (unbiasable, slot-independent, a pure function of the blocks, so every node
+    agrees). At the lowest height where the local block is NOT that canonical choice the
+    block history has forked; under ``enforce`` the node would reorg onto the peer
+    holding the winning chain (reusing the longest-chain reorg machinery).
+
+    Observe-first: with ``enforce=False`` this only MEASURES and logs the would-be
+    canonical choice + a RANDAO-mix probe (the sharpest convergence signal — it folds
+    every block's reveal, so it agrees network-wide only when block history is identical
+    at every height). It never mutates state. Returns a small summary dict for the
+    caller/probe. See the active-reconciliation redirect in FORK_CHOICE_CONVERGENCE.md.
+    """
+    summary = {"window": None, "diverged_at": None, "randao_mix": None}
+    try:
+        if security.sync_state_manager.is_syncing:
+            return summary
+        last = await db.get_last_block()
+        if not last:
+            return summary
+        tip = int(last['id'])
+        try:
+            from ..validator.finality import finalized_block_height
+            fin = await finalized_block_height(db)
+        except Exception:
+            fin = -1
+        low = max(0, fin + 1, tip - _FORK_CHOICE_WINDOW)
+        if low > tip:
+            return summary
+        summary["window"] = (low, tip)
+
+        peers = [p for p in NodesManager.get_all_peers() if p.get('url')]
+        # RANDAO-mix convergence probe (cheap, local) — logged every pass.
+        try:
+            from ..validator.randao import compute_randao_mix
+            mix = await compute_randao_mix(db, tip)
+            mix_hex = mix.hex()[:16] if isinstance(mix, (bytes, bytearray)) else str(mix)[:16]
+        except Exception:
+            mix_hex = "?"
+        summary["randao_mix"] = mix_hex
+        if not peers:
+            return summary
+
+        # Local hashes across the window.
+        local_hashes = {}
+        for h in range(low, tip + 1):
+            b = await db.get_block_by_id(h)
+            if b:
+                local_hashes[h] = b.get('hash') or b.get('block_hash')
+        # candidates[h] = { block_hash: source_url_or_None(local) }
+        candidates = {h: {hh: None} for h, hh in local_hashes.items()}
+        for peer in peers:
+            iface = NodeInterface(peer['url'], client=http_client, db=db)
+            for h in range(low, tip + 1):
+                try:
+                    resp = await iface.get_block(str(h))
+                    if resp and resp.get('ok'):
+                        rh = resp['result']['block']['hash']
+                        if rh:
+                            candidates.setdefault(h, {}).setdefault(rh, peer['url'])
+                except Exception:
+                    break  # peer unreachable — skip the rest of its window
+
+        # Lowest height where local is not the canonical (lowest-hash) choice.
+        diverged = None
+        for h in range(low, tip + 1):
+            if h not in local_hashes or h not in candidates:
+                continue
+            winner = min(candidates[h].keys())
+            if winner != local_hashes[h]:
+                diverged = (h, winner, candidates[h][winner])
+                break
+
+        if diverged is None:
+            logger.debug("[fork-choice observe] window=%d..%d converged; randao_mix=%s",
+                         low, tip, mix_hex)
+            return summary
+        h, winner, src = diverged
+        summary["diverged_at"] = h
+        logger.warning(
+            "[fork-choice %s] block-history divergence at h=%d: local=%s canonical(min-hash)=%s "
+            "from=%s; randao_mix=%s (window %d..%d)",
+            "ENFORCE" if enforce else "observe", h, str(local_hashes[h])[:16],
+            str(winner)[:16], src or "local", mix_hex, low, tip)
+        # ENFORCE (active reorg) is intentionally not wired yet — it lands with its own
+        # soak once this observe stage confirms forks are tip-local and the canonical
+        # choice is consistent across nodes. Flag stays False until then.
+        return summary
+    except Exception as e:
+        logger.debug("fork-choice reconcile pass error: %s", e)
+        return summary
 
 
 
