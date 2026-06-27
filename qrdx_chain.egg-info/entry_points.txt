@@ -1,0 +1,3 @@
+[console_scripts]
+qrdx-node = run_node:main
+qrdx-wallet = qrdx.cli.wallet:cli

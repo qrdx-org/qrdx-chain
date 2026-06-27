@@ -4,13 +4,14 @@ Quick script to send a transaction from a system wallet using the master control
 """
 import sys
 import json
+import httpx
 import hashlib
 from pathlib import Path
 from decimal import Decimal
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from qrdx.crypto.pq.dilithium import PQPrivateKey
+from qrdx.crypto.pq.dilithium import PQPrivateKey, PQSignature
 
 def main():
     if len(sys.argv) < 5:
@@ -45,37 +46,33 @@ def main():
     
     # Create PQ private key
     private_key = PQPrivateKey.from_hex(private_key_hex)
-    
-    # Fetch UTXOs from database (node RPC doesn't have getUTXOs yet)
-    import sqlite3
-    db_path = "testnet/databases/node0.db"
-    
-    print(f"Fetching UTXOs from database...")
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT tx_hash, tx_index, amount
-        FROM utxos
-        WHERE address = ?
-        ORDER BY amount DESC
-    """, (from_address,))
-    
-    utxo_rows = cursor.fetchall()
-    conn.close()
-    
-    if not utxo_rows:
-        print(f"✗ No UTXOs found for {from_address}")
-        sys.exit(1)
-    
-    # Convert to format expected by transaction
-    utxos = []
-    for tx_hash_bytes, idx, amount in utxo_rows:
-        utxos.append({
-            "tx_hash": tx_hash_bytes.hex(),
-            "index": 0,  # Genesis outputs are always index 0
-            "amount": amount
-        })
+    """
+        {
+            "ok": true,
+            "result": {
+                "balance": "6000000.000000",
+                "spendable_outputs": [
+                {
+                    "amount": "6000000.000000",
+                    "tx_hash": "27b0d9a045adcdabf4cf13cb7f90cd5b9915b8bdbe45bb0d1591bc061195e78e",
+                    "index": 0
+                }
+                ],
+                "transactions": [],
+                "pending_transactions": null,
+                "pending_spent_outputs": null
+            }
+        }
+    """
+    address_utxo_response: httpx.Response = httpx.get(
+        f"{node_url}/get_address_info",
+        params={
+            "address": from_address
+        },
+        timeout=30.0
+    )
+    address_utxo_result: dict = address_utxo_response.json()
+    utxos: list = address_utxo_result.get("result", {}).get("spendable_outputs", [])
     
     print(f"✓ Found {len(utxos)} UTXOs")
     
@@ -89,7 +86,7 @@ def main():
     total_input = 0
     for utxo in utxos:
         selected_utxos.append(utxo)
-        total_input += utxo['amount']  # Already in microQRDX
+        total_input += float(utxo['amount'])  # Already in microQRDX
         if total_input >= total_needed:
             break
     
@@ -124,20 +121,19 @@ def main():
     tx_bytes = json.dumps(tx_data, sort_keys=True).encode()
     tx_hash = hashlib.sha256(tx_bytes).digest()
     
-    signature = private_key.sign(tx_hash)
-    tx_data["controller_signature"] = signature.hex()
+    signature: PQSignature = private_key.sign(tx_hash)
+    tx_data["controller_signature"] = signature.to_hex()
     
     print("✓ Transaction signed")
     
     # Send transaction
     print("Broadcasting transaction...")
     
-    import httpx
     send_response = httpx.post(
         f"{node_url}/rpc",
         json={
             "jsonrpc": "2.0",
-            "method": "qrdx_sendTransaction",
+            "method": "eth_sendRawTransaction",
             "params": [tx_data],
             "id": 2
         },
