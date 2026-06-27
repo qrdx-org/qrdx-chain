@@ -2781,12 +2781,16 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
             return None  # caller aborts the sync cycle; local finalized chain kept
 
     logger.info(f"[REORG] Rolling back local chain to block {last_common_block_id}.")
-    await db.remove_blocks(last_common_block_id + 1)
-
-    # E-D3b + Phase E reorg safety: rebuild all derived state (account/EVM, token
-    # ledger, exchange) from the canonical blocks up to the rolled-back tip. Shared
-    # with the equal-height tie-break path.
-    await _rebuild_derived_state_after_rollback()
+    # Serialize the rollback + derived-state rebuild under the block-processing lock
+    # (the same one the forward-sync apply loop and every import/propose path hold), so
+    # the multi-step reseed→reflush is atomic w.r.t. a concurrent block on a busy node.
+    # The ancestor search above stays OUTSIDE the lock (it does network I/O).
+    async with block_processing_lock:
+        await db.remove_blocks(last_common_block_id + 1)
+        # E-D3b + Phase E reorg safety: rebuild all derived state (account/EVM, token
+        # ledger, exchange) from the canonical blocks up to the rolled-back tip. Shared
+        # with the equal-height tie-break path.
+        await _rebuild_derived_state_after_rollback()
 
     logger.info(f"[REORG] Re-adding {len(orphaned_txs)} orphaned transactions to the pending pool.")
     for tx in orphaned_txs:
@@ -2924,14 +2928,23 @@ async def _sync_blockchain(node_id: str = None):
                     logger.info('[SYNC] No more blocks returned by peer. Sync presumed complete.')
                     break
                 
-                for block_data in blocks_batch:
-                    if not await process_and_create_block(block_data):
-                        logger.error("[SYNC] FATAL ERROR: Failed to create blocks during sync. Aborting.")
-                        await security.reputation_manager.record_violation(
-                            peer_to_sync_from['node_id'], 'invalid_sync_block', severity=8
-                        )
-                        return
-                    await asyncio.sleep(0)
+                # Serialize block APPLICATION under the same lock every other block-
+                # mutation path holds (p2p import, REST, proposer). The forward-sync loop
+                # was the ONE unlocked state-mutating path, so its process_and_create_block
+                # raced a concurrent proposer/import on a busy node — a block landing mid-
+                # apply could leave derived account_state at a reseeded-genesis value with
+                # the activity (perp margin / EVM transfer) re-applied to the wrong base.
+                # The network FETCH above stays outside the lock (I/O); only the local
+                # per-batch apply is serialized. See phase_e_invariants reorg divergence.
+                async with block_processing_lock:
+                    for block_data in blocks_batch:
+                        if not await process_and_create_block(block_data):
+                            logger.error("[SYNC] FATAL ERROR: Failed to create blocks during sync. Aborting.")
+                            await security.reputation_manager.record_violation(
+                                peer_to_sync_from['node_id'], 'invalid_sync_block', severity=8
+                            )
+                            return
+                        await asyncio.sleep(0)
 
                 NodesManager.update_peer_last_seen(peer_to_sync_from['node_id'])
     
