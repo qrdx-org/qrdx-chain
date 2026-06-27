@@ -167,7 +167,10 @@ async def rebuild_account_state_from_chain(
         )
         if root is not None:
             applied += 1
-    return await db.get_account_state_root()
+    root = await db.get_account_state_root()
+    logger.info("[reorg-diag] rebuild_account_state: tip=%d evm_sections_applied=%d acct_root=%s",
+                tip, applied, root[:16])
+    return root
 
 
 async def apply_block_evm_section(

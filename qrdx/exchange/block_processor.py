@@ -473,9 +473,10 @@ async def rebuild_exchange_state_from_chain(
         except Exception as e:
             logger.warning("rebuild_exchange_state: account_state flush commit failed: %s", e)
 
-    if applied:
-        logger.info("Rebuilt exchange state from %d canonical block section(s)%s",
-                    applied, f"; re-flushed {flushed} to account_state" if flushed else "")
+    # [reorg-diag] log UNCONDITIONALLY (incl. applied=0) so a heavy-reorg run reveals
+    # whether the reflush re-applied the activity sections after a rollback+reseed.
+    logger.info("[reorg-diag] rebuild_exchange: tip=%d applied=%d flushed=%d (flush_to_account=%s)",
+                tip, applied, flushed, flush_to_account_state)
     return mgr.compute_state_root()
 
 
