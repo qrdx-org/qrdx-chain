@@ -172,6 +172,14 @@ class ExchangeStateManager:
         # Spot settlement enforcement gate (set by the node when enforcing): when
         # True, a transfer/swap rejects if the holder lacks sufficient balance.
         self.enforce_spot_settlement: bool = False
+        # CLOB order-book settlement gate (observe-first, SEPARATE from the AMM
+        # enforce_spot_settlement so it can be soaked independently). When True,
+        # PLACE_ORDER escrows the order's funds, matched trades settle real token
+        # moves maker↔taker via the book escrow, and CANCEL_ORDER refunds — and an
+        # unaffordable LIMIT order (or any MARKET/STOP order) is rejected BEFORE it
+        # mutates the book. When False (default) the book matches as before and moves
+        # no value (behaviour-neutral). See docs/CONSENSUS_REMAINING_WORK.md item 7.
+        self.enforce_orderbook_settlement: bool = False
 
         # --- Counters ---
         self._total_swaps: int = 0
@@ -542,7 +550,32 @@ class ExchangeStateManager:
             stop_price=Decimal(str(p["stop_price"])) if p.get("stop_price") else None,
             nonce=tx.nonce,
         )
+
+        # Phase E CLOB settlement: reject what we cannot settle BEFORE matching mutates
+        # the book (a failed op is NOT reverted — the block continues). Only plain LIMIT
+        # orders are settled in this increment; MARKET/STOP need affordability handling
+        # not yet built. The worst-case cost (full amount at the limit price) bounds the
+        # taker's total outflow (fills at maker prices ≤ limit, + resting escrow), so a
+        # taker that affords it can never overdraw.
+        base, quote = (pair.split(":", 1) + [""])[:2] if ":" in pair else (pair, "")
+        if self.enforce_orderbook_settlement:
+            if order_type is not OrderType.LIMIT:
+                return ExchangeExecResult(
+                    success=False,
+                    error=f"CLOB settlement supports LIMIT orders only (got {order_type.value})")
+            need_token = quote if side == OrderSide.BUY else base
+            need_amount = (order.amount * order.price) if side == OrderSide.BUY else order.amount
+            avail = self.available_token_balance(tx.sender, need_token)
+            if avail is not None and avail < need_amount:
+                return ExchangeExecResult(
+                    success=False,
+                    error=f"insufficient balance for order: need {need_amount} {need_token[:10]}, "
+                          f"available {avail}")
+
         trades = book.place_order(order)
+
+        if self.enforce_orderbook_settlement:
+            self._settle_orderbook(order, trades, base, quote, pair)
 
         self._total_orders += 1
         return ExchangeExecResult(
@@ -554,6 +587,32 @@ class ExchangeStateManager:
                 "filled": str(order.filled),
             },
         )
+
+    def _settle_orderbook(self, order, trades, base: str, quote: str, pair: str) -> None:
+        """Settle a CLOB order's matched trades + escrow its resting remainder as real
+        token moves (Phase E). Conserves both tokens: each trade moves base seller→buyer
+        and quote buyer→seller; the MAKER's side (the resting party) comes from the book
+        escrow it funded at placement, the TAKER's (this order's owner) comes live; the
+        taker keeps any price improvement automatically (it pays the maker's price, not
+        its limit). The resting remainder is escrowed; CANCEL_ORDER refunds it."""
+        taker = order.owner
+        escrow = self.orderbook_escrow_address(pair)
+        for tr in trades:
+            f = Decimal(str(tr.amount))
+            notional = f * Decimal(str(tr.price))
+            # base: seller → buyer (taker pays live; resting maker's side from escrow)
+            base_src = tr.seller if tr.seller == taker else escrow
+            self._settle_token_move(base_src, tr.buyer, base, f)
+            # quote: buyer → seller (same maker-escrow / taker-live split)
+            quote_src = tr.buyer if tr.buyer == taker else escrow
+            self._settle_token_move(quote_src, tr.seller, quote, notional)
+        # Escrow this order's UNFILLED remainder (it now rests on the book).
+        r = Decimal(str(order.remaining))
+        if r > ZERO and order.is_active:
+            if order.side == OrderSide.BUY:
+                self._settle_token_move(taker, escrow, quote, r * Decimal(str(order.price)))
+            else:
+                self._settle_token_move(taker, escrow, base, r)
 
     def _op_cancel_order(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
@@ -569,6 +628,19 @@ class ExchangeStateManager:
         for book in books_to_check:
             result = book.cancel_order(order_id, caller=tx.sender)
             if result is not None:
+                # Phase E CLOB: refund the cancelled order's escrowed remainder
+                # (exactly what it locked at placement: remaining*price quote for a BUY,
+                # remaining base for a SELL — the book's pair is token0:token1).
+                if self.enforce_orderbook_settlement:
+                    book_pair = getattr(book, "pool_id", "") or ""
+                    rbase, rquote = (book_pair.split(":", 1) + [""])[:2] if ":" in book_pair else (book_pair, "")
+                    r = Decimal(str(result.remaining))
+                    if r > ZERO:
+                        escrow = self.orderbook_escrow_address(book_pair)
+                        if result.side == OrderSide.BUY:
+                            self._settle_token_move(escrow, result.owner, rquote, r * Decimal(str(result.price)))
+                        else:
+                            self._settle_token_move(escrow, result.owner, rbase, r)
                 return ExchangeExecResult(
                     success=True,
                     gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.CANCEL_ORDER],
@@ -617,6 +689,14 @@ class ExchangeStateManager:
         (Phase E spot). Liquidity providers' tokens move INTO this holder; swap
         outputs move OUT of it — so pool reserves are real, conserved token balances."""
         return "0xPOOL" + hashlib.blake2b(f"pool:{pool_id}".encode(), digest_size=18).hexdigest()
+
+    @staticmethod
+    def orderbook_escrow_address(pair: str) -> str:
+        """Deterministic token-ledger holder for a CLOB book's RESTING-order funds
+        (Phase E spot). A placed limit order's funds move INTO this holder; matched
+        fills + cancels move OUT — so resting orders are backed by real, conserved
+        token balances (the same pattern as ``pool_holder_address`` for AMM reserves)."""
+        return "0xCLOB" + hashlib.blake2b(f"book:{pair}".encode(), digest_size=18).hexdigest()
 
     @staticmethod
     def _cl_token_amounts(pool, tick_lower: int, tick_upper: int, liquidity: Decimal) -> Tuple[Decimal, Decimal]:

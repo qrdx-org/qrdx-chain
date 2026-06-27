@@ -60,6 +60,13 @@ ENFORCE_EXCHANGE_COLLATERAL = True
 # (preload_token_balances) on every path, so rejection is deterministic + convergent.
 ENFORCE_SPOT_SETTLEMENT = True
 
+# CLOB order-book settlement gate (observe-first, SEPARATE from the AMM
+# ENFORCE_SPOT_SETTLEMENT so it can be soaked independently). OFF: the book matches as
+# before and moves no value (behaviour-neutral). ON: PLACE_ORDER escrows + matched
+# trades settle real token moves + CANCEL refunds, with unaffordable/MARKET orders
+# rejected before they mutate the book. Stays OFF until the escrow settlement is soaked.
+ENFORCE_ORDERBOOK_SETTLEMENT = False
+
 
 async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:
     """
@@ -109,6 +116,11 @@ async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateM
             for k in ("token0", "token1"):
                 if p.get(k):
                     wanted.add((sender, str(p[k])))
+        elif op == ExchangeOpType.PLACE_ORDER and ":" in str(p.get("pair", "")):
+            # CLOB sufficiency: a buy spends quote, a sell spends base — load both.
+            b, q = str(p["pair"]).split(":", 1)
+            wanted.add((sender, b))
+            wanted.add((sender, q))
     for holder, token in wanted:
         try:
             mgr.set_available_token_balance(holder, token, await db.get_token_balance(token, holder))
