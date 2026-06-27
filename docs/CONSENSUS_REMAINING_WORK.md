@@ -279,10 +279,26 @@
        Verified: suite 15/15 enforced, all 4 nodes 1 unique token root, every token
        conserves. **→ spot settlement is real, enforced, convergent.**
 
-   **✅ PHASE E COMPLETE.** Every economic operation now moves real, consensus-tracked
-   value: EVM gas (py-evm), perp margin + PnL (account_state — enforced, convergent,
-   reorg-safe), and spot deploy/transfer/swap/liquidity (the QRC-20 token ledger — an
-   enforced 4th unified-state-root domain). Only the process gates below remain.
+   **✅ PHASE E — primary venues COMPLETE.** The economic operations that move value
+   through the primary venues are real, consensus-tracked, enforced, convergent and
+   reorg-safe: EVM gas (py-evm), perp margin + PnL + **ADD_MARGIN** (account_state), and
+   spot deploy/transfer/**AMM** swap/liquidity (the QRC-20 token ledger — an enforced 4th
+   unified-state-root domain). Reorg-safety of 0x genesis funding was fixed (the EVM
+   balance-sync registry is now reset on rebuild) and is continuously checked by
+   `scripts/phase_e_invariants.py`.
+
+   **⏳ Remaining economic-settlement gaps (secondary, no live scenario):**
+   - **CLOB order-book** — `_op_place_order` matches orders and produces trades but moves
+     NO token balances; `_op_cancel_order` refunds nothing. Needs escrow-on-place →
+     settle-on-match (maker↔taker base/quote + fees) → refund-on-cancel. The AMM is the
+     settled spot venue; the order book is still a simulation. (Largest remaining item;
+     escrow accounting per resting order.)
+   - **`_op_create_pool` stake/burn** — validates `stake_amount >= required` (subsidized
+     pools "require burn", others "require staking" QRDX) but never DEBITS it from the
+     creator. Needs a lock-vs-burn tokenomics decision + a return path before settling
+     (cf. the clean ADD_MARGIN fix, which had an existing return path via close).
+
+   Then the process gates below.
 
 ## 🔒 Process gates (cannot be satisfied in-repo)
 
