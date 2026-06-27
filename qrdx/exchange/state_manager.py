@@ -864,9 +864,37 @@ class ExchangeStateManager:
 
     def _op_add_margin(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
-        new_margin = self.perp_engine.add_margin(
-            p["position_id"], Decimal(str(p["amount"])),
-        )
+        amount = Decimal(str(p["amount"]))
+        position_id = p["position_id"]
+
+        # Phase E: topping up margin must be backed by real collateral, debited from the
+        # trader — symmetric with open (which debits pos.margin) and close (which credits
+        # the FULL locked margin, additions included), so it conserves. Only the position
+        # OWNER may pay (the engine doesn't check), else the payer ≠ who is refunded on
+        # close → value leak.
+        pos = self.perp_engine.get_position(position_id) if hasattr(self.perp_engine, "get_position") else None
+        if pos is not None and getattr(pos, "owner", tx.sender) != tx.sender:
+            if self.enforce_collateral:
+                return ExchangeExecResult(
+                    success=False, error="add_margin: only the position owner may add margin")
+            logger.warning("[Phase E observe] add_margin by %s on position owned by %s — "
+                           "would REJECT once collateral is enforced",
+                           tx.sender[:20], str(getattr(pos, "owner", "?"))[:20])
+
+        avail = self.available_balance(tx.sender)
+        if avail is not None and avail < amount:
+            if self.enforce_collateral:
+                return ExchangeExecResult(
+                    success=False,
+                    error=f"insufficient collateral: need {amount}, available {avail}")
+            logger.warning(
+                "[Phase E observe] add_margin by %s: amount %s exceeds available %s — "
+                "would REJECT once collateral is enforced", tx.sender[:20], amount, avail)
+
+        new_margin = self.perp_engine.add_margin(position_id, amount)
+        # Lock the added margin as a real-balance debit (flushed to account_state by the
+        # async wrapper when enforced) — returned to the owner on close/liquidation.
+        self._record_balance_delta(tx.sender, -amount)
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ADD_MARGIN],

@@ -114,6 +114,54 @@ def test_enforce_allows_sufficient_collateral():
     assert mgr.balance_deltas()[sender] == -Decimal(res.data["margin"])
 
 
+# --- Phase E: ADD_MARGIN must debit real collateral (was a free top-up) ------
+
+def _add_margin_tx(sender, position_id, amount="500"):
+    return SimpleNamespace(sender=sender, params={
+        "position_id": position_id, "amount": amount,
+    })
+
+
+def test_add_margin_debits_trader_balance():
+    mgr, mid = _mgr_with_market()
+    sender = "0xPQ" + "a1" * 16
+    mgr.set_available_balance(sender, Decimal("1000000"))
+    open_res = mgr._op_open_position(_open_tx(sender, mid))
+    pid = open_res.data["position_id"]
+    margin0 = Decimal(open_res.data["margin"])
+    avail_after_open = mgr.available_balance(sender)
+
+    res = mgr._op_add_margin(_add_margin_tx(sender, pid, "500"))
+    assert res.success
+    assert Decimal(res.data["new_margin"]) == margin0 + Decimal("500")
+    # The added margin is a real debit on top of the opening margin (conserves —
+    # close credits the full locked margin back).
+    assert mgr.balance_deltas()[sender] == -(margin0 + Decimal("500"))
+    assert mgr.available_balance(sender) == avail_after_open - Decimal("500")
+
+
+def test_add_margin_enforce_rejects_non_owner():
+    mgr, mid = _mgr_with_market()
+    owner = "0xPQ" + "a2" * 16
+    other = "0xPQ" + "a3" * 16
+    mgr.enforce_collateral = True
+    mgr.set_available_balance(owner, Decimal("1000000"))
+    mgr.set_available_balance(other, Decimal("1000000"))
+    pid = mgr._op_open_position(_open_tx(owner, mid)).data["position_id"]
+    res = mgr._op_add_margin(_add_margin_tx(other, pid, "500"))
+    assert not res.success and "owner" in (res.error or "")
+
+
+def test_add_margin_enforce_rejects_insufficient():
+    mgr, mid = _mgr_with_market()
+    sender = "0xPQ" + "a4" * 16
+    mgr.enforce_collateral = True
+    mgr.set_available_balance(sender, Decimal("1000000"))
+    pid = mgr._op_open_position(_open_tx(sender, mid)).data["position_id"]
+    res = mgr._op_add_margin(_add_margin_tx(sender, pid, "999999999"))
+    assert not res.success and "insufficient" in (res.error or "")
+
+
 # --- Phase E (c): PnL settlement + margin release on close ------------------
 
 def _close_tx(sender, position_id, price="30000"):
