@@ -191,11 +191,23 @@
    identical prefix → same mix regardless of WHEN (cross-time stable); and `H − LOOKBACK` is
    below the churning tip → all nodes agree (cross-node stable, as the `[randao-observe]`
    already confirms for the finalized mix). Early blocks (H ≤ LOOKBACK) fall back to the seed.
-   Then change BOTH the proposer's self-selection AND `verify_proposer_eligibility` to this
-   checkpoint mix together (changing only one halts the chain), gated `_ENFORCE_RANDAO_SELECTION`,
-   and soak ≥6 runs (gate: 0 eligibility halts, blocks produced every epoch, 1 unique RANDAO
-   mix across nodes). The observe confirms the hard part (cross-node mix+set convergence); the
-   height checkpoint is the deterministic-timing wrapper.
+   **Mechanism IMPLEMENTED + validated (2026-06-28).** `randao.checkpoint_mix_for_block(db,
+   height, lookback)` is the primitive (cross-time stable — unit-tested; default lookback =
+   `SLOTS_PER_EPOCH`). The `[randao-observe]` was repointed at it (anchored to the agreed
+   finalized block): a 16/16 run shows agree=8 / disagree=0 (all nodes pick the same proposer
+   under the checkpoint mix). So the mechanism is proven cross-time + cross-node.
+
+   **Remaining = the ENFORCE flip + soak (halt-risk; own session).** ALL proposer-selection
+   sites must switch to `checkpoint_mix_for_block(db, H)` for the block's height H together —
+   they currently use the constant `manager._randao_mix` (`b"\x00"*32`) / the zero default:
+   (1) `ValidatorManager.is_proposer` (manager.py:457 → `selector.is_proposer(..., self._randao_mix)`),
+   (2) `ValidatorManager.validate_block` (manager.py:978 → `select_proposer(..., self._randao_mix)`),
+   (3) `block_verification.verify_proposer_eligibility` (the import-path check, ENFORCED via
+   `_ENFORCE_PROPOSER_ELIGIBILITY`; uses `expected_proposer_for_slot`'s zero default).
+   Simplest wiring: refresh `manager._randao_mix = await checkpoint_mix_for_block(db, next_height)`
+   per proposal attempt (covers 1+2), and pass the checkpoint mix into (3) from the block's
+   `number`. Gate all on `_ENFORCE_RANDAO_SELECTION` (default False = zero mix = today), flip
+   together, soak ≥6 runs (gate: 0 eligibility halts, blocks every epoch, 1 unique RANDAO mix).
 
 6. **`from_hex`/`from_bytes` caller audit. — ✅ DONE.** Core primitive hardened
    (raises rather than inventing identity), with an actionable error message.
