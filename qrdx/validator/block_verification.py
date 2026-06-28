@@ -211,7 +211,20 @@ async def verify_proposer_eligibility(
     if not validators:
         return True, ""
 
-    expected = expected_proposer_for_slot(slot, validators)
+    # Selection mix: the zero constant today; the deterministic height-checkpoint mix when
+    # RANDAO selection is enforced (must match what the proposer used — see manager.
+    # _selection_mix and docs item 5). Computed from the block's own height so it is
+    # cross-time stable. Behaviour-neutral while the gate is off.
+    mix = PROPOSER_RANDAO_MIX
+    try:
+        from .randao import ENFORCE_RANDAO_SELECTION, checkpoint_mix_for_block
+        if ENFORCE_RANDAO_SELECTION:
+            mix = await checkpoint_mix_for_block(db, int(bc.get("number", 0)))
+    except Exception as e:
+        logger.debug("eligibility: checkpoint mix fallback (zero): %s", e)
+        mix = PROPOSER_RANDAO_MIX
+
+    expected = expected_proposer_for_slot(slot, validators, mix)
     if expected and expected != proposer:
         msg = (f"proposer {str(proposer)[:20]}... not eligible for slot {slot} "
                f"(expected {expected[:20]}...)")

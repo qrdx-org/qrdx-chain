@@ -54,6 +54,14 @@ logger = logging.getLogger(__name__)
 # ~1 epoch out. This is the cross-time-stable selection input (see checkpoint_mix_for_block).
 RANDAO_SELECTION_LOOKBACK = SLOTS_PER_EPOCH
 
+# ENFORCE gate (observe→soak→enforce; default OFF = zero mix = today's behaviour). When
+# True, ALL proposer-selection sites compute the height-checkpoint mix instead of the zero
+# constant: manager.is_proposer + manager.validate_block (via manager._selection_mix) and
+# block_verification.verify_proposer_eligibility. They MUST flip together — selecting on a
+# different mix than the importer verifies halts the chain. Flip + soak ≥6 runs (gate: 0
+# eligibility halts). See docs/CONSENSUS_REMAINING_WORK.md item 5.
+ENFORCE_RANDAO_SELECTION = False
+
 # Genesis seed for the fold. Equal to the current constant proposer mix, so the
 # accumulated mix at height 0 (no reveals) reproduces today's selection input —
 # the switch-over increment can then move selection onto the live mix cleanly.
