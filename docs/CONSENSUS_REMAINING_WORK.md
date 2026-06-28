@@ -180,13 +180,22 @@
    **ENFORCE design (the remaining prerequisite — cross-TIME stability + soak).** Selection
    must be stable between propose-time and verify-time too. "Current finalized mix" advances
    as finality progresses, so a proposer and a later importer could compute different mixes →
-   reject. Enforce therefore needs a DETERMINISTIC per-epoch mix CHECKPOINT (a fixed function
-   of the slot's epoch, e.g. the mix accumulated up to the last block before epoch(S)−1), so
-   proposer + importer compute the identical mix regardless of WHEN. Then change BOTH the
-   proposer's self-selection AND `verify_proposer_eligibility` to that checkpoint mix together
-   (changing only one halts the chain), gated `_ENFORCE_RANDAO_SELECTION`, and soak ≥6 runs
-   (gate: 0 eligibility halts, blocks produced every epoch). The observe confirms the hard
-   part (cross-node mix+set convergence); the checkpoint is the deterministic-timing wrapper.
+   reject. Enforce therefore needs a DETERMINISTIC mix CHECKPOINT that is a fixed function of
+   the BLOCK, not of wall-clock finality.
+
+   **Recommended checkpoint: HEIGHT-based** (cleaner than slot-based — `blocks` has no slot
+   column; slot lives in `block_content`). Select the proposer of the block at height H using
+   `compute_randao_mix(db, H − LOOKBACK)` for a fixed `LOOKBACK` (~1 epoch of blocks, safely
+   below the tip-fork depth, which the fork-choice observe showed is ~≤4). Because H is the
+   block's own height, the proposer (building H) and every importer (verifying H) fold the
+   identical prefix → same mix regardless of WHEN (cross-time stable); and `H − LOOKBACK` is
+   below the churning tip → all nodes agree (cross-node stable, as the `[randao-observe]`
+   already confirms for the finalized mix). Early blocks (H ≤ LOOKBACK) fall back to the seed.
+   Then change BOTH the proposer's self-selection AND `verify_proposer_eligibility` to this
+   checkpoint mix together (changing only one halts the chain), gated `_ENFORCE_RANDAO_SELECTION`,
+   and soak ≥6 runs (gate: 0 eligibility halts, blocks produced every epoch, 1 unique RANDAO
+   mix across nodes). The observe confirms the hard part (cross-node mix+set convergence); the
+   height checkpoint is the deterministic-timing wrapper.
 
 6. **`from_hex`/`from_bytes` caller audit. — ✅ DONE.** Core primitive hardened
    (raises rather than inventing identity), with an actionable error message.
