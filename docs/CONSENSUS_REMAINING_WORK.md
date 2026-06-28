@@ -231,6 +231,19 @@
    fixed finalized height), THEN flip + soak. `checkpoint_mix_for_block(height)` stays as the
    reorg-safe fold primitive; the epoch-indexed lookup is the missing piece.
 
+   **IMPLEMENTED + SOAKED (2026-06-28) — works, but liveness gate NOT yet met.** Built
+   `epoch_checkpoint_mix(db, epoch)` + `selection_mix_for_slot(db, slot)` (boundary height via
+   binary search on the slot-monotonic chain; unit-tested incl. tip-independence) and re-pointed
+   all 3 sites off the slot's epoch. 5-run enforce soak (flag flipped, then reverted): the
+   epoch-based design NO LONGER HALTS (vs the height-based trial) — 4/5 runs 16/16 with selection
+   converging (16/16 ⇒ no eligibility mismatch) and 1 unique RANDAO mix when block history
+   converges. BUT 1/5 dipped to 94% with slow block production (a node reached block 58 vs ~79)
+   + elevated "not eligible" rejections: an intermittent LIVENESS degradation under reorg churn
+   (a reorg recomputes the eligible proposer → more in-flight competing blocks rejected). Gate =
+   ALL ≥6 green → NOT met. Remaining: damp the reorg/eligibility churn (don't re-reject
+   already-validated competing blocks on the losing tip, or widen the lookback) so liveness holds
+   across the soak, then flip `ENFORCE_RANDAO_SELECTION`. Mechanism + wiring committed (gated off).
+
 6. **`from_hex`/`from_bytes` caller audit. — ✅ DONE.** Core primitive hardened
    (raises rather than inventing identity), with an actionable error message.
    Audited callers: the consensus/validator path passes the public key; the only

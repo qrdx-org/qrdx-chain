@@ -454,31 +454,21 @@ class ValidatorManager:
     # BLOCK PROPOSAL
     # =========================================================================
     
-    async def _selection_mix(self, height: Optional[int]) -> bytes:
-        """The proposer-selection RANDAO mix for a block at ``height``. When RANDAO
-        selection is ENFORCED this is the deterministic height-checkpoint mix (cross-time
-        + cross-node stable); otherwise the legacy zero constant — so it is exactly
-        behaviour-neutral while the gate is off. See docs item 5."""
-        from .randao import ENFORCE_RANDAO_SELECTION, checkpoint_mix_for_block
-        if not ENFORCE_RANDAO_SELECTION or self.database is None or height is None:
+    async def _selection_mix(self, slot: Optional[int]) -> bytes:
+        """The proposer-selection RANDAO mix for ``slot``. When RANDAO selection is ENFORCED
+        this is the per-EPOCH checkpoint mix (`epoch_checkpoint_mix` — keyed off the slot's
+        epoch, so it is TIP-INDEPENDENT: every validator computes the same mix for a slot
+        regardless of its current height); otherwise the legacy zero constant — exactly
+        behaviour-neutral while the gate is off. (Keying off height was tip-dependent and
+        halted the chain — see docs item 5.)"""
+        from .randao import ENFORCE_RANDAO_SELECTION, selection_mix_for_slot
+        if not ENFORCE_RANDAO_SELECTION or self.database is None or slot is None:
             return self._randao_mix
         try:
-            return await checkpoint_mix_for_block(self.database, int(height))
+            return await selection_mix_for_slot(self.database, int(slot))
         except Exception as e:
-            logger.warning("[randao] selection-mix fallback (zero) at h=%s: %s", height, e)
+            logger.warning("[randao] selection-mix fallback (zero) at slot=%s: %s", slot, e)
             return self._randao_mix
-
-    async def _next_block_selection_mix(self) -> bytes:
-        """Selection mix for the block this validator would propose NEXT (its height is the
-        current ``next_block_id``). Zero constant unless RANDAO selection is enforced."""
-        from .randao import ENFORCE_RANDAO_SELECTION
-        if not ENFORCE_RANDAO_SELECTION:
-            return self._randao_mix
-        try:
-            height = await self.database.get_next_block_id() if self.database is not None else None
-        except Exception:
-            height = None
-        return await self._selection_mix(height)
 
     async def is_proposer(self, slot: int) -> bool:
         """
@@ -496,7 +486,7 @@ class ValidatorManager:
         if current_stake < self.config.staking.min_validator_stake:
             return False
         validators = self._validator_set.validators if self._validator_set else [self._validator]
-        mix = await self._next_block_selection_mix()
+        mix = await self._selection_mix(slot)
         return self.selector.is_proposer(
             slot, self.wallet.address, validators, mix,
         )
@@ -1005,7 +995,7 @@ class ValidatorManager:
             expected_proposer = self.selector.select_proposer(
                 block.slot,
                 validators,
-                await self._selection_mix(getattr(block, "number", None)),
+                await self._selection_mix(getattr(block, "slot", None)),
             )
 
             if expected_proposer and expected_proposer.address != block.proposer_address:

@@ -14,8 +14,25 @@ from decimal import Decimal
 import pytest
 
 from qrdx.validator.randao import (
-    compute_randao_mix, checkpoint_mix_for_block, RANDAO_SEED, _mix_in,
+    compute_randao_mix, checkpoint_mix_for_block, epoch_checkpoint_mix,
+    _boundary_height_for_slot, RANDAO_SEED, _mix_in,
 )
+from qrdx.constants import SLOTS_PER_EPOCH
+
+
+class _SlotDB:
+    """Block store with slot + reveal: height -> {'content': json(slot, randao_reveal)}."""
+    def __init__(self, n_blocks, slot_of=lambda h: h):
+        self._blocks = {}
+        for h in range(n_blocks):
+            self._blocks[h] = {"content": json.dumps(
+                {"slot": slot_of(h), "randao_reveal": (f"{h:02x}" * 32)[:64]})}
+
+    async def get_next_block_id(self):
+        return (max(self._blocks) + 1) if self._blocks else 0
+
+    async def get_block_by_id(self, height):
+        return self._blocks.get(height)
 
 
 class _FakeDB:
@@ -94,6 +111,38 @@ async def test_checkpoint_mix_cross_time_stable():
 async def test_checkpoint_mix_early_blocks_use_seed():
     db = _FakeDB({1: "aa" * 32, 2: "bb" * 32})
     assert await checkpoint_mix_for_block(db, height=1, lookback=8) == RANDAO_SEED
+
+
+async def test_boundary_height_for_slot_binary_search():
+    # slot == height (no empty slots): highest block with slot < B is height B-1.
+    db = _SlotDB(50)
+    assert await _boundary_height_for_slot(db, 40) == 39
+    assert await _boundary_height_for_slot(db, 1) == 0
+    assert await _boundary_height_for_slot(db, 0) == -1  # none below slot 0
+
+
+async def test_epoch_checkpoint_mix_uses_prev_epoch_boundary():
+    # epoch E with lookback L → mix folded up to the last block of epoch E-L. slot==height,
+    # so the last block of epoch (E-L) is at height (E-L+1)*SPE - 1.
+    db = _SlotDB(4 * SLOTS_PER_EPOCH)  # epochs 0..3
+    boundary = 3 * SLOTS_PER_EPOCH - 1  # epoch 3, lookback 1 → checkpoint epoch 2's last block
+    assert await epoch_checkpoint_mix(db, epoch=3, lookback_epochs=1) == \
+        await compute_randao_mix(db, up_to_height=boundary)
+
+
+async def test_epoch_checkpoint_mix_is_tip_independent():
+    # The KEY property the height-based checkpoint lacked: epoch E's mix is identical
+    # whether the chain currently sits in epoch E or several epochs later — so validators
+    # a block apart compute the same proposer for a slot.
+    short = _SlotDB(2 * SLOTS_PER_EPOCH + 1)   # just into epoch 2
+    longer = _SlotDB(5 * SLOTS_PER_EPOCH)      # well into epoch 4
+    assert await epoch_checkpoint_mix(short, epoch=2) == \
+        await epoch_checkpoint_mix(longer, epoch=2)
+
+
+async def test_epoch_checkpoint_mix_early_epochs_use_seed():
+    db = _SlotDB(2 * SLOTS_PER_EPOCH)
+    assert await epoch_checkpoint_mix(db, epoch=0, lookback_epochs=1) == RANDAO_SEED
 
 
 async def test_reorg_recompute_drops_orphaned_reveals():

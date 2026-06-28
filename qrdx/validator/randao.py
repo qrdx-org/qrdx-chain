@@ -59,12 +59,19 @@ RANDAO_SELECTION_LOOKBACK = SLOTS_PER_EPOCH
 # constant: manager.is_proposer + manager.validate_block (via manager._selection_mix) and
 # block_verification.verify_proposer_eligibility.
 #
-# DO NOT FLIP YET — a 2026-06-28 trial HALTED the chain (~block 10): keying the mix off
-# next_block_id / block.number makes it TIP-DEPENDENT, so validators a block apart
-# (propagation lag) disagree on the slot's proposer. The correct design keys the checkpoint
-# off the SLOT/EPOCH (identical across validators regardless of tip), not the height — see
-# docs/CONSENSUS_REMAINING_WORK.md item 5 ("Corrected design"). The wiring below is staged
-# scaffolding; the mix SOURCE must move to an epoch-indexed checkpoint first.
+# Selection keys off the SLOT's EPOCH (selection_mix_for_slot → epoch_checkpoint_mix) — a
+# per-epoch checkpoint that is TIP-INDEPENDENT, so validators a block apart still agree on a
+# slot's proposer. (An earlier HEIGHT-based version keyed off next_block_id and HALTED the
+# chain — tip-dependent.)
+#
+# STILL OFF after a 5-run soak (2026-06-28): the epoch-based design no longer halts and
+# selection converges (16/16 ⇒ no eligibility mismatch; 1 unique RANDAO mix when block
+# history converges), BUT 1 of 5 runs degraded to 94% with slow block production (a node
+# reached block 58 vs ~79) + elevated "not eligible" rejections — an intermittent LIVENESS
+# dip under reorg churn (a reorg recomputes the eligible proposer, rejecting more in-flight
+# blocks). The gate is ALL ≥6 runs green, so it is NOT met. Resolve the reorg/eligibility
+# churn (e.g. don't re-reject already-validated competing blocks on the losing tip; or a
+# wider lookback) before flipping. See docs/CONSENSUS_REMAINING_WORK.md item 5.
 ENFORCE_RANDAO_SELECTION = False
 
 # Genesis seed for the fold. Equal to the current constant proposer mix, so the
@@ -148,3 +155,73 @@ async def checkpoint_mix_for_block(db: Any, height: int, lookback: Optional[int]
     if cp < 0:
         return RANDAO_SEED
     return await compute_randao_mix(db, cp)
+
+
+async def _block_slot(db: Any, height: int) -> Optional[int]:
+    """The slot of the block at ``height`` (parsed from its content), or None."""
+    from .block_verification import _parse_block_content
+    try:
+        b = await db.get_block_by_id(height)
+    except Exception:
+        b = None
+    if not b:
+        return None
+    try:
+        bc = _parse_block_content(b.get("content") or b.get("block_content") or "{}")
+        s = bc.get("slot")
+        return int(s) if s is not None else None
+    except Exception:
+        return None
+
+
+async def _boundary_height_for_slot(db: Any, boundary_slot: int) -> int:
+    """Highest block height whose slot is < ``boundary_slot``. Block slot is strictly
+    increasing with height on any single chain (each block is proposed at a later slot
+    than its parent), so a binary search over heights is correct and O(log n). Returns -1
+    if no such block."""
+    try:
+        tip = (await db.get_next_block_id()) - 1
+    except Exception:
+        return -1
+    lo, hi, ans = 0, tip, -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        s = await _block_slot(db, mid)
+        if s is None:
+            hi = mid - 1  # missing/unparseable → search lower (conservative)
+            continue
+        if s < boundary_slot:
+            ans = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return ans
+
+
+async def epoch_checkpoint_mix(db: Any, epoch: int, lookback_epochs: int = 1) -> bytes:
+    """The proposer-selection RANDAO mix for slots in ``epoch``: the mix folded up to the
+    LAST block of epoch ``epoch - lookback_epochs``.
+
+    Keyed off the EPOCH (a fixed function of the slot), NOT a node's current height — so it
+    is TIP-INDEPENDENT: validators a block apart still compute the identical mix for the same
+    slot (the flaw the height-based `checkpoint_mix_for_block` had, which halted the chain in
+    the 2026-06-28 trial). The checkpoint epoch ended ``lookback_epochs`` epochs ago → settled
+    below the fork tip → all nodes agree (cross-node) and it does not move over time
+    (cross-time). Early epochs (≤ lookback) use the seed. See docs item 5 ("Corrected design").
+    """
+    cp_epoch = int(epoch) - int(lookback_epochs)
+    if cp_epoch < 0:
+        return RANDAO_SEED
+    boundary_slot = (cp_epoch + 1) * SLOTS_PER_EPOCH  # first slot of cp_epoch+1
+    h = await _boundary_height_for_slot(db, boundary_slot)
+    if h < 0:
+        return RANDAO_SEED
+    return await compute_randao_mix(db, h)
+
+
+async def selection_mix_for_slot(db: Any, slot: int, lookback_epochs: int = 1) -> bytes:
+    """The proposer-selection mix for a given SLOT = `epoch_checkpoint_mix(epoch(slot))`.
+    The SINGLE entry point used by both the proposer (`manager._selection_mix`) and the
+    importer (`verify_proposer_eligibility`), so the slot→epoch conversion uses ONE
+    `SLOTS_PER_EPOCH` (this module's) — a proposer/verifier mismatch there would halt."""
+    return await epoch_checkpoint_mix(db, int(slot) // SLOTS_PER_EPOCH, lookback_epochs)
