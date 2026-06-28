@@ -167,6 +167,27 @@
    rule + observe→soak→enforce rollout + the RANDAO-mix convergence proof). Until
    then keep observe; RANDAO selection stays on the zero constant (this is its gate).
 
+   **UPDATE (2026-06-28) — gate now MET; selection-convergence CONFIRMED (observe).** The
+   fork-choice work since then showed block history CONVERGES (the RANDAO mix is byte-
+   identical across nodes at the common/finalized height; divergences are tip-local
+   transients). A new observe in `fork_choice_reconcile_pass` (`[randao-observe]`) computes
+   the real-mix proposer using the FINALIZED mix (settled, below the churning tip) + the
+   converged validator set, for a chain-anchored slot, on every node. Measured across a
+   16/16 run: for every (slot, finalized-mix) computed on ≥2 nodes, ALL nodes selected the
+   **same** real-mix proposer (agree=8, disagree=0; real ≠ zero, so it's a real change). So
+   cross-NODE agreement — the eligibility-halt risk — is resolved.
+
+   **ENFORCE design (the remaining prerequisite — cross-TIME stability + soak).** Selection
+   must be stable between propose-time and verify-time too. "Current finalized mix" advances
+   as finality progresses, so a proposer and a later importer could compute different mixes →
+   reject. Enforce therefore needs a DETERMINISTIC per-epoch mix CHECKPOINT (a fixed function
+   of the slot's epoch, e.g. the mix accumulated up to the last block before epoch(S)−1), so
+   proposer + importer compute the identical mix regardless of WHEN. Then change BOTH the
+   proposer's self-selection AND `verify_proposer_eligibility` to that checkpoint mix together
+   (changing only one halts the chain), gated `_ENFORCE_RANDAO_SELECTION`, and soak ≥6 runs
+   (gate: 0 eligibility halts, blocks produced every epoch). The observe confirms the hard
+   part (cross-node mix+set convergence); the checkpoint is the deterministic-timing wrapper.
+
 6. **`from_hex`/`from_bytes` caller audit. — ✅ DONE.** Core primitive hardened
    (raises rather than inventing identity), with an actionable error message.
    Audited callers: the consensus/validator path passes the public key; the only
