@@ -28,12 +28,21 @@
 
 ## ⏳ Remaining — consensus / state
 
-1. **E-D4 sync-path enforcement (settled-state).** E-D4 is enforced only on the
-   live-broadcast paths. The bulk-sync path is trust-replay because a catching-up
-   node transiently differs mid-reorg. To extend cryptographic enforcement to
-   syncing nodes, add a **finalized-height** check: verify the unified root only
-   at/under the finalized boundary (where state can no longer reorg), not at the
-   churning tip. Prereq: a usable finality marker (see item 3).
+1. **E-D4 sync-path enforcement (settled-state). — ✅ DONE (defense-in-depth) + finding.**
+   Unblocked once finality became real (item 3 / attestation gossip). The bulk-sync
+   path now ENFORCES the unified root for a block at/under the node's `finalized_block_height`
+   (`_ED4_ENFORCE_SYNC_FINALIZED=True`): such a block is settled (the reorg guard refuses to
+   go below finalized), so a mismatch means divergent state from a corrupt/malicious peer →
+   reject. The churning tip stays observe (a catching-up node can transiently differ).
+   **Finding (measured: 0 would-rejects):** this is near-vacuous DEFENSE-IN-DEPTH — a node
+   only syncs blocks ABOVE its tip, and its local `finalized_height` always trails its tip,
+   so a synced block is essentially never at/under the local finalized boundary. The
+   steady-state E-D4 coverage is therefore the live-broadcast path (already enforced); the
+   finalized-sync check only bites if a finalized block is ever re-synced with divergent
+   state (e.g. a restart re-syncing below a retained finalized boundary), where honest
+   deterministic replay still matches so it never false-rejects (integration 16/16, 0
+   finalized rejections). A non-vacuous "retroactive finalized-state audit" would need state
+   replay to a past height; not pursued (low marginal value over live enforcement).
 
 2. **Full-node import performance / S10 flake. — ✅ RESOLVED (was a test bug).**
    S10's balance check compared `eth_getBalance` across all nodes without

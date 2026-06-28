@@ -1118,6 +1118,19 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
 # live-broadcast import — see _verify_unified_state_root.
 _ED4_ENFORCE_UNIFIED_ROOT = True
 
+# E-D4 sync-path enforcement at the FINALIZED boundary (doc item 1). The bulk-sync path
+# stays trust-replay for the churning tip (a catching-up node transiently differs mid-
+# reorg), but a block at/under the node's deterministic finalized height is SETTLED — the
+# reorg guard refuses to roll back below it — so its unified root can no longer change and
+# a mismatch there means the synced block's state genuinely diverges from what this node
+# computed (a corrupt/malicious peer). Now that finality is real + bounds reorgs, enforce
+# E-D4 for finalized synced blocks. Observe-first: False logs would-reject at finalized
+# heights (to confirm 0 before flipping); True rejects them. Measured 0 would-rejects (the
+# path near-never fires — a node syncs blocks ABOVE its tip and its local finalized_height
+# trails its tip), and honest deterministic replay can't mismatch a settled block, so
+# enforcing is safe + correct defense-in-depth.
+_ED4_ENFORCE_SYNC_FINALIZED = True
+
 
 async def _check_parent_continuity(block_height, block_content, enforce: bool = False) -> Tuple[bool, str]:
     """
@@ -2562,16 +2575,28 @@ async def process_and_create_block(block_info: dict) -> bool:
                 logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr_evm}")
                 return False
 
-        # E-D4 (link 5b): run the unified-state-root check on the bulk-sync path in
-        # OBSERVE mode (enforce=False) — warn on mismatch but never reject, because
-        # a catching-up node can transiently differ mid-reorg and must not drop
-        # canonical history. This gives visibility into sync-path state consistency
-        # (now that reorgs are ~0 + finality bounds them) to decide whether sync
-        # enforcement is safe; the live-broadcast paths still enforce.
+        # E-D4 (link 5b + item 1): unified-state-root check on the bulk-sync path. The
+        # CHURNING TIP stays observe (a catching-up node can transiently differ mid-reorg
+        # and must not drop canonical history). A block at/under the node's FINALIZED
+        # height is settled (the reorg guard refuses to go below it), so its root can no
+        # longer change — there we ENFORCE (reject a corrupt/malicious peer's bad state).
+        # NOTE (measured): this is DEFENSE-IN-DEPTH that near-never fires — a node only
+        # syncs blocks ABOVE its tip, and its local finalized_height always trails its
+        # tip, so a synced block is essentially never at/under the local finalized
+        # boundary. It is correct (and free in the common path) and would catch a
+        # finalized block re-synced with divergent state, but the steady-state E-D4
+        # coverage is the live-broadcast path. See docs/CONSENSUS_REMAINING_WORK.md item 1.
         try:
-            await _verify_unified_state_root(block_content, enforce=False)
+            from ..validator.finality import finalized_block_height
+            final_h = await finalized_block_height(db)
+            at_finalized = final_h is not None and final_h >= 0 and block_height <= final_h
+            ok_ed4, verr_ed4 = await _verify_unified_state_root(
+                block_content, enforce=(at_finalized and _ED4_ENFORCE_SYNC_FINALIZED))
+            if not ok_ed4:
+                logger.warning(f"[SYNC] Rejecting FINALIZED block {block_height}: E-D4 {verr_ed4}")
+                return False
         except Exception as e:
-            logger.debug(f"[SYNC] E-D4 observe check skipped for block {block_height}: {e}")
+            logger.debug(f"[SYNC] E-D4 finalized check skipped for block {block_height}: {e}")
 
         try:
             timestamp_val = block.get('timestamp', 0)
