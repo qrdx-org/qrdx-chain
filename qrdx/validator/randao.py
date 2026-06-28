@@ -44,9 +44,15 @@ import hashlib
 import logging
 from typing import Any, Optional
 
-from ..constants import DOMAIN_RANDAO
+from ..constants import DOMAIN_RANDAO, SLOTS_PER_EPOCH
 
 logger = logging.getLogger(__name__)
+
+# Lookback (in blocks) for the proposer-selection CHECKPOINT mix. ~1 epoch of blocks —
+# below the observed tip-fork depth (≤4 from the fork-choice observe), so the checkpoint
+# height is SETTLED (all nodes agree on it), while keeping proposers unpredictable until
+# ~1 epoch out. This is the cross-time-stable selection input (see checkpoint_mix_for_block).
+RANDAO_SELECTION_LOOKBACK = SLOTS_PER_EPOCH
 
 # Genesis seed for the fold. Equal to the current constant proposer mix, so the
 # accumulated mix at height 0 (no reveals) reproduces today's selection input —
@@ -110,3 +116,22 @@ async def compute_randao_mix(db: Any, up_to_height: Optional[int] = None) -> byt
         folded += 1
     logger.debug("compute_randao_mix: folded %d reveal(s) up to height %s", folded, up_to_height)
     return mix
+
+
+async def checkpoint_mix_for_block(db: Any, height: int, lookback: Optional[int] = None) -> bytes:
+    """The deterministic RANDAO CHECKPOINT mix for selecting the proposer of the block at
+    ``height``: the mix folded up to ``height - lookback``.
+
+    A fixed function of the block's OWN height (not of wall-clock finality), so the proposer
+    building H and every importer verifying H fold the identical prefix → the SAME mix
+    regardless of WHEN (cross-time stable). With ``lookback`` ~1 epoch the checkpoint height
+    sits below the churning tip, so all nodes agree on that prefix (cross-node stable). Early
+    blocks (height ≤ lookback) use the seed. This is the enforce-ready selection input;
+    proposer selection still uses the zero constant until ``_ENFORCE_RANDAO_SELECTION`` flips
+    the proposer + verifier together. See docs/CONSENSUS_REMAINING_WORK.md item 5."""
+    if lookback is None:
+        lookback = RANDAO_SELECTION_LOOKBACK
+    cp = int(height) - int(lookback)
+    if cp < 0:
+        return RANDAO_SEED
+    return await compute_randao_mix(db, cp)

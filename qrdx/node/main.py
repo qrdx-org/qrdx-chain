@@ -3051,25 +3051,29 @@ async def fork_choice_reconcile_pass(enforce: bool = False) -> dict:
         # zero constant); this only measures. See docs item 5.
         try:
             from decimal import Decimal as _D
-            from ..validator.randao import compute_randao_mix as _crm
+            from ..validator.randao import checkpoint_mix_for_block
             from ..validator.block_verification import expected_proposer_for_slot, _parse_block_content
             if fin is not None and fin >= 0:
-                fin_mix = await _crm(db, fin)
+                # Anchor to the agreed FINALIZED block and use the height-based CHECKPOINT
+                # mix (the actual enforce mechanism: cross-time-stable, settled), so this
+                # measures exactly what _ENFORCE_RANDAO_SELECTION would compute.
+                cp_mix = await checkpoint_mix_for_block(db, fin)
                 fin_block = await db.get_block_by_id(fin)
-                fslot = int(_parse_block_content(
-                    (fin_block or {}).get("content") or (fin_block or {}).get("block_content") or "{}"
-                ).get("slot") or 0)
+                bc = _parse_block_content(
+                    (fin_block or {}).get("content") or (fin_block or {}).get("block_content") or "{}")
+                fslot = int(bc.get("slot") or 0)
+                actual = bc.get("proposer_address")
                 rows = await db.get_validators()
                 vset = [(r["address"], _D(str(r.get("effective_stake") or r.get("stake") or 0)))
                         for r in rows if r.get("address")
                         and str(r.get("status", "active")).upper() in ("ACTIVE", "PENDING", "EXITING")]
                 if vset:
-                    nslot = fslot + 1  # chain-anchored: derived from the agreed finalized block
-                    real = expected_proposer_for_slot(nslot, vset, fin_mix)
-                    zero = expected_proposer_for_slot(nslot, vset)
-                    logger.info("[randao-observe] slot=%d fin_h=%d fin_mix=%s real_proposer=%s "
-                                "zero_proposer=%s same=%s", nslot, fin, fin_mix.hex()[:12],
-                                str(real)[:18], str(zero)[:18], real == zero)
+                    cp_prop = expected_proposer_for_slot(fslot, vset, cp_mix)
+                    zero_prop = expected_proposer_for_slot(fslot, vset)
+                    logger.info("[randao-observe] h=%d slot=%d cp_mix=%s checkpoint_proposer=%s "
+                                "actual=%s zero=%s match_actual=%s", fin, fslot, cp_mix.hex()[:12],
+                                str(cp_prop)[:18], str(actual)[:18], str(zero_prop)[:18],
+                                cp_prop == actual)
         except Exception as e:
             logger.debug("randao-observe skipped: %s", e)
 

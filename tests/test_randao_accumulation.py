@@ -13,7 +13,9 @@ from decimal import Decimal
 
 import pytest
 
-from qrdx.validator.randao import compute_randao_mix, RANDAO_SEED, _mix_in
+from qrdx.validator.randao import (
+    compute_randao_mix, checkpoint_mix_for_block, RANDAO_SEED, _mix_in,
+)
 
 
 class _FakeDB:
@@ -69,6 +71,29 @@ async def test_up_to_height_bounds_the_fold():
     assert mix_2 != mix_3
     # mix_3 == folding cc into mix_2 (reorg/extension safety: prefix-consistent).
     assert mix_3 == _mix_in(mix_2, bytes.fromhex("cc" * 32))
+
+
+async def test_checkpoint_mix_is_height_lookback():
+    # Checkpoint for block H = mix folded up to H - lookback (a fixed function of H).
+    db = _FakeDB({1: "aa" * 32, 2: "bb" * 32, 3: "cc" * 32, 4: "dd" * 32, 5: "ee" * 32})
+    assert await checkpoint_mix_for_block(db, height=5, lookback=2) == \
+        await compute_randao_mix(db, up_to_height=3)
+
+
+async def test_checkpoint_mix_cross_time_stable():
+    # The checkpoint for block H is IDENTICAL whether the chain currently ends at H
+    # or has grown past it — proposer (at H) and importer (later) agree. This is the
+    # cross-time-stability property the enforce path relies on.
+    at_h = _FakeDB({1: "aa" * 32, 2: "bb" * 32, 3: "cc" * 32, 4: "dd" * 32})
+    grown = _FakeDB({1: "aa" * 32, 2: "bb" * 32, 3: "cc" * 32, 4: "dd" * 32,
+                     5: "ee" * 32, 6: "ff" * 32})
+    assert await checkpoint_mix_for_block(at_h, height=4, lookback=2) == \
+        await checkpoint_mix_for_block(grown, height=4, lookback=2)
+
+
+async def test_checkpoint_mix_early_blocks_use_seed():
+    db = _FakeDB({1: "aa" * 32, 2: "bb" * 32})
+    assert await checkpoint_mix_for_block(db, height=1, lookback=8) == RANDAO_SEED
 
 
 async def test_reorg_recompute_drops_orphaned_reveals():
