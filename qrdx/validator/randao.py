@@ -57,9 +57,14 @@ RANDAO_SELECTION_LOOKBACK = SLOTS_PER_EPOCH
 # ENFORCE gate (observe→soak→enforce; default OFF = zero mix = today's behaviour). When
 # True, ALL proposer-selection sites compute the height-checkpoint mix instead of the zero
 # constant: manager.is_proposer + manager.validate_block (via manager._selection_mix) and
-# block_verification.verify_proposer_eligibility. They MUST flip together — selecting on a
-# different mix than the importer verifies halts the chain. Flip + soak ≥6 runs (gate: 0
-# eligibility halts). See docs/CONSENSUS_REMAINING_WORK.md item 5.
+# block_verification.verify_proposer_eligibility.
+#
+# DO NOT FLIP YET — a 2026-06-28 trial HALTED the chain (~block 10): keying the mix off
+# next_block_id / block.number makes it TIP-DEPENDENT, so validators a block apart
+# (propagation lag) disagree on the slot's proposer. The correct design keys the checkpoint
+# off the SLOT/EPOCH (identical across validators regardless of tip), not the height — see
+# docs/CONSENSUS_REMAINING_WORK.md item 5 ("Corrected design"). The wiring below is staged
+# scaffolding; the mix SOURCE must move to an epoch-indexed checkpoint first.
 ENFORCE_RANDAO_SELECTION = False
 
 # Genesis seed for the fold. Equal to the current constant proposer mix, so the

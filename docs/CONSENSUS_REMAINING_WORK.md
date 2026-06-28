@@ -206,8 +206,30 @@
    `_ENFORCE_PROPOSER_ELIGIBILITY`; uses `expected_proposer_for_slot`'s zero default).
    Simplest wiring: refresh `manager._randao_mix = await checkpoint_mix_for_block(db, next_height)`
    per proposal attempt (covers 1+2), and pass the checkpoint mix into (3) from the block's
-   `number`. Gate all on `_ENFORCE_RANDAO_SELECTION` (default False = zero mix = today), flip
+   `number`. Gate all on `ENFORCE_RANDAO_SELECTION` (default False = zero mix = today), flip
    together, soak ≥6 runs (gate: 0 eligibility halts, blocks every epoch, 1 unique RANDAO mix).
+
+   **TRIAL (2026-06-28) — the HEIGHT-based checkpoint is WRONG; the chain HALTED.** Wired all
+   3 sites (commit 0356692, gated off) and flipped the gate for one trial run: it stalled at
+   ~block 10 / slot 17 with "proposer not eligible for slot" mismatches (6% pass). **Root
+   cause:** keying the mix off `next_block_id` (proposer) / `block.number` (verifier) makes it
+   depend on a node's CURRENT TIP — validators a block apart from propagation lag compute
+   DIFFERENT heights for the same slot → different mix → they disagree on who may propose →
+   no single agreed proposer → halt. The `[randao-observe]` MISSED this because it anchored to
+   the agreed FINALIZED block (a fixed height all nodes share), so it only ever compared the
+   mix at one common height — never the per-validator-tip decision.
+
+   **Corrected design — key the checkpoint off the SLOT/EPOCH, not the height.** The selection
+   mix for slot S must be identical across all validators regardless of their tip. Use a
+   per-EPOCH mix checkpoint (beacon-chain style): mix for slot S = the mix as of a SETTLED
+   point of epoch(S)−LOOKBACK_EPOCHS, computed once and indexed by EPOCH (e.g. stored in the
+   `epochs` table when that epoch finalizes, or derived via a slot→height map — note `blocks`
+   has no slot column, so this needs either an added slot column or the epochs-table
+   checkpoint). Then both proposer (`is_proposer(slot)`) and verifier
+   (`verify_proposer_eligibility`, which has `bc["slot"]`) key off the SLOT's epoch → same mix
+   for everyone. Re-validate with an observe that compares the per-validator decision (not a
+   fixed finalized height), THEN flip + soak. `checkpoint_mix_for_block(height)` stays as the
+   reorg-safe fold primitive; the epoch-indexed lookup is the missing piece.
 
 6. **`from_hex`/`from_bytes` caller audit. — ✅ DONE.** Core primitive hardened
    (raises rather than inventing identity), with an actionable error message.
