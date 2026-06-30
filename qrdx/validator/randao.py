@@ -54,6 +54,13 @@ logger = logging.getLogger(__name__)
 # ~1 epoch out. This is the cross-time-stable selection input (see checkpoint_mix_for_block).
 RANDAO_SELECTION_LOOKBACK = SLOTS_PER_EPOCH
 
+# Lookback (in EPOCHS) for the per-epoch selection checkpoint (epoch_checkpoint_mix /
+# selection_mix_for_slot) — the selection boundary is the end of epoch(S)-LOOKBACK, settled
+# below the tip-fork depth so all validators agree on a slot's proposer regardless of tip.
+# NOTE: widening this to 2 did NOT cure the enforce liveness dip (a lookback=2 soak run hit
+# 81% / block 49 — worse), so the dip is not reorg-boundary instability; kept at 1.
+RANDAO_SELECTION_LOOKBACK_EPOCHS = 1
+
 # ENFORCE gate (observe→soak→enforce; default OFF = zero mix = today's behaviour). When
 # True, ALL proposer-selection sites compute the height-checkpoint mix instead of the zero
 # constant: manager.is_proposer + manager.validate_block (via manager._selection_mix) and
@@ -64,14 +71,17 @@ RANDAO_SELECTION_LOOKBACK = SLOTS_PER_EPOCH
 # slot's proposer. (An earlier HEIGHT-based version keyed off next_block_id and HALTED the
 # chain — tip-dependent.)
 #
-# STILL OFF after a 5-run soak (2026-06-28): the epoch-based design no longer halts and
-# selection converges (16/16 ⇒ no eligibility mismatch; 1 unique RANDAO mix when block
-# history converges), BUT 1 of 5 runs degraded to 94% with slow block production (a node
-# reached block 58 vs ~79) + elevated "not eligible" rejections — an intermittent LIVENESS
-# dip under reorg churn (a reorg recomputes the eligible proposer, rejecting more in-flight
-# blocks). The gate is ALL ≥6 runs green, so it is NOT met. Resolve the reorg/eligibility
-# churn (e.g. don't re-reject already-validated competing blocks on the losing tip; or a
-# wider lookback) before flipping. See docs/CONSENSUS_REMAINING_WORK.md item 5.
+# STILL OFF after soaking (2026-06-28): the epoch-based design no longer HALTS and selection
+# converges (16/16 ⇒ no eligibility mismatch; 1 unique RANDAO mix when block history
+# converges). But under enforce, block production is INTERMITTENTLY degraded: across 7 runs
+# (lookback 1 and 2) most were 16/16 yet ~2 dipped to 81–94% with low block height
+# (49/58 vs ~79) + elevated "not eligible" rejections. Widening lookback to 2 made it WORSE,
+# so it is NOT reorg-boundary mix instability. Root cause is structural: RANDAO makes ONE
+# specific validator eligible per slot, so with few validators + propagation lag + reorgs an
+# unlucky/uneven schedule occasionally leaves a slot unproposed or competing blocks rejected,
+# dipping liveness. The gate is ALL ≥6 runs green → NOT met. Enforcing needs a LIVENESS
+# mechanism first (e.g. a deterministic backup proposer when the primary misses its slot),
+# not a parameter tune. See docs/CONSENSUS_REMAINING_WORK.md item 5.
 ENFORCE_RANDAO_SELECTION = False
 
 # Genesis seed for the fold. Equal to the current constant proposer mix, so the
@@ -219,7 +229,8 @@ async def epoch_checkpoint_mix(db: Any, epoch: int, lookback_epochs: int = 1) ->
     return await compute_randao_mix(db, h)
 
 
-async def selection_mix_for_slot(db: Any, slot: int, lookback_epochs: int = 1) -> bytes:
+async def selection_mix_for_slot(db: Any, slot: int,
+                                 lookback_epochs: int = RANDAO_SELECTION_LOOKBACK_EPOCHS) -> bytes:
     """The proposer-selection mix for a given SLOT = `epoch_checkpoint_mix(epoch(slot))`.
     The SINGLE entry point used by both the proposer (`manager._selection_mix`) and the
     importer (`verify_proposer_eligibility`), so the slot→epoch conversion uses ONE

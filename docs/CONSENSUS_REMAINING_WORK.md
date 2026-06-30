@@ -219,17 +219,31 @@
    the agreed FINALIZED block (a fixed height all nodes share), so it only ever compared the
    mix at one common height — never the per-validator-tip decision.
 
-   **Corrected design — key the checkpoint off the SLOT/EPOCH, not the height.** The selection
-   mix for slot S must be identical across all validators regardless of their tip. Use a
-   per-EPOCH mix checkpoint (beacon-chain style): mix for slot S = the mix as of a SETTLED
-   point of epoch(S)−LOOKBACK_EPOCHS, computed once and indexed by EPOCH (e.g. stored in the
-   `epochs` table when that epoch finalizes, or derived via a slot→height map — note `blocks`
-   has no slot column, so this needs either an added slot column or the epochs-table
-   checkpoint). Then both proposer (`is_proposer(slot)`) and verifier
-   (`verify_proposer_eligibility`, which has `bc["slot"]`) key off the SLOT's epoch → same mix
-   for everyone. Re-validate with an observe that compares the per-validator decision (not a
-   fixed finalized height), THEN flip + soak. `checkpoint_mix_for_block(height)` stays as the
-   reorg-safe fold primitive; the epoch-indexed lookup is the missing piece.
+   **Corrected design — key the checkpoint off the SLOT/EPOCH, not the height — IMPLEMENTED.**
+   `randao.epoch_checkpoint_mix(db, epoch)` = mix folded to the last block of epoch−LOOKBACK
+   (boundary found by binary search over heights, since block slot is monotonic in height —
+   no schema change needed); `selection_mix_for_slot(db, slot)` is the single entry point both
+   the proposer (`manager._selection_mix`) and verifier (`verify_proposer_eligibility`) use, so
+   the slot→epoch math has one source. Keyed off the epoch → TIP-INDEPENDENT (unit-tested).
+
+   **Corrected enforce TRIAL + SOAK (2026-06-28): no longer halts, but an intermittent
+   LIVENESS dip gates it.** Flipping the (now epoch-based) gate no longer halts — the trial +
+   most soak runs were 16/16 with 1 unique RANDAO mix (selection converges; 16/16 itself proves
+   no cross-node eligibility mismatch, else blocks would be rejected → stall). BUT across 7
+   enforce runs ~2 dipped to 81–94% with low block height (49/58 vs ~79) + elevated "not
+   eligible" rejections. Widening LOOKBACK to 2 made it WORSE, so it is NOT reorg-boundary mix
+   instability. **Root cause is structural:** RANDAO makes exactly ONE validator eligible per
+   slot, so with few validators + propagation lag + reorgs an unlucky/uneven schedule
+   occasionally leaves a slot unproposed (the primary missed it) or rejects competing blocks,
+   dipping liveness. The ≥6-all-green gate is NOT met → kept OFF.
+
+   **Remaining = a LIVENESS mechanism (not a parameter tune).** Add a deterministic BACKUP
+   proposer: if the slot's primary RANDAO proposer doesn't produce within the slot, a
+   deterministic next-in-line (e.g. next-lowest selection score) may propose, and
+   `verify_proposer_eligibility` accepts EITHER primary or the backup for that slot. Then the
+   schedule tolerates a missed/slow primary without a liveness dip. Re-soak ≥6 after. The
+   mechanism (epoch_checkpoint_mix + the gated wiring) is committed; only this liveness layer
+   and the soak remain.
 
    **IMPLEMENTED + SOAKED (2026-06-28) — works, but liveness gate NOT yet met.** Built
    `epoch_checkpoint_mix(db, epoch)` + `selection_mix_for_slot(db, slot)` (boundary height via
