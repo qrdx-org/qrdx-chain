@@ -371,14 +371,21 @@ class ValidatorNode:
                 # Get pending transactions
                 pending_txs = await self.db.get_need_propagate_transactions() or []
 
-                # E-D4: only the eligible slot proposer executes the protocol
-                # sections (which mutate state) and proposes. Checking eligibility
-                # BEFORE section execution lets us compute the post-block unified
-                # state root and bind it into the block's signed header. propose_block
-                # re-checks eligibility identically (deterministic for the slot).
-                if not await self.manager.is_proposer(current_slot):
+                # E-D4 + RANDAO liveness: determine our eligibility RANK for the slot
+                # (0 = primary; 1.. = backup, only under enforced RANDAO selection;
+                # None = not eligible). The primary executes the sections + proposes
+                # immediately; a BACKUP waits proportionally and proposes ONLY if no block
+                # for this height has landed — so a slow/offline primary no longer leaves
+                # the slot empty. Eligibility is re-checked identically in propose_block +
+                # on import (deterministic top-K for the slot).
+                rank = await self.manager.proposer_rank(current_slot)
+                if rank is None:
                     await asyncio.sleep(SLOT_DURATION_SECONDS)
                     continue
+                if rank > 0:
+                    await asyncio.sleep(min(rank, 3) * (SLOT_DURATION_SECONDS / 2))
+                    if (await self.db.get_next_block_id()) != next_block_id:
+                        continue  # a higher-priority proposer already filled this slot
 
                 # Timestamp/parent used as the (non-consensus) execution context for
                 # the sections — they affect only audit tables, never the state roots.

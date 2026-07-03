@@ -99,3 +99,40 @@ def test_weighting_still_reflects_stake():
     # ~50% expected; assert it's the clear winner and selection isn't degenerate.
     assert counts.get(heaviest, 0) == max(counts.values())
     assert len(counts) >= 2, "selection collapsed to a single validator"
+
+
+# --- RANDAO liveness layer: top-K proposer ranking (primary + backups) ---
+
+def test_proposer_ranking_primary_matches_select_proposer():
+    sel = ValidatorSelector()
+    vals = _set()
+    mix = b"\x11" * 32
+    for slot in range(20):
+        ranking = sel.proposer_ranking(slot, vals, mix, k=2)
+        primary = sel.select_proposer(slot, vals, mix)
+        assert ranking[0].address == primary.address  # rank 0 == the existing primary
+
+
+def test_proposer_ranking_distinct_deterministic_and_order_independent():
+    sel = ValidatorSelector()
+    vals = _set()
+    mix = b"\x22" * 32
+    import itertools as _it
+    for slot in (0, 5, 13, 99):
+        base = [v.address for v in sel.proposer_ranking(slot, vals, mix, k=3)]
+        assert len(base) == len(set(base)) == 3          # distinct, full ranking
+        # deterministic + order-independent across permutations of the input
+        for perm in _it.permutations(vals):
+            assert [v.address for v in sel.proposer_ranking(slot, list(perm), mix, k=3)] == base
+
+
+def test_proposer_rank_lookup():
+    sel = ValidatorSelector()
+    vals = _set()
+    mix = b"\x33" * 32
+    ranking = sel.proposer_ranking(0, vals, mix, k=2)
+    assert sel.proposer_rank(0, ranking[0].address, vals, mix, k=2) == 0
+    assert sel.proposer_rank(0, ranking[1].address, vals, mix, k=2) == 1
+    # the third validator is outside the top-2 → not eligible
+    outside = [v for v in vals if v.address not in {ranking[0].address, ranking[1].address}][0]
+    assert sel.proposer_rank(0, outside.address, vals, mix, k=2) is None

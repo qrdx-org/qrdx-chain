@@ -470,26 +470,32 @@ class ValidatorManager:
             logger.warning("[randao] selection-mix fallback (zero) at slot=%s: %s", slot, e)
             return self._randao_mix
 
-    async def is_proposer(self, slot: int) -> bool:
-        """
-        Whether this validator is the eligible proposer for ``slot``.
-
-        Pure check (no side effects): active validator able to propose, meets the
-        minimum stake, and is the deterministic slot proposer (selector + RANDAO).
-        Lets the caller decide whether to do proposer-only work (E-D4: execute the
-        protocol sections to compute the unified state root) BEFORE calling
-        ``propose_block``, which re-checks this identically.
-        """
+    async def proposer_rank(self, slot: int) -> Optional[int]:
+        """This validator's rank in the slot's ELIGIBLE proposer set (0 = primary,
+        1.. = backups), or None if not eligible. Under enforced RANDAO selection the set is
+        the top-K ranking (the liveness layer); otherwise it is just the single primary
+        (rank 0 or None) — behaviour-neutral. The proposal loop uses the rank to stagger
+        backups (primary proposes immediately; a backup fills in only if no block lands)."""
         if not self._validator or not self._validator.can_propose:
-            return False
+            return None
         current_stake = await self.stake_manager.get_effective_stake(self.wallet.address)
         if current_stake < self.config.staking.min_validator_stake:
-            return False
+            return None
         validators = self._validator_set.validators if self._validator_set else [self._validator]
         mix = await self._selection_mix(slot)
-        return self.selector.is_proposer(
-            slot, self.wallet.address, validators, mix,
-        )
+        from .randao import ENFORCE_RANDAO_SELECTION, RANDAO_PROPOSER_ELIGIBLE_K
+        if ENFORCE_RANDAO_SELECTION:
+            return self.selector.proposer_rank(
+                slot, self.wallet.address, validators, mix, RANDAO_PROPOSER_ELIGIBLE_K)
+        # Gate off: single primary only (rank 0 or None) — exactly today's behaviour.
+        return 0 if self.selector.is_proposer(slot, self.wallet.address, validators, mix) else None
+
+    async def is_proposer(self, slot: int) -> bool:
+        """Whether this validator is ELIGIBLE to propose ``slot`` (primary or, under enforced
+        RANDAO selection, a backup). ``propose_block`` re-checks this identically; the
+        proposal loop uses ``proposer_rank`` to decide WHEN (primary first, backups delayed).
+        Pure check (no side effects): active, meets min stake, and in the slot's eligible set."""
+        return (await self.proposer_rank(slot)) is not None
 
     async def propose_block(
         self,
@@ -992,14 +998,18 @@ class ValidatorManager:
         validators = self._validator_set.validators if self._validator_set else []
         
         if validators:
-            expected_proposer = self.selector.select_proposer(
-                block.slot,
-                validators,
-                await self._selection_mix(getattr(block, "slot", None)),
-            )
-
-            if expected_proposer and expected_proposer.address != block.proposer_address:
-                return False, f"Invalid proposer: expected {expected_proposer.address}"
+            mix = await self._selection_mix(getattr(block, "slot", None))
+            from .randao import ENFORCE_RANDAO_SELECTION, RANDAO_PROPOSER_ELIGIBLE_K
+            if ENFORCE_RANDAO_SELECTION:
+                # Accept any of the slot's eligible top-K (primary or a backup).
+                eligible = {v.address for v in self.selector.proposer_ranking(
+                    block.slot, validators, mix, RANDAO_PROPOSER_ELIGIBLE_K)}
+                if eligible and block.proposer_address not in eligible:
+                    return False, f"Invalid proposer: {block.proposer_address} not in slot's eligible set"
+            else:
+                expected_proposer = self.selector.select_proposer(block.slot, validators, mix)
+                if expected_proposer and expected_proposer.address != block.proposer_address:
+                    return False, f"Invalid proposer: expected {expected_proposer.address}"
         
         # Verify proposer signature
         from ..crypto.pq import PQPublicKey, PQSignature, verify as pq_verify

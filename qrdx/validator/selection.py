@@ -91,6 +91,49 @@ class ValidatorSelector:
         
         return proposer
     
+    def proposer_ranking(
+        self,
+        slot: int,
+        validators: List[Validator],
+        randao_mix: bytes,
+        k: int = 2,
+    ) -> List[Validator]:
+        """Ordered top-``k`` eligible proposers for a slot — index 0 is the PRIMARY (the
+        same `select_proposer` stake-weighted pick), 1.. are deterministic BACKUPS.
+
+        Liveness layer for enforced RANDAO selection: any of the top-k may validly propose
+        the slot (the primary first; a backup fills in if the primary misses its slot — see
+        the proposal loop), so one slow/offline validator no longer leaves a slot unproposed.
+        Each rank is a stake-weighted pick over the validators not yet ranked, with a
+        rank-distinct seed, so it is deterministic + identical on every node (canonical
+        address order, like `select_proposer`)."""
+        eligible = sorted((v for v in validators if v.can_propose), key=lambda v: v.address)
+        ranking: List[Validator] = []
+        remaining = list(eligible)
+        while remaining and len(ranking) < max(1, k):
+            rank = len(ranking)
+            suffix = b'' if rank == 0 else b'backup' + rank.to_bytes(2, 'little')
+            seed = self._compute_slot_seed(slot, randao_mix, suffix=suffix)
+            pick = self._weighted_selection(remaining, seed)
+            ranking.append(pick)
+            remaining = [v for v in remaining if v.address != pick.address]
+        return ranking
+
+    def proposer_rank(
+        self,
+        slot: int,
+        validator_address: str,
+        validators: List[Validator],
+        randao_mix: bytes,
+        k: int = 2,
+    ) -> Optional[int]:
+        """This validator's rank in the slot's top-``k`` proposer ranking (0 = primary),
+        or None if not eligible for the slot."""
+        for i, v in enumerate(self.proposer_ranking(slot, validators, randao_mix, k)):
+            if v.address == validator_address:
+                return i
+        return None
+
     def select_committee(
         self,
         slot: int,

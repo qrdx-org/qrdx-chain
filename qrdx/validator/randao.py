@@ -61,6 +61,12 @@ RANDAO_SELECTION_LOOKBACK = SLOTS_PER_EPOCH
 # 81% / block 49 — worse), so the dip is not reorg-boundary instability; kept at 1.
 RANDAO_SELECTION_LOOKBACK_EPOCHS = 1
 
+# Size of the per-slot ELIGIBLE proposer set under enforced RANDAO selection: the primary
+# plus (K-1) deterministic backups. Any of the K may validly propose the slot (primary
+# first; a backup fills in if the primary misses), so one slow/offline validator doesn't
+# leave a slot unproposed — the liveness layer that the single-eligible-proposer soak needed.
+RANDAO_PROPOSER_ELIGIBLE_K = 2
+
 # ENFORCE gate (observe→soak→enforce; default OFF = zero mix = today's behaviour). When
 # True, ALL proposer-selection sites compute the height-checkpoint mix instead of the zero
 # constant: manager.is_proposer + manager.validate_block (via manager._selection_mix) and
@@ -71,17 +77,20 @@ RANDAO_SELECTION_LOOKBACK_EPOCHS = 1
 # slot's proposer. (An earlier HEIGHT-based version keyed off next_block_id and HALTED the
 # chain — tip-dependent.)
 #
-# STILL OFF after soaking (2026-06-28): the epoch-based design no longer HALTS and selection
-# converges (16/16 ⇒ no eligibility mismatch; 1 unique RANDAO mix when block history
-# converges). But under enforce, block production is INTERMITTENTLY degraded: across 7 runs
-# (lookback 1 and 2) most were 16/16 yet ~2 dipped to 81–94% with low block height
-# (49/58 vs ~79) + elevated "not eligible" rejections. Widening lookback to 2 made it WORSE,
-# so it is NOT reorg-boundary mix instability. Root cause is structural: RANDAO makes ONE
-# specific validator eligible per slot, so with few validators + propagation lag + reorgs an
-# unlucky/uneven schedule occasionally leaves a slot unproposed or competing blocks rejected,
-# dipping liveness. The gate is ALL ≥6 runs green → NOT met. Enforcing needs a LIVENESS
-# mechanism first (e.g. a deterministic backup proposer when the primary misses its slot),
-# not a parameter tune. See docs/CONSENSUS_REMAINING_WORK.md item 5.
+# STILL OFF — selection CONVERGES under enforce (no halt; 16/16 ⇒ no eligibility mismatch;
+# 1 unique RANDAO mix when history converges), but LIVENESS under enforce is unsolved after
+# three approaches (all failed the ALL-≥6-runs-green gate):
+#   1. Single eligible proposer (K=1): intermittent dip (2/7 runs 81–94%) — an unlucky/slow
+#      primary leaves a slot unproposed. Widening the epoch lookback to 2 made it WORSE.
+#   2. Top-K backup proposers (K=2, primary + 1 backup; RANDAO_PROPOSER_ELIGIBLE_K): WORSE
+#      (a run hit 75%). The backup's proposal timing (wait, then check the LOCAL tip) races
+#      propagation lag — the primary's block exists but has not imported on the backup's node
+#      yet, so the backup proposes a COMPETING block → reorg churn.
+# Fundamental tension: single-eligible misses slots; multi-eligible creates competing blocks.
+# A real fix needs propagation-aware backup timing (wait > propagation, or gossip "slot filled")
+# or slot-time-aligned proposal — not just a bigger eligible set. The ranking + top-K
+# acceptance are correct consensus infra (unit-tested, neutral off); only the backup PROPOSAL
+# timing in node_integration is the flawed piece. See docs item 5.
 ENFORCE_RANDAO_SELECTION = False
 
 # Genesis seed for the fold. Equal to the current constant proposer mix, so the

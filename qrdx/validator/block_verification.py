@@ -75,6 +75,25 @@ def expected_proposer_for_slot(
     chosen = ValidatorSelector().select_proposer(slot, vals, randao_mix)
     return chosen.address if chosen else None
 
+
+def eligible_proposers_for_slot(
+    slot: int,
+    validators: List[Tuple[str, Decimal]],
+    randao_mix: bytes = PROPOSER_RANDAO_MIX,
+    k: int = 1,
+) -> List[str]:
+    """The slot's ELIGIBLE proposer addresses (top-``k`` ranking: primary + backups) — the
+    enforced-RANDAO liveness set. Built identically to ``expected_proposer_for_slot`` so every
+    node agrees; ``k=1`` reproduces the single-primary check."""
+    from .selection import ValidatorSelector
+    from .types import Validator, ValidatorStatus
+    vals = [
+        Validator(address=addr, public_key=b"", stake=stake, effective_stake=stake,
+                  status=ValidatorStatus.ACTIVE, activation_epoch=0)
+        for addr, stake in validators
+    ]
+    return [v.address for v in ValidatorSelector().proposer_ranking(slot, vals, randao_mix, k)]
+
 # Header fields the proposer signs (see manager.PoSBlock.signing_root).
 _SIGNING_FIELDS = (
     "number", "parent_hash", "state_root", "transactions_root",
@@ -215,23 +234,34 @@ async def verify_proposer_eligibility(
     # selection is enforced — keyed off the block's SLOT via the SAME entry point the
     # proposer uses (selection_mix_for_slot), so it is tip-independent and matches what the
     # proposer computed. Behaviour-neutral while the gate is off. See docs item 5.
+    randao_enforced = False
     mix = PROPOSER_RANDAO_MIX
     try:
         from .randao import ENFORCE_RANDAO_SELECTION, selection_mix_for_slot
         if ENFORCE_RANDAO_SELECTION:
             mix = await selection_mix_for_slot(db, slot)
+            randao_enforced = True
     except Exception as e:
         logger.debug("eligibility: checkpoint mix fallback (zero): %s", e)
-        mix = PROPOSER_RANDAO_MIX
+        mix, randao_enforced = PROPOSER_RANDAO_MIX, False
 
-    expected = expected_proposer_for_slot(slot, validators, mix)
-    if expected and expected != proposer:
+    if randao_enforced:
+        # Accept ANY of the slot's top-K eligible proposers (primary or a backup) — the
+        # liveness set, so a slow/offline primary that a backup covered still verifies.
+        from .randao import RANDAO_PROPOSER_ELIGIBLE_K
+        eligible = set(eligible_proposers_for_slot(slot, validators, mix, RANDAO_PROPOSER_ELIGIBLE_K))
+        ok = (not eligible) or (proposer in eligible)
+        msg = (f"proposer {str(proposer)[:20]}... not in eligible set for slot {slot}") if not ok else ""
+    else:
+        expected = expected_proposer_for_slot(slot, validators, mix)
+        ok = not (expected and expected != proposer)
         msg = (f"proposer {str(proposer)[:20]}... not eligible for slot {slot} "
-               f"(expected {expected[:20]}...)")
+               f"(expected {expected[:20]}...)") if not ok else ""
+
+    if not ok:
         if enforce:
             return False, msg
         logger.warning(f"[eligibility observe] {msg}")
-        return True, ""
     return True, ""
 
 

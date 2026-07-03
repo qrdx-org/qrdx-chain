@@ -237,13 +237,22 @@
    occasionally leaves a slot unproposed (the primary missed it) or rejects competing blocks,
    dipping liveness. The ≥6-all-green gate is NOT met → kept OFF.
 
-   **Remaining = a LIVENESS mechanism (not a parameter tune).** Add a deterministic BACKUP
-   proposer: if the slot's primary RANDAO proposer doesn't produce within the slot, a
-   deterministic next-in-line (e.g. next-lowest selection score) may propose, and
-   `verify_proposer_eligibility` accepts EITHER primary or the backup for that slot. Then the
-   schedule tolerates a missed/slow primary without a liveness dip. Re-soak ≥6 after. The
-   mechanism (epoch_checkpoint_mix + the gated wiring) is committed; only this liveness layer
-   and the soak remain.
+   **Backup-proposer attempt (2026-07-01) — implemented, but WORSENED liveness.** Built the
+   top-K eligible set: `selector.proposer_ranking` (primary + deterministic stake-weighted
+   backups; unit-tested — rank 0 == the old `select_proposer`), `verify_proposer_eligibility`
+   + `manager.validate_block` accept ANY of the slot's top-K, and the proposal loop staggers
+   backups (primary immediate; a backup waits then proposes only if no block landed). Gated on
+   `RANDAO_PROPOSER_ELIGIBLE_K` (=2), neutral off. Soak: a run hit 75% (WORSE than K=1's
+   81–94%), with HIGH block production (107) — so not a stall. Cause: the backup's timing
+   checks the LOCAL tip, which races propagation lag — the primary's block exists but has not
+   imported on the backup's node yet, so the backup proposes a COMPETING block → reorg churn.
+
+   **Remaining = propagation-aware liveness (a real design, not a tune).** The consensus
+   pieces (ranking + top-K acceptance) are correct + kept (neutral off); the flawed piece is
+   the backup PROPOSAL TIMING. A working fix needs the backup to wait LONGER than propagation
+   before proposing (so it sees the primary's block), or a "slot filled" gossip signal, or
+   slot-time-aligned proposal windows. Until that lands, RANDAO selection stays observe/off.
+   The epoch_checkpoint_mix mechanism + gated wiring + ranking infra are committed.
 
    **IMPLEMENTED + SOAKED (2026-06-28) — works, but liveness gate NOT yet met.** Built
    `epoch_checkpoint_mix(db, epoch)` + `selection_mix_for_slot(db, slot)` (boundary height via
