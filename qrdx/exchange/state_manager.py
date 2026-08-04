@@ -180,6 +180,16 @@ class ExchangeStateManager:
         # mutates the book. When False (default) the book matches as before and moves
         # no value (behaviour-neutral). See docs/CONSENSUS_REMAINING_WORK.md item 7.
         self.enforce_orderbook_settlement: bool = False
+        # Pool-creation stake gate (observe-first, SEPARATE gate so it soaks
+        # independently). When True, CREATE_POOL debits the creator's real QRDX
+        # (account_state) stake — held in pool.state.stake_amount, returnable by a
+        # future remove-pool op (staking pools) or forfeit (subsidized = burn) — and
+        # rejects a creator who cannot afford it. Because the shared account_state
+        # flush (flush_exchange_balance_deltas) is ALREADY enforced for collateral,
+        # this gate must guard the DELTA RECORDING itself (not just the flush), or the
+        # stake would debit as soon as collateral is enforced. When False (default) the
+        # pool is created as before and no value moves (behaviour-neutral).
+        self.enforce_pool_stake: bool = False
 
         # --- Counters ---
         self._total_swaps: int = 0
@@ -374,10 +384,37 @@ class ExchangeStateManager:
         sqrt_price = Decimal(str(p["initial_sqrt_price"]))
         stake = Decimal(str(p["stake_amount"]))
 
+        # Phase E: pool creation must be backed by real QRDX. Check affordability of
+        # the declared stake BEFORE creating (a failed op is not reverted), mirroring
+        # the perp-margin path. create_pool() separately validates stake >= the
+        # per-type minimum (raises) — this is the additional can-the-creator-afford-it
+        # check.
+        avail = self.available_balance(tx.sender)
+        if avail is not None and avail < stake:
+            if self.enforce_pool_stake:
+                return ExchangeExecResult(
+                    success=False,
+                    error=(f"insufficient balance for pool stake: need {stake}, "
+                           f"available {avail}"),
+                )
+            logger.warning(
+                "[Phase E observe] create_pool by %s: stake %s exceeds available "
+                "balance %s — would REJECT once pool stake is enforced",
+                tx.sender[:20], stake, avail,
+            )
+
         pool = self.pool_manager.create_pool(
             p["token0"], p["token1"], fee_tier, pool_type,
             sqrt_price, tx.sender, stake,
         )
+
+        # Debit the stake as a real-balance move (flushed to account_state by the
+        # async wrapper). Only RECORD the delta when enforcing — the shared flush is
+        # already on for collateral, so recording unconditionally would debit even
+        # while this gate is off. The stake is held in pool.state.stake_amount for a
+        # future remove-pool return (staking pools) / forfeit (subsidized = burn).
+        if self.enforce_pool_stake and stake > ZERO:
+            self._record_balance_delta(tx.sender, -stake)
 
         # Create matching orderbook and oracle
         pair_key = f"{pool.state.token0}:{pool.state.token1}"

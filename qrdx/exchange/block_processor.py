@@ -67,6 +67,15 @@ ENFORCE_SPOT_SETTLEMENT = True
 # rejected before they mutate the book. Stays OFF until the escrow settlement is soaked.
 ENFORCE_ORDERBOOK_SETTLEMENT = True
 
+# Pool-creation stake gate (observe-first, SEPARATE gate so it soaks independently).
+# OFF (default): CREATE_POOL is created as before and debits nothing (behaviour-neutral,
+# but pool creation is "free"). ON: the creator's declared QRDX stake is debited from
+# account_state (via the same collateral flush path) and held in pool.state.stake_amount
+# for a future remove-pool return (staking pools) / forfeit (subsidized = burn); a creator
+# who cannot afford the stake is rejected. Stays OFF until soaked. See item 7 (create_pool
+# stake) in docs/CONSENSUS_REMAINING_WORK.md.
+ENFORCE_POOL_STAKE = False
+
 
 async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:
     """
@@ -432,6 +441,9 @@ async def rebuild_exchange_state_from_chain(
         # enabling it would only add canonical-tx rejection risk during trust-replay.
         mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
         mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
+        # Pool-stake debit records an account_state delta (flushed below); the reorg
+        # replay must re-record it or the reconstructed ledger loses the stake debit.
+        mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
 
     try:
         tip = (await db.get_next_block_id()) - 1

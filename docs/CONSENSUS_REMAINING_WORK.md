@@ -396,16 +396,46 @@
    balance-sync registry is now reset on rebuild) and is continuously checked by
    `scripts/phase_e_invariants.py`.
 
-   **⏳ Remaining economic-settlement gaps (secondary, no live scenario):**
-   - **CLOB order-book** — `_op_place_order` matches orders and produces trades but moves
-     NO token balances; `_op_cancel_order` refunds nothing. Needs escrow-on-place →
-     settle-on-match (maker↔taker base/quote + fees) → refund-on-cancel. The AMM is the
-     settled spot venue; the order book is still a simulation. (Largest remaining item;
-     escrow accounting per resting order.)
-   - **`_op_create_pool` stake/burn** — validates `stake_amount >= required` (subsidized
-     pools "require burn", others "require staking" QRDX) but never DEBITS it from the
-     creator. Needs a lock-vs-burn tokenomics decision + a return path before settling
-     (cf. the clean ADD_MARGIN fix, which had an existing return path via close).
+   **Economic-settlement gaps:**
+   - ✅ **CLOB order-book — DONE + ENFORCED (2026-08-04, commit 90e04f5).**
+     `_op_place_order` escrows the order's funds into a deterministic per-book escrow
+     holder (`orderbook_escrow_address`), matched trades settle maker↔taker via that
+     escrow, and `_op_cancel_order` refunds exactly. `ENFORCE_ORDERBOOK_SETTLEMENT=True`.
+     Two fixes were needed to converge: (1) `_op_place_order`/`_op_cancel_order` must
+     canonicalize the pair the way `create_pool` does (it SORTS `token0:token1`), or the
+     book lookup misses → the op silently fails → no escrow (added
+     `_canonical_pair()`); (2) the reorg rebuild must re-enable
+     `enforce_orderbook_settlement` — unlike spot (whose token moves are unconditional;
+     the flag only gates a sufficiency CHECK) the CLOB escrow MOVE itself is behind the
+     flag, so a reorg-rebuilt node dropped every resting order's escrow. Validated: suite
+     17/17 under heavy reorg (17-41/node), 0 FATAL, token conservation holds on all nodes
+     incl. qCLOB* (200 escrowed on place → 0 on cancel), account_state converges, E-D4=0;
+     a 25-reorg node correctly RECONSTRUCTED the escrow. Follow-up: CLOB *match*
+     settlement across two wallets (self-trade prevention makes single-wallet match a
+     no-op) has no live scenario yet.
+   - 🔱 **`_op_create_pool` stake/burn — BUILT (observe-only, gated off), enforce
+     validated once; needs a soak before the flip (2026-08-04).** `create_pool` validated
+     `stake_amount >= the per-type minimum` but never DEBITED it, so pool creation was
+     free. Added the debit mirroring the perp-margin path: the declared stake is checked
+     against the creator's pre-loaded available balance and recorded as a `-stake`
+     account_state delta (flushed by the same path as margin), held in
+     `pool.state.stake_amount` for a future remove-pool return (staking pools) / forfeit
+     (subsidized = burn). Gated by `ENFORCE_POOL_STAKE` (default False) — a SEPARATE gate
+     because the shared account_state flush is already enforced for collateral, so the
+     DELTA RECORDING itself (not just the flush) must be gated or the stake would debit as
+     soon as collateral is. Set on the proposer + importer + reorg-rebuild paths. Tests:
+     `test_pool_stake_settlement.py` (7). Enforce validation (1 run, flag flipped then
+     reverted): suite 17/17 under heavy reorg (9-44/node), 0 FATAL, 0 spurious rejects,
+     and the 10000 stake debit was DETERMINISTIC + CONVERGENT on every caught-up node
+     (node0/1/3 all exactly 990000 despite 44/9/27 reorgs — so the debit is reorg-safe,
+     reconstructed correctly by the wired rebuild). The one residual was a node trailing 2
+     blocks whose derived-state lagged its own stored tip at shutdown (the known
+     "balance is a function of height" artifact, cf. item 2 / the S10 fix) — not a
+     pool-stake defect, but the suite shut down before it caught up so post-catch-up
+     convergence was not observed. Flip `ENFORCE_POOL_STAKE` after a multi-run soak that
+     confirms the trailing node converges (or the checker height-gates account_state).
+     A REMOVE_POOL op (return path for staking pools; burn for subsidized) is the natural
+     follow-up before/with the flip.
 
    Then the process gates below.
 

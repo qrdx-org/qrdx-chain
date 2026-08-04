@@ -1062,12 +1062,14 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
         flush_exchange_balance_deltas, flush_token_balance_deltas,
         flush_validator_lifecycle_deltas,
         ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT, ENFORCE_ORDERBOOK_SETTLEMENT,
+        ENFORCE_POOL_STAKE,
     )
     from ..exchange.state_manager import ExchangeStateManager
     mgr = ExchangeStateManager.get_instance()
     mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
     mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
     mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
+    mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
     # Phase E: pre-load senders' real QRDX + token balances so the collateral and
     # spot-sufficiency checks can read them during the sync section processing.
     try:
