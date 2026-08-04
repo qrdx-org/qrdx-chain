@@ -2485,7 +2485,7 @@ async def periodic_update_fetcher():
             traceback.print_exc()
 
 
-async def process_and_create_block(block_info: dict) -> bool:
+async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False) -> bool:
     """Processes a single block dictionary with validation.
     
     Supports both PoW blocks (hex content → manager.create_block) and
@@ -2527,9 +2527,17 @@ async def process_and_create_block(block_info: dict) -> bool:
             return False
 
         # Security: verify the proposer is the validator selected for this slot
-        # (catches signature-valid but out-of-turn proposals). Observe-first.
+        # (catches signature-valid but out-of-turn proposals). The proposer SIGNATURE is
+        # already enforced above; slot-eligibility, however, is NOT enforced on the BULK-SYNC
+        # path — a catching-up node's validators table (effective_stake / activation timing)
+        # can transiently differ from the network's at selection time, so it would reject a
+        # genuinely CANONICAL block, abort the sync ("FATAL ERROR: Failed to create blocks
+        # during sync"), and get STUCK behind — which leaves its derived state (tokens /
+        # account_state) diverged. So bulk-sync TRUST-REPLAYS eligibility (observe), exactly
+        # like the E-D4 unified-root check does; live-broadcast import (p2p/REST) still
+        # enforces. See the reorg-derived-state divergence in phase_e_invariants.
         ok_elig, elig_err = await verify_proposer_eligibility(
-            db, block_content, enforce=_ENFORCE_PROPOSER_ELIGIBILITY,
+            db, block_content, enforce=(_ENFORCE_PROPOSER_ELIGIBILITY and not is_bulk_sync),
         )
         if not ok_elig:
             logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {elig_err}")
@@ -2963,7 +2971,7 @@ async def _sync_blockchain(node_id: str = None):
                 # per-batch apply is serialized. See phase_e_invariants reorg divergence.
                 async with block_processing_lock:
                     for block_data in blocks_batch:
-                        if not await process_and_create_block(block_data):
+                        if not await process_and_create_block(block_data, is_bulk_sync=True):
                             logger.error("[SYNC] FATAL ERROR: Failed to create blocks during sync. Aborting.")
                             await security.reputation_manager.record_violation(
                                 peer_to_sync_from['node_id'], 'invalid_sync_block', severity=8
