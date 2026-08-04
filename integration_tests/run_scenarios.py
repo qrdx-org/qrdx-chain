@@ -43,9 +43,7 @@ from integration_tests.scenarios.s13_perp_collateral import S13PerpCollateral
 from integration_tests.scenarios.s14_token_consensus import S14TokenConsensus
 from integration_tests.scenarios.s15_spot_settlement import S15SpotSettlement
 from integration_tests.scenarios.s16_validator_membership import S16ValidatorMembership
-# s17_clob_settlement is STAGED (not in the active suite): it needs ENFORCE_ORDERBOOK_
-# SETTLEMENT=True AND a run free of the open reorg-derived-state divergence to validate. See
-# docs item 7 / memory phase-e-perp-margin-reorg-divergence.
+from integration_tests.scenarios.s17_clob_settlement import S17ClobSettlement
 
 
 ALL_SCENARIOS = [
@@ -65,6 +63,7 @@ ALL_SCENARIOS = [
     S14TokenConsensus,
     S15SpotSettlement,
     S16ValidatorMembership,
+    S17ClobSettlement,
 ]
 
 

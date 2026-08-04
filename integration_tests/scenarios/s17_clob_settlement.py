@@ -41,6 +41,17 @@ class S17ClobSettlement(Scenario):
         nz = [v for v in roots.values() if v and v != "0" * 128]
         return Counter(nz).most_common(1)[0] if nz else (None, 0)
 
+    async def _wait_converge(self, node_urls, predicate, attempts):
+        """Poll (2s/step) until the modal token root satisfies ``predicate`` AND at least
+        all-but-one node agree on it (tolerating a single trailing node); return that root,
+        or None if it never converged. Robust to reorg settling."""
+        for _ in range(attempts):
+            await asyncio.sleep(2)
+            m, nm = self._modal_root(await self._token_roots(node_urls))
+            if nm >= max(2, len(node_urls) - 1) and predicate(m):
+                return m
+        return None
+
     async def _submit_and_wait(self, node_urls, target, tx_hex, base_root, label):
         async with NodeRPCClient(target) as c:
             r = await c._post("/submit_exchange_tx", json_data={"tx_hex": tx_hex})
@@ -113,8 +124,11 @@ class S17ClobSettlement(Scenario):
                  "pool_type": int(PoolType.STANDARD), "initial_sqrt_price": str(sqrt_price),
                  "stake_amount": "10000"}))})
             self.check(bool(rp and rp.get("ok")), "CREATE_POOL (order book): admitted")
-        await asyncio.sleep(8)
-        pre_place = self._modal_root(await self._token_roots(node_urls))[0] or r2
+        # Stable, CONVERGED baseline after the deploys + pool (poll so it is not a mid-reorg
+        # transient — the escrow/refund below compare against it).
+        pre_place = await self._wait_converge(node_urls, lambda m: m and m != base_root, 20)
+        self.check_not_none(pre_place, "Baseline token root converged after deploys + pool")
+        pre_place = pre_place or r2
 
         # 4. Place a RESTING limit BUY: buy 100 base @ price 2 → escrows 100*2 = 200 quote
         #    (token B) from the trader into the book escrow holder. No asks exist, so it rests.
@@ -122,29 +136,26 @@ class S17ClobSettlement(Scenario):
                        {"pair": pair, "side": "buy", "order_type": "limit",
                         "price": "2", "amount": "100"})
         order_id = place_tx.tx_hash()[:16]  # the node derives the order id the same way
-        r4 = await self._submit_and_wait(node_urls, target, _sign(place_tx), pre_place,
-                                         "PLACE_ORDER (resting buy)")
-        self.check_not_none(r4, "Limit buy placed → quote escrowed (token root advanced)")
+        async with NodeRPCClient(target) as c:
+            rp = await c._post("/submit_exchange_tx", json_data={"tx_hex": _sign(place_tx)})
+            self.check(bool(rp and rp.get("ok")), "PLACE_ORDER (resting buy): admitted")
 
-        # 5. Cross-node convergence of the escrow settlement.
-        n_modal = 0; modal = None; final = {}
-        for _ in range(12):
-            final = await self._token_roots(node_urls)
-            modal, n_modal = self._modal_root(final)
-            if n_modal >= max(2, len(final) - 1):
-                break
-            await asyncio.sleep(2)
-        self.check(n_modal >= max(2, len(final) - 1),
-                   f"Nodes converge on the escrow-settled token root ({n_modal}/{len(final)})")
-        self.check(bool(modal) and modal != pre_place,
-                   "Escrow moved real quote tokens (root advanced from pre-place)")
+        # 5. The escrow is a STABLE end-state (the order rests until cancelled) — poll
+        #    GENEROUSLY for ALL nodes to converge on ONE token root DIFFERENT from pre_place.
+        #    That proves the escrow moved real quote tokens AND every node replayed it to the
+        #    same ledger. Robust to reorg settling (unlike catching the transient advance).
+        escrowed = await self._wait_converge(node_urls, lambda m: m and m != pre_place, 45)
+        self.check(escrowed is not None,
+                   "Escrow-on-place settled: all nodes converge on a NEW token root != pre_place "
+                   "(real quote tokens escrowed, deterministically)")
 
-        # 6. Cancel → refund the escrowed quote. The token root must return to its EXACT
-        #    pre-place value (escrow fully refunded ⇒ token ledger conserves).
-        r6 = await self._submit_and_wait(node_urls, target, _sign(_tx(
-            ExchangeOpType.CANCEL_ORDER, 4, {"order_id": order_id, "pair": pair})),
-            modal, "CANCEL_ORDER (refund escrow)")
-        self.check_not_none(r6, "Order cancelled (token root moved on refund)")
-        self.check(r6 == pre_place,
-                   f"Cancel refunded escrow EXACTLY — token root returned to pre-place "
-                   f"(conservation): {str(r6)[:12]} == {str(pre_place)[:12]}")
+        # 6. Cancel → refund. Poll for ALL nodes to converge BACK to pre_place — the escrow was
+        #    refunded EXACTLY, so the token ledger returns to its pre-place state (conservation).
+        async with NodeRPCClient(target) as c:
+            rc = await c._post("/submit_exchange_tx", json_data={"tx_hex": _sign(_tx(
+                ExchangeOpType.CANCEL_ORDER, 4, {"order_id": order_id, "pair": pair}))})
+            self.check(bool(rc and rc.get("ok")), "CANCEL_ORDER: admitted")
+        refunded = await self._wait_converge(node_urls, lambda m: m == pre_place, 30) is not None
+        self.check(refunded,
+                   "Cancel refunded escrow EXACTLY — token root converged back to pre-place "
+                   "on all nodes (CLOB settlement conserves value)")

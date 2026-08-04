@@ -65,7 +65,7 @@ ENFORCE_SPOT_SETTLEMENT = True
 # before and moves no value (behaviour-neutral). ON: PLACE_ORDER escrows + matched
 # trades settle real token moves + CANCEL refunds, with unaffordable/MARKET orders
 # rejected before they mutate the book. Stays OFF until the escrow settlement is soaked.
-ENFORCE_ORDERBOOK_SETTLEMENT = False
+ENFORCE_ORDERBOOK_SETTLEMENT = True
 
 
 async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:
@@ -415,7 +415,23 @@ async def rebuild_exchange_state_from_chain(
         mgr = state_manager
 
     if flush_to_account_state:
+        # Reorg rebuild (token_balances + account_state were just cleared+reseeded):
+        # the replay must reconstruct the SAME ledger live import produced. Gated on
+        # flush_to_account_state (like the collateral flush) because the plain-restart
+        # path does NOT re-flush token deltas — the durable ledger already holds them,
+        # and apply_token_balance_delta is additive, so re-applying would double them.
+        #
+        # enforce_orderbook_settlement MUST be on here: unlike spot (whose token moves
+        # are unconditional — the flag only gates a sufficiency CHECK), the CLOB escrow
+        # MOVE itself is behind this flag (_settle_orderbook). With it off, a reorg
+        # rebuild loses every resting order's escrow → the token root diverges from
+        # nodes that never reorged. The canonical order already afforded its escrow at
+        # build time, and the in-order preload reconstructs that balance, so the
+        # accompanying sufficiency pre-check does not reject it (same as live import).
+        # enforce_spot_settlement stays off: its moves are already reconstructed, and
+        # enabling it would only add canonical-tx rejection risk during trust-replay.
         mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
+        mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
 
     try:
         tip = (await db.get_next_block_id()) - 1

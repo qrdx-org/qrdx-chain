@@ -520,9 +520,20 @@ class ExchangeStateManager:
             },
         )
 
+    @staticmethod
+    def _canonical_pair(pair: str) -> str:
+        """Order books (like AMM pools) are keyed by the SORTED token pair — create_pool
+        canonicalizes ``token0:token1`` (swaps if token0 > token1). Normalize a caller's
+        pair the same way so PLACE_ORDER/CANCEL_ORDER find the book in either input order."""
+        if ":" in pair:
+            a, b = pair.split(":", 1)
+            if a > b:
+                return f"{b}:{a}"
+        return pair
+
     def _op_place_order(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
-        pair = p["pair"]
+        pair = self._canonical_pair(p["pair"])
         book = self._order_books.get(pair)
         if book is None:
             return ExchangeExecResult(success=False, error=f"No order book for {pair}")
@@ -617,7 +628,7 @@ class ExchangeStateManager:
     def _op_cancel_order(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
         order_id = p["order_id"]
-        pair = p.get("pair", "")
+        pair = self._canonical_pair(p.get("pair", ""))
 
         # Search across all books if pair not specified
         if pair and pair in self._order_books:
