@@ -432,10 +432,22 @@
      blocks whose derived-state lagged its own stored tip at shutdown (the known
      "balance is a function of height" artifact, cf. item 2 / the S10 fix) — not a
      pool-stake defect, but the suite shut down before it caught up so post-catch-up
-     convergence was not observed. Flip `ENFORCE_POOL_STAKE` after a multi-run soak that
-     confirms the trailing node converges (or the checker height-gates account_state).
-     A REMOVE_POOL op (return path for staking pools; burn for subsidized) is the natural
-     follow-up before/with the flip.
+     convergence was not observed.
+     **6-run soak (2026-08-04, ENFORCE_POOL_STAKE=True, height-gated checker that compares
+     only nodes AT the max tip): gate NOT met → kept OFF.** All 6 runs were 17/17 with 0
+     spurious pool-stake rejects, and 5/6 had the caught-up set fully converge (account_state
+     + token ledger). But run 3 diverged with ALL 4 nodes caught up at the same tip (128,
+     no trailing): 1 account_state address AND the TOKEN ROOTS differed. Since pool-stake
+     never moves token balances, the token-root divergence proves this is NOT a pool-stake
+     defect — it is the pre-existing reorg-derived-state divergence (equal-tip, E-D4=0
+     signature; cf. [[phase-e-perp-margin-reorg-divergence]] / item 4-class) resurfacing
+     under heavy reorg (~1/6 ≈ 17%, in line with the documented ~30-40% intermittent). Run 4
+     also logged a (recovered, non-terminal) FATAL. **Conclusion: the pool-stake debit is
+     correct (deterministic, reorg-safe, converges whenever the reorg machinery does), but
+     the enforce flip is GATED on resolving the recurring reorg-derived-state divergence —
+     which gates every account_state-affecting enforce, not just this one.** Flip
+     `ENFORCE_POOL_STAKE` once that divergence is fixed AND a clean multi-run soak passes;
+     a REMOVE_POOL return path (staking pools) / burn (subsidized) is the natural companion.
 
    Then the process gates below.
 
