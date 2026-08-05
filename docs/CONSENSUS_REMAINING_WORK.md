@@ -448,6 +448,20 @@
      which gates every account_state-affecting enforce, not just this one.** Flip
      `ENFORCE_POOL_STAKE` once that divergence is fixed AND a clean multi-run soak passes;
      a REMOVE_POOL return path (staking pools) / burn (subsidized) is the natural companion.
+     **Follow-up (2026-08-05) — the divergence is RARE and NOT pool-stake-caused.** Two more
+     capture batches (8 runs flag OFF + 8 runs flag ON, each looping the suite until an
+     equal-tip divergence) were BOTH 16/16 clean → the soak's run-3 hit was the rare
+     (~1/22 ≈ 4.5%) pre-existing bug, not the pool-stake debit (which converged in all 22
+     runs). So this is a project-wide reorg-safety item (item 4-class / the reorg-derived-
+     state divergence) that equally affects the already-SHIPPED enforced features
+     (collateral, spot, CLOB) — pool-stake is no riskier than those. It is now the top
+     reorg-safety lever: because it is ~4.5%, root-causing it wants a FORCED-reorg repro
+     harness or a deterministic rebuild-vs-forward-apply equivalence test (rebuild replays
+     via produce_block_evm_section / clear+additive flush; forward import via
+     apply_block_evm_section / incremental flush — a mismatch between the two paths, or a
+     concurrent-write race during the rollback→reseed→reflush, is the leading suspect),
+     rather than blind soaking (missed in 16 runs). Healing is not guaranteed at equal tip
+     (E-D4 live-reject stalls a divergent node until a reorg-rebuild fixes it).
 
    Then the process gates below.
 
