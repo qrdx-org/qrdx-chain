@@ -1265,6 +1265,26 @@ class DatabaseSQLite:
         return [{"validator_address": r[0], "condition": r[1], "slot": r[2], "epoch": r[3]}
                 for r in rows]
 
+    async def get_pending_slashing_evidence(self, limit: int = 16) -> list:
+        """The full self-validating PROOFS for unprocessed slashing events, for a proposer to
+        include in the block body so they propagate to every node. Returns the parsed evidence
+        dicts (the two signed headers). Bounded by ``limit`` to keep block size sane; a proof
+        keeps riding blocks until the finalized-epoch penalty marks it processed (deduped by
+        every importer via INSERT OR IGNORE)."""
+        import json as _json
+        cur = await self.connection.execute(
+            "SELECT evidence FROM slashing_events WHERE processed = 0 "
+            "ORDER BY validator_address, slot LIMIT ?", (int(limit),))
+        out = []
+        for (ev_json,) in await cur.fetchall():
+            try:
+                d = _json.loads(ev_json)
+                if isinstance(d, dict) and d.get("header_a") and d.get("header_b"):
+                    out.append(d)
+            except Exception:
+                continue
+        return out
+
     async def apply_validator_slash(self, address: str, penalty, enforce: bool = False) -> dict:
         """Apply a slashing penalty to one validator: effective_stake -= penalty
         (clamped at 0), total_slashed += penalty, status='slashed' (ejecting it from the

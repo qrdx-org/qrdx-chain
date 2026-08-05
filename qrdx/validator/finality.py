@@ -191,6 +191,13 @@ async def record_finality_from_block(db, block_content) -> Dict[str, int]:
         if not isinstance(bc, dict):
             return {}
         await record_block_attestations(db, bc)
+        # Record any DOUBLE_SIGN evidence the block carries (deterministic on every node) so the
+        # finalized-epoch slash can be enforced off identical slashing_events. Self-verifying.
+        try:
+            from .slashing_block import record_block_slashing_evidence
+            await record_block_slashing_evidence(db, bc)
+        except Exception as e:
+            logger.debug("finality: slashing-evidence record skipped: %s", e)
         return await update_finality(db)
     except Exception as e:
         logger.debug("finality: record_from_block skipped: %s", e)

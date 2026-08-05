@@ -77,7 +77,12 @@ class PoSBlock:
     
     # Transactions
     transactions: List[Any] = field(default_factory=list)
-    
+
+    # DOUBLE_SIGN slashing evidence (body-only, NOT in signing_root/hash — like attestations).
+    # Rides the block so every node records identical evidence and the finalized-epoch slash
+    # can be enforced deterministically. See validator/slashing_block.py.
+    slashing_evidence: List[Any] = field(default_factory=list)
+
     # Graffiti (optional message from proposer)
     graffiti: str = ""
     
@@ -124,6 +129,7 @@ class PoSBlock:
             'epoch': self.epoch,
             'randao_reveal': self.randao_reveal.hex(),
             'attestations': [a.to_dict() for a in self.attestations],
+            'slashing_evidence': list(self.slashing_evidence),
             'graffiti': self.graffiti,
             'hash': self.hash,
         }
@@ -561,7 +567,16 @@ class ValidatorManager:
             self.config.attestation.max_attestations_per_block,
             self.config.attestation.max_inclusion_distance,
         )
-        
+
+        # DOUBLE_SIGN evidence to include: pending proofs ride the block so every node records
+        # identical slashing_events (the determinism the finalized-epoch slash needs).
+        slashing_evidence = []
+        try:
+            if self.database is not None:
+                slashing_evidence = await self.database.get_pending_slashing_evidence()
+        except Exception as e:
+            logger.debug("slashing-evidence inclusion skipped: %s", e)
+
         # Create unsigned block
         block = PoSBlock(
             number=slot,  # In PoS, block number often equals slot
@@ -577,6 +592,7 @@ class ValidatorManager:
             randao_reveal=randao_reveal,
             attestations=attestations,
             transactions=transactions,
+            slashing_evidence=slashing_evidence,
             graffiti=self.config.graffiti,
         )
         

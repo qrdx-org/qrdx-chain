@@ -9,13 +9,32 @@ able to fabricate a slash for an honest validator (it would need that validator'
 over two blocks), and the benign equal-height race (distinct proposers) must never validate.
 """
 import hashlib
+import os
+import tempfile
+
+import pytest
 
 from qrdx.crypto.pq.dilithium import PQPrivateKey
+from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.validator.block_verification import reconstruct_signing_root
 from qrdx.validator.slashing_block import (
     make_double_sign_evidence, verify_double_sign_evidence,
-    extract_slashing_evidence_from_dict, BLOCK_SLASHING_KEY,
+    extract_slashing_evidence_from_dict, record_block_slashing_evidence, BLOCK_SLASHING_KEY,
 )
+
+
+@pytest.fixture
+async def db():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    database = await DatabaseSQLite.create(path)
+    yield database
+    await database.connection.close()
+    for p in (path, path + "-wal", path + "-shm"):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
 
 def _signed_header(key: PQPrivateKey, slot=7, **overrides):
@@ -102,3 +121,29 @@ def test_extract_from_block_dict():
     assert extract_slashing_evidence_from_dict({BLOCK_SLASHING_KEY: [ev]}) == [ev]
     assert extract_slashing_evidence_from_dict({}) == []
     assert extract_slashing_evidence_from_dict({BLOCK_SLASHING_KEY: "junk"}) == []
+
+
+async def test_record_block_evidence_is_deterministic(db):
+    """The RECEIVING side: recording a block's evidence is a pure function of the block, so every
+    node ends with the SAME slashing_events (the determinism the finalized-epoch slash needs).
+    A forged proof in the same block is skipped (never records a slash for an honest validator)."""
+    victim = PQPrivateKey.generate()
+    h1, addr = _signed_header(victim, slot=12, state_root="11" * 32)
+    h2, _ = _signed_header(victim, slot=12, state_root="22" * 32)
+    good = make_double_sign_evidence(h1, h2)
+    # A forged proof: distinct proposers (benign race) — must not record.
+    other = PQPrivateKey.generate()
+    ho, _ = _signed_header(other, slot=13)
+    forged = {"proposer": addr, "slot": 13, "header_a": h1, "header_b": ho}
+    block = {BLOCK_SLASHING_KEY: [good, forged]}
+
+    recorded = await record_block_slashing_evidence(db, block)
+    await db.connection.commit()
+    assert recorded == 1  # only the genuine double-sign
+    events = await db.get_slashing_events(addr)
+    assert len(events) == 1 and events[0]["slot"] == 12
+
+    # Idempotent: re-recording the same block (e.g. re-included in a later block) is a no-op.
+    again = await record_block_slashing_evidence(db, block)
+    assert again == 0
+    assert len(await db.get_slashing_events(addr)) == 1
