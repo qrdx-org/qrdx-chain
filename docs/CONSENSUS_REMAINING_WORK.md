@@ -135,6 +135,25 @@
    — it only converges the pending window, not the post-activation state, and trades away
    multi-deposit accumulation; the correct fix belongs WITH the reconstruction.
 
+   **Deep attempt (2026-08-05) — finalized-gated scheduling: converges ACTIVATION, not EXIT →
+   confirms the fix must be a ONE-PASS reconstruction.** Implemented + reverted: import leaves
+   `activation_epoch`/`exit_epoch` NULL (so a validator can't activate on a divergent import
+   value); an all-nodes per-tick pass assigns them from each unscheduled validator's deposit/exit
+   FINALIZED epoch (converged + reorg-stable; iterate by unscheduled validator, not by epoch, to
+   catch a late-added high-height/low-slot deposit block under heavy reorg). RESULT: the
+   activation schedule now CONVERGES byte-identically across all 4 nodes (`act={9}`, was `{7,8}`)
+   — a real win. BUT the EXIT then diverges: `mark_validator_exiting` (active→exiting) reads the
+   validator's status AT IMPORT, which varies across nodes because activation lands at slightly
+   different wall-clock moments → `status={active,exited}`, and `effective_stake` cascades (a
+   penalty applied only where it was active that epoch). Each transition that reads live per-node
+   status is a divergence source, so **incremental patches cannot close it.** The fix must
+   recompute activation + exit + rewards TOGETHER in one deterministic pass from finalized
+   canonical data (the reconstruction above), never transition-by-transition off live status.
+   Full attempt log in memory `validator-dynamic-state-reorg-reconstruction`. Severity stays
+   BENIGN at current scale (0 eligibility halts; divergence is in recorded schedule +
+   effective_stake); it becomes a real halt risk only when a deposit is large enough that the
+   effective_stake gap flips stake-weighted proposer selection.
+
    **Scoped (June 2026) — it is TWO disconnected data models, not a quick port.**
    - Consensus reads the **`validators`** table: `db.get_validators()` →
      `block_verification.expected_proposer_for_slot` (proposer selection +
