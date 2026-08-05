@@ -413,8 +413,13 @@
      a 25-reorg node correctly RECONSTRUCTED the escrow. Follow-up: CLOB *match*
      settlement across two wallets (self-trade prevention makes single-wallet match a
      no-op) has no live scenario yet.
-   - 🔱 **`_op_create_pool` stake/burn — BUILT (observe-only, gated off), enforce
-     validated once; needs a soak before the flip (2026-08-04).** `create_pool` validated
+   - ✅ **`_op_create_pool` stake/burn — DONE + ENFORCED (2026-08-05).**
+     `ENFORCE_POOL_STAKE=True` after the reorg-rebuild spot-enforce fix (9649931) removed
+     the divergence that failed its first soak: a 6-run re-soak was 6/6 with 5 runs fully
+     4-node-converged, and the rebuild-vs-forward equivalence test proves the debit
+     reconstructs byte-identically. A REMOVE_POOL return path (staking pools) / burn
+     (subsidized) remains the natural follow-up. History below.
+     `create_pool` validated
      `stake_amount >= the per-type minimum` but never DEBITED it, so pool creation was
      free. Added the debit mirroring the perp-margin path: the declared stake is checked
      against the creator's pre-loaded available balance and recorded as a `-stake`
