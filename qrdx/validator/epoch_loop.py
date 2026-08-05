@@ -32,13 +32,23 @@ _SLEEP = SLOT_DURATION if isinstance(SLOT_DURATION, int) and SLOT_DURATION > 0 e
 # validators-table updates without writing; True = write them at each finalized epoch.
 _ENFORCE_EPOCH_VALIDATOR_UPDATES = True
 
-# Slashing penalty enforce gate. The deterministic slash (effective_stake reduction +
-# eject) at the finalized epoch keeps the validators table byte-identical across nodes
-# ONLY if every node holds the SAME slashing_events by then — which needs evidence to
-# ride the canonical chain (evidence-in-blocks) or robust gossip. Until that lands this
-# stays OBSERVE: compute + log the would-be slash, write nothing (so the table stays
-# convergent). The detection + evidence recording is already live (observe).
-_ENFORCE_SLASHING = False
+# Slashing penalty enforce gate. The deterministic slash (effective_stake reduction + eject)
+# at the finalized epoch keeps the validators table byte-identical across nodes ONLY if every
+# node holds the SAME slashing_events by then — which now holds: DOUBLE_SIGN evidence rides the
+# canonical chain (evidence-in-blocks, validator/slashing_block.py), so every node records
+# identical evidence + applies the identical penalty. ENABLED after:
+#   • the enforce path proven byte-identical convergent across nodes (tests/test_slashing_
+#     enforce_convergence.py) — the halt risk (divergent eligible set) is settled;
+#   • the transport confirmed LIVE-wired (proposer propose_block includes evidence; every
+#     import path records it via record_finality_from_block — same mechanism as attestations);
+#   • a false-positive soak (4 honest runs incl. 2 at ~50 reorgs) recording 0 double-sign
+#     detections → enforce is a no-op on an honest network, no false slashes;
+#   • the penalty itself unit-tested (test_slashing_detection, enforce=True → 50% + eject).
+# A slash requires two VALIDLY-SIGNED conflicting blocks by the same proposer for one slot, so
+# an honest validator (which signs once per slot) is never slashed. A live malicious-node soak
+# remains a nice-to-have to exercise detection under adversarial load, but the halt risk is
+# settled deterministically.
+_ENFORCE_SLASHING = True
 
 
 async def apply_epoch_validator_update(db, epoch: int, enforce: bool) -> None:
