@@ -104,11 +104,36 @@
    the finality reorg guard (refuses rewrites below finalized) + the sequential
    height check. Full sync enforcement is unnecessary given those.
 
-4. **Validator lifecycle convergence.** The `validators` table is genesis-seeded
-   and consistent, but runtime validator set changes (activation/exit queues,
-   stake updates via rewards/slashing at epoch boundaries) are not yet propagated
-   into a single converged source. Until then the active set is effectively the
-   genesis set. Needed before dynamic validator membership.
+4. **Validator lifecycle convergence.** ✅ **LARGELY DONE + ENFORCED** (see
+   `docs/VALIDATOR_LIFECYCLE_UNIFICATION.md`): the SQLite-port + unification is complete —
+   one deterministic, finality-gated processor (`validator/epoch_loop.py` +
+   `db.apply_epoch_validator_updates`, `_ENFORCE_EPOCH_VALIDATOR_UPDATES=True`) runs on
+   EVERY node and writes rewards/penalties/activations/exits into the consensus
+   `validators` table; `STAKE_DEPOSIT`/`STAKE_EXIT` ops drive JOIN/LEAVE with schedules
+   derived deterministically from the carrying block's epoch; the old PG
+   `epoch_processing.process_epoch` is legacy (only its constants are imported). The
+   genesis validator set + rewards converge byte-identically across nodes.
+
+   **⏳ Remaining gap (2026-08-05 finding) — the DEPOSITED validator's dynamic state is not
+   reorg-reconstructed.** A clean run's decisive probe (per-node `validators` dump) shows the
+   3 genesis validators converge perfectly, but the s16-deposited validator DIVERGES on the
+   submission/proposer node: node0 `status=exited, act=8, ex=11, effective_stake=100000` vs
+   node1/2/3 `exited, act=7, ex=4, es=99990`. Root cause: the validators *dynamic* state
+   (deposit stake + activation/exit schedule + epoch rewards/penalties) is applied
+   INCREMENTALLY and is NOT reconstructed on reorg — so it depends on a node's reorg history,
+   not purely on the canonical chain. A deposit orphaned + re-included at a different epoch
+   freezes the first-import schedule (the validator activates before reconciliation catches
+   it) and double-counts stake. This is the SAME class as the token-ledger reorg issue, and
+   the fix is the same shape: **make the `validators` dynamic state a reorg-RECONSTRUCTED
+   consensus domain** — on the reorg rebuild, reset to the genesis validator base, replay
+   the canonical `STAKE_DEPOSIT/EXIT` ops idempotently (dedup by deposit tx-id so genuine
+   top-ups still accumulate while reorg replays don't double-count), and re-run the
+   finality-gated epoch processing for all finalized epochs. Substantial (a "5th
+   reorg-reconstructed domain"); until it lands, `s16` keeps its dynamic-convergence checks
+   OBSERVE-only (the JOIN pipeline + deterministic scheduling are hard-asserted and pass).
+   NOTE: a partial DB-primitive fix (idempotent-SET the pending schedule) was tried + reverted
+   — it only converges the pending window, not the post-activation state, and trades away
+   multi-deposit accumulation; the correct fix belongs WITH the reconstruction.
 
    **Scoped (June 2026) — it is TWO disconnected data models, not a quick port.**
    - Consensus reads the **`validators`** table: `db.get_validators()` →
