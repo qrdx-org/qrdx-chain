@@ -430,19 +430,23 @@ async def rebuild_exchange_state_from_chain(
         # path does NOT re-flush token deltas — the durable ledger already holds them,
         # and apply_token_balance_delta is additive, so re-applying would double them.
         #
-        # enforce_orderbook_settlement MUST be on here: unlike spot (whose token moves
-        # are unconditional — the flag only gates a sufficiency CHECK), the CLOB escrow
-        # MOVE itself is behind this flag (_settle_orderbook). With it off, a reorg
-        # rebuild loses every resting order's escrow → the token root diverges from
-        # nodes that never reorged. The canonical order already afforded its escrow at
-        # build time, and the in-order preload reconstructs that balance, so the
-        # accompanying sufficiency pre-check does not reject it (same as live import).
-        # enforce_spot_settlement stays off: its moves are already reconstructed, and
-        # enabling it would only add canonical-tx rejection risk during trust-replay.
+        # CRITICAL: the rebuild MUST set the SAME enforce flags the forward import path
+        # (_apply_exchange_section_on_import) uses, so it makes byte-identical accept/
+        # reject decisions during replay. A canonical block can contain a spot op the
+        # forward path REJECTS (an op unaffordable at that point — common under reorg
+        # churn when re-queued orphan txs are re-included): forward moves no value for
+        # it, so a rebuild that runs WITHOUT enforce_spot_settlement would instead
+        # EXECUTE it → the reorged node's token ledger diverges from the network at
+        # equal tip (the equal-tip derived-state divergence; token roots differ, E-D4
+        # stays 0 because block history matches). enforce_orderbook_settlement gates the
+        # CLOB escrow MOVE itself; enforce_pool_stake gates the stake debit. A canonical
+        # op that forward ACCEPTED had sufficient balance, and the in-order preload
+        # reconstructs that same balance, so enforcing here re-accepts it (no false
+        # reject) — the flags only make the REJECTIONS match too. Verified by
+        # tests/test_reorg_rebuild_equivalence.py.
         mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
+        mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
         mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
-        # Pool-stake debit records an account_state delta (flushed below); the reorg
-        # replay must re-record it or the reconstructed ledger loses the stake debit.
         mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
 
     try:
