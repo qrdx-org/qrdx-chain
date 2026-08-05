@@ -164,17 +164,23 @@ class P2PModule(RPCModule):
         DOUBLE_SIGN, persist slashing evidence (idempotent). Observe-only — records
         evidence, applies no penalty. Returns True if evidence was newly recorded."""
         from ...validator.block_verification import is_double_sign, _parse_block_content
+        from ...validator.slashing_block import (
+            make_double_sign_evidence, verify_double_sign_evidence)
         if not is_double_sign(incoming_content, stored_content):
             return False
         c = _parse_block_content(incoming_content)
         proposer = c.get("proposer_address")
         slot = int(c.get("slot") or 0)
         epoch = int(c.get("epoch") if c.get("epoch") is not None else slot // SLOTS_PER_EPOCH)
-        evidence = {
-            "slot": slot,
-            "block1_hash": (_parse_block_content(stored_content).get("hash")),
-            "block2_hash": c.get("hash"),
-        }
+        # Build the SELF-VALIDATING proof (both signed headers) so the evidence can ride the
+        # canonical chain (block body) and every importer can verify it with no external state.
+        evidence = make_double_sign_evidence(c, _parse_block_content(stored_content))
+        ok_ev, ev_err = verify_double_sign_evidence(evidence)
+        if not ok_ev:
+            # is_double_sign matched proposer+slot+hash but a header isn't validly signed —
+            # do NOT record an unslashable proof (a real double-sign has two valid signatures).
+            logger.debug("double-sign at h=%d not a verifiable proof: %s", block_no, ev_err)
+            return False
         new = await self._db.record_slashing_event(
             proposer, "double_sign", slot, epoch, json.dumps(evidence))
         logger.warning("[slashing observe] DOUBLE_SIGN by %s at slot %d (h=%d) — evidence %s",
