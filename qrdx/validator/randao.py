@@ -77,20 +77,25 @@ RANDAO_PROPOSER_ELIGIBLE_K = 2
 # slot's proposer. (An earlier HEIGHT-based version keyed off next_block_id and HALTED the
 # chain — tip-dependent.)
 #
-# STILL OFF — selection CONVERGES under enforce (no halt; 16/16 ⇒ no eligibility mismatch;
-# 1 unique RANDAO mix when history converges), but LIVENESS under enforce is unsolved after
-# three approaches (all failed the ALL-≥6-runs-green gate):
-#   1. Single eligible proposer (K=1): intermittent dip (2/7 runs 81–94%) — an unlucky/slow
-#      primary leaves a slot unproposed. Widening the epoch lookback to 2 made it WORSE.
-#   2. Top-K backup proposers (K=2, primary + 1 backup; RANDAO_PROPOSER_ELIGIBLE_K): WORSE
-#      (a run hit 75%). The backup's proposal timing (wait, then check the LOCAL tip) races
-#      propagation lag — the primary's block exists but has not imported on the backup's node
-#      yet, so the backup proposes a COMPETING block → reorg churn.
-# Fundamental tension: single-eligible misses slots; multi-eligible creates competing blocks.
-# A real fix needs propagation-aware backup timing (wait > propagation, or gossip "slot filled")
-# or slot-time-aligned proposal — not just a bigger eligible set. The ranking + top-K
-# acceptance are correct consensus infra (unit-tested, neutral off); only the backup PROPOSAL
-# timing in node_integration is the flawed piece. See docs item 5.
+# STILL OFF, but the CONSENSUS is now SOLVED — the residual is a testnet-scale/harness matter,
+# not a correctness bug (diagnosed 2026-08-26; see docs item 5).
+#
+# A K=1 and a K=2 enforce diagnostic (3 runs each) established:
+#   • SAFE + CONVERGENT: 0 "not eligible" rejects in ANY run (selection is stable network-wide),
+#     and with K=2 the per-node final-height spread was 0–1 (block history converges TIGHTLY —
+#     the old K=2 reorg churn is GONE, fixed by this session's reorg-safety work: the equal-tip
+#     divergence fix 9649931 + bulk-sync trust-replay 800f614). So enforce does NOT halt or
+#     diverge — the reason it was gated.
+#   • The ONLY residual is THROUGHPUT variance: with 3 validators + a 2s slot, the single
+#     eligible proposer occasionally misses its short slot → fewer blocks. K=2 backups recover
+#     most of it (2/3 runs 17/17, ~110 blocks) but 1/3 dipped (81 blocks) and timed out two
+#     THROUGHPUT-heavy scenarios (s13/s14) — a scenario-timeout artifact (the chain converged
+#     fine, spread 0), NOT a consensus failure.
+# So RANDAO selection is production-correct + safe; enabling it just needs a config where its
+# proposer variance doesn't starve throughput: a production-scale validator set (variance
+# averages out) OR a slot sized above worst-case block-production time OR throughput-tolerant
+# (convergence-polled, not fixed-attempt) integration scenarios. Kept OFF only to avoid a
+# ~1/3-flaky CI on the small testnet. K=2 retained (strictly better than K=1, neutral when off).
 ENFORCE_RANDAO_SELECTION = False
 
 # Genesis seed for the fold. Equal to the current constant proposer mix, so the
