@@ -63,6 +63,7 @@ class ExchangeOpType(IntEnum):
     TOKEN_TRANSFER = 14
     STAKE_DEPOSIT = 15
     STAKE_EXIT = 16
+    REMOVE_POOL = 17
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +325,10 @@ class ExchangeTransaction:
         elif op == ExchangeOpType.STAKE_EXIT:
             pass  # the sender exits their own validator; no extra params
 
+        elif op == ExchangeOpType.REMOVE_POOL:
+            if not self.params.get("pool_id"):
+                raise ValueError("REMOVE_POOL missing param: pool_id")
+
     # -- Identification -----------------------------------------------------
 
     def is_exchange_transaction(self) -> bool:
@@ -356,4 +361,5 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.TOKEN_TRANSFER: 40_000,
     ExchangeOpType.STAKE_DEPOSIT: 150_000,
     ExchangeOpType.STAKE_EXIT: 80_000,
+    ExchangeOpType.REMOVE_POOL: 60_000,
 }

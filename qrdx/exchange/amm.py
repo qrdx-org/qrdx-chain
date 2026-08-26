@@ -175,6 +175,11 @@ class PoolState:
     pool_type: PoolType
     creator: str
 
+    # QRDX staked to create the pool (debited from the creator's account_state under
+    # ENFORCE_POOL_STAKE). Recorded so REMOVE_POOL can refund the exact amount for a
+    # staking pool (SUBSIDIZED pools burn it → never refunded).
+    stake_amount: Decimal = ZERO
+
     # Price / liquidity
     sqrt_price: Decimal = ZERO
     tick: int = 0
@@ -591,6 +596,7 @@ class PoolManager:
             fee_tier=fee_tier,
             pool_type=pool_type,
             creator=creator,
+            stake_amount=stake_amount,
             sqrt_price=initial_sqrt_price,
             tick=sqrt_price_to_tick(initial_sqrt_price),
         )
@@ -602,6 +608,22 @@ class PoolManager:
         self._pair_index[pair_key].append(pool_id)
 
         logger.info("Pool %s created: %s/%s fee=%s type=%s", pool_id, token0, token1, fee_tier, pool_type.name)
+        return pool
+
+    def remove_pool(self, pool_id: str) -> Optional[ConcentratedLiquidityPool]:
+        """Remove a pool from the manager (REMOVE_POOL). Drops it from ``_pools`` and its
+        ``_pair_index`` entry, and returns the removed pool (so the caller can refund the
+        creator's stake). Returns None if the pool does not exist. Deterministic — every
+        node that replays the same REMOVE_POOL op removes the identical pool."""
+        pool = self._pools.pop(pool_id, None)
+        if pool is None:
+            return None
+        pair_key = f"{pool.state.token0}:{pool.state.token1}"
+        ids = self._pair_index.get(pair_key)
+        if ids and pool_id in ids:
+            ids.remove(pool_id)
+            if not ids:
+                self._pair_index.pop(pair_key, None)
         return pool
 
     def get_pool(self, pool_id: str) -> Optional[ConcentratedLiquidityPool]:

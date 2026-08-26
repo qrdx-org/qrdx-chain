@@ -350,6 +350,7 @@ class ExchangeStateManager:
         """Dispatch to the appropriate handler."""
         handlers = {
             ExchangeOpType.CREATE_POOL: self._op_create_pool,
+            ExchangeOpType.REMOVE_POOL: self._op_remove_pool,
             ExchangeOpType.ADD_LIQUIDITY: self._op_add_liquidity,
             ExchangeOpType.REMOVE_LIQUIDITY: self._op_remove_liquidity,
             ExchangeOpType.SWAP: self._op_swap,
@@ -436,6 +437,54 @@ class ExchangeStateManager:
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.CREATE_POOL],
             data={"pool_id": pool.state.id, "pair": pair_key},
+        )
+
+    def _op_remove_pool(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Remove a pool the sender created and REFUND its staked QRDX (the mirror of the
+        CREATE_POOL stake debit — completes the pool-stake lifecycle). Only the creator may
+        remove it, and only an EMPTY pool (liquidity withdrawn) — else LPs' reserves would be
+        stranded. SUBSIDIZED pools burned their stake, so it is never refunded."""
+        p = tx.params
+        pool = self.pool_manager.get_pool(p["pool_id"]) if p.get("pool_id") else None
+        if pool is None:
+            return ExchangeExecResult(success=False, error=f"no such pool: {p.get('pool_id')}")
+        if tx.sender != pool.state.creator:
+            return ExchangeExecResult(success=False, error="only the pool creator may remove it")
+        if Decimal(str(pool.state.liquidity or 0)) > ZERO:
+            return ExchangeExecResult(
+                success=False,
+                error=f"pool has active liquidity ({pool.state.liquidity}); remove liquidity first")
+
+        from .amm import PoolType
+        stake = Decimal(str(pool.state.stake_amount or 0))
+        pool_type = pool.state.pool_type
+        pair_key = f"{pool.state.token0}:{pool.state.token1}"
+
+        self.pool_manager.remove_pool(pool.state.id)
+        # Drop the matching order book + oracle (mirror create). Reorg rebuild replays
+        # CREATE_POOL (recreates) then REMOVE_POOL (removes), so the in-memory state converges.
+        book = self._order_books.pop(pair_key, None)
+        if book is not None:
+            try:
+                self.router.unregister_order_book(pair_key)
+            except Exception:
+                pass
+        self._oracles.pop(pair_key, None)
+
+        # Refund the creator's staked QRDX as a real-balance CREDIT (mirror the debit; flushed
+        # to account_state by the async wrapper, reconstructed on reorg like a margin release).
+        # Only when ENFORCING (the debit only happened then) and only for STAKING pools.
+        refunded = ZERO
+        if self.enforce_pool_stake and pool_type != PoolType.SUBSIDIZED and stake > ZERO:
+            self._record_balance_delta(tx.sender, stake)
+            refunded = stake
+
+        self._total_pools = max(0, self._total_pools - 1)
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.REMOVE_POOL],
+            data={"pool_id": pool.state.id, "refunded_stake": str(refunded),
+                  "burned_stake": str(stake) if pool_type == PoolType.SUBSIDIZED else "0"},
         )
 
     def _op_add_liquidity(self, tx: ExchangeTransaction) -> ExchangeExecResult:
