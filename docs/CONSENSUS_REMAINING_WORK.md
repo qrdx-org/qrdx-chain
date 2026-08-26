@@ -519,7 +519,7 @@
      the enforce flip is GATED on resolving the recurring reorg-derived-state divergence —
      which gates every account_state-affecting enforce, not just this one.** Flip
      `ENFORCE_POOL_STAKE` once that divergence is fixed AND a clean multi-run soak passes;
-     a REMOVE_POOL return path (staking pools) / burn (subsidized) is the natural companion.
+     ✅ REMOVE_POOL return path DONE (3e15c4a) — refunds staking-pool stake / burns subsidized, reorg-safe.
      **Follow-up (2026-08-05) — the divergence is RARE and NOT pool-stake-caused.** Two more
      capture batches (8 runs flag OFF + 8 runs flag ON, each looping the suite until an
      equal-tip divergence) were BOTH 16/16 clean → the soak's run-3 hit was the rare
