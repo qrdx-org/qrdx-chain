@@ -86,16 +86,20 @@ RANDAO_PROPOSER_ELIGIBLE_K = 2
 #     the old K=2 reorg churn is GONE, fixed by this session's reorg-safety work: the equal-tip
 #     divergence fix 9649931 + bulk-sync trust-replay 800f614). So enforce does NOT halt or
 #     diverge — the reason it was gated.
-#   • The ONLY residual is THROUGHPUT variance: with 3 validators + a 2s slot, the single
-#     eligible proposer occasionally misses its short slot → fewer blocks. K=2 backups recover
-#     most of it (2/3 runs 17/17, ~110 blocks) but 1/3 dipped (81 blocks) and timed out two
-#     THROUGHPUT-heavy scenarios (s13/s14) — a scenario-timeout artifact (the chain converged
-#     fine, spread 0), NOT a consensus failure.
-# So RANDAO selection is production-correct + safe; enabling it just needs a config where its
-# proposer variance doesn't starve throughput: a production-scale validator set (variance
-# averages out) OR a slot sized above worst-case block-production time OR throughput-tolerant
-# (convergence-polled, not fixed-attempt) integration scenarios. Kept OFF only to avoid a
-# ~1/3-flaky CI on the small testnet. K=2 retained (strictly better than K=1, neutral when off).
+#   • Residual = throughput variance AND transient K=2 reorg churn (fuller finding, 2026-08-26).
+#     First read was "throughput only" (K=2: 2/3 runs 17/17 at ~110 blocks; 1/3 dipped to 81).
+#     But a follow-up trial that made the throughput-heavy scenarios (s13/s14) convergence-polled
+#     (generous attempts) did NOT go green — it was WORSE (4/4 runs failed): s13's perp-root
+#     cross-node convergence check still failed even in a HEALTHY-throughput run (113 blocks) at
+#     92s of polling, and s16 (membership) failed too. So the K=2 backups' COMPETING BLOCKS create
+#     transient cross-node divergence DURING the run (the FINAL state still converges — spread 0-1,
+#     0 eligibility rejects — but specific roots churn long enough that convergence checks catch
+#     it). Making scenarios wait longer just slowed the suite (more churn accrued), not fixed it.
+# So RANDAO selection is SAFE (no halt, no permanent divergence) but NOT cleanly passable on the
+# 3-validator/2s-slot testnet: K=1 dips on throughput (missed slots), K=2 churns on competing
+# blocks. Both are small-N/short-slot artifacts, not consensus bugs — on a production-scale set
+# the variance averages out and backups rarely collide. Enable there (or with a slot sized above
+# worst-case block-production time). Kept OFF; K=2 retained (neutral when off).
 ENFORCE_RANDAO_SELECTION = False
 
 # Genesis seed for the fold. Equal to the current constant proposer mix, so the

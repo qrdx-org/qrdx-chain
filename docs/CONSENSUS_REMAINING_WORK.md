@@ -319,15 +319,20 @@
      divergence fix 9649931 + bulk-sync trust-replay 800f614). So enforce does NOT halt/diverge
      (the reason it was gated is retired). This ALSO settles item 4-class fork-choice: block
      history converges under enforce.
-   - **Residual = THROUGHPUT variance only.** 3 validators + a 2s slot → the single eligible
-     proposer occasionally misses its short slot → fewer blocks. K=2 recovers most (2/3 runs
-     17/17 at ~110 blocks) but 1/3 dipped (81 blocks), timing out two THROUGHPUT-heavy scenarios
-     (s13/s14) — a scenario-timeout artifact (chain converged, spread 0), NOT a consensus failure.
-   So RANDAO selection is production-correct + safe; enabling it just needs a config where its
-   proposer variance doesn't starve throughput: a production-scale validator set (variance
-   averages out), a slot sized above worst-case block-production time, OR throughput-tolerant
-   (convergence-polled, not fixed-attempt) scenarios. Kept OFF only to avoid a ~1/3-flaky CI on
-   the small testnet; K=2 retained (strictly better than K=1, neutral when off).
+   - **Residual = throughput variance AND transient K=2 reorg churn.** First read (K=2 alone:
+     2/3 runs 17/17 at ~110 blocks, 1/3 dipped to 81) suggested "throughput only." But a
+     follow-up trial that made the throughput-heavy scenarios (s13/s14) convergence-polled with
+     generous attempts did NOT go green — it was WORSE (4/4 failed): s13's cross-node perp-root
+     convergence still failed in a HEALTHY-throughput run (113 blocks) after 92s of polling, and
+     s16 (membership) failed too. So the K=2 backups' COMPETING BLOCKS create transient cross-node
+     divergence DURING the run — the FINAL state still converges (spread 0-1, 0 eligibility
+     rejects) but specific roots churn long enough that convergence checks catch it; waiting
+     longer just slowed the suite (more churn accrued). K=1 instead dips on throughput (missed
+     2s slots). BOTH are small-N/short-slot artifacts, not consensus bugs.
+   So RANDAO selection is SAFE (no halt, no permanent divergence) but NOT cleanly passable on the
+   3-validator/2s-slot testnet. On a production-scale validator set the proposer variance averages
+   out and backups rarely collide, so enable it THERE (or with a slot sized above worst-case
+   block-production time). Kept OFF; K=2 retained (neutral when off).
 
 6. **`from_hex`/`from_bytes` caller audit. — ✅ DONE.** Core primitive hardened
    (raises rather than inventing identity), with an actionable error message.
