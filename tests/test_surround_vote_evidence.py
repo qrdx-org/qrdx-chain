@@ -29,13 +29,27 @@ def _pub(key):
 
 
 def test_double_vote_validates():
-    """Two attestations for the SAME target epoch but DIFFERENT blocks → double vote."""
+    """Two attestations for the SAME SLOT but DIFFERENT blocks → double vote (the validator
+    signed two heads for one slot; the attestation analog of DOUBLE_SIGN)."""
     key = PQPrivateKey.generate()
     a = _signed_att(key, slot=32, epoch=1, block_hash="aa" * 32, source=0, target=1)
-    b = _signed_att(key, slot=33, epoch=1, block_hash="bb" * 32, source=0, target=1)
+    b = _signed_att(key, slot=32, epoch=1, block_hash="bb" * 32, source=0, target=1)
     assert attestation_equivocation(a, b) == "double_vote"
     ok, err = verify_attestation_evidence(make_attestation_evidence(a, b, _pub(key)))
     assert ok, err
+
+
+def test_honest_per_slot_votes_not_slashable():
+    """REGRESSION: this chain attests PER SLOT, so one honest validator casts many attestations
+    sharing a target epoch but pointing at the advancing head (DIFFERENT slot + block). That MUST
+    NOT be a double vote — else honest validators are slashable and anyone could harvest two of
+    their public per-slot attestations to forge a slash."""
+    key = PQPrivateKey.generate()
+    a = _signed_att(key, slot=8, epoch=1, block_hash="aa" * 32, source=0, target=1)
+    b = _signed_att(key, slot=9, epoch=1, block_hash="bb" * 32, source=0, target=1)  # same target, next slot/head
+    assert attestation_equivocation(a, b) is None
+    ok, err = verify_attestation_evidence({"att_a": a, "att_b": b, "public_key": _pub(key)})
+    assert not ok and "not a double/surround" in err
 
 
 def test_surround_vote_validates():
@@ -79,7 +93,7 @@ def test_forged_signature_rejected():
     after signing → signature no longer valid → rejected (the security boundary)."""
     victim = PQPrivateKey.generate()
     a = _signed_att(victim, slot=10, epoch=1, block_hash="aa" * 32, source=0, target=1)
-    b = _signed_att(victim, slot=11, epoch=1, block_hash="bb" * 32, source=0, target=1)
+    b = _signed_att(victim, slot=10, epoch=1, block_hash="bb" * 32, source=0, target=1)  # same slot → double vote
     b["block_hash"] = "cc" * 32  # tamper after signing
     ok, err = verify_attestation_evidence(make_attestation_evidence(a, b, _pub(victim)))
     assert not ok and "signature invalid" in err
@@ -89,7 +103,7 @@ def test_pubkey_address_mismatch_rejected():
     """An evidence whose carried pubkey doesn't derive to the attestations' validator is invalid."""
     victim, attacker = PQPrivateKey.generate(), PQPrivateKey.generate()
     a = _signed_att(victim, slot=10, epoch=1, block_hash="aa" * 32, source=0, target=1)
-    b = _signed_att(victim, slot=11, epoch=1, block_hash="bb" * 32, source=0, target=1)
+    b = _signed_att(victim, slot=10, epoch=1, block_hash="bb" * 32, source=0, target=1)  # same slot → double vote
     ev = make_attestation_evidence(a, b, _pub(attacker))  # wrong pubkey
     ok, err = verify_attestation_evidence(ev)
     assert not ok and "does not derive" in err

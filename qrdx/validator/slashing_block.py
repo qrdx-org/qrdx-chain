@@ -93,20 +93,30 @@ def extract_slashing_evidence_from_dict(block: Dict[str, Any]) -> List[Dict[str,
 
 
 def attestation_equivocation(a: Dict[str, Any], b: Dict[str, Any]) -> Optional[str]:
-    """Casper FFG attestation-slashing relationship between two attestations BY THE SAME
-    validator, or None if they don't conflict:
-      - 'double_vote'   : same target_epoch, DIFFERENT block_hash (two blocks for one target).
+    """Attestation-slashing relationship between two attestations BY THE SAME validator, or None
+    if they don't conflict:
+      - 'double_vote'   : same SLOT, DIFFERENT block_hash (two heads signed for one slot).
       - 'surround_vote' : one's (source,target) span STRICTLY surrounds the other's.
-    Requires the two to be distinct (different block_hash or different epochs). An honest
-    validator makes at most one attestation per target and never surrounds, so neither fires on
-    honest voting."""
+
+    IMPORTANT — the double-vote rule keys on SLOT, not target_epoch. This chain attests PER SLOT
+    (node_integration attests every slot with target_epoch = slot // SLOTS_PER_EPOCH), so ONE
+    honest validator legitimately casts many attestations that share a target epoch but point at
+    the ADVANCING head (different block_hash) across the epoch's slots. Keying double-vote on
+    target_epoch (canonical single-vote-per-epoch Casper) would flag that honest pattern as
+    slashable — and, since attestations ride blocks publicly, would let anyone HARVEST two honest
+    per-slot attestations and forge a slash. An honest validator signs exactly ONE head per slot,
+    so same-slot/different-block is genuine equivocation; different slots never conflict. Honest
+    source/target spans are width-1 (source = target-1), which can never strictly surround another,
+    so surround never fires on honest voting either. (A stricter future option is to make the
+    attester emit one vote per target so the canonical target-keyed rule would apply.)"""
     try:
         sa, ta = int(a["source_epoch"]), int(a["target_epoch"])
         sb, tb = int(b["source_epoch"]), int(b["target_epoch"])
+        sla, slb = int(a["slot"]), int(b["slot"])
     except (KeyError, TypeError, ValueError):
         return None
     ha, hb = a.get("block_hash"), b.get("block_hash")
-    if ta == tb and ha != hb:
+    if sla == slb and ha != hb:
         return "double_vote"
     if (sa < sb and ta > tb) or (sb < sa and tb > ta):
         return "surround_vote"

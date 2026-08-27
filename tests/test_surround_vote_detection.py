@@ -68,21 +68,41 @@ async def test_honest_sequential_votes_no_detection():
             await F.record_block_attestations(db, _block([a]))
         assert await _events(db) == []
     finally:
-        F._ENFORCE_SURROUND_DETECTION = False
+        F._ENFORCE_SURROUND_DETECTION = True
+        await db.connection.close()
+        os.remove(path)
+
+
+@pytest.mark.asyncio
+async def test_honest_per_slot_same_target_no_detection():
+    """REGRESSION (the enforce-soak false positive): a validator attesting EVERY slot in an epoch
+    to the advancing head produces many votes sharing a target epoch but with different slots +
+    blocks. Even with enforce ON this must yield ZERO events — else honest churn slashes everyone."""
+    key = PQPrivateKey.generate()
+    db, path = await _fresh_db_with_validator(key)
+    F._ENFORCE_SURROUND_DETECTION = True
+    try:
+        # slots 8,9,10 all in epoch 1 (target=1, source=0), each a different head.
+        for slot, bh in ((8, "a1"), (9, "b2"), (10, "c3")):
+            a = _signed_att(key, slot=slot, epoch=1, block_hash=bh * 32, source=0, target=1)
+            await F.record_block_attestations(db, _block([a]))
+        assert await _events(db) == []
+    finally:
+        F._ENFORCE_SURROUND_DETECTION = True
         await db.connection.close()
         os.remove(path)
 
 
 @pytest.mark.asyncio
 async def test_double_vote_detected_and_recorded_when_enforced():
-    """Two verified votes for the SAME target but different blocks → a SURROUND_VOTE event whose
+    """Two verified votes for the SAME SLOT but different blocks → a SURROUND_VOTE event whose
     recorded evidence self-validates and is surfaced for block inclusion."""
     key = PQPrivateKey.generate()
     db, path = await _fresh_db_with_validator(key)
     F._ENFORCE_SURROUND_DETECTION = True
     try:
         a = _signed_att(key, slot=32, epoch=1, block_hash="aa" * 32, source=0, target=1)
-        b = _signed_att(key, slot=33, epoch=1, block_hash="bb" * 32, source=0, target=1)
+        b = _signed_att(key, slot=32, epoch=1, block_hash="bb" * 32, source=0, target=1)
         await F.record_block_attestations(db, _block([a]))
         await F.record_block_attestations(db, _block([b]))  # conflict caught here
         rows = await _events(db)
@@ -92,7 +112,7 @@ async def test_double_vote_detected_and_recorded_when_enforced():
         pending = await db.get_pending_slashing_evidence()
         assert len(pending) == 1 and pending[0].get("att_a") and pending[0].get("att_b")
     finally:
-        F._ENFORCE_SURROUND_DETECTION = False
+        F._ENFORCE_SURROUND_DETECTION = True
         await db.connection.close()
         os.remove(path)
 
@@ -113,7 +133,7 @@ async def test_surround_vote_detected_across_targets():
         ok, err = verify_attestation_evidence(json.loads(rows[0][1]))
         assert ok, err
     finally:
-        F._ENFORCE_SURROUND_DETECTION = False
+        F._ENFORCE_SURROUND_DETECTION = True
         await db.connection.close()
         os.remove(path)
 
@@ -124,15 +144,16 @@ async def test_observe_gate_detects_but_does_not_record():
     the observe-first posture that lets an honest soak run before enforcing."""
     key = PQPrivateKey.generate()
     db, path = await _fresh_db_with_validator(key)
-    assert F._ENFORCE_SURROUND_DETECTION is False  # default posture
+    F._ENFORCE_SURROUND_DETECTION = False  # explicit observe posture (enabled by default now)
     try:
         a = _signed_att(key, slot=32, epoch=1, block_hash="aa" * 32, source=0, target=1)
-        b = _signed_att(key, slot=33, epoch=1, block_hash="bb" * 32, source=0, target=1)
+        b = _signed_att(key, slot=32, epoch=1, block_hash="bb" * 32, source=0, target=1)
         assert await F._detect_attestation_equivocation(
             db, b, key.public_key.to_bytes()) is False  # no retained vote yet
         await F.record_block_attestations(db, _block([a]))
         await F.record_block_attestations(db, _block([b]))
         assert await _events(db) == []  # detected but observe-gated → not recorded
     finally:
+        F._ENFORCE_SURROUND_DETECTION = True
         await db.connection.close()
         os.remove(path)

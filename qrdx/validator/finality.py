@@ -33,9 +33,12 @@ logger = get_logger(__name__)
 # already retained for the same validator, we build SELF-VALIDATING evidence (the two signed
 # attestations + the offender's pubkey — the enforce-ready proof from slashing_block). Because
 # `_ENFORCE_SLASHING` is already True, RECORDING that evidence would immediately enforce the 50%
-# +eject penalty. So detection is OBSERVE-gated: with the flag False we detect + WARN but do NOT
-# record, so an honest-network soak can prove zero false positives before we flip it. Honest
-# validators attest once per target and never surround, so a true detection means a real offence.
+# +eject penalty. KEPT OFF — an enforce-on soak under network churn recorded surround_vote/double-
+# vote events against ALL honest validators: this chain attests PER-SLOT (target_epoch = slot //
+# SLOTS_PER_EPOCH), so one validator legitimately casts many attestations sharing a target epoch to
+# the ADVANCING head (different block_hash) — which the old double_vote rule (same target/different
+# block) flagged as slashable. See attestation_equivocation for the corrected per-slot rule; this
+# stays observe-gated until a CHURN soak (not just a clean one) shows zero detections.
 _ENFORCE_SURROUND_DETECTION = False
 
 
