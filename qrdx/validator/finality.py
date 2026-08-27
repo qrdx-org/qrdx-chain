@@ -28,6 +28,43 @@ from .attestation_block import extract_attestations_from_dict
 
 logger = get_logger(__name__)
 
+# ── Surround/double-vote slashing DETECTION gate (observe-first) ──────────────────────────────
+# When an imported attestation conflicts (double- or surround-vote) with a vote this node has
+# already retained for the same validator, we build SELF-VALIDATING evidence (the two signed
+# attestations + the offender's pubkey — the enforce-ready proof from slashing_block). Because
+# `_ENFORCE_SLASHING` is already True, RECORDING that evidence would immediately enforce the 50%
+# +eject penalty. So detection is OBSERVE-gated: with the flag False we detect + WARN but do NOT
+# record, so an honest-network soak can prove zero false positives before we flip it. Honest
+# validators attest once per target and never surround, so a true detection means a real offence.
+_ENFORCE_SURROUND_DETECTION = False
+
+
+async def _detect_attestation_equivocation(db, new_att, pub: bytes) -> bool:
+    """Compare a freshly-verified attestation against the validator's RETAINED votes; on a genuine
+    double/surround conflict, build self-validating evidence and (when enforce-gated on) record it
+    as a SURROUND_VOTE slashing_event so it rides the chain to every node. Returns True if a
+    conflict was detected. Best-effort — never raises into the import path."""
+    from .slashing_block import attestation_equivocation, make_attestation_evidence
+    try:
+        new_dict = new_att.to_dict()
+        for stored in await db.get_validator_votes(new_att.validator_address):
+            if attestation_equivocation(new_dict, stored) is None:
+                continue
+            ev = make_attestation_evidence(new_dict, stored, pub.hex())
+            logger.warning(
+                "SLASHABLE attestation-equivocation DETECTED for %s (%s) — targets %s/%s%s",
+                new_att.validator_address, ev.get("detected_kind"),
+                new_dict.get("target_epoch"), stored.get("target_epoch"),
+                "" if _ENFORCE_SURROUND_DETECTION else " [observe: not recorded]")
+            if _ENFORCE_SURROUND_DETECTION:
+                await db.record_slashing_event(
+                    ev["proposer"], ev["condition"], int(ev["slot"]), int(ev["epoch"]),
+                    __import__("json").dumps(ev))
+            return True
+    except Exception as e:
+        logger.debug("attestation-equivocation detection skipped: %s", e)
+    return False
+
 
 async def _validator_stakes_and_keys(db) -> Tuple[Dict[str, Decimal], Dict[str, bytes]]:
     """{address: effective_stake} and {address: public_key_bytes} from the
@@ -72,10 +109,19 @@ async def record_block_attestations(db, block: Dict[str, Any]) -> int:
                 continue
         except Exception:
             continue
+        # Compare against retained votes BEFORE recording — a double-vote is same-target, and
+        # the INSERT OR IGNORE below keeps only the first per target, so the conflict must be
+        # caught here (the incoming vote isn't stored yet, so we compare it vs the retained one).
+        try:
+            await _detect_attestation_equivocation(db, att, pub)
+        except Exception:
+            pass
         try:
             await db.record_attestation_vote(
                 att.validator_address, att.target_epoch, att.source_epoch,
                 att.slot, att.block_hash,
+                epoch=att.epoch, validator_index=att.validator_index,
+                signature=att.signature.hex(),
             )
             recorded += 1
         except Exception:

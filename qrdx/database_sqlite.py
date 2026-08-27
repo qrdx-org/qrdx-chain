@@ -352,6 +352,12 @@ class DatabaseSQLite:
             source_epoch INTEGER NOT NULL DEFAULT 0,
             slot INTEGER NOT NULL,
             block_hash TEXT NOT NULL,
+            -- Retained so a stored vote can be reconstructed into a fully-signed
+            -- Attestation for SELF-VALIDATING surround/double-vote slashing evidence
+            -- (finality only needs target/source; slashing detection needs the rest).
+            epoch INTEGER NOT NULL DEFAULT 0,
+            validator_index INTEGER NOT NULL DEFAULT 0,
+            signature TEXT NOT NULL DEFAULT '',
             recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (validator_address, target_epoch)
         );
@@ -445,6 +451,10 @@ class DatabaseSQLite:
         _migrations = [
             "ALTER TABLE validators ADD COLUMN total_slashed TEXT NOT NULL DEFAULT '0'",
             "ALTER TABLE validators ADD COLUMN total_rewards TEXT NOT NULL DEFAULT '0'",
+            # Signed-attestation retention for surround/double-vote slashing detection.
+            "ALTER TABLE attestation_votes ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE attestation_votes ADD COLUMN validator_index INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE attestation_votes ADD COLUMN signature TEXT NOT NULL DEFAULT ''",
         ]
         for stmt in _migrations:
             try:
@@ -1210,20 +1220,45 @@ class DatabaseSQLite:
     # ── Finality: attestation votes (link 2) ────────────────────────────
 
     async def record_attestation_vote(self, validator_address: str, target_epoch: int,
-                                      source_epoch: int, slot: int, block_hash: str) -> None:
+                                      source_epoch: int, slot: int, block_hash: str,
+                                      epoch: int = 0, validator_index: int = 0,
+                                      signature: str = "") -> None:
         """
         Record a validator's attestation vote for a target epoch (one per
         validator per target — later/duplicate votes for the same target are
         ignored). Idempotent; safe to call from every importer for the same
         block-carried attestation.
+
+        ``epoch``/``validator_index``/``signature`` retain the fully-signed
+        attestation so a stored vote can be reconstructed for self-validating
+        surround/double-vote slashing evidence (see ``get_validator_votes``).
         """
         await self.connection.execute(
             "INSERT OR IGNORE INTO attestation_votes "
-            "(validator_address, target_epoch, source_epoch, slot, block_hash) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (validator_address, int(target_epoch), int(source_epoch), int(slot), block_hash),
+            "(validator_address, target_epoch, source_epoch, slot, block_hash, "
+            "epoch, validator_index, signature) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (validator_address, int(target_epoch), int(source_epoch), int(slot), block_hash,
+             int(epoch), int(validator_index), str(signature)),
         )
         await self.connection.commit()
+
+    async def get_validator_votes(self, validator_address: str, limit: int = 128) -> list:
+        """The validator's retained attestation votes as fully-signed Attestation dicts
+        (most recent target first), for surround/double-vote slashing detection. Only rows
+        with a retained ``signature`` are returned (pre-retention rows can't form a proof).
+        Bounded by ``limit`` — surround votes span a small epoch window in practice."""
+        cur = await self.connection.execute(
+            "SELECT slot, epoch, block_hash, validator_index, signature, source_epoch, target_epoch "
+            "FROM attestation_votes WHERE validator_address = ? AND signature != '' "
+            "ORDER BY target_epoch DESC LIMIT ?",
+            (validator_address, int(limit)))
+        rows = await cur.fetchall()
+        return [
+            {"slot": s, "epoch": e, "block_hash": bh, "validator_address": validator_address,
+             "validator_index": vi, "signature": sig, "source_epoch": se, "target_epoch": te}
+            for (s, e, bh, vi, sig, se, te) in rows
+        ]
 
     # ── Slashing evidence (consensus security) ──────────────────────────
 
@@ -1279,7 +1314,12 @@ class DatabaseSQLite:
         for (ev_json,) in await cur.fetchall():
             try:
                 d = _json.loads(ev_json)
-                if isinstance(d, dict) and d.get("header_a") and d.get("header_b"):
+                if not isinstance(d, dict):
+                    continue
+                # DOUBLE_SIGN proofs carry two signed headers; attestation-equivocation
+                # (surround/double-vote) proofs carry two signed attestations — include both
+                # kinds so either rides the block body to every node.
+                if (d.get("header_a") and d.get("header_b")) or (d.get("att_a") and d.get("att_b")):
                     out.append(d)
             except Exception:
                 continue
