@@ -44,6 +44,7 @@ from integration_tests.scenarios.s14_token_consensus import S14TokenConsensus
 from integration_tests.scenarios.s15_spot_settlement import S15SpotSettlement
 from integration_tests.scenarios.s16_validator_membership import S16ValidatorMembership
 from integration_tests.scenarios.s17_clob_settlement import S17ClobSettlement
+from integration_tests.scenarios.s18_clob_match import S18ClobMatch
 
 
 ALL_SCENARIOS = [
@@ -64,6 +65,7 @@ ALL_SCENARIOS = [
     S15SpotSettlement,
     S16ValidatorMembership,
     S17ClobSettlement,
+    S18ClobMatch,
 ]
 
 
