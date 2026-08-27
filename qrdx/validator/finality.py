@@ -33,13 +33,14 @@ logger = get_logger(__name__)
 # already retained for the same validator, we build SELF-VALIDATING evidence (the two signed
 # attestations + the offender's pubkey — the enforce-ready proof from slashing_block). Because
 # `_ENFORCE_SLASHING` is already True, RECORDING that evidence would immediately enforce the 50%
-# +eject penalty. KEPT OFF — an enforce-on soak under network churn recorded surround_vote/double-
-# vote events against ALL honest validators: this chain attests PER-SLOT (target_epoch = slot //
-# SLOTS_PER_EPOCH), so one validator legitimately casts many attestations sharing a target epoch to
-# the ADVANCING head (different block_hash) — which the old double_vote rule (same target/different
-# block) flagged as slashable. See attestation_equivocation for the corrected per-slot rule; this
-# stays observe-gated until a CHURN soak (not just a clean one) shows zero detections.
-_ENFORCE_SURROUND_DETECTION = False
+# +eject penalty. ENABLED (2026-08-27): the corrected SLOT-keyed rule (see attestation_equivocation)
+# is false-positive-free by CONSTRUCTION — an honest validator attests exactly once per slot, so a
+# same-slot/different-head pair is impossible without malicious software, and honest source/target
+# spans are width-1 so they can never surround. Empirically confirmed by 4 honest --force soaks
+# (2 heavy-churn, ~100+ reorgs/node): 18/18, converged, ZERO detections + ZERO slashing_events on
+# every node. (The earlier enable that misfired used the OLD target-keyed rule; a clean-only soak
+# had masked it — hence the two-heavy-churn bar here, matching DOUBLE_SIGN's enable evidence.)
+_ENFORCE_SURROUND_DETECTION = True
 
 
 async def _detect_attestation_equivocation(db, new_att, pub: bytes) -> bool:
