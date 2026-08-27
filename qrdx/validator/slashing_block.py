@@ -92,6 +92,87 @@ def extract_slashing_evidence_from_dict(block: Dict[str, Any]) -> List[Dict[str,
     return decode_slashing_evidence(block.get(BLOCK_SLASHING_KEY))
 
 
+def attestation_equivocation(a: Dict[str, Any], b: Dict[str, Any]) -> Optional[str]:
+    """Casper FFG attestation-slashing relationship between two attestations BY THE SAME
+    validator, or None if they don't conflict:
+      - 'double_vote'   : same target_epoch, DIFFERENT block_hash (two blocks for one target).
+      - 'surround_vote' : one's (source,target) span STRICTLY surrounds the other's.
+    Requires the two to be distinct (different block_hash or different epochs). An honest
+    validator makes at most one attestation per target and never surrounds, so neither fires on
+    honest voting."""
+    try:
+        sa, ta = int(a["source_epoch"]), int(a["target_epoch"])
+        sb, tb = int(b["source_epoch"]), int(b["target_epoch"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    ha, hb = a.get("block_hash"), b.get("block_hash")
+    if ta == tb and ha != hb:
+        return "double_vote"
+    if (sa < sb and ta > tb) or (sb < sa and tb > ta):
+        return "surround_vote"
+    return None
+
+
+def make_attestation_evidence(att_a: Dict[str, Any], att_b: Dict[str, Any],
+                              public_key_hex: str) -> Dict[str, Any]:
+    """Build canonical attestation-equivocation evidence: the two conflicting attestation dicts
+    plus the offending validator's public key (attestations carry no pubkey, so — like a
+    DOUBLE_SIGN proof's proposer_public_key — the pubkey rides the evidence so importers can
+    verify with no external state). Ordered by (target_epoch, block_hash) for determinism."""
+    if (int(att_a.get("target_epoch", 0)), str(att_a.get("block_hash", ""))) > \
+       (int(att_b.get("target_epoch", 0)), str(att_b.get("block_hash", ""))):
+        att_a, att_b = att_b, att_a
+    # Record under SURROUND_VOTE (the 50% attestation-equivocation SlashingConditions) for BOTH
+    # double- and surround-votes — they are the same offence class + penalty; the precise kind is
+    # inferable from the two attestations. detected_kind is kept for logs/clarity.
+    return {
+        "condition": "surround_vote",
+        "detected_kind": attestation_equivocation(att_a, att_b) or "surround_vote",
+        "proposer": att_a.get("validator_address"),
+        "slot": min(int(att_a.get("slot", 0)), int(att_b.get("slot", 0))),
+        "epoch": min(int(att_a.get("target_epoch", 0)), int(att_b.get("target_epoch", 0))),
+        "public_key": public_key_hex,
+        "att_a": att_a,
+        "att_b": att_b,
+    }
+
+
+def verify_attestation_evidence(evidence: Dict[str, Any]) -> Tuple[bool, str]:
+    """Self-validate an attestation-slashing proof with NO external state. Slashable iff the two
+    carried attestations are each validly Dilithium-signed by the SAME validator (whose pubkey,
+    carried in the evidence, derives to their validator_address) and they form a double/surround
+    vote. A malicious proposer cannot fabricate one for an honest validator — it would need that
+    validator's signature over two conflicting attestations."""
+    from .attestation import Attestation
+    from ..crypto.pq.dilithium import PQPublicKey
+    a, b = evidence.get("att_a"), evidence.get("att_b")
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False, "evidence missing att_a/att_b"
+    va, vb = a.get("validator_address"), b.get("validator_address")
+    if not va or va != vb:
+        return False, "attestations are from different/absent validators"
+    cond = attestation_equivocation(a, b)
+    if cond is None:
+        return False, "attestations do not conflict (not a double/surround vote)"
+    pub_hex = evidence.get("public_key")
+    if not pub_hex:
+        return False, "evidence missing validator public_key"
+    try:
+        pub = bytes.fromhex(pub_hex)
+        if PQPublicKey.from_bytes(pub).to_address() != va:
+            return False, "public_key does not derive to the validator address"
+    except Exception as e:
+        return False, f"bad validator public_key: {e}"
+    try:
+        if not Attestation.from_dict(a).verify(pub):
+            return False, "att_a signature invalid"
+        if not Attestation.from_dict(b).verify(pub):
+            return False, "att_b signature invalid"
+    except Exception as e:
+        return False, f"attestation verification error: {e}"
+    return True, ""
+
+
 async def record_block_slashing_evidence(db, block: Dict[str, Any]) -> int:
     """Record the DOUBLE_SIGN evidence carried in an imported block — the RECEIVING side of the
     block-body transport, run on EVERY node from the shared produce/import hook so all nodes end
@@ -109,9 +190,15 @@ async def record_block_slashing_evidence(db, block: Dict[str, Any]) -> int:
         return 0
     recorded = 0
     for ev in evidence_list:
-        ok, _err = verify_double_sign_evidence(ev)
+        cond = str(ev.get("condition", "double_sign"))
+        # Dispatch verification by condition — each proof self-validates (no external state), so a
+        # malicious proposer can never record a fabricated slash for an honest validator.
+        if cond in ("surround_vote", "double_vote"):
+            ok, _err = verify_attestation_evidence(ev)
+        else:
+            ok, _err = verify_double_sign_evidence(ev)
         if not ok:
-            continue  # unverifiable proof — never record (cannot slash an honest validator)
+            continue  # unverifiable proof — never record
         proposer = ev.get("proposer") or (ev.get("header_a") or {}).get("proposer_address")
         slot = ev.get("slot")
         if slot is None:
