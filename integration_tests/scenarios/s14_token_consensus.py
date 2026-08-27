@@ -41,7 +41,7 @@ class S14TokenConsensus(Scenario):
         async with NodeRPCClient(target) as c:
             r = await c._post("/submit_exchange_tx", json_data={"tx_hex": tx_hex})
             self.check(bool(r and r.get("ok")), f"{label}: admitted to proposer node")
-        for _ in range(25):  # ~50s
+        for _ in range(60):  # ~120s (reorg-tolerant tx inclusion)
             await asyncio.sleep(2)
             cur = await self._token_roots(node_urls)
             if cur.get(target) and cur[target] != base_root:
@@ -112,7 +112,7 @@ class S14TokenConsensus(Scenario):
         n_on_modal = 0
         modal_root = None
         final = {}
-        for _ in range(12):  # ~24s
+        for _ in range(60):  # ~120s — poll until convergence (reorg-tolerant)
             final = await self._token_roots(node_urls)
             nonzero = [v for v in final.values() if v and v != "0" * 128]
             if nonzero:

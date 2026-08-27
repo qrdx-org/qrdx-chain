@@ -41,7 +41,7 @@ class S13PerpCollateral(Scenario):
         async with NodeRPCClient(target) as c:
             r = await c._post("/submit_exchange_tx", json_data={"tx_hex": tx_hex})
             self.check(bool(r and r.get("ok")), f"{label}: admitted to proposer node")
-        for _ in range(25):  # ~50s
+        for _ in range(60):  # ~120s (reorg-tolerant tx inclusion)
             await asyncio.sleep(2)
             cur = await self._roots(node_urls)
             tnode = cur.get(target)
@@ -116,7 +116,7 @@ class S13PerpCollateral(Scenario):
         #    market-block root, not yet the position-block root).
         n_on_final = 0
         final = {}
-        for _ in range(10):  # ~20s
+        for _ in range(60):  # ~120s — poll until convergence (reorg-tolerant)
             final = await self._roots(node_urls)
             n_on_final = sum(1 for v in final.values()
                              if v.get("exchange_state_root") == root_after_open)

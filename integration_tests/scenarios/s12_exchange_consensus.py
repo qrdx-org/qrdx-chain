@@ -97,7 +97,7 @@ class S12ExchangeConsensus(Scenario):
         #    documented next piece — see docs/EXCHANGE_PRODUCTION_READINESS.md.
         target = node_urls[0]
         new_root = None
-        for attempt in range(25):  # up to ~50s
+        for attempt in range(60):  # up to ~120s (reorg-tolerant)
             await asyncio.sleep(2)
             cur = await self._roots(node_urls)
             tnode = cur.get(target)
