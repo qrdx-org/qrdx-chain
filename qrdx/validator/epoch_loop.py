@@ -50,6 +50,24 @@ _ENFORCE_EPOCH_VALIDATOR_UPDATES = True
 # settled deterministically.
 _ENFORCE_SLASHING = True
 
+# Item 3 — validators reorg-reconstruction composition fix. The incremental per-epoch mutation
+# below diverges when a deposit was seen on an orphaned block (frozen schedule + topped-up stake),
+# because the schedule it reads was set at import time, not re-derived from the canonical chain.
+# When True (+ enforce), the loop instead REBUILDS the whole validators dynamic state as a pure
+# function of the canonical chain each time finality advances (validator_reconstruction), making it
+# the SINGLE writer — so it is import-history-independent and converges across nodes. This replaces
+# (does not compose with) the incremental path; the reorg-path reconstruction call in node/main is
+# left OFF (a second writer is exactly what diverged the first enable). Finalized-epoch state is
+# immutable (the finality reorg guard refuses reorgs below it), so a full rebuild each finalized
+# epoch is deterministic on every node. Gated for observe/soak before enable.
+_RECONSTRUCT_VALIDATORS = False  # SOAK: fixes item-3 SCHEDULE divergence (deposited validator
+# converges byte-identically both runs), but full-table convergence is blocked by a SEPARATE issue
+# it surfaced — attestation_votes is not reorg-deterministic (a node had an extra epoch-0 vote → a
+# one-epoch reward diff → effective_stake diverges ~20 on that node). Reconstruction reads
+# attestation_votes as INPUT so it inherits that; closing item 3 fully also needs the reward input
+# made deterministic (rewards from FINALIZED canonical-block attestations, or attestation_votes as a
+# reorg-reconstructed domain). KEPT OFF until then; severity stays BENIGN (0 eligibility halts).
+
 
 async def apply_epoch_validator_update(db, epoch: int, enforce: bool) -> None:
     """Apply (or, in observe, log) the deterministic reward/penalty deltas for one
@@ -131,10 +149,22 @@ async def epoch_validator_update_loop(db, enforce: bool = None) -> None:
         try:
             fin = await update_finality(db)
             finalized_epoch = int(fin.get("finalized_epoch", -1))
-            while last_processed < finalized_epoch:
-                ep = last_processed + 1
-                await apply_epoch_validator_update(db, ep, enforce)
-                last_processed = ep
+            if _RECONSTRUCT_VALIDATORS and enforce:
+                # Single-writer reconstruction: rebuild the validators dynamic state from the
+                # canonical chain each time finality advances (import-history-independent).
+                if finalized_epoch >= 0 and finalized_epoch > last_processed:
+                    from .validator_reconstruction import reconstruct_validators_live
+                    await reconstruct_validators_live(db, finalized_epoch)
+                    last_processed = finalized_epoch
+                    vhash = await db.get_validators_table_hash()
+                    logger.info(
+                        "[epoch-validators RECONSTRUCT] finalized=%d validators_hash=%s",
+                        finalized_epoch, vhash[:16])
+            else:
+                while last_processed < finalized_epoch:
+                    ep = last_processed + 1
+                    await apply_epoch_validator_update(db, ep, enforce)
+                    last_processed = ep
         except asyncio.CancelledError:
             break
         except Exception as e:

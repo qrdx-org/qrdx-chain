@@ -19,6 +19,13 @@ from qrdx.validator.validator_reconstruction import (
     enumerate_canonical_validator_ops, reconstruct_validators_live,
 )
 
+
+async def _vsnapshot(db):
+    c = await db.connection.execute(
+        "SELECT address, status, activation_epoch, exit_epoch, stake, effective_stake, "
+        "total_rewards, total_slashed FROM validators ORDER BY address")
+    return {r[0]: tuple(r[1:]) for r in await c.fetchall()}
+
 G1 = "0xPQg1" + "0" * 58
 G2 = "0xPQg2" + "0" * 58
 V = "0xPQv1" + "0" * 58
@@ -131,3 +138,32 @@ async def test_reconstruct_live_end_to_end_produces_canonical_state():
     finally:
         await db.connection.close()
         os.remove(path)
+
+
+@pytest.mark.asyncio
+async def test_reconstruct_progression_matches_single_pass():
+    """The epoch loop reconstructs at each finalized epoch as finality advances. Stepping through
+    (reconstruct at 5, then 8) must yield the SAME state as a single reconstruction at 8 — the
+    single-writer progression is stable + import-history-independent (the composition-fix property
+    that diverged when reconstruction and the incremental loop were BOTH writers)."""
+    async def _build():
+        db, path = await _db()
+        await _seed_genesis(db)
+        await _store_block(db, 0, slot=0)
+        await _store_block(db, 1, slot=DEP_SLOT, exchange_txs=[_deposit_tx()])
+        await _seed_attesters(db)
+        return db, path
+
+    stepped, ps = await _build()
+    single, pg = await _build()
+    try:
+        # Stepped node: as the loop would, reconstruct at successive finalized epochs.
+        await reconstruct_validators_live(stepped, 5)   # V still pending (activates at 7)
+        await reconstruct_validators_live(stepped, 8)   # V now active
+        # Single-pass node: reconstruct once at 8.
+        await reconstruct_validators_live(single, 8)
+        assert await _vsnapshot(stepped) == await _vsnapshot(single)
+    finally:
+        for db, p in ((stepped, ps), (single, pg)):
+            await db.connection.close()
+            os.remove(p)
