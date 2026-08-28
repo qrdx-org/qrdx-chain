@@ -1591,6 +1591,39 @@ class DatabaseSQLite:
              int(activation_epoch) if activation_epoch is not None else None))
         return True
 
+    async def seed_genesis_validators(self, genesis_validators: list) -> int:
+        """Reset the consensus ``validators`` table to its GENESIS BASE — the reset primitive for
+        validators reorg-reconstruction (mirror of ``seed_genesis_account_state``). Removes every
+        non-genesis (DEPOSITED) validator and resets each genesis validator's DYNAMIC state
+        (effective_stake=stake, status='active', activation_epoch=0, exit_epoch=NULL,
+        total_rewards/total_slashed=0, slashed=0). After this, replaying the canonical STAKE ops +
+        re-running finalized epoch processing rebuilds the dynamic state as a pure function of the
+        chain. ``genesis_validators`` = [{address, public_key, stake}]. Does NOT commit.
+
+        Genesis is defined by this passed-in set (from the genesis config/snapshot), NOT by a
+        table heuristic — a deposited validator can also sit at activation_epoch 0 mid-reorg."""
+        from decimal import Decimal
+        addrs = [v["address"] for v in genesis_validators]
+        if addrs:
+            ph = ",".join("?" * len(addrs))
+            await self.connection.execute(
+                f"DELETE FROM validators WHERE address NOT IN ({ph})", addrs)
+        else:
+            await self.connection.execute("DELETE FROM validators")
+        for v in genesis_validators:
+            s = str(Decimal(str(v["stake"])))
+            await self.connection.execute(
+                "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
+                "activation_epoch, exit_epoch, slashed, total_slashed, total_rewards) "
+                "VALUES (?, ?, ?, ?, 'active', 0, NULL, 0, '0', '0') "
+                "ON CONFLICT(address) DO UPDATE SET "
+                "public_key=excluded.public_key, stake=excluded.stake, "
+                "effective_stake=excluded.effective_stake, status='active', "
+                "activation_epoch=0, exit_epoch=NULL, slashed=0, "
+                "total_slashed='0', total_rewards='0', updated_at=CURRENT_TIMESTAMP",
+                (v["address"], v["public_key"], s, s))
+        return len(genesis_validators)
+
     async def get_validators_to_activate(self, current_epoch: int) -> list:
         """Pending validators whose scheduled activation_epoch has arrived
         (<= current_epoch). Deterministic, canonical address order."""
