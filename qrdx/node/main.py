@@ -2686,6 +2686,13 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
 # function of the canonical chain (validator_reconstruction), so it converges across nodes
 # regardless of import history — the 5th reorg-reconstructed domain. Enable only after a cross-node
 # soak proves byte-identical validators_table_hash (mirrors how exchange/EVM rebuilds were adopted).
+# KEPT OFF — the first enable soak DIVERGED: reconstruction on the reorg path runs to the node's
+# CURRENT finalized_epoch, but the incremental epoch loop (epoch_loop, last_processed) keeps mutating
+# subsequent epochs, so the two compose inconsistently across nodes (status active vs exited, act 2
+# vs 7, three effective_stakes). The core reconstruction is proven correct in isolation; enabling it
+# live requires the epoch loop to STOP mutating incrementally and instead drive off reconstruction
+# (or reset last_processed so it re-derives from the rebuilt point) — the reconstruction↔epoch-loop
+# composition, a dedicated follow-up. See tests/test_validator_reconstruction_equivalence.py.
 _ENFORCE_VALIDATOR_RECONSTRUCTION = False
 
 
