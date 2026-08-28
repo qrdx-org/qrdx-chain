@@ -2680,6 +2680,15 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
     return True
 
 
+# Validators reorg-reconstruction gate (item 3). OFF = the deposited-validator dynamic state stays
+# incrementally-mutated (benign cross-node divergence in recorded schedule + effective_stake; 0
+# eligibility halts). ON = on every rollback, rebuild the validators dynamic state as a pure
+# function of the canonical chain (validator_reconstruction), so it converges across nodes
+# regardless of import history — the 5th reorg-reconstructed domain. Enable only after a cross-node
+# soak proves byte-identical validators_table_hash (mirrors how exchange/EVM rebuilds were adopted).
+_ENFORCE_VALIDATOR_RECONSTRUCTION = False
+
+
 async def _rebuild_derived_state_after_rollback():
     """Rebuild all derived state (account/EVM, token ledger, exchange) from the
     canonical blocks up to the CURRENT tip — i.e. after a ``db.remove_blocks(...)``
@@ -2712,6 +2721,22 @@ async def _rebuild_derived_state_after_rollback():
         await rebuild_exchange_state_from_chain(db, flush_to_account_state=True)
     except Exception as e:
         logger.error(f"[REORG] Exchange state rebuild failed: {e}")
+
+    # Validators reorg-reconstruction (item 3) — gated. Rebuild the deposited-validator dynamic
+    # state as a pure function of the canonical chain so it converges across nodes regardless of
+    # import history. Runs through the current finalized epoch (settled network-wide). Best-effort.
+    if _ENFORCE_VALIDATOR_RECONSTRUCTION:
+        try:
+            from ..validator.finality import update_finality
+            from ..validator.validator_reconstruction import reconstruct_validators_live
+            fin = await update_finality(db)
+            finalized_epoch = int(fin.get("finalized_epoch", -1))
+            if finalized_epoch >= 0:
+                await reconstruct_validators_live(db, finalized_epoch)
+                logger.info("[REORG] validators reconstructed through finalized epoch %d",
+                            finalized_epoch)
+        except Exception as e:
+            logger.error(f"[REORG] validators reconstruction failed: {e}")
 
 
 async def _tiebreak_rollback(block_no: int) -> None:

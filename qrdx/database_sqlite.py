@@ -1624,6 +1624,18 @@ class DatabaseSQLite:
                 (v["address"], v["public_key"], s, s))
         return len(genesis_validators)
 
+    async def get_genesis_validators(self) -> list:
+        """The GENESIS validator set as [{address, public_key, stake}] for the reconstruction
+        reset. Genesis validators are uniquely identified by ``activation_epoch = 0`` — a
+        DEPOSITED validator always gets ``block_epoch + ACTIVATION_DELAY_EPOCHS`` (≥ 4 > 0), so
+        it can never collide. Their ``stake`` column stays at the genesis base (register_pending
+        tops up only deposited rows; epoch updates touch effective_stake, not stake), so it is the
+        correct base to reset to. Canonical address order for determinism."""
+        cur = await self.connection.execute(
+            "SELECT address, public_key, stake FROM validators WHERE activation_epoch = 0 "
+            "ORDER BY address ASC")
+        return [{"address": r[0], "public_key": r[1], "stake": r[2]} for r in await cur.fetchall()]
+
     async def get_validators_to_activate(self, current_epoch: int) -> list:
         """Pending validators whose scheduled activation_epoch has arrived
         (<= current_epoch). Deterministic, canonical address order."""
