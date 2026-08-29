@@ -50,6 +50,28 @@ def test_metrics_prometheus_render():
     assert m.snapshot()["qrdx_chain_height"] == 42
 
 
+def test_metrics_labels_group_under_one_type_line():
+    """Labeled series (per-RPC-method) render as one # TYPE line + a series per label set, and
+    aggregate independently."""
+    m = Metrics()
+    m.describe("qrdx_rpc_requests_total", "reqs")
+    m.inc("qrdx_rpc_requests_total", labels={"method": "eth_blockNumber"})
+    m.inc("qrdx_rpc_requests_total", labels={"method": "eth_blockNumber"})
+    m.inc("qrdx_rpc_requests_total", labels={"method": "net_version"})
+    text = m.render_prometheus()
+    assert text.count("# TYPE qrdx_rpc_requests_total counter") == 1
+    assert 'qrdx_rpc_requests_total{method="eth_blockNumber"} 2' in text
+    assert 'qrdx_rpc_requests_total{method="net_version"} 1' in text
+    snap = m.snapshot()
+    assert snap['qrdx_rpc_requests_total{method="eth_blockNumber"}'] == 2
+
+
+def test_metrics_label_value_escaping():
+    m = Metrics()
+    m.inc("x_total", labels={"m": 'a"b\\c'})
+    assert 'x_total{m="a\\"b\\\\c"} 1' in m.render_prometheus()
+
+
 @pytest.mark.asyncio
 async def test_poller_emits_block_events_and_updates_metrics():
     hub, m = EventHub(), Metrics()

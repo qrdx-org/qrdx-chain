@@ -72,44 +72,65 @@ class EventHub:
 # Metrics registry (Prometheus text exposition)
 # ─────────────────────────────────────────────────────────────────────────────
 class Metrics:
-    """Minimal counter/gauge registry rendered in Prometheus text format. Counters only increase;
-    gauges are set to a current value. Thread-safety is not needed — the event loop is single-
-    threaded and all updates happen on it."""
+    """Minimal counter/gauge registry rendered in Prometheus text format, with optional LABELS
+    (e.g. per-RPC-method, per-p2p-event breakdowns). Counters only increase; gauges are set to a
+    current value. Thread-safety is not needed — the event loop is single-threaded.
+
+    Labels are passed as a dict; a metric name may carry many label series. Keep label VALUE
+    cardinality bounded (method names, event kinds) — never user-supplied unbounded strings."""
 
     def __init__(self):
-        self._counters: Dict[str, float] = defaultdict(float)
-        self._gauges: Dict[str, float] = {}
+        self._counters: Dict[tuple, float] = defaultdict(float)   # (name, labelkey) -> value
+        self._gauges: Dict[tuple, float] = {}                     # (name, labelkey) -> value
         self._help: Dict[str, str] = {}
+
+    @staticmethod
+    def _lk(labels: Optional[Dict[str, Any]]) -> tuple:
+        return tuple(sorted((str(k), str(v)) for k, v in (labels or {}).items()))
 
     def describe(self, name: str, help_text: str) -> None:
         self._help[name] = help_text
 
-    def inc(self, name: str, amount: float = 1.0) -> None:
-        self._counters[name] += amount
+    def inc(self, name: str, amount: float = 1.0, labels: Optional[Dict[str, Any]] = None) -> None:
+        self._counters[(name, self._lk(labels))] += amount
 
-    def set(self, name: str, value: float) -> None:
+    def set(self, name: str, value: float, labels: Optional[Dict[str, Any]] = None) -> None:
         try:
-            self._gauges[name] = float(value)
+            self._gauges[(name, self._lk(labels))] = float(value)
         except (TypeError, ValueError):
             pass
 
+    @staticmethod
+    def _series(name: str, labelkey: tuple) -> str:
+        if not labelkey:
+            return name
+        inner = ",".join(f'{k}="{_esc(v)}"' for k, v in labelkey)
+        return f"{name}{{{inner}}}"
+
     def snapshot(self) -> Dict[str, float]:
-        out: Dict[str, float] = dict(self._gauges)
-        out.update(self._counters)
+        out: Dict[str, float] = {}
+        for (name, lk), v in self._gauges.items():
+            out[self._series(name, lk)] = v
+        for (name, lk), v in self._counters.items():
+            out[self._series(name, lk)] = v
         return out
 
-    def render_prometheus(self) -> str:
+    def _render_group(self, store: Dict[tuple, float], kind: str) -> list:
+        by_name: Dict[str, list] = defaultdict(list)
+        for (name, lk), v in store.items():
+            by_name[name].append((lk, v))
         lines = []
-        for name, val in sorted(self._counters.items()):
+        for name in sorted(by_name):
             if name in self._help:
                 lines.append(f"# HELP {name} {self._help[name]}")
-            lines.append(f"# TYPE {name} counter")
-            lines.append(f"{name} {_fmt(val)}")
-        for name, val in sorted(self._gauges.items()):
-            if name in self._help:
-                lines.append(f"# HELP {name} {self._help[name]}")
-            lines.append(f"# TYPE {name} gauge")
-            lines.append(f"{name} {_fmt(val)}")
+            lines.append(f"# TYPE {name} {kind}")
+            for lk, v in sorted(by_name[name]):
+                lines.append(f"{self._series(name, lk)} {_fmt(v)}")
+        return lines
+
+    def render_prometheus(self) -> str:
+        lines = self._render_group(self._counters, "counter")
+        lines += self._render_group(self._gauges, "gauge")
         return "\n".join(lines) + "\n"
 
 
@@ -118,6 +139,10 @@ def _fmt(v: float) -> str:
     if v == int(v):
         return str(int(v))
     return repr(v)
+
+
+def _esc(v: str) -> str:
+    return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,6 +220,32 @@ async def chain_event_poller(
 # ─────────────────────────────────────────────────────────────────────────────
 # Stream framing helpers (shared by WebSocket + SSE)
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Process-wide singletons — shared by main.py (endpoints + poller) AND the RPC / p2p layers, which
+# record into them WITHOUT importing main.py (observability imports only stdlib, so it is safe to
+# import from anywhere with no cycle). Recording is best-effort; a metrics error never breaks a
+# request or block-propagation path.
+# ─────────────────────────────────────────────────────────────────────────────
+METRICS = Metrics()
+EVENT_HUB = EventHub()
+
+
+def record(name: str, amount: float = 1.0, labels: Optional[Dict[str, Any]] = None) -> None:
+    """Best-effort counter increment on the shared registry (never raises into a caller)."""
+    try:
+        METRICS.inc(name, amount, labels)
+    except Exception:
+        pass
+
+
+def gauge(name: str, value: float, labels: Optional[Dict[str, Any]] = None) -> None:
+    """Best-effort gauge set on the shared registry (never raises into a caller)."""
+    try:
+        METRICS.set(name, value, labels)
+    except Exception:
+        pass
+
+
 def sse_frame(event: Dict[str, Any]) -> str:
     """Format an event as a Server-Sent-Events frame."""
     return f"data: {json.dumps(event, default=str)}\n\n"

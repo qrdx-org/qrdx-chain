@@ -20,6 +20,14 @@ from ..logger import get_logger
 
 logger = get_logger(__name__)
 
+# Best-effort metrics recording into the shared observability registry (imports only stdlib, so no
+# cycle). Falls back to a no-op so RPC handling never depends on observability being importable.
+try:
+    from ..node.observability import record as _metric
+except Exception:  # pragma: no cover
+    def _metric(*_a, **_k):
+        return None
+
 
 class RPCErrorCode(IntEnum):
     """Standard JSON-RPC 2.0 error codes."""
@@ -351,6 +359,7 @@ class RPCServer:
         # Rate limit check
         if self._rate_limiter is not None:
             if not await self._rate_limiter.check(client_id):
+                _metric("qrdx_rpc_ratelimited_total")
                 error = RPCError(RPCErrorCode.LIMIT_EXCEEDED, "Rate limit exceeded")
                 return RPCResponse(error=error.to_dict()).to_json()
         # Parse request
@@ -410,6 +419,10 @@ class RPCServer:
         # Find method
         handler = self._methods.get(request.method)
         if handler is None:
+            # Fixed label — the requested method is unregistered/arbitrary, so never label by it
+            # (unbounded cardinality); count under "_unknown".
+            _metric("qrdx_rpc_requests_total", labels={"method": "_unknown"})
+            _metric("qrdx_rpc_errors_total", labels={"method": "_unknown"})
             if request.is_notification:
                 return None
             return RPCResponse(
@@ -419,7 +432,10 @@ class RPCServer:
                     f"Method not found: {request.method}"
                 ).to_dict()
             ).to_dict()
-        
+
+        # request.method is a REGISTERED method here → bounded label cardinality.
+        _metric("qrdx_rpc_requests_total", labels={"method": request.method})
+
         # Execute method
         try:
             # Convert params to args/kwargs
@@ -438,11 +454,13 @@ class RPCServer:
             return RPCResponse(id=request.id, result=result).to_dict()
             
         except RPCError as e:
+            _metric("qrdx_rpc_errors_total", labels={"method": request.method})
             if request.is_notification:
                 return None
             return RPCResponse(id=request.id, error=e.to_dict()).to_dict()
-            
+
         except Exception as e:
+            _metric("qrdx_rpc_errors_total", labels={"method": request.method})
             logger.exception(f"Error handling RPC method {request.method}")
             if request.is_notification:
                 return None

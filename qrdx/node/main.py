@@ -888,10 +888,8 @@ startup_time = time.time()
 # TOGGLEABLE (opt-in per operator) via QRDX_ENABLE_STREAMING. The stream is fed by a consensus-
 # decoupled poller (reads chain tip/finality only) so it can never stall or diverge block import.
 from qrdx.node.observability import (
-    EventHub, Metrics, chain_event_poller, sse_stream,
+    METRICS, EVENT_HUB, chain_event_poller, sse_stream,
 )
-EVENT_HUB = EventHub()
-METRICS = Metrics()
 STREAMING_ENABLED = os.environ.get("QRDX_ENABLE_STREAMING", "").lower() in ("1", "true", "yes")
 _chain_poller_task: Optional[asyncio.Task] = None
 
@@ -2841,6 +2839,7 @@ async def _tiebreak_rollback(block_no: int) -> None:
 
 async def handle_reorganization(node_interface: NodeInterface, local_height: int):
     """Handles blockchain reorganization with proper validation"""
+    METRICS.inc("qrdx_reorgs_total")
     logger.warning(f"[REORG] Fork detected! Starting reorganization process from local height {local_height}.")
 
     last_common_block_id = -1
@@ -3389,6 +3388,12 @@ async def startup():
     # touches the import path, so it cannot stall or diverge consensus. Runs on every node.
     try:
         global _chain_poller_task
+        # HELP text for the RPC/p2p layer counters (incremented in their own modules).
+        METRICS.describe("qrdx_rpc_requests_total", "JSON-RPC requests handled, by method")
+        METRICS.describe("qrdx_rpc_errors_total", "JSON-RPC requests that errored, by method")
+        METRICS.describe("qrdx_rpc_ratelimited_total", "JSON-RPC requests rejected by the rate limiter")
+        METRICS.describe("qrdx_p2p_blocks_received_total", "Blocks accepted from peers via p2p")
+        METRICS.describe("qrdx_reorgs_total", "Chain reorganizations handled")
 
         async def _poll_tip():
             return (await db.get_next_block_id()) - 1

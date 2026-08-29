@@ -98,3 +98,38 @@ async def test_ws_enabled_accepts_and_streams_a_published_event(monkeypatch):
     await asyncio.wait_for(task, timeout=2)
     assert sent[0]["type"] == "hello"
     assert any(e.get("height") == 99 for e in sent)
+
+
+@pytest.mark.asyncio
+async def test_rpc_server_records_per_method_metrics():
+    """handle_request feeds the shared metrics registry: per-method request + error counters and
+    an _unknown bucket for unregistered methods."""
+    from qrdx.rpc.server import RPCServer, RPCModule, rpc_method
+    from qrdx.node.observability import METRICS
+
+    class _Mod(RPCModule):
+        namespace = "obstest"
+
+        @rpc_method
+        async def ping(self):
+            return "pong"
+
+        @rpc_method
+        async def boom(self):
+            raise ValueError("nope")
+
+    srv = RPCServer()
+    srv.register_module(_Mod())
+    snap0 = METRICS.snapshot()
+    b_req = snap0.get('qrdx_rpc_requests_total{method="obstest_ping"}', 0)
+    b_err = snap0.get('qrdx_rpc_errors_total{method="obstest_boom"}', 0)
+    b_unk = snap0.get('qrdx_rpc_requests_total{method="_unknown"}', 0)
+
+    await srv.handle_request({"jsonrpc": "2.0", "id": 1, "method": "obstest_ping"})
+    await srv.handle_request({"jsonrpc": "2.0", "id": 2, "method": "obstest_boom"})
+    await srv.handle_request({"jsonrpc": "2.0", "id": 3, "method": "no_such_method"})
+
+    snap = METRICS.snapshot()
+    assert snap['qrdx_rpc_requests_total{method="obstest_ping"}'] == b_req + 1
+    assert snap['qrdx_rpc_errors_total{method="obstest_boom"}'] == b_err + 1
+    assert snap.get('qrdx_rpc_requests_total{method="_unknown"}', 0) == b_unk + 1

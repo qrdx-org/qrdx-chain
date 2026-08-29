@@ -31,6 +31,14 @@ from ...logger import get_logger
 
 logger = get_logger(__name__)
 
+# Best-effort p2p metrics into the shared observability registry (no-op fallback so propagation
+# never depends on it importing).
+try:
+    from ...node.observability import record as _metric
+except Exception:  # pragma: no cover
+    def _metric(*_a, **_k):
+        return None
+
 
 class P2PModule(RPCModule):
     """
@@ -204,6 +212,7 @@ class P2PModule(RPCModule):
             ``{"ok": True, "result": "..."}`` on success.
         """
         self._require_db()
+        _metric("qrdx_p2p_blocks_received_total")
 
         block_content = block_data.get('block_content')
         if not block_content:
