@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from typing import Any, Optional
 
 from ..constants import DOMAIN_RANDAO, SLOTS_PER_EPOCH
@@ -100,7 +101,18 @@ RANDAO_PROPOSER_ELIGIBLE_K = 2
 # blocks. Both are small-N/short-slot artifacts, not consensus bugs — on a production-scale set
 # the variance averages out and backups rarely collide. Enable there (or with a slot sized above
 # worst-case block-production time). Kept OFF; K=2 retained (neutral when off).
-ENFORCE_RANDAO_SELECTION = False
+# LARGER-SLOT ENABLE ATTEMPT (2026-08-29, two 6s soaks): a slot sized above block-production time
+# (QRDX_SLOT_DURATION=6 → backup wait slot/2 = 3s) SUBSTANTIALLY reduces the K=2 competing-block
+# churn — 0 live-path eligibility rejects (selection stable), state converges (token ledger
+# byte-identical, height spread 0–1), reorgs down (~8 vs ~13), and s07/s08 pass with the new
+# slot-aware height check. Run 1 was FULLY green incl. all perp/token/CLOB convergence scenarios;
+# run 2 flaked on s13's perp-root convergence poll. So the bigger slot moves RANDAO enforce from
+# "K=2 churns / s13 fails" to "mostly passes, occasionally flakes" — a real improvement that
+# confirms the slot-sizing direction, but NOT reliably clean on only 3 validators (backups still
+# occasionally collide). Full reliability needs a production-scale set (variance averages out).
+# ENV-GATED, default OFF (fast 2s dev testnet stays green); enable in production with
+# QRDX_ENFORCE_RANDAO=1 + QRDX_SLOT_DURATION≥6. See docs item 5 / [[randao-fork-choice-status]].
+ENFORCE_RANDAO_SELECTION = os.getenv("QRDX_ENFORCE_RANDAO", "").lower() in ("1", "true", "yes")
 
 # Genesis seed for the fold. Equal to the current constant proposer mix, so the
 # accumulated mix at height 0 (no reveals) reproduces today's selection input —

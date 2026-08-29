@@ -510,7 +510,11 @@ BOOTSTRAP_NODES = [node.url for node in BOOTSTRAP_NODES_PARSED]
 # WARNING: Changing these values will break consensus with mainnet nodes!
 
 # --- Slot and Epoch Configuration ---
-SLOT_DURATION = 2                      # 2 seconds per slot
+# Seconds per slot. All nodes on a network MUST agree (it defines the slot clock + the backup-
+# proposer wait = SLOT_DURATION/2). Overridable via env so a network can size the slot above
+# worst-case block-production+propagation time — which is what makes ENFORCE_RANDAO_SELECTION
+# cleanly convergent (backups then never fire competing blocks). Default 2 (unchanged).
+SLOT_DURATION = int(os.getenv("QRDX_SLOT_DURATION", "2"))
 # Network parameter: all nodes on a network MUST agree on this (it defines epoch
 # boundaries → finality + validator-lifecycle processing). Overridable via env for
 # test networks that want faster epochs (the integration harness sets it small so

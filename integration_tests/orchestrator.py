@@ -218,7 +218,12 @@ class TestnetOrchestrator:
             # Faster epochs so epoch-boundary processing (finality + validator
             # lifecycle) fires several times within a short test run. All nodes get
             # the same value → consensus-consistent.
-            "QRDX_SLOTS_PER_EPOCH": str(SLOTS_PER_EPOCH),
+            # Fast defaults for dev velocity; a RANDAO enforce experiment overrides via the parent
+            # env: QRDX_ENFORCE_RANDAO=1 QRDX_SLOT_DURATION=6 QRDX_SLOTS_PER_EPOCH=4 (the proven
+            # cleanly-convergent larger-slot config). Passed through to every node so all agree.
+            "QRDX_SLOT_DURATION": os.environ.get("QRDX_SLOT_DURATION", str(SLOT_DURATION)),
+            "QRDX_SLOTS_PER_EPOCH": os.environ.get("QRDX_SLOTS_PER_EPOCH", str(SLOTS_PER_EPOCH)),
+            "QRDX_ENFORCE_RANDAO": os.environ.get("QRDX_ENFORCE_RANDAO", ""),
             # Short activation/unbonding so the dynamic-membership scenario (S16) can
             # observe a deposit→active→exit→exited round-trip within a short soak.
             # Same value on every node → deterministic scheduling preserved.

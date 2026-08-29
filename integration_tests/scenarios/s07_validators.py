@@ -76,10 +76,20 @@ class S07Validators(Scenario):
             self.check(min(validator_counts) >= 1,
                        f"Each reachable node reports validators (min={min(validator_counts)})")
 
-        await asyncio.sleep(4)
-        async with NodeRPCClient(primary_url) as client:
-            after_info = await client.get_mining_info()
-            after_height = int(after_info.get("last_block", {}).get("id", 0))
+        # Slot-aware: poll for the next block rather than assuming a fixed wall-clock (a larger
+        # QRDX_SLOT_DURATION — e.g. the RANDAO enforce experiment's 6s — produces blocks slower).
+        from qrdx.constants import SLOT_DURATION as _SLOT
+        after_height = before_height
+        deadline = 3 * int(_SLOT) + 6
+        waited = 0.0
+        while waited < deadline:
+            await asyncio.sleep(2)
+            waited += 2
+            async with NodeRPCClient(primary_url) as client:
+                after_info = await client.get_mining_info()
+                after_height = int(after_info.get("last_block", {}).get("id", 0))
+            if after_height > before_height:
+                break
 
         self.check(after_height > before_height,
                    f"Height advanced while validators active ({before_height} -> {after_height})")
