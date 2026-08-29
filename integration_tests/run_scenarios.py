@@ -138,6 +138,19 @@ async def main(args: argparse.Namespace) -> int:
             logger.error("\n✗ FAILED SCENARIOS: %s", failed)
             exit_code = 1
 
+        # ── Phase 4.5: Soak-invariant monitor (opt-in) ──────────────
+        if args.soak and args.soak > 0:
+            logger.info("Phase 4.5: Soak-invariant monitor (%.0fs, fault_inject=%s)",
+                        args.soak, args.fault_inject)
+            from integration_tests.soak import run_soak_phase
+            soak_report = await run_soak_phase(
+                node_urls, duration=args.soak, node_processes=orch.node_processes,
+                fault_inject=args.fault_inject)
+            logger.info("\n" + soak_report.summary())
+            if not soak_report.passed:
+                logger.error("\n✗ SOAK FAILED")
+                exit_code = 1
+
         # Keep running if requested
         if args.keep:
             logger.info("\nNodes still running. Press Ctrl+C to stop.")
@@ -192,6 +205,12 @@ Examples:
                         help="Stop execution on first failed scenario")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable debug logging")
+    parser.add_argument("--soak", type=float, default=0.0, metavar="SECONDS",
+                        help="After scenarios, run a soak-invariant monitor for SECONDS (health/"
+                             "liveness/finality/convergence/safety via /metrics). The ≥30-day soak "
+                             "gate, parameterized. Requires QRDX_ENABLE_STREAMING for /metrics.")
+    parser.add_argument("--fault-inject", action="store_true",
+                        help="During --soak, kill + restart a backup node and verify recovery")
     return parser.parse_args()
 
 

@@ -3414,9 +3414,17 @@ async def startup():
             except Exception:
                 return 0
 
+        async def _poll_slashing():
+            try:
+                cur = await db.connection.execute("SELECT COUNT(*) FROM slashing_events")
+                return int((await cur.fetchone())[0])
+            except Exception:
+                return 0
+
+        METRICS.describe("qrdx_slashing_events", "Recorded slashing events (0 on an honest network)")
         _chain_poller_task = asyncio.create_task(chain_event_poller(
             EVENT_HUB, METRICS, get_tip=_poll_tip, get_peer_count=_poll_peers,
-            get_finality=_poll_finality, interval=2.0))
+            get_finality=_poll_finality, get_slashing_count=_poll_slashing, interval=2.0))
         app.state.chain_poller_task = _chain_poller_task
         logger.info("✅ Observability chain-event poller scheduled (streaming %s)",
                     "ENABLED" if STREAMING_ENABLED else "disabled — /metrics + health still on")

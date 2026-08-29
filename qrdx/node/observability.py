@@ -164,6 +164,7 @@ async def chain_event_poller(
     get_tip: _MaybeAsync,
     get_peer_count: Optional[_MaybeAsync] = None,
     get_finality: Optional[_MaybeAsync] = None,
+    get_slashing_count: Optional[_MaybeAsync] = None,
     interval: float = 1.0,
     _max_iterations: Optional[int] = None,   # test hook
 ) -> None:
@@ -192,6 +193,8 @@ async def chain_event_poller(
                 fin = (await _maybe_await(get_finality())) or {}
                 metrics.set("qrdx_finalized_epoch", int(fin.get("finalized_epoch", -1)))
                 metrics.set("qrdx_justified_epoch", int(fin.get("justified_epoch", -1)))
+            if get_slashing_count is not None:
+                metrics.set("qrdx_slashing_events", int(await _maybe_await(get_slashing_count())))
 
             if tip > last_height:
                 # Emit a per-height block event (cap the catch-up burst so a fresh node that jumps
