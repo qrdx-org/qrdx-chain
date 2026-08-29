@@ -7,6 +7,58 @@
 > **Companion docs:** `EVM_STATE_CONSENSUS_INTEGRATION.md` (the detailed E-D*
 > ledger), `PRODUCTION_DEPLOYMENT.md`, `QRDX_IMPLEMENTATION_CHECKLIST.md`.
 
+---
+
+## 📌 CURRENT STATUS — August 2026 (supersedes the June snapshot below)
+
+The consensus-hardening arc has continued well past the June baseline. The detailed
+per-item ledger below remains an accurate history, but the **current** picture is:
+
+### ✅ Completed since the June snapshot
+
+- **Economic layer fully enforced + convergent (Phase E COMPLETE).** Perps (margin +
+  PnL), spot (consensus tokens + AMM swap/liquidity), the CLOB order book
+  (escrow-on-place, match settlement maker↔taker, cancel-refund), and pool-stake debit
+  all settle **real, enforced, convergent** balances bound into the unified state root;
+  EVM gas is real. Reorg safety proven via rebuild-vs-forward equivalence tests
+  (principle: *the reorg rebuild must use the forward path's exact enforce-flag set*).
+- **Slashing ENFORCED — both conditions.** DOUBLE_SIGN and surround/double-vote
+  attestation-equivocation both ride self-validating evidence-in-blocks and apply the
+  finalized-epoch 50% + eject penalty deterministically (proven byte-identical across
+  nodes; false-positive soaks clean). A double-vote forgery hole (a target-keyed rule
+  that would have let anyone harvest two honest per-slot attestations to slash a
+  validator) was found + fixed — both conditions now key equivocation on SLOT.
+  Per-epoch **inactivity leak** (non-attester penalty) is enforced + deterministic.
+- **Validators dynamic-state reorg reconstruction — ✅ RESOLVED + ENABLED (item 4's last
+  gap).** The validators table (deposit stake + activation/exit schedule + epoch rewards)
+  is now a reorg-reconstructed domain: the epoch loop rebuilds it from the canonical chain
+  each finalized epoch (single writer), with rewards computed from attestations carried in
+  **finalized canonical blocks** (not the non-reorg-clean `attestation_votes` table). Two
+  soaks: 18/18, full validators table **byte-identical across all 4 nodes**,
+  import-history-independent. This was the last known consensus-**divergence** gap.
+- **All five derived-state domains are now reorg-reconstructed** — UTXO, account/EVM,
+  token ledger, exchange, **and validators** — each proven convergent.
+
+### ⏳ What actually remains (in-repo)
+
+- **RANDAO proposer-selection enable** — SAFE (no halt/divergence) but not cleanly
+  passable on the 3-validator / 2s-slot testnet (small-N / short-slot churn artifact,
+  not a consensus bug). **Blocked on a production-scale validator set or larger slot**,
+  not on code. Gated off. *(Item 5 below.)*
+- **DOWNTIME ejection & BRIDGE_FRAUD** — the economic downtime penalty already applies
+  each epoch (see inactivity leak); an explicit extended-absence *ejection* and a
+  bridge-fraud evidence type are **nice-to-haves, not gates**.
+
+### 🔒 The real remaining blockers are the external process gates (unchanged)
+
+External security audit • ≥30-day multi-validator soak at scale • operational readiness
+(HSM/key management, monitoring/alerting, DoS/rate-limiting, genesis ceremony, upgrade
+governance). See "Process gates" at the end. **The in-repo consensus + economic protocol
+is essentially complete and convergent; the path to mainnet is now dominated by these
+external gates, not by remaining protocol code.**
+
+---
+
 ## ✅ Done (committed, integration-verified)
 
 - **Exchange domain consensus integration** — admission → block codec → proposer
@@ -104,7 +156,10 @@
    the finality reorg guard (refuses rewrites below finalized) + the sequential
    height check. Full sync enforcement is unnecessary given those.
 
-4. **Validator lifecycle convergence.** ✅ **LARGELY DONE + ENFORCED** (see
+4. **Validator lifecycle convergence.** ✅ **FULLY DONE + ENFORCED** — the reorg-reconstruction
+   gap noted below is now RESOLVED + ENABLED (see the August-2026 status at the top: the validators
+   table is rebuilt from the canonical chain each finalized epoch, byte-identical across nodes).
+   (see
    `docs/VALIDATOR_LIFECYCLE_UNIFICATION.md`): the SQLite-port + unification is complete —
    one deterministic, finality-gated processor (`validator/epoch_loop.py` +
    `db.apply_epoch_validator_updates`, `_ENFORCE_EPOCH_VALIDATOR_UPDATES=True`) runs on
@@ -346,7 +401,9 @@
 
 ## ⏳ Remaining — economic integrity (Phase E)
 
-7. **Exchange ↔ real-balance integration (the actual Phase E gap).**
+7. **Exchange ↔ real-balance integration (the actual Phase E gap).** ✅ **COMPLETE** —
+   perps + spot + CLOB + pool-stake all settle real, enforced, convergent balances in the
+   unified state root (see the August-2026 status at the top). The scoping below is history.
    **Scoped (investigated June 2026):** EVM gas IS real — py-evm debits gas+value
    from the EVM balance and `ContractStateManager.commit` writes `account_state`.
    The gap is the **exchange**: `_op_open_position` opens a leveraged perp with
