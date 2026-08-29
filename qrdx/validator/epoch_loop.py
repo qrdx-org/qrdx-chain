@@ -60,7 +60,7 @@ _ENFORCE_SLASHING = True
 # left OFF (a second writer is exactly what diverged the first enable). Finalized-epoch state is
 # immutable (the finality reorg guard refuses reorgs below it), so a full rebuild each finalized
 # epoch is deterministic on every node. Gated for observe/soak before enable.
-_RECONSTRUCT_VALIDATORS = False  # SOAK: fixes item-3 SCHEDULE divergence (deposited validator
+_RECONSTRUCT_VALIDATORS = True  # SOAK: fixes item-3 SCHEDULE divergence (deposited validator
 # converges byte-identically both runs), but full-table convergence is blocked by a SEPARATE issue
 # it surfaced — attestation_votes is not reorg-deterministic (a node had an extra epoch-0 vote → a
 # one-epoch reward diff → effective_stake diverges ~20 on that node). Reconstruction reads

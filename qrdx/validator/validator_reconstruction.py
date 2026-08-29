@@ -175,6 +175,51 @@ async def enumerate_canonical_validator_ops(db) -> List[Dict[str, Any]]:
     return ops
 
 
+async def enumerate_canonical_epoch_attesters(db, finalized_epoch: int) -> Dict[int, list]:
+    """Per-epoch attester sets computed from attestations carried in FINALIZED CANONICAL BLOCKS —
+    the DETERMINISTIC reward input (replacing db.get_epoch_attesters → the accumulated
+    `attestation_votes` table, which is NOT reorg-clean: a node can hold an extra/orphan vote,
+    diverging rewards → effective_stake, even though the schedule converges).
+
+    A vote counts for epoch e's reward iff a validator's attestation with target_epoch=e is carried
+    in a canonical block whose OWN epoch ≤ finalized_epoch (i.e. the carrying block is finalized) —
+    so every node, reading the identical finalized canonical blocks, derives the identical sets.
+    Deduped by (target_epoch, validator) — one honest vote per target; re-inclusion is idempotent.
+    (compute_epoch_reward_deltas only rewards attesters that are ACTIVE, so a spurious attester that
+    is not in the active set is harmless — no signature re-verification needed here.)"""
+    import ast
+    from .attestation_block import extract_attestations_from_dict
+    from .block_verification import epoch_from_block
+
+    sets: Dict[int, set] = {e: set() for e in range(int(finalized_epoch) + 1)}
+    try:
+        tip = (await db.get_next_block_id()) - 1
+    except Exception:
+        return {e: [] for e in sets}
+    for height in range(0, int(tip) + 1):
+        try:
+            block = await db.get_block_by_id(height)
+        except Exception:
+            block = None
+        if not block:
+            continue
+        content = block.get("content")
+        try:
+            bc = ast.literal_eval(content) if isinstance(content, str) else content
+        except Exception:
+            continue
+        if not isinstance(bc, dict):
+            continue
+        carry_epoch = epoch_from_block(bc)
+        if carry_epoch is None or carry_epoch > finalized_epoch:
+            continue  # only attestations carried in FINALIZED blocks are deterministic across nodes
+        for att in extract_attestations_from_dict(bc):
+            te = int(att.target_epoch)
+            if 0 <= te <= finalized_epoch:
+                sets[te].add(att.validator_address)
+    return {e: list(s) for e, s in sets.items()}
+
+
 async def reconstruct_validators_live(db, finalized_epoch: int, *, commit: bool = True) -> None:
     """Live entrypoint: gather the reconstruction inputs from the DB (genesis set, canonical STAKE
     ops, per-epoch attesters) and rebuild the ``validators`` dynamic state through ``finalized_epoch``
@@ -182,7 +227,9 @@ async def reconstruct_validators_live(db, finalized_epoch: int, *, commit: bool 
     deposited-validator dynamic state converges across nodes regardless of import history."""
     genesis = await db.get_genesis_validators()
     ops = await enumerate_canonical_validator_ops(db)
-    attesters_by_epoch = {e: await db.get_epoch_attesters(e) for e in range(int(finalized_epoch) + 1)}
+    # Reward input from FINALIZED CANONICAL BLOCKS (deterministic) — NOT db.get_epoch_attesters,
+    # whose backing attestation_votes table is not reorg-clean (see enumerate_canonical_epoch_attesters).
+    attesters_by_epoch = await enumerate_canonical_epoch_attesters(db, int(finalized_epoch))
     await reconstruct_validators_state(
         db, genesis_validators=genesis, canonical_ops=ops,
         attesters_by_epoch=attesters_by_epoch, finalized_epoch=int(finalized_epoch), commit=commit)

@@ -68,11 +68,17 @@ async def test_genesis_validator_converges_across_histories():
         await _close(b, pb)
 
 
-@pytest.mark.xfail(strict=True, reason="item 3: validators dynamic state is not reorg-reconstructed")
+@pytest.mark.xfail(strict=True, reason="the FORWARD register path alone still diverges BY DESIGN; "
+                   "item 3 is healed at the RECONSTRUCTION layer (epoch loop rebuilds from the "
+                   "canonical chain) — see test_validator_reconstruction_live.py, not here")
 @pytest.mark.asyncio
 async def test_deposited_validator_converges_across_histories():
     """A STAKE_DEPOSIT for V is canonically included at epoch 8. Two nodes with different reorg
-    histories of the SAME canonical chain MUST end with identical V state — but today they don't.
+    histories of the SAME canonical chain MUST end with identical V state — the FORWARD register
+    path alone does NOT (this stays xfail): that is exactly why the validators domain is rebuilt
+    from the canonical chain each finalized epoch (reconstruct_validators_live), which DOES converge
+    them — proven full-table byte-identical across nodes in
+    test_validator_reconstruction_live.py::test_reconstruct_live_converges_incl_rewards_* + soaks.
 
     Node A saw V's deposit first on an ORPHAN block at epoch 7 (register act=7+D), then the chain
     reorged and the canonical epoch-8 inclusion was re-flushed live (register again → TOP-UP: stake
