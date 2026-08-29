@@ -224,6 +224,8 @@ class TestnetOrchestrator:
             # Same value on every node → deterministic scheduling preserved.
             "QRDX_ACTIVATION_DELAY_EPOCHS": "1",
             "QRDX_UNBONDING_PERIOD_EPOCHS": "2",
+            # Operational-readiness: exercise the realtime stream (/ws + /stream) in-suite.
+            "QRDX_ENABLE_STREAMING": "true",
         }
 
         if spec.is_validator and spec.validator_index is not None:

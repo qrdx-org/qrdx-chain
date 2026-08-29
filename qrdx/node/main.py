@@ -21,8 +21,8 @@ import socket
 import sqlite3
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Body, Query, Depends, HTTPException, status 
-from fastapi.responses import RedirectResponse, Response
+from fastapi import FastAPI, Body, Query, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi.responses import RedirectResponse, Response, StreamingResponse, JSONResponse
 
 import httpx
 from httpx import TimeoutException
@@ -882,6 +882,88 @@ security = SecureNodeComponents()
 
 # Track startup time
 startup_time = time.time()
+
+# ─── Operational-readiness surface: health / metrics / realtime streaming ─────────────
+# Monitoring (health + Prometheus metrics) is ALWAYS on; the realtime WebSocket/SSE stream is
+# TOGGLEABLE (opt-in per operator) via QRDX_ENABLE_STREAMING. The stream is fed by a consensus-
+# decoupled poller (reads chain tip/finality only) so it can never stall or diverge block import.
+from qrdx.node.observability import (
+    EventHub, Metrics, chain_event_poller, sse_stream,
+)
+EVENT_HUB = EventHub()
+METRICS = Metrics()
+STREAMING_ENABLED = os.environ.get("QRDX_ENABLE_STREAMING", "").lower() in ("1", "true", "yes")
+_chain_poller_task: Optional[asyncio.Task] = None
+
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness probe — the process is up and serving. Always 200."""
+    return {"status": "ok", "version": NODE_VERSION,
+            "uptime_s": round(time.time() - startup_time, 1)}
+
+
+@app.get("/readyz")
+async def readyz():
+    """Readiness probe — the node can serve chain data (DB reachable, a tip exists). 503 if not,
+    so a load balancer / orchestrator drains this node until it is caught up."""
+    try:
+        tip = (await db.get_next_block_id()) - 1
+        ready = tip is not None and tip >= 0
+    except Exception:
+        tip, ready = None, False
+    return JSONResponse({"ready": ready, "height": tip if ready else None},
+                        status_code=200 if ready else 503)
+
+
+@app.get("/metrics")
+async def metrics_endpoint():
+    """Prometheus text exposition — chain height, finality, peers, stream subscribers, etc."""
+    try:
+        METRICS.set("qrdx_uptime_seconds", round(time.time() - startup_time, 1))
+        METRICS.set("qrdx_streaming_enabled", 1 if STREAMING_ENABLED else 0)
+    except Exception:
+        pass
+    return Response(METRICS.render_prometheus(), media_type="text/plain; version=0.0.4")
+
+
+@app.get("/stream")
+async def stream_endpoint():
+    """Realtime data stream over Server-Sent Events (HTTP; proxy/curl-friendly). Toggleable —
+    404 when QRDX_ENABLE_STREAMING is off. Emits a per-block feed + hello/keepalive frames."""
+    if not STREAMING_ENABLED:
+        return JSONResponse({"error": "streaming disabled", "hint": "set QRDX_ENABLE_STREAMING=1"},
+                            status_code=404)
+    METRICS.inc("qrdx_stream_connections_total")
+    return StreamingResponse(sse_stream(EVENT_HUB), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.websocket("/ws")
+async def ws_stream(websocket: WebSocket):
+    """Realtime data stream over WebSocket. Toggleable — closed immediately (policy 1008) when
+    QRDX_ENABLE_STREAMING is off. Server→client push of the block/finality feed; inbound client
+    frames are drained and ignored (a future revision can add topic subscriptions)."""
+    if not STREAMING_ENABLED:
+        await websocket.close(code=1008)  # policy violation: disabled
+        return
+    await websocket.accept()
+    METRICS.inc("qrdx_ws_connections_total")
+    q = EVENT_HUB.subscribe()
+    try:
+        await websocket.send_json({"type": "hello", "ts": time.time(), "version": NODE_VERSION})
+        while True:
+            try:
+                event = await asyncio.wait_for(q.get(), timeout=30.0)
+                await websocket.send_json(event)
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "ping", "ts": time.time()})  # detect dead peers
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        EVENT_HUB.unsubscribe(q)
 
 # Connection pool for HTTP requests
 http_client: Optional[httpx.AsyncClient] = None
@@ -3302,6 +3384,40 @@ async def startup():
     except Exception as e:
         logger.warning(f"Could not start epoch validator-update loop: {e}")
 
+    # ---- Operational-readiness: realtime chain-event poller (feeds /metrics + /ws + /stream) ----
+    # READ-ONLY (chain tip, peer count, finalized/justified epoch from the `epochs` table) — never
+    # touches the import path, so it cannot stall or diverge consensus. Runs on every node.
+    try:
+        global _chain_poller_task
+
+        async def _poll_tip():
+            return (await db.get_next_block_id()) - 1
+
+        async def _poll_finality():
+            try:
+                cur = await db.connection.execute(
+                    "SELECT COALESCE(MAX(CASE WHEN finalized=1 THEN epoch END), -1), "
+                    "COALESCE(MAX(CASE WHEN justified=1 THEN epoch END), -1) FROM epochs")
+                row = await cur.fetchone()
+                return {"finalized_epoch": int(row[0]), "justified_epoch": int(row[1])}
+            except Exception:
+                return {}
+
+        def _poll_peers():
+            try:
+                return len(NodesManager.peers) if hasattr(NodesManager, "peers") else 0
+            except Exception:
+                return 0
+
+        _chain_poller_task = asyncio.create_task(chain_event_poller(
+            EVENT_HUB, METRICS, get_tip=_poll_tip, get_peer_count=_poll_peers,
+            get_finality=_poll_finality, interval=2.0))
+        app.state.chain_poller_task = _chain_poller_task
+        logger.info("✅ Observability chain-event poller scheduled (streaming %s)",
+                    "ENABLED" if STREAMING_ENABLED else "disabled — /metrics + health still on")
+    except Exception as e:
+        logger.warning(f"Could not start observability poller: {e}")
+
     # ---- Wire module-level RPC server into app.state ----
     app.state.dht_rpc_module = dht_rpc_module
     app.state.rpc_server = rpc_server
@@ -3622,7 +3738,15 @@ async def shutdown():
     if http_client:
         await http_client.aclose()
         logger.info("Shared HTTP client closed.")
-        
+
+    # Stop the observability poller.
+    if _chain_poller_task is not None:
+        _chain_poller_task.cancel()
+        try:
+            await _chain_poller_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     await security.shutdown()
 
 
