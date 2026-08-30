@@ -68,6 +68,8 @@ class SoakReport:
     end_finalized: int = -1
     worst_live_spread: int = 0
     max_reorgs: int = 0
+    max_finality_lag: int = 0
+    max_mempool: int = 0
     violations: List[str] = field(default_factory=list)
     recovery: Optional[str] = None
 
@@ -91,6 +93,7 @@ class SoakReport:
             f"(all nodes advanced: {self.end_min_height > self.start_min_height})",
             f"  finalized_epoch {self.start_finalized} → {self.end_finalized}",
             f"  worst live height spread={self.worst_live_spread}  max reorgs={self.max_reorgs}",
+            f"  max finality lag={self.max_finality_lag} epochs  max mempool={self.max_mempool}",
         ]
         if self.recovery is not None:
             lines.append(f"  fault recovery: {self.recovery}")
@@ -107,6 +110,7 @@ async def run_soak_phase(
     node_processes: Optional[list] = None,
     fault_inject: bool = False,
     stall_ticks: int = 8,
+    max_finality_lag: int = 12,
 ) -> SoakReport:
     """Monitor the network for ``duration`` seconds, asserting the soak invariants each ``interval``.
     If ``fault_inject`` and ``node_processes`` are given, kills a non-primary node ~40% in and
@@ -198,6 +202,14 @@ async def run_soak_phase(
         if reorg_counts:
             report.max_reorgs = max(report.max_reorgs, max(reorg_counts))
 
+        # FINALITY LAG + MEMPOOL — track the worst for the report (alerting-ready signals).
+        lags = [int(m.get("qrdx_finality_lag_epochs", 0)) for m in metrics.values() if m]
+        if lags:
+            report.max_finality_lag = max(report.max_finality_lag, max(lags))
+        mempools = [int(m.get("qrdx_mempool_pending", 0)) for m in metrics.values() if m]
+        if mempools:
+            report.max_mempool = max(report.max_mempool, max(mempools))
+
         report.ticks += 1
         report.end_max_height = cur_max
         if heights:
@@ -219,6 +231,13 @@ async def run_soak_phase(
         report.violate("convergence", f"a node made no progress (min height "
                                       f"{report.start_min_height} → {report.end_min_height} while "
                                       f"max reached {report.end_max_height})")
+
+    # FINALITY LAG — finality must keep PACE with the tip; a lag that peaks beyond the bound means
+    # finality is falling behind (distinct from the finalized-advances check: finality can advance
+    # yet still lose ground to a faster-growing tip).
+    if report.max_finality_lag > max_finality_lag:
+        report.violate("finality-lag", f"finality lag peaked at {report.max_finality_lag} epochs "
+                                       f"(> {max_finality_lag}) — finality falling behind the tip")
 
     # RECOVERY — the restarted node must re-sync near the tip.
     if fault_inject and killed_url is not None:

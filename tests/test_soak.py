@@ -24,9 +24,10 @@ def _feeder(seq):
     return scrape
 
 
-def _uniform(height, finalized=1, slashing=0, reorgs=0):
+def _uniform(height, finalized=1, slashing=0, reorgs=0, lag=0, mempool=0):
     return {u: {"qrdx_chain_height": height, "qrdx_finalized_epoch": finalized,
-                "qrdx_slashing_events": slashing, "qrdx_reorgs_total": reorgs} for u in URLS}
+                "qrdx_slashing_events": slashing, "qrdx_reorgs_total": reorgs,
+                "qrdx_finality_lag_epochs": lag, "qrdx_mempool_pending": mempool} for u in URLS}
 
 
 def test_report_verdict_and_summary():
@@ -97,6 +98,29 @@ async def test_detects_slashing_safety_violation(monkeypatch):
     rep = await run_soak_phase(URLS, duration=0.2, interval=0.02)
     assert not rep.passed
     assert any(v.startswith("safety") for v in rep.violations)
+
+
+@pytest.mark.asyncio
+async def test_detects_finality_lag_falling_behind(monkeypatch):
+    """Finality advances but the tip outruns it → the lag peaks past the bound → finality-lag
+    violation (distinct from the finalized-frozen check)."""
+    seq = [_uniform(h, finalized=1 + h // 5, lag=h) for h in range(1, 20)]  # lag grows with height
+    monkeypatch.setattr(soak, "_scrape_metrics", _feeder(seq))
+    monkeypatch.setattr(soak, "_healthz_ok", lambda u, timeout=5.0: True)
+    rep = await run_soak_phase(URLS, duration=0.3, interval=0.01, max_finality_lag=8)
+    assert not rep.passed
+    assert any(v.startswith("finality-lag") for v in rep.violations)
+    assert rep.max_finality_lag >= 9
+
+
+@pytest.mark.asyncio
+async def test_bounded_finality_lag_and_mempool_pass(monkeypatch):
+    seq = [_uniform(h, finalized=1 + h // 3, lag=2, mempool=5) for h in range(1, 14)]
+    monkeypatch.setattr(soak, "_scrape_metrics", _feeder(seq))
+    monkeypatch.setattr(soak, "_healthz_ok", lambda u, timeout=5.0: True)
+    rep = await run_soak_phase(URLS, duration=0.2, interval=0.02, max_finality_lag=8)
+    assert rep.passed, rep.summary()
+    assert rep.max_finality_lag == 2 and rep.max_mempool == 5
 
 
 @pytest.mark.asyncio

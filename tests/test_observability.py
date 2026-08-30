@@ -93,6 +93,19 @@ async def test_poller_emits_block_events_and_updates_metrics():
 
 
 @pytest.mark.asyncio
+async def test_poller_computes_finality_lag_and_mempool():
+    hub, m = EventHub(), Metrics()
+    fin = {"finalized_epoch": 5, "justified_epoch": 6, "max_epoch": 9}
+    await chain_event_poller(
+        hub, m, get_tip=lambda: 100, get_finality=lambda: fin,
+        get_mempool_depth=lambda: 12, interval=0, _max_iterations=1)
+    snap = m.snapshot()
+    assert snap["qrdx_finalized_epoch"] == 5
+    assert snap["qrdx_finality_lag_epochs"] == 4      # 9 - 5
+    assert snap["qrdx_mempool_pending"] == 12
+
+
+@pytest.mark.asyncio
 async def test_poller_survives_getter_errors():
     hub, m = EventHub(), Metrics()
     def boom():

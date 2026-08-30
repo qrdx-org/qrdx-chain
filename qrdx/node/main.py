@@ -3402,11 +3402,19 @@ async def startup():
             try:
                 cur = await db.connection.execute(
                     "SELECT COALESCE(MAX(CASE WHEN finalized=1 THEN epoch END), -1), "
-                    "COALESCE(MAX(CASE WHEN justified=1 THEN epoch END), -1) FROM epochs")
+                    "COALESCE(MAX(CASE WHEN justified=1 THEN epoch END), -1), "
+                    "COALESCE(MAX(epoch), -1) FROM epochs")
                 row = await cur.fetchone()
-                return {"finalized_epoch": int(row[0]), "justified_epoch": int(row[1])}
+                return {"finalized_epoch": int(row[0]), "justified_epoch": int(row[1]),
+                        "max_epoch": int(row[2])}
             except Exception:
                 return {}
+
+        async def _poll_mempool():
+            try:
+                return int(await db.get_pending_transaction_count())
+            except Exception:
+                return 0
 
         def _poll_peers():
             try:
@@ -3422,9 +3430,12 @@ async def startup():
                 return 0
 
         METRICS.describe("qrdx_slashing_events", "Recorded slashing events (0 on an honest network)")
+        METRICS.describe("qrdx_finality_lag_epochs", "Epochs the tip is ahead of the finalized boundary")
+        METRICS.describe("qrdx_mempool_pending", "Pending transactions in the mempool")
         _chain_poller_task = asyncio.create_task(chain_event_poller(
             EVENT_HUB, METRICS, get_tip=_poll_tip, get_peer_count=_poll_peers,
-            get_finality=_poll_finality, get_slashing_count=_poll_slashing, interval=2.0))
+            get_finality=_poll_finality, get_slashing_count=_poll_slashing,
+            get_mempool_depth=_poll_mempool, interval=2.0))
         app.state.chain_poller_task = _chain_poller_task
         logger.info("✅ Observability chain-event poller scheduled (streaming %s)",
                     "ENABLED" if STREAMING_ENABLED else "disabled — /metrics + health still on")

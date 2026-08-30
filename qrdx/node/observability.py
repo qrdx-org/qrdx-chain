@@ -165,6 +165,7 @@ async def chain_event_poller(
     get_peer_count: Optional[_MaybeAsync] = None,
     get_finality: Optional[_MaybeAsync] = None,
     get_slashing_count: Optional[_MaybeAsync] = None,
+    get_mempool_depth: Optional[_MaybeAsync] = None,
     interval: float = 1.0,
     _max_iterations: Optional[int] = None,   # test hook
 ) -> None:
@@ -191,10 +192,18 @@ async def chain_event_poller(
             fin: Dict[str, Any] = {}
             if get_finality is not None:
                 fin = (await _maybe_await(get_finality())) or {}
-                metrics.set("qrdx_finalized_epoch", int(fin.get("finalized_epoch", -1)))
+                fin_ep = int(fin.get("finalized_epoch", -1))
+                metrics.set("qrdx_finalized_epoch", fin_ep)
                 metrics.set("qrdx_justified_epoch", int(fin.get("justified_epoch", -1)))
+                # Finality lag = how many epochs the tip is ahead of the finalized boundary. A
+                # healthy chain keeps this small + bounded; a growing lag = finality falling behind
+                # (the key production alert). -1 finalized (pre-finality) → lag 0 (not yet meaningful).
+                max_ep = int(fin.get("max_epoch", -1))
+                metrics.set("qrdx_finality_lag_epochs", max(0, max_ep - fin_ep) if fin_ep >= 0 else 0)
             if get_slashing_count is not None:
                 metrics.set("qrdx_slashing_events", int(await _maybe_await(get_slashing_count())))
+            if get_mempool_depth is not None:
+                metrics.set("qrdx_mempool_pending", int(await _maybe_await(get_mempool_depth())))
 
             if tip > last_height:
                 # Emit a per-height block event (cap the catch-up burst so a fresh node that jumps
