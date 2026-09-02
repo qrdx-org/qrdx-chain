@@ -70,6 +70,7 @@ class SoakReport:
     max_reorgs: int = 0
     max_finality_lag: int = 0
     max_mempool: int = 0
+    end_finality_spread: int = 0
     violations: List[str] = field(default_factory=list)
     recovery: Optional[str] = None
 
@@ -91,7 +92,8 @@ class SoakReport:
             f"(+{self.end_max_height - self.start_max_height})",
             f"  min height {self.start_min_height} → {self.end_min_height} "
             f"(all nodes advanced: {self.end_min_height > self.start_min_height})",
-            f"  finalized_epoch {self.start_finalized} → {self.end_finalized}",
+            f"  finalized_epoch {self.start_finalized} → {self.end_finalized} "
+            f"(cross-node spread at end={self.end_finality_spread})",
             f"  worst live height spread={self.worst_live_spread}  max reorgs={self.max_reorgs}",
             f"  max finality lag={self.max_finality_lag} epochs  max mempool={self.max_mempool}",
         ]
@@ -111,6 +113,7 @@ async def run_soak_phase(
     fault_inject: bool = False,
     stall_ticks: int = 8,
     max_finality_lag: int = 12,
+    max_finality_spread: int = 2,
 ) -> SoakReport:
     """Monitor the network for ``duration`` seconds, asserting the soak invariants each ``interval``.
     If ``fault_inject`` and ``node_processes`` are given, kills a non-primary node ~40% in and
@@ -122,6 +125,7 @@ async def run_soak_phase(
     killed_idx: Optional[int] = None
     killed_url: Optional[str] = None
     restart_pending = False
+    latest_finals: List[int] = []
     fault_kill_at = duration * 0.40
     fault_restart_at = duration * 0.70
     height_at_kill = -1
@@ -170,6 +174,9 @@ async def run_soak_phase(
         heights = [int(m.get("qrdx_chain_height", -1)) for m in metrics.values() if m]
         heights = [h for h in heights if h >= 0]
         finals = [int(m.get("qrdx_finalized_epoch", -1)) for m in metrics.values() if m]
+        node_finals = [f for f in finals if f >= 0]
+        if node_finals:
+            latest_finals = node_finals
         slashes = [int(m.get("qrdx_slashing_events", 0)) for m in metrics.values() if m]
         reorg_counts = [int(m.get("qrdx_reorgs_total", 0)) for m in metrics.values() if m]
 
@@ -238,6 +245,17 @@ async def run_soak_phase(
     if report.max_finality_lag > max_finality_lag:
         report.violate("finality-lag", f"finality lag peaked at {report.max_finality_lag} epochs "
                                        f"(> {max_finality_lag}) — finality falling behind the tip")
+
+    # FINALITY CONVERGENCE — at the end, all assessed nodes must agree on the finalized epoch (within
+    # a small tolerance for propagation timing). A node stuck far below the others' finalized epoch
+    # is a real divergence (matters most at scale, where propagation spread is larger). This is the
+    # cross-node convergence signal the single-node advance checks can't give.
+    if len(latest_finals) >= 2:
+        report.end_finality_spread = max(latest_finals) - min(latest_finals)
+        if report.end_finality_spread > max_finality_spread:
+            report.violate("finality-convergence", f"nodes disagree on finalized epoch by "
+                           f"{report.end_finality_spread} (> {max_finality_spread}) at soak end "
+                           f"— {sorted(latest_finals)}")
 
     # RECOVERY — the restarted node must re-sync near the tip.
     if fault_inject and killed_url is not None:

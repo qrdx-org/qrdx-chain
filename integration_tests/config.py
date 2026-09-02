@@ -45,8 +45,11 @@ ATTESTATION_THRESHOLD = Decimal("0.667")
 
 BASE_NODE_PORT = 3007
 BASE_RPC_PORT = 8545
-NUM_NODES = 4
-NUM_VALIDATORS = 3
+# Validator/node counts are env-overridable so a scaled at-scale soak (and the RANDAO enforce
+# experiment, whose churn averages out on a larger set) can bump them without a code change; the
+# fast dev default stays 3 validators + 1 full node. NUM_NODES defaults to NUM_VALIDATORS + 1.
+NUM_VALIDATORS = int(os.getenv("QRDX_NUM_VALIDATORS", "3"))
+NUM_NODES = int(os.getenv("QRDX_NUM_NODES", str(max(4, NUM_VALIDATORS + 1))))
 
 # ──────────────────────────────────────────────────────────────────
 #  Genesis Allocations
@@ -74,10 +77,10 @@ class WalletSpec:
 
 
 WALLET_ROSTER: List[WalletSpec] = [
-    # Validators
-    WalletSpec("Validator 0", "pq", VALIDATOR_GENESIS_BALANCE, is_validator=True, validator_index=0),
-    WalletSpec("Validator 1", "pq", VALIDATOR_GENESIS_BALANCE, is_validator=True, validator_index=1),
-    WalletSpec("Validator 2", "pq", VALIDATOR_GENESIS_BALANCE, is_validator=True, validator_index=2),
+    # Validators — generated dynamically for NUM_VALIDATORS (env-scalable). Validator 0..2 remain
+    # the wallets the scenarios reference by name; extras (3+) just add consensus participants.
+    *(WalletSpec(f"Validator {i}", "pq", VALIDATOR_GENESIS_BALANCE, is_validator=True,
+                 validator_index=i) for i in range(NUM_VALIDATORS)),
     # Test users (numbered to match scenario references)
     WalletSpec("Test User 0", "pq", TEST_USER_BALANCE),
     WalletSpec("Test User 1", "traditional", TEST_USER_BALANCE),

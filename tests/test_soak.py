@@ -91,6 +91,23 @@ async def test_trailing_but_advancing_node_passes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_detects_finality_divergence_across_nodes(monkeypatch):
+    """All nodes advance, but one node's finalized epoch stays far below the others → cross-node
+    finality-convergence violation (the at-scale stuck/lagging-node signal)."""
+    def snap(h):
+        return {"http://n0": {"qrdx_chain_height": h, "qrdx_finalized_epoch": h // 2},
+                "http://n1": {"qrdx_chain_height": h, "qrdx_finalized_epoch": h // 2},
+                "http://n2": {"qrdx_chain_height": h, "qrdx_finalized_epoch": 1}}  # n2 finality stuck
+    seq = [snap(h) for h in range(4, 20)]
+    monkeypatch.setattr(soak, "_scrape_metrics", _feeder(seq))
+    monkeypatch.setattr(soak, "_healthz_ok", lambda u, timeout=5.0: True)
+    rep = await run_soak_phase(URLS, duration=0.3, interval=0.02, max_finality_spread=2)
+    assert not rep.passed
+    assert any(v.startswith("finality-convergence") for v in rep.violations)
+    assert rep.end_finality_spread > 2
+
+
+@pytest.mark.asyncio
 async def test_detects_slashing_safety_violation(monkeypatch):
     seq = [_uniform(h, slashing=1) for h in range(1, 12)]  # advancing but slashing recorded
     monkeypatch.setattr(soak, "_scrape_metrics", _feeder(seq))
