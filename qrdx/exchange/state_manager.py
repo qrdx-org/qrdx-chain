@@ -22,27 +22,33 @@ Security:
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import hashlib
 import json
 import logging
 import time
 from dataclasses import asdict
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from .amm import (
     ConcentratedLiquidityPool,
+    FEE_CREATOR_SHARE,
+    FEE_TREASURY_SHARE,
+    FEE_VALIDATOR_SHARE,
     FeeTier,
     PoolManager,
     PoolType,
     Q96,
-    tick_to_sqrt_price,
 )
 from .hooks import CircuitBreaker, HookContext, HookRegistry
 from .oracle import TWAPOracle
-from .orderbook import Order, OrderBook, OrderSide, OrderType, SelfTradeAction
+from .orderbook import Order, OrderBook, OrderSide, OrderType, SelfTradeAction, _pinned
+from .clearinghouse import Clearinghouse, ClearinghouseError
 from .perpetual import PerpEngine, PerpSide
 from .router import FillSource, UnifiedRouter
+from .tokens import TokenError, TokenRegistry, account as token_account, amount as token_amount
 from .transactions import (
     EXCHANGE_GAS_COSTS,
     ExchangeOpType,
@@ -101,8 +107,28 @@ class ExchangeStateManager:
     def __init__(self) -> None:
         # --- Engine instances (consensus-critical state) ---
         self.pool_manager = PoolManager()
+        # Legacy: no consensus path reaches PerpEngine any more (its positions had no
+        # counterparty). Perps trade through the clearinghouse (docs/PERPS_CLEARINGHOUSE.md).
         self.perp_engine = PerpEngine()
+        self.clearinghouse = Clearinghouse()
+        # Validator price oracle (docs/PERPS_CLEARINGHOUSE.md §8). The committee — address →
+        # stake — starts from the genesis block's validator set (loaded before the first block
+        # section by block_processor.preload_sender_balances) and follows STAKE_DEPOSIT /
+        # STAKE_EXIT. None: not loaded, or a genesis without a validator set — votes disabled.
+        self.oracle_committee: Optional[Dict[str, Decimal]] = None
+        # market_id → voter → (price, block time of the vote)
+        self.oracle_votes: Dict[str, Dict[str, Tuple[Decimal, Decimal]]] = {}
+        # Node-local receipts + perps event feed for wallets, the API and streams — NOT
+        # consensus state (see journal.py). Recorded at commit, rebuilt with the manager.
+        from .journal import ExchangeJournal
+        self.journal = ExchangeJournal()
+        self._block_tick_events: List[Dict[str, Any]] = []
         self.router = UnifiedRouter(pool_manager=self.pool_manager)
+        # Funding cadence, oracle staleness and swap deadlines are judged by the block being
+        # processed (begin_block sets it), so every node — and every rebuild or catching-up
+        # sync — decides them identically. They used to read the wall clock.
+        self.perp_engine.clock = self._block_clock
+        self.router.clock = self._block_clock
         self.hook_registry = HookRegistry()
         self.circuit_breaker = CircuitBreaker()
 
@@ -115,11 +141,6 @@ class ExchangeStateManager:
         self._oracles: Dict[str, TWAPOracle] = {}
         # Per-sender nonces for replay protection
         self._nonces: Dict[str, int] = {}
-
-        # --- EVM precompile state (consensus-safe, owned by this manager) ---
-        # Exchange precompiles delegate to these dicts instead of module-level state.
-        self._precompile_pools: Dict[bytes, dict] = {}
-        self._precompile_orderbooks: Dict[str, dict] = {}
 
         # --- Block-level tracking ---
         self._current_block_height: int = 0
@@ -161,10 +182,11 @@ class ExchangeStateManager:
         # async wrapper when spot settlement is enforced. Block-scoped, so not part
         # of the exchange state root.
         self._token_balance_deltas: Dict[Tuple[str, str], Decimal] = {}
-        # Per-block QRC-20 registry creations (TOKEN_DEPLOY) to flush to the durable
-        # token_registry alongside the balance deltas. Deterministic metadata
-        # (replicated on every node); the value-bearing state is the balance root.
-        self._token_registry_ops: List[Dict[str, Any]] = []
+        # The native token standard (qrdx/exchange/tokens.py): every token's registry entry
+        # (supply, authorities), the allowances and the frozen accounts. Exchange state —
+        # replayed on every path and committed in the exchange root; the balances live in
+        # the token ledger. Tokens it changes in a block are mirrored to the DB registry.
+        self.tokens = TokenRegistry()
         # Per-block validator-lifecycle ops (STAKE_DEPOSIT / STAKE_EXIT) to flush to
         # the consensus validators table. Deterministic (same txs on every node),
         # reset per block. See qrdx.validator.epoch_loop for activation scheduling.
@@ -191,6 +213,20 @@ class ExchangeStateManager:
         # pool is created as before and no value moves (behaviour-neutral).
         self.enforce_pool_stake: bool = False
 
+        # Validator-stake gate. A STAKE_DEPOSIT registers the sender as a consensus
+        # validator with the stake it CLAIMS, and that claimed figure becomes the
+        # validator's effective_stake — which weights proposer selection and
+        # fork-choice attesting weight. So an unbacked claim is a consensus attack,
+        # not just an accounting error: a zero-balance account could claim more stake
+        # than the honest set combined and dominate both.
+        #
+        # ON: the deposit must clear MIN_VALIDATOR_STAKE, the sender must actually
+        # hold the stake, and it is DEBITED from account_state (refunded at the
+        # deterministic finalized exit epoch — see epoch_loop). Like
+        # enforce_pool_stake this must gate the delta RECORDING, because the shared
+        # account_state flush is already enforced for collateral.
+        self.enforce_validator_stake: bool = False
+
         # --- Counters ---
         self._total_swaps: int = 0
         self._total_orders: int = 0
@@ -214,6 +250,10 @@ class ExchangeStateManager:
     #  Block lifecycle
     # =====================================================================
 
+    def _block_clock(self) -> float:
+        """Timestamp of the block being processed — the exchange's only consensus clock."""
+        return float(self._current_block_timestamp)
+
     def begin_block(self, block_height: int, block_timestamp: float) -> None:
         """
         Called at the start of block processing.
@@ -227,15 +267,18 @@ class ExchangeStateManager:
         self._block_fees = ZERO
         self._balance_deltas = {}  # Phase E: reset per-block balance deltas
         self._token_balance_deltas = {}  # Phase E (spot): reset per-block token deltas
-        self._token_registry_ops = []    # Phase E (spot): reset per-block registry creations
+        self.tokens.changed.clear()      # the DB registry mirror is written per block
         self._validator_lifecycle_ops = []  # Phase 3: reset per-block staking deposit/exit ops
+        self._block_tick_events = []        # journal: this block's liquidations + funding
+        self._block_journaled = False
 
-        # Reset per-block rate limits on all order books
+        # Reset per-block rate limits on all order books; expiry is judged by block time
         for book in self._order_books.values():
-            book.new_block()
+            book.new_block(block_timestamp)
 
         # Reset circuit breaker per-block counters
         self.circuit_breaker.new_block()
+        self.clearinghouse.new_block(block_timestamp)
 
     def finalize_block(self) -> str:
         """
@@ -274,14 +317,29 @@ class ExchangeStateManager:
 
         Discards the pre-block revert snapshot so a later ``revert_block`` cannot
         undo committed state. Called once a block (its exchange section) has been
-        validated and accepted by consensus.
+        validated and accepted by consensus. Records the block in the journal.
         """
         self._snapshot = None
+        if not getattr(self, "_block_journaled", False):
+            self._block_journaled = True
+            try:
+                self.journal.record_block(
+                    self._current_block_height, self._current_block_timestamp,
+                    self._block_exchange_txs, self._block_results, self._block_tick_events)
+            except Exception as e:              # the journal must never break a block
+                logger.warning("exchange journal: block %s not recorded: %s",
+                               self._current_block_height, e)
+        self._block_tick_events = []
+
+    def record_tick_events(self, events: List[Dict[str, Any]]) -> None:
+        """The block-boundary tick's liquidations and funding, for the journal at commit."""
+        self._block_tick_events.extend(events or [])
 
     # =====================================================================
     #  Transaction processing (consensus-critical)
     # =====================================================================
 
+    @_pinned
     def process_transaction(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """
         Execute a single exchange transaction deterministically.
@@ -326,9 +384,12 @@ class ExchangeStateManager:
                 success=False, gas_used=base_gas, error=str(e)
             )
 
-        # 5. Update nonce on success
-        if result.success:
-            self._nonces[tx.sender] = tx.nonce + 1
+        # 5. Consume the nonce once the operation has EXECUTED — success or failure. It used
+        #    to advance only on success, so a failing operation could be re-submitted and
+        #    re-included indefinitely at the same nonce: one signed transaction, unlimited
+        #    block space. Transactions rejected before execution (malformed, wrong nonce,
+        #    under-gassed — steps 1-3) are not includable and consume nothing.
+        self._nonces[tx.sender] = tx.nonce + 1
 
         # 6. Charge gas
         if result.gas_used == 0:
@@ -356,14 +417,29 @@ class ExchangeStateManager:
             ExchangeOpType.SWAP: self._op_swap,
             ExchangeOpType.PLACE_ORDER: self._op_place_order,
             ExchangeOpType.CANCEL_ORDER: self._op_cancel_order,
-            ExchangeOpType.OPEN_POSITION: self._op_open_position,
-            ExchangeOpType.CLOSE_POSITION: self._op_close_position,
-            ExchangeOpType.PARTIAL_CLOSE: self._op_partial_close,
-            ExchangeOpType.ADD_MARGIN: self._op_add_margin,
+            ExchangeOpType.OPEN_POSITION: self._op_retired_perp,
+            ExchangeOpType.CLOSE_POSITION: self._op_retired_perp,
+            ExchangeOpType.PARTIAL_CLOSE: self._op_retired_perp,
+            ExchangeOpType.ADD_MARGIN: self._op_retired_perp,
+            ExchangeOpType.PERP_DEPOSIT: self._op_perp_deposit,
+            ExchangeOpType.PERP_WITHDRAW: self._op_perp_withdraw,
+            ExchangeOpType.PERP_SET_LEVERAGE: self._op_perp_set_leverage,
+            ExchangeOpType.PERP_ORDER: self._op_perp_order,
+            ExchangeOpType.PERP_CANCEL: self._op_perp_cancel,
+            ExchangeOpType.VAULT_DEPOSIT: self._op_vault_deposit,
+            ExchangeOpType.VAULT_WITHDRAW: self._op_vault_withdraw,
+            ExchangeOpType.ORACLE_VOTE: self._op_oracle_vote,
             ExchangeOpType.UPDATE_ORACLE: self._op_update_oracle,
             ExchangeOpType.CREATE_MARKET: self._op_create_market,
             ExchangeOpType.TOKEN_DEPLOY: self._op_token_deploy,
             ExchangeOpType.TOKEN_TRANSFER: self._op_token_transfer,
+            ExchangeOpType.TOKEN_MINT: self._op_token_mint,
+            ExchangeOpType.TOKEN_BURN: self._op_token_burn,
+            ExchangeOpType.TOKEN_APPROVE: self._op_token_approve,
+            ExchangeOpType.TOKEN_TRANSFER_FROM: self._op_token_transfer_from,
+            ExchangeOpType.TOKEN_SET_AUTHORITY: self._op_token_set_authority,
+            ExchangeOpType.TOKEN_FREEZE: self._op_token_freeze,
+            ExchangeOpType.TOKEN_THAW: self._op_token_freeze,
             ExchangeOpType.STAKE_DEPOSIT: self._op_stake_deposit,
             ExchangeOpType.STAKE_EXIT: self._op_stake_exit,
         }
@@ -382,7 +458,11 @@ class ExchangeStateManager:
         p = tx.params
         fee_tier = FeeTier(int(p["fee_tier"]))
         pool_type = PoolType[p["pool_type"]] if isinstance(p["pool_type"], str) else PoolType(int(p["pool_type"]))
-        sqrt_price = Decimal(str(p["initial_sqrt_price"]))
+        if p.get("initial_price") is not None:
+            # Plain price, token1 per token0 of the CANONICAL (sorted) pair.
+            sqrt_price = Decimal(str(p["initial_price"])).sqrt() * Q96
+        else:
+            sqrt_price = Decimal(str(p["initial_sqrt_price"]))
         stake = Decimal(str(p["stake_amount"]))
 
         # Phase E: pool creation must be backed by real QRDX. Check affordability of
@@ -404,10 +484,13 @@ class ExchangeStateManager:
                 tx.sender[:20], stake, avail,
             )
 
-        pool = self.pool_manager.create_pool(
-            p["token0"], p["token1"], fee_tier, pool_type,
-            sqrt_price, tx.sender, stake,
-        )
+        try:
+            pool = self.pool_manager.create_pool(
+                p["token0"], p["token1"], fee_tier, pool_type,
+                sqrt_price, tx.sender, stake,
+            )
+        except ValueError as e:
+            return ExchangeExecResult(success=False, error=str(e))
 
         # Debit the stake as a real-balance move (flushed to account_state by the
         # async wrapper). Only RECORD the delta when enforcing — the shared flush is
@@ -422,7 +505,7 @@ class ExchangeStateManager:
         if pair_key not in self._order_books:
             book = OrderBook(
                 pool_id=pair_key,
-                self_trade_action=SelfTradeAction.REJECT,
+                self_trade_action=SelfTradeAction.CANCEL_TAKER,
             )
             self._order_books[pair_key] = book
             self.router.register_order_book(pair_key, book)
@@ -441,39 +524,50 @@ class ExchangeStateManager:
 
     def _op_remove_pool(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Remove a pool the sender created and REFUND its staked QRDX (the mirror of the
-        CREATE_POOL stake debit — completes the pool-stake lifecycle). Only the creator may
-        remove it, and only an EMPTY pool (liquidity withdrawn) — else LPs' reserves would be
-        stranded. SUBSIDIZED pools burned their stake, so it is never refunded."""
+        CREATE_POOL stake debit). Only the creator may, and only once no position remains —
+        any position, in range or not, still owns tokens in the pool. The protocol's share of
+        the fees it collected is paid out as §7.6 splits it: the creator's part (15 of 30) to
+        the creator, the treasury's and validators' to the treasury. SUBSIDIZED pools burned
+        their stake, so it is never refunded."""
         p = tx.params
         pool = self.pool_manager.get_pool(p["pool_id"]) if p.get("pool_id") else None
         if pool is None:
             return ExchangeExecResult(success=False, error=f"no such pool: {p.get('pool_id')}")
         if tx.sender != pool.state.creator:
             return ExchangeExecResult(success=False, error="only the pool creator may remove it")
-        if Decimal(str(pool.state.liquidity or 0)) > ZERO:
+        if pool.state.positions:
             return ExchangeExecResult(
                 success=False,
-                error=f"pool has active liquidity ({pool.state.liquidity}); remove liquidity first")
+                error=f"pool still has {len(pool.state.positions)} position(s); remove them first")
 
         from .amm import PoolType
+        from .. import constants
         stake = Decimal(str(pool.state.stake_amount or 0))
         pool_type = pool.state.pool_type
         pair_key = f"{pool.state.token0}:{pool.state.token1}"
+        holder = self.pool_holder_address(pool.state.id)
+        treasury = constants.SYSTEM_WALLET_ADDRESSES["TREASURY_MULTISIG"]
+        share = FEE_CREATOR_SHARE / (FEE_CREATOR_SHARE + FEE_TREASURY_SHARE + FEE_VALIDATOR_SHARE)
+        try:
+            with self._atomic(pool):
+                for token, fees in ((pool.state.token0, pool.state.protocol_fees_0),
+                                    (pool.state.token1, pool.state.protocol_fees_1)):
+                    to_creator = (fees * share).quantize(Decimal("1e-18"), rounding=ROUND_FLOOR)
+                    self._settle_token_move(holder, pool.state.creator, token, to_creator)
+                    self._settle_token_move(holder, treasury, token, fees - to_creator)
+        except ValueError as e:
+            return ExchangeExecResult(success=False, error=str(e))
 
         self.pool_manager.remove_pool(pool.state.id)
-        # Drop the matching order book + oracle (mirror create). Reorg rebuild replays
-        # CREATE_POOL (recreates) then REMOVE_POOL (removes), so the in-memory state converges.
-        book = self._order_books.pop(pair_key, None)
-        if book is not None:
-            try:
+        # The order book and reporter oracle are per PAIR; keep them while another pool of the
+        # pair remains (removing them would strand that book's resting orders).
+        if not self.pool_manager.get_pools_for_pair(pool.state.token0, pool.state.token1):
+            book = self._order_books.get(pair_key)
+            if book is not None and not book._orders:
+                self._order_books.pop(pair_key, None)
                 self.router.unregister_order_book(pair_key)
-            except Exception:
-                pass
-        self._oracles.pop(pair_key, None)
+            self._oracles.pop(pair_key, None)
 
-        # Refund the creator's staked QRDX as a real-balance CREDIT (mirror the debit; flushed
-        # to account_state by the async wrapper, reconstructed on reorg like a margin release).
-        # Only when ENFORCING (the debit only happened then) and only for STAKING pools.
         refunded = ZERO
         if self.enforce_pool_stake and pool_type != PoolType.SUBSIDIZED and stake > ZERO:
             self._record_balance_delta(tx.sender, stake)
@@ -484,125 +578,179 @@ class ExchangeStateManager:
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.REMOVE_POOL],
             data={"pool_id": pool.state.id, "refunded_stake": str(refunded),
-                  "burned_stake": str(stake) if pool_type == PoolType.SUBSIDIZED else "0"},
+                  "burned_stake": str(stake) if pool_type == PoolType.SUBSIDIZED else "0",
+                  "protocol_fees": [str(pool.state.protocol_fees_0),
+                                    str(pool.state.protocol_fees_1)]},
         )
 
     def _op_add_liquidity(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Deposit liquidity ``amount`` (L) in [tick_lower, tick_upper). The tokens it costs —
+        rounded up, in the pool's favour — move from the provider to the pool's holder. The pool
+        is named by ``pool_id``, or by ``token0`` / ``token1`` (+ ``fee_tier`` when the pair has
+        several pools)."""
         p = tx.params
-        # Resolve by pool_id, or by token pair (the pool_id is a hash of an internal
-        # sequence the submitter can't predict, so callers may reference the pool by
-        # its token0/token1 addresses instead).
         pool = self.pool_manager.get_pool(p["pool_id"]) if p.get("pool_id") else None
         if pool is None and p.get("token0") and p.get("token1"):
-            pool = self._find_pool_for_pair(str(p["token0"]), str(p["token1"]))
+            pool = self._find_pool_for_pair(str(p["token0"]), str(p["token1"]), p.get("fee_tier"))
         if pool is None:
             return ExchangeExecResult(success=False, error="Pool not found")
-
         tick_lower, tick_upper = int(p["tick_lower"]), int(p["tick_upper"])
         liquidity = Decimal(str(p["amount"]))
-        # Phase E spot: the deposited token0/token1 amounts (sqrt_price/tick are
-        # unchanged by an LP add, so computing them pre-add equals the deposit).
-        amt0, amt1 = self._cl_token_amounts(pool, tick_lower, tick_upper, liquidity)
-        # Under enforcement the LP must actually hold the tokens it escrows — else a
-        # clamp-at-0 debit on the flush would mint reserves from nothing.
+        try:
+            pool._check_range(tick_lower, tick_upper)
+        except ValueError as e:
+            return ExchangeExecResult(success=False, error=str(e))
+        if liquidity <= 0:
+            return ExchangeExecResult(success=False, error="Liquidity amount must be positive")
+        amt0, amt1 = pool.amounts_for_liquidity(tick_lower, tick_upper, liquidity, round_up=True)
         if self.enforce_spot_settlement:
             for tok, amt in ((pool.state.token0, amt0), (pool.state.token1, amt1)):
                 av = self.available_token_balance(tx.sender, tok)
                 if av is not None and av < amt:
                     return ExchangeExecResult(
                         success=False,
-                        error=f"insufficient {tok[:10]} for liquidity: need {amt}, available {av}",
-                    )
-        position = pool.add_liquidity(tx.sender, tick_lower, tick_upper, liquidity)
-        # Escrow the deposited tokens LP→pool holder (real, conserved balances).
+                        error=f"insufficient {tok[:10]} for liquidity: need {amt}, available {av}")
         holder = self.pool_holder_address(pool.state.id)
-        self._settle_token_move(tx.sender, holder, pool.state.token0, amt0)
-        self._settle_token_move(tx.sender, holder, pool.state.token1, amt1)
+        with self._atomic(pool):
+            position = pool.add_liquidity(tx.sender, tick_lower, tick_upper, liquidity,
+                                          now=int(self._block_clock()))
+            self._settle_token_move(tx.sender, holder, pool.state.token0, amt0)
+            self._settle_token_move(tx.sender, holder, pool.state.token1, amt1)
         return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ADD_LIQUIDITY],
-            data={"position_id": position.id, "amount0": str(amt0), "amount1": str(amt1)},
-        )
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ADD_LIQUIDITY],
+            data={"pool_id": pool.state.id, "position_id": position.id,
+                  "liquidity": str(liquidity), "amount0": str(amt0), "amount1": str(amt1)})
 
     def _op_remove_liquidity(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Withdraw ``amount`` of L (default: all) from one of the SENDER's positions: its
+        principal at the current price (rounded down) plus every fee it has earned move from
+        the pool's holder to the owner. ``amount`` 0 collects fees only."""
         p = tx.params
         pool = self.pool_manager.get_pool(p["pool_id"])
         if pool is None:
             return ExchangeExecResult(success=False, error="Pool not found")
-
-        amount = Decimal(str(p.get("amount", "0")))
-        removed = pool.remove_liquidity(p["position_id"], amount if amount > 0 else None)
-        # Phase E spot: return the withdrawn token0/token1 from the pool holder to the
-        # LP (remove_liquidity returns (amount0, amount1)).
-        try:
-            amt0, amt1 = removed
-        except (TypeError, ValueError):
-            amt0, amt1 = ZERO, ZERO
+        position = pool.state.positions.get(str(p["position_id"]))
+        if position is None:
+            return ExchangeExecResult(success=False, error=f"Position {p['position_id']} not found")
+        if position.owner != tx.sender:
+            return ExchangeExecResult(
+                success=False, error="only the position's owner may remove its liquidity")
+        raw = p.get("amount")
+        amount = Decimal(str(raw)) if raw not in (None, "", "all") else None
+        if amount is not None and amount < 0:
+            return ExchangeExecResult(success=False, error="amount must not be negative")
         holder = self.pool_holder_address(pool.state.id)
-        self._settle_token_move(holder, tx.sender, pool.state.token0, Decimal(str(amt0)))
-        self._settle_token_move(holder, tx.sender, pool.state.token1, Decimal(str(amt1)))
+        try:
+            with self._atomic(pool):
+                out0, out1 = pool.remove_liquidity(position.id, amount, owner=tx.sender,
+                                                   now=int(self._block_clock()))
+                self._settle_token_move(holder, tx.sender, pool.state.token0, out0)
+                self._settle_token_move(holder, tx.sender, pool.state.token1, out1)
+        except ValueError as e:
+            return ExchangeExecResult(success=False, error=str(e))
         return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.REMOVE_LIQUIDITY],
-            data={"removed": str(removed)},
-        )
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.REMOVE_LIQUIDITY],
+            data={"pool_id": pool.state.id, "position_id": position.id,
+                  "amount0": str(out0), "amount1": str(out1),
+                  "removed": str((out0, out1))})
 
-    def _find_pool_for_pair(self, token_a: str, token_b: str):
-        """The AMM pool whose token pair == {token_a, token_b} (Phase E spot
-        settlement: identifies the holder of the reserves a swap moves)."""
-        pair = {token_a, token_b}
-        for pool in self.pool_manager._pools.values():
-            if {pool.state.token0, pool.state.token1} == pair:
-                return pool
-        return None
+    def _find_pool_for_pair(self, token_a: str, token_b: str, fee_tier=None):
+        """A pool for the pair: the one with ``fee_tier`` if given, else — only when the pair
+        has exactly one pool — that one. Several pools and no fee tier is ambiguous: None."""
+        pools = sorted(self.pool_manager.get_pools_for_pair(token_a, token_b),
+                       key=lambda p: p.state.id)
+        if fee_tier is not None:
+            pools = [p for p in pools if int(p.state.fee_tier) == int(fee_tier)]
+        return pools[0] if len(pools) == 1 else None
+
+    @contextlib.contextmanager
+    def _atomic(self, *engines):
+        """All or nothing for one operation: if anything below raises, every touched pool or
+        book and every recorded balance move is put back as it was. (``process_transaction``
+        turns the exception into a failed result — and a failed operation must change
+        nothing, or a swap that misses its own slippage limit could still move a pool's price
+        for free.)"""
+        saved = [(e, e.snapshot() if hasattr(e, "snapshot") else copy.deepcopy(e.__dict__))
+                 for e in engines]
+        ledgers = (dict(self._token_balance_deltas), dict(self._balance_deltas),
+                   dict(self._available_token_balances), dict(self._available_balances))
+        try:
+            yield
+        except Exception:
+            for engine, snap in saved:
+                if hasattr(engine, "restore"):
+                    engine.restore(snap)
+                else:
+                    engine.__dict__.clear()
+                    engine.__dict__.update(snap)
+            (self._token_balance_deltas, self._balance_deltas,
+             self._available_token_balances, self._available_balances) = ledgers
+            raise
 
     def _op_swap(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Exact-input swap through the best venue — any of the pair's AMM pools or its order
+        book (``pool_id`` pins a pool; ``venue`` = auto | amm | clob). Every check runs on the
+        router's exact quote before anything changes, and the fill settles with its real
+        counterparty: the pool's holder, or the matched makers' escrow."""
         p = tx.params
         token_in = str(p["token_in"])
         token_out = str(p["token_out"])
         amount_in = Decimal(str(p["amount_in"]))
-        min_out = Decimal(str(p.get("min_amount_out", "0")))
-        deadline = float(p.get("deadline", 0))
-
-        # Phase E spot: the trader must hold enough token_in (when balances are
-        # pre-loaded). Observe warns; enforce rejects before touching pool state.
+        min_out = Decimal(str(p.get("min_amount_out", "0") or "0"))
+        deadline = float(p.get("deadline", 0) or 0)
+        if token_in == token_out:
+            return ExchangeExecResult(success=False, error="token_in and token_out are the same")
+        if amount_in <= 0:
+            return ExchangeExecResult(success=False, error="amount_in must be positive")
+        if deadline > 0 and self._block_clock() > deadline:
+            return ExchangeExecResult(success=False, error="Transaction deadline expired")
         avail = self.available_token_balance(tx.sender, token_in)
         if avail is not None and avail < amount_in:
             if self.enforce_spot_settlement:
                 return ExchangeExecResult(
                     success=False,
-                    error=f"insufficient token_in: need {amount_in}, available {avail}",
-                )
-            logger.warning(
-                "[Phase E observe] swap by %s: amount_in %s exceeds available %s — "
-                "would REJECT once spot settlement is enforced",
-                tx.sender[:20], amount_in, avail,
-            )
+                    error=f"insufficient token_in: need {amount_in}, available {avail}")
+            logger.warning("[Phase E observe] swap by %s: amount_in %s exceeds available %s",
+                           tx.sender[:20], amount_in, avail)
 
-        result = self.router.execute(
-            token_in, token_out, amount_in, tx.sender,
-            min_amount_out=min_out,
-            deadline=deadline,
-        )
+        route = self.router.best_route(token_in, token_out, amount_in, tx.sender,
+                                       pool_id=p.get("pool_id"),
+                                       venue=str(p.get("venue", "auto")).lower())
+        if route is None:
+            return ExchangeExecResult(success=False, error="No liquidity available for this pair")
+        if min_out > 0 and route.amount_out < min_out:
+            return ExchangeExecResult(
+                success=False,
+                error=f"Slippage exceeded: got {route.amount_out}, minimum {min_out}")
 
-        # Settle the swap against the pool holder: trader pays amount_in token_in,
-        # receives amount_out token_out (pool reserves move the opposite way), so the
-        # token ledger conserves. Only AMM-routed swaps have a pool holder.
-        pool = self._find_pool_for_pair(token_in, token_out)
-        if pool is not None:
-            holder = self.pool_holder_address(pool.state.id)
-            self._settle_token_move(tx.sender, holder, token_in, amount_in)
-            self._settle_token_move(holder, tx.sender, token_out, Decimal(str(result.amount_out)))
+        if route.source == FillSource.AMM:
+            engine = self.pool_manager.get_pool(route.pool_id)
+        else:
+            engine = self._order_books[route.pair]
+        try:
+            with self._atomic(engine):
+                result = self.router.apply_route(route, tx.sender, now=int(self._block_clock()))
+                if route.source == FillSource.AMM:
+                    holder = self.pool_holder_address(route.pool_id)
+                    self._settle_token_move(tx.sender, holder, token_in, route.amount_in)
+                    self._settle_token_move(holder, tx.sender, token_out, route.amount_out)
+                else:
+                    base, quote = route.pair.split(":", 1)
+                    self._settle_orderbook(result.order, result.trades, base, quote, route.pair)
+        except ValueError as e:
+            return ExchangeExecResult(success=False, error=str(e))
 
         self._total_swaps += 1
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.SWAP],
             data={
-                "amount_out": str(result.amount_out),
-                "fee_total": str(result.fee_total),
-                "price": str(result.price),
-                "source": result.source.value,
+                "amount_in": str(route.amount_in),
+                "amount_out": str(route.amount_out),
+                "fee_total": str(route.fee_total),
+                "price": str(route.price),
+                "source": route.source.value,
+                "pool_id": route.pool_id,
             },
         )
 
@@ -669,10 +817,13 @@ class ExchangeStateManager:
                     error=f"insufficient balance for order: need {need_amount} {need_token[:10]}, "
                           f"available {avail}")
 
-        trades = book.place_order(order)
-
-        if self.enforce_orderbook_settlement:
-            self._settle_orderbook(order, trades, base, quote, pair)
+        try:
+            with self._atomic(book):
+                trades = book.place_order(order)
+                if self.enforce_orderbook_settlement:
+                    self._settle_orderbook(order, trades, base, quote, pair)
+        except ValueError as e:
+            return ExchangeExecResult(success=False, error=str(e))
 
         self._total_orders += 1
         return ExchangeExecResult(
@@ -723,21 +874,25 @@ class ExchangeStateManager:
             books_to_check = list(self._order_books.values())
 
         for book in books_to_check:
-            result = book.cancel_order(order_id, caller=tx.sender)
+            try:
+                with self._atomic(book):
+                    result = book.cancel_order(order_id, caller=tx.sender)
+                    # Phase E CLOB: refund the cancelled order's escrowed remainder
+                    # (exactly what it locked at placement: remaining*price quote for a BUY,
+                    # remaining base for a SELL — the book's pair is token0:token1).
+                    if result is not None and self.enforce_orderbook_settlement:
+                        book_pair = getattr(book, "pool_id", "") or ""
+                        rbase, rquote = (book_pair.split(":", 1) + [""])[:2] if ":" in book_pair else (book_pair, "")
+                        r = Decimal(str(result.remaining))
+                        if r > ZERO:
+                            escrow = self.orderbook_escrow_address(book_pair)
+                            if result.side == OrderSide.BUY:
+                                self._settle_token_move(escrow, result.owner, rquote, r * Decimal(str(result.price)))
+                            else:
+                                self._settle_token_move(escrow, result.owner, rbase, r)
+            except ValueError as e:
+                return ExchangeExecResult(success=False, error=str(e))
             if result is not None:
-                # Phase E CLOB: refund the cancelled order's escrowed remainder
-                # (exactly what it locked at placement: remaining*price quote for a BUY,
-                # remaining base for a SELL — the book's pair is token0:token1).
-                if self.enforce_orderbook_settlement:
-                    book_pair = getattr(book, "pool_id", "") or ""
-                    rbase, rquote = (book_pair.split(":", 1) + [""])[:2] if ":" in book_pair else (book_pair, "")
-                    r = Decimal(str(result.remaining))
-                    if r > ZERO:
-                        escrow = self.orderbook_escrow_address(book_pair)
-                        if result.side == OrderSide.BUY:
-                            self._settle_token_move(escrow, result.owner, rquote, r * Decimal(str(result.price)))
-                        else:
-                            self._settle_token_move(escrow, result.owner, rbase, r)
                 return ExchangeExecResult(
                     success=True,
                     gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.CANCEL_ORDER],
@@ -747,26 +902,24 @@ class ExchangeStateManager:
         return ExchangeExecResult(success=False, error=f"Order {order_id} not found")
 
     def _op_create_market(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """Create a perpetual market so positions can be opened (consensus path).
+        """Create a perp market — an order book in the clearinghouse (consensus path).
 
-        Idempotent-on-conflict: a duplicate market_id is a non-critical failure
-        (the market already exists), not a block-breaking error.
+        Maintenance margin is half the initial margin at ``max_leverage``; the old
+        ``initial_margin_rate`` / ``maintenance_margin_rate`` params are no longer read.
+        A duplicate market is a non-critical failure, not a block-breaking error.
         """
+        from .. import constants
         p = tx.params
         base = str(p["base_token"])
-        quote = str(p.get("quote_token", "QRDX"))
-        kwargs = {}
-        if "initial_margin_rate" in p:
-            kwargs["initial_margin_rate"] = Decimal(str(p["initial_margin_rate"]))
-        if "maintenance_margin_rate" in p:
-            kwargs["maintenance_margin_rate"] = Decimal(str(p["maintenance_margin_rate"]))
-        if "max_leverage" in p:
-            kwargs["max_leverage"] = Decimal(str(p["max_leverage"]))
+        quote = str(p.get("quote_token", constants.PERP_QUOTE))
         try:
-            market = self.perp_engine.create_market(base, quote, **kwargs)
-        except ValueError as e:
+            if "max_leverage" in p:
+                market = self.clearinghouse.create_market(
+                    base, quote, max_leverage=Decimal(str(p["max_leverage"])))
+            else:
+                market = self.clearinghouse.create_market(base, quote)
+        except ClearinghouseError as e:
             return ExchangeExecResult(success=False, error=str(e))
-        self._total_positions += 0  # markets aren't positions
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.CREATE_MARKET],
@@ -795,110 +948,227 @@ class ExchangeStateManager:
         token balances (the same pattern as ``pool_holder_address`` for AMM reserves)."""
         return "0xCLOB" + hashlib.blake2b(f"book:{pair}".encode(), digest_size=18).hexdigest()
 
-    @staticmethod
-    def _cl_token_amounts(pool, tick_lower: int, tick_upper: int, liquidity: Decimal) -> Tuple[Decimal, Decimal]:
-        """token0/token1 amounts for a concentrated-liquidity position (Uniswap-V3
-        formula, deterministic from pool state). Mirrors the integration PoolOperator
-        so liquidity settlement moves the real deposited amounts."""
-        sqrt_p = pool.state.sqrt_price
-        sqrt_a = tick_to_sqrt_price(tick_lower)
-        sqrt_b = tick_to_sqrt_price(tick_upper)
-        cur = pool.state.tick
-        amt0 = ZERO
-        amt1 = ZERO
-        if cur < tick_lower:
-            amt0 = liquidity * Q96 * (sqrt_b - sqrt_a) / (sqrt_a * sqrt_b)
-        elif cur >= tick_upper:
-            amt1 = liquidity * (sqrt_b - sqrt_a) / Q96
-        else:
-            amt0 = liquidity * Q96 * (sqrt_b - sqrt_p) / (sqrt_p * sqrt_b)
-            amt1 = liquidity * (sqrt_p - sqrt_a) / Q96
-        q = Decimal("0.00000001")
-        return abs(amt0).quantize(q), abs(amt1).quantize(q)
-
     def _settle_token_move(self, frm: str, to: str, token: str, amount: Decimal) -> None:
-        """Phase E spot: record a token move frm→to as paired deltas (no-op for 0)."""
+        """Phase E spot: record a token move frm→to as paired deltas (no-op for 0). Raises if
+        ``frm`` — a trader, a pool's holder or a book's escrow — cannot cover it, so the
+        enclosing operation fails whole (see ``_atomic``) instead of the ledger flush clamping a
+        debit while its credit lands, which would mint the difference."""
         if amount and amount > ZERO:
+            if self.tokens.is_frozen(token, frm):
+                raise ValueError(f"{frm[:16]}…'s {token[:12]}… balance is frozen")
+            avail = self.available_token_balance(frm, token)
+            if avail is None:
+                # Every debit's balance is loaded with its block (block_processor.
+                # preload_token_balances). One that was not is a gap in that list: refuse it
+                # rather than let an unchecked debit overdraw the ledger.
+                if self.enforce_spot_settlement:
+                    raise ValueError(f"{frm[:16]}…'s {token[:12]}… balance was not loaded "
+                                     "for this block")
+            elif avail < amount:
+                # The protocol's holders (pool reserves, book escrow, the perps clearinghouse)
+                # are always held to it; a trader only once spot settlement is enforced (in
+                # observe mode their overdraft is logged by the flush, not refused).
+                from ..crypto.account_id import is_synthetic_holder
+                if self.enforce_spot_settlement or is_synthetic_holder(frm):
+                    raise ValueError(f"{frm[:16]}… cannot cover {amount} of {token[:12]}… "
+                                     f"(holds {avail})")
             self._record_token_delta(frm, token, -amount)
             self._record_token_delta(to, token, amount)
 
     def _op_token_deploy(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """Deploy a QRC-20 token via consensus (Phase E spot): mint ``total_supply``
-        to the deployer in the real token ledger and record the registry metadata.
-        The token address is derived deterministically from the tx so every node
-        agrees. Recorded as a token-balance delta + a registry op, flushed to the
-        durable token tables with the block (so token state converges on every
-        node, unlike the old out-of-band deploy)."""
+        """Deploy a native token (qrdx/exchange/tokens.py): its registry entry — name, symbol,
+        display decimals, optional supply cap, mint and freeze authorities — and its initial
+        supply, credited to the deployer. The address derives from the deploy transaction, so
+        every node agrees on it. A token with no initial supply needs a mint authority (a
+        bridge's stablecoin starts at zero and is minted as deposits arrive)."""
         p = tx.params
-        name = str(p["name"])
-        symbol = str(p["symbol"])
-        decimals = int(p.get("decimals", 18))
+        symbol = str(p.get("symbol", ""))
+        address = self.derive_token_address(tx.sender, tx.nonce, symbol)
         try:
-            supply = Decimal(str(p["total_supply"]))
-        except Exception:
-            return ExchangeExecResult(success=False, error="TOKEN_DEPLOY: invalid total_supply")
-        if supply <= 0:
-            return ExchangeExecResult(success=False, error="TOKEN_DEPLOY: total_supply must be positive")
-
-        token_address = self.derive_token_address(tx.sender, tx.nonce, symbol)
-        self._token_registry_ops.append({
-            "token_address": token_address, "name": name, "symbol": symbol,
-            "decimals": decimals, "total_supply": str(supply), "owner_address": tx.sender,
-        })
-        # Credit the deployer the full supply in the token ledger.
-        self._record_token_delta(tx.sender, token_address, supply)
+            token = self.tokens.deploy(
+                address, tx.sender, self._current_block_height,
+                name=p.get("name", ""), symbol=symbol, decimals=p.get("decimals", 18),
+                initial_supply=p.get("initial_supply", p.get("total_supply", 0)),
+                max_supply=p.get("max_supply"), mint_authority=p.get("mint_authority"),
+                freeze_authority=p.get("freeze_authority"))
+        except TokenError as e:
+            return ExchangeExecResult(success=False, error=f"TOKEN_DEPLOY: {e}")
+        if token.supply > 0:
+            self._record_token_delta(tx.sender, token.address, token.supply)
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_DEPLOY],
-            data={"token_address": token_address, "symbol": symbol, "total_supply": str(supply)},
+            data={"token_address": token.address, "symbol": token.symbol,
+                  "total_supply": str(token.supply), "decimals": token.decimals,
+                  "mint_authority": token.mint_authority,
+                  "freeze_authority": token.freeze_authority},
         )
 
+    def _token_move(self, op: str, token: str, frm: str, to: str, value) -> Tuple[Any, Decimal]:
+        """Validate a holder-to-holder move of a registered token: the token, the amount, a
+        keyable recipient (an unkeyable one would have its credit dropped while the debit
+        applied — burning the tokens), the sender's balance and freeze. Raises TokenError."""
+        t = self.tokens.require(token)
+        v = token_amount(value)
+        token_account(to)
+        avail = self.available_token_balance(frm, t.address)
+        if avail is not None and avail < v:
+            if self.enforce_spot_settlement:
+                raise TokenError(f"insufficient token balance: need {v}, available {avail}")
+            logger.warning("[Phase E observe] %s by %s: amount %s exceeds available %s — would "
+                           "REJECT once spot settlement is enforced", op, frm[:20], v, avail)
+        return t, v
+
     def _op_token_transfer(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """Transfer QRC-20 tokens via consensus (Phase E spot): debit the sender,
-        credit the recipient in the real token ledger. Under enforcement an
-        insufficient-balance transfer is rejected; in observe it warns. Recorded as
-        paired token deltas, flushed with the block."""
+        """Move tokens from the sender to ``to`` in the token ledger."""
         p = tx.params
-        token = str(p["token_address"])
         to = str(p["to"])
         try:
-            amount = Decimal(str(p["amount"]))
-        except Exception:
-            return ExchangeExecResult(success=False, error="TOKEN_TRANSFER: invalid amount")
-        if amount <= 0:
-            return ExchangeExecResult(success=False, error="TOKEN_TRANSFER: amount must be positive")
-
-        avail = self.available_token_balance(tx.sender, token)
-        if avail is not None and avail < amount:
-            if self.enforce_spot_settlement:
-                return ExchangeExecResult(
-                    success=False,
-                    error=f"insufficient token balance: need {amount}, available {avail}",
-                )
-            logger.warning(
-                "[Phase E observe] token_transfer by %s: amount %s exceeds available "
-                "%s — would REJECT once spot settlement is enforced",
-                tx.sender[:20], amount, avail,
-            )
-
-        self._record_token_delta(tx.sender, token, -amount)
-        self._record_token_delta(to, token, amount)
+            t, v = self._token_move("token_transfer", str(p["token_address"]), tx.sender, to,
+                                    p["amount"])
+            self._settle_token_move(tx.sender, to, t.address, v)
+        except (TokenError, ValueError) as e:
+            return ExchangeExecResult(success=False, error=f"TOKEN_TRANSFER: {e}")
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER],
-            data={"token_address": token, "to": to, "amount": str(amount)},
+            data={"token_address": t.address, "to": to, "amount": str(v)},
         )
 
+    def _op_token_transfer_from(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """The sender — a spender ``from`` approved — moves ``from``'s tokens to ``to``,
+        within the allowance, which it consumes."""
+        p = tx.params
+        owner, to = str(p["from"]), str(p["to"])
+        try:
+            t, v = self._token_move("token_transfer_from", str(p["token_address"]), owner, to,
+                                    p["amount"])
+            have = self.tokens.allowance(t.address, owner, tx.sender)
+            if have < v:
+                raise TokenError(f"allowance {have} is less than {v}")
+            self._settle_token_move(owner, to, t.address, v)
+        except (TokenError, ValueError) as e:
+            return ExchangeExecResult(success=False, error=f"TOKEN_TRANSFER_FROM: {e}")
+        left = self.tokens.spend_allowance(t.address, owner, tx.sender, v)
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER_FROM],
+            data={"token_address": t.address, "from": owner, "to": to, "amount": str(v),
+                  "allowance_left": str(left)},
+        )
+
+    def _op_token_mint(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """The mint authority mints ``amount`` to ``to`` (default: itself), within any cap."""
+        p = tx.params
+        to = str(p.get("to") or tx.sender)
+        try:
+            token_account(to)
+            t = self.tokens.require(str(p["token_address"]))
+            v = self.tokens.mint(t.address, tx.sender, p["amount"])
+        except TokenError as e:
+            return ExchangeExecResult(success=False, error=f"TOKEN_MINT: {e}")
+        self._record_token_delta(to, t.address, v)
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_MINT],
+            data={"token_address": t.address, "to": to, "amount": str(v),
+                  "total_supply": str(t.supply)})
+
+    def _op_token_burn(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """A holder burns ``amount`` of its own balance; the supply falls by as much."""
+        p = tx.params
+        try:
+            t = self.tokens.require(str(p["token_address"]))
+            v = token_amount(p["amount"])
+            if self.tokens.is_frozen(t.address, tx.sender):
+                raise TokenError("the sender's balance is frozen")
+            avail = self.available_token_balance(tx.sender, t.address)
+            if self.enforce_spot_settlement and (avail is None or avail < v):
+                raise TokenError(f"insufficient token balance: need {v}, available {avail}")
+            self.tokens.burn(t.address, v)
+        except TokenError as e:
+            return ExchangeExecResult(success=False, error=f"TOKEN_BURN: {e}")
+        self._record_token_delta(tx.sender, t.address, -v)
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_BURN],
+            data={"token_address": t.address, "amount": str(v), "total_supply": str(t.supply)})
+
+    def _op_token_approve(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Set ``spender``'s allowance over the sender's tokens to ``amount`` (0 revokes)."""
+        p = tx.params
+        try:
+            t = self.tokens.require(str(p["token_address"]))
+            v = self.tokens.approve(t.address, tx.sender, str(p["spender"]), p["amount"])
+        except TokenError as e:
+            return ExchangeExecResult(success=False, error=f"TOKEN_APPROVE: {e}")
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_APPROVE],
+            data={"token_address": t.address, "spender": str(p["spender"]), "amount": str(v)})
+
+    def _op_token_set_authority(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Hand the mint or freeze authority to ``new_authority``, or renounce it (empty) —
+        irreversibly."""
+        p = tx.params
+        try:
+            t = self.tokens.require(str(p["token_address"]))
+            new = self.tokens.set_authority(t.address, tx.sender, str(p["authority"]),
+                                            p.get("new_authority"))
+        except TokenError as e:
+            return ExchangeExecResult(success=False, error=f"TOKEN_SET_AUTHORITY: {e}")
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_SET_AUTHORITY],
+            data={"token_address": t.address, "authority": str(p["authority"]).lower(),
+                  "new_authority": new})
+
+    def _op_token_freeze(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """TOKEN_FREEZE / TOKEN_THAW: the freeze authority stops (or lets again) ``account``
+        moving its balance of the token."""
+        p = tx.params
+        frozen = tx.op_type == ExchangeOpType.TOKEN_FREEZE
+        try:
+            t = self.tokens.require(str(p["token_address"]))
+            self.tokens.freeze(t.address, tx.sender, str(p["account"]), frozen)
+        except TokenError as e:
+            return ExchangeExecResult(success=False, error=f"{tx.op_type.name}: {e}")
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[tx.op_type],
+            data={"token_address": t.address, "account": str(p["account"]), "frozen": frozen})
+
     def token_registry_ops(self) -> List[Dict[str, Any]]:
-        """This block's accumulated token registry creations (TOKEN_DEPLOY)."""
-        return list(self._token_registry_ops)
+        """The registry rows of the tokens this block deployed or changed (supply,
+        authorities), for the DB mirror (``token_registry``)."""
+        return [self.tokens.tokens[a].summary() for a in sorted(self.tokens.changed)
+                if a in self.tokens.tokens]
 
     def _op_stake_deposit(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """Validator-lifecycle Phase 3: a staking deposit registers the SENDER as a
+        """
+        Validator-lifecycle Phase 3: a staking deposit registers the SENDER as a
         validator. Records a deterministic 'deposit' op (address=sender, the supplied
         validator public key, stake) flushed to the consensus validators table as a
         PENDING validator; the all-nodes epoch loop schedules + activates it (so every
-        node agrees on membership). Stake collateral-locking is a documented follow-on."""
+        node agrees on membership).
+
+        **The stake must be real.** The claimed ``stake_amount`` becomes the
+        validator's ``effective_stake`` in the consensus ``validators`` table, and that
+        figure weights BOTH stake-weighted proposer selection and fork-choice attesting
+        weight. An unbacked claim is therefore a consensus attack: without these checks
+        an account holding nothing could claim more stake than the whole honest set and
+        dominate block production and fork choice. So under
+        ``enforce_validator_stake`` a deposit must:
+
+          1. clear ``MIN_VALIDATOR_STAKE`` — the same floor the local registration API
+             (``validator/manager.py``) and epoch activation already apply, which the
+             consensus join path was silently skipping;
+          2. be backed by the sender's real ``account_state`` balance; and
+          3. be DEBITED, so the stake is genuinely at risk and cannot be spent twice.
+
+        The debit is refunded at the deterministic finalized exit epoch (see
+        ``epoch_loop._refund_exited_validator_stakes``). A SLASHED validator moves to
+        status 'slashed', never reaches 'exited', and so forfeits its stake — which is
+        what makes slashing bite.
+
+        Genesis validators are NOT debited: their stake is declared by the genesis file,
+        which is the chain's trust root. This gate governs *joining* validators.
+        """
         p = tx.params
         try:
             stake = Decimal(str(p["stake_amount"]))
@@ -906,14 +1176,63 @@ class ExchangeStateManager:
             return ExchangeExecResult(success=False, error="STAKE_DEPOSIT: invalid stake_amount")
         if stake <= 0:
             return ExchangeExecResult(success=False, error="STAKE_DEPOSIT: stake must be positive")
+
+        if self.enforce_validator_stake:
+            from ..constants import MIN_VALIDATOR_STAKE
+
+            # (1) Minimum stake. Deterministic — a pure comparison against a constant.
+            if stake < MIN_VALIDATOR_STAKE:
+                return ExchangeExecResult(
+                    success=False,
+                    error=(f"STAKE_DEPOSIT: stake {stake} below minimum "
+                           f"{MIN_VALIDATOR_STAKE} QRDX"),
+                )
+
+            # (2) Ownership. ``available_balance`` is pre-loaded from account_state by
+            # preload_sender_balances on every path, so this reads the same value on
+            # every node. A missing pre-load (None) means the balance could not be
+            # read; refuse rather than assume solvency — a deposit is too dangerous to
+            # admit unverified.
+            avail = self.available_balance(tx.sender)
+            if avail is None:
+                return ExchangeExecResult(
+                    success=False,
+                    error="STAKE_DEPOSIT: sender balance unavailable; cannot verify stake",
+                )
+            if avail < stake:
+                return ExchangeExecResult(
+                    success=False,
+                    error=(f"STAKE_DEPOSIT: insufficient balance for stake: need {stake}, "
+                           f"available {avail}"),
+                )
+        else:
+            avail = self.available_balance(tx.sender)
+            if avail is not None and avail < stake:
+                logger.warning(
+                    "[observe] stake_deposit by %s: claimed stake %s exceeds available "
+                    "balance %s — would REJECT once validator stake is enforced",
+                    tx.sender[:20], stake, avail,
+                )
+
         self._validator_lifecycle_ops.append({
             "type": "deposit", "address": tx.sender,
             "public_key": str(p["validator_public_key"]), "stake": str(stake),
         })
+        if self.oracle_committee is not None:
+            key = tx.sender.lower()
+            self.oracle_committee[key] = self.oracle_committee.get(key, ZERO) + stake
+
+        # (3) Lock it. Gate the RECORDING, not just the flush: the shared
+        # account_state flush is already enforced for collateral, so recording
+        # unconditionally would debit even while this gate is off.
+        if self.enforce_validator_stake:
+            self._record_balance_delta(tx.sender, -stake)
+
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.STAKE_DEPOSIT],
-            data={"validator": tx.sender, "stake": str(stake), "status": "pending"},
+            data={"validator": tx.sender, "stake": str(stake), "status": "pending",
+                  "staked_debit": str(stake) if self.enforce_validator_stake else "0"},
         )
 
     def _op_stake_exit(self, tx: ExchangeTransaction) -> ExchangeExecResult:
@@ -921,6 +1240,8 @@ class ExchangeStateManager:
         deterministic 'exit' op; the all-nodes epoch loop schedules exit_epoch and moves
         the validator exiting→exited."""
         self._validator_lifecycle_ops.append({"type": "exit", "address": tx.sender})
+        if self.oracle_committee is not None:
+            self.oracle_committee.pop(tx.sender.lower(), None)
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.STAKE_EXIT],
@@ -931,157 +1252,166 @@ class ExchangeStateManager:
         """This block's accumulated staking deposit/exit ops (Phase 3)."""
         return list(self._validator_lifecycle_ops)
 
-    def _op_open_position(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        p = tx.params
-        raw_side = p["side"]
-        try:
-            side = PerpSide(raw_side)
-        except ValueError:
-            side = PerpSide[str(raw_side).upper()]
+    # =====================================================================
+    #  Perps clearinghouse (docs/PERPS_CLEARINGHOUSE.md)
+    # =====================================================================
 
-        # Phase E: the position's margin must be backed by real collateral. We can
-        # only check/lock when balances are pre-loaded; compute the required margin
-        # the same way PerpEngine does so we can decide BEFORE opening.
-        avail = self.available_balance(tx.sender)
-        market = self.perp_engine.get_market(p["market_id"]) if hasattr(self.perp_engine, "get_market") else None
-        size = Decimal(str(p["size"]))
-        price = Decimal(str(p["price"]))
-        leverage = Decimal(str(p["leverage"]))
-        notional = size * price
-        req_margin = notional / leverage
-        if market is not None:
-            min_margin = notional * market.initial_margin_rate
-            if min_margin > req_margin:
-                req_margin = min_margin
+    @staticmethod
+    def perps_holder_address() -> str:
+        """The single holder of all perp collateral. Real QRDX moves only between a trader and
+        this holder (deposit / withdraw); trading moves value between internal records."""
+        return "0xPERP" + hashlib.blake2b(b"perps:clearinghouse", digest_size=18).hexdigest()
 
-        if avail is not None and avail < req_margin:
-            if self.enforce_collateral:
+    def _op_retired_perp(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        return ExchangeExecResult(
+            success=False,
+            error=(f"{tx.op_type.name} is retired: it traded against nobody, so it minted and "
+                   f"burned QRDX. Perps trade on the order book — PERP_DEPOSIT, then PERP_ORDER."))
+
+    @staticmethod
+    def perp_collateral_token() -> str:
+        """What perps settle in: a QRC-20 token address (production: the bridged USD
+        stablecoin), "QRDX" for native QRDX, or "" when none is configured."""
+        from .. import constants
+        return constants.PERP_COLLATERAL_TOKEN
+
+    def _op_perp_deposit(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        token = self.perp_collateral_token()
+        if not token:
+            return ExchangeExecResult(
+                success=False, error="perps have no collateral token configured")
+        amount = Decimal(str(tx.params["amount"]))
+        native = token.upper() == "QRDX"
+        if native:
+            avail = self.available_balance(tx.sender)
+            if avail is not None and avail < amount and self.enforce_collateral:
                 return ExchangeExecResult(
-                    success=False,
-                    error=(f"insufficient collateral: need margin {req_margin}, "
-                           f"available {avail}"),
-                )
-            logger.warning(
-                "[Phase E observe] open_position by %s: margin %s exceeds available "
-                "balance %s — would REJECT once collateral is enforced",
-                tx.sender[:20], req_margin, avail,
-            )
-
-        pos = self.perp_engine.open_position(
-            p["market_id"], tx.sender, side, size, leverage, price,
-            reduce_only=p.get("reduce_only", False),
-        )
-
-        self._total_positions += 1
-        # Lock the margin as a real-balance debit for this block (flushed to
-        # account_state by the async wrapper when enforced).
-        self._record_balance_delta(tx.sender, -pos.margin)
-
-        return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.OPEN_POSITION],
-            data={"position_id": pos.id, "margin": str(pos.margin)},
-        )
-
-    def _op_close_position(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        p = tx.params
-        # Phase E: capture the (funding-adjusted) locked margin + owner BEFORE the
-        # close so we can release it and settle realized PnL to the real balance.
-        pos = self.perp_engine.get_position(p["position_id"])
-        margin_before = pos.margin if pos is not None else ZERO
-        owner = pos.owner if pos is not None else tx.sender
-        pnl = self.perp_engine.close_position(
-            p["position_id"], Decimal(str(p["price"])),
-        )
-        # Release the locked margin + realized PnL back to the owner. Clamp at 0 so
-        # a close never returns less than nothing (debiting beyond the locked
-        # margin is the liquidation path, not a voluntary close).
-        settled = self._settle_close(owner, margin_before, pnl)
-        return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.CLOSE_POSITION],
-            data={"pnl": str(pnl), "settled": str(settled)},
-        )
-
-    def _op_partial_close(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        p = tx.params
-        pos = self.perp_engine.get_position(p["position_id"])
-        margin_before = pos.margin if pos is not None else ZERO
-        owner = pos.owner if pos is not None else tx.sender
-        pnl = self.perp_engine.partial_close(
-            p["position_id"],
-            Decimal(str(p["close_size"])),
-            Decimal(str(p["price"])),
-        )
-        # Margin released = the proportional margin freed by this partial close. If
-        # the close_size covered the whole position the engine delegates to a full
-        # close (margin untouched, position now CLOSED) → release all of it.
-        if pos is not None and pos.is_open:
-            margin_released = margin_before - pos.margin
+                    success=False, error=f"insufficient balance: need {amount}, available {avail}")
         else:
-            margin_released = margin_before
-        settled = self._settle_close(owner, margin_released, pnl)
-        return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PARTIAL_CLOSE],
-            data={"pnl": str(pnl), "settled": str(settled)},
-        )
-
-    def _settle_close(self, owner: str, margin_released: Decimal, pnl: Decimal) -> Decimal:
-        """Phase E: credit (released margin + realized PnL) back to ``owner``'s real
-        balance, clamped at >= 0. Records a positive balance delta flushed to
-        account_state with the block (mirror of the ``-margin`` debit on open).
-        Returns the settled amount."""
-        settled = margin_released + pnl
-        if settled < ZERO:
-            settled = ZERO
-        if settled > ZERO:
-            self._record_balance_delta(owner, settled)
-        return settled
-
-    def _op_add_margin(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        p = tx.params
-        amount = Decimal(str(p["amount"]))
-        position_id = p["position_id"]
-
-        # Phase E: topping up margin must be backed by real collateral, debited from the
-        # trader — symmetric with open (which debits pos.margin) and close (which credits
-        # the FULL locked margin, additions included), so it conserves. Only the position
-        # OWNER may pay (the engine doesn't check), else the payer ≠ who is refunded on
-        # close → value leak.
-        pos = self.perp_engine.get_position(position_id) if hasattr(self.perp_engine, "get_position") else None
-        if pos is not None and getattr(pos, "owner", tx.sender) != tx.sender:
-            if self.enforce_collateral:
-                return ExchangeExecResult(
-                    success=False, error="add_margin: only the position owner may add margin")
-            logger.warning("[Phase E observe] add_margin by %s on position owned by %s — "
-                           "would REJECT once collateral is enforced",
-                           tx.sender[:20], str(getattr(pos, "owner", "?"))[:20])
-
-        avail = self.available_balance(tx.sender)
-        if avail is not None and avail < amount:
-            if self.enforce_collateral:
+            # Always enforced: the token flush is not gated, so admitting an unaffordable
+            # deposit would apply the holder's credit while the sender's debit could not land.
+            avail = self.available_token_balance(tx.sender, token)
+            if avail is None or avail < amount:
                 return ExchangeExecResult(
                     success=False,
-                    error=f"insufficient collateral: need {amount}, available {avail}")
-            logger.warning(
-                "[Phase E observe] add_margin by %s: amount %s exceeds available %s — "
-                "would REJECT once collateral is enforced", tx.sender[:20], amount, avail)
-
-        new_margin = self.perp_engine.add_margin(position_id, amount)
-        # Lock the added margin as a real-balance debit (flushed to account_state by the
-        # async wrapper when enforced) — returned to the owner on close/liquidation.
-        self._record_balance_delta(tx.sender, -amount)
+                    error=f"insufficient collateral token balance: need {amount}, available {avail}")
+        try:
+            amount = self.clearinghouse.deposit(tx.sender, amount)
+        except ClearinghouseError as e:
+            return ExchangeExecResult(success=False, error=str(e))
+        if native:
+            self._record_balance_delta(tx.sender, -amount)
+            self._record_balance_delta(self.perps_holder_address(), amount)
+        else:
+            self._settle_token_move(tx.sender, self.perps_holder_address(), token, amount)
         return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ADD_MARGIN],
-            data={"new_margin": str(new_margin)},
-        )
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_DEPOSIT],
+            data={"collateral": str(self.clearinghouse.accounts[tx.sender].collateral)})
+
+    def _op_perp_withdraw(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        token = self.perp_collateral_token()
+        if not token:
+            return ExchangeExecResult(
+                success=False, error="perps have no collateral token configured")
+        try:
+            amount = self.clearinghouse.withdraw(tx.sender, Decimal(str(tx.params["amount"])))
+        except ClearinghouseError as e:
+            return ExchangeExecResult(success=False, error=str(e))
+        if token.upper() == "QRDX":
+            self._record_balance_delta(self.perps_holder_address(), -amount)
+            self._record_balance_delta(tx.sender, amount)
+        else:
+            self._settle_token_move(self.perps_holder_address(), tx.sender, token, amount)
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_WITHDRAW],
+            data={"collateral": str(self.clearinghouse.accounts[tx.sender].collateral)})
+
+    def _op_vault_deposit(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Perp collateral → backstop vault shares at NAV. Internal to the clearinghouse: no
+        real balance moves (the vault's collateral is inside the perps holder too)."""
+        from .. import constants
+        seeder = tx.sender.lower() in {a.lower() for a in constants.PERP_VAULT_SEEDERS}
+        try:
+            shares = self.clearinghouse.vault_deposit(
+                tx.sender, Decimal(str(tx.params["amount"])), self._block_clock(),
+                constants.PERP_VAULT_LOCKUP_SECONDS, protocol=seeder)
+        except (ClearinghouseError, ValueError) as e:
+            return ExchangeExecResult(success=False, error=str(e))
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.VAULT_DEPOSIT],
+            data={"shares": str(shares), "protocol_owned": seeder})
+
+    def _op_vault_withdraw(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        try:
+            value = self.clearinghouse.vault_withdraw(
+                tx.sender, Decimal(str(tx.params["shares"])), self._block_clock())
+        except (ClearinghouseError, ValueError) as e:
+            return ExchangeExecResult(success=False, error=str(e))
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.VAULT_WITHDRAW],
+            data={"value": str(value)})
+
+    def _op_perp_set_leverage(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        p = tx.params
+        mode = str(p.get("mode", "cross")).lower()
+        if mode not in ("cross", "isolated"):
+            return ExchangeExecResult(success=False, error=f"unknown margin mode {mode!r}")
+        try:
+            self.clearinghouse.set_leverage(tx.sender, str(p["market_id"]),
+                                            Decimal(str(p["leverage"])), mode == "isolated")
+        except ClearinghouseError as e:
+            return ExchangeExecResult(success=False, error=str(e))
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_SET_LEVERAGE])
+
+    def _op_perp_order(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        p = tx.params
+        order_id = tx.tx_hash()[:16]
+        from .. import constants
+        m = self.clearinghouse.markets.get(str(p["market_id"]))
+        if (m is not None and not bool(p.get("reduce_only", False)) and m.oracle_time > 0
+                and Decimal(str(self._block_clock())) - m.oracle_time
+                > constants.PERP_ORACLE_STALE_SECONDS):
+            return ExchangeExecResult(
+                success=False,
+                error=f"the oracle for {m.id} is stale; only reduce-only orders are accepted")
+        try:
+            fills = self.clearinghouse.place_order(
+                tx.sender, str(p["market_id"]), order_id, str(p["side"]),
+                Decimal(str(p["size"])), Decimal(str(p["price"])), tx.nonce,
+                reduce_only=bool(p.get("reduce_only", False)),
+                ioc=str(p.get("tif", "gtc")).lower() == "ioc")
+        except (ClearinghouseError, ValueError) as e:
+            return ExchangeExecResult(success=False, error=str(e))
+        # Not resting after its fills: filled, IOC, or stopped by self-trade prevention
+        # (an order that would hit the sender's own resting order is cancelled there).
+        resting = order_id in self.clearinghouse.markets[str(p["market_id"])].orders
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_ORDER],
+            data={"order_id": order_id, "fills": fills, "resting": resting})
+
+    def _op_perp_cancel(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        p = tx.params
+        try:
+            self.clearinghouse.cancel_order(tx.sender, str(p["market_id"]), str(p["order_id"]))
+        except (ClearinghouseError, ValueError) as e:
+            return ExchangeExecResult(success=False, error=str(e))
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_CANCEL])
 
     def _op_update_oracle(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
         pair = p["pair"]
         price = Decimal(str(p["price"]))
+        # The oracle price is what perps execute, settle and liquidate at — so only an
+        # authorized reporter may set it (constants.ORACLE_REPORTERS). Unrestricted, any
+        # user could move the price their own position closes at.
+        from .. import constants
+        if tx.sender.lower() not in {a.lower() for a in constants.ORACLE_REPORTERS}:
+            return ExchangeExecResult(success=False,
+                                      error="sender is not an authorized oracle reporter")
+        if price <= 0:
+            return ExchangeExecResult(success=False, error="oracle price must be positive")
 
         oracle = self._oracles.get(pair)
         if oracle is None:
@@ -1092,11 +1422,11 @@ class ExchangeStateManager:
 
         oracle.record(price, timestamp=self._current_block_timestamp)
 
-        # Also update perp markets that track this pair
-        market_id = f"{pair.split(':')[0]}-QRDX-PERP"
-        market = self.perp_engine.get_market(market_id)
-        if market is not None:
-            self.perp_engine.update_price(market_id, price)
+        # Price the perp market that tracks this pair: "BTC:USD" → BTC-USD-PERP.
+        base, _, quote = pair.partition(":")
+        market_id = Clearinghouse.market_id(base, quote or constants.PERP_QUOTE)
+        if market_id in self.clearinghouse.markets:
+            self.clearinghouse.set_oracle_price(market_id, price, self._block_clock())
 
         return ExchangeExecResult(
             success=True,
@@ -1105,9 +1435,106 @@ class ExchangeStateManager:
         )
 
     # =====================================================================
+    #  Validator price oracle (docs/PERPS_CLEARINGHOUSE.md §8)
+    # =====================================================================
+
+    MAX_VOTE_PRICES = 64
+
+    def load_oracle_committee(self, genesis_content: Any) -> None:
+        """Seed the committee from the genesis block's ``validator_set`` (address, stake) — the
+        one source every node holds identically. A genesis without one leaves votes disabled
+        (None): a committee built from joiners alone would hand the oracle to the first one."""
+        if self.oracle_committee is not None:
+            return
+        try:
+            content = json.loads(genesis_content) if isinstance(genesis_content, str) else genesis_content
+            members = content.get("validator_set") if isinstance(content, dict) else None
+        except Exception:
+            members = None
+        if not members:
+            return
+        committee: Dict[str, Decimal] = {}
+        for v in members:
+            stake = Decimal(str(v["stake"]))
+            if stake > 0:
+                key = str(v["address"]).lower()
+                committee[key] = committee.get(key, ZERO) + stake
+        self.oracle_committee = committee
+
+    def _op_oracle_vote(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """A committee member's USD prices, keyed by market base ("BTC" → BTC-USD-PERP). Votes
+        only for existing markets; each replaces the voter's previous one for that market."""
+        from .. import constants
+        committee = self.oracle_committee
+        if not committee or tx.sender.lower() not in committee:
+            return ExchangeExecResult(success=False, error="sender is not in the oracle committee")
+        prices = tx.params.get("prices")
+        if not isinstance(prices, dict) or not prices or len(prices) > self.MAX_VOTE_PRICES:
+            return ExchangeExecResult(
+                success=False, error=f"a vote carries 1 to {self.MAX_VOTE_PRICES} prices")
+        parsed: Dict[str, Decimal] = {}
+        for base in sorted(prices):
+            market_id = Clearinghouse.market_id(str(base), constants.PERP_QUOTE)
+            if market_id not in self.clearinghouse.markets:
+                return ExchangeExecResult(success=False, error=f"no market {market_id}")
+            try:
+                price = Decimal(str(prices[base]))
+            except Exception:
+                return ExchangeExecResult(success=False, error=f"invalid price for {base}")
+            if not price.is_finite() or price <= 0:
+                return ExchangeExecResult(success=False, error=f"invalid price for {base}")
+            parsed[market_id] = price
+        now = Decimal(str(self._block_clock()))
+        voter = tx.sender.lower()
+        for market_id, price in parsed.items():
+            self.oracle_votes.setdefault(market_id, {})[voter] = (price, now)
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ORACLE_VOTE],
+            data={"markets": sorted(parsed)})
+
+    def apply_oracle_votes(self, now) -> None:
+        """Each block (before the clearinghouse tick): set every voted market's oracle to the
+        stake-weighted median of fresh committee votes — when they carry a majority of the
+        committee's stake. Without that the oracle is not refreshed, and goes stale. Votes
+        older than the window are dropped, so the state stays small."""
+        from .. import constants
+        committee = self.oracle_committee
+        if not committee:
+            return
+        now = Decimal(str(now))
+        max_age = Decimal(constants.PERP_ORACLE_VOTE_MAX_AGE)
+        total = sum(committee.values(), ZERO)
+        for market_id in sorted(self.oracle_votes):
+            votes = {v: pt for v, pt in self.oracle_votes[market_id].items()
+                     if v in committee and now - pt[1] <= max_age}
+            self.oracle_votes[market_id] = votes
+            if market_id not in self.clearinghouse.markets or not votes:
+                continue
+            weighted = sorted((price, committee[v]) for v, (price, _t) in votes.items())
+            weight = sum((w for _p, w in weighted), ZERO)
+            if weight * 2 <= total:
+                continue
+            acc = ZERO
+            for price, w in weighted:            # lower weighted median
+                acc += w
+                if acc * 2 >= weight:
+                    self.clearinghouse.set_oracle_price(market_id, price, now)
+                    break
+        self.oracle_votes = {m: v for m, v in self.oracle_votes.items() if v}
+
+    def oracle_state_hash(self) -> bytes:
+        """The live votes. (Not the committee: see block_processor.ensure_oracle_committee —
+        it is a function of genesis and the staking ops, which the chain already commits to.)"""
+        votes = {m: {v: [str(p), str(t)] for v, (p, t) in sorted(vs.items())}
+                 for m, vs in sorted(self.oracle_votes.items())}
+        blob = json.dumps(votes, sort_keys=True, separators=(",", ":"))
+        return hashlib.blake2b(blob.encode(), digest_size=32).digest()
+
+    # =====================================================================
     #  State root computation (consensus-critical)
     # =====================================================================
 
+    @_pinned
     def compute_state_root(self) -> str:
         """
         Compute a deterministic hash of the entire exchange state.
@@ -1124,24 +1551,18 @@ class ExchangeStateManager:
         hasher = blake3.blake3()
 
         # 1. Pool state hashes (sorted by pool ID)
-        pool_ids = sorted(self.pool_manager._pools.keys())
-        for pid in pool_ids:
-            pool = self.pool_manager._pools[pid]
-            s = pool.state
-            pool_hash = hashlib.blake2b(
-                f"{pid}:{s.sqrt_price}:{s.tick}:{s.liquidity}:{s.fee_growth_global_0}:{s.fee_growth_global_1}".encode(),
-                digest_size=16,
-            ).digest()
-            hasher.update(pool_hash)
+        # Each pool's full state — price, liquidity, fee growth, protocol fees, every tick,
+        # every position (owner, range, liquidity, fees owed) and its oracle observations.
+        for pid in sorted(self.pool_manager._pools.keys()):
+            hasher.update(self.pool_manager._pools[pid].state_digest())
 
-        # 2. Order book state hashes (sorted by pair key)
+        # 2. Order books (sorted by pair key): every resting order in priority order, the
+        #    parked stop orders, owners' order nonces, last trade price, totals. (It used to
+        #    commit only the totals and level counts — two nodes could hold different orders
+        #    under one root.)
         for pair_key in sorted(self._order_books.keys()):
-            book = self._order_books[pair_key]
-            book_hash = hashlib.blake2b(
-                f"{pair_key}:{book.total_trades}:{book.total_volume}:{book.bid_depth}:{book.ask_depth}".encode(),
-                digest_size=16,
-            ).digest()
-            hasher.update(book_hash)
+            hasher.update(pair_key.encode())
+            hasher.update(self._order_books[pair_key].state_digest())
 
         # 3. Oracle state hashes
         for pair_key in sorted(self._oracles.keys()):
@@ -1164,6 +1585,15 @@ class ExchangeStateManager:
                 digest_size=16,
             ).digest()
             hasher.update(market_hash)
+
+        # 4b. Perps clearinghouse: books, accounts, positions, vault, holder mirror.
+        hasher.update(self.clearinghouse.state_hash())
+
+        # 4c. Validator price oracle: committee and live votes.
+        hasher.update(self.oracle_state_hash())
+
+        # 4d. Native tokens: registry (supply, authorities), allowances, frozen accounts.
+        hasher.update(self.tokens.state_hash())
 
         # 5. Nonce state
         for addr in sorted(self._nonces.keys()):
@@ -1208,8 +1638,11 @@ class ExchangeStateManager:
             "perp_owner_positions": copy.deepcopy(self.perp_engine._owner_positions),
             "perp_pos_sequence": self.perp_engine._pos_sequence,
             "perp_paused": self.perp_engine._paused,
-            "precompile_pools": copy.deepcopy(self._precompile_pools),
-            "precompile_orderbooks": copy.deepcopy(self._precompile_orderbooks),
+            "clearinghouse": copy.deepcopy(self.clearinghouse),
+            "oracle_committee": copy.deepcopy(self.oracle_committee),
+            "oracle_votes": copy.deepcopy(self.oracle_votes),
+            "tokens": copy.deepcopy(self.tokens),
+            "router_clob_sequence": self.router._clob_sequence,
         }
         self._snapshot = snapshot
         return snapshot
@@ -1262,10 +1695,12 @@ class ExchangeStateManager:
         self.perp_engine._owner_positions.update(copy.deepcopy(snapshot["perp_owner_positions"]))
         self.perp_engine._pos_sequence = snapshot["perp_pos_sequence"]
         self.perp_engine._paused = snapshot["perp_paused"]
+        self.clearinghouse = copy.deepcopy(snapshot["clearinghouse"])
+        self.oracle_committee = copy.deepcopy(snapshot.get("oracle_committee"))
+        self.oracle_votes = copy.deepcopy(snapshot.get("oracle_votes", {}))
 
-        # Precompile EVM state.
-        self._precompile_pools = copy.deepcopy(snapshot.get("precompile_pools", {}))
-        self._precompile_orderbooks = copy.deepcopy(snapshot.get("precompile_orderbooks", {}))
+        self.tokens = copy.deepcopy(snapshot.get("tokens", TokenRegistry()))
+        self.router._clob_sequence = snapshot.get("router_clob_sequence", 0)
 
     # =====================================================================
     #  Query interface (read-only, for API layer)

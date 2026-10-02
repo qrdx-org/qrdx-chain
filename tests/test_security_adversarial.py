@@ -674,19 +674,18 @@ class TestAMMPriceManipulation:
         assert r1[0] == r2[0], "Swap must be deterministic"
         assert r1[1] == r2[1], "Fee must be deterministic"
 
-    def test_reentrancy_blocked(self):
-        """Reentrancy during swap must be rejected."""
+    def test_quote_never_mutates_the_pool(self):
+        """A swap is simulated (quote) and only then applied, so nothing can observe or
+        re-enter a half-applied pool; and a quote leaves the pool exactly as it was."""
         from qrdx.exchange.amm import ConcentratedLiquidityPool
 
         state = self._make_pool_state()
         pool = ConcentratedLiquidityPool(state)
-
-        pool._acquire_lock()
-        try:
-            with pytest.raises(ValueError, match="[Rr]eentranc"):
-                pool.swap(Decimal("100"), zero_for_one=True)
-        finally:
-            pool._release_lock()
+        pool.add_liquidity("0xPQ" + "a" * 64, -600, 600, Decimal("1000000"))
+        before = pool.state_digest()
+        plan = pool.quote(Decimal("100"), zero_for_one=True)
+        assert pool.state_digest() == before
+        assert pool.swap(Decimal("100"), zero_for_one=True)[0] == plan.amount_out
 
     def test_paused_pool_rejects_swaps(self):
         """Paused pool must reject all operations."""

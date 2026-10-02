@@ -1,0 +1,34 @@
+# =============================================================================
+# Optional overlay for docker-compose.tunnel.yml — supply your OWN validator
+# wallet from the host instead of letting validator-init generate one.
+#
+#   mkdir -p /secure/path                       # MUST exist; Compose won't create it
+#   cp my-validator.json /secure/path/
+#   export QRDX_VALIDATOR_WALLET_DIR=/secure/path
+#   export QRDX_VALIDATOR_WALLET=/app/wallet/my-validator.json
+#
+#   docker compose -f docker/docker-compose.tunnel.yml \
+#                  -f docker/docker-compose.tunnel-wallet.yml up -d
+#
+# This is a separate file on purpose. A bind mount in the base stack whose source
+# directory does not exist makes Docker create it, and on Docker Desktop / WSL two
+# services binding the same missing path collide in the bind-mount shim with
+# "error while creating mount source path ... file exists". Keeping the mount
+# opt-in means the default stack uses named volumes only and always starts.
+#
+# QRDX_VALIDATOR_WALLET_DIR is required here — there is no fallback default, so a
+# typo fails loudly instead of silently mounting the wrong directory.
+#
+# On Docker Desktop / WSL, prefer a path inside the WSL filesystem (e.g.
+# /home/you/qrdx-wallet) over one on a mounted Windows drive (/mnt/d/...): the
+# Windows-drive path goes through the same shim and inherits its quirks.
+# =============================================================================
+
+services:
+  validator-init:
+    volumes:
+      - ${QRDX_VALIDATOR_WALLET_DIR:?set QRDX_VALIDATOR_WALLET_DIR to an EXISTING host directory holding your validator wallet}:/app/wallet:ro
+
+  node:
+    volumes:
+      - ${QRDX_VALIDATOR_WALLET_DIR:?set QRDX_VALIDATOR_WALLET_DIR to an EXISTING host directory holding your validator wallet}:/app/wallet:ro

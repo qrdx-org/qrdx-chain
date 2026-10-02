@@ -251,6 +251,13 @@ class GenesisInitializer:
             "randao_seed": state.randao_seed,
             "prefunded_accounts": len(prefunded_accounts),
             "validators": len(state.validators),
+            # The genesis validator set itself, not just its size: the validator price oracle's
+            # committee starts from it (ExchangeStateManager.load_oracle_committee), and block 0
+            # is the one record every node holds identically.
+            "validator_set": sorted(
+                ({"address": v["address"], "stake": str(Decimal(str(v["stake"])))}
+                 for v in state.validators),
+                key=lambda v: v["address"]),
             "system_wallets": len(state.system_wallets),
             "system_wallet_controller": state.system_wallet_controller,
         }
@@ -313,6 +320,7 @@ class GenesisInitializer:
         """
         from ..crypto.hashing import sha256
         from decimal import Decimal as _D
+        from ..crypto.account_id import to_account_id
 
         logger.info(f"Funding {len(prefunded_accounts)} genesis accounts in account_state (unified ledger)")
 
@@ -340,16 +348,24 @@ class GenesisInitializer:
                 fees=Decimal("0"),
             )
 
-            # Fund the unified ledger (account_state, wei).
+            # Fund the unified ledger (account_state, wei), keyed by the canonical
+            # 20-byte ACCOUNT ID — not the display address. A 0xPQ allocation and
+            # the EVM's view of that account are then one row, so the EVM can
+            # execute against PQ-funded accounts and contracts can pay them.
+            # The genesis tx above keeps the display address for auditability.
+            account_id = to_account_id(address)
             wei = int(_D(str(balance)) * _D(10 ** 18))
             await self.db.connection.execute(
                 "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, is_contract) "
                 "VALUES (?, ?, 0, 0, 0, 0) "
                 "ON CONFLICT(address) DO UPDATE SET balance = excluded.balance",
-                (address, str(wei)),
+                (account_id, str(wei)),
             )
 
-            logger.debug(f"Funded genesis account: {address[:20]}... = {balance} QRDX ({label})")
+            logger.debug(
+                f"Funded genesis account: {address[:20]}... (id {account_id}) "
+                f"= {balance} QRDX ({label})"
+            )
 
         await self.db.connection.commit()
         logger.info(f"Funded {len(prefunded_accounts)} genesis accounts in account_state")

@@ -529,8 +529,20 @@ SYNC_COMMITTEE_SUBNET_COUNT = 4        # Number of subnets for distribution
 # --- Validator Set ---
 MIN_VALIDATORS = int(os.environ.get('QRDX_MIN_VALIDATORS', '4'))  # Mainnet: 4, testnet override via env
 MAX_VALIDATORS = 150                   # Maximum active validators
-MIN_VALIDATOR_STAKE = Decimal('100000')  # 100,000 QRDX minimum stake
+MIN_VALIDATOR_STAKE = Decimal('100000')  # 100,000 QRDX minimum stake to ACTIVATE
 MAX_EFFECTIVE_STAKE = Decimal('1000000')  # 1,000,000 QRDX max effective stake
+
+# Stake at which an ACTIVE validator is ejected — deliberately well BELOW the activation
+# threshold, mirroring Ethereum's 16 ETH ejection vs 32 ETH activation.
+#
+# The hysteresis is the point. Attestation penalties make effective_stake drift a little
+# below the activation floor during normal operation (observed live: 99,840 against a
+# 100,000 floor), and ejecting at the activation threshold would churn the validator set
+# on ordinary missed attestations — on a small set that means repeatedly losing
+# proposers, and in the worst case emptying the set and halting the chain. Requiring a
+# validator to have lost HALF its stake before it loses its slot means only sustained
+# inactivity (or slashing, which ejects on its own) removes it.
+VALIDATOR_EJECTION_STAKE = MIN_VALIDATOR_STAKE / 2   # 50,000 QRDX
 
 # --- Staking Parameters ---
 # Env-overridable (like SLOTS_PER_EPOCH) so an integration/Phase-4 run can observe the
@@ -539,7 +551,49 @@ UNBONDING_PERIOD_EPOCHS = int(os.getenv("QRDX_UNBONDING_PERIOD_EPOCHS", "5040"))
 MIN_DEPOSIT = Decimal('10000')         # Minimum deposit amount
 MAX_DEPOSIT = Decimal('10000000')      # Maximum single deposit
 ACTIVATION_DELAY_EPOCHS = int(os.getenv("QRDX_ACTIVATION_DELAY_EPOCHS", "4"))  # Epochs until deposit becomes active
-WITHDRAWAL_DELAY_EPOCHS = 256          # Epochs until withdrawal finalizes
+# Epochs between a validator's exit_epoch and the first block that may return its principal
+# (Ethereum's MIN_VALIDATOR_WITHDRAWABILITY_DELAY). An exiting validator stays eligible until
+# the FINALIZED epoch reaches exit_epoch, and evidence of an offence needs time to be carried
+# in a block; paying before both would let it misbehave after its stake had left. Enforced by
+# qrdx/validator/withdrawals.py. Env-overridable only so a fast testnet can observe a payout.
+WITHDRAWAL_DELAY_EPOCHS = int(os.getenv("QRDX_WITHDRAWAL_DELAY_EPOCHS", "256"))
+
+# Addresses allowed to submit UPDATE_ORACLE. Oracle prices drive perp execution, margin,
+# PnL and liquidations — all settled into real balances — so an unrestricted update let any
+# user set the price their own position closed at. A CONSENSUS parameter: every node must
+# hold the same list (like SLOTS_PER_EPOCH). Empty (the default) means no one can set a
+# price, so perp markets cannot trade until reporters are configured.
+ORACLE_REPORTERS = tuple(
+    a.strip() for a in os.getenv("QRDX_ORACLE_REPORTERS", "").split(",") if a.strip())
+
+# Perps backstop vault (docs/PERPS_CLEARINGHOUSE.md). Deposits are locked for this much block
+# time (Hyperliquid's HLP: 4 days) so capital cannot leave the moment a loss is in sight.
+# CONSENSUS parameters: every node must hold the same values. Env-overridable only so a fast
+# testnet can exercise a withdrawal.
+PERP_VAULT_LOCKUP_SECONDS = int(os.getenv("QRDX_PERP_VAULT_LOCKUP_SECONDS", str(4 * 24 * 3600)))
+# Treasury seeders: a VAULT_DEPOSIT from one of these is the protocol's own capital — its shares
+# belong to the protocol and never unlock. (The treasury multisig cannot sign exchange
+# transactions, which are PQ-only, so a designated PQ key seeds on its behalf.)
+PERP_VAULT_SEEDERS = tuple(
+    a.strip() for a in os.getenv("QRDX_PERP_VAULT_SEEDERS", "").split(",") if a.strip())
+# Perps settlement asset (docs/PERPS_CLEARINGHOUSE.md §2). Production: the bridged USD
+# stablecoin's QRC-20 token address — Hyperliquid's USDC model: prices, PnL, fees and funding are
+# all in USD, which validators can observe on any exchange. "QRDX" settles in native QRDX
+# (development and tests only). Empty (the default): no collateral is configured and perps
+# deposits are refused. CONSENSUS parameters, like the two below.
+PERP_COLLATERAL_TOKEN = os.getenv("QRDX_PERP_COLLATERAL_TOKEN", "").strip()
+# The unit perp markets are quoted in: "BTC-USD-PERP", priced by oracle pair "BTC:USD".
+PERP_QUOTE = os.getenv("QRDX_PERP_QUOTE", "USD").strip() or "USD"
+# Validator price oracle (docs/PERPS_CLEARINGHOUSE.md §8). Each block, a market's oracle is the
+# stake-weighted median of the committee's votes no older than PERP_ORACLE_VOTE_MAX_AGE seconds
+# of block time, provided they carry a majority of the committee's stake. A market whose oracle
+# has not been set for PERP_ORACLE_STALE_SECONDS refuses new exposure (reduce-only orders still
+# work). CONSENSUS parameters.
+PERP_ORACLE_VOTE_MAX_AGE = int(os.getenv("QRDX_PERP_ORACLE_VOTE_MAX_AGE", "60"))
+PERP_ORACLE_STALE_SECONDS = int(os.getenv("QRDX_PERP_ORACLE_STALE_SECONDS", "300"))
+# Perp funding is paid at every boundary of this much block time (Hyperliquid: hourly). A
+# CONSENSUS parameter; env-overridable only so a fast testnet sees several settlements.
+PERP_FUNDING_INTERVAL_SECONDS = int(os.getenv("QRDX_PERP_FUNDING_INTERVAL_SECONDS", "3600"))
 
 # --- Finality ---
 ATTESTATION_THRESHOLD = Decimal('0.667')  # 2/3 + 1 of stake for finality
@@ -598,6 +652,7 @@ POS_CONSTANTS = {
     'MIN_VALIDATORS': MIN_VALIDATORS,
     'MAX_VALIDATORS': MAX_VALIDATORS,
     'MIN_VALIDATOR_STAKE': MIN_VALIDATOR_STAKE,
+    'VALIDATOR_EJECTION_STAKE': VALIDATOR_EJECTION_STAKE,
     'MAX_EFFECTIVE_STAKE': MAX_EFFECTIVE_STAKE,
     
     # Staking
@@ -826,11 +881,15 @@ EXCHANGE_POOL_STAKE_INSTITUTIONAL = Decimal("100000")
 EXCHANGE_MIN_TICK = -887272
 EXCHANGE_MAX_TICK =  887272
 
-# --- Perpetual Contracts (roadmap extension) ---
+# --- Perpetual Contracts (roadmap extension; the retired PerpEngine's figures) ---
+# The live perps rules are in qrdx/exchange/clearinghouse.py (leverage, margin, funding cap) and
+# PERP_FUNDING_INTERVAL_SECONDS / PERP_VAULT_* above. This block once ALSO defined
+# PERP_FUNDING_INTERVAL_SECONDS (8 hours); being later in the file, it silently replaced the
+# env-driven one, so no node could be configured. Never define a protocol constant twice
+# (tests/test_constants_single_definition.py).
 PERP_MAX_LEVERAGE               = Decimal("20")
 PERP_DEFAULT_INITIAL_MARGIN     = Decimal("0.05")    # 5 %
 PERP_DEFAULT_MAINTENANCE_MARGIN = Decimal("0.025")   # 2.5 %
-PERP_FUNDING_INTERVAL_SECONDS   = 8 * 3600           # 8 hours
 PERP_MAX_FUNDING_RATE           = Decimal("0.01")     # ±1 % cap
 PERP_INSURANCE_CLAWBACK_PCT     = Decimal("0.20")     # ADL trigger
 

@@ -1,13 +1,86 @@
-/main.py
-venv
+# ---------------------------------------------------------------------------
+# Docker build context exclusions
+#
+# The repo root carries ~3.8 GB of local state (ref/, testnet/, logs/, .git).
+# Only qrdx/, py-evm/, run_node.py and requirements-v3.txt are needed to build
+# the node image, so everything else is excluded to keep the context small.
+# ---------------------------------------------------------------------------
+
+# --- VCS / tooling ---
+.git
+.gitignore
+.gitmodules
+.github
+.devcontainer
+.claude
 .idea
-__pycache__
-bot.py
-miner.html
-bot.session
-test.db
-postgres/
-nodes.json
+.vscode
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.pre-commit-config.yaml
+.gitleaks.toml
+
+# --- Local runtime state (never belongs in an image) ---
+data/
+logs/
+testnet/
+testnet*/
+miner/
+dvm/
+*.db
+*.log
+*.pid
+
+# --- Vendored reference material (1.5 GB, not used at runtime) ---
+ref/
+
+# --- Tests, examples, docs ---
+tests/
+integration_tests/
+examples/
+docs/
+changelogs/
+*.md
+!README.md
+
+# --- py-evm: source is needed, its test fixtures are not ---
+py-evm/fixtures
+py-evm/fixtures_eest
+py-evm/docs
+py-evm/tests
+py-evm/scripts
+py-evm/.git
+py-evm/.tox
+
+# --- Secrets & keys: MUST NOT be baked into an image ---
 .env
-node_key.priv
-denaro/node/node_key.priv
+*.env
+.postgres-env
+*.priv
+*.key
+*.pem
+*.pq
+*.pq.pub
+*.keystore
+node_key.*
+validator_wallet.json
+slashing_protection.db
+
+# --- Python build artifacts ---
+__pycache__
+**/__pycache__
+*.py[cod]
+venv
+.venv
+build/
+dist/
+*.egg-info
+
+# --- Misc ---
+*.bak
+*.html
+nodes.json
+postgres/
+target-openapi.json
+test_results.txt

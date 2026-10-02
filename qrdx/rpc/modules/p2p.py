@@ -67,6 +67,7 @@ class P2PModule(RPCModule):
         self._exchange_apply_section = None    # D3/Phase E importer hook (main._apply_exchange_section_on_import)
         self._verify_unified_root = None       # E-D4 importer hook (main._verify_unified_state_root)
         self._check_parent_continuity = None   # parent-continuity hook (main._check_parent_continuity)
+        self._restore_after_rejected_block = None  # undo a rejected block's effects (main)
         self._tiebreak_rollback = None         # mechanism-2 rollback hook (main._tiebreak_rollback)
         self._enforce_equal_height_tiebreak = False  # mechanism-2 enforce gate (observe-first)
         self._enforce_proposer_eligibility = False  # slot-eligibility gate (observe-first)
@@ -91,6 +92,7 @@ class P2PModule(RPCModule):
         exchange_apply_section=None,
         verify_unified_root=None,
         check_parent_continuity=None,
+        restore_after_rejected_block=None,
         tiebreak_rollback=None,
         enforce_equal_height_tiebreak=False,
         enforce_proposer_eligibility=False,
@@ -110,6 +112,7 @@ class P2PModule(RPCModule):
         self._exchange_apply_section = exchange_apply_section
         self._verify_unified_root = verify_unified_root
         self._check_parent_continuity = check_parent_continuity
+        self._restore_after_rejected_block = restore_after_rejected_block
         self._tiebreak_rollback = tiebreak_rollback
         self._enforce_equal_height_tiebreak = enforce_equal_height_tiebreak
         self._enforce_proposer_eligibility = enforce_proposer_eligibility
@@ -123,6 +126,19 @@ class P2PModule(RPCModule):
     # BLOCK ENDPOINTS
     # =====================================================================
 
+
+    async def _restore_after_rejection(self, block_no, reason: str) -> None:
+        """Undo a rejected block's already-applied effects (see main._restore_after_rejected_block).
+
+        The sections run before the final checks and do not all roll back on their own, so a
+        block rejected at the EVM root check or at E-D4 would otherwise leave its effects in
+        this node's derived state. The caller holds the block-processing lock."""
+        if self._restore_after_rejected_block is None:
+            return
+        try:
+            await self._restore_after_rejected_block(block_no, reason)
+        except Exception as e:
+            logger.error("restore after rejected block %s failed: %s", block_no, e)
     async def _equal_height_incoming_wins(self, block_no, block_data, block_content) -> bool:
         """Fork-choice convergence (mechanism-2). Compare an incoming block at an
         already-filled height to the one we stored: if they share a parent but
@@ -351,6 +367,14 @@ class P2PModule(RPCModule):
                         ok_ex, verr = False, f"exchange validation error: {e}"
                     if not ok_ex:
                         return {'ok': False, 'error': f'Invalid exchange section: {verr}'}
+                elif block_no and int(block_no) >= 1:
+                    # No exchange transactions — the exchange still ticks every block (mark
+                    # prices; liquidations and funding next), exactly as the other paths do.
+                    try:
+                        from ...exchange.block_processor import run_exchange_tick
+                        run_exchange_tick(int(block_no), float(block_data.get('timestamp', 0) or 0))
+                    except Exception as e:
+                        logger.error(f"exchange tick failed at block {block_no}: {e}")
 
                 # E-D3b: validate + replay the EVM section (execute-on-mine) before
                 # storing; reject on account_state_root mismatch. The apply hook is
@@ -365,7 +389,20 @@ class P2PModule(RPCModule):
                     except Exception as e:
                         ok_evm, verr_evm = False, f"evm validation error: {e}"
                     if not ok_evm:
+                        await self._restore_after_rejection(block_no, f"EVM section: {verr_evm}")
                         return {'ok': False, 'error': f'Invalid EVM section: {verr_evm}'}
+
+                # Stake withdrawals — same point as the proposer and the other import
+                # paths: after the EVM section, before the unified-root check.
+                try:
+                    from ...validator.block_verification import epoch_from_block
+                    from ...validator.withdrawals import process_block_withdrawals
+                    _wd_epoch = epoch_from_block(block_data)
+                    if _wd_epoch is not None:
+                        await process_block_withdrawals(self._db, int(block_no), int(_wd_epoch))
+                except Exception as e:
+                    logger.error("withdrawal processing failed on p2p import of block %s: %s",
+                                 block_no, e)
 
                 # E-D4: verify the recomputed unified state root against the signed
                 # root (after section replay, before storing).
@@ -375,6 +412,7 @@ class P2PModule(RPCModule):
                     except Exception as e:
                         ok_root, root_err = True, f"unified root check error: {e}"
                     if not ok_root:
+                        await self._restore_after_rejection(block_no, f"E-D4: {root_err}")
                         return {'ok': False, 'error': f'Invalid state root: {root_err}'}
 
                 try:

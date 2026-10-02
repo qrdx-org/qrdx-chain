@@ -27,6 +27,7 @@ readable report, or via pytest as ``test_exchange_e2e_leverage``.
 import asyncio
 from decimal import Decimal
 
+
 import pytest
 
 from qrdx.crypto.pq.dilithium import PQPrivateKey, PQPublicKey, PQSignature, verify
@@ -208,80 +209,85 @@ async def run_exchange_e2e(report=False):
     say("\n=== 5. Limit orders matched ===")
     say(f"  maker SELL 1 qBTC @30000  ↔  taker BUY 1 qBTC @30000  → trades={r.data['trades']}, filled={r.data['filled']}")
 
-    # ---- 6. Leveraged perpetual position --------------------------------
-    # Perp markets are protocol/governance objects (no per-tx create op), so
-    # the market is set up on the engine directly, then traded via txs.
-    market = sm.perp_engine.create_market("qBTC", "qUSD", max_leverage=Decimal("20"))
+    # ---- 6. Leveraged perpetual positions (clearinghouse order book) -----
+    # Perps trade on an order book: every position has a counterparty, so whatever one
+    # trader makes another loses (docs/PERPS_CLEARINGHOUSE.md). The market is set up on the
+    # clearinghouse directly and priced as an authorized oracle reporter would.
+    ch = sm.clearinghouse
+    market = ch.create_market("qBTC", "qUSD", max_leverage=Decimal("20"))
     market_id = market.id
-
     LEVERAGE = Decimal("10")
     SIZE = Decimal("2")          # 2 qBTC
     ENTRY = Decimal("30000")     # qUSD per qBTC
-    notional = SIZE * ENTRY                      # 60,000 qUSD
-    expected_margin = notional / LEVERAGE        # 6,000 qUSD collateral
+    notional = SIZE * ENTRY                      # 60,000
+    expected_margin = notional / LEVERAGE        # 6,000 at 10x
+    ch.set_oracle_price(market_id, ENTRY)
 
-    taker.spend(expected_margin, "perp long margin")
-    r = sm.process_transaction(make_tx(
-        taker.address, ExchangeOpType.OPEN_POSITION,
-        {
-            "market_id": market_id, "side": PerpSide.LONG.value,
-            "size": str(SIZE), "leverage": str(LEVERAGE), "price": str(ENTRY),
-        },
-        next_nonce(taker.address),
-    ))
-    assert r.success, f"OPEN_POSITION (long) failed: {r.error}"
-    pos_id = r.data["position_id"]
-    assert Decimal(r.data["margin"]) == expected_margin, (
-        f"margin should be notional/leverage = {expected_margin}, got {r.data['margin']}"
-    )
+    for who, collateral in ((taker, Decimal("20000")), (hedger, Decimal("20000"))):
+        who.spend(collateral, "perp collateral deposit")
+        r = sm.process_transaction(make_tx(who.address, ExchangeOpType.PERP_DEPOSIT,
+                                           {"amount": str(collateral)}, next_nonce(who.address)))
+        assert r.success, f"PERP_DEPOSIT failed: {r.error}"
+    for who, lev in ((taker, LEVERAGE), (hedger, Decimal("5"))):
+        r = sm.process_transaction(make_tx(who.address, ExchangeOpType.PERP_SET_LEVERAGE,
+                                           {"market_id": market_id, "leverage": str(lev)},
+                                           next_nonce(who.address)))
+        assert r.success, f"PERP_SET_LEVERAGE failed: {r.error}"
 
-    # A hedger opens the opposite side at lower leverage.
-    hedger.spend((SIZE * ENTRY) / Decimal("5"), "perp short margin")
-    r = sm.process_transaction(make_tx(
-        hedger.address, ExchangeOpType.OPEN_POSITION,
-        {
-            "market_id": market_id, "side": PerpSide.SHORT.value,
-            "size": str(SIZE), "leverage": "5", "price": str(ENTRY),
-        },
-        next_nonce(hedger.address),
-    ))
-    assert r.success, f"OPEN_POSITION (short) failed: {r.error}"
+    # Leverage cap is enforced: 25x must be rejected (max is 20x).
+    r = sm.process_transaction(make_tx(taker.address, ExchangeOpType.PERP_SET_LEVERAGE,
+                                       {"market_id": market_id, "leverage": "25"},
+                                       next_nonce(taker.address)))
+    assert not r.success, "leverage above the 20x cap must be rejected"
 
-    # Leverage cap is enforced: 25× must be rejected (max is 20×).
-    r = sm.process_transaction(make_tx(
-        taker.address, ExchangeOpType.OPEN_POSITION,
-        {
-            "market_id": market_id, "side": PerpSide.LONG.value,
-            "size": "1", "leverage": "25", "price": str(ENTRY),
-        },
-        next_nonce(taker.address),
-    ))
-    assert not r.success, "leverage above the 20× cap must be rejected"
+    # The hedger rests a sell; the taker lifts it. One trade, two equal and opposite positions.
+    r = sm.process_transaction(make_tx(hedger.address, ExchangeOpType.PERP_ORDER,
+                                       {"market_id": market_id, "side": "sell",
+                                        "size": str(SIZE), "price": str(ENTRY)},
+                                       next_nonce(hedger.address)))
+    assert r.success, f"hedger sell failed: {r.error}"
+    r = sm.process_transaction(make_tx(taker.address, ExchangeOpType.PERP_ORDER,
+                                       {"market_id": market_id, "side": "buy",
+                                        "size": str(SIZE), "price": str(ENTRY)},
+                                       next_nonce(taker.address)))
+    assert r.success and len(r.data["fills"]) == 1, f"taker buy failed: {r.error}"
+    assert ch.accounts[taker.address].positions[market_id].size == SIZE
+    assert ch.accounts[hedger.address].positions[market_id].size == -SIZE
+    assert ch.cross_requirement(taker.address) == expected_margin
 
-    say("\n=== 6. Leveraged perpetual positions ===")
-    say(f"  market={market_id}  max_leverage={market.max_leverage}×")
-    say(f"  taker LONG  {SIZE} qBTC @ {ENTRY}  {LEVERAGE}×  → margin={expected_margin} qUSD (notional={notional})")
-    say(f"  hedger SHORT {SIZE} qBTC @ {ENTRY}  5×  → margin={(SIZE*ENTRY)/5} qUSD")
-    say(f"  25× open correctly REJECTED (cap = {market.max_leverage}×)")
+    say("\n=== 6. Leveraged perpetual positions (order book) ===")
+    say(f"  market={market_id}  max_leverage={market.max_leverage}x")
+    say(f"  taker LONG {SIZE} qBTC @ {ENTRY} {LEVERAGE}x vs hedger SHORT {SIZE} @ {ENTRY} 5x")
+    say(f"  taker initial margin = {expected_margin} (notional {notional}); 25x REJECTED")
 
-    # ---- 7. Close the long for PnL, finalize the block ------------------
-    EXIT = Decimal("31000")  # +1000 qUSD per qBTC
-    r = sm.process_transaction(make_tx(
-        taker.address, ExchangeOpType.CLOSE_POSITION,
-        {"position_id": pos_id, "price": str(EXIT)},
-        next_nonce(taker.address),
-    ))
-    assert r.success, f"CLOSE_POSITION failed: {r.error}"
-    realized = Decimal(r.data["pnl"])
-    expected_pnl = SIZE * (EXIT - ENTRY)  # long: size*(exit-entry) = 2*1000 = 2000
+    # ---- 7. Close for PnL, finalize the block -------------------------
+    EXIT = Decimal("31000")  # +1000 per qBTC to the long — and −1000 per qBTC to the short
+    ch.set_oracle_price(market_id, EXIT)
+    r = sm.process_transaction(make_tx(hedger.address, ExchangeOpType.PERP_ORDER,
+                                       {"market_id": market_id, "side": "buy",
+                                        "size": str(SIZE), "price": str(EXIT),
+                                        "reduce_only": True},
+                                       next_nonce(hedger.address)))
+    assert r.success, f"hedger close failed: {r.error}"
+    r = sm.process_transaction(make_tx(taker.address, ExchangeOpType.PERP_ORDER,
+                                       {"market_id": market_id, "side": "sell",
+                                        "size": str(SIZE), "price": str(EXIT),
+                                        "reduce_only": True},
+                                       next_nonce(taker.address)))
+    assert r.success, f"taker close failed: {r.error}"
+    realized = Decimal(r.data["fills"][0]["realized"][taker.address])
+    hedger_realized = Decimal(r.data["fills"][0]["realized"][hedger.address])
+    expected_pnl = SIZE * (EXIT - ENTRY)
     assert realized == expected_pnl, f"PnL should be {expected_pnl}, got {realized}"
+    assert hedger_realized == -expected_pnl, "the hedger's loss is exactly the taker's gain"
+    assert ch.identity_gap() == 0 and ch.net_size(market_id) == 0
 
     state_root = sm.finalize_block()
     assert isinstance(state_root, str) and len(state_root) > 0
     stats = sm.get_stats()
 
     say("\n=== 7. Settlement ===")
-    say(f"  taker closes LONG @ {EXIT}  → realized PnL = +{realized} qUSD")
+    say(f"  taker closes LONG @ {EXIT}  → realized PnL = +{realized}; hedger {hedger_realized}")
     say(f"  block state_root = {state_root[:32]}…")
     say(f"  engine stats: {stats}")
     say("\n✅ Full exchange path exercised: tokens → pair → limit orders → leverage → settlement\n")
@@ -294,6 +300,7 @@ async def run_exchange_e2e(report=False):
         "realized_pnl": realized,
         "state_root": state_root,
         "stats": stats,
+        "perp_trades": market.book.total_trades,
     }
 
 
@@ -307,7 +314,8 @@ async def test_exchange_e2e_full_flow():
     assert result["long_margin"] == Decimal("6000")
     assert result["realized_pnl"] == Decimal("2000")
     assert result["market_id"] == "qBTC-qUSD-PERP"
-    assert result["stats"]["total_positions"] >= 2
+    # Both sides of the perp trade existed and both were closed by order-book fills.
+    assert result["perp_trades"] == 2
 
 
 if __name__ == "__main__":

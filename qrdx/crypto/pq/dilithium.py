@@ -114,6 +114,17 @@ class PQPublicKey:
         from ..address import public_key_to_address, AddressType
         return public_key_to_address(self.key_bytes, AddressType.POST_QUANTUM)
 
+    def to_account_id(self) -> str:
+        """
+        Derive the canonical 20-byte ACCOUNT ID this key controls.
+
+        This — not ``to_address()`` — is the key the ledger and the EVM use, so it
+        is what a PQ transaction's sender resolves to and what a contract sees as
+        ``msg.sender``.  ``to_address()`` remains the human-facing ``0xPQ…`` form.
+        """
+        from ..account_id import to_account_id
+        return to_account_id(self.to_address())
+
     def fingerprint(self) -> str:
         """
         Get short fingerprint for display.

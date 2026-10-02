@@ -1,4 +1,8 @@
 # Prometheus configuration for QRDX node monitoring
+#
+# The QRDX node exposes /metrics on its main HTTP port (QRDX_NODE_PORT, default
+# 3007) — there is no separate metrics listener. Keep the target in sync with
+# QRDX_NODE_PORT in docker-compose.prod.yml.
 
 global:
   scrape_interval: 15s
@@ -11,7 +15,7 @@ scrape_configs:
   # QRDX node metrics
   - job_name: "qrdx-node"
     static_configs:
-      - targets: ["qrdx-node:9090"]
+      - targets: ["qrdx-node:3007"]
     metrics_path: "/metrics"
     scrape_interval: 10s
 

@@ -64,6 +64,24 @@ class ExchangeOpType(IntEnum):
     STAKE_DEPOSIT = 15
     STAKE_EXIT = 16
     REMOVE_POOL = 17
+    # Perps clearinghouse (docs/PERPS_CLEARINGHOUSE.md). OPEN_POSITION, CLOSE_POSITION,
+    # PARTIAL_CLOSE and ADD_MARGIN (7-10) are retired: they traded against nobody.
+    PERP_DEPOSIT = 18
+    PERP_WITHDRAW = 19
+    PERP_SET_LEVERAGE = 20
+    PERP_ORDER = 21
+    PERP_CANCEL = 22
+    VAULT_DEPOSIT = 23     # perps backstop vault: collateral in, shares at NAV
+    VAULT_WITHDRAW = 24    # shares out at NAV, after the lockup
+    ORACLE_VOTE = 25       # a validator's USD prices for perp markets
+    # The native token standard (qrdx/exchange/tokens.py): authorities, supply, allowances.
+    TOKEN_MINT = 26            # the mint authority mints new supply
+    TOKEN_BURN = 27            # a holder burns its own balance
+    TOKEN_APPROVE = 28         # set a spender's allowance (0 revokes)
+    TOKEN_TRANSFER_FROM = 29   # a spender moves an owner's tokens within its allowance
+    TOKEN_SET_AUTHORITY = 30   # hand over or renounce the mint / freeze authority
+    TOKEN_FREEZE = 31          # the freeze authority freezes an account's balance
+    TOKEN_THAW = 32            # … and thaws it
 
 
 # ---------------------------------------------------------------------------
@@ -250,9 +268,11 @@ class ExchangeTransaction:
         op = self.op_type
 
         if op == ExchangeOpType.CREATE_POOL:
-            for key in ("token0", "token1", "fee_tier", "pool_type", "initial_sqrt_price", "stake_amount"):
+            for key in ("token0", "token1", "fee_tier", "pool_type", "stake_amount"):
                 if key not in p:
                     raise ValueError(f"CREATE_POOL missing param: {key}")
+            if "initial_sqrt_price" not in p and "initial_price" not in p:
+                raise ValueError("CREATE_POOL missing param: initial_price (or initial_sqrt_price)")
 
         elif op == ExchangeOpType.ADD_LIQUIDITY:
             for key in ("pool_id", "tick_lower", "tick_upper", "amount"):
@@ -298,6 +318,37 @@ class ExchangeTransaction:
                 if key not in p:
                     raise ValueError(f"ADD_MARGIN missing param: {key}")
 
+        elif op in (ExchangeOpType.PERP_DEPOSIT, ExchangeOpType.PERP_WITHDRAW):
+            if "amount" not in p:
+                raise ValueError(f"{op.name} missing param: amount")
+
+        elif op == ExchangeOpType.PERP_SET_LEVERAGE:
+            for key in ("market_id", "leverage"):
+                if key not in p:
+                    raise ValueError(f"PERP_SET_LEVERAGE missing param: {key}")
+
+        elif op == ExchangeOpType.PERP_ORDER:
+            for key in ("market_id", "side", "size", "price"):
+                if key not in p:
+                    raise ValueError(f"PERP_ORDER missing param: {key}")
+
+        elif op == ExchangeOpType.PERP_CANCEL:
+            for key in ("market_id", "order_id"):
+                if key not in p:
+                    raise ValueError(f"PERP_CANCEL missing param: {key}")
+
+        elif op == ExchangeOpType.VAULT_DEPOSIT:
+            if "amount" not in p:
+                raise ValueError("VAULT_DEPOSIT missing param: amount")
+
+        elif op == ExchangeOpType.VAULT_WITHDRAW:
+            if "shares" not in p:
+                raise ValueError("VAULT_WITHDRAW missing param: shares")
+
+        elif op == ExchangeOpType.ORACLE_VOTE:
+            if not isinstance(p.get("prices"), dict) or not p["prices"]:
+                raise ValueError("ORACLE_VOTE needs a non-empty prices map")
+
         elif op == ExchangeOpType.UPDATE_ORACLE:
             for key in ("pair", "price"):
                 if key not in p:
@@ -308,9 +359,39 @@ class ExchangeTransaction:
                 raise ValueError("CREATE_MARKET missing param: base_token")
 
         elif op == ExchangeOpType.TOKEN_DEPLOY:
-            for key in ("name", "symbol", "total_supply"):
+            for key in ("name", "symbol"):
                 if key not in p:
                     raise ValueError(f"TOKEN_DEPLOY missing param: {key}")
+            if "total_supply" not in p and "initial_supply" not in p and not p.get("mint_authority"):
+                raise ValueError("TOKEN_DEPLOY needs an initial supply or a mint authority")
+
+        elif op in (ExchangeOpType.TOKEN_MINT, ExchangeOpType.TOKEN_BURN):
+            for key in ("token_address", "amount"):
+                if key not in p:
+                    raise ValueError(f"{op.name} missing param: {key}")
+
+        elif op == ExchangeOpType.TOKEN_APPROVE:
+            for key in ("token_address", "spender", "amount"):
+                if key not in p:
+                    raise ValueError(f"TOKEN_APPROVE missing param: {key}")
+
+        elif op == ExchangeOpType.TOKEN_TRANSFER_FROM:
+            for key in ("token_address", "from", "to", "amount"):
+                if key not in p:
+                    raise ValueError(f"TOKEN_TRANSFER_FROM missing param: {key}")
+
+        elif op == ExchangeOpType.TOKEN_SET_AUTHORITY:
+            for key in ("token_address", "authority"):
+                if key not in p:
+                    raise ValueError(f"TOKEN_SET_AUTHORITY missing param: {key}")
+            if "new_authority" not in p:
+                raise ValueError("TOKEN_SET_AUTHORITY missing param: new_authority "
+                                 "(empty to renounce)")
+
+        elif op in (ExchangeOpType.TOKEN_FREEZE, ExchangeOpType.TOKEN_THAW):
+            for key in ("token_address", "account"):
+                if key not in p:
+                    raise ValueError(f"{op.name} missing param: {key}")
 
         elif op == ExchangeOpType.TOKEN_TRANSFER:
             for key in ("token_address", "to", "amount"):
@@ -362,4 +443,19 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.STAKE_DEPOSIT: 150_000,
     ExchangeOpType.STAKE_EXIT: 80_000,
     ExchangeOpType.REMOVE_POOL: 60_000,
+    ExchangeOpType.PERP_DEPOSIT: 40_000,
+    ExchangeOpType.PERP_WITHDRAW: 40_000,
+    ExchangeOpType.PERP_SET_LEVERAGE: 20_000,
+    ExchangeOpType.PERP_ORDER: 60_000,
+    ExchangeOpType.PERP_CANCEL: 25_000,
+    ExchangeOpType.VAULT_DEPOSIT: 40_000,
+    ExchangeOpType.VAULT_WITHDRAW: 40_000,
+    ExchangeOpType.ORACLE_VOTE: 30_000,
+    ExchangeOpType.TOKEN_MINT: 40_000,
+    ExchangeOpType.TOKEN_BURN: 30_000,
+    ExchangeOpType.TOKEN_APPROVE: 25_000,
+    ExchangeOpType.TOKEN_TRANSFER_FROM: 45_000,
+    ExchangeOpType.TOKEN_SET_AUTHORITY: 25_000,
+    ExchangeOpType.TOKEN_FREEZE: 25_000,
+    ExchangeOpType.TOKEN_THAW: 25_000,
 }

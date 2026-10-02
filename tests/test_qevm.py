@@ -81,6 +81,7 @@ from eth.crypto import (
 )
 
 # ── State / Executor / Bridge imports ─────────────────────────────────
+from qrdx.crypto.account_id import to_account_id
 from qrdx.contracts.state import ContractStateManager, Account
 from qrdx.contracts.state_sync import (
     StateSyncManager,
@@ -128,10 +129,13 @@ class MockDatabaseSQLite:
 
     def __init__(self):
         self.connection = None  # will be set to real aiosqlite connection
-        self._balances = {}     # address → Decimal
+        self._balances = {}     # account id → Decimal
 
     async def get_address_balance(self, address: str) -> Decimal:
-        return self._balances.get(address, Decimal('0'))
+        # Account-id keyed, like the real ledger: any address form resolves to the
+        # one row for that account.
+        from qrdx.crypto.account_id import to_account_id
+        return self._balances.get(to_account_id(address), Decimal('0'))
 
 
 async def _create_test_db():
@@ -226,6 +230,38 @@ class TestPrecompileRegistry:
         assert KYBER_ENCAPSULATE_ADDRESS == bytes(19) + b'\x0a'
         assert KYBER_DECAPSULATE_ADDRESS == bytes(19) + b'\x0b'
         assert BLAKE3_HASH_ADDRESS == bytes(19) + b'\x0c'
+
+
+class TestRetiredExchangePrecompiles:
+    """0x0100–0x0104 ran a separate, simulated exchange (pools keyed by symbol strings, no
+    tokens moved, nothing in any state root). The addresses stay reserved and revert with a
+    reason, so a contract written against them fails loudly instead of reading an empty answer
+    as success."""
+
+    def test_every_retired_address_reverts_with_a_reason(self):
+        from eth.exceptions import Revert
+        from eth.vm.forks.qrdx.precompiles import (
+            EXCHANGE_CREATE_POOL_ADDRESS, EXCHANGE_SWAP_ADDRESS, EXCHANGE_ADD_LIQUIDITY_ADDRESS,
+            EXCHANGE_PLACE_LIMIT_ORDER_ADDRESS, EXCHANGE_CANCEL_ORDER_ADDRESS,
+            GAS_RETIRED_EXCHANGE_PRECOMPILE, RETIRED_EXCHANGE_REASON,
+        )
+
+        class Computation:
+            output = b""
+            gas = 0
+
+            def consume_gas(self, amount, reason):
+                self.gas += amount
+
+        for address in (EXCHANGE_CREATE_POOL_ADDRESS, EXCHANGE_SWAP_ADDRESS,
+                        EXCHANGE_ADD_LIQUIDITY_ADDRESS, EXCHANGE_PLACE_LIMIT_ORDER_ADDRESS,
+                        EXCHANGE_CANCEL_ORDER_ADDRESS):
+            comp = Computation()
+            with pytest.raises(Revert):
+                QRDX_PRECOMPILES[address](comp)
+            assert comp.gas == GAS_RETIRED_EXCHANGE_PRECOMPILE
+            assert comp.output[:4].hex() == "08c379a0"                  # Error(string)
+            assert RETIRED_EXCHANGE_REASON.encode() in comp.output
 
 
 class TestPrecompileSizeConstants:
@@ -795,10 +831,18 @@ class TestContractStateManager:
         assert sm.get_code_sync('0x' + '00' * 20) == b''
 
     def test_account_created_on_set(self):
+        """
+        The cache is keyed by canonical account id, not by the caller's spelling —
+        so the EVM's checksummed writes and the ledger's canonical reads land on one
+        entry rather than two.
+        """
         sm = ContractStateManager(MagicMock())
         addr = '0xAbCdEf0123456789AbCdEf0123456789AbCdEf01'
         sm.set_balance_sync(addr, 42)
-        assert addr in sm._accounts_cache
+        assert to_account_id(addr) in sm._accounts_cache
+        # And reading back through any spelling finds it.
+        assert sm.get_balance_sync(addr) == 42
+        assert sm.get_balance_sync(addr.lower()) == 42
 
 
 class TestContractStateManagerAsync:
@@ -869,8 +913,8 @@ class TestStateSyncManager:
     async def test_sync_address_sets_evm_balance(self, sync_env):
         db, evm_state, sync_mgr = sync_env
         addr = '0x' + 'AA' * 20
-        # sync_address_to_evm checksums the address before calling get_address_balance
-        db._balances[_cksum(addr)] = Decimal('10.5')
+        # The ledger is keyed by canonical account id, not by display spelling.
+        db._balances[to_account_id(addr)] = Decimal('10.5')
 
         synced = await sync_mgr.sync_address_to_evm(
             address=addr, block_height=1, block_hash='ab' * 32
@@ -882,7 +926,7 @@ class TestStateSyncManager:
     async def test_sync_skips_if_already_synced(self, sync_env):
         db, evm_state, sync_mgr = sync_env
         addr = '0x' + 'BB' * 20
-        db._balances[_cksum(addr)] = Decimal('1')
+        db._balances[to_account_id(addr)] = Decimal('1')
 
         await sync_mgr.sync_address_to_evm(addr, 5, 'cc' * 32)
         # Second sync at same block should be skipped
@@ -893,7 +937,7 @@ class TestStateSyncManager:
     async def test_sync_force_overrides_skip(self, sync_env):
         db, evm_state, sync_mgr = sync_env
         addr = '0x' + 'CC' * 20
-        db._balances[_cksum(addr)] = Decimal('2')
+        db._balances[to_account_id(addr)] = Decimal('2')
 
         await sync_mgr.sync_address_to_evm(addr, 5, 'dd' * 32)
         synced = await sync_mgr.sync_address_to_evm(addr, 5, 'dd' * 32, force=True)
@@ -941,7 +985,7 @@ class TestExecutionContext:
             db=db, evm_state=evm_state, sync_manager=sync_mgr
         )
         addr = '0x' + 'EE' * 20
-        db._balances[_cksum(addr)] = Decimal('5')
+        db._balances[to_account_id(addr)] = Decimal('5')
         await ctx.prepare_execution(addr)
         assert ctx._evm_snapshot_id is not None
 
@@ -953,7 +997,7 @@ class TestExecutionContext:
             db=db, evm_state=evm_state, sync_manager=sync_mgr
         )
         addr = '0x' + 'FF' * 20
-        db._balances[_cksum(addr)] = Decimal('10')
+        db._balances[to_account_id(addr)] = Decimal('10')
         await ctx.prepare_execution(addr)
 
         await ctx.finalize_execution(
@@ -970,7 +1014,7 @@ class TestExecutionContext:
             db=db, evm_state=evm_state, sync_manager=sync_mgr
         )
         addr = '0x' + '11' * 20
-        db._balances[_cksum(addr)] = Decimal('10')
+        db._balances[to_account_id(addr)] = Decimal('10')
         await ctx.prepare_execution(addr)
 
         balance_before = await evm_state.get_balance(addr)

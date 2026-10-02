@@ -563,14 +563,24 @@ class TestConcentratedLiquidity:
     def test_fee_accrual_on_swap(self):
         pool = self._make_pool()
         pool.add_liquidity(ADDR_A, -60, 60, Decimal("100000"))
-        pool.swap(Decimal("1000"), zero_for_one=True)
+        pool.swap(Decimal("100"), zero_for_one=True)      # ±60 ticks of 100,000 L ≈ 300 deep
         assert pool.state.fee_growth_global_0 > 0
 
     def test_protocol_fees_accrued(self):
         pool = self._make_pool()
         pool.add_liquidity(ADDR_A, -60, 60, Decimal("100000"))
-        pool.swap(Decimal("1000"), zero_for_one=True)
+        pool.swap(Decimal("100"), zero_for_one=True)
         assert pool.state.protocol_fees_0 > 0
+
+    def test_a_swap_larger_than_the_range_is_refused_whole(self):
+        """Concentrated liquidity ends at its range: past it there is nothing to trade
+        against, so the swap fails — and changes nothing."""
+        pool = self._make_pool()
+        pool.add_liquidity(ADDR_A, -60, 60, Decimal("100000"))
+        before = (pool.state.sqrt_price, pool.state.tick, pool.state.liquidity)
+        with pytest.raises(ValueError, match="liquidity"):
+            pool.swap(Decimal("1000"), zero_for_one=True)
+        assert (pool.state.sqrt_price, pool.state.tick, pool.state.liquidity) == before
 
 
 # ============================================================================
@@ -822,14 +832,21 @@ class TestUnifiedRouter:
         assert result.fee_total > 0
 
     def test_clob_only_fill(self):
+        """Selling the base (QRDX) hits the bids; paying with the quote (USDC) buys from
+        the asks. (The router used to have the sides the wrong way round.)"""
         book = OrderBook()
+        book.place_order(Order(id="bid", owner=ADDR_B, side=OrderSide.BUY,
+                               order_type=OrderType.LIMIT, price=Decimal("0.9"),
+                               amount=Decimal("100")))
         book.place_order(Order(id="ask", owner=ADDR_B, side=OrderSide.SELL,
                                order_type=OrderType.LIMIT, price=Decimal("1.0"),
                                amount=Decimal("100")))
         router = UnifiedRouter()
         router.register_order_book("QRDX:USDC", book)
-        result = router.execute("QRDX", "USDC", Decimal("10"), ADDR_A)
-        assert result.source == FillSource.CLOB
+        sell = router.execute("QRDX", "USDC", Decimal("10"), ADDR_A)
+        assert sell.source == FillSource.CLOB and sell.amount_out == Decimal("9.0")
+        buy = router.execute("USDC", "QRDX", Decimal("10"), ADDR_A)
+        assert buy.source == FillSource.CLOB and buy.amount_out == Decimal("10")
 
     def test_no_liquidity_raises(self):
         router = UnifiedRouter()
@@ -852,12 +869,15 @@ class TestUnifiedRouter:
         total = result.fee_lp + result.fee_creator + result.fee_treasury + result.fee_validator
         assert total == result.fee_total
 
-    def test_oracle_update_on_trade(self):
+    def test_trades_do_not_write_the_reporter_oracle(self):
+        """Fills used to be recorded into the pair's reporter oracle with wall-clock
+        timestamps — which made a replay compute a different state root. Each pool now keeps
+        its own block-time oracle; the reporter oracle is the reporters' alone."""
         router = self._setup_router()
         oracle = router.get_oracle("QRDX:USDC")
         before = oracle.observation_count
         router.execute("QRDX", "USDC", Decimal("10"), ADDR_A)
-        assert oracle.observation_count > before
+        assert oracle.observation_count == before
 
     def test_register_and_get_order_book(self):
         router = UnifiedRouter()
@@ -1234,7 +1254,7 @@ class TestExchangeConstants:
         assert PERP_MAX_LEVERAGE == Decimal("20")
         assert PERP_DEFAULT_INITIAL_MARGIN == Decimal("0.05")
         assert PERP_DEFAULT_MAINTENANCE_MARGIN == Decimal("0.025")
-        assert PERP_FUNDING_INTERVAL_SECONDS == 28800
+        assert PERP_FUNDING_INTERVAL_SECONDS == 3600   # hourly, as Hyperliquid (env-overridable)
         assert PERP_MAX_FUNDING_RATE == Decimal("0.01")
 
     def test_gas_costs(self):
@@ -1372,6 +1392,36 @@ class TestOrderBookSecurity:
         # Both cancelled
         assert len(trades) == 0
         assert book.bid_depth == 0
+
+    def test_stp_cancel_taker_mode(self):
+        """STP CANCEL_TAKER: the taker stops at its own resting order and its remainder is
+        cancelled — fills already made stand, makers are untouched, the book never crosses."""
+        book = OrderBook(self_trade_action=SelfTradeAction.CANCEL_TAKER)
+        book.place_order(Order(id="ask_b", owner=ADDR_B, side=OrderSide.SELL,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("3")))
+        book.place_order(Order(id="ask_a", owner=ADDR_A, side=OrderSide.SELL,
+                               order_type=OrderType.LIMIT, price=Decimal("101"),
+                               amount=Decimal("10")))
+        taker = Order(id="bid_a", owner=ADDR_A, side=OrderSide.BUY,
+                      order_type=OrderType.LIMIT, price=Decimal("105"), amount=Decimal("10"))
+        trades = book.place_order(taker)
+        assert [t.amount for t in trades] == [Decimal("3")]
+        assert taker.status == OrderStatus.CANCELLED and not taker.is_active
+        assert book.bid_depth == 0 and book.best_ask == Decimal("101")
+
+    def test_stp_cancel_both_never_rests_the_taker(self):
+        book = OrderBook(self_trade_action=SelfTradeAction.CANCEL_BOTH)
+        book.place_order(Order(id="ask_a", owner=ADDR_A, side=OrderSide.SELL,
+                               order_type=OrderType.LIMIT, price=Decimal("100"),
+                               amount=Decimal("10")))
+        book.place_order(Order(id="ask_b", owner=ADDR_B, side=OrderSide.SELL,
+                               order_type=OrderType.LIMIT, price=Decimal("101"),
+                               amount=Decimal("10")))
+        trades = book.place_order(Order(id="bid_a", owner=ADDR_A, side=OrderSide.BUY,
+                                        order_type=OrderType.LIMIT, price=Decimal("105"),
+                                        amount=Decimal("5")))
+        assert trades == [] and book.bid_depth == 0 and book.best_ask == Decimal("101")
 
     def test_stp_different_owners_trade_normally(self):
         """STP doesn't affect different-owner trades."""
@@ -1536,6 +1586,7 @@ class TestOrderBookSecurity:
 
     def test_expired_order_rejected(self):
         book = OrderBook()
+        book.new_block(1_000.0)        # expiry is judged by the block's time
         with pytest.raises(ValueError, match="expired"):
             book.place_order(Order(id="exp", owner=ADDR_A, side=OrderSide.BUY,
                                    order_type=OrderType.LIMIT, price=Decimal("100"),
@@ -1917,15 +1968,17 @@ class TestRouterSecurity:
     # -- Deterministic CLOB order IDs ---------------------------------------
 
     def test_clob_order_ids_deterministic(self):
-        book = OrderBook()
-        book.place_order(Order(id="ask", owner=ADDR_B, side=OrderSide.SELL,
-                               order_type=OrderType.LIMIT, price=Decimal("1.0"),
-                               amount=Decimal("100")))
-        router = UnifiedRouter()
-        router.register_order_book("QRDX:USDC", book)
-        result = router.execute("QRDX", "USDC", Decimal("10"), ADDR_A)
-        # The order placed on the book should have a deterministic ID
-        assert result.source == FillSource.CLOB
+        def run():
+            book = OrderBook()
+            book.place_order(Order(id="bid", owner=ADDR_B, side=OrderSide.BUY,
+                                   order_type=OrderType.LIMIT, price=Decimal("1.0"),
+                                   amount=Decimal("100")))
+            router = UnifiedRouter()
+            router.register_order_book("QRDX:USDC", book)
+            result = router.execute("QRDX", "USDC", Decimal("10"), ADDR_A)
+            assert result.source == FillSource.CLOB
+            return result.order.id
+        assert run() == run()
 
 
 # ============================================================================

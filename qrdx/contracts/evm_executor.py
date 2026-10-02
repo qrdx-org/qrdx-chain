@@ -8,8 +8,21 @@ Uses py-evm library for full Ethereum compatibility.
 from typing import Optional, Dict, List, Tuple, Any
 from decimal import Decimal
 from dataclasses import dataclass
+from importlib import util as importlib_util
+
+# Prefer an installed `eth` package (the container installs the py-evm QRDX fork
+# as a wheel). Fall back to the in-repo checkout for local development, resolved
+# relative to this file rather than a hardcoded absolute path.
+import os
 import sys
-sys.path.insert(0, '/workspaces/qrdx-chain-denaro/py-evm')
+
+if importlib_util.find_spec("eth") is None:
+    _vendored_py_evm = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "py-evm",
+    )
+    if os.path.isdir(_vendored_py_evm) and _vendored_py_evm not in sys.path:
+        sys.path.insert(0, _vendored_py_evm)
 
 from eth.vm.forks.qrdx import QRDXVM
 from eth.db.atomic import AtomicDB

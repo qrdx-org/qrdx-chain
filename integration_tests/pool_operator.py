@@ -309,29 +309,9 @@ class PoolOperator:
         if not pool:
             raise ValueError(f"Pool {pool_id} not found")
 
-        sqrt_p = pool.state.sqrt_price
-        sqrt_a = tick_to_sqrt_price(tick_lower)
-        sqrt_b = tick_to_sqrt_price(tick_upper)
-        current_tick = pool.state.tick
-
-        token0_amount = ZERO
-        token1_amount = ZERO
-
-        if current_tick < tick_lower:
-            # Entirely above current price — only token0
-            token0_amount = liquidity * Q96 * (sqrt_b - sqrt_a) / (sqrt_a * sqrt_b)
-        elif current_tick >= tick_upper:
-            # Entirely below current price — only token1
-            token1_amount = liquidity * (sqrt_b - sqrt_a) / Q96
-        else:
-            # Current price in range — both tokens
-            token0_amount = liquidity * Q96 * (sqrt_b - sqrt_p) / (sqrt_p * sqrt_b)
-            token1_amount = liquidity * (sqrt_p - sqrt_a) / Q96
-
-        # Quantize to 8 decimal places
-        token0_amount = abs(token0_amount).quantize(Decimal("0.00000001"))
-        token1_amount = abs(token1_amount).quantize(Decimal("0.00000001"))
-        return token0_amount, token1_amount
+        # The engine's own deposit amounts (rounded up), so the escrow is exactly what the
+        # position is worth.
+        return pool.amounts_for_liquidity(tick_lower, tick_upper, liquidity, round_up=True)
 
     async def add_liquidity_persisted(
         self,

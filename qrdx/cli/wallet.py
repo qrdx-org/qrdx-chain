@@ -17,6 +17,9 @@ Usage:
     qrdx-wallet import <private_key> [--type TYPE] [--output FILE]
     qrdx-wallet sign <wallet_file> <message>
     qrdx-wallet verify <address> <message> <signature>
+    qrdx-wallet perp …   (perpetual futures: markets, book, account, deposit, order, …)
+    qrdx-wallet token …  (native tokens: list, info, balance, deploy, mint, transfer, approve, …)
+    qrdx-wallet spot …   (spot: pools, quote, swap, liquidity, order books)
 """
 
 import sys
@@ -299,13 +302,16 @@ def send_cmd(wallet_file: str, to_address: str, amount: float, node: str, fee: f
         if not isinstance(wallet, PQWallet):
             raise click.ClickException("System wallet transactions require a PQ master controller wallet")
         
-        sender_address = from_system_wallet
+        # The SIGNER is the controller — that is whose nonce is consumed and whose
+        # balance pays the gas. The system wallet is the delegated VALUE source, carried
+        # separately in the transaction's `on_behalf_of` field.
+        sender_address = wallet.address
         controller_address = wallet.address
-        
+
         click.echo()
         click.echo(click.style("System Wallet Transaction", fg="cyan", bold=True))
-        click.echo(f"From (System):  {sender_address}")
-        click.echo(f"Controller:     {controller_address}")
+        click.echo(f"Value from:     {from_system_wallet}")
+        click.echo(f"Signed by:      {controller_address}  (pays gas, consumes nonce)")
     else:
         # Regular transaction
         if isinstance(wallet, UnifiedWallet):
@@ -329,159 +335,148 @@ def send_cmd(wallet_file: str, to_address: str, amount: float, node: str, fee: f
         click.echo("Cancelled.")
         return
     
-    # Build and send transaction
+    # ── Build and send ───────────────────────────────────────────────────────
+    #
+    # Transfers go through the account/EVM path (eth_sendRawTransaction) — the
+    # unified ledger. The legacy UTXO path this command used to build against is
+    # empty from genesis onward, so it could only ever fail with "No UTXOs found".
+    #
+    # Two signing envelopes, one destination ledger:
+    #   * traditional (secp256k1) wallet → legacy EIP-155 transaction
+    #   * post-quantum (Dilithium) wallet → type-0x51 PQ transaction
+    #
+    # Either can pay either kind of address, because `to` is the recipient's
+    # canonical 20-byte ACCOUNT ID — which a 0xPQ address resolves to by
+    # derivation. That is what makes 0x → 0xPQ and 0xPQ → 0x transfers possible.
     try:
         import httpx
-        
-        # Get UTXOs
-        click.echo("Fetching UTXOs...")
-        utxo_response = httpx.post(
-            f"{node}/rpc",
-            json={
-                "jsonrpc": "2.0",
-                "method": "qrdx_getUTXOs",
-                "params": [sender_address],
-                "id": 1
-            },
-            timeout=10.0
-        )
-        
-        if utxo_response.status_code != 200:
-            raise click.ClickException(f"Failed to fetch UTXOs (HTTP {utxo_response.status_code})")
-        
-        utxo_result = utxo_response.json()
-        if "error" in utxo_result:
-            raise click.ClickException(f"RPC error: {utxo_result['error'].get('message', 'Unknown error')}")
-        
-        utxos = utxo_result.get("result", [])
-        if not utxos:
-            raise click.ClickException(f"No UTXOs found for {sender_address}")
-        
-        # Build transaction
-        click.echo(f"Found {len(utxos)} UTXOs")
-        
-        amount_smallest = int(Decimal(str(amount)) * Decimal("1000000"))  # Convert to microQRDX
-        fee_smallest = int(Decimal(str(fee)) * Decimal("1000000"))
-        total_needed = amount_smallest + fee_smallest
-        
-        # Select UTXOs
-        selected_utxos = []
-        total_input = 0
-        for utxo in utxos:
-            selected_utxos.append(utxo)
-            total_input += int(utxo['amount'])
-            if total_input >= total_needed:
-                break
-        
-        if total_input < total_needed:
-            available = total_input / 1000000
-            needed = total_needed / 1000000
-            raise click.ClickException(f"Insufficient balance. Have: {available} QRDX, Need: {needed} QRDX")
-        
-        # Calculate change
-        change = total_input - total_needed
-        
-        # Build transaction data
-        tx_data = {
-            "inputs": [{"tx_hash": utxo["tx_hash"], "index": utxo["index"]} for utxo in selected_utxos],
-            "outputs": [
-                {"address": to_address, "amount": amount_smallest}
-            ],
-            "fee": fee_smallest,
-        }
-        
-        if change > 0:
-            tx_data["outputs"].append({"address": sender_address, "amount": change})
-        
-        # Add system wallet fields if applicable
+        from decimal import Decimal as _D
+
+        from ..crypto.account_id import to_account_id
+
+        def _rpc(method, params, timeout=30.0):
+            resp = httpx.post(f"{node}/rpc",
+                              json={"jsonrpc": "2.0", "method": method,
+                                    "params": params, "id": 1}, timeout=timeout)
+            if resp.status_code != 200:
+                raise click.ClickException(f"{method} failed (HTTP {resp.status_code})")
+            body = resp.json()
+            if "error" in body and body["error"]:
+                msg = body["error"].get("message", str(body["error"]))
+                raise click.ClickException(f"{method} failed: {msg}")
+            return body.get("result")
+
+        # The recipient's ledger key. Accepts 0x, 0xPQ, 0xPQMS and legacy forms.
+        # Note the NONCE below is the signer's, not the system wallet's: a delegated
+        # spend consumes the controller's nonce, because the controller submits and pays.
+        try:
+            to_account = to_account_id(to_address)
+        except ValueError as e:
+            raise click.ClickException(f"Cannot resolve destination address: {e}")
+        if to_account != to_address.lower():
+            click.echo(f"Resolved {to_address[:24]}... → account {to_account}")
+
+        value_wei = int(_D(str(amount)) * _D(10 ** 18))
+
+        # Nonce and chain id from the node, so the transaction is replay-bound.
+        nonce = int(_rpc("eth_getTransactionCount", [sender_address, "pending"]) or "0x0", 16)
+        try:
+            chain_id = int(_rpc("eth_chainId", []) or "0x0", 16)
+        except click.ClickException:
+            chain_id = 0
+
+        # `fee` is a gas PRICE in QRDX per gas unit on this path; derive wei/gas.
+        gas_price_wei = max(1, int(_D(str(fee)) * _D(10 ** 18) // _D(21000)))
+
+        # A system-wallet send is a DELEGATED spend: the controller signs, the value
+        # leaves the system wallet, and gas + nonce stay with the controller. The node
+        # authorises the controller relationship against its genesis-registered
+        # system_wallets table before anything moves.
+        on_behalf_of = None
         if from_system_wallet:
-            tx_data["system_wallet_source"] = sender_address
-            tx_data["controller_address"] = controller_address
-        
-        # Sign transaction
+            if not isinstance(wallet, PQWallet):
+                raise click.ClickException(
+                    "System-wallet sends must be signed by the controller, which is a "
+                    "post-quantum (0xPQ) or multisig wallet.")
+            try:
+                on_behalf_of = bytes.fromhex(to_account_id(from_system_wallet)[2:])
+            except ValueError as e:
+                raise click.ClickException(f"Invalid system wallet address: {e}")
+            click.echo(f"Delegated spend from system wallet {from_system_wallet[:24]}...")
+            click.echo(f"  authorised by controller {wallet.address[:24]}...")
+
         click.echo("Signing transaction...")
-        
-        # Create signature
-        import json
-        import hashlib
-        tx_bytes = json.dumps(tx_data, sort_keys=True).encode()
-        tx_hash = hashlib.sha256(tx_bytes).digest()
-        
-        if from_system_wallet:
-            # Sign with controller (PQ wallet)
-            signature = wallet.sign(tx_hash)
-            tx_data["controller_signature"] = signature.hex()
+        if isinstance(wallet, PQWallet):
+            from ..transactions.pq_tx import PQTransaction, intrinsic_gas_pq
+            from ..crypto.pq.dilithium import PUBLIC_KEY_SIZE, SIGNATURE_SIZE
+
+            # A PQ transaction must supply its intrinsic floor, which prices the
+            # ~5.3KB Dilithium key + signature it carries.
+            gas_limit = intrinsic_gas_pq(b"", b"\x00" * PUBLIC_KEY_SIZE,
+                                        b"\x00" * SIGNATURE_SIZE) + 30_000
+            tx = PQTransaction(
+                chain_id=chain_id,
+                nonce=nonce,
+                gas_price=gas_price_wei,
+                gas_limit=gas_limit,
+                to=bytes.fromhex(to_account[2:]),
+                value=value_wei,
+                data=b"",
+                on_behalf_of=on_behalf_of,
+            )
+            tx.sign(wallet._private_key)
+            raw_hex = "0x" + tx.encode().hex()
+            click.echo(f"  Post-quantum (ML-DSA-65) signature, {len(raw_hex) // 2} bytes")
         else:
-            # Sign with sender wallet
-            if isinstance(wallet, UnifiedWallet):
-                signer = wallet.traditional if wallet.traditional else wallet.pq
-            else:
-                signer = wallet
-            signature = signer.sign(tx_hash)
-            tx_data["signature"] = signature.hex()
-        
-        # Send transaction
+            from eth_account import Account as EthAccount
+
+            signer = wallet.traditional if isinstance(wallet, UnifiedWallet) and wallet.traditional else wallet
+            key_hex = signer.private_key_hex
+            signed = EthAccount.sign_transaction(
+                {"nonce": nonce, "gasPrice": gas_price_wei, "gas": 21000,
+                 "to": to_account, "value": value_wei, "data": b"",
+                 "chainId": chain_id},
+                key_hex if key_hex.startswith("0x") else "0x" + key_hex,
+            )
+            raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+            raw_hex = "0x" + bytes(raw).hex()
+            click.echo("  secp256k1 (EIP-155) signature")
+
         click.echo("Broadcasting transaction...")
-        
-        send_response = httpx.post(
-            f"{node}/rpc",
-            json={
-                "jsonrpc": "2.0",
-                "method": "qrdx_sendTransaction",
-                "params": [tx_data],
-                "id": 2
-            },
-            timeout=30.0
-        )
-        
-        if send_response.status_code != 200:
-            raise click.ClickException(f"Failed to send transaction (HTTP {send_response.status_code})")
-        
-        send_result = send_response.json()
-        if "error" in send_result:
-            raise click.ClickException(f"Transaction failed: {send_result['error'].get('message', 'Unknown error')}")
-        
-        tx_hash_result = send_result.get("result", {}).get("tx_hash", "unknown")
-        
+        tx_hash_result = _rpc("eth_sendRawTransaction", [raw_hex])
+
         click.echo()
-        click.echo(click.style("✓ Transaction sent!", fg="green", bold=True))
+        click.echo(click.style("✓ Transaction submitted!", fg="green", bold=True))
         click.echo(f"TX Hash: {tx_hash_result}")
-        
+        click.echo("Balances change when a proposer includes it in a block.")
+
         if wait:
             click.echo()
-            click.echo("Waiting for confirmation...")
+            click.echo("Waiting for inclusion...")
             import time
             for i in range(30):
                 time.sleep(2)
-                
-                # Check transaction status
-                status_response = httpx.post(
-                    f"{node}/rpc",
-                    json={
-                        "jsonrpc": "2.0",
-                        "method": "qrdx_getTransaction",
-                        "params": [tx_hash_result],
-                        "id": 3
-                    },
-                    timeout=10.0
-                )
-                
-                if status_response.status_code == 200:
-                    status_result = status_response.json()
-                    if "result" in status_result and status_result["result"]:
-                        tx_info = status_result["result"]
-                        if tx_info.get("confirmed", False):
-                            click.echo(click.style("✓ Transaction confirmed!", fg="green", bold=True))
-                            click.echo(f"Block: {tx_info.get('block_hash', 'unknown')[:16]}...")
-                            break
-                
-                click.echo(f"  Waiting... ({i*2}s)")
+                try:
+                    receipt = _rpc("eth_getTransactionReceipt", [tx_hash_result], timeout=10.0)
+                except click.ClickException:
+                    receipt = None
+                if receipt:
+                    ok = str(receipt.get("status", "0x1")).rstrip("0") != "0x"
+                    click.echo(click.style(
+                        "✓ Included!" if ok else "✗ Included but reverted",
+                        fg="green" if ok else "red", bold=True))
+                    click.echo(f"Block: {receipt.get('blockNumber')}  "
+                               f"Gas used: {receipt.get('gasUsed')}")
+                    break
+                click.echo(f"  Waiting... ({i * 2}s)")
             else:
-                click.echo(click.style("⚠ Timeout waiting for confirmation", fg="yellow"))
-                click.echo("Transaction may still be pending. Check status manually.")
-        
-    except ImportError:
-        click.echo("Install httpx to send transactions: pip install httpx")
+                click.echo(click.style("⚠ Timeout waiting for inclusion", fg="yellow"))
+                click.echo("Transaction may still be pending in the mempool.")
+
+    except click.ClickException:
+        raise
+    except ImportError as e:
+        raise click.ClickException(f"Missing dependency for sending: {e}")
     except Exception as e:
         raise click.ClickException(f"Transaction failed: {e}")
 
@@ -918,6 +913,22 @@ def list_cmd(dir: Optional[str]):
             
         except Exception as e:
             click.echo(f"  {wallet_file.name} - Error: {e}")
+
+
+# Perpetuals: qrdx-wallet perp … (qrdx/cli/perp.py)
+from qrdx.cli.perp import perp as _perp_commands  # noqa: E402
+
+cli.add_command(_perp_commands)
+
+# Native tokens: qrdx-wallet token … (qrdx/cli/token.py)
+from qrdx.cli.token import token as _token_commands  # noqa: E402
+
+cli.add_command(_token_commands)
+
+# Spot: qrdx-wallet spot … (qrdx/cli/spot.py)
+from qrdx.cli.spot import spot as _spot_commands  # noqa: E402
+
+cli.add_command(_spot_commands)
 
 
 @cli.command("generate-mnemonic")

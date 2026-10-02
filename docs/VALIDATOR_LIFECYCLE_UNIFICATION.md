@@ -9,7 +9,7 @@
 > diverging node. Roll out observe → soak → enforce, with the decisive probe being
 > *the `validators` table is byte-identical on every node after each epoch*.
 
-## Current state — three gaps
+## Starting state (June 2026) — three gaps, all since closed (see the implementation log)
 
 1. **Two epoch processors, only the wrong one is wired.**
    - `validator/epoch_processing.py` computes rewards/penalties/activations/exits and

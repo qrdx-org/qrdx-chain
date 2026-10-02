@@ -11,6 +11,20 @@
 
 ## 1. Where it stands
 
+> **October 2026:** the table below is the original snapshot. Since then signature
+> verification, mempool admission, proposer inclusion, import replay with root validation,
+> real-balance settlement (Phase E) and the single block path (Phase C) are all done. Still
+> open: **fees are tallied but never charged** (E1), and the circuit-breaker hooks are
+> constructed but never invoked on the swap path (F1). **Perps were rebuilt** on a zero-sum,
+> order-book-matched clearinghouse (docs/PERPS_CLEARINGHOUSE.md): mark price, liquidations
+> with a backstop vault and auto-deleveraging, funding, settlement in a USD stablecoin, and a
+> validator price oracle. The old engine traded against nobody and minted or burned QRDX on
+> every close (docs/KNOWN_ISSUES.md). **Spot was audited and fixed** (2026-10-02): Uniswap-V3
+> mathematics, all-or-nothing operations, owner-only liquidity removal paying principal and fees,
+> venue-correct settlement, order books committed in full in the state root. **Tokens** are one
+> native standard (docs/NATIVE_TOKENS.md: mint/freeze authorities, mint, burn, approvals) that
+> web3 wallets read as ERC-20s; the simulated EVM exchange precompiles are retired.
+
 | Capability | State | Evidence |
 |------------|-------|----------|
 | AMM, order book, perps, router, oracle | ✅ implemented | `qrdx/exchange/*` |

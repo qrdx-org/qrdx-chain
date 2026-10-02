@@ -69,9 +69,9 @@ class S17ClobSettlement(Scenario):
         node_urls = self.ctx.node_urls
         wallets = self.ctx.wallets
 
-        # A PQ wallet with a CLEAN exchange nonce: validators don't submit exchange txs, so
-        # Validator 1's exchange nonce is 0 (Validator 2 is s15's; Pool Creator is s12's).
-        w = wallets.get("Validator 1")
+        # A PQ wallet with a CLEAN exchange nonce, used by no other scenario (validators vote
+        # oracle prices, so their exchange nonces move on their own).
+        w = wallets.get("CLOB Trader")
         if not w or not w.get("private_key") or "PQ" not in str(w.get("address", "")):
             self.check(False, "funded PQ wallet available")
             return

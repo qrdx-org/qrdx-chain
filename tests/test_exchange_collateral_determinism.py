@@ -2,18 +2,22 @@
 Phase E — cross-node determinism of the enforced collateral/flush path.
 
 Two independent nodes (separate DB + ExchangeStateManager) that fund the same
-trader and process the SAME open-position must end with IDENTICAL account_state
+trader and process the SAME perp deposit must end with IDENTICAL account_state
 debits and IDENTICAL exchange roots — the consensus property required before
 flipping ENFORCE_EXCHANGE_COLLATERAL. Also pins enforce-mode rejection of an
-under-collateralized open (no debit, no position) and that it's deterministic too.
+unaffordable deposit (no debit, no collateral) and that it's deterministic too.
+Perp collateral moves into the clearinghouse holder (docs/PERPS_CLEARINGHOUSE.md).
 """
 import os, tempfile
 from decimal import Decimal
 from types import SimpleNamespace
 
 from qrdx.database_sqlite import DatabaseSQLite
+from qrdx.crypto.account_id import to_account_id
 from qrdx.exchange.state_manager import ExchangeStateManager
 from qrdx.exchange.block_processor import preload_sender_balances, flush_exchange_balance_deltas
+
+from pq_addrs import pq
 
 
 async def _node(trader, fund_qrdx):
@@ -21,24 +25,23 @@ async def _node(trader, fund_qrdx):
     if fund_qrdx is not None:
         await db.connection.execute(
             "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, is_contract) "
-            "VALUES (?, ?, 0, 0, 0, 0)", (trader, str(int(Decimal(fund_qrdx) * 10**18))))
+            "VALUES (?, ?, 0, 0, 0, 0)",
+            (to_account_id(trader), str(int(Decimal(fund_qrdx) * 10**18))))
         await db.connection.commit()
     mgr = ExchangeStateManager()
-    mgr.perp_engine.create_market("BTC")
     mgr.enforce_collateral = True
     return db, mgr
 
 
 def _open_tx(trader):
-    return SimpleNamespace(sender=trader, params={
-        "market_id": "BTC-QRDX-PERP", "side": "long",
-        "size": "1", "leverage": "10", "price": "30000"})
+    """A 3,000 QRDX perp deposit (named for the open it used to be)."""
+    return SimpleNamespace(sender=trader, params={"amount": "3000"})
 
 
 async def _run_block(db, mgr, tx):
     mgr.begin_block(1, 0.0)
     await preload_sender_balances(db, [tx], mgr)
-    res = mgr._op_open_position(tx)
+    res = mgr._op_perp_deposit(tx)
     mgr.commit_block()
     await flush_exchange_balance_deltas(db, mgr, enforce=True)
     return res
@@ -46,13 +49,14 @@ async def _run_block(db, mgr, tx):
 
 async def _acct_wei(db, addr):
     cur = await db.connection.execute(
-        "SELECT balance FROM account_state WHERE LOWER(address)=LOWER(?)", (addr,))
+        "SELECT balance FROM account_state WHERE LOWER(address)=LOWER(?)",
+        (to_account_id(addr),))
     r = await cur.fetchone()
     return int(r[0]) if r and r[0] is not None else None
 
 
 async def test_two_nodes_agree_on_debit_and_root():
-    trader = "0xPQ" + "ab" * 16
+    trader = pq("abx16")
     db1, mgr1 = await _node(trader, "1000000")
     db2, mgr2 = await _node(trader, "1000000")
     try:
@@ -62,7 +66,9 @@ async def test_two_nodes_agree_on_debit_and_root():
         # Identical account_state debit (margin moved) on both nodes.
         b1, b2 = await _acct_wei(db1, trader), await _acct_wei(db2, trader)
         assert b1 == b2, f"account_state diverged: {b1} != {b2}"
-        assert b1 < 1000000 * 10**18, "margin should have been debited"
+        assert b1 == (1000000 - 3000) * 10**18, "the deposit should have been debited"
+        holder = ExchangeStateManager.perps_holder_address()
+        assert await _acct_wei(db1, holder) == await _acct_wei(db2, holder) == 3000 * 10**18
         # Identical exchange root.
         assert mgr1.compute_state_root() == mgr2.compute_state_root()
     finally:
@@ -70,7 +76,7 @@ async def test_two_nodes_agree_on_debit_and_root():
 
 
 async def test_enforce_rejects_uncollateralized_deterministically():
-    trader = "0xPQ" + "cd" * 16
+    trader = pq("cdx16")
     db1, mgr1 = await _node(trader, "100")   # margin ~3000 > 100
     db2, mgr2 = await _node(trader, "100")
     try:

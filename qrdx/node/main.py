@@ -97,7 +97,22 @@ _ENFORCE_FINALITY_REORG_GUARD = True
 # genesis bootstrap / proposer self-build). Full convergence needs mechanism-2
 # (equal-height tie-break) + covering that path. Kept OBSERVE (minimal footprint,
 # known-good) until both land and can be enforced together. See FORK_CHOICE_CONVERGENCE.md.
-_ENFORCE_PARENT_CONTINUITY = False
+# Env-overridable (QRDX_ENFORCE_PARENT_CONTINUITY=1) for A/B testing.
+#
+# NOTE (2026-09-29): the "6/6 pass" enforce soak above only ever covered the sync and REST
+# paths. The p2p path — live broadcast, where most blocks arrive — called the checker
+# without `enforce`, so it defaulted to False and p2p NEVER enforced whatever this flag
+# said. `_check_parent_continuity` now defaults to this flag, so enabling it covers p2p too.
+#
+# ENABLED (2026-09-29) together with _ENFORCE_FORK_CHOICE_RECONCILE, the combination prior
+# work concluded was required. Interleaved A/B, three fault-injecting soaks per arm:
+#   observe : worst block divergence 4, 4, 5   broken parent links 3, 3, 4
+#   ENFORCED: worst block divergence 0, 0, 0   broken parent links 0, 0, 0
+# all six soaks PASS 19/19 with derived state converged; liveness unchanged (tips 182-225
+# vs 184-237, tip spread 6-7 vs 6-15). Env-overridable (=0) for A/B testing only — it must
+# match on every node.
+_ENFORCE_PARENT_CONTINUITY = os.getenv(
+    "QRDX_ENFORCE_PARENT_CONTINUITY", "1").lower() not in ("0", "false", "no")
 
 # Fork-choice mechanism-2 (equal-height tie-break). When a competing block arrives
 # at the just-filled tip (same parent, different hash) and WINS the lowest-hash
@@ -128,7 +143,38 @@ _ENFORCE_EQUAL_HEIGHT_TIEBREAK = False
 # + logs the would-be canonical choice and a RANDAO-mix convergence probe; it never
 # rolls back. Never reconciles below the finalized height (the reorg guard). See the
 # active-reconciliation redirect in FORK_CHOICE_CONVERGENCE.md.
-_ENFORCE_FORK_CHOICE_RECONCILE = False
+#
+# ENABLED (2026-09-28) with the enforce path now wired. Root cause confirmed from
+# preserved soak databases: competing blocks at one height share a PARENT but come from
+# ADJACENT SLOTS — e.g. h=66 held slot 72's block on one node and slot 73's on another,
+# each signed by its own slot's legitimately-eligible proposer. Both are valid, so
+# eligibility cannot reject either, and with a 2s slot the next proposer routinely builds
+# before the previous block propagates. Nothing broke the tie, so the fork was permanent
+# (19 differing block hashes between two nodes in a 20-reorg soak, with the token ledger
+# splitting three ways). See "Block history did not converge" in docs/KNOWN_ISSUES.md.
+# The enforce path was a stub ("intentionally not wired yet"), so flipping this flag did
+# nothing. Once implemented, it was first kept OBSERVE because no soak with it alone was
+# clean:
+#
+#   soak                      reorgs  worst block divergence  derived state  scenarios
+#   baseline (observe)          20            19              3-way split      FAIL
+#   rollback only               29            12              node1 wrecked    pass
+#   via _sync_blockchain        10            22              converged        pass
+#   rollback + fetch            25             7              converged        FAIL
+#
+# Divergence improves (19 → 7) and derived state converges, but reorg counts swing 10-29
+# between runs, so the scenario failures cannot be separated from churn. More runs at a
+# controlled churn level are needed before this can be judged.
+#
+# ENABLED (2026-09-29). Alone it did not converge (the A/Bs above), because nodes kept
+# appending blocks onto parents they did not hold — the p2p path never enforced parent
+# continuity (it called the checker without `enforce`). With continuity now enforced on
+# every path, the two together drove worst pairwise block divergence to 0 in all three
+# fault-injecting soaks (vs 4-5 observe), and this path logged real convergences (2-6 per
+# run) where every earlier version logged none. See _ENFORCE_PARENT_CONTINUITY above and
+# docs/KNOWN_ISSUES.md. Env-overridable (=0) for A/B testing only.
+_ENFORCE_FORK_CHOICE_RECONCILE = os.getenv(
+    "QRDX_ENFORCE_FORK_CHOICE_RECONCILE", "1").lower() not in ("0", "false", "no")
 # How many recent heights (down from the tip) the active pass inspects per cycle. Forks
 # are tip-local (block-time ≈ propagation-time), so a bounded window catches them while
 # keeping the per-cycle peer-query cost small. Clamped to the finalized boundary.
@@ -888,7 +934,7 @@ startup_time = time.time()
 # TOGGLEABLE (opt-in per operator) via QRDX_ENABLE_STREAMING. The stream is fed by a consensus-
 # decoupled poller (reads chain tip/finality only) so it can never stall or diverge block import.
 from qrdx.node.observability import (
-    METRICS, EVENT_HUB, chain_event_poller, sse_stream,
+    METRICS, EVENT_HUB, chain_event_poller, sse_stream, handle_client_frame, parse_channels,
 )
 STREAMING_ENABLED = os.environ.get("QRDX_ENABLE_STREAMING", "").lower() in ("1", "true", "yes")
 _chain_poller_task: Optional[asyncio.Task] = None
@@ -925,42 +971,94 @@ async def metrics_endpoint():
     return Response(METRICS.render_prometheus(), media_type="text/plain; version=0.0.4")
 
 
+def _perp_snapshots(channels) -> list:
+    """Current state for newly subscribed perps channels (qrdx/exchange/stream.py)."""
+    wanted = [c for c in channels if c.startswith("perp_")]
+    if not wanted:
+        return []
+    try:
+        from qrdx.exchange import ExchangeStateManager
+        from qrdx.exchange.stream import initial_snapshots
+        return initial_snapshots(ExchangeStateManager.get_instance(), wanted)
+    except Exception as e:
+        logger.debug(f"stream snapshot failed: {e}")
+        return []
+
+
 @app.get("/stream")
-async def stream_endpoint():
+async def stream_endpoint(channels: Optional[str] = None):
     """Realtime data stream over Server-Sent Events (HTTP; proxy/curl-friendly). Toggleable —
-    404 when QRDX_ENABLE_STREAMING is off. Emits a per-block feed + hello/keepalive frames."""
+    404 when QRDX_ENABLE_STREAMING is off. ``?channels=blocks,perp_markets,perp_book:BTC-USD-PERP,
+    perp_events,perp_account:0xPQ…`` picks the feeds (default: blocks); perps channels start
+    with a snapshot of the current state."""
     if not STREAMING_ENABLED:
         return JSONResponse({"error": "streaming disabled", "hint": "set QRDX_ENABLE_STREAMING=1"},
                             status_code=404)
     METRICS.inc("qrdx_stream_connections_total")
-    return StreamingResponse(sse_stream(EVENT_HUB), media_type="text/event-stream",
+    chosen = parse_channels(channels)
+    return StreamingResponse(sse_stream(EVENT_HUB, channels=chosen,
+                                        initial=_perp_snapshots(chosen or ())),
+                             media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.websocket("/ws")
 async def ws_stream(websocket: WebSocket):
     """Realtime data stream over WebSocket. Toggleable — closed immediately (policy 1008) when
-    QRDX_ENABLE_STREAMING is off. Server→client push of the block/finality feed; inbound client
-    frames are drained and ignored (a future revision can add topic subscriptions)."""
+    QRDX_ENABLE_STREAMING is off. The default feed is blocks; a client changes its feeds by
+    sending ``{"op": "subscribe" | "unsubscribe" | "set", "channels": [...]}`` (or
+    ``{"op": "channels"}`` to list them), or with ``?channels=`` on the URL. Channels:
+    ``blocks``, ``perp_markets[:<id>]``, ``perp_book:<id>``, ``perp_events[:<id>]``,
+    ``perp_account:<address>`` — each perps subscription starts with a snapshot."""
     if not STREAMING_ENABLED:
         await websocket.close(code=1008)  # policy violation: disabled
         return
     await websocket.accept()
     METRICS.inc("qrdx_ws_connections_total")
-    q = EVENT_HUB.subscribe()
-    try:
-        await websocket.send_json({"type": "hello", "ts": time.time(), "version": NODE_VERSION})
+    query = getattr(websocket, "query_params", None) or {}
+    q = EVENT_HUB.subscribe(parse_channels(query.get("channels")))
+
+    async def _reader():
+        # Control frames are answered through the client's own queue, so the one sender below
+        # writes every frame (no concurrent sends on the socket).
+        receive = getattr(websocket, "receive_json", None)
+        if receive is None:
+            await asyncio.Event().wait()            # a socket that cannot receive: feed only
         while True:
             try:
-                event = await asyncio.wait_for(q.get(), timeout=30.0)
-                await websocket.send_json(event)
-            except asyncio.TimeoutError:
-                await websocket.send_json({"type": "ping", "ts": time.time()})  # detect dead peers
+                frame = await receive()
+            except WebSocketDisconnect:
+                return
+            except Exception:
+                EVENT_HUB.deliver(q, {"type": "error", "error": "expected a JSON object"})
+                continue
+            before = EVENT_HUB.channels(q)
+            EVENT_HUB.deliver(q, handle_client_frame(EVENT_HUB, q, frame))
+            for event in _perp_snapshots(EVENT_HUB.channels(q) - before):
+                EVENT_HUB.deliver(q, event)
+
+    reader = asyncio.create_task(_reader())
+    try:
+        await websocket.send_json({"type": "hello", "ts": time.time(), "version": NODE_VERSION,
+                                   "channels": sorted(EVENT_HUB.channels(q))})
+        for event in _perp_snapshots(EVENT_HUB.channels(q)):
+            await websocket.send_json(event)
+        while not reader.done():
+            getter = asyncio.ensure_future(q.get())
+            done, _ = await asyncio.wait({getter, reader}, timeout=30.0,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if getter in done:
+                await websocket.send_json(getter.result())
+            else:
+                getter.cancel()
+                if not done:
+                    await websocket.send_json({"type": "ping", "ts": time.time()})  # detect dead peers
     except WebSocketDisconnect:
         pass
     except Exception:
         pass
     finally:
+        reader.cancel()
         EVENT_HUB.unsubscribe(q)
 
 # Connection pool for HTTP requests
@@ -985,6 +1083,30 @@ rpc_server.register_module(dht_rpc_module)
 # Register P2P module unconditionally — block/tx propagation over JSON-RPC
 p2p_rpc_module = P2PModule()
 rpc_server.register_module(p2p_rpc_module)
+
+
+# Exchange + perps JSON-RPC (exchange_* / perp_*), unconditionally: wallets need them on any node,
+# and exchange_sendTransaction is also how nodes gossip exchange transactions to each other.
+class _ExchangeRPCContext:
+    """Resolved at call time: ``db`` and the HTTP client exist only after startup."""
+
+    @property
+    def db(self):
+        return db
+
+    @property
+    def submitter(self):
+        return _get_exchange_submitter()
+
+
+from qrdx.rpc.modules.exchange import ExchangeModule, PerpModule
+
+exchange_rpc_module = ExchangeModule()
+exchange_rpc_module.context = _ExchangeRPCContext()
+rpc_server.register_module(exchange_rpc_module)
+perp_rpc_module = PerpModule()
+perp_rpc_module.context = _ExchangeRPCContext()
+rpc_server.register_module(perp_rpc_module)
 
 @app.post("/rpc")
 async def rpc_endpoint(body: dict = Body(...)):
@@ -1016,6 +1138,28 @@ def _get_exchange_mempool():
         EXCHANGE_MEMPOOL = ExchangeMempool()
     return EXCHANGE_MEMPOOL
 
+
+# The one exchange write path (REST, JSON-RPC, CLI wallet): admit to the mempool, then gossip what
+# is new to peers over exchange_sendTransaction, so any validator can include it — not only the
+# node a wallet happened to submit to. See qrdx/exchange/submission.py.
+EXCHANGE_SUBMITTER = None
+
+
+def _get_exchange_submitter():
+    global EXCHANGE_SUBMITTER
+    if EXCHANGE_SUBMITTER is None:
+        from qrdx.exchange.submission import ExchangeSubmitter
+
+        def _peer_urls():
+            return [p.get('url') for p in NodesManager.get_propagate_peers()]
+
+        async def _forward(url, tx_dict):
+            return await NodeInterface(url, client=http_client, db=db)._rpc_call(
+                'exchange_sendTransaction', [tx_dict, True])
+
+        EXCHANGE_SUBMITTER = ExchangeSubmitter(_get_exchange_mempool, _peer_urls, _forward)
+    return EXCHANGE_SUBMITTER
+
 # EVM/account consensus path (Phase 2 / E-D3). The executor + state manager are
 # set when the contract RPC system initializes; the mempool admits eth txs for
 # block inclusion. EVM_PENDING_NONCE tracks each sender's next expected account
@@ -1024,6 +1168,106 @@ EVM_EXECUTOR = None
 EVM_STATE_MANAGER = None
 EVM_MEMPOOL = None
 EVM_PENDING_NONCE = {}
+
+# Transaction-nonce validity gate.
+#
+# Closes a replay / double-spend hole: nothing used to compare a transaction's nonce to
+# the sender's ACCOUNT nonce during execution. Mempool admission checked a nonce window,
+# but against EVM_PENDING_NONCE — an in-memory dict lost on restart — and the dedup cache
+# was in-memory too. So after a node restart an already-executed signed transaction could
+# be re-submitted, re-admitted (expected nonce back to 0) and RE-EXECUTED, moving value a
+# second time.
+#
+# This check is the authoritative one; the mempool's window is advisory spam control.
+#
+# A mismatched transaction is rejected as a NO-OP rather than invalidating the whole
+# block. Ethereum treats an invalid-nonce transaction as making its block invalid, which
+# is stricter, but here rejecting the block would turn any nonce disagreement into an
+# import halt, and a poisoned mempool entry into a griefing vector (the proposer drops its
+# entire EVM section on a tx that cannot execute). Rejecting just the transaction leaves
+# state untouched, is identical on every node (so roots still agree), and still makes the
+# replay impossible — which is the security property. The trade-off is recorded in
+# docs/KNOWN_ISSUES.md.
+_ENFORCE_TX_NONCE = True
+
+# Charge gas and consume the nonce for a FAILED transaction, as Ethereum does.
+#
+# On failure ``ExecutionContext.finalize_execution`` reverts the EVM snapshot, which undid
+# the gas charge AND the nonce increment that ``execute()`` had applied — so a transaction
+# that reverted or ran out of gas cost its sender NOTHING and could be retried forever with
+# the same nonce. Free failed execution is a spam vector: an attacker makes every node run
+# expensive work and pays nothing.
+#
+# It also contradicted the importer's own assumption —
+# ``apply_block_evm_section``'s comment states that a reverted transaction "is still validly
+# included and still mutates state (nonce/gas)", which was not true.
+#
+# With this on, only the *state changes* roll back: the gas is charged and the nonce
+# advances, re-applied explicitly after the revert.
+# ENABLED. Env-overridable (QRDX_ENFORCE_FAILED_TX_COSTS=0) for A/B testing, the way
+# ENFORCE_RANDAO_SELECTION is gated.
+#
+# This was briefly gated OFF on a suspicion that it amplified reorg churn: the first two
+# soaks with it on came in at 20-21 reorgs and failed CLOB convergence scenarios, against
+# 9-16 reorgs on earlier passing runs. A controlled A/B refuted that:
+#
+#   flag ON : 20, 21 reorgs   (10 differing block hashes between nodes, 2-way token split)
+#   flag OFF:  9, 10, 14, 20 reorgs
+#   flag OFF at 20 reorgs: 19 differing hashes, THREE-way token split — WORSE than with it on
+#
+# So the failures track churn, not this flag, and the underlying cause is the pre-existing
+# block-history fork ("Block history did not converge" in docs/KNOWN_ISSUES.md; since fixed) which reproduced with this off. While that fork
+# broke any 20+-reorg soak regardless, "wait for a clean high-churn soak" was an unmeetable
+# bar for every change — so the gate was decided on the change's own
+# merits: deterministic, unit-tested including cross-node account-root agreement, and not
+# implicated in any observed failure.
+_ENFORCE_FAILED_TX_COSTS = os.getenv(
+    "QRDX_ENFORCE_FAILED_TX_COSTS", "1").lower() not in ("0", "false", "no")
+
+
+async def _reset_evm_pending_nonces() -> int:
+    """
+    REPLACE the mempool's per-sender nonce expectations with the durable account nonces.
+
+    Unlike ``_rehydrate_evm_pending_nonces`` (which only raises expectations), this also
+    LOWERS them — needed after derived state is rebuilt from the chain. A transaction that
+    executed in a block which was then orphaned (reorg) or rejected (E-D4) bumped
+    EVM_PENDING_NONCE past the sender's real account nonce. Left alone, the mempool refuses
+    that transaction as "nonce too low" when it is re-queued — so every reorg silently lost
+    its orphaned EVM transactions — and refuses the sender's correct next transaction too.
+    """
+    EVM_PENDING_NONCE.clear()
+    return await _rehydrate_evm_pending_nonces()
+
+
+async def _rehydrate_evm_pending_nonces() -> int:
+    """
+    Rebuild EVM_PENDING_NONCE from the durable account nonces at startup.
+
+    Without this the mempool's expected nonce resets to 0 on every restart, so a replayed
+    transaction is *admitted* (and only stopped later, at execution). Rehydrating means a
+    replay is refused at the door, which also keeps it out of a proposer's selection.
+
+    Best-effort: the execution-path check in ``_execute_evm_raw_tx`` is what actually
+    guarantees safety, so a failure here degrades spam filtering, not correctness.
+    """
+    global EVM_PENDING_NONCE
+    try:
+        cursor = await db.connection.execute(
+            "SELECT LOWER(address), nonce FROM account_state WHERE nonce > 0")
+        rows = await cursor.fetchall()
+    except Exception as e:
+        logger.warning("EVM pending-nonce rehydrate skipped: %s", e)
+        return 0
+    for address, nonce in rows:
+        try:
+            EVM_PENDING_NONCE[address] = max(EVM_PENDING_NONCE.get(address, 0), int(nonce))
+        except (TypeError, ValueError):
+            continue
+    if rows:
+        logger.info("Rehydrated %d account nonce(s) into the EVM mempool's expectations",
+                    len(rows))
+    return len(rows)
 
 
 def _get_evm_mempool():
@@ -1034,6 +1278,56 @@ def _get_evm_mempool():
             nonce_provider=lambda addr: EVM_PENDING_NONCE.get(addr.lower(), 0)
         )
     return EVM_MEMPOOL
+
+
+async def _charge_failed_tx(state_manager, sender_hex, tx_nonce, gas_used, gas_limit,
+                            gas_price, intrinsic, defer_commit=False):
+    """
+    Apply the cost of a FAILED transaction: charge gas and consume the nonce.
+
+    Called after ``finalize_execution`` has reverted the execution snapshot. That revert
+    is what makes a failure safe — no state changes survive — but it also rolled back the
+    gas charge and the nonce increment, which SHOULD survive: otherwise a reverting
+    transaction is free to submit and free to retry with the same nonce, and every node
+    does its work for nothing.
+
+    Gas charged is ``min(gas_limit, max(consumed, intrinsic))`` — the same rule the success
+    path uses, so a failure is never cheaper than the floor and never exceeds what the
+    sender authorised. A sender who cannot cover it is charged down to zero rather than
+    going negative (the balance check belongs at admission, and clamping keeps this
+    deterministic rather than raising mid-block).
+
+    Nonce advances to ``tx_nonce + 1``, which is what stops a failed transaction from being
+    resubmitted unchanged — and keeps the nonce sequence gap-free for the sender's next
+    transaction.
+
+    Does not commit; under ``defer_commit`` the change rides the block's flush like any
+    other, so it is included in the declared account_state root.
+    """
+    charged = min(gas_limit, max(int(gas_used or 0), int(intrinsic or 0)))
+    cost = charged * int(gas_price or 0)
+    try:
+        if cost > 0:
+            balance = state_manager.get_balance_sync(sender_hex)
+            state_manager.set_balance_sync(sender_hex, max(0, balance - cost))
+        # Consume the nonce regardless of gas price: a zero-gas-price failure must still
+        # not be replayable.
+        state_manager.set_nonce_sync(sender_hex, int(tx_nonce) + 1)
+    except Exception as e:
+        logger.error("could not charge failed tx for %s: %s", sender_hex[:20], e)
+        return 0
+    EVM_PENDING_NONCE[sender_hex.lower()] = max(
+        EVM_PENDING_NONCE.get(sender_hex.lower(), 0), int(tx_nonce) + 1)
+    return charged
+
+
+def _evm_block_timestamp(value) -> int:
+    """A block's timestamp as the EVM's ``block.timestamp``. Blocks store unix seconds;
+    genesis stores a datetime string, which (like a missing value) maps to 1."""
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
 
 
 async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timestamp,
@@ -1064,35 +1358,56 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
     if evm_executor is None or state_manager is None:
         return {"success": False, "error": "EVM system not initialized", "tx_hash": None}
 
-    # Decode + recover sender (recovery binds the sender).
+    # Decode + authenticate through the SHARED parser, which is also what mempool
+    # admission and block-section import use — so the RPC, the proposer and every
+    # importer agree byte-for-byte on who the sender is and what the tx does.
+    # It handles both envelopes: legacy/EIP-155 (sender recovered from v,r,s) and
+    # type 0x51 post-quantum (sender derived from the embedded ML-DSA-65 key).
+    # Either way ``sender`` is 20 bytes, which is why the EVM below needs no
+    # knowledge of PQ accounts at all.
+    from ..contracts.evm_mempool import parse_eth_raw_tx
     try:
         raw_tx = decode_hex(raw_tx_hex)
-        tx_data = rlp.decode(raw_tx)
-        nonce = int.from_bytes(tx_data[0], 'big') if tx_data[0] else 0
-        gas_price_wei = int.from_bytes(tx_data[1], 'big') if tx_data[1] else 0
-        gas = int.from_bytes(tx_data[2], 'big') if tx_data[2] else 21000
-        to_bytes = tx_data[3]
-        value_wei = int.from_bytes(tx_data[4], 'big') if tx_data[4] else 0
-        data = tx_data[5]
-        v_int = int.from_bytes(tx_data[6], 'big')
-        r_int = int.from_bytes(tx_data[7], 'big')
-        s_int = int.from_bytes(tx_data[8], 'big')
-        if v_int >= 35:  # EIP-155
-            chain_id = (v_int - 35) // 2
-            recovery_id = v_int - (chain_id * 2 + 35)
-            unsigned_data = [tx_data[i] for i in range(6)] + [
-                chain_id.to_bytes((chain_id.bit_length() + 7) // 8, 'big'), b'', b'']
-        else:
-            recovery_id = v_int - 27
-            unsigned_data = [tx_data[i] for i in range(6)]
-        message_hash = keccak(rlp.encode(unsigned_data))
-        signature = keys.Signature(r_int.to_bytes(32, 'big') + s_int.to_bytes(32, 'big') + bytes([recovery_id]))
-        sender = signature.recover_public_key_from_msg_hash(message_hash).to_canonical_address()
-        sender_hex = encode_hex(sender)
-        to_hex = encode_hex(to_bytes) if to_bytes else None
-        tx_hash_hex = encode_hex(keccak(raw_tx))
+        parsed = parse_eth_raw_tx(raw_tx_hex)
+        nonce = parsed["nonce"]
+        gas_price_wei = parsed["gas_price"]
+        gas = parsed["gas"] or 21000
+        value_wei = parsed["value"]
+        data = parsed["data"]
+        sender_hex = parsed["sender"]
+        sender = decode_hex(sender_hex)
+        # Delegated spend: VALUE leaves this account instead of the signer's, while the
+        # nonce and gas stay with the signer (they submitted and they pay). Authorisation
+        # already happened in parse/verify_delegated_spend at both choke points.
+        spend_hex = parsed.get("spend_from") or sender_hex
+        spend_from = decode_hex(spend_hex)
+        to_hex = parsed["to"]
+        to_bytes = decode_hex(to_hex) if to_hex else b''
+        tx_hash_hex = parsed["tx_hash"]
     except Exception as e:
-        return {"success": False, "error": f"decode/recover failed: {e}", "tx_hash": None}
+        return {"success": False, "error": f"decode/authenticate failed: {e}", "tx_hash": None}
+
+    # Nonce validity — the authoritative anti-replay check. Compared against the
+    # sender's durable ACCOUNT nonce, so it holds across restarts (unlike the
+    # mempool's in-memory expectation) and is identical on every node replaying the
+    # same chain. Reading the account caches it but does not mark it dirty, so this
+    # cannot move the state root.
+    if _ENFORCE_TX_NONCE:
+        try:
+            expected_nonce = await state_manager.get_nonce(sender_hex)
+        except Exception as e:
+            return {"success": False, "error": f"cannot read account nonce: {e}",
+                    "tx_hash": tx_hash_hex, "sender": sender_hex, "nonce": nonce}
+        if nonce != expected_nonce:
+            # No state is touched, so this is a deterministic no-op on every node.
+            return {
+                "success": False,
+                "error": (f"invalid nonce: tx has {nonce}, account expects "
+                          f"{expected_nonce}" +
+                          (" (replay of an already-executed transaction)"
+                           if nonce < expected_nonce else "")),
+                "tx_hash": tx_hash_hex, "sender": sender_hex, "nonce": nonce,
+            }
 
     sync_manager = StateSyncManager(db, state_manager)
     await sync_manager.ensure_tables_exist()
@@ -1101,19 +1416,48 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
         db=db, evm_state=state_manager, sync_manager=sync_manager,
     )
     await context_exec.prepare_execution(sender_hex)
+    if spend_hex != sender_hex:
+        # Load the delegated source's balance too — the EVM debits it for the transfer.
+        await sync_manager.sync_address_to_evm(
+            address=spend_hex, block_height=block_height, block_hash=block_hash)
     if to_hex:
         await sync_manager.sync_address_to_evm(address=to_hex, block_height=block_height, block_hash=block_hash)
 
     try:
-        result = evm_executor.execute(sender, to_bytes if to_bytes else None, value_wei, data, gas, gas_price_wei)
+        # The EVM moves value from the account named as `sender`, so a delegated spend
+        # runs with the SOURCE as the EVM sender and `origin` kept as the real signer
+        # (so a contract still sees who authorised it via tx.origin). Gas is charged to
+        # the signer separately below, via the ExecutionContext.
+        result = evm_executor.execute(
+            spend_from, to_bytes if to_bytes else None, value_wei, data, gas,
+            gas_price_wei,
+            origin=sender,
+            intrinsic_gas=int(parsed.get("intrinsic_gas") or 0),
+            block_number=int(block_height or 1),
+            timestamp=_evm_block_timestamp(block_timestamp),
+        )
         await context_exec.finalize_execution(
             sender=sender_hex, tx_hash=tx_hash_hex, success=result.success,
             gas_used=result.gas_used, gas_price=gas_price_wei, value=value_wei,
             defer_commit=defer_commit,
         )
         if not result.success:
+            # Re-apply what a failure must still cost. finalize_execution has just
+            # reverted the snapshot, which rolled back the gas charge and nonce bump
+            # along with the state changes; only the state changes should roll back.
+            # Deterministic: every node takes this branch for the same transaction with
+            # the same gas figure, so the account root still agrees.
+            if _ENFORCE_FAILED_TX_COSTS:
+                await _charge_failed_tx(
+                    state_manager, sender_hex, nonce,
+                    gas_used=result.gas_used, gas_limit=gas, gas_price=gas_price_wei,
+                    intrinsic=int(parsed.get("intrinsic_gas") or 0),
+                    defer_commit=defer_commit,
+                )
             return {"success": False, "error": result.error, "tx_hash": tx_hash_hex,
-                    "sender": sender_hex, "nonce": nonce}
+                    "sender": sender_hex, "nonce": nonce,
+                    "gas_charged": min(gas, max(result.gas_used,
+                                                int(parsed.get("intrinsic_gas") or 0)))}
         created = encode_hex(result.created_address) if result.created_address else None
         EVM_PENDING_NONCE[sender_hex.lower()] = max(EVM_PENDING_NONCE.get(sender_hex.lower(), 0), nonce + 1)
         return {"success": True, "tx_hash": tx_hash_hex, "sender": sender_hex,
@@ -1122,8 +1466,55 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
         await context_exec.finalize_execution(
             sender=sender_hex, tx_hash=tx_hash_hex, success=False, gas_used=0, gas_price=0, value=0,
         )
+        # A transaction that raised (out of gas, insufficient funds mid-execution, a VM
+        # error) must cost the same as one that reverted — otherwise the cheapest way to
+        # spam the network is to make execution throw. The full gas limit is charged, as
+        # Ethereum does for an out-of-gas failure, since the work was done and the cause
+        # is not attributable to a partial execution.
+        if _ENFORCE_FAILED_TX_COSTS:
+            await _charge_failed_tx(
+                state_manager, sender_hex, nonce,
+                gas_used=gas, gas_limit=gas, gas_price=gas_price_wei,
+                intrinsic=int(parsed.get("intrinsic_gas") or 0),
+                defer_commit=defer_commit,
+            )
         return {"success": False, "error": str(e), "tx_hash": tx_hash_hex,
                 "sender": sender_hex, "nonce": nonce}
+
+
+async def _apply_block_withdrawals_on_import(block_height, block_epoch):
+    """
+    Apply a block's stake withdrawals during import — the importer's half of the in-block
+    withdrawal mechanism (qrdx/validator/withdrawals.py).
+
+    Placed after the EVM section and before the unified-root check on every import path,
+    mirroring the proposer, so both compute the same credits against the same state. An
+    unknown epoch skips processing rather than guessing: a guessed epoch could pay a
+    different set than the proposer did.
+    """
+    if block_epoch is None:
+        return
+    try:
+        from ..validator.withdrawals import process_block_withdrawals
+        await process_block_withdrawals(db, int(block_height), int(block_epoch))
+    except Exception as e:
+        logger.error(f"withdrawal processing failed on import of block {block_height}: {e}")
+
+
+def _exchange_tick_on_import(block_height, block_timestamp) -> None:
+    """
+    The exchange's per-block tick for an imported block that carries no exchange section
+    (``block_processor.run_exchange_tick``). Clearinghouse duties — mark prices now,
+    liquidations and funding next — must advance on every block, so every path ticks every
+    block from height 1: the proposer, these importers and both rebuilds.
+    """
+    if not block_height or int(block_height) < 1:
+        return
+    try:
+        from ..exchange.block_processor import run_exchange_tick
+        run_exchange_tick(int(block_height), float(block_timestamp or 0))
+    except Exception as e:
+        logger.error(f"exchange tick failed at block {block_height}: {e}")
 
 
 async def _apply_exchange_section_on_import(block_height, block_timestamp,
@@ -1142,7 +1533,7 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
         flush_exchange_balance_deltas, flush_token_balance_deltas,
         flush_validator_lifecycle_deltas,
         ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT, ENFORCE_ORDERBOOK_SETTLEMENT,
-        ENFORCE_POOL_STAKE,
+        ENFORCE_POOL_STAKE, ENFORCE_VALIDATOR_STAKE,
     )
     from ..exchange.state_manager import ExchangeStateManager
     mgr = ExchangeStateManager.get_instance()
@@ -1150,6 +1541,7 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
     mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
     mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
     mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
+    mgr.enforce_validator_stake = ENFORCE_VALIDATOR_STAKE
     # Phase E: pre-load senders' real QRDX + token balances so the collateral and
     # spot-sufficiency checks can read them during the sync section processing.
     try:
@@ -1169,7 +1561,8 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
             # token ledger (before the E-D4 root check, so both domains reflect).
             await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
             await flush_token_balance_deltas(db, mgr)
-            await flush_validator_lifecycle_deltas(db, mgr, block_epoch=block_epoch)
+            await flush_validator_lifecycle_deltas(
+                db, mgr, block_epoch=block_epoch, block_height=block_height)
         return ok, err
     # Trust-replay (sync): adopt the canonical section's computed root.
     try:
@@ -1182,7 +1575,8 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
             mgr.commit_block()
             await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
             await flush_token_balance_deltas(db, mgr)
-            await flush_validator_lifecycle_deltas(db, mgr, block_epoch=block_epoch)
+            await flush_validator_lifecycle_deltas(
+                db, mgr, block_epoch=block_epoch, block_height=block_height)
         else:
             logger.warning(f"Exchange section trust-replay failed at block {block_height}: {err}")
         return True, ""
@@ -1195,9 +1589,7 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
 # paths (p2p/REST) recompute the unified state root and observed 0 mismatches
 # across a 3-run soak (reorgs now ~0, so no transient divergence). With True, a
 # live-broadcast block whose recomputed unified root != the signed root is
-# REJECTED. NOTE: the check is intentionally NOT run on the bulk-sync path (a
-# catching-up node can still transiently differ mid-reorg), only on stable
-# live-broadcast import — see _verify_unified_state_root.
+# REJECTED. The bulk-sync path has its own gates below.
 _ED4_ENFORCE_UNIFIED_ROOT = True
 
 # E-D4 sync-path enforcement at the FINALIZED boundary (doc item 1). The bulk-sync path
@@ -1213,8 +1605,30 @@ _ED4_ENFORCE_UNIFIED_ROOT = True
 # enforcing is safe + correct defense-in-depth.
 _ED4_ENFORCE_SYNC_FINALIZED = True
 
+# E-D4 on the bulk-sync TIP, not only at finalized heights. While the tip only observed, E-D4
+# was not binding at all: a block the live paths REJECTED for a bad root re-entered through
+# sync — its proposer builds on it, the next live block triggers a sync from that proposer,
+# and the sync path accepted the bad block with an "[E-D4 observe]" warning. That is exactly
+# how the proposer-mid-rebuild bug's wrong roots got into every node's chain.
+#
+# The tip was left observe because "a catching-up node legitimately holds different state
+# mid-reorg". That stopped being true: every rollback now rebuilds derived state from the
+# canonical prefix in forward order, the proposer can no longer build over a half-finished
+# rebuild, and the exchange no longer reads the wall clock — so a node's state is a function
+# of its chain, and an honest block's root must match. Two fault-injecting soaks with those
+# fixes logged zero observe mismatches. A node whose own state is wrong is not stuck either:
+# the rejection rebuilds derived state from the chain, and the next sync attempt re-applies
+# the block on clean state. Env-overridable (QRDX_ED4_ENFORCE_SYNC=0) for A/B testing only.
+_ED4_ENFORCE_SYNC_TIP = os.getenv(
+    "QRDX_ED4_ENFORCE_SYNC", "1").lower() not in ("0", "false", "no")
 
-async def _check_parent_continuity(block_height, block_content, enforce: bool = False) -> Tuple[bool, str]:
+
+def _sync_ed4_enforced(at_finalized: bool) -> bool:
+    """Whether the bulk-sync path rejects a block whose unified root does not match."""
+    return _ED4_ENFORCE_SYNC_TIP or (at_finalized and _ED4_ENFORCE_SYNC_FINALIZED)
+
+
+async def _check_parent_continuity(block_height, block_content, enforce: Optional[bool] = None) -> Tuple[bool, str]:
     """
     Verify a block's declared ``parent_hash`` equals the local tip (the stored
     block at ``block_height - 1``). The import path otherwise only checks that
@@ -1226,6 +1640,10 @@ async def _check_parent_continuity(block_height, block_content, enforce: bool = 
     (so the caller can reorg to the correct parent); otherwise it logs and accepts
     (observe). Returns ``(ok, error)``.
     """
+    if enforce is None:
+        # Default to the global gate so EVERY caller honours it — the p2p hook calls
+        # this without `enforce`, and used to get a silent False.
+        enforce = _ENFORCE_PARENT_CONTINUITY
     if not block_height or block_height <= 0:
         return True, ""
     from ..validator.block_verification import _parse_block_content
@@ -1262,9 +1680,7 @@ async def _verify_unified_state_root(block_content, enforce: Optional[bool] = No
     (UTXO pre-native-apply, account/exchange post-section). Returns ``(ok, err)``.
 
     ``enforce`` overrides the global gate: the live-broadcast paths use the global
-    ``_ED4_ENFORCE_UNIFIED_ROOT`` (enforce); the bulk-sync path passes
-    ``enforce=False`` (observe), because a catching-up node can transiently differ
-    mid-reorg and must not reject canonical history.
+    ``_ED4_ENFORCE_UNIFIED_ROOT``; the bulk-sync path passes ``_sync_ed4_enforced(...)``.
     """
     if enforce is None:
         enforce = _ED4_ENFORCE_UNIFIED_ROOT
@@ -2190,8 +2606,11 @@ async def _init_dht() -> None:
 
         logger.info(f"DHT local node: {local_node.node_id_hex} @ {listen_host}:{listen_port}")
 
-        # Load or create routing table with disk persistence
+        # Load or create routing table with disk persistence — in this node's own state
+        # directory unless the config names one explicitly.
         persist_dir = dht_config.routing_table_path
+        if persist_dir.rstrip("/") == "data":
+            persist_dir = _p2p_state_dir()
         os.makedirs(persist_dir, exist_ok=True)
 
         rt_path = os.path.join(persist_dir, 'routing_table.json')
@@ -2649,6 +3068,9 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
             if not ok:
                 logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr}")
                 return False
+        else:
+            # No exchange transactions — the exchange still ticks (mark prices, ...).
+            _exchange_tick_on_import(block_height, block.get('timestamp', 0) or 0)
 
         # E-D3b: validate + replay the EVM section (execute-on-mine) before
         # storing — reject any block whose account_state_root doesn't match.
@@ -2663,30 +3085,30 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
             )
             if not ok_evm:
                 logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr_evm}")
+                await _restore_after_rejected_block(block_height, f"EVM section: {verr_evm}")
                 return False
 
-        # E-D4 (link 5b + item 1): unified-state-root check on the bulk-sync path. The
-        # CHURNING TIP stays observe (a catching-up node can transiently differ mid-reorg
-        # and must not drop canonical history). A block at/under the node's FINALIZED
-        # height is settled (the reorg guard refuses to go below it), so its root can no
-        # longer change — there we ENFORCE (reject a corrupt/malicious peer's bad state).
-        # NOTE (measured): this is DEFENSE-IN-DEPTH that near-never fires — a node only
-        # syncs blocks ABOVE its tip, and its local finalized_height always trails its
-        # tip, so a synced block is essentially never at/under the local finalized
-        # boundary. It is correct (and free in the common path) and would catch a
-        # finalized block re-synced with divergent state, but the steady-state E-D4
-        # coverage is the live-broadcast path. See docs/CONSENSUS_REMAINING_WORK.md item 1.
+        # Stake withdrawals — same point as the proposer: after EVM, before E-D4.
+        from ..validator.block_verification import epoch_from_block as _efb
+        _wd_epoch = _efb(block)
+        if _wd_epoch is None:
+            _wd_epoch = _efb(block_info)
+        await _apply_block_withdrawals_on_import(block_height, _wd_epoch)
+
+        # E-D4 on the bulk-sync path — binding at the tip too (see _ED4_ENFORCE_SYNC_TIP):
+        # without it, a block the live paths rejected for a bad root re-entered here.
         try:
             from ..validator.finality import finalized_block_height
             final_h = await finalized_block_height(db)
             at_finalized = final_h is not None and final_h >= 0 and block_height <= final_h
             ok_ed4, verr_ed4 = await _verify_unified_state_root(
-                block_content, enforce=(at_finalized and _ED4_ENFORCE_SYNC_FINALIZED))
+                block_content, enforce=_sync_ed4_enforced(at_finalized))
             if not ok_ed4:
-                logger.warning(f"[SYNC] Rejecting FINALIZED block {block_height}: E-D4 {verr_ed4}")
+                logger.warning(f"[SYNC] Rejecting block {block_height}: E-D4 {verr_ed4}")
+                await _restore_after_rejected_block(block_height, f"E-D4: {verr_ed4}")
                 return False
         except Exception as e:
-            logger.debug(f"[SYNC] E-D4 finalized check skipped for block {block_height}: {e}")
+            logger.debug(f"[SYNC] E-D4 check skipped for block {block_height}: {e}")
 
         try:
             timestamp_val = block.get('timestamp', 0)
@@ -2775,15 +3197,37 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
 # composition, a dedicated follow-up. See tests/test_validator_reconstruction_equivalence.py.
 _ENFORCE_VALIDATOR_RECONSTRUCTION = False
 
+# Reverse deposit-created validator registrations whose carrying block was orphaned.
+#
+# Narrow complement to the (gated-off) full validators reconstruction above: rather than
+# recomputing the whole table from the canonical chain — which diverged when tried,
+# because reconstruction and the incremental epoch loop compose inconsistently — this
+# reverses exactly the logged deposits from rolled-back blocks. It can only remove what
+# a deposit created, never touch a genesis validator, and never recompute reward-driven
+# effective_stake, so it cannot reintroduce that composition problem.
+#
+# ENABLED because leaving it off means a validator keeps stake-weighted influence over
+# proposer selection and fork choice after the deposit that paid for it was orphaned —
+# i.e. the stake enforcement in ExchangeStateManager._op_stake_deposit is bypassable by
+# any party who can get a block orphaned. See docs/EXCHANGE_AND_VALIDATOR_STAKE_AUDIT.md
+# and tests/test_orphaned_deposit_undo.py.
+_ENFORCE_DEPOSIT_REORG_UNDO = True
 
-async def _rebuild_derived_state_after_rollback():
-    """Rebuild all derived state (account/EVM, token ledger, exchange) from the
-    canonical blocks up to the CURRENT tip — i.e. after a ``db.remove_blocks(...)``
-    rollback. Shared by ``handle_reorganization`` (longest-chain reorg) and the
-    equal-height tie-break (mechanism-2). Order matters: reset the durable
-    account_state to a clean genesis+EVM base FIRST, then clear the token ledger,
-    then let the exchange rebuild re-apply collateral debits + token moves on top.
-    Each step is best-effort + logged (a rebuild failure must not crash the caller)."""
+
+# Rollback rebuild order (docs/KNOWN_ISSUES.md — "rollback rebuild replays out of forward
+# order"). Forward import applies each block as exchange → EVM → withdrawals, then the next
+# block; the rebuild must replay in that same order or any transaction that depends on an
+# earlier block's effect in another domain (a stake debit, a withdrawal credit, perp margin)
+# replays with a different outcome and the reorged node diverges at equal tip.
+# Env-overridable (QRDX_INTERLEAVED_REBUILD=0) only to A/B against the old by-domain rebuild.
+_INTERLEAVED_DERIVED_REBUILD = os.getenv(
+    "QRDX_INTERLEAVED_REBUILD", "1").lower() not in ("0", "false", "no")
+
+
+async def _rebuild_derived_state_by_domain():
+    """The pre-fix rebuild — every EVM section, then every exchange section, then every
+    withdrawal. Kept only for A/B (QRDX_INTERLEAVED_REBUILD=0); see
+    qrdx/derived_state_rebuild.py for why the order is wrong."""
     if EVM_STATE_MANAGER is not None:
         try:
             from ..contracts.evm_block_apply import rebuild_account_state_from_chain
@@ -2809,6 +3253,78 @@ async def _rebuild_derived_state_after_rollback():
     except Exception as e:
         logger.error(f"[REORG] Exchange state rebuild failed: {e}")
 
+    try:
+        from ..validator.withdrawals import reapply_withdrawal_ledger
+        _recredited = await reapply_withdrawal_ledger(db)
+        await db.connection.commit()
+        if _recredited:
+            logger.info("[REORG] re-credited %d canonical stake withdrawal(s)", _recredited)
+    except Exception as e:
+        logger.error(f"[REORG] stake-withdrawal ledger restore failed: {e}")
+
+
+async def _rebuild_derived_state_after_rollback():
+    """Rebuild all derived state (account/EVM, token ledger, exchange, stake withdrawals)
+    from the canonical blocks up to the CURRENT tip — i.e. after a ``db.remove_blocks(...)``
+    rollback. Shared by ``handle_reorganization`` (longest-chain reorg), the equal-height
+    tie-break, and ``_restore_after_rejected_block``. Each step is best-effort + logged (a
+    rebuild failure must not crash the caller)."""
+    # Stake withdrawals: discard exit/withdrawal records carried by orphaned blocks FIRST.
+    # A withdrawal is neither an EVM nor an exchange effect, so replaying sections alone
+    # would drop it; the rebuild therefore re-credits every row still in the ledger, at the
+    # block that paid it. An orphaned row left in place would be paid as if canonical.
+    try:
+        from ..validator.withdrawals import undo_withdrawal_logs_above
+        _wd_tip = (await db.get_next_block_id()) - 1
+        await undo_withdrawal_logs_above(db, _wd_tip)
+        await db.connection.commit()
+    except Exception as e:
+        logger.error(f"[REORG] orphaned stake-withdrawal log trim failed: {e}")
+
+    if _INTERLEAVED_DERIVED_REBUILD:
+        try:
+            from ..derived_state_rebuild import rebuild_derived_state_interleaved
+            await rebuild_derived_state_interleaved(
+                db, EVM_STATE_MANAGER,
+                _evm_defer_execute() if EVM_STATE_MANAGER is not None else None)
+        except Exception as e:
+            logger.error(f"[REORG] derived-state rebuild failed: {e}")
+    else:
+        await _rebuild_derived_state_by_domain()
+
+    # Mempool nonce expectations must follow the rebuilt account nonces, or transactions
+    # from orphaned/rejected blocks can never be re-admitted (see _reset_evm_pending_nonces).
+    try:
+        await _reset_evm_pending_nonces()
+    except Exception as e:
+        logger.error(f"[REORG] mempool nonce reset failed: {e}")
+
+    # Reverse validator registrations created by deposits in ORPHANED blocks.
+    #
+    # The validators table is not reconstructed from the chain
+    # (_ENFORCE_VALIDATOR_RECONSTRUCTION below is off), so a STAKE_DEPOSIT in a block
+    # that just got rolled back would otherwise leave its registration standing while
+    # the rebuild above correctly does NOT re-apply its stake debit — leaving a
+    # validator with the effective_stake that weights proposer selection and fork
+    # choice, but none of the funds locked. That is the stake-enforcement guarantee
+    # reopened through a reorg, so it is undone here.
+    #
+    # This is an exact reversal of the logged deposits, not a recomputation, which is
+    # why it is safe while full reconstruction stays gated: it can only remove what a
+    # deposit created. Genesis validators have no deposit-log rows and are untouched.
+    if _ENFORCE_DEPOSIT_REORG_UNDO:
+        try:
+            tip = (await db.get_next_block_id()) - 1
+            res = await db.undo_validator_deposits_above(tip)
+            if res.get("reversed"):
+                await db.connection.commit()
+                logger.warning(
+                    "[REORG] reversed %d orphaned validator deposit(s) above h=%d "
+                    "(%d validator(s) removed, %d stake top-up(s) reduced)",
+                    res["reversed"], tip, res["removed"], res["reduced"])
+        except Exception as e:
+            logger.error(f"[REORG] orphaned validator-deposit undo failed: {e}")
+
     # Validators reorg-reconstruction (item 3) — gated. Rebuild the deposited-validator dynamic
     # state as a pure function of the canonical chain so it converges across nodes regardless of
     # import history. Runs through the current finalized epoch (settled network-wide). Best-effort.
@@ -2826,6 +3342,121 @@ async def _rebuild_derived_state_after_rollback():
             logger.error(f"[REORG] validators reconstruction failed: {e}")
 
 
+# Startup rebuild (docs/KNOWN_ISSUES.md — "a restart replayed exchange state without
+# enforcement"). Env-overridable (QRDX_STARTUP_REBUILD=0) only to A/B against the old
+# exchange-only replay.
+_STARTUP_DERIVED_REBUILD = os.getenv(
+    "QRDX_STARTUP_REBUILD", "1").lower() not in ("0", "false", "no")
+
+
+async def _rebuild_derived_state_on_startup():
+    """
+    Reconstruct the in-memory exchange state on startup — and, to get it right, every other
+    derived domain with it.
+
+    Exchange state lives only in memory, so a restart must replay it from the chain. The
+    exchange sections alone cannot reproduce forward decisions: an op is accepted or
+    rejected against the sender's balance *at that block*, and the durable account_state
+    holds only tip balances. The old exchange-only replay therefore ran with every
+    enforcement gate off and accepted ops the network had rejected (an under-collateralised
+    position, an unaffordable pool), so a restarted node's exchange root differed from the
+    network's and it rejected every later block carrying an exchange section.
+
+    The interleaved rebuild recomputes each block's balances as it replays, so it makes the
+    network's decisions. It rewrites account_state and the token ledger to what forward
+    application produces; comparing against the durable roots first turns every restart
+    into an equivalence check between the rebuild and forward application.
+
+    Must run after the contract system is initialised (EVM sections replay through it) and
+    before block production or sync start.
+    """
+    if not _STARTUP_DERIVED_REBUILD:
+        try:
+            from ..exchange.block_processor import rebuild_exchange_state_from_chain
+            root = await rebuild_exchange_state_from_chain(db)
+            logger.info(f"Exchange state initialized from chain (root={root[:16]}...)")
+        except Exception as e:
+            logger.warning(f"Exchange state rebuild on startup skipped: {e}")
+        return
+
+    try:
+        from ..derived_state_rebuild import rebuild_derived_state_interleaved
+        from ..exchange.state_manager import ExchangeStateManager
+        from ..validator.withdrawals import undo_withdrawal_logs_above
+
+        durable_account = await db.get_account_state_root()
+        durable_token = await db.get_token_balances_root()
+        tip = (await db.get_next_block_id()) - 1
+        await undo_withdrawal_logs_above(db, tip)
+        await db.connection.commit()
+
+        res = await rebuild_derived_state_interleaved(
+            db, EVM_STATE_MANAGER,
+            _evm_defer_execute() if EVM_STATE_MANAGER is not None else None)
+        rebuilt_token = await db.get_token_balances_root()
+        exchange_root = ExchangeStateManager.get_instance().compute_state_root()
+        if res["account_root"] != durable_account or rebuilt_token != durable_token:
+            logger.error(
+                "[RESTART-REBUILD] rebuilt state differs from the durable state at tip %d: "
+                "account %s -> %s, token %s -> %s. Either an earlier rebuild or write was "
+                "interrupted (a crash or stop mid-rebuild leaves partial state), or rebuild "
+                "and forward application disagree on this chain. The chain-derived state is "
+                "kept, as every reorg would produce it.",
+                tip, durable_account[:16], res["account_root"][:16],
+                durable_token[:16], rebuilt_token[:16])
+        else:
+            logger.info("[startup] derived state rebuilt from chain (tip=%d, matches durable "
+                        "state; exchange root=%s...)", tip, exchange_root[:16])
+    except Exception as e:
+        logger.error(f"[startup] derived-state rebuild failed: {e}")
+
+
+def _p2p_state_dir() -> str:
+    """Where this node keeps its peer store and DHT routing table: beside its own database
+    (``<database>.p2p/``), or ``QRDX_P2P_STATE_DIR``. They used to be a file inside the package
+    (``qrdx/node/nodes.json``) and a ``data/`` directory relative to the working directory —
+    shared by every node started from one directory, which is how one testnet came to dial
+    another."""
+    explicit = os.environ.get("QRDX_P2P_STATE_DIR")
+    if explicit:
+        return explicit
+    db_path = str(DENARO_DATABASE_PATH) if DENARO_DATABASE_PATH else 'data/qrdx.db'
+    return os.path.splitext(db_path)[0] + ".p2p"
+
+
+async def _restore_after_rejected_block(block_height, reason: str) -> None:
+    """
+    Undo a REJECTED block's effects on derived state.
+
+    Every import path applies a block's sections BEFORE its final checks, and those
+    sections do not all roll back on their own: ``apply_block_evm_section`` commits on
+    success (committing the exchange deltas flushed before it), the in-memory
+    ``ExchangeStateManager`` has already been mutated, and withdrawal credits sit in the
+    open transaction for the next commit to persist. So when a LATER step rejects the block
+    — the EVM section's own root check, or E-D4 — the node used to keep the effects of a
+    block its chain does not contain, and would then build on corrupted state.
+
+    The rejected block was never stored, so the canonical chain is intact: rebuilding
+    derived state from it restores exactly the pre-block state, in every domain and in
+    memory, using the same rebuild the reorg path relies on.
+
+    Cost: the rebuild replays the chain, so this is O(chain). Acceptable because it only
+    fires when a block that already passed signature, eligibility and parent-continuity
+    checks then fails a state check — which only an eligible proposer can cause, once per
+    slot it owns. Must be called with the block-processing lock held (every import path
+    holds it), since it does not acquire it.
+    """
+    logger.warning(f"[REJECT] restoring derived state after rejecting block {block_height}: {reason}")
+    try:
+        await db.connection.rollback()
+    except Exception as e:
+        logger.debug(f"[REJECT] rollback before restore: {e}")
+    try:
+        await _rebuild_derived_state_after_rollback()
+    except Exception as e:
+        logger.error(f"[REJECT] derived-state restore failed after block {block_height}: {e}")
+
+
 async def _tiebreak_rollback(block_no: int) -> None:
     """Fork-choice mechanism-2: roll back the losing block at the contested tip
     (height ``block_no``) and rebuild derived state to ``block_no - 1``, so the
@@ -2837,13 +3468,22 @@ async def _tiebreak_rollback(block_no: int) -> None:
     logger.warning("[fork-choice ENFORCE] rolled back contested tip h=%d for equal-height replacement", block_no)
 
 
-async def handle_reorganization(node_interface: NodeInterface, local_height: int):
-    """Handles blockchain reorganization with proper validation"""
+async def handle_reorganization(node_interface: NodeInterface, local_height: int,
+                                search_from: Optional[int] = None):
+    """Handles blockchain reorganization with proper validation.
+
+    ``local_height`` is the local tip: everything above the common ancestor up to it is
+    rolled back and its transactions re-queued. ``search_from`` is where the common-ancestor
+    search starts (default: the local tip). Fork-choice reconciliation passes the divergence
+    height, because the peer holding the canonical block can be SHORTER than the local
+    chain — searching from the local tip asked it for a block it did not have, and the
+    reorg aborted ("Could not get remote block"). That was 18 of the 24 failed
+    reconciliations across three soaks."""
     METRICS.inc("qrdx_reorgs_total")
     logger.warning(f"[REORG] Fork detected! Starting reorganization process from local height {local_height}.")
 
     last_common_block_id = -1
-    check_height = local_height
+    check_height = local_height if search_from is None else min(local_height, int(search_from))
 
     # Find the last common block
     while check_height >= 0:
@@ -3049,52 +3689,55 @@ async def _sync_blockchain(node_id: str = None):
             else:
                 logger.info("[SYNC] Local chain is empty. Beginning initial block download.")
 
-            if fork_detected:
-                reorg_result = await handle_reorganization(node_interface, local_height)
-                if reorg_result is None:
-                    logger.error("[SYNC] Reorganization failed. Aborting sync cycle.")
-                    return
+            # Everything from here to the end of the fetch loop adopts the peer's chain: the
+            # local proposer must not build on the tip meanwhile (_adopting_peer_chain).
+            async with _adopting_peer_chain():
+                if fork_detected:
+                    reorg_result = await handle_reorganization(node_interface, local_height)
+                    if reorg_result is None:
+                        logger.error("[SYNC] Reorganization failed. Aborting sync cycle.")
+                        return
             
-            logger.info("[SYNC] Starting block fetching process.")
-            while True:
-                start_block_id = await db.get_next_block_id()
+                logger.info("[SYNC] Starting block fetching process.")
+                while True:
+                    start_block_id = await db.get_next_block_id()
 
-                if start_block_id > remote_height:
-                    logger.info("[SYNC] Local height now meets or exceeds remote height. Sync appears complete.")
-                    break
+                    if start_block_id > remote_height:
+                        logger.info("[SYNC] Local height now meets or exceeds remote height. Sync appears complete.")
+                        break
 
-                logger.debug(f"[SYNC] Fetching {MAX_REORG_DEPTH} blocks starting from block {start_block_id}...")
+                    logger.debug(f"[SYNC] Fetching {MAX_REORG_DEPTH} blocks starting from block {start_block_id}...")
                 
-                blocks_resp = await node_interface.get_blocks(start_block_id, MAX_REORG_DEPTH)
+                    blocks_resp = await node_interface.get_blocks(start_block_id, MAX_REORG_DEPTH)
                 
-                if not (blocks_resp and blocks_resp.get('ok')):
-                    logger.warning("[SYNC] Failed to fetch a batch of blocks from peer. Aborting sync cycle.")
-                    break
+                    if not (blocks_resp and blocks_resp.get('ok')):
+                        logger.warning("[SYNC] Failed to fetch a batch of blocks from peer. Aborting sync cycle.")
+                        break
                 
-                blocks_batch = blocks_resp['result']
-                if not blocks_batch:
-                    logger.info('[SYNC] No more blocks returned by peer. Sync presumed complete.')
-                    break
+                    blocks_batch = blocks_resp['result']
+                    if not blocks_batch:
+                        logger.info('[SYNC] No more blocks returned by peer. Sync presumed complete.')
+                        break
                 
-                # Serialize block APPLICATION under the same lock every other block-
-                # mutation path holds (p2p import, REST, proposer). The forward-sync loop
-                # was the ONE unlocked state-mutating path, so its process_and_create_block
-                # raced a concurrent proposer/import on a busy node — a block landing mid-
-                # apply could leave derived account_state at a reseeded-genesis value with
-                # the activity (perp margin / EVM transfer) re-applied to the wrong base.
-                # The network FETCH above stays outside the lock (I/O); only the local
-                # per-batch apply is serialized. See phase_e_invariants reorg divergence.
-                async with block_processing_lock:
-                    for block_data in blocks_batch:
-                        if not await process_and_create_block(block_data, is_bulk_sync=True):
-                            logger.error("[SYNC] FATAL ERROR: Failed to create blocks during sync. Aborting.")
-                            await security.reputation_manager.record_violation(
-                                peer_to_sync_from['node_id'], 'invalid_sync_block', severity=8
-                            )
-                            return
-                        await asyncio.sleep(0)
+                    # Serialize block APPLICATION under the same lock every other block-
+                    # mutation path holds (p2p import, REST, proposer). The forward-sync loop
+                    # was the ONE unlocked state-mutating path, so its process_and_create_block
+                    # raced a concurrent proposer/import on a busy node — a block landing mid-
+                    # apply could leave derived account_state at a reseeded-genesis value with
+                    # the activity (perp margin / EVM transfer) re-applied to the wrong base.
+                    # The network FETCH above stays outside the lock (I/O); only the local
+                    # per-batch apply is serialized. See phase_e_invariants reorg divergence.
+                    async with block_processing_lock:
+                        for block_data in blocks_batch:
+                            if not await process_and_create_block(block_data, is_bulk_sync=True):
+                                logger.error("[SYNC] FATAL ERROR: Failed to create blocks during sync. Aborting.")
+                                await security.reputation_manager.record_violation(
+                                    peer_to_sync_from['node_id'], 'invalid_sync_block', severity=8
+                                )
+                                return
+                            await asyncio.sleep(0)
 
-                NodesManager.update_peer_last_seen(peer_to_sync_from['node_id'])
+                    NodesManager.update_peer_last_seen(peer_to_sync_from['node_id'])
     
 
     except httpx.RequestError:
@@ -3108,6 +3751,30 @@ async def _sync_blockchain(node_id: str = None):
         traceback.print_exc()
     finally:
         logger.info('[SYNC] Synchronization process finished.')
+
+
+# Peer-chain adoptions in flight (rollback → fetch → apply). The rollback and each applied batch
+# hold block_processing_lock, but the network fetches between them cannot, and the local
+# proposer used to slip into that gap: it built a fresh block on the just-rolled-back tip, the
+# adoption's next block then failed ("height N != expected N+1"), and the fork it was resolving
+# was re-created by the resolver itself — seen in soaks, including after the proposer started
+# taking the lock. While this is non-zero the proposer skips its slot (checked under the lock).
+_PEER_CHAIN_ADOPTIONS = 0
+
+
+@asynccontextmanager
+async def _adopting_peer_chain():
+    global _PEER_CHAIN_ADOPTIONS
+    _PEER_CHAIN_ADOPTIONS += 1
+    try:
+        yield
+    finally:
+        _PEER_CHAIN_ADOPTIONS -= 1
+
+
+def _peer_chain_adoption_in_progress() -> bool:
+    """Proposal guard for the validator node: True while this node is adopting a peer chain."""
+    return _PEER_CHAIN_ADOPTIONS > 0
 
 
 async def handle_unreachable_peer(peer_id: str, peer_url: str, context: str):
@@ -3138,7 +3805,7 @@ async def fork_choice_reconcile_pass(enforce: bool = False) -> dict:
     at every height). It never mutates state. Returns a small summary dict for the
     caller/probe. See the active-reconciliation redirect in FORK_CHOICE_CONVERGENCE.md.
     """
-    summary = {"window": None, "diverged_at": None, "randao_mix": None}
+    summary = {"window": None, "diverged_at": None, "randao_mix": None, "reconciled": None}
     try:
         if security.sync_state_manager.is_syncing:
             return summary
@@ -3244,9 +3911,101 @@ async def fork_choice_reconcile_pass(enforce: bool = False) -> dict:
             "from=%s; randao_mix=%s (window %d..%d)",
             "ENFORCE" if enforce else "observe", h, str(local_hashes[h])[:16],
             str(winner)[:16], src or "local", mix_hex, low, tip)
-        # ENFORCE (active reorg) is intentionally not wired yet — it lands with its own
-        # soak once this observe stage confirms forks are tip-local and the canonical
-        # choice is consistent across nodes. Flag stays False until then.
+        if not enforce or not src:
+            # Observe, or the canonical block is already local (nothing to pull).
+            return summary
+
+        # ENFORCE: adopt the canonical chain by reorganising onto the peer that holds it.
+        #
+        # Reuses handle_reorganization wholesale rather than hand-rolling a rollback: it
+        # already finds the common ancestor with that peer, applies the FINALITY REORG
+        # GUARD (never roll back below a finalized block), re-queues orphaned
+        # transactions and exchange/EVM sections, and rebuilds every derived-state domain
+        # under the block-processing lock.
+        #
+        # Convergence argument: every node computes the winner as min(hash) over the same
+        # candidate set (its own block plus every peer's at that height), so all nodes
+        # agree on the target and only the losers move. The rule is a pure function of
+        # the block hashes — no slot, stake or arrival-time input — so it cannot
+        # oscillate: the winner never reorgs onto a loser.
+        #
+        # This is the ACTIVE half that passive on-receipt replacement lacked. A node that
+        # only ever saw the losing fork never receives the winning block, so it never
+        # triggers a receive-time tie-break; here every node queries its peers each cycle
+        # regardless of what it received, so the whole network converges rather than just
+        # the nodes that happened to see both blocks.
+        # Adopt the canonical chain: reorg onto it, THEN fetch it.
+        #
+        # Neither existing primitive does this on its own:
+        #   * handle_reorganization only ROLLS BACK to the common ancestor — its caller in
+        #     _sync_blockchain runs the fetch loop. Calling it alone leaves the node short
+        #     with nothing re-fetched, so ordinary sync later pulls from an arbitrary peer
+        #     and often re-establishes the same fork.
+        #   * _sync_blockchain refuses any peer that is not strictly LONGER
+        #     ("Local chain is at or ahead of remote. No sync needed."). Equal-height fork
+        #     reconciliation is precisely the case it declines — which is why the first
+        #     attempt logged 204 enforce lines and converged nothing.
+        #
+        # So do both halves here, deliberately without the longest-chain gate: the
+        # canonical choice is min(hash), not max(height). The finality guard still applies
+        # (inside handle_reorganization), so this can never roll back below finality.
+        try:
+            iface = NodeInterface(src, client=http_client, db=db)
+            logger.warning(
+                "[fork-choice ENFORCE] adopting the canonical chain at h=%d from %s "
+                "(local=%s → canonical=%s)",
+                h, src, str(local_hashes[h])[:16], str(winner)[:16])
+
+            async with _adopting_peer_chain():
+                common = await handle_reorganization(iface, tip, search_from=h)
+                if common is None:
+                    logger.warning(
+                        "[fork-choice ENFORCE] rollback declined at h=%d (finality guard, "
+                        "depth cap, or peer unreachable) — will retry", h)
+                    summary["reconciled"] = False
+                    return summary
+
+                # Fetch the winner's chain from the common ancestor forward.
+                status = await iface.get_status()
+                remote_height = (status or {}).get('result', {}).get('height', -1)
+                applied = 0
+                while True:
+                    start_id = await db.get_next_block_id()
+                    if start_id > remote_height:
+                        break
+                    resp = await iface.get_blocks(start_id, MAX_REORG_DEPTH)
+                    if not (resp and resp.get('ok')) or not resp.get('result'):
+                        break
+                    rejected = False
+                    async with block_processing_lock:
+                        for block_data in resp['result']:
+                            if not await process_and_create_block(block_data, is_bulk_sync=True):
+                                logger.warning(
+                                    "[fork-choice ENFORCE] peer block rejected while adopting "
+                                    "the canonical chain at h=%d — stopping", h)
+                                rejected = True
+                                break
+                            applied += 1
+                            await asyncio.sleep(0)
+                    if rejected:
+                        break
+
+            after = await db.get_block_by_id(h)
+            now_hash = (after or {}).get('hash') or (after or {}).get('block_hash')
+            summary["reconciled"] = (now_hash == winner)
+            if summary["reconciled"]:
+                METRICS.inc("qrdx_fork_choice_reconciles_total")
+                logger.warning(
+                    "[fork-choice ENFORCE] converged at h=%d onto %s (%d block(s) adopted)",
+                    h, str(winner)[:16], applied)
+            else:
+                logger.warning(
+                    "[fork-choice ENFORCE] h=%d is %s after adopting %d block(s) from %s "
+                    "— not yet canonical, will retry",
+                    h, str(now_hash)[:16], applied, src)
+        except Exception as e:
+            logger.error("[fork-choice ENFORCE] reconciliation failed at h=%d: %s", h, e)
+            summary["reconciled"] = False
         return summary
     except Exception as e:
         logger.debug("fork-choice reconcile pass error: %s", e)
@@ -3260,7 +4019,7 @@ async def fork_choice_reconcile_pass(enforce: bool = False) -> dict:
 
 @app.on_event("startup")
 async def startup():
-    global db, self_node_id, http_client  # Add http_client here
+    global db, self_node_id, http_client, EVM_EXECUTOR, EVM_STATE_MANAGER
     
     logger.info("Starting Denaro Node Server...")
 
@@ -3271,6 +4030,8 @@ async def startup():
     # Initialize security components
     await security.startup()
     
+    os.makedirs(_p2p_state_dir(), exist_ok=True)
+    NodesManager.db_path = os.path.join(_p2p_state_dir(), 'nodes.json')
     NodesManager.purge_peers()
     initialize_identity()
     self_node_id = get_node_id()
@@ -3281,7 +4042,6 @@ async def startup():
     logger.info(f"Using SQLite database: {db_path}")
 
     # Ensure the database directory exists
-    import os
     os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else '.', exist_ok=True)
 
     db = await Database.create(db_path=db_path)
@@ -3311,14 +4071,25 @@ async def startup():
     else:
         logger.info("Genesis block already exists")
 
-    # D3 durability: rebuild exchange state from the stored canonical block
-    # sections so it survives a restart / fresh resync (no-op on a fresh chain).
-    try:
-        from ..exchange.block_processor import rebuild_exchange_state_from_chain
-        root = await rebuild_exchange_state_from_chain(db)
-        logger.info(f"Exchange state initialized from chain (root={root[:16]}...)")
-    except Exception as e:
-        logger.warning(f"Exchange state rebuild on startup skipped: {e}")
+    # Contract system (EVM executor + account-state manager). Initialised here, ahead of
+    # the RPC modules that also use it, because the startup rebuild below replays EVM
+    # sections through it — and because block production and sync, which start before the
+    # RPC modules are registered, must never run with EVM state uninitialised.
+    if os.getenv('QRDX_RPC_ENABLED', 'false').lower() == 'true':
+        try:
+            from ..contracts import ContractStateManager, QRDXEVMExecutor
+            logger.info("Initializing contract execution system...")
+            EVM_STATE_MANAGER = ContractStateManager(db)
+            EVM_EXECUTOR = QRDXEVMExecutor(EVM_STATE_MANAGER)
+            logger.info("✅ Contract system initialized")
+        except Exception as e:
+            EVM_STATE_MANAGER = EVM_EXECUTOR = None
+            logger.error(f"Contract system initialization failed: {e}")
+
+    # Derived state (exchange in memory; account_state + token ledger durable) rebuilt from
+    # the canonical chain, so it survives a restart / fresh resync with the network's
+    # accept/reject decisions (see _rebuild_derived_state_on_startup).
+    await _rebuild_derived_state_on_startup()
 
     # Initialize PoS validator if enabled
     validator_node = None
@@ -3363,6 +4134,10 @@ async def startup():
                     try:
                         validator_node.set_evm_tx_source(_get_evm_mempool())
                         validator_node.set_evm_section_producer(_produce_evm_section)
+                        # Block production must never interleave with an import or a
+                        # derived-state rebuild: share the lock they hold.
+                        validator_node.set_block_processing_lock(block_processing_lock)
+                        validator_node.set_proposal_guard(_peer_chain_adoption_in_progress)
                     except Exception as e:
                         logger.warning(f"Could not attach EVM tx source/producer: {e}")
                 else:
@@ -3437,6 +4212,12 @@ async def startup():
             get_finality=_poll_finality, get_slashing_count=_poll_slashing,
             get_mempool_depth=_poll_mempool, interval=2.0))
         app.state.chain_poller_task = _chain_poller_task
+        if STREAMING_ENABLED:
+            # Perps channels (qrdx/exchange/stream.py): read-only, like the chain poller.
+            from qrdx.exchange import ExchangeStateManager
+            from qrdx.exchange.stream import perp_stream_poller
+            app.state.perp_poller_task = asyncio.create_task(perp_stream_poller(
+                EVENT_HUB, get_manager=ExchangeStateManager.get_instance, interval=1.0))
         logger.info("✅ Observability chain-event poller scheduled (streaming %s)",
                     "ENABLED" if STREAMING_ENABLED else "disabled — /metrics + health still on")
     except Exception as e:
@@ -3463,6 +4244,7 @@ async def startup():
         verify_unified_root=_verify_unified_state_root,  # E-D4 importer hook
         check_parent_continuity=_check_parent_continuity,  # parent-continuity observe hook
         tiebreak_rollback=_tiebreak_rollback,  # fork-choice mechanism-2 rollback hook
+        restore_after_rejected_block=_restore_after_rejected_block,  # undo a rejected block's effects
         enforce_equal_height_tiebreak=_ENFORCE_EQUAL_HEIGHT_TIEBREAK,  # mechanism-2 gate
 
         enforce_proposer_eligibility=_ENFORCE_PROPOSER_ELIGIBILITY,  # slot-eligibility gate
@@ -3480,19 +4262,19 @@ async def startup():
             from ..rpc.modules.eth import EthModule
             from ..rpc.modules.qrdx import QRDXModule
             from ..rpc.modules.net import NetModule
-            from ..contracts import ContractStateManager, QRDXEVMExecutor
-            
-            # Initialize contract system first
-            logger.info("Initializing contract execution system...")
-            state_manager = ContractStateManager(db)
-            evm_executor = QRDXEVMExecutor(state_manager)
-            # Expose for the EVM consensus path (proposer inclusion + import replay,
-            # E-D3) so block production / import can execute EVM txs with the same
-            # executor + state manager as the live RPC handler.
-            global EVM_EXECUTOR, EVM_STATE_MANAGER
-            EVM_EXECUTOR = evm_executor
-            EVM_STATE_MANAGER = state_manager
-            logger.info("✅ Contract system initialized")
+
+            # The contract system was initialised before the startup rebuild; the RPC
+            # modules share that instance with the EVM consensus path (proposer inclusion
+            # + import replay, E-D3), so both execute against the same state.
+            if EVM_STATE_MANAGER is None or EVM_EXECUTOR is None:
+                raise RuntimeError("contract system is not initialized")
+            state_manager = EVM_STATE_MANAGER
+            evm_executor = EVM_EXECUTOR
+
+            # Anti-replay: restore the mempool's per-sender nonce expectations from the
+            # durable account nonces, so a restart does not reset them to 0 and let an
+            # already-executed transaction back in.
+            await _rehydrate_evm_pending_nonces()
             
             # Create context for modules
             from dataclasses import dataclass
@@ -3522,128 +4304,20 @@ async def startup():
             rpc_server.register_module(web3_module)
             
             # Register contract methods manually (not a full module)
-            async def eth_sendTransaction_handler(tx_params):
-                """Deploy or call a contract (requires signed transaction)."""
-                try:
-                    from eth_utils import to_canonical_address, encode_hex, decode_hex
-                    from eth_keys import keys
-                    from eth_account._utils.signing import serializable_unsigned_transaction_from_dict, encode_transaction
-                    from eth_account._utils.legacy_transactions import Transaction as LegacyTransaction
-                    from decimal import Decimal
-                    import rlp
-                    
-                    if not tx_params:
-                        raise Exception("Missing transaction parameters")
-                    
-                    # Extract signature components
-                    r = tx_params.get('r')
-                    s = tx_params.get('s')
-                    v = tx_params.get('v')
-                    
-                    if not r or not s or not v:
-                        raise Exception("Transaction must be signed (missing r, s, or v)")
-                    
-                    # Extract transaction parameters
-                    to_hex = tx_params.get('to', '')
-                    data_hex = tx_params.get('data', '0x')
-                    gas = int(tx_params.get('gas', '1000000'))
-                    gas_price_wei = int(tx_params.get('gasPrice', '1000000000'))
-                    value_wei = int(tx_params.get('value', '0'))
-                    nonce = int(tx_params.get('nonce', '0'))
-                    
-                    # Build unsigned transaction for signature recovery
-                    unsigned_tx = LegacyTransaction(
-                        nonce=nonce,
-                        gas_price=gas_price_wei,
-                        gas=gas,
-                        to=decode_hex(to_hex) if to_hex else b'',
-                        value=value_wei,
-                        data=decode_hex(data_hex)
-                    )
-                    
-                    # Convert r, s, v to integers
-                    r_int = int(r, 16) if isinstance(r, str) else r
-                    s_int = int(s, 16) if isinstance(s, str) else s
-                    v_int = int(v, 16) if isinstance(v, str) else v
-                    
-                    # Recover sender from signature
-                    # v is chain_id * 2 + 35 or 36 for EIP-155, or 27/28 for legacy
-                    if v_int >= 35:
-                        # EIP-155
-                        chain_id = (v_int - 35) // 2
-                        recovery_id = v_int - (chain_id * 2 + 35)
-                    else:
-                        # Legacy
-                        recovery_id = v_int - 27
-                        chain_id = None
-                    
-                    # Hash the unsigned transaction
-                    if chain_id is not None:
-                        # EIP-155 signing hash
-                        tx_for_hash = LegacyTransaction(
-                            nonce=nonce,
-                            gasPrice=gas_price_wei,  # camelCase!
-                            gas=gas,
-                            to=decode_hex(to_hex) if to_hex else b'',
-                            value=value_wei,
-                            data=decode_hex(data_hex)
-                        )
-                        msg_hash = rlp.encode(list(tx_for_hash) + [chain_id, 0, 0])
-                    else:
-                        msg_hash = rlp.encode(unsigned_tx)
-                    
-                    from eth_hash.auto import keccak
-                    message_hash = keccak(msg_hash)
-                    
-                    # Recover public key and address
-                    signature_bytes = r_int.to_bytes(32, 'big') + s_int.to_bytes(32, 'big')
-                    signature = keys.Signature(signature_bytes=signature_bytes)
-                    
-                    public_key = signature.recover_public_key_from_msg_hash(message_hash)
-                    sender = public_key.to_canonical_address()
-                    sender_hex = encode_hex(sender)
-                    
-                    logger.info(f"eth_sendTransaction: from={sender_hex}, to={to_hex}, data_len={len(data_hex)}, signed=True")
-                    
-                    to = decode_hex(to_hex) if to_hex else None
-                    data = decode_hex(data_hex)
-                    
-                    # Convert wei to QRDX (1 QRDX = 10^18 wei for Ethereum compatibility)
-                    value_qrdx = Decimal(value_wei) / Decimal(10**18)
-                    gas_price_qrdx = Decimal(gas_price_wei) / Decimal(10**18)
-                    
-                    logger.info(f"Executing EVM: sender={sender_hex}, to={encode_hex(to) if to else 'CONTRACT_DEPLOY'}, data_len={len(data)}, value={value_qrdx} QRDX")
-                    
-                    result = evm_executor.execute(
-                        sender,
-                        to,
-                        int(value_qrdx * Decimal(10**18)),  # Convert back to wei
-                        data,
-                        gas,
-                        int(gas_price_qrdx * Decimal(10**18))  # Convert back to wei
-                    )
-                    
-                    logger.info(f"EVM result: success={result.success}, gas_used={result.gas_used}")
-                    
-                    if not result.success:
-                        logger.error(f"EVM execution failed: {result.error}")
-                        raise Exception(f"Execution failed: {result.error}")
-                    
-                    if result.created_address:
-                        contract_addr = encode_hex(result.created_address)
-                        logger.info(f"✅ Contract deployed at: {contract_addr}")
-                        return contract_addr
-                    else:
-                        output = encode_hex(result.output)
-                        logger.info(f"✅ Call output: {output}")
-                        return output
-                        
-                except Exception as e:
-                    logger.error(f"eth_sendTransaction error: {e}", exc_info=True)
-                    raise Exception(f"Transaction failed: {str(e)}")
-            
-            async def eth_call_handler(call_params):
-                """Read-only contract call."""
+            # There is deliberately no eth_sendTransaction handler here. The one that stood
+            # here executed a signed call straight against the EVM state manager — no block, no
+            # mempool, no nonce check. Its writes sat in the manager's cache as dirty entries
+            # and the next block's EVM flush committed them, so any RPC client could push
+            # off-chain effects into this node's account_state (diverging it from the network)
+            # and replay the same parameters indefinitely. It also silently overrode
+            # EthModule.sendTransaction, which correctly refuses and points callers at
+            # eth_sendRawTransaction — the one write path, through the mempool and a block.
+
+            async def eth_call_handler(call_params, block_number="latest"):
+                """Read-only contract call. Takes the standard ``[transaction, block]`` params —
+                it used to accept the transaction alone, so every web3 client's eth_call (which
+                always sends the block tag) failed with an internal error. Calls run against
+                the latest state."""
                 from eth_utils import to_canonical_address, encode_hex, decode_hex
                 
                 sender_hex = call_params.get('from', '0x' + '0' * 40)
@@ -3653,13 +4327,27 @@ async def startup():
                 sender = to_canonical_address(sender_hex)
                 to = to_canonical_address(to_hex)
                 data = decode_hex(data_hex)
+
+                # A native token answers the ERC-20 reads itself (qrdx/exchange/erc20_view.py).
+                from ..exchange import erc20_view
+                try:
+                    native = await erc20_view.call(db, to_hex, data)
+                except erc20_view.NativeTokenCallError as e:
+                    raise Exception(f"Call failed: execution reverted: {e}")
+                if native is not None:
+                    return encode_hex(native)
                 
+                # "latest" semantics: the tip block's number and timestamp, as geth does.
+                tip = (await db.get_next_block_id()) - 1
+                tip_block = await db.get_block_by_id(tip) if tip >= 0 else None
                 result = evm_executor.call(
                     sender=sender,
                     to=to,
                     data=data,
                     value=0,
-                    gas=10000000
+                    gas=10000000,
+                    block_number=max(tip, 1),
+                    timestamp=_evm_block_timestamp((tip_block or {}).get('timestamp')),
                 )
                 
                 if not result.success:
@@ -3697,6 +4385,15 @@ async def startup():
                     # sender, enforce the nonce window + DoS caps. A stale-nonce /
                     # unrecoverable / far-future tx is rejected here. The tx then
                     # waits in the mempool to be included by a proposer.
+                    # Authorise a delegated (system-wallet) spend before admission. The
+                    # block-import path checks this independently — neither trusts the
+                    # other — but refusing here keeps an unauthorised transaction out of
+                    # the mempool and off the gossip network in the first place.
+                    from ..contracts.evm_mempool import verify_delegated_spend
+                    deleg_ok, deleg_err = await verify_delegated_spend(db, raw_tx_hex)
+                    if not deleg_ok:
+                        raise Exception(f"rejected: {deleg_err}")
+
                     mp = _get_evm_mempool()
                     admit_ok, admit_err, _ = mp.admit(raw_tx_hex)
                     if not admit_ok and "duplicate" not in (admit_err or ""):
@@ -3714,7 +4411,6 @@ async def startup():
                     logger.error(f"eth_sendRawTransaction error: {e}", exc_info=True)
                     raise Exception(f"Transaction failed: {str(e)}")
             
-            rpc_server.register_method('eth_sendTransaction', eth_sendTransaction_handler)
             rpc_server.register_method('eth_call', eth_call_handler)
             rpc_server.register_method('eth_sendRawTransaction', eth_sendRawTransaction_handler)
             
@@ -3963,28 +4659,57 @@ async def submit_tx(
 @limiter.limit("30/minute")
 async def submit_exchange_tx(request: Request, body: dict = Body(...)):
     """
-    Admit an exchange transaction to the local admission mempool (Phase D1).
+    Submit a signed exchange transaction (spot, perps, staking, oracle votes — every exchange op).
 
-    Authentication (PQ signature + sender binding), nonce window, dedup, and
-    capacity are enforced by ``ExchangeMempool.admit`` before the transaction is
-    queued. This endpoint does NOT yet include the transaction in a block or
-    gossip it to peers — block inclusion + deterministic import replay are
-    Phase D2/D3 (see docs/EXCHANGE_PRODUCTION_READINESS.md).
+    Body: ``{"tx": {...}}`` (the transaction as a JSON object) or ``{"tx_hex": "..."}`` (the
+    string ``ExchangeTransaction.to_hex()`` makes). Admission — PQ signature + sender binding,
+    nonce window, dedup, capacity — happens here; then the transaction is gossiped to peers and
+    executes when a validator includes it in a block. Poll ``/get_exchange_receipt`` for the
+    result. ``POST /exchange_signing_payload`` returns the exact bytes to sign.
     """
-    tx_hex = body.get('tx_hex')
-    if not tx_hex:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="'tx_hex' not found in body.")
-
+    tx = body.get('tx') if body.get('tx') is not None else body.get('tx_hex')
+    if tx is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="send the transaction as 'tx' (object) or 'tx_hex' (string)")
     try:
-        mempool = _get_exchange_mempool()
-        ok, error, tx_hash = mempool.admit_hex(tx_hex)
+        ok, error, tx_hash = await _get_exchange_submitter().submit(tx)
     except Exception as e:
         logger.error(f"submit_exchange_tx error: {e}")
         return {'ok': False, 'error': 'Exchange transaction rejected'}
-
     if not ok:
         return {'ok': False, 'error': error}
-    return {'ok': True, 'result': {'tx_hash': tx_hash, 'mempool_size': mempool.size()}}
+    return {'ok': True, 'result': {'tx_hash': tx_hash, 'mempool_size': _get_exchange_mempool().size()}}
+
+
+@app.post("/exchange_signing_payload")
+async def exchange_signing_payload(body: dict = Body(...)):
+    """The exact bytes an exchange transaction's sender signs, for these fields (``op_type`` as
+    a number or name, ``sender``, ``nonce``, ``params``, optional ``gas_limit`` / ``gas_price``),
+    and the hash the transaction will have. Sign ``signing_bytes`` with the sender's Dilithium
+    key, add ``signature`` and ``public_key`` (hex) to ``tx``, and submit it."""
+    from qrdx.exchange.submission import signing_payload
+    try:
+        return {'ok': True, 'result': signing_payload(body.get('tx', body))}
+    except Exception as e:
+        return {'ok': False, 'error': f'invalid transaction fields: {e}'}
+
+
+@app.get("/get_exchange_receipt")
+async def get_exchange_receipt(tx_hash: str):
+    """The executed result of an exchange transaction — success or failure, its error, and the
+    operation's data (an order's id and fills, a deposit's collateral, …). ``null`` while it is
+    pending (or after it ages out of this node's journal)."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.receipt(ExchangeStateManager.get_instance(), tx_hash)}
+
+
+@app.get("/get_exchange_nonce")
+async def get_exchange_nonce(address: str):
+    """The next exchange nonce for ``address`` (exchange transactions have their own sequence)."""
+    from qrdx.exchange import ExchangeStateManager, views
+    mgr = ExchangeStateManager.get_instance()
+    return {'ok': True, 'result': {'address': address, 'nonce': mgr.get_nonce(
+        views.account_key(mgr.clearinghouse, address) or address)}}
 
 
 @app.get("/get_exchange_state_root")
@@ -4001,11 +4726,228 @@ async def get_exchange_state_root():
         mgr = ExchangeStateManager.get_instance()
         return {'ok': True, 'result': {
             'exchange_state_root': mgr.compute_state_root(),
+            # The root commits to the height, and the exchange ticks every block: compare
+            # roots between nodes only at the same height.
+            'block_height': mgr._current_block_height,
             'pools': mgr.pool_count,
             'pairs': mgr.pair_count,
         }}
     except Exception as e:
         logger.error(f"get_exchange_state_root error: {e}")
+        return {'ok': False, 'error': str(e)}
+
+
+@app.get("/get_perp_account")
+async def get_perp_account(address: str):
+    """
+    One perps account (docs/PERPS_CLEARINGHOUSE.md): exchange nonce, collateral, withdrawable,
+    equity and margin, positions (with unrealized PnL and an estimated liquidation price), open
+    orders, vault shares — plus the clearinghouse holder and the backstop vault. Identical on
+    every node that has imported the same blocks.
+    """
+    try:
+        from qrdx.exchange import ExchangeStateManager, views
+        return {'ok': True, 'result': views.account(ExchangeStateManager.get_instance(), address)}
+    except Exception as e:
+        logger.error(f"get_perp_account error: {e}")
+        return {'ok': False, 'error': str(e)}
+
+
+@app.get("/get_perp_orders")
+async def get_perp_orders(address: str):
+    """An address's resting perp orders, every market."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.open_orders(ExchangeStateManager.get_instance(), address)}
+
+
+@app.get("/get_perp_markets")
+async def get_perp_markets():
+    """Every perps market: prices (oracle, mark, last), open interest, top of book, funding."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.markets(ExchangeStateManager.get_instance())}
+
+
+@app.get("/get_perp_orderbook")
+async def get_perp_orderbook(market_id: str, depth: int = Query(default=20, ge=1, le=500)):
+    """A market's order book: aggregated price levels, best first."""
+    from qrdx.exchange import ExchangeStateManager, views
+    book = views.order_book(ExchangeStateManager.get_instance(), market_id, depth)
+    if book is None:
+        return {'ok': False, 'error': f'market {market_id} not found'}
+    return {'ok': True, 'result': book}
+
+
+@app.get("/get_perp_vault")
+async def get_perp_vault():
+    """The backstop vault: NAV, shares, share value, the positions it carries, the lockup."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.vault(ExchangeStateManager.get_instance())}
+
+
+@app.get("/get_perp_trades")
+async def get_perp_trades(market_id: str, limit: int = Query(default=50, ge=1, le=1000)):
+    """A market's recent fills, oldest first (liquidation fills included, and flagged)."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.trades(ExchangeStateManager.get_instance(), market_id, limit)}
+
+
+@app.get("/get_perp_events")
+async def get_perp_events(market_id: Optional[str] = None, address: Optional[str] = None,
+                          types: Optional[str] = None, since: Optional[int] = None,
+                          limit: int = Query(default=100, ge=1, le=1000)):
+    """The perps event feed — fills, liquidations, funding settlements — filtered by market,
+    address (a fill's buyer or seller, a liquidation's owner), comma-separated ``types``, and
+    ``since`` (a sequence number: return only newer events). ``last_seq`` is the newest
+    sequence number, to resume from."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.events(
+        ExchangeStateManager.get_instance(), market=market_id, address=address,
+        types=[t.strip() for t in types.split(",") if t.strip()] if types else None,
+        since=since, limit=limit)}
+
+
+@app.get("/get_token_balance")
+async def get_token_balance(token_address: str, address: str):
+    """Read-only: one holder's balance in the consensus QRC-20 token ledger. Any address form,
+    including protocol holders (the perps clearinghouse, pool reserves, order-book escrow)."""
+    try:
+        from qrdx.exchange import ExchangeStateManager, views
+        return {'ok': True, 'result': {
+            'token_address': token_address, 'address': address,
+            'balance': str(await db.get_token_balance(token_address, address)),
+            'frozen': views.token_frozen(ExchangeStateManager.get_instance(), token_address,
+                                         address),
+        }}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+
+@app.get("/get_tokens")
+async def get_tokens():
+    """Every native token: name, symbol, decimals, supply, max supply, mint and freeze
+    authorities (docs/NATIVE_TOKENS.md)."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.tokens(ExchangeStateManager.get_instance())}
+
+
+@app.get("/get_token")
+async def get_token(token_address: str):
+    """One native token's registry entry."""
+    from qrdx.exchange import ExchangeStateManager, views
+    found = views.token(ExchangeStateManager.get_instance(), token_address)
+    if found is None:
+        return {'ok': False, 'error': f'token {token_address} not found'}
+    return {'ok': True, 'result': found}
+
+
+@app.get("/get_token_allowance")
+async def get_token_allowance(token_address: str, owner: str, spender: str):
+    """How much of ``owner``'s tokens ``spender`` may move with TOKEN_TRANSFER_FROM."""
+    from qrdx.exchange import ExchangeStateManager, views
+    try:
+        return {'ok': True, 'result': views.token_allowance(
+            ExchangeStateManager.get_instance(), token_address, owner, spender)}
+    except ValueError as e:
+        return {'ok': False, 'error': str(e)}
+
+
+@app.get("/get_pools")
+async def get_pools(token_a: Optional[str] = None, token_b: Optional[str] = None):
+    """Spot AMM pools — all of them, or one pair's: price, tick, active liquidity, fee tier,
+    protocol fees, volume, and the holder address that owns the pool's reserves."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.pools(ExchangeStateManager.get_instance(), token_a, token_b)}
+
+
+@app.get("/get_pool")
+async def get_pool(pool_id: str, twap_window: Optional[int] = Query(default=None, ge=1)):
+    """One AMM pool with its initialized ticks and positions. ``twap_window`` (seconds of block
+    time) adds the pool's time-weighted price over that window."""
+    from qrdx.exchange import ExchangeStateManager, views
+    found = views.pool(ExchangeStateManager.get_instance(), pool_id, twap_window)
+    if found is None:
+        return {'ok': False, 'error': f'pool {pool_id} not found'}
+    return {'ok': True, 'result': found}
+
+
+@app.get("/get_liquidity_quote")
+async def get_liquidity_quote(pool_id: str, tick_lower: int, tick_upper: int,
+                              liquidity: Optional[str] = None, amount0: Optional[str] = None,
+                              amount1: Optional[str] = None):
+    """What adding liquidity to a range costs: pass ``liquidity`` for its exact deposit, or
+    ``amount0`` / ``amount1`` for the most liquidity they buy at the current price. Ticks are
+    multiples of the pool's tick spacing; the result's ``liquidity`` is ADD_LIQUIDITY's
+    ``amount``."""
+    from qrdx.exchange import ExchangeStateManager, views
+    try:
+        found = views.liquidity_quote(ExchangeStateManager.get_instance(), pool_id, tick_lower,
+                                      tick_upper, liquidity, amount0, amount1)
+    except (ValueError, ArithmeticError) as e:
+        return {'ok': False, 'error': str(e)}
+    if found is None:
+        return {'ok': False, 'error': f'pool {pool_id} not found'}
+    return {'ok': True, 'result': found}
+
+
+@app.get("/get_lp_positions")
+async def get_lp_positions(address: str):
+    """An address's liquidity positions, every pool: range, liquidity, whether it is in range,
+    and what removing it would pay right now (principal + uncollected fees)."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.positions(ExchangeStateManager.get_instance(), address)}
+
+
+@app.get("/get_swap_quote")
+async def get_swap_quote(token_in: str, token_out: str, amount_in: str, sender: str = "",
+                         pool_id: Optional[str] = None, venue: str = "auto"):
+    """The exact fill a SWAP would get right now — the router's own quote across the pair's
+    pools and its order book (``venue`` auto | amm | clob, ``pool_id`` pins a pool). Pass
+    ``sender`` so the quote stops where self-trade prevention would. Set the swap's
+    ``min_amount_out`` from ``amount_out`` less your slippage tolerance."""
+    from qrdx.exchange import ExchangeStateManager, views
+    try:
+        found = views.quote(ExchangeStateManager.get_instance(), token_in, token_out, amount_in,
+                            sender, pool_id, venue)
+    except (ValueError, ArithmeticError) as e:
+        return {'ok': False, 'error': str(e)}
+    if found is None:
+        return {'ok': False, 'error': 'no liquidity for this swap'}
+    return {'ok': True, 'result': found}
+
+
+@app.get("/get_spot_orderbook")
+async def get_spot_orderbook(pair: str, depth: int = Query(default=20, ge=1, le=500)):
+    """A spot pair's order book (``tokenA:tokenB`` by address, either order): aggregated price
+    levels in quote per base, best first."""
+    from qrdx.exchange import ExchangeStateManager, views
+    book = views.spot_order_book(ExchangeStateManager.get_instance(), pair, depth)
+    if book is None:
+        return {'ok': False, 'error': f'no order book for {pair}'}
+    return {'ok': True, 'result': book}
+
+
+@app.get("/get_spot_orders")
+async def get_spot_orders(address: str):
+    """An address's resting spot orders, every pair."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.spot_open_orders(ExchangeStateManager.get_instance(), address)}
+
+
+@app.get("/get_perp_market")
+async def get_perp_market(market_id: str):
+    """
+    One perps market (docs/PERPS_CLEARINGHOUSE.md): oracle, mark and last trade prices, open
+    interest, the top of the book, and funding — the rate last paid, when, when the next is due,
+    and the premium accumulated since. Identical on every node that has imported the same blocks.
+    """
+    try:
+        from qrdx.exchange import ExchangeStateManager, views
+        found = views.market(ExchangeStateManager.get_instance(), market_id)
+        if found is None:
+            return {'ok': False, 'error': f'market {market_id} not found'}
+        return {'ok': True, 'result': found}
+    except Exception as e:
+        logger.error(f"get_perp_market error: {e}")
         return {'ok': False, 'error': str(e)}
 
 
@@ -4299,6 +5241,9 @@ async def submit_block(
                         verified_sender, 'invalid_exchange_section', severity=6
                     )
                     return {'ok': False, 'error': f'Invalid exchange section: {verr}'}
+            else:
+                # No exchange transactions — the exchange still ticks (mark prices, ...).
+                _exchange_tick_on_import(block_no, body.get('timestamp', 0) or 0)
 
             # E-D3b: validate + replay the EVM section (execute-on-mine) before
             # storing; reject on account_state_root mismatch.
@@ -4312,7 +5257,12 @@ async def submit_block(
                     await security.reputation_manager.record_violation(
                         verified_sender, 'invalid_evm_section', severity=6
                     )
+                    await _restore_after_rejected_block(block_no, f"EVM section: {verr_evm}")
                     return {'ok': False, 'error': f'Invalid EVM section: {verr_evm}'}
+
+            # Stake withdrawals — same point as the proposer: after EVM, before E-D4.
+            from ..validator.block_verification import epoch_from_block as _efb
+            await _apply_block_withdrawals_on_import(block_no, _efb(body))
 
             # E-D4: verify the recomputed unified state root against the signed root.
             ok_root, root_err = await _verify_unified_state_root(block_content)
@@ -4320,6 +5270,7 @@ async def submit_block(
                 await security.reputation_manager.record_violation(
                     verified_sender, 'invalid_state_root', severity=8
                 )
+                await _restore_after_rejected_block(block_no, f"E-D4: {root_err}")
                 return {'ok': False, 'error': f'Invalid state root: {root_err}'}
 
             try:
@@ -4949,10 +5900,12 @@ async def get_address_info(
     verify: bool = False, 
     pretty: bool = False
 ):
-    # Validate address format
-    if not security.input_validator.validate_address(address):
+    # Validate address format. Protocol holders (pool reserves, order-book escrow, the perps
+    # clearinghouse) are readable here even though no transaction can name them.
+    from qrdx.crypto.account_id import is_synthetic_holder
+    if not (security.input_validator.validate_address(address) or is_synthetic_holder(address)):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid address format")
-    
+
     # Check query cost
     offset = (page - 1) * transactions_count_limit
     await security.query_calculator.check_and_update_cost(

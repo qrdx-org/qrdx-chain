@@ -35,6 +35,8 @@ from typing import Dict, List, Optional, Tuple
 from eth_account import Account
 from eth_utils import to_checksum_address
 
+from qrdx.crypto.account_id import to_account_id
+
 from integration_tests.rpc_client import NodeRPCClient
 
 logger = logging.getLogger(__name__)
@@ -166,11 +168,14 @@ class TransactionSender:
             signer_addr[:20], to_address[:20], amount, nonce,
         )
 
+        # Resolve the recipient to its canonical 20-byte ACCOUNT ID. A 0xPQ address
+        # is 32 bytes and cannot go in an RLP `to` field, but its account id can —
+        # which is what makes a 0x → 0xPQ transfer expressible at all.
         tx = {
             "nonce": nonce,
             "gasPrice": gas_price_wei,
             "gas": gas,
-            "to": to_checksum_address(to_address),
+            "to": to_checksum_address(to_account_id(to_address)),
             "value": value_wei,
             "data": b"",
             "chainId": chain_id,
@@ -205,6 +210,91 @@ class TransactionSender:
                 logger.info("  ✓ TX confirmed: %s", tx_hash)
             else:
                 logger.warning("  ⚠ TX not confirmed within %ss: %s", confirm_timeout, tx_hash)
+
+        return tx_hash
+
+    # ─────────── Post-quantum send flow (type 0x51) ───────────
+
+    async def send_pq(
+        self,
+        pq_wallet: dict,
+        to_address: str,
+        amount: Decimal,
+        gas_price_wei: int = DEFAULT_GAS_PRICE_WEI,
+        wait_confirm: bool = False,
+        confirm_timeout: float = 30.0,
+    ) -> Optional[str]:
+        """
+        Build, sign, and broadcast a **post-quantum** value transfer.
+
+        Same destination ledger and same RPC as ``send()`` — the only difference is
+        the authentication envelope: an EIP-2718 type-0x51 transaction carrying an
+        ML-DSA-65 public key and signature instead of ``(v, r, s)``. The node
+        derives the sender from the embedded key, so this spends from the wallet's
+        own account with nothing to forge.
+
+        Args:
+            pq_wallet: a roster PQ wallet dict — needs ``private_key`` and
+                ``public_key`` hex (a Dilithium secret key cannot re-derive its
+                public key, so the wallet must carry both).
+            to_address: any address form; resolved to its canonical account id.
+        """
+        from qrdx.crypto.pq.dilithium import PQPrivateKey
+        from qrdx.transactions.pq_tx import PQTransaction, intrinsic_gas_pq
+        from qrdx.crypto.pq.dilithium import PUBLIC_KEY_SIZE, SIGNATURE_SIZE
+
+        priv = PQPrivateKey.from_hex(
+            pq_wallet["private_key"], public_key_hex=pq_wallet["public_key"],
+        )
+        sender_account = priv.public_key.to_account_id()
+
+        nonce = await self._next_nonce(sender_account)
+        chain_id = await self._resolve_chain_id()
+        value_wei = int(Decimal(str(amount)) * WEI_PER_QRDX)
+
+        # A PQ transaction must supply its intrinsic floor, which prices the ~5.3KB
+        # key + signature it carries; under that floor the node rejects it outright.
+        gas_limit = intrinsic_gas_pq(
+            b"", b"\x00" * PUBLIC_KEY_SIZE, b"\x00" * SIGNATURE_SIZE) + 30_000
+
+        logger.info(
+            "Building PQ tx: %s (%s) → %s, amount=%s QRDX (nonce=%d)",
+            pq_wallet.get("address", "?")[:24], sender_account,
+            to_address[:24], amount, nonce,
+        )
+
+        tx = PQTransaction(
+            chain_id=chain_id,
+            nonce=nonce,
+            gas_price=gas_price_wei,
+            gas_limit=gas_limit,
+            to=bytes.fromhex(to_account_id(to_address)[2:]),
+            value=value_wei,
+            data=b"",
+        )
+        tx.sign(priv)
+        raw_hex = "0x" + tx.encode().hex()
+
+        try:
+            tx_hash = await self._client.eth_send_raw_transaction(raw_hex)
+        except Exception as e:
+            logger.error("  PQ submit failed (nonce=%d): %s", nonce, e)
+            return None
+
+        if not tx_hash:
+            logger.error("  PQ submit returned empty hash (nonce=%d)", nonce)
+            return None
+
+        self._nonce[sender_account.lower()] = nonce + 1
+        logger.info("  ✓ PQ TX submitted: %s", tx_hash)
+
+        if wait_confirm:
+            confirmed = await self._client.wait_tx_confirmed(tx_hash, timeout=confirm_timeout)
+            if confirmed:
+                logger.info("  ✓ PQ TX confirmed: %s", tx_hash)
+            else:
+                logger.warning("  ⚠ PQ TX not confirmed within %ss: %s",
+                               confirm_timeout, tx_hash)
 
         return tx_hash
 

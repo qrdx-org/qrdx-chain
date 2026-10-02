@@ -1419,23 +1419,16 @@ class TestVerifyExternalProofPrecompile:
         verify_external_proof_precompile(comp)
         assert comp.output == b'\x00'
 
-    def test_valid_proof_accepted(self):
-        data = (1).to_bytes(4, 'big') + b'\xaa' * 32
-        comp = MockComputation(data)
+    @pytest.mark.parametrize("chain_id,proof", [(1, b'\xaa' * 32), (2, b'\xbb' * 64),
+                                                (3, b'\xcc' * 32)])
+    def test_arbitrary_bytes_are_not_a_proof(self, chain_id, proof):
+        """It used to answer "valid" for any non-zero 32 bytes on a known chain: a contract
+        trusting it would accept forged proofs. With no chain adapter verifying anything yet,
+        it fails closed."""
+        comp = MockComputation(chain_id.to_bytes(4, 'big') + proof)
         verify_external_proof_precompile(comp)
-        assert comp.output == b'\x01'
-
-    def test_bitcoin_proof_accepted(self):
-        data = (2).to_bytes(4, 'big') + b'\xbb' * 64
-        comp = MockComputation(data)
-        verify_external_proof_precompile(comp)
-        assert comp.output == b'\x01'
-
-    def test_solana_proof_accepted(self):
-        data = (3).to_bytes(4, 'big') + b'\xcc' * 32
-        comp = MockComputation(data)
-        verify_external_proof_precompile(comp)
-        assert comp.output == b'\x01'
+        assert comp.output == b'\x00'
+        assert comp._gas_consumed == GAS_ORACLE_VERIFY_PROOF
 
 
 class TestSubmitCrossChainTxPrecompile:

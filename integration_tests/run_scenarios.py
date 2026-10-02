@@ -31,6 +31,7 @@ from integration_tests.scenarios.s01_genesis import S01GenesisBootstrap
 from integration_tests.scenarios.s02_peer_mesh import S02PeerMesh
 from integration_tests.scenarios.s03_block_production import S03BlockProduction
 from integration_tests.scenarios.s04_transactions import S04Transactions
+from integration_tests.scenarios.s04b_cross_type_transfers import S04bCrossTypeTransfers
 from integration_tests.scenarios.s05_tokens import S05Tokens
 from integration_tests.scenarios.s06_pools import S06Pools
 from integration_tests.scenarios.s07_validators import S07Validators
@@ -45,6 +46,8 @@ from integration_tests.scenarios.s15_spot_settlement import S15SpotSettlement
 from integration_tests.scenarios.s16_validator_membership import S16ValidatorMembership
 from integration_tests.scenarios.s17_clob_settlement import S17ClobSettlement
 from integration_tests.scenarios.s18_clob_match import S18ClobMatch
+from integration_tests.scenarios.s19_perp_liquidation import S19PerpLiquidation
+from integration_tests.scenarios.s20_native_tokens import S20NativeTokens
 
 
 ALL_SCENARIOS = [
@@ -52,6 +55,7 @@ ALL_SCENARIOS = [
     S02PeerMesh,
     S03BlockProduction,
     S04Transactions,
+    S04bCrossTypeTransfers,
     S05Tokens,
     S06Pools,
     S07Validators,
@@ -66,6 +70,8 @@ ALL_SCENARIOS = [
     S16ValidatorMembership,
     S17ClobSettlement,
     S18ClobMatch,
+    S19PerpLiquidation,
+    S20NativeTokens,
 ]
 
 

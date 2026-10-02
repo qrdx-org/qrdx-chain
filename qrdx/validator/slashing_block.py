@@ -183,6 +183,53 @@ def verify_attestation_evidence(evidence: Dict[str, Any]) -> Tuple[bool, str]:
     return True, ""
 
 
+def verified_offence(evidence: Dict[str, Any]) -> Optional[Tuple[str, str, int, int]]:
+    """
+    ``(offender, condition, slot, epoch)`` for a slashing proof that verifies, else None.
+
+    Every field is taken from the VERIFIED content of the proof, never from its unchecked
+    top-level fields. A proof carries a top-level ``proposer`` for convenience, but neither
+    verifier checks it: taking the offender from there let any proposer sign two conflicting
+    headers (or attestations) with its OWN key, name an honest validator as ``proposer``,
+    and have that validator slashed and ejected while it lost nothing. Likewise the epoch
+    comes from the slot, not a free field, so it cannot be pushed out to delay a penalty.
+
+    * DOUBLE_SIGN: the proposer both headers are signed by (``verify_double_sign_evidence``
+      checks the two agree and that each key derives to that address) and their shared slot.
+    * Attestation equivocation (``surround_vote`` / ``double_vote``): the validator both
+      attestations are signed by (``verify_attestation_evidence`` binds the carried public
+      key to that address) and the earlier of the two slots.
+    """
+    from ..constants import SLOTS_PER_EPOCH
+    if not isinstance(evidence, dict):
+        return None
+    if str(evidence.get("condition", "double_sign")) in ("surround_vote", "double_vote"):
+        ok, _err = verify_attestation_evidence(evidence)
+        if not ok:
+            return None
+        a, b = evidence["att_a"], evidence["att_b"]
+        offender = a.get("validator_address")
+        slot = min(int(a.get("slot", 0)), int(b.get("slot", 0)))
+        condition = "surround_vote"
+    else:
+        ok, _err = verify_double_sign_evidence(evidence)
+        if not ok:
+            return None
+        header = evidence["header_a"]
+        offender = header.get("proposer_address")
+        slot = int(header["slot"])
+        condition = "double_sign"
+    if not offender:
+        return None
+    return str(offender), condition, slot, slot // SLOTS_PER_EPOCH
+
+
+def verified_offender(evidence: Dict[str, Any]) -> Optional[str]:
+    """The validator a slashing proof convicts, or None if it does not verify."""
+    offence = verified_offence(evidence)
+    return offence[0] if offence else None
+
+
 async def record_block_slashing_evidence(db, block: Dict[str, Any]) -> int:
     """Record the DOUBLE_SIGN evidence carried in an imported block — the RECEIVING side of the
     block-body transport, run on EVERY node from the shared produce/import hook so all nodes end
@@ -194,34 +241,17 @@ async def record_block_slashing_evidence(db, block: Dict[str, Any]) -> int:
     INSERT-OR-IGNORE on (validator, slot, condition), so re-inclusion across blocks is a harmless
     no-op. Best-effort: a bad proof is skipped, never raised. Returns the count newly recorded."""
     import json
-    from ..constants import SLOTS_PER_EPOCH
     evidence_list = extract_slashing_evidence_from_dict(block)
     if not evidence_list:
         return 0
     recorded = 0
     for ev in evidence_list:
-        cond = str(ev.get("condition", "double_sign"))
-        # Dispatch verification by condition — each proof self-validates (no external state), so a
-        # malicious proposer can never record a fabricated slash for an honest validator.
-        if cond in ("surround_vote", "double_vote"):
-            ok, _err = verify_attestation_evidence(ev)
-        else:
-            ok, _err = verify_double_sign_evidence(ev)
-        if not ok:
+        offence = verified_offence(ev)
+        if offence is None:
             continue  # unverifiable proof — never record
-        proposer = ev.get("proposer") or (ev.get("header_a") or {}).get("proposer_address")
-        slot = ev.get("slot")
-        if slot is None:
-            slot = (ev.get("header_a") or {}).get("slot")
-        if not proposer or slot is None:
-            continue
-        epoch = ev.get("epoch")
-        if epoch is None:
-            epoch = int(slot) // SLOTS_PER_EPOCH
+        offender, condition, slot, epoch = offence
         try:
-            new = await db.record_slashing_event(
-                proposer, str(ev.get("condition", "double_sign")),
-                int(slot), int(epoch), json.dumps(ev))
+            new = await db.record_slashing_event(offender, condition, slot, epoch, json.dumps(ev))
             if new:
                 recorded += 1
         except Exception:

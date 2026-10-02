@@ -11,8 +11,20 @@ import sys
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
 
-# Add py-evm to path
-sys.path.insert(0, '/workspaces/qrdx-chain-denaro/py-evm')
+from importlib import util as importlib_util
+
+# Prefer an installed `eth` package (the container installs the py-evm QRDX fork
+# as a wheel). Fall back to the in-repo checkout for local development, resolved
+# relative to this file rather than a hardcoded absolute path.
+import os
+
+if importlib_util.find_spec("eth") is None:
+    _vendored_py_evm = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "py-evm",
+    )
+    if os.path.isdir(_vendored_py_evm) and _vendored_py_evm not in sys.path:
+        sys.path.insert(0, _vendored_py_evm)
 
 from eth.vm.forks.qrdx import QRDXVM
 from eth.db.atomic import AtomicDB
@@ -117,6 +129,9 @@ class QRDXEVMExecutor:
         gas: int,
         gas_price: int,
         origin: Optional[bytes] = None,
+        intrinsic_gas: int = 0,
+        block_number: int = 1,
+        timestamp: int = 1,
     ) -> EVMResult:
         """
         Execute EVM transaction.
@@ -129,9 +144,16 @@ class QRDXEVMExecutor:
             gas: Gas limit
             gas_price: Gas price in wei
             origin: Transaction origin (defaults to sender)
+            intrinsic_gas: Transaction-level gas floor (21000 + calldata for a
+                legacy tx; substantially more for a type-0x51 PQ tx, which must
+                pay for its ~5.3KB authentication envelope). ``apply_message``
+                charges NO transaction-level gas, so without this a plain transfer
+                costs nothing at all. Callers that are not executing a real
+                transaction (``eth_call``, gas estimation) leave it at 0.
             
         Returns:
-            EVMResult with execution details
+            EVMResult with execution details. ``gas_used`` is the amount actually
+            charged, i.e. the floor when execution consumed less than it.
         """
         if origin is None:
             origin = sender
@@ -140,10 +162,14 @@ class QRDXEVMExecutor:
         
         try:
             # Create execution context (block-level context)
+            # block.number / block.timestamp are the block being executed — every consensus
+            # path passes them (proposer, importers, rebuild), so contracts with timelocks or
+            # vesting see the chain advance, identically on every node. They used to be the
+            # constant 1. The defaults serve callers with no block (standalone use).
             exec_context = ExecutionContext(
                 coinbase=ZERO_ADDRESS,
-                timestamp=1,
-                block_number=1,
+                timestamp=max(1, int(timestamp)),
+                block_number=max(1, int(block_number)),
                 difficulty=GENESIS_DIFFICULTY,
                 mix_hash=b'\x00' * 32,
                 gas_limit=10_000_000,
@@ -239,28 +265,50 @@ class QRDXEVMExecutor:
                     to_checksum_address(to),
                     encode_hex(deployed_code)
                 )
-                # Update nonce
+
+            # Increment the sender's nonce on ANY successful transaction, not just a
+            # contract creation.
+            #
+            # ``apply_message`` / ``apply_create_message`` do not touch the sender
+            # nonce (that is ``apply_transaction``'s job, which this executor does
+            # not use), so before this a plain value transfer left the account nonce
+            # at 0 forever. ``eth_getTransactionCount`` reads that nonce, so it
+            # under-reported, and every web3 client broke on its SECOND transaction:
+            # it would sign nonce 0 again and the mempool would reject it as
+            # "nonce too low" against its own correctly-advanced pending counter.
+            if success:
+                sender_addr = to_checksum_address(sender)
                 self.state_manager.set_nonce_sync(
-                    to_checksum_address(sender),
-                    nonce + 1
+                    sender_addr,
+                    self.state_manager.get_nonce_sync(sender_addr) + 1,
                 )
+
             
-            # Deduct gas cost from sender
+            # Charge tx-level gas ONLY.
+            #
+            # The value transfer is performed by the EVM itself inside
+            # apply_message / apply_create_message, and ``_sync_from_evm`` above has
+            # already written the VM's post-execution balances back — so the
+            # sender's debit and the recipient's credit are recorded at that point.
+            # Re-applying ``value`` here as well double-counted every native
+            # transfer: the recipient received 2x and the sender paid 2x. (It also
+            # meant a reverted call still moved funds, since the VM rolls its own
+            # transfer back but this manual credit did not.)
+            #
+            # Gas is different and must stay: py-evm's apply_message does NOT do
+            # tx-level gas accounting (that lives in apply_transaction, which this
+            # executor does not use), so nothing else charges it.
+            # Charge at least the transaction's intrinsic floor, never more than the
+            # gas limit the sender authorised.
+            gas_used = min(gas, max(gas_used, intrinsic_gas))
             gas_cost = gas_used * gas_price
             sender_addr_str = to_checksum_address(sender)
             sender_balance = self.state_manager.get_balance_sync(sender_addr_str)
             self.state_manager.set_balance_sync(
                 sender_addr_str,
-                sender_balance - gas_cost - value
+                sender_balance - gas_cost,
             )
-            
-            # Credit value to recipient
-            if value > 0:
-                if to:
-                    to_addr_str = to_checksum_address(to)
-                    to_balance = self.state_manager.get_balance_sync(to_addr_str)
-                    self.state_manager.set_balance_sync(to_addr_str, to_balance + value)
-            
+
             return EVMResult(
                 success=success,
                 gas_used=gas_used,
@@ -287,9 +335,12 @@ class QRDXEVMExecutor:
         data: bytes,
         value: int = 0,
         gas: int = 10_000_000,
+        block_number: int = 1,
+        timestamp: int = 1,
     ) -> EVMResult:
         """
-        Execute read-only call (eth_call).
+        Execute read-only call (eth_call), in the context of ``block_number``/``timestamp``
+        (the caller passes the latest block's).
         
         State changes are not persisted.
         """
@@ -301,6 +352,8 @@ class QRDXEVMExecutor:
                 sender=sender,
                 to=to,
                 value=value,
+                block_number=block_number,
+                timestamp=timestamp,
                 data=data,
                 gas=gas,
                 gas_price=0,

@@ -131,3 +131,38 @@ def test_observe_off_is_behaviour_neutral():
     res = mgr._op_place_order(_order_tx("0xPQt", "buy", 5, 10, "t" * 16))
     assert res.success
     assert mgr.token_balance_deltas() == {}             # matches as before, moves no value
+
+
+# ── self-trade prevention never crosses the book or strands escrow ─────────
+
+def _stp_mgr():
+    from qrdx.exchange.orderbook import SelfTradeAction
+    mgr = _mgr()
+    mgr._order_books[PAIR] = OrderBook(pool_id=PAIR,
+                                       self_trade_action=SelfTradeAction.CANCEL_TAKER)
+    return mgr
+
+
+def test_consensus_books_are_created_with_cancel_taker():
+    import inspect
+    from qrdx.exchange.clearinghouse import Clearinghouse
+    assert "SelfTradeAction.CANCEL_TAKER" in inspect.getsource(ExchangeStateManager._op_create_pool)
+    assert "SelfTradeAction.CANCEL_TAKER" in inspect.getsource(Clearinghouse.create_market)
+
+
+def test_an_order_into_its_own_resting_order_is_cancelled_not_escrowed():
+    mgr = _stp_mgr()
+    mgr.set_available_token_balance("0xPQm", BASE, Decimal("100"))
+    mgr.set_available_token_balance("0xPQm", QUOTE, Decimal("100000"))
+    mgr.set_available_token_balance("0xPQt", BASE, Decimal("100"))
+    mgr._op_place_order(_order_tx("0xPQt", "sell", 5, 3, "t" * 16))        # best ask, 3 @ 5
+    mgr._op_place_order(_order_tx("0xPQm", "sell", "5.5", 10, "a" * 16))   # m's own ask
+    res = mgr._op_place_order(_order_tx("0xPQm", "buy", 6, 10, "b" * 16))
+    assert res.success and res.data["filled"] == "3"     # takes t's 3 @ 5, stops at its own
+    book = mgr._order_books[PAIR]
+    assert book.best_bid is None and book.best_ask == Decimal("5.5"), "the book crossed"
+    d = mgr.token_balance_deltas()
+    assert d[("0xPQm", QUOTE)] == Decimal("-15")         # paid the fill only: nothing escrowed
+    assert d[("0xPQm", BASE)] == Decimal("-10") + Decimal("3")
+    assert d[(_escrow(mgr), BASE)] == Decimal("10")      # m's resting ask, untouched
+    _assert_conserves(mgr)

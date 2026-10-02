@@ -509,6 +509,7 @@ class ValidatorManager:
         parent_hash: str,
         transactions: List[Any],
         state_root: str = None,
+        timestamp: Optional[int] = None,
     ) -> Optional[PoSBlock]:
         """
         Propose a block if selected for this slot.
@@ -524,6 +525,10 @@ class ValidatorManager:
             parent_hash: Hash of parent block
             transactions: Transactions to include
             state_root: Optional state root (computed if not provided)
+            timestamp: The timestamp the caller executed the block's sections at. It
+                MUST be the one the block carries: importers execute the sections at the
+                block's timestamp, and the exchange judges time-dependent rules (funding,
+                oracle staleness, swap deadlines) by it. Defaults to now.
             
         Returns:
             Proposed block or None if not selected
@@ -583,7 +588,7 @@ class ValidatorManager:
             parent_hash=parent_hash,
             state_root=state_root,
             transactions_root=transactions_root,
-            timestamp=int(time.time()),
+            timestamp=int(timestamp) if timestamp is not None else int(time.time()),
             proposer_address=self.wallet.address,
             proposer_public_key=self.wallet.public_key,
             proposer_signature=b'',  # Will be set below

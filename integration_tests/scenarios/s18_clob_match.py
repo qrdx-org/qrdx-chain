@@ -6,7 +6,7 @@ remaining path: a resting maker order that a DIFFERENT taker FILLS — settling 
 token moves maker↔taker (maker side from the book escrow, taker side live). Self-trade prevention
 means a match needs two wallets, so this is the last CLOB settlement path without a live proof.
 
-Flow: a maker (Validator 0, clean exchange nonce) deploys base + quote tokens, creates the order
+Flow: a maker (the CLOB Maker wallet, clean exchange nonce) deploys base + quote tokens, creates the order
 book, funds the taker (Test User 1) with quote, and places a resting SELL (escrows base). The
 taker places a BUY that matches fully → the trade settles: taker receives base (from the maker's
 escrow), maker receives quote (from the taker, live). Validated cross-node — each step advances
@@ -68,11 +68,17 @@ class S18ClobMatch(Scenario):
         wallets = self.ctx.wallets
         target = node_urls[0]
 
-        maker = wallets.get("Validator 0")    # PQ, clean exchange nonce (validators don't trade)
-        # Test User 0 is the only other funded PQ wallet available; it did s13's 2 perp txs
-        # (CREATE_MARKET nonce 0, OPEN_POSITION nonce 1), so its exchange nonce continues at 2.
+        maker = wallets.get("CLOB Maker")     # PQ, clean exchange nonce, used by no other scenario
+        # Test User 0 also traded perps in s13; read where its exchange nonce stands rather
+        # than assume how many transactions s13 sent.
         taker = wallets.get("Test User 0")
-        TAKER_NONCE = 2
+        TAKER_NONCE = 0
+        try:
+            async with NodeRPCClient(target) as c:
+                r = await c._get("/get_perp_account", params={"address": taker["address"]})
+            TAKER_NONCE = int(r["result"]["exchange_nonce"]) if r and r.get("ok") else 0
+        except Exception:
+            pass
         for who, w in (("maker", maker), ("taker", taker)):
             if not w or not w.get("private_key") or "PQ" not in str(w.get("address", "")):
                 self.check(False, f"funded PQ {who} wallet available")

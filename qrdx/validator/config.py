@@ -232,17 +232,36 @@ class ValidatorConfig:
         }
 
 
-# Default PoS constants (can be overridden by config)
+# Default PoS constants (can be overridden by config).
+#
+# Timing and staking values are taken FROM qrdx.constants, the single, env-aware source
+# of truth — they used to be hardcoded here (SLOT_DURATION 2, SLOTS_PER_EPOCH 32,
+# UNBONDING_PERIOD_EPOCHS 9450). With QRDX_SLOTS_PER_EPOCH=8 (the testnet) the node loop,
+# finality, RANDAO, block verification and slashing all used 8-slot epochs, while
+# `ValidatorManager.propose_block` stamped every block's `epoch` field from THIS dict at 32.
+# `epoch_from_block` reads that field, so the proposer scheduled validator lifecycle ops on
+# 8-slot epochs and every importer on 32-slot epochs (an exit scheduled for epoch 11 on the
+# proposer and 4 on importers), and reconstruction — which walks epochs in finality's
+# 8-slot terms — read op epochs roughly 4x too early, compressing a deposit's activation and
+# a later exit into the same epoch, where the exit was silently dropped. Production defaults
+# (32) happened to agree, which is why it hid. Never re-hardcode these.
+from ..constants import (
+    SLOT_DURATION as _SLOT_DURATION,
+    SLOTS_PER_EPOCH as _SLOTS_PER_EPOCH,
+    UNBONDING_PERIOD_EPOCHS as _UNBONDING_PERIOD_EPOCHS,
+    MIN_VALIDATOR_STAKE as _MIN_VALIDATOR_STAKE,
+)
+
 POS_CONSTANTS = {
     # Timing
-    'SLOT_DURATION': 2,              # 2 seconds per slot
-    'SLOTS_PER_EPOCH': 32,           # 32 slots per epoch (64 seconds)
-    
+    'SLOT_DURATION': _SLOT_DURATION,
+    'SLOTS_PER_EPOCH': _SLOTS_PER_EPOCH,
+
     # Staking
-    'MIN_VALIDATOR_STAKE': Decimal("100000"),  # 100,000 QRDX
+    'MIN_VALIDATOR_STAKE': _MIN_VALIDATOR_STAKE,
     'MIN_DELEGATION': Decimal("100"),          # 100 QRDX minimum delegation
     'MAX_VALIDATORS': 150,                     # Maximum active validators
-    'UNBONDING_PERIOD_EPOCHS': 9450,           # ~7 days
+    'UNBONDING_PERIOD_EPOCHS': _UNBONDING_PERIOD_EPOCHS,
     
     # Consensus
     'ATTESTATION_THRESHOLD': Decimal("0.667"), # 2/3 for finality

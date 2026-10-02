@@ -90,6 +90,8 @@ async def test_ws_enabled_accepts_and_streams_a_published_event(monkeypatch):
                 raise WebSocketDisconnect()
         async def close(self, code=1000):
             pass
+        async def receive_json(self):
+            await asyncio.Event().wait()       # a client that never sends a control frame
 
     import asyncio
     task = asyncio.create_task(m.ws_stream(_WS()))
@@ -133,3 +135,40 @@ async def test_rpc_server_records_per_method_metrics():
     assert snap['qrdx_rpc_requests_total{method="obstest_ping"}'] == b_req + 1
     assert snap['qrdx_rpc_errors_total{method="obstest_boom"}'] == b_err + 1
     assert snap.get('qrdx_rpc_requests_total{method="_unknown"}', 0) == b_unk + 1
+
+
+@pytest.mark.asyncio
+async def test_ws_client_subscribes_to_perps_channels(monkeypatch):
+    """A client sends {"op": "subscribe", ...}: it gets the ack, then only its channels' events
+    (its default block feed is replaced when it unsubscribes from it)."""
+    import asyncio
+    monkeypatch.setattr(m, "STREAMING_ENABLED", True)
+    from fastapi import WebSocketDisconnect
+    sent, inbox = [], asyncio.Queue()
+
+    class _WS:
+        query_params = {}
+        async def accept(self):
+            pass
+        async def send_json(self, data):
+            sent.append(data)
+            if data.get("key") == "BTC-USD-PERP" and data.get("type") == "perp_event":
+                raise WebSocketDisconnect()
+        async def receive_json(self):
+            return await inbox.get()
+        async def close(self, code=1000):
+            pass
+
+    task = asyncio.create_task(m.ws_stream(_WS()))
+    await asyncio.sleep(0.05)
+    await inbox.put({"op": "set", "channels": ["perp_events:BTC-USD-PERP"]})
+    await asyncio.sleep(0.05)
+    await m.EVENT_HUB.publish({"type": "block", "channel": "blocks", "height": 7})
+    await m.EVENT_HUB.publish({"type": "perp_event", "channel": "perp_events", "key": "ETH-USD-PERP"})
+    await m.EVENT_HUB.publish({"type": "perp_event", "channel": "perp_events", "key": "BTC-USD-PERP"})
+    await asyncio.wait_for(task, timeout=2)
+    kinds = [(e["type"], e.get("key")) for e in sent]
+    assert kinds[0][0] == "hello"
+    assert ("subscribed", None) in kinds
+    assert ("block", None) not in kinds and ("perp_event", "ETH-USD-PERP") not in kinds
+    assert kinds[-1] == ("perp_event", "BTC-USD-PERP")

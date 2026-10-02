@@ -146,8 +146,14 @@ def epoch_from_block(block_like: Dict[str, Any]) -> Optional[int]:
             return int(ep)
         except (TypeError, ValueError):
             pass
-    # 2. Header fields nested in a block_content repr (the p2p/REST wire envelope).
+    # 2. Header fields nested in a content repr. The p2p/REST wire envelope calls it
+    #    `block_content`; the SYNC path's block dict comes from the peer's stored row,
+    #    where the column is `content`. Only `block_content` used to be checked, so every
+    #    block imported via sync — bulk sync and every post-reorg re-fetch — returned None
+    #    here, and its validator activations/exits were scheduled with no epoch at all.
     bc = block_like.get("block_content")
+    if bc is None:
+        bc = block_like.get("content")
     if bc is not None:
         try:
             content = _parse_block_content(bc)

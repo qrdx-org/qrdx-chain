@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +220,13 @@ class PerpEngine:
         self._owner_positions: Dict[str, List[str]] = {}  # owner → [pos_ids]
         self._pos_sequence: int = 0  # deterministic ID counter
         self._paused: bool = False
+        # Consensus clock. Every time-dependent rule here must be judged by the timestamp of
+        # the BLOCK being processed, never the node's wall clock: nodes process a block at
+        # different wall times, and a rebuild or catching-up sync replays hours of blocks in
+        # seconds — a wall-clock rule makes them decide differently from the network.
+        # ExchangeStateManager points this at the current block; the wall-clock default only
+        # serves standalone, non-consensus use.
+        self.clock: Callable[[], float] = time.time
 
     @property
     def market_count(self) -> int:
@@ -346,7 +353,7 @@ class PerpEngine:
             entry_price=price,
             margin=required_margin,
             leverage=leverage,
-            last_funding_time=time.time(),
+            last_funding_time=self.clock(),
             reduce_only=reduce_only,
         )
 
@@ -454,7 +461,7 @@ class PerpEngine:
             raise ValueError(f"Market {market_id} not found")
 
         market.index_price = index_price
-        market.last_price_update = time.time()
+        market.last_price_update = self.clock()
 
         # Mark price = index + EMA(premium)
         # Premium = (last_trade_price - index) — simplified
@@ -521,7 +528,7 @@ class PerpEngine:
         if market is None:
             return None
 
-        now = time.time()
+        now = self.clock()
         if market.last_funding_time > 0 and (now - market.last_funding_time) < FUNDING_INTERVAL:
             return None
 
@@ -679,7 +686,7 @@ class PerpEngine:
         """Reject operations if oracle data is stale."""
         if market.last_price_update <= 0:
             return  # no update yet — allow (market just created)
-        age = time.time() - market.last_price_update
+        age = self.clock() - market.last_price_update
         if age > ORACLE_STALENESS_SECONDS:
             raise ValueError(
                 f"Oracle data stale: {age:.0f}s old (max {ORACLE_STALENESS_SECONDS}s)"

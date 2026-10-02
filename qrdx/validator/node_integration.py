@@ -24,6 +24,12 @@ logger = get_logger(__name__)
 # Slot duration in seconds (from SLOT_DURATION constant which is in int format)
 SLOT_DURATION_SECONDS = SLOT_DURATION if isinstance(SLOT_DURATION, int) else 12
 
+# Proposer propagation grace (fork PREVENTION). Env-gated for A/B measurement; see the
+# comment at the use site and "Block history did not converge" in docs/KNOWN_ISSUES.md.
+_PROPOSER_PROPAGATION_GRACE = os.getenv(
+    "QRDX_PROPOSER_PROPAGATION_GRACE", "0").lower() in ("1", "true", "yes")
+_PROPOSER_PROPAGATION_GRACE_SECONDS = SLOT_DURATION_SECONDS / 2
+
 # Validator-lifecycle unification rollout gate. False = OBSERVE (each epoch the
 # reward/penalty deltas are computed + the would-be validators-table hash is logged,
 # but NOT written → zero consensus impact, used to confirm cross-node determinism).
@@ -147,6 +153,12 @@ class ValidatorNode:
         #   the EVM system is initialized.
         self._evm_tx_source = None
         self._evm_section_producer = None
+        # The node's block-processing lock (main.block_processing_lock), set from main.py.
+        # None only when running standalone.
+        self._block_processing_lock = None
+        # () -> bool: True while the node is adopting a peer's chain (main.py); the proposer
+        # then skips its slot rather than build on a tip that is about to change.
+        self._proposal_guard = None
         
         logger.info(f"ValidatorNode initialized for wallet: {validator_wallet_path}")
     
@@ -384,168 +396,263 @@ class ValidatorNode:
                     continue
                 if rank > 0:
                     await asyncio.sleep(min(rank, 3) * (SLOT_DURATION_SECONDS / 2))
+
+                # Propagation grace: if our tip is not from the IMMEDIATELY previous slot,
+                # that slot's block may simply not have reached us yet. Proposing now would
+                # put a competing block at the same height off the same parent — the
+                # adjacent-slot race measured as the cause of the persistent block-history
+                # fork (docs/KNOWN_ISSUES.md, "Block history did not converge"). Waiting
+                # briefly lets it arrive; the tip
+                # re-check below then skips this height and the next iteration builds ON TOP
+                # of it instead of racing it. A genuinely empty previous slot costs only the
+                # grace period. Behaviour-only: no consensus rule changes, so it cannot make
+                # any block invalid.
+                if _PROPOSER_PROPAGATION_GRACE and rank == 0 and latest_block:
+                    try:
+                        from .block_verification import _parse_block_content
+                        tip_slot = int(_parse_block_content(
+                            latest_block.get('content'))['slot'])
+                    except Exception:
+                        tip_slot = None
+                    if tip_slot is not None and tip_slot < current_slot - 1:
+                        await asyncio.sleep(_PROPOSER_PROPAGATION_GRACE_SECONDS)
+
+                # Everything from the tip re-check to storing the block runs under the node's
+                # block-processing lock — the one every import path and the reorg rebuild
+                # hold. Without it the proposer interleaved with a rebuild in progress (the
+                # rebuild yields at every database await): it computed its unified root over
+                # half-rebuilt state, and importers rejected the declared root (the recurring
+                # E-D4 observe mismatch). A block's sections could equally land in the middle
+                # of a replay, out of order. Broadcasting happens after the lock is released.
+                async with self._production_lock():
+                    # Re-check the tip for EVERY rank, not just backups.
+                    #
+                    # next_height/parent_hash were captured at the top of this iteration, and
+                    # the section work below (exchange execution, EVM execution, root
+                    # computation) takes long enough for a block to land meanwhile. Proposing
+                    # at a height that is already filled creates a competing block at that
+                    # height off the same parent — precisely the adjacent-slot race that
+                    # leaves a permanent fork (docs/KNOWN_ISSUES.md, "Block history did not
+                    # converge"). Nothing is lost by
+                    # skipping: the height we would have claimed is already taken, and the
+                    # next iteration proposes on top of the new tip.
+                    #
+                    # This cannot fix the fork on its own — the real race is a proposer that
+                    # has not yet RECEIVED the previous slot's block, which no local check can
+                    # see — but it removes the self-inflicted half, where the block HAD
+                    # arrived and we proposed against a stale height anyway.
+                    #
+                    # Placed BEFORE any section execution deliberately: the exchange and EVM
+                    # sections commit as they execute, so aborting after them would leave
+                    # committed state with no block to carry it.
                     if (await self.db.get_next_block_id()) != next_block_id:
-                        continue  # a higher-priority proposer already filled this slot
+                        logger.info(
+                            "⏭  Skipping slot %s: height %s was filled while preparing",
+                            current_slot, next_height)
+                        continue
 
-                # Timestamp/parent used as the (non-consensus) execution context for
-                # the sections — they affect only audit tables, never the state roots.
-                block_timestamp = int(datetime.now(timezone.utc).timestamp())
+                    # Mid-adoption of a peer's chain the tip is about to change: the rollback
+                    # has happened, the peer's blocks have not landed yet. A block built now
+                    # would compete with the very chain being adopted and make the adoption
+                    # fail on the height it just took.
+                    if self._proposal_guard is not None and self._proposal_guard():
+                        logger.info("⏭  Skipping slot %s: adopting a peer's chain", current_slot)
+                        continue
 
-                # Exchange section: select + execute (commit on success). Drop on
-                # failure rather than ship a bad block.
-                exchange_txs = []
-                exchange_state_root = None
-                if self._exchange_tx_source is not None:
-                    try:
-                        exchange_txs = self._exchange_tx_source.select_for_block() or []
-                    except Exception as e:
-                        logger.warning(f"Exchange tx selection failed: {e}")
-                        exchange_txs = []
-                    if exchange_txs:
+                    # The block's timestamp, fixed BEFORE the sections execute and passed to
+                    # propose_block so the block carries exactly this value: importers execute
+                    # the sections at the block's timestamp, and the exchange judges funding,
+                    # oracle staleness and swap deadlines by it.
+                    block_timestamp = int(datetime.now(timezone.utc).timestamp())
+
+                    # Exchange section: select + execute (commit on success). Drop on
+                    # failure rather than ship a bad block.
+                    exchange_txs = []
+                    exchange_state_root = None
+                    if self._exchange_tx_source is not None:
                         try:
-                            from ..exchange.block_processor import (
-                                process_exchange_transactions, preload_sender_balances,
-                                preload_token_balances, flush_exchange_balance_deltas,
-                                flush_token_balance_deltas, flush_validator_lifecycle_deltas,
-                                ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT,
-                                ENFORCE_ORDERBOOK_SETTLEMENT, ENFORCE_POOL_STAKE,
-                            )
-                            from ..exchange.state_manager import ExchangeStateManager
-                            mgr = ExchangeStateManager.get_instance()
-                            mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
-                            mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
-                            mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
-                            mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
-                            # Phase E: pre-load senders' real QRDX + token balances for
-                            # the collateral + spot-sufficiency checks during processing.
-                            await preload_sender_balances(self.db, exchange_txs, mgr)
-                            await preload_token_balances(self.db, exchange_txs, mgr)
-                            ok, err, root = process_exchange_transactions(
-                                next_height, float(block_timestamp), exchange_txs, mgr,
-                            )
-                            if ok:
-                                mgr.commit_block()
-                                # Phase E: flush margin debits to account_state +
-                                # token moves to the token ledger (before the unified
-                                # root is computed below).
-                                await flush_exchange_balance_deltas(
-                                    self.db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
-                                await flush_token_balance_deltas(self.db, mgr)
-                                await flush_validator_lifecycle_deltas(
-                                    self.db, mgr, block_epoch=current_epoch)
-                                exchange_state_root = root
-                                logger.info(
-                                    f"📦 Including {len(exchange_txs)} exchange tx(s) in "
-                                    f"block #{next_height} (root={root[:16]}...)"
-                                )
-                            else:
-                                logger.warning(f"Exchange execution failed, dropping section: {err}")
-                                exchange_txs = []
+                            exchange_txs = self._exchange_tx_source.select_for_block() or []
                         except Exception as e:
-                            logger.warning(f"Exchange execution error, dropping section: {e}")
+                            logger.warning(f"Exchange tx selection failed: {e}")
                             exchange_txs = []
-
-                # EVM/account section: execute-on-mine.
-                evm_txs = []
-                account_state_root = None
-                if self._evm_tx_source is not None and self._evm_section_producer is not None:
-                    try:
-                        evm_raws = self._evm_tx_source.select_for_block() or []
-                    except Exception as e:
-                        logger.warning(f"EVM tx selection failed: {e}")
-                        evm_raws = []
-                    if evm_raws:
                         try:
-                            account_state_root, evm_txs = await self._evm_section_producer(
-                                next_height, parent_hash, block_timestamp, evm_raws,
-                            )
-                            evm_txs = evm_txs or []
-                            if account_state_root and evm_txs:
-                                logger.info(
-                                    f"📦 Including {len(evm_txs)} EVM tx(s) in "
-                                    f"block #{next_height} (root={account_state_root[:16]}...)"
+                            vote = await self._oracle_vote(exchange_txs)
+                            if vote is not None:
+                                exchange_txs = list(exchange_txs) + [vote]
+                        except Exception as e:
+                            logger.warning(f"Oracle vote skipped: {e}")
+                        if exchange_txs:
+                            try:
+                                from ..exchange.block_processor import (
+                                    process_exchange_transactions, preload_sender_balances,
+                                    preload_token_balances, flush_exchange_balance_deltas,
+                                    flush_token_balance_deltas, flush_validator_lifecycle_deltas,
+                                    ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT,
+                                    ENFORCE_ORDERBOOK_SETTLEMENT, ENFORCE_POOL_STAKE,
+                                    ENFORCE_VALIDATOR_STAKE,
                                 )
-                            else:
+                                from ..exchange.state_manager import ExchangeStateManager
+                                mgr = ExchangeStateManager.get_instance()
+                                mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
+                                mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
+                                mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
+                                mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
+                                mgr.enforce_validator_stake = ENFORCE_VALIDATOR_STAKE
+                                # Phase E: pre-load senders' real QRDX + token balances for
+                                # the collateral + spot-sufficiency checks during processing.
+                                await preload_sender_balances(self.db, exchange_txs, mgr)
+                                await preload_token_balances(self.db, exchange_txs, mgr)
+                                ok, err, root = process_exchange_transactions(
+                                    next_height, float(block_timestamp), exchange_txs, mgr,
+                                )
+                                if ok:
+                                    mgr.commit_block()
+                                    # Phase E: flush margin debits to account_state +
+                                    # token moves to the token ledger (before the unified
+                                    # root is computed below).
+                                    await flush_exchange_balance_deltas(
+                                        self.db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
+                                    await flush_token_balance_deltas(self.db, mgr)
+                                    await flush_validator_lifecycle_deltas(
+                                        self.db, mgr, block_epoch=current_epoch,
+                                        block_height=next_height)
+                                    exchange_state_root = root
+                                    logger.info(
+                                        f"📦 Including {len(exchange_txs)} exchange tx(s) in "
+                                        f"block #{next_height} (root={root[:16]}...)"
+                                    )
+                                else:
+                                    logger.warning(f"Exchange execution failed, dropping section: {err}")
+                                    exchange_txs = []
+                            except Exception as e:
+                                logger.warning(f"Exchange execution error, dropping section: {e}")
+                                exchange_txs = []
+
+                    # A block without exchange transactions — none selected, or the section
+                    # dropped — still ticks: mark prices (and later liquidations and funding)
+                    # advance on every block. Importers and the rebuild tick identically.
+                    if not exchange_txs:
+                        try:
+                            from ..exchange.block_processor import run_exchange_tick
+                            run_exchange_tick(next_height, float(block_timestamp))
+                        except Exception as e:
+                            logger.error(f"Exchange tick failed for block #{next_height}: {e}")
+
+                    # EVM/account section: execute-on-mine.
+                    evm_txs = []
+                    account_state_root = None
+                    if self._evm_tx_source is not None and self._evm_section_producer is not None:
+                        try:
+                            evm_raws = self._evm_tx_source.select_for_block() or []
+                        except Exception as e:
+                            logger.warning(f"EVM tx selection failed: {e}")
+                            evm_raws = []
+                        if evm_raws:
+                            try:
+                                account_state_root, evm_txs = await self._evm_section_producer(
+                                    next_height, parent_hash, block_timestamp, evm_raws,
+                                )
+                                evm_txs = evm_txs or []
+                                if account_state_root and evm_txs:
+                                    logger.info(
+                                        f"📦 Including {len(evm_txs)} EVM tx(s) in "
+                                        f"block #{next_height} (root={account_state_root[:16]}...)"
+                                    )
+                                else:
+                                    evm_txs = []
+                                    account_state_root = None
+                            except Exception as e:
+                                logger.warning(f"EVM section production failed, dropping section: {e}")
                                 evm_txs = []
                                 account_state_root = None
-                        except Exception as e:
-                            logger.warning(f"EVM section production failed, dropping section: {e}")
-                            evm_txs = []
-                            account_state_root = None
 
-                # E-D4: compute the post-block unified state root (UTXO + account +
-                # exchange) and bind it into the block's signed header. The importer
-                # recomputes it after replaying the sections and verifies it matches
-                # this signed root — full cryptographic binding of all state domains.
-                unified_root = await self._compute_unified_state_root()
-
-                block = await self.manager.propose_block(
-                    slot=current_slot,
-                    parent_hash=parent_hash,
-                    transactions=pending_txs[:100],  # Limit to 100 txs per block
-                    state_root=unified_root,
-                )
-
-                if block:
-                    logger.info(f"📦 Proposed block #{next_height} at slot {current_slot}: {block.hash[:16]}...")
-
-                    block_data = assemble_pos_block_data(
-                        block, next_height, exchange_txs, exchange_state_root,
-                        evm_txs, account_state_root,
-                    )
-
-                    # Add block to database with sequential height
-                    await self.db.add_block(
-                        block_hash=block.hash,
-                        block_height=next_height,
-                        block_content=block_data['block_content'],
-                        validator_address=block.proposer_address,
-                        timestamp=block.timestamp
-                    )
-
-                    # D2.2b: persist the exchange section locally (so it is durable
-                    # and replayable on this node too) and drain the mempool now
-                    # that the txs are included + stored.
-                    if exchange_txs:
-                        try:
-                            from ..exchange.block_processor import BLOCK_EXCHANGE_TXS_KEY
-                            section = block_data.get(BLOCK_EXCHANGE_TXS_KEY)
-                            if section:
-                                await self.db.add_block_exchange_txs(block.hash, section)
-                            if self._exchange_tx_source is not None:
-                                self._exchange_tx_source.remove([t.tx_hash() for t in exchange_txs])
-                        except Exception as e:
-                            logger.warning(f"Failed to persist/drain exchange section: {e}")
-
-                    # E-D3b: persist the (now-executed) EVM section so it is durable
-                    # + replayable, and drain the included txs from the mempool.
-                    if evm_txs:
-                        try:
-                            from ..contracts.evm_block import BLOCK_EVM_TXS_KEY
-                            from ..contracts.evm_mempool import parse_eth_raw_tx
-                            evm_section = block_data.get(BLOCK_EVM_TXS_KEY)
-                            if evm_section:
-                                await self.db.add_block_evm_txs(block.hash, evm_section)
-                            if self._evm_tx_source is not None:
-                                hashes = []
-                                for raw in evm_txs:
-                                    try:
-                                        hashes.append(parse_eth_raw_tx(raw)["tx_hash"])
-                                    except Exception:
-                                        pass
-                                self._evm_tx_source.remove(hashes)
-                        except Exception as e:
-                            logger.warning(f"Failed to persist/drain EVM section: {e}")
-
-                    # Finality (observe): record this block's attestation votes +
-                    # recompute, so the proposer tracks finality like importers do.
+                    # Stake withdrawals: credit exited validators' principal as part of THIS
+                    # block's state transition. After the EVM section (so the section's own
+                    # declared account root is unaffected on both sides) and before the
+                    # unified root (so E-D4 binds the credits). Every importer runs the same
+                    # computation at the same point. See qrdx/validator/withdrawals.py.
                     try:
-                        from .finality import record_finality_from_block
-                        await record_finality_from_block(self.db, block_data['block_content'])
+                        from .withdrawals import process_block_withdrawals
+                        await process_block_withdrawals(self.db, next_height, current_epoch)
                     except Exception as e:
-                        logger.debug(f"finality record skipped for block #{next_height}: {e}")
+                        logger.error(f"Withdrawal processing failed for block #{next_height}: {e}")
 
-                    # Broadcast block to network peers
+                    # E-D4: compute the post-block unified state root (UTXO + account +
+                    # exchange) and bind it into the block's signed header. The importer
+                    # recomputes it after replaying the sections and verifies it matches
+                    # this signed root — full cryptographic binding of all state domains.
+                    unified_root = await self._compute_unified_state_root()
+
+                    block = await self.manager.propose_block(
+                        slot=current_slot,
+                        parent_hash=parent_hash,
+                        transactions=pending_txs[:100],  # Limit to 100 txs per block
+                        state_root=unified_root,
+                        timestamp=block_timestamp,
+                    )
+
+                    if block:
+                        logger.info(f"📦 Proposed block #{next_height} at slot {current_slot}: {block.hash[:16]}...")
+
+                        block_data = assemble_pos_block_data(
+                            block, next_height, exchange_txs, exchange_state_root,
+                            evm_txs, account_state_root,
+                        )
+
+                        # Add block to database with sequential height
+                        await self.db.add_block(
+                            block_hash=block.hash,
+                            block_height=next_height,
+                            block_content=block_data['block_content'],
+                            validator_address=block.proposer_address,
+                            timestamp=block.timestamp
+                        )
+
+                        # D2.2b: persist the exchange section locally (so it is durable
+                        # and replayable on this node too) and drain the mempool now
+                        # that the txs are included + stored.
+                        if exchange_txs:
+                            try:
+                                from ..exchange.block_processor import BLOCK_EXCHANGE_TXS_KEY
+                                section = block_data.get(BLOCK_EXCHANGE_TXS_KEY)
+                                if section:
+                                    await self.db.add_block_exchange_txs(block.hash, section)
+                                if self._exchange_tx_source is not None:
+                                    self._exchange_tx_source.remove([t.tx_hash() for t in exchange_txs])
+                            except Exception as e:
+                                logger.warning(f"Failed to persist/drain exchange section: {e}")
+
+                        # E-D3b: persist the (now-executed) EVM section so it is durable
+                        # + replayable, and drain the included txs from the mempool.
+                        if evm_txs:
+                            try:
+                                from ..contracts.evm_block import BLOCK_EVM_TXS_KEY
+                                from ..contracts.evm_mempool import parse_eth_raw_tx
+                                evm_section = block_data.get(BLOCK_EVM_TXS_KEY)
+                                if evm_section:
+                                    await self.db.add_block_evm_txs(block.hash, evm_section)
+                                if self._evm_tx_source is not None:
+                                    hashes = []
+                                    for raw in evm_txs:
+                                        try:
+                                            hashes.append(parse_eth_raw_tx(raw)["tx_hash"])
+                                        except Exception:
+                                            pass
+                                    self._evm_tx_source.remove(hashes)
+                            except Exception as e:
+                                logger.warning(f"Failed to persist/drain EVM section: {e}")
+
+                        # Finality (observe): record this block's attestation votes +
+                        # recompute, so the proposer tracks finality like importers do.
+                        try:
+                            from .finality import record_finality_from_block
+                            await record_finality_from_block(self.db, block_data['block_content'])
+                        except Exception as e:
+                            logger.debug(f"finality record skipped for block #{next_height}: {e}")
+
+                # Broadcast block to network peers — outside the lock, so a slow peer never
+                # holds up imports.
+                if block:
                     if self.broadcast_callback:
                         try:
                             await self.broadcast_callback('submit_block', block_data, ignore_node_id=None, db=self.db)
@@ -739,6 +846,34 @@ class ValidatorNode:
         self._doomsday_protocol = doomsday
         logger.info("ValidatorNode: DoomsdayProtocol attached for canary monitoring")
 
+    async def _oracle_vote(self, selected):
+        """This validator's price vote, appended to the block it proposes
+        (docs/PERPS_CLEARINGHOUSE.md §8): USD prices from its feed (QRDX_ORACLE_FEED) for every
+        perp market, when it sits on the oracle committee. Its nonce follows any of its own
+        transactions already selected for the block. None when it has nothing to vote."""
+        if self.wallet is None:
+            return None
+        if not hasattr(self, "_price_feed"):
+            from .price_feed import feed_from_env
+            self._price_feed = feed_from_env()
+        if self._price_feed is None:
+            return None
+        from .. import constants
+        from ..exchange.block_processor import ensure_oracle_committee
+        from ..exchange.state_manager import ExchangeStateManager
+        from .price_feed import build_vote
+        mgr = ExchangeStateManager.get_instance()
+        await ensure_oracle_committee(self.db, mgr)
+        if not mgr.oracle_committee or self.wallet.address.lower() not in mgr.oracle_committee:
+            return None
+        bases = sorted(m.base for m in mgr.clearinghouse.markets.values()
+                       if m.quote == constants.PERP_QUOTE)
+        prices = self._price_feed.prices(bases) if bases else {}
+        if not prices:
+            return None
+        own = sum(1 for t in selected if t.sender == self.wallet.address)
+        return build_vote(self.wallet, mgr.get_nonce(self.wallet.address) + own, prices)
+
     def set_exchange_tx_source(self, source) -> None:
         """
         Attach the exchange mempool the proposer pulls transactions from.
@@ -790,6 +925,21 @@ class ValidatorNode:
         except Exception:
             token_root = TOKEN_ZERO_ROOT
         return unified_state_root(utxo_root or "0" * 64, account_root, exchange_root, token_root)
+
+    def set_block_processing_lock(self, lock) -> None:
+        """Share the node's block-processing lock, so block production never interleaves
+        with an import or a derived-state rebuild (see _block_production_loop)."""
+        self._block_processing_lock = lock
+
+    def set_proposal_guard(self, guard) -> None:
+        """Attach main.py's "adopting a peer chain" check (see _block_production_loop)."""
+        self._proposal_guard = guard
+
+    def _production_lock(self):
+        if self._block_processing_lock is None:
+            import contextlib
+            return contextlib.nullcontext()
+        return self._block_processing_lock
 
     def set_evm_section_producer(self, producer) -> None:
         """

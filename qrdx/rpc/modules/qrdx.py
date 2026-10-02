@@ -141,16 +141,125 @@ class QRDXModule(RPCModule):
         if not self.context or not self.context.db:
             raise RPCError(RPCErrorCode.INTERNAL_ERROR, "Database not available")
         
+        from ...crypto.account_id import to_account_id
+
         balance = await self.context.db.get_address_balance(address)
         pending_balance = await self.context.db.get_address_balance(address, True)
-        
+
+        try:
+            account_id = to_account_id(address)
+        except ValueError:
+            account_id = None
+
         return {
             "address": address,
+            # The 20-byte key this account's state actually lives under. For a
+            # 0xPQ address this is the form to hand to any Ethereum tool, and the
+            # form a contract sees as msg.sender.
+            "accountId": account_id,
             "balance": str(balance or Decimal(0)),
             "pendingBalance": str(pending_balance or Decimal(0)),
             "pendingDelta": str((pending_balance or Decimal(0)) - (balance or Decimal(0))),
         }
+
+    @rpc_method
+    async def getAccountId(self, address: str) -> Dict:
+        """
+        Resolve any QRDX address form to its canonical 20-byte account id.
+
+        Wallets and explorers need this to show a post-quantum account through
+        Ethereum tooling: a ``0xPQ…`` address is a credential fingerprint, while
+        the account id is the ledger key, the ``eth_getBalance`` argument, and what
+        a contract sees as ``msg.sender``.
+
+        Purely computational — a deterministic hash, no state access, so it is
+        answerable for an address that has never been funded.
+
+        Args:
+            address: ``0x…``, ``0xPQ…``, ``0xPQMS…``, or a legacy ``Q``/``R`` address.
+
+        Returns:
+            ``{"address", "accountId", "addressType", "isAccountId"}``
+        """
+        from ...crypto.account_id import to_account_id, is_account_id
+
+        try:
+            account_id = to_account_id(address)
+        except ValueError as e:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e))
+
+        if address.startswith("0xPQMS") or address.startswith("0xpqms"):
+            addr_type = "multisig"
+        elif address.startswith("0xPQ") or address.startswith("0xpq"):
+            addr_type = "post-quantum"
+        elif address[:1] in ("Q", "R"):
+            addr_type = "legacy"
+        else:
+            addr_type = "traditional"
+
+        return {
+            "address": address,
+            "accountId": account_id,
+            "addressType": addr_type,
+            # True when the input already WAS the canonical key (traditional
+            # addresses are their own account id).
+            "isAccountId": is_account_id(address) and account_id == address.lower(),
+        }
+
     
+    @rpc_method
+    async def getIntrinsicGas(self, envelope: str = "legacy", data: str = "0x",
+                              is_create: bool = False) -> Dict:
+        """
+        The minimum gas a transaction must supply before execution begins.
+
+        Explicit counterpart to ``eth_estimateGas`` for callers that would rather ask than
+        set an EIP-2718 ``type`` field. It matters most for the post-quantum envelope: a
+        type-0x51 transaction carries a ~5.3KB ML-DSA-65 public key and signature, its
+        floor prices that (≈145,000 gas for a plain transfer), and a transaction below the
+        floor is rejected outright rather than merely reverting — so a wallet that guesses
+        21,000 would have every transaction refused.
+
+        Purely computational — no state access.
+
+        Args:
+            envelope: ``"legacy"`` (secp256k1 / EIP-155) or ``"pq"`` (type 0x51).
+            data: Calldata as a hex string; priced per byte.
+            is_create: True for contract creation (adds the EIP-2 surcharge).
+
+        Returns:
+            ``{"envelope", "intrinsicGas", "intrinsicGasHex", "txType"}``
+        """
+        from ...transactions.pq_tx import PQ_TX_TYPE, intrinsic_gas_pq
+
+        try:
+            call_data = bytes.fromhex(data[2:] if data.startswith("0x") else data)
+        except ValueError as e:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, f"invalid data: {e}")
+
+        kind = str(envelope).lower()
+        if kind in ("pq", "post-quantum", "postquantum", hex(PQ_TX_TYPE), str(PQ_TX_TYPE)):
+            from ...crypto.pq.dilithium import PUBLIC_KEY_SIZE, SIGNATURE_SIZE
+            gas = intrinsic_gas_pq(call_data, b"\x00" * PUBLIC_KEY_SIZE,
+                                   b"\x00" * SIGNATURE_SIZE, is_create=bool(is_create))
+            tx_type = PQ_TX_TYPE
+            kind = "pq"
+        elif kind in ("legacy", "eip155", "eip-155", "0x0", "0"):
+            from ...contracts.evm_mempool import intrinsic_gas_legacy
+            gas = intrinsic_gas_legacy(call_data, is_create=bool(is_create))
+            tx_type = 0
+            kind = "legacy"
+        else:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS,
+                           f"unknown envelope {envelope!r} (expected 'legacy' or 'pq')")
+
+        return {
+            "envelope": kind,
+            "txType": hex(tx_type),
+            "intrinsicGas": gas,
+            "intrinsicGasHex": hex(gas),
+        }
+
     @rpc_method
     async def getPendingTransactions(
         self,

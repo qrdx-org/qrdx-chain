@@ -298,6 +298,47 @@ class DatabaseSQLite:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         
+        -- Append-only log of every consensus STAKE_DEPOSIT, keyed to the block that
+        -- carried it. This exists to make a deposit-created registration REORG-SAFE:
+        -- the `validators` table is not reconstructed on reorg
+        -- (_ENFORCE_VALIDATOR_RECONSTRUCTION is off), so without this log a deposit in
+        -- a later-ORPHANED block would leave its registration behind while the stake
+        -- debit was correctly not re-applied — a validator holding stake weight it no
+        -- longer paid for. On rollback, rows above the new tip are reversed exactly
+        -- (see undo_validator_deposits_above), which is why the log must record each
+        -- deposit individually: register_pending_validator is ADDITIVE, so a top-up
+        -- can only be undone if its own increment is known.
+        -- Genesis validators have NO rows here and so can never be touched by the undo.
+        CREATE TABLE IF NOT EXISTS validator_deposits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            block_height INTEGER NOT NULL,
+            block_hash TEXT,
+            address TEXT NOT NULL,
+            public_key TEXT,
+            stake TEXT NOT NULL,
+            created_new BOOLEAN NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Consensus STAKE_EXITs, keyed to the carrying block (reversed on rollback), and
+        -- the ledger of stake withdrawals paid inside block application. Both feed
+        -- qrdx/validator/withdrawals.py, which must read ONLY chain-derived records so the
+        -- proposer and every importer compute the same withdrawals — hence these rather
+        -- than the asynchronously rebuilt validators table.
+        CREATE TABLE IF NOT EXISTS validator_exits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            block_height INTEGER NOT NULL,
+            address TEXT NOT NULL,
+            exit_epoch INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS validator_withdrawals (
+            address TEXT NOT NULL,
+            exit_epoch INTEGER NOT NULL,
+            amount TEXT NOT NULL,
+            block_height INTEGER NOT NULL,
+            PRIMARY KEY (address, exit_epoch)
+        );
+
         CREATE TABLE IF NOT EXISTS stakes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             validator_address TEXT NOT NULL,
@@ -420,6 +461,10 @@ class DatabaseSQLite:
         CREATE INDEX IF NOT EXISTS idx_stakes_activation ON validator_stakes(activation_epoch);
         CREATE INDEX IF NOT EXISTS idx_deposits_validator ON stake_deposits(validator_address);
         CREATE INDEX IF NOT EXISTS idx_withdrawals_validator ON stake_withdrawals(validator_address);
+        CREATE INDEX IF NOT EXISTS idx_validator_deposits_height ON validator_deposits(block_height);
+        CREATE INDEX IF NOT EXISTS idx_validator_exits_height ON validator_exits(block_height);
+        CREATE INDEX IF NOT EXISTS idx_validator_withdrawals_height ON validator_withdrawals(block_height);
+        CREATE INDEX IF NOT EXISTS idx_validator_deposits_address ON validator_deposits(address);
         CREATE INDEX IF NOT EXISTS idx_account_state_address ON account_state(address);
         CREATE INDEX IF NOT EXISTS idx_account_state_is_contract ON account_state(is_contract);
         CREATE INDEX IF NOT EXISTS idx_contract_metadata_verified ON contract_metadata(verified);
@@ -784,9 +829,12 @@ class DatabaseSQLite:
         Does NOT commit — the caller commits atomically with the rest of the block.
         """
         from decimal import Decimal
+        from .crypto.account_id import to_account_id
         wei_delta = int(Decimal(str(qrdx_delta)) * Decimal(10 ** 18))
         if wei_delta == 0:
             return False
+        # Canonical key: a PQ sender's delta lands on the same row the EVM uses.
+        address = to_account_id(address)
         cur = await self.connection.execute(
             "SELECT address, balance FROM account_state WHERE LOWER(address) = LOWER(?)",
             (address,),
@@ -822,6 +870,7 @@ class DatabaseSQLite:
         """
         import json as _json
         from decimal import Decimal as _D
+        from .crypto.account_id import to_account_id
         cur = await self.connection.execute(
             "SELECT block_hash FROM blocks WHERE block_height = 0")
         row = await cur.fetchone()
@@ -843,7 +892,7 @@ class DatabaseSQLite:
                 "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, is_contract) "
                 "VALUES (?, ?, 0, 0, 0, 0) "
                 "ON CONFLICT(address) DO UPDATE SET balance = excluded.balance",
-                (d["recipient"], str(wei)),
+                (to_account_id(d["recipient"]), str(wei)),
             )
             seeded += 1
         return seeded
@@ -852,15 +901,24 @@ class DatabaseSQLite:
         """
         Phase E (spot): apply a token-balance delta (negative = debit) to the
         ``token_balances`` ledger. Balances are stored as Decimal-string token
-        units (matching qrdx.tokens.persistence). A debit clamps at 0 as a safety
-        net (spot enforcement should already reject an over-debit). The token
-        analog of ``apply_account_balance_delta``. Returns True if a row was
-        updated/created. Does NOT commit — the caller commits with the block.
+        units (matching qrdx.tokens.persistence). The token analog of
+        ``apply_account_balance_delta``. Returns True if a row was updated/created.
+        Does NOT commit — the caller commits with the block.
+
+        A debit is applied IN FULL even if it takes the balance below zero. It used to clamp
+        at 0 while the paired credit landed in full — so any accounting slip minted the
+        difference. The exchange refuses an operation whose debit its holder cannot cover
+        (``ExchangeStateManager._settle_token_move``), so a negative balance here is a bug:
+        it is logged as critical, and supply stays exactly conserved.
         """
         from decimal import Decimal
+        from .crypto.account_id import to_account_id
         d = Decimal(str(delta))
         if d == 0:
             return False
+        # Holders are keyed by account id too, so a PQ trader's QRC-20 balance and
+        # an ERC-20 view of the same account cannot drift apart.
+        holder_address = to_account_id(holder_address)
         now = 0  # deterministic (block-replayed); wall-clock would diverge per node
         cur = await self.connection.execute(
             "SELECT balance FROM token_balances WHERE token_address = ? AND holder_address = ?",
@@ -870,7 +928,8 @@ class DatabaseSQLite:
         cur_bal = Decimal(row[0]) if row and row[0] is not None else Decimal("0")
         new_bal = cur_bal + d
         if new_bal < 0:
-            new_bal = Decimal("0")
+            logger.critical("[TOKEN-OVERDRAFT] %s of token %s debited %s with %s: balance %s",
+                            holder_address, token_address, -d, cur_bal, new_bal)
         await self.connection.execute(
             """INSERT INTO token_balances (token_address, holder_address, balance, updated_at)
                VALUES (?, ?, ?, ?)
@@ -881,24 +940,38 @@ class DatabaseSQLite:
 
     async def apply_token_registry_op(self, op: dict) -> bool:
         """
-        Phase E (spot): create a QRC-20 registry row from a TOKEN_DEPLOY op
-        (deterministic metadata; the value-bearing state is token_balances). Idem-
-        potent on token_address. Does NOT commit — the caller commits with the
-        block.
+        Mirror one native token's registry entry (a deploy, or a block that changed its
+        supply or authorities) into ``token_registry``, for queries. The authoritative
+        registry is exchange state (qrdx/exchange/tokens.py, in the exchange root); this
+        row only reflects it. Does NOT commit — the caller commits with the block.
         """
+        owner = op.get("creator") or op.get("owner_address") or ""
         await self.connection.execute(
             """INSERT INTO token_registry
                  (token_address, name, symbol, decimals, total_supply, owner_address, is_frozen, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)
-               ON CONFLICT(token_address) DO NOTHING""",
+               VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+               ON CONFLICT(token_address) DO UPDATE SET
+                 name = excluded.name, symbol = excluded.symbol, decimals = excluded.decimals,
+                 total_supply = excluded.total_supply, owner_address = excluded.owner_address,
+                 updated_at = excluded.updated_at""",
             (op["token_address"], op["name"], op["symbol"], int(op.get("decimals", 18)),
-             str(op["total_supply"]), op["owner_address"]),
+             str(op["total_supply"]), owner, int(op.get("created_height", 0) or 0),
+             int(op.get("created_height", 0) or 0)),
         )
         return True
 
     async def get_token_balance(self, token_address: str, holder_address: str):
-        """Token-units balance for (token, holder); Decimal(0) if no row."""
+        """Token-units balance for (token, holder); Decimal(0) if no row.
+
+        ``holder_address`` may be any address form — it is resolved to the
+        canonical account id the ledger is keyed by.
+        """
         from decimal import Decimal
+        from .crypto.account_id import to_account_id
+        try:
+            holder_address = to_account_id(holder_address)
+        except ValueError:
+            pass
         cur = await self.connection.execute(
             "SELECT balance FROM token_balances WHERE token_address = ? AND holder_address = ?",
             (token_address, holder_address),
@@ -944,6 +1017,9 @@ class DatabaseSQLite:
         """Clear the token ledger (Phase E spot reorg rebuild). Replayed exchange
         sections re-apply the canonical token deltas afterwards. Commits."""
         await self.connection.execute("DELETE FROM token_balances")
+        # The registry mirror too: a token deployed on an orphaned branch must not survive
+        # the replay (which re-mirrors every canonical deploy).
+        await self.connection.execute("DELETE FROM token_registry")
         await self.connection.commit()
 
     async def get_pending_transaction_count(self):
@@ -1553,16 +1629,27 @@ class DatabaseSQLite:
         ``exit_epoch`` (the finalized epoch at which the epoch loop removes it). The
         caller passes a DETERMINISTIC exit_epoch derived from the exit block's epoch, so
         every node assigns the same value. ``exit_epoch=None`` leaves it unscheduled.
-        No-op if not currently active. No commit."""
+        Applies to 'active' AND 'pending' validators. A pending validator that exits leaves
+        without ever activating: activation only selects 'pending' rows, so moving it to
+        'exiting' removes it from activation, and it becomes 'exited' at exit_epoch.
+
+        Previously only 'active' rows moved. The reconstruction walk applies an epoch's
+        STAKE ops BEFORE that epoch's activations, so an exit landing in (or before) the
+        activation epoch hit a still-pending validator, no-op'd, and the validator was
+        then activated and stayed active FOREVER despite having exited. With in-block
+        withdrawals that becomes an exploit — the exit log pays the stake back while the
+        validator keeps its stake weight — so the gap is closed here, for every caller.
+        No-op for any other status. No commit."""
         cur = await self.connection.execute(
             "UPDATE validators SET status = 'exiting', "
             "exit_epoch = COALESCE(?, exit_epoch), updated_at = CURRENT_TIMESTAMP "
-            "WHERE address = ? AND status = 'active'",
+            "WHERE address = ? AND status IN ('active', 'pending')",
             (int(exit_epoch) if exit_epoch is not None else None, address))
         return bool(cur.rowcount)
 
     async def register_pending_validator(self, address: str, public_key: str, stake,
-                                          activation_epoch=None) -> bool:
+                                          activation_epoch=None, block_height=None,
+                                          block_hash=None) -> bool:
         """
         Validator-lifecycle Phase 3 (staking deposit / join): insert a PENDING
         validator into the consensus ``validators`` table, scheduled to activate at
@@ -1570,12 +1657,20 @@ class DatabaseSQLite:
         Stake stored as a Decimal string (matching effective_stake). Does NOT commit
         — the caller commits with the block/flush. Deterministic: every node that
         replays the same deposit creates the identical row.
+
+        ``block_height``/``block_hash`` record the carrying block in the
+        ``validator_deposits`` log, which is what makes the registration REORG-SAFE:
+        if that block is later orphaned, ``undo_validator_deposits_above`` reverses
+        exactly this increment. Omitting them (legacy callers) leaves the
+        registration un-reversible, so every consensus path passes them.
         """
         from decimal import Decimal
         s = str(Decimal(str(stake)))
         cur = await self.connection.execute(
             "SELECT stake, effective_stake FROM validators WHERE address = ?", (address,))
         row = await cur.fetchone()
+        created_new = row is None
+
         if row:
             new_stake = str(Decimal(str(row[0] or 0)) + Decimal(str(stake)))
             new_eff = str(Decimal(str(row[1] or 0)) + Decimal(str(stake)))
@@ -1583,13 +1678,89 @@ class DatabaseSQLite:
                 "UPDATE validators SET stake = ?, effective_stake = ?, public_key = ?, "
                 "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
                 (new_stake, new_eff, public_key, address))
-            return False  # topped up an existing validator
-        await self.connection.execute(
-            "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
-            "activation_epoch) VALUES (?, ?, ?, ?, 'pending', ?)",
-            (address, public_key, s, s,
-             int(activation_epoch) if activation_epoch is not None else None))
-        return True
+        else:
+            await self.connection.execute(
+                "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
+                "activation_epoch) VALUES (?, ?, ?, ?, 'pending', ?)",
+                (address, public_key, s, s,
+                 int(activation_epoch) if activation_epoch is not None else None))
+
+        if block_height is not None:
+            await self.connection.execute(
+                "INSERT INTO validator_deposits "
+                "(block_height, block_hash, address, public_key, stake, created_new) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (int(block_height), block_hash, address, public_key, s,
+                 1 if created_new else 0))
+
+        return created_new
+
+    async def undo_validator_deposits_above(self, tip_height: int) -> dict:
+        """
+        Reverse every logged STAKE_DEPOSIT from a block above ``tip_height``.
+
+        Called after a reorg rollback. The ``validators`` table is not reconstructed
+        from the chain (``_ENFORCE_VALIDATOR_RECONSTRUCTION`` is off), so without this
+        a deposit in an ORPHANED block would leave its registration behind: the stake
+        debit is correctly not re-applied by the rebuild, but the validator would keep
+        the ``effective_stake`` that weights proposer selection and fork choice — stake
+        weight it no longer paid for.
+
+        Reversal is exact rather than a recomputation, which is what lets this be safe
+        while full reconstruction stays gated off:
+
+          * a deposit that CREATED the row → delete the validator entirely (it was
+            never validly registered on the canonical chain, so its accrued rewards
+            and status go with it);
+          * a deposit that TOPPED UP an existing row → subtract exactly that
+            increment from ``stake`` and ``effective_stake``.
+
+        Newest-first so a create/top-up sequence for one address unwinds in reverse
+        order. **Genesis validators have no rows in the log and are therefore never
+        touched** — the undo can only remove what a deposit created.
+
+        Does NOT commit; the caller commits with the rest of the rollback.
+
+        Returns ``{"reversed": n, "removed": n, "reduced": n}``.
+        """
+        from decimal import Decimal
+
+        cur = await self.connection.execute(
+            "SELECT id, address, stake, created_new FROM validator_deposits "
+            "WHERE block_height > ? ORDER BY block_height DESC, id DESC",
+            (int(tip_height),))
+        rows = await cur.fetchall()
+        if not rows:
+            return {"reversed": 0, "removed": 0, "reduced": 0}
+
+        removed = reduced = 0
+        for dep_id, address, stake, created_new in rows:
+            if created_new:
+                await self.connection.execute(
+                    "DELETE FROM validators WHERE address = ?", (address,))
+                removed += 1
+            else:
+                cur2 = await self.connection.execute(
+                    "SELECT stake, effective_stake FROM validators WHERE address = ?",
+                    (address,))
+                v = await cur2.fetchone()
+                if v:
+                    back = Decimal(str(stake))
+                    new_stake = Decimal(str(v[0] or 0)) - back
+                    new_eff = Decimal(str(v[1] or 0)) - back
+                    if new_stake < 0:
+                        new_stake = Decimal(0)
+                    if new_eff < 0:
+                        new_eff = Decimal(0)
+                    await self.connection.execute(
+                        "UPDATE validators SET stake = ?, effective_stake = ?, "
+                        "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
+                        (str(new_stake), str(new_eff), address))
+                    reduced += 1
+            await self.connection.execute(
+                "DELETE FROM validator_deposits WHERE id = ?", (dep_id,))
+
+        return {"reversed": len(rows), "removed": removed, "reduced": reduced}
 
     async def seed_genesis_validators(self, genesis_validators: list) -> int:
         """Reset the consensus ``validators`` table to its GENESIS BASE — the reset primitive for
@@ -1842,14 +2013,25 @@ class DatabaseSQLite:
     async def get_address_balance(self, address: str, check_pending_txs: bool = False) -> 'Decimal':
         """Get total balance for an address.
 
-        Checks account_state first (ETH/EVM accounts populated at genesis),
-        then falls back to the UTXO unspent_outputs table.
+        Accepts ANY address form — ``0x…``, ``0xPQ…``, ``0xPQMS…``, legacy — and
+        resolves it to the canonical 20-byte account id, which is the key
+        ``account_state`` is stored under. A PQ holder and the 20-byte form of the
+        same account therefore read the SAME balance (see
+        ``qrdx.crypto.account_id``).
+
+        Checks account_state first (the unified ledger), then falls back to the
+        UTXO unspent_outputs table (vestigial — empty from genesis onward).
         Returns balance in QRDX (not micro-QRDX, not wei).
-        Uses case-insensitive matching for 0x addresses.
         """
         from decimal import Decimal
+        from .crypto.account_id import to_account_id
 
-        addr_lower = address.lower()
+        try:
+            addr_lower = to_account_id(address)
+        except ValueError:
+            # Unkeyable address: no account can exist for it. The UTXO fallback
+            # below still gets a chance on the literal string (legacy reads).
+            addr_lower = address.lower()
 
         # 1. Check account_state (ETH/EVM accounts — balance stored as wei string)
         try:
@@ -1865,11 +2047,12 @@ class DatabaseSQLite:
         except Exception:
             pass
 
-        # 2. Fallback: sum unspent_outputs (stored as micro-QRDX)
+        # 2. Fallback: sum unspent_outputs (stored as micro-QRDX). Keyed by the
+        #    LITERAL address — the legacy UTXO ledger predates account ids.
         try:
             cursor = await self.connection.execute(
                 "SELECT COALESCE(SUM(amount), 0) FROM unspent_outputs WHERE LOWER(address) = ?",
-                (addr_lower,),
+                (address.lower(),),
             )
             row = await cursor.fetchone()
             micro = int(row[0]) if row and row[0] else 0

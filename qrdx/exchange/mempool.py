@@ -84,7 +84,13 @@ class ExchangeMempool:
         if tx_hash in self._txs:
             return False, "duplicate: transaction already in mempool"
 
-        # 3. Capacity (global + per-sender).
+        # 3. Capacity (global + per-sender). Exchange transactions are gossiped, so every node
+        #    holds copies of transactions another validator has since included; those are
+        #    stale once their nonce is consumed. Drop them before counting, or a busy sender
+        #    (and eventually the whole pool) would be locked out by its own history.
+        self._prune_sender(tx.sender)
+        if len(self._txs) >= self.max_size:
+            self.prune_stale()
         if len(self._txs) >= self.max_size:
             return False, "mempool full"
         sender_hashes = self._by_sender.get(tx.sender, set())
@@ -148,6 +154,7 @@ class ExchangeMempool:
         The result is the canonical ordering every validator would compute from
         the same mempool contents + committed state — the basis for D2.
         """
+        self.prune_stale()
         selected: List[ExchangeTransaction] = []
         for sender in sorted(self._by_sender.keys()):
             by_nonce = {self._txs[h].nonce: self._txs[h] for h in self._by_sender[sender]}
@@ -176,13 +183,20 @@ class ExchangeMempool:
                     del self._by_sender[tx.sender]
         return removed
 
+    def _prune_sender(self, sender: str) -> int:
+        hashes = self._by_sender.get(sender)
+        if not hashes:
+            return 0
+        expected = self._nonce_provider(sender)
+        return self.remove([h for h in hashes if self._txs[h].nonce < expected])
+
     def prune_stale(self) -> int:
         """
         Drop txs whose nonce is now below the sender's expected nonce (e.g. a
         competing tx for that nonce was committed). Returns the number pruned.
         """
         to_remove: List[str] = []
-        for sender, hashes in self._by_sender.items():
+        for sender, hashes in list(self._by_sender.items()):
             expected = self._nonce_provider(sender)
             for h in hashes:
                 if self._txs[h].nonce < expected:

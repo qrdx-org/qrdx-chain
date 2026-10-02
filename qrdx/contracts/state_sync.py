@@ -14,6 +14,8 @@ from typing import Optional, Dict, Tuple, Any
 from decimal import Decimal
 from datetime import datetime, timezone
 from eth_utils import to_checksum_address, keccak
+
+from ..crypto.account_id import to_account_id
 import asyncio
 import time
 
@@ -155,7 +157,7 @@ class StateSyncManager:
         Returns:
             True if sync performed, False if skipped (already synced)
         """
-        address = to_checksum_address(address)
+        address = to_account_id(address)
         
         # Check if already synced at this block height
         if not force:
@@ -474,7 +476,7 @@ class ExecutionContext:
         1. Sync sender's balance from native to EVM
         2. Create state snapshot for potential rollback
         """
-        sender = to_checksum_address(sender)
+        sender = to_account_id(sender)
         
         self._sender_balance_before_sync = await self.evm_state.get_balance(sender)
         
@@ -515,7 +517,7 @@ class ExecutionContext:
         snapshot. Default False preserves the per-tx commit behavior of the live
         RPC path exactly.
         """
-        sender = to_checksum_address(sender)
+        sender = to_account_id(sender)
 
         if success:
             if self._evm_snapshot_id is not None and not defer_commit:

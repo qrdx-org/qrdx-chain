@@ -78,6 +78,45 @@ ENFORCE_ORDERBOOK_SETTLEMENT = True
 # rebuild reconstructs it byte-identically. See item 7 in docs/CONSENSUS_REMAINING_WORK.md.
 ENFORCE_POOL_STAKE = True
 
+# Validator-stake gate. A STAKE_DEPOSIT's CLAIMED stake_amount becomes the validator's
+# effective_stake in the consensus `validators` table, and that figure weights BOTH
+# stake-weighted proposer selection (consensus.select_proposer) and fork-choice
+# attesting weight. The join path checked neither ownership nor the MIN_VALIDATOR_STAKE
+# floor that the local registration API and epoch activation already apply — so an
+# account holding NOTHING could register with an arbitrary stake and outweigh the whole
+# honest set. That is a consensus-capture vector, not an accounting rounding error.
+#
+# ON: a deposit must clear MIN_VALIDATOR_STAKE, be backed by the sender's real
+# account_state balance, and is DEBITED through the same collateral flush; the principal
+# is refunded at the deterministic finalized exit epoch (epoch_loop). A SLASHED
+# validator never reaches 'exited', so it forfeits the stake — which is what gives
+# slashing teeth. Genesis validators are exempt: their stake is declared by the genesis
+# file, the chain's trust root.
+#
+# ENABLED: every input is deterministic (a constant floor, and a balance pre-loaded from
+# account_state by preload_sender_balances on every path), and the debit rides the
+# already-enforced collateral flush, so it lands before each node computes its E-D4
+# unified root. The reorg rebuild sets this flag identically — see the note at
+# rebuild_exchange_state_from_chain, and tests/test_validator_stake_enforcement.py.
+ENFORCE_VALIDATOR_STAKE = True
+
+
+async def ensure_oracle_committee(db, mgr: ExchangeStateManager) -> None:
+    """Load the validator oracle's committee from the genesis block's validator set, once per
+    manager. Every path that applies a block section calls this first (through
+    ``preload_sender_balances``, or directly in the by-domain rebuild), so the committee is in
+    place before any vote or staking op is judged — on every node, whatever height it loaded at.
+    That is also why the committee is not hashed into the state root: a restarted node loads it
+    at height 0, a long-running one at its first section, and between them it decides nothing."""
+    if mgr.oracle_committee is not None:
+        return
+    try:
+        genesis = await db.get_block_by_id(0)
+        if genesis:
+            mgr.load_oracle_committee(genesis.get("content") or genesis.get("block_content"))
+    except Exception as e:
+        logger.debug("oracle committee not loaded: %s", e)
+
 
 async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:
     """
@@ -89,6 +128,7 @@ async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeState
     """
     mgr = state_manager or ExchangeStateManager.get_instance()
     mgr.clear_available_balances()
+    await ensure_oracle_committee(db, mgr)
     seen = set()
     for tx in txs or []:
         sender = getattr(tx, "sender", None)
@@ -121,17 +161,58 @@ async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateM
             continue
         if op == ExchangeOpType.SWAP and p.get("token_in"):
             wanted.add((sender, str(p["token_in"])))
-        elif op == ExchangeOpType.TOKEN_TRANSFER and p.get("token_address"):
-            wanted.add((sender, str(p["token_address"])))
+        elif op in (ExchangeOpType.TOKEN_TRANSFER, ExchangeOpType.TOKEN_BURN) \
+                and p.get("token_address"):
+            # Native tokens are keyed by their canonical (lowercase) address.
+            wanted.add((sender, str(p["token_address"]).lower()))
+        elif op == ExchangeOpType.TOKEN_TRANSFER_FROM and p.get("token_address") and p.get("from"):
+            wanted.add((str(p["from"]), str(p["token_address"]).lower()))
         elif op == ExchangeOpType.ADD_LIQUIDITY:
             for k in ("token0", "token1"):
                 if p.get(k):
                     wanted.add((sender, str(p[k])))
+            # Named by pool id alone: the deposit spends that pool's two tokens.
+            pool = mgr.pool_manager.get_pool(str(p["pool_id"])) if p.get("pool_id") else None
+            if pool is not None:
+                wanted.add((sender, pool.state.token0))
+                wanted.add((sender, pool.state.token1))
         elif op == ExchangeOpType.PLACE_ORDER and ":" in str(p.get("pair", "")):
             # CLOB sufficiency: a buy spends quote, a sell spends base — load both.
             b, q = str(p["pair"]).split(":", 1)
             wanted.add((sender, b))
             wanted.add((sender, q))
+        elif op == ExchangeOpType.PERP_DEPOSIT:
+            # Perps settled in a token (the stablecoin): the deposit spends it.
+            collateral = mgr.perp_collateral_token()
+            if collateral and collateral.upper() != "QRDX":
+                wanted.add((sender, collateral))
+        elif op == ExchangeOpType.PERP_WITHDRAW:
+            collateral = mgr.perp_collateral_token()
+            if collateral and collateral.upper() != "QRDX":
+                wanted.add((mgr.perps_holder_address(), collateral))
+        # The protocol's holders this operation may DEBIT — a pool's reserves, a book's
+        # escrow — so the manager can refuse an operation they cannot cover.
+        if op == ExchangeOpType.SWAP and p.get("token_in") and p.get("token_out"):
+            a, b = str(p["token_in"]), str(p["token_out"])
+            for pool in mgr.pool_manager.get_pools_for_pair(a, b):
+                holder = mgr.pool_holder_address(pool.state.id)
+                wanted.add((holder, a))
+                wanted.add((holder, b))
+            escrow = mgr.orderbook_escrow_address(min(a, b) + ":" + max(a, b))
+            wanted.add((escrow, a))
+            wanted.add((escrow, b))
+        elif op in (ExchangeOpType.REMOVE_LIQUIDITY, ExchangeOpType.REMOVE_POOL) and p.get("pool_id"):
+            pool = mgr.pool_manager.get_pool(str(p["pool_id"]))
+            if pool is not None:
+                holder = mgr.pool_holder_address(pool.state.id)
+                wanted.add((holder, pool.state.token0))
+                wanted.add((holder, pool.state.token1))
+        elif op in (ExchangeOpType.PLACE_ORDER, ExchangeOpType.CANCEL_ORDER):
+            pair = mgr._canonical_pair(str(p.get("pair", "")))
+            if ":" in pair:
+                escrow = mgr.orderbook_escrow_address(pair)
+                for tok in pair.split(":", 1):
+                    wanted.add((escrow, tok))
     for holder, token in wanted:
         try:
             mgr.set_available_token_balance(holder, token, await db.get_token_balance(token, holder))
@@ -163,14 +244,21 @@ async def flush_exchange_balance_deltas(db, state_manager: Optional[ExchangeStat
         try:
             await db.apply_account_balance_delta(addr, delta)
         except Exception as e:
-            logger.warning("flush_exchange_balance_deltas: %s for %s", e, str(addr)[:20])
+            # A dropped delta LOSES VALUE silently. It is deterministic (every node
+            # drops the same one, so no fork) which is exactly why it can hide: the
+            # paired delta still applies, so funds vanish with only a log line.
+            # ERROR-level and explicitly marked so a log scan or soak catches it —
+            # this is how the 0xPOOL/0xCLOB holder break went unnoticed through a
+            # green integration run.
+            logger.error("[VALUE-LOST] flush_exchange_balance_deltas dropped %s for %s: %s",
+                         delta, str(addr)[:24], e)
 
 
 async def flush_token_balance_deltas(db, state_manager: Optional[ExchangeStateManager] = None) -> None:
     """
-    Phase E (spot): apply this block's QRC-20 registry creations + token-balance
-    deltas (from TOKEN_DEPLOY / TOKEN_TRANSFER, later spot swaps) to the durable
-    token ledger. Called by the async block paths AFTER the section commits and
+    Phase E (spot): apply this block's token-registry changes (deploys, supply, authorities
+    — the DB mirror of the manager's registry) + token-balance deltas (token ops, spot,
+    perps) to the durable token ledger. Called by the async block paths AFTER the section commits and
     BEFORE the unified state root is computed, so the token root reflects the moved
     tokens on every node. Does not commit — the block's ``add_block`` commits.
 
@@ -194,11 +282,15 @@ async def flush_token_balance_deltas(db, state_manager: Optional[ExchangeStateMa
         try:
             await db.apply_token_balance_delta(token, holder, delta)
         except Exception as e:
-            logger.warning("flush_token: delta %s for (%s,%s)", e, str(holder)[:16], str(token)[:16])
+            # See the note in flush_exchange_balance_deltas: a dropped token delta
+            # BURNS tokens while its paired debit applies. Loud and marked.
+            logger.error("[VALUE-LOST] flush_token dropped %s of %s for holder %s: %s",
+                         delta, str(token)[:24], str(holder)[:24], e)
 
 
 async def flush_validator_lifecycle_deltas(
     db, state_manager: Optional[ExchangeStateManager] = None, block_epoch: Optional[int] = None,
+    block_height: Optional[int] = None, block_hash: Optional[str] = None,
 ) -> None:
     """
     Validator-lifecycle Phase 3: apply this block's staking ops to the consensus
@@ -226,8 +318,13 @@ async def flush_validator_lifecycle_deltas(
     for op in ops:
         try:
             if op.get("type") == "deposit":
+                # block_height/block_hash log the carrying block so an ORPHANED
+                # deposit's registration can be reversed exactly on reorg rollback
+                # (db.undo_validator_deposits_above) — the validators table itself is
+                # not reconstructed from the chain.
                 await db.register_pending_validator(
-                    op["address"], op["public_key"], op["stake"], activation_epoch=act_epoch)
+                    op["address"], op["public_key"], op["stake"], activation_epoch=act_epoch,
+                    block_height=block_height, block_hash=block_hash)
             elif op.get("type") == "exit":
                 # Phase 3c: a STAKE_EXIT moves an active validator to 'exiting'. This is
                 # SAFE at live-import because 'exiting' stays ELIGIBLE for proposer
@@ -240,14 +337,19 @@ async def flush_validator_lifecycle_deltas(
                 # (get_validators_to_exit → exited), so every node drops the validator at
                 # the same converged chain point.
                 moved = await db.mark_validator_exiting(op["address"], exit_epoch=exit_epoch)
+                # Log the exit against its carrying block so the principal can be returned
+                # by an in-block withdrawal once exit_epoch is reached. Logged even when
+                # `moved` is False: the withdrawal inputs must be a pure function of the
+                # chain, and the validators table this flag comes from is rebuilt
+                # asynchronously, so its state here can differ between nodes.
+                if block_height is not None and exit_epoch is not None:
+                    from ..validator.withdrawals import record_validator_exit
+                    await record_validator_exit(db, op["address"], exit_epoch, block_height)
                 logger.info("[Phase 3c] STAKE_EXIT by %s → %s (exit_epoch=%s)",
                             str(op.get("address"))[:20],
                             "exiting" if moved else "no-op (not active)", exit_epoch)
         except Exception as e:
             logger.warning("flush_validator_lifecycle: %s for %s", e, str(op.get("address"))[:20])
-
-# Funding settlement happens every epoch (32 slots × 12s = 384s ≈ 6.4 min)
-FUNDING_SETTLEMENT_INTERVAL = 32  # slots
 
 
 # ---------------------------------------------------------------------------
@@ -305,8 +407,11 @@ def process_exchange_transactions(
     """
     mgr = state_manager or ExchangeStateManager.get_instance()
 
-    # Take snapshot for potential revert
-    mgr.take_snapshot()
+    # Take snapshot for potential revert. A block with no transactions only runs the per-block
+    # tick, which has nothing to revert — and a deep copy of every book on every block would
+    # be the most expensive thing the node does.
+    if exchange_txs:
+        mgr.take_snapshot()
 
     # Begin block processing
     mgr.begin_block(block_height, block_timestamp)
@@ -450,6 +555,7 @@ async def rebuild_exchange_state_from_chain(
         mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
         mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
         mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
+        mgr.enforce_validator_stake = ENFORCE_VALIDATOR_STAKE
 
     try:
         tip = (await db.get_next_block_id()) - 1
@@ -459,6 +565,7 @@ async def rebuild_exchange_state_from_chain(
 
     applied = 0
     flushed = 0
+    await ensure_oracle_committee(db, mgr)
     for height in range(0, tip + 1):
         try:
             block = await db.get_block_by_id(height)
@@ -474,6 +581,13 @@ async def rebuild_exchange_state_from_chain(
         except Exception:
             section = None
         if not section:
+            if height >= 1:
+                # No exchange transactions: the exchange still ticks, as on every forward
+                # path (see run_exchange_tick).
+                try:
+                    run_exchange_tick(height, float(block.get("timestamp", 0) or 0), mgr)
+                except Exception as e:
+                    logger.error("rebuild_exchange_state: tick at %d failed: %s", height, e)
             continue
         txs = decode_exchange_txs(section)
         ts = float(block.get("timestamp", 0) or 0)
@@ -583,6 +697,26 @@ def apply_block_exchange_section(
 # Block boundary duties (executed by every validator)
 # ---------------------------------------------------------------------------
 
+def run_exchange_tick(block_height: int, block_timestamp: float,
+                      state_manager: Optional[ExchangeStateManager] = None) -> str:
+    """
+    The exchange's per-block tick for a block that carries no exchange transactions.
+
+    Clearinghouse duties — mark prices (docs/PERPS_CLEARINGHOUSE.md Phase 2), and later
+    liquidations and funding — must advance on EVERY block, not only on blocks that happen to
+    carry exchange transactions; otherwise prices, liquidations and funding freeze through a
+    quiet stretch. Every path runs this for every block from height 1 (genesis is never
+    processed by the exchange): the proposer, the sync/REST/p2p importers and both rebuilds.
+    Returns the exchange state root.
+    """
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    ok, err, root = process_exchange_transactions(block_height, block_timestamp, [], mgr)
+    if not ok:
+        logger.error("exchange tick failed at block %d: %s", block_height, err)
+    mgr.commit_block()
+    return root
+
+
 def _execute_block_boundary_duties(
     mgr: ExchangeStateManager,
     block_height: int,
@@ -592,52 +726,24 @@ def _execute_block_boundary_duties(
     Execute protocol-level duties at block boundaries.
 
     These are NOT user-submitted transactions — they are deterministic
-    protocol operations that every validator executes identically.
+    protocol operations that every validator executes identically. They run on every block
+    (see ``run_exchange_tick``).
     """
-    # 1. Funding rate settlement (every FUNDING_SETTLEMENT_INTERVAL slots)
-    if block_height > 0 and block_height % FUNDING_SETTLEMENT_INTERVAL == 0:
-        _settle_funding_rates(mgr, block_timestamp)
-
-    # 2. Liquidation checks (every block)
-    _check_liquidations(mgr)
-
-
-def _settle_funding_rates(
-    mgr: ExchangeStateManager,
-    block_timestamp: float,
-) -> None:
-    """Apply funding rates on all perp markets."""
-    for market_id in list(mgr.perp_engine._markets.keys()):
-        try:
-            snapshot = mgr.perp_engine.apply_funding(market_id)
-            if snapshot is not None:
-                logger.debug(
-                    "Funding settled for %s: rate=%s",
-                    market_id, snapshot.funding_rate,
-                )
-        except Exception as e:
-            logger.error("Funding settlement failed for %s: %s", market_id, e)
-
-
-def _check_liquidations(mgr: ExchangeStateManager) -> None:
-    """Check and execute liquidations on all perp markets."""
-    for market_id in list(mgr.perp_engine._markets.keys()):
-        try:
-            results = mgr.perp_engine.check_all_liquidations(market_id)
-            for liq in results:
-                # Phase E: return the liquidated trader's residual equity to their
-                # real balance (the locked margin was debited on open). This is a
-                # deterministic protocol op — every validator computes the same
-                # residual — so the delta flushes to account_state with the block.
-                residual = getattr(liq, "margin_returned", ZERO)
-                if residual and residual > ZERO:
-                    mgr._record_balance_delta(liq.owner, residual)
-                logger.info(
-                    "Liquidation: %s pos=%s pnl=%s returned=%s adl=%s",
-                    market_id, liq.position_id, liq.pnl, residual, liq.adl_triggered,
-                )
-        except Exception as e:
-            logger.error("Liquidation check failed for %s: %s", market_id, e)
+    # Perps clearinghouse: mark prices, funding at interval boundaries, then liquidations at
+    # the new marks — all judged by block time.
+    from .. import constants
+    mgr.apply_oracle_votes(Decimal(str(block_timestamp)))
+    events = mgr.clearinghouse.tick(Decimal(str(block_timestamp)),
+                                    funding_interval=constants.PERP_FUNDING_INTERVAL_SECONDS)
+    for ev in events:
+        if ev["type"] == "liquidation":
+            logger.info("Perp liquidation at height %d: %s %s (%s, filled %s on the book) "
+                        "equity=%s maintenance=%s", block_height, ev["owner"],
+                        ",".join(ev["markets"]), ev["stage"], ev["filled"], ev["equity"],
+                        ev["maintenance"])
+    # The node-local journal (receipts + events for wallets, the API and streams) records them
+    # once the block commits.
+    mgr.record_tick_events(events)
 
 
 # ---------------------------------------------------------------------------

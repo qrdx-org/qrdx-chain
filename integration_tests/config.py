@@ -21,6 +21,9 @@ from typing import Dict, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TESTNET_DIR = PROJECT_ROOT / "testnet"          # Data directory (gitignored)
+# The testnet's scripted price feed: every validator reads it (QRDX_ORACLE_FEED=file:…) and votes
+# what it says; scenarios move prices by writing it.
+ORACLE_FEED_FILE = TESTNET_DIR / "oracle_prices.json"
 WALLETS_DIR = TESTNET_DIR / "wallets"
 DATABASES_DIR = TESTNET_DIR / "databases"
 CONFIGS_DIR = TESTNET_DIR / "configs"
@@ -93,7 +96,34 @@ WALLET_ROSTER: List[WalletSpec] = [
     WalletSpec("Staker Candidate", "pq", Decimal("500000")),
     # Master controller (no genesis balance of its own)
     WalletSpec("Master Controller", "pq", Decimal("0")),
+    # The testnet's oracle reporter: the only key allowed to submit UPDATE_ORACLE
+    # (QRDX_ORACLE_REPORTERS, set identically on every node by the orchestrator). Perps
+    # execute at the oracle price, so S13 prices its market through this wallet.
+    WalletSpec("Oracle Reporter", "pq", Decimal("1000")),
+    # S13's second perp trader (the counterparty to Test User 0 on the order book).
+    WalletSpec("Perp Trader", "pq", Decimal("500000")),
+    # S19's backstop-vault depositor (an HLP-style liquidity provider).
+    WalletSpec("Vault Depositor", "pq", Decimal("100000")),
+    # Issues the testnet's USD stablecoin (qUSD), which perps settle in — standing in for the
+    # bridged stablecoin on mainnet. Its FIRST exchange transaction must be the deploy: the
+    # token address is derived from (issuer, nonce 0, "qUSD") and configured on every node.
+    WalletSpec("Stablecoin Issuer", "pq", Decimal("1000")),
+    # Spot scenarios sign with these and assume a clean exchange nonce. They used validator
+    # wallets until validators began submitting exchange transactions — their price votes
+    # (docs/PERPS_CLEARINGHOUSE.md §8) advance a validator's nonce with every block it proposes.
+    WalletSpec("Spot Trader", "pq", VALIDATOR_GENESIS_BALANCE),     # S15
+    WalletSpec("Spot Stranger", "pq", Decimal("1000")),             # S15: not the LP
+    # S20: the native token standard — issuer (mint + freeze authority), holder, spender.
+    WalletSpec("Token Issuer", "pq", Decimal("1000")),
+    WalletSpec("Token Holder", "pq", Decimal("1000")),
+    WalletSpec("Token Spender", "pq", Decimal("1000")),
+    WalletSpec("CLOB Trader", "pq", VALIDATOR_GENESIS_BALANCE),     # S17
+    WalletSpec("CLOB Maker", "pq", VALIDATOR_GENESIS_BALANCE),      # S18
 ]
+
+# The testnet stablecoin perps settle in (S13 deploys it; S13/S19 trade in it).
+STABLECOIN_SYMBOL = "qUSD"
+STABLECOIN_SUPPLY = Decimal("10000000")
 
 
 @dataclass

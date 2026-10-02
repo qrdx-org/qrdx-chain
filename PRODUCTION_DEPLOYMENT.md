@@ -84,8 +84,14 @@ All items must be **✅ checked** before a node goes live.
 ### 2.3 Python Runtime
 
 - Python 3.11 (matches Docker base image `python:3.11-slim`)
-- `liboqs-python>=0.9.0` is mandatory — the node will refuse to start without it
-- System deps: `gcc`, `libgmp-dev`, `openssh-client` (see `docker/Dockerfile`)
+- `liboqs-python` is mandatory — the node will refuse to start without it, and the pip
+  package is only a ctypes wrapper: the **liboqs C library must also be present**. The image
+  builds liboqs from source (pinned by the `LIBOQS_VERSION` build arg, default `0.15.0`) and
+  asserts at build time that `ML-DSA-65` is available.
+- The `eth` package comes from the in-repo `py-evm` QRDX fork, installed as a wheel in the image.
+  Clone with `--recurse-submodules` or the build will fail.
+- Build deps (build stages only): `build-essential`, `cmake`, `ninja-build`, `git`, `libgmp-dev`,
+  `libssl-dev`. Runtime deps: `libgmp10`, `libssl3`, `openssh-client`, `curl`. See `docker/Dockerfile`.
 
 ---
 
@@ -368,7 +374,19 @@ cp .env.example .env
 # Pull or build the image
 docker compose -f docker/docker-compose.prod.yml build
 
-# Start services
+# Start services.
+#
+# TLS certificates and the validator wallet are NOT mounted by the base stack --
+# a bind mount with a nonexistent source makes Docker create it, which fails on
+# Docker Desktop / WSL. Add them with the secrets overlay when you need them; the
+# directories must already exist on the host:
+#
+#   export QRDX_TLS_CERT_DIR=/etc/qrdx/certs
+#   export QRDX_VALIDATOR_WALLET_DIR=/etc/qrdx/wallet
+#   export QRDX_VALIDATOR_WALLET=/app/wallet/validator.json
+#   docker compose -f docker/docker-compose.prod.yml \
+#                  -f docker/docker-compose.prod-secrets.yml up -d
+
 docker compose -f docker/docker-compose.prod.yml up -d
 
 # Verify health
@@ -378,26 +396,43 @@ docker logs qrdx-node --tail 50
 
 ### 8.2 Verifying the Node is Healthy
 
-```bash
-# Health endpoint
-curl -sf http://localhost:8545/health | python3 -m json.tool
+> **Ports:** the node serves the REST API, JSON-RPC (`/rpc`), Prometheus metrics (`/metrics`),
+> `/healthz`, `/readyz` and the optional `/ws` + `/stream` feeds on the **single** `QRDX_NODE_PORT`
+> (default `3007`). There is no separate `8545` / `8546` / `9090` listener.
 
-# JSON-RPC
-curl -s -X POST http://localhost:8545 \
+```bash
+# Liveness — always 200 while the process is serving
+curl -sf http://localhost:3007/healthz | python3 -m json.tool
+
+# Readiness — 503 until the DB is reachable and a chain tip exists
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3007/readyz
+
+# JSON-RPC (requires QRDX_RPC_ENABLED=true)
+curl -s -X POST http://localhost:3007/rpc \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
 
 # Check peer count
-curl -s -X POST http://localhost:8545 \
+curl -s -X POST http://localhost:3007/rpc \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}'
+
+# Prometheus metrics
+curl -s http://localhost:3007/metrics | grep qrdx_chain_height
 ```
 
-### 8.3 Image Build Hardening (Gap)
+### 8.3 Image Build Hardening
 
-> **Gap (tracked in checklist §0.5):** The Dockerfile uses a single-stage build without pinned
-> dependency hashes. For production, migrate to a multi-stage build and pin all pip dependencies
-> with `pip-compile --generate-hashes`. Until then, always build from a tagged release commit.
+The image is a three-stage build (liboqs → wheels → runtime): the runtime layer carries no
+compilers or build tools, and runs as the unprivileged user `qrdx` (UID 1000). The build fails
+if `ML-DSA-65`, `py-evm` or the `qrdx` package cannot be imported.
+
+> **Remaining gap (tracked in checklist §0.5):** pip dependencies are pinned by range in
+> `requirements-v3.txt`, not by hash, so two builds on different days can resolve different
+> transitive versions of consensus-relevant libraries (`rlp`, `eth-utils`, `eth-hash`). Before
+> a production release, lock them with `pip-compile --generate-hashes` and pin the base image
+> by digest. Until then, always build from a tagged release commit and promote the *same image
+> digest* through environments rather than rebuilding per environment.
 
 ---
 

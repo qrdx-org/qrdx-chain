@@ -8,6 +8,11 @@ Ethereum-compatible state management for QRDX blockchain.
 from typing import Optional, Dict, List, Tuple, Any
 from decimal import Decimal
 from eth_utils import keccak, to_checksum_address
+
+# Every account key in this manager is the canonical 20-byte account id, so a
+# 0x and a 0xPQ credential naming the same account hit the SAME cache entry and
+# the SAME account_state row. Never key this cache by a display address.
+from ..crypto.account_id import to_account_id
 import rlp
 from dataclasses import dataclass, field
 
@@ -99,7 +104,7 @@ class ContractStateManager:
         Returns:
             Account object
         """
-        address = to_checksum_address(address)
+        address = to_account_id(address)
         
         # Check cache
         if address in self._accounts_cache:
@@ -138,7 +143,7 @@ class ContractStateManager:
         Args:
             account: Account to update
         """
-        address = to_checksum_address(account.address)
+        address = to_account_id(account.address)
         self._accounts_cache[address] = account
         self._dirty_accounts.add(address)
     
@@ -149,7 +154,7 @@ class ContractStateManager:
         Args:
             address: Account address
         """
-        address = to_checksum_address(address)
+        address = to_account_id(address)
         
         # Create empty account
         empty_account = Account(address=address)
@@ -266,7 +271,7 @@ class ContractStateManager:
         Returns:
             Storage value (32 bytes)
         """
-        address = to_checksum_address(address)
+        address = to_account_id(address)
         cache_key = (address, key)
         
         # Check cache
@@ -301,7 +306,7 @@ class ContractStateManager:
             key: Storage key (32 bytes)
             value: Storage value (32 bytes)
         """
-        address = to_checksum_address(address)
+        address = to_account_id(address)
         cache_key = (address, key)
         
         self._storage_cache[cache_key] = value
@@ -314,7 +319,7 @@ class ContractStateManager:
         Args:
             address: Contract address
         """
-        address = to_checksum_address(address)
+        address = to_account_id(address)
         
         # Remove from cache
         keys_to_remove = [k for k in self._storage_cache if k[0] == address]
@@ -493,9 +498,18 @@ class ContractStateManager:
     # ========================================================================
     # SYNCHRONOUS WRAPPERS FOR EVM EXECUTOR
     # ========================================================================
-    
+    #
+    # These MUST normalize their address argument exactly as the async methods do.
+    # The EVM executor reaches state only through this sync surface and hands it
+    # EIP-55 checksummed strings, while genesis funding and the exchange reach it
+    # through the async surface. If the two normalized differently, the same
+    # account would occupy two cache entries — the EVM's gas debit and value credit
+    # landing on one, the funded balance on the other — and the account_state root
+    # would diverge. One normalization, one key, one account.
+
     def get_balance_sync(self, address: str) -> int:
         """Sync wrapper for get_balance."""
+        address = to_account_id(address)
         if address in self._accounts_cache:
             return self._accounts_cache[address].balance
         # Simple sync DB query (would need async in production)
@@ -503,6 +517,7 @@ class ContractStateManager:
     
     def set_balance_sync(self, address: str, balance: int) -> None:
         """Sync wrapper for set_balance."""
+        address = to_account_id(address)
         if address not in self._accounts_cache:
             self._accounts_cache[address] = Account(address=address)
         self._accounts_cache[address].balance = balance
@@ -510,12 +525,14 @@ class ContractStateManager:
     
     def get_nonce_sync(self, address: str) -> int:
         """Sync wrapper for get_nonce."""
+        address = to_account_id(address)
         if address in self._accounts_cache:
             return self._accounts_cache[address].nonce
         return 0
     
     def set_nonce_sync(self, address: str, nonce: int) -> None:
         """Sync wrapper for set_nonce."""
+        address = to_account_id(address)
         if address not in self._accounts_cache:
             self._accounts_cache[address] = Account(address=address)
         self._accounts_cache[address].nonce = nonce
@@ -523,6 +540,7 @@ class ContractStateManager:
     
     def get_code_sync(self, address: str) -> bytes:
         """Sync wrapper for get_code."""
+        address = to_account_id(address)
         if address not in self._accounts_cache:
             return b''
         account = self._accounts_cache[address]
@@ -534,6 +552,7 @@ class ContractStateManager:
     
     def set_code_sync(self, address: str, code: bytes) -> None:
         """Sync wrapper for set_code."""
+        address = to_account_id(address)
         if address not in self._accounts_cache:
             self._accounts_cache[address] = Account(address=address)
         
@@ -546,19 +565,20 @@ class ContractStateManager:
     
     def get_storage_sync(self, address: str, key: bytes) -> bytes:
         """Sync wrapper for get_storage."""
-        cache_key = (address, key)
+        cache_key = (to_account_id(address), key)
         if cache_key in self._storage_cache:
             return self._storage_cache[cache_key]
         return b'\x00' * 32
     
     def set_storage_sync(self, address: str, key: bytes, value: bytes) -> None:
         """Sync wrapper for set_storage."""
-        cache_key = (address, key)
+        cache_key = (to_account_id(address), key)
         self._storage_cache[cache_key] = value
         self._dirty_storage.add(cache_key)
     
     def get_all_storage_sync(self, address: str) -> Dict[str, str]:
         """Get all storage for an address (sync)."""
+        address = to_account_id(address)
         result = {}
         for (addr, key), value in self._storage_cache.items():
             if addr == address:

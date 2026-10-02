@@ -891,6 +891,20 @@ class EthModule(RPCModule):
         else:
             return self._fmt_native_tx(tx, block)
 
+    def _pending_nonce(self, address: str, confirmed: int) -> int:
+        """Advance ``confirmed`` past any mempool-queued nonces for this sender."""
+        try:
+            from qrdx.node import main as node_main
+            from qrdx.crypto.account_id import to_account_id
+
+            mp = getattr(node_main, "EVM_MEMPOOL", None)
+            if mp is None:
+                return confirmed
+            return mp.next_nonce(to_account_id(address), confirmed)
+        except Exception as e:
+            logger.debug("pending nonce(%s) failed: %s", address, e)
+            return confirmed
+
     @rpc_method
     async def getTransactionCount(
         self,
@@ -900,6 +914,13 @@ class EthModule(RPCModule):
         """
         Returns the number of transactions sent from an address (nonce).
 
+        Accepts any address form — a ``0xPQ…`` address resolves to the same account
+        as its 20-byte account id.
+
+        With ``block_number="pending"`` (what wallets use when signing) the answer
+        also skips over transactions already queued in the mempool, so a client can
+        send several transactions between blocks without colliding with itself.
+
         Checks EVM state manager first, falls back to counting native
         transactions from the address.
         """
@@ -908,6 +929,8 @@ class EthModule(RPCModule):
         if sm:
             try:
                 nonce = await sm.get_nonce(address)
+                if str(block_number).lower() == "pending":
+                    nonce = self._pending_nonce(address, nonce)
                 if nonce > 0:
                     return _to_hex(nonce)
             except Exception as e:
@@ -1293,8 +1316,6 @@ class EthModule(RPCModule):
         except ImportError as exc:
             raise RPCError(RPCErrorCode.INTERNAL_ERROR, f"EVM dependencies missing: {exc}")
 
-        evm = self._evm()
-
         sender_hex = transaction.get("from", _ZERO_ADDR_HEX)
         to_hex = transaction.get("to")
         data_hex = transaction.get("data", transaction.get("input", "0x"))
@@ -1310,6 +1331,19 @@ class EthModule(RPCModule):
         value = _parse_hex_int(value_str)
         gas = _parse_hex_int(gas_str)
 
+        # A native token answers the ERC-20 reads itself (qrdx/exchange/erc20_view.py).
+        from ...exchange import erc20_view
+        db = getattr(self.context, "db", None) if self.context else None
+        if db is not None:
+            try:
+                native = await erc20_view.call(db, to_hex, data)
+            except erc20_view.NativeTokenCallError as e:
+                raise RPCError(RPCErrorCode.EXECUTION_ERROR, f"execution reverted: {e}",
+                               data=encode_hex(erc20_view.revert_data(str(e))))
+            if native is not None:
+                return encode_hex(native)
+
+        evm = self._evm()
         result = evm.call(
             sender=sender,
             to=to,
@@ -1337,15 +1371,55 @@ class EthModule(RPCModule):
         """
         Estimate gas for a transaction.
 
-        For contract calls/deploys, uses the EVM executor's binary-search
-        estimator.  For simple transfers (no data, no contract recipient),
-        returns 21000.
+        For contract calls/deploys, uses the EVM executor's binary-search estimator. For
+        simple transfers (no data, no contract recipient), returns the intrinsic floor.
+
+        **Envelope-aware.** A type-0x51 post-quantum transaction carries a ~5.3KB
+        ML-DSA-65 key + signature, and its intrinsic floor prices that; a transaction
+        supplying less is rejected outright. The binary-search estimator knows nothing
+        about the envelope, so without this a PQ wallet trusting the estimate would build
+        an under-funded transaction and have it refused. Pass ``type: "0x51"`` in the
+        transaction object (the standard EIP-2718 field) to get the PQ floor.
         """
+        from ...transactions.pq_tx import PQ_TX_TYPE
+
         data_hex = transaction.get("data", transaction.get("input", "0x"))
         to_hex = transaction.get("to")
 
-        # Simple value transfer — no data and not a contract
+        # Envelope type (EIP-2718). Absent ⇒ legacy.
+        tx_type = transaction.get("type")
+        is_pq = False
+        if tx_type is not None:
+            try:
+                is_pq = _parse_hex_int(tx_type) == PQ_TX_TYPE
+            except Exception:
+                is_pq = str(tx_type).lower() in (hex(PQ_TX_TYPE), str(PQ_TX_TYPE))
+
         has_data = data_hex and data_hex != "0x" and data_hex != "0x0"
+
+        from ...exchange.erc20_view import refuse_transaction_to
+        refusal = refuse_transaction_to(to_hex)
+        if refusal:
+            raise RPCError(RPCErrorCode.EXECUTION_ERROR, f"execution reverted: {refusal}")
+
+        if is_pq:
+            # The floor dominates for a PQ transaction (≈145k for a plain transfer), so
+            # return it directly rather than binary-searching execution that cannot
+            # account for the envelope. Sizes are the protocol's fixed ML-DSA-65 sizes.
+            from eth_utils import decode_hex
+
+            from ...crypto.pq.dilithium import PUBLIC_KEY_SIZE, SIGNATURE_SIZE
+            from ...transactions.pq_tx import intrinsic_gas_pq
+
+            try:
+                call_data = decode_hex(data_hex) if has_data else b""
+            except Exception:
+                call_data = b""
+            return _to_hex(intrinsic_gas_pq(
+                call_data, b"\x00" * PUBLIC_KEY_SIZE, b"\x00" * SIGNATURE_SIZE,
+                is_create=not to_hex))
+
+        # Simple value transfer — no data and not a contract
         if not has_data and to_hex:
             sm = getattr(self.context, "state_manager", None) if self.context else None
             is_contract = False

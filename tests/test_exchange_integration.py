@@ -40,6 +40,8 @@ from qrdx.exchange.block_processor import (
 )
 from qrdx.exchange.amm import tick_to_sqrt_price
 
+from exchange_prices import price_market
+
 # Q96-format sqrt price at tick 0 (price = 1.0)
 SQRT_PRICE_1 = str(tick_to_sqrt_price(0))
 
@@ -54,8 +56,12 @@ VALIDATOR = "0xPQ" + "v" * 64
 
 
 @pytest.fixture(autouse=True)
-def reset_state_manager():
-    """Reset the singleton before every test."""
+def reset_state_manager(monkeypatch):
+    """Reset the singleton before every test, and authorize this module's senders as
+    oracle reporters: many tests use UPDATE_ORACLE as a cheap generic op, and only
+    configured reporters may submit it (tests/test_perp_price_integrity.py)."""
+    from qrdx import constants
+    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (ALICE, BOB, VALIDATOR))
     ExchangeStateManager.reset_instance()
     yield
     ExchangeStateManager.reset_instance()
@@ -496,72 +502,44 @@ class TestOperationHandlers:
         assert oracle is not None
         assert oracle.latest_price == Decimal("2.50")
 
-    def test_open_position(self, mgr):
+    def test_the_house_perp_ops_are_retired(self, mgr):
+        """OPEN_POSITION and friends traded against nobody, so they minted and burned QRDX
+        (docs/PERPS_CLEARINGHOUSE.md). They now refuse; perps trade on the order book."""
         mgr.begin_block(1, 1000.0)
-        # Create perp market: create_market(base_token, quote_token, init_margin, maint_margin, max_lev)
-        market = mgr.perp_engine.create_market("BTC")
-        mgr.perp_engine.update_price(market.id, Decimal("50000"))
-        tx = make_tx(ExchangeOpType.OPEN_POSITION, sender=BOB, nonce=0, params={
-            "market_id": market.id, "side": "long", "size": "1",
-            "leverage": "10", "price": "50000",
-        })
-        result = mgr.process_transaction(tx)
-        assert result.success
-        assert "position_id" in result.data
+        for nonce, op in enumerate((ExchangeOpType.OPEN_POSITION, ExchangeOpType.CLOSE_POSITION,
+                                    ExchangeOpType.PARTIAL_CLOSE, ExchangeOpType.ADD_MARGIN)):
+            params = {"market_id": "X", "side": "long", "size": "1", "leverage": "5",
+                      "price": "30", "position_id": "p", "close_size": "1", "amount": "1"}
+            result = mgr.process_transaction(make_tx(op, sender=BOB, nonce=nonce, params=params))
+            assert not result.success and "retired" in result.error
 
-    def test_close_position(self, mgr):
+    def test_perps_trade_between_two_accounts(self, mgr):
         mgr.begin_block(1, 1000.0)
-        market = mgr.perp_engine.create_market("ETH")
-        mgr.perp_engine.update_price(market.id, Decimal("3000"))
-        open_tx = make_tx(ExchangeOpType.OPEN_POSITION, sender=BOB, nonce=0, params={
-            "market_id": market.id, "side": "long", "size": "5",
-            "leverage": "5", "price": "3000",
-        })
-        open_result = mgr.process_transaction(open_tx)
-        assert open_result.success
-
-        close_tx = make_tx(ExchangeOpType.CLOSE_POSITION, sender=BOB, nonce=1, params={
-            "position_id": open_result.data["position_id"], "price": "3100",
-        })
-        result = mgr.process_transaction(close_tx)
-        assert result.success
-        assert "pnl" in result.data
-
-    def test_partial_close(self, mgr):
-        mgr.begin_block(1, 1000.0)
-        market = mgr.perp_engine.create_market("SOL")
-        mgr.perp_engine.update_price(market.id, Decimal("100"))
-        open_tx = make_tx(ExchangeOpType.OPEN_POSITION, sender=BOB, nonce=0, params={
-            "market_id": market.id, "side": "long", "size": "10",
-            "leverage": "5", "price": "100",
-        })
-        open_result = mgr.process_transaction(open_tx)
-        assert open_result.success
-
-        partial_tx = make_tx(ExchangeOpType.PARTIAL_CLOSE, sender=BOB, nonce=1, params={
-            "position_id": open_result.data["position_id"],
-            "close_size": "5", "price": "110",
-        })
-        result = mgr.process_transaction(partial_tx)
-        assert result.success
-
-    def test_add_margin(self, mgr):
-        mgr.begin_block(1, 1000.0)
-        market = mgr.perp_engine.create_market("AVAX")
-        mgr.perp_engine.update_price(market.id, Decimal("30"))
-        open_tx = make_tx(ExchangeOpType.OPEN_POSITION, sender=BOB, nonce=0, params={
-            "market_id": market.id, "side": "long", "size": "10",
-            "leverage": "5", "price": "30",
-        })
-        open_result = mgr.process_transaction(open_tx)
-        assert open_result.success
-
-        margin_tx = make_tx(ExchangeOpType.ADD_MARGIN, sender=BOB, nonce=1, params={
-            "position_id": open_result.data["position_id"], "amount": "50",
-        })
-        result = mgr.process_transaction(margin_tx)
-        assert result.success
-        assert "new_margin" in result.data
+        assert mgr.process_transaction(make_tx(
+            ExchangeOpType.CREATE_MARKET, sender=ALICE, nonce=0,
+            params={"base_token": "AVAX"})).success
+        assert mgr.process_transaction(make_tx(
+            ExchangeOpType.UPDATE_ORACLE, sender=VALIDATOR, nonce=0,
+            params={"pair": "AVAX:QRDX", "price": "30"})).success
+        for who, n in ((ALICE, 1), (BOB, 0)):
+            assert mgr.process_transaction(make_tx(
+                ExchangeOpType.PERP_DEPOSIT, sender=who, nonce=n,
+                params={"amount": "1000"})).success
+        assert mgr.process_transaction(make_tx(
+            ExchangeOpType.PERP_ORDER, sender=ALICE, nonce=2, params={
+                "market_id": "AVAX-QRDX-PERP", "side": "sell", "size": "10",
+                "price": "30"})).success
+        result = mgr.process_transaction(make_tx(
+            ExchangeOpType.PERP_ORDER, sender=BOB, nonce=1, params={
+                "market_id": "AVAX-QRDX-PERP", "side": "buy", "size": "10",
+                "price": "30"}))
+        assert result.success and len(result.data["fills"]) == 1
+        ch = mgr.clearinghouse
+        assert ch.accounts[BOB].positions["AVAX-QRDX-PERP"].size == 10
+        assert ch.accounts[ALICE].positions["AVAX-QRDX-PERP"].size == -10
+        assert ch.identity_gap() == 0
+        # Real QRDX moved only on the deposits: traders −2,000, holder +2,000.
+        assert sum(mgr.balance_deltas().values()) == 0
 
 
 # ============================================================================
@@ -867,7 +845,7 @@ class TestExchangeOpTypeEnum:
     """Tests for the operation type enum."""
 
     def test_all_types_defined(self):
-        assert len(ExchangeOpType) == 17  # +CREATE_MARKET, +TOKEN_DEPLOY/TRANSFER (E), +STAKE_DEPOSIT/EXIT (lifecycle), +REMOVE_POOL
+        assert len(ExchangeOpType) == 32  # +CREATE_MARKET, +TOKEN_DEPLOY/TRANSFER (E), +STAKE_DEPOSIT/EXIT (lifecycle), +REMOVE_POOL, +5 perps clearinghouse ops, +2 backstop vault ops, +ORACLE_VOTE, +7 native-token ops
 
     def test_values_unique(self):
         values = [e.value for e in ExchangeOpType]

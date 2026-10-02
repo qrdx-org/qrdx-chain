@@ -178,9 +178,19 @@ async def test_stake_exit_op_records_and_flush_marks_exiting(db):
     assert row[0] == "exiting"
 
 
-async def test_stake_exit_noop_when_not_active(db):
-    """Exit only affects an ACTIVE validator (you can only exit a validator you hold);
-    a pending/unknown address is a harmless no-op."""
+async def test_stake_exit_from_pending_leaves_without_activating(db):
+    """
+    A PENDING validator that exits moves to 'exiting' and never activates.
+
+    This used to be a no-op ("you can only exit an active validator"). That rule combined
+    badly with reconstruction, which applies an epoch's STAKE ops before its activations:
+    an exit landing in the activation epoch hit a still-pending validator, was dropped, and
+    the validator stayed active forever despite having exited. With in-block stake
+    withdrawals — whose exit log is chain-derived and so records the exit either way — that
+    became an exploit: stake refunded AND still stake-weighted. The exit log cannot be gated
+    on whether the table moved, because the table is rebuilt asynchronously. So the rule
+    changed: an exit always takes effect. See tests/test_validator_withdrawals.py.
+    """
     from types import SimpleNamespace
     from qrdx.exchange.state_manager import ExchangeStateManager
     from qrdx.exchange.block_processor import flush_validator_lifecycle_deltas
@@ -192,7 +202,21 @@ async def test_stake_exit_noop_when_not_active(db):
     mgr._op_stake_exit(SimpleNamespace(sender="0xPend", nonce=0, params={}))
     await flush_validator_lifecycle_deltas(db, mgr)
     await db.connection.commit()
-    assert (await _status(db, "0xPend"))[0] == "pending"  # unchanged
+    assert (await _status(db, "0xPend"))[0] == "exiting"
+
+
+async def test_stake_exit_noop_for_unknown_address(db):
+    """An address that never deposited has nothing to exit — still a harmless no-op."""
+    from types import SimpleNamespace
+    from qrdx.exchange.state_manager import ExchangeStateManager
+    from qrdx.exchange.block_processor import flush_validator_lifecycle_deltas
+
+    mgr = ExchangeStateManager()
+    mgr.begin_block(1, 0.0)
+    mgr._op_stake_exit(SimpleNamespace(sender="0xNobody", nonce=0, params={}))
+    await flush_validator_lifecycle_deltas(db, mgr)
+    await db.connection.commit()
+    assert await _status(db, "0xNobody") is None
 
 
 async def test_exiting_completes_at_finalized_exit_epoch(db):

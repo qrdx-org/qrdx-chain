@@ -30,6 +30,14 @@ from .address import (
     get_address_type,
     AddressType,
 )
+from .account_id import (
+    to_account_id,
+    to_account_id_bytes,
+    is_account_id,
+    same_account,
+    ACCOUNT_ID_DOMAIN,
+    ACCOUNT_ID_LENGTH,
+)
 from .encoding import rlp_encode, rlp_decode, encode_transaction
 
 # Post-quantum cryptography - lazy loaded
@@ -110,6 +118,12 @@ __all__ = [
     "to_pq_checksum_address",
     "normalize_address",
     "is_pq_address",
+    "to_account_id",
+    "to_account_id_bytes",
+    "is_account_id",
+    "same_account",
+    "ACCOUNT_ID_DOMAIN",
+    "ACCOUNT_ID_LENGTH",
     "is_traditional_address",
     "get_address_type",
     "AddressType",

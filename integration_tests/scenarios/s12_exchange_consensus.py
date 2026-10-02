@@ -84,57 +84,38 @@ class S12ExchangeConsensus(Scenario):
             admitted = bool(r and r.get("ok"))
         self.check(admitted, "Exchange tx admitted to proposer node")
 
-        # 4. Poll until the proposer node has included + executed the tx (its
-        #    exchange root advances). This proves the LIVE pipeline end to end on
-        #    a real node: admit → proposer selects → executes through the
-        #    consensus state machine → declares the BLAKE3 exchange_state_root.
-        #
-        #    NOTE: full cross-node convergence additionally requires reorg-safe
-        #    exchange state. The base PoS converges on one chain at settled
-        #    heights, but at the tip validators propose competing blocks; a
-        #    tx-bearing block can be orphaned while the proposer's exchange state
-        #    has already advanced (it is not reverted on reorg). That is the
-        #    documented next piece — see docs/EXCHANGE_PRODUCTION_READINESS.md.
+        # 4. Poll until the proposer node has included + executed the tx: the pool it
+        #    creates exists. (Not "the exchange root changed": the root commits to the
+        #    block height and the exchange ticks on every block, so it changes every
+        #    block whether or not anything was included.)
         target = node_urls[0]
-        new_root = None
+        included = False
         for attempt in range(60):  # up to ~120s (reorg-tolerant)
             await asyncio.sleep(2)
             cur = await self._roots(node_urls)
-            tnode = cur.get(target)
-            converged = sum(
-                1 for v in cur.values() if v["exchange_state_root"] != base_root
-            )
-            self._log.info(
-                "attempt %d: proposer_root_changed=%s, %d/%d node(s) advanced",
-                attempt + 1,
-                bool(tnode and tnode["exchange_state_root"] != base_root),
-                converged, len(cur),
-            )
-            if tnode and tnode["exchange_state_root"] != base_root:
-                new_root = tnode["exchange_state_root"]
+            have = sum(1 for v in cur.values() if v.get("pools", 0) >= 1)
+            self._log.info("attempt %d: %d/%d node(s) hold the new pool",
+                           attempt + 1, have, len(cur))
+            if cur.get(target, {}).get("pools", 0) >= 1:
+                included = True
                 break
+        self.check(included, "Exchange tx included + executed (the pool exists on the proposer)")
 
-        self.check_not_none(new_root, "Exchange tx included + executed (proposer root advanced)")
-
-        # 5. The created trading pair is present in the proposer's protocol state.
-        final = await self._roots(node_urls)
-        tnode = final.get(target, {})
-        self.check(
-            tnode.get("pools", 0) >= 1,
-            f"Trading pair present in protocol state (pools={tnode.get('pools', 0)})",
-        )
-        # Determinism guard: no node may report a DIFFERENT new root than the
-        # proposer's (any node that advanced must match — that is D3 determinism).
-        others = {v["exchange_state_root"] for v in final.values()
-                  if v["exchange_state_root"] != base_root}
-        self.check(
-            len(others) <= 1,
-            f"All advanced nodes share one deterministic root ({len(others)} distinct)",
-        )
-        n_converged = sum(1 for v in final.values()
-                          if v.get("exchange_state_root") == new_root)
-        self._log.info(
-            "Cross-node convergence: %d/%d nodes on the new root "
-            "(full convergence pending reorg-safe exchange state)",
-            n_converged, len(final),
-        )
+        # 5. Determinism: nodes at the same height that hold the pool report one root.
+        #    Sampled until a quorum sits at one height (they usually do: blocks are 2 s).
+        need = max(2, len(node_urls) - 1)
+        agreed, seen = False, {}
+        for _ in range(30):
+            cur = await self._roots(node_urls)
+            groups = {}
+            for v in cur.values():
+                if v.get("pools", 0) >= 1 and "block_height" in v:
+                    groups.setdefault(v["block_height"], []).append(v["exchange_state_root"])
+            for height, roots in groups.items():
+                if len(roots) >= need:
+                    seen = {"height": height, "roots": len(set(roots)), "nodes": len(roots)}
+                    agreed = len(set(roots)) == 1
+            if agreed:
+                break
+            await asyncio.sleep(1)
+        self.check(agreed, f"Nodes at one height share one exchange root ({seen})")

@@ -24,6 +24,7 @@ from integration_tests.scenarios.s01_genesis import S01GenesisBootstrap
 from integration_tests.scenarios.s02_peer_mesh import S02PeerMesh
 from integration_tests.scenarios.s03_block_production import S03BlockProduction
 from integration_tests.scenarios.s04_transactions import S04Transactions
+from integration_tests.scenarios.s04b_cross_type_transfers import S04bCrossTypeTransfers
 from integration_tests.scenarios.s05_tokens import S05Tokens
 from integration_tests.scenarios.s06_pools import S06Pools
 from integration_tests.scenarios.s07_validators import S07Validators
@@ -104,6 +105,15 @@ async def test_s04_transactions(scenario_ctx):
     runner.register(S04Transactions)
     results = await runner.run_all()
     assert results[0].passed, f"S04 failed: {results[0].error_message}"
+
+
+@pytest.mark.asyncio
+async def test_s04b_cross_type_transfers(scenario_ctx):
+    """S04b: Verify native transfers between 0x and 0xPQ accounts, both ways."""
+    runner = ScenarioRunner(scenario_ctx)
+    runner.register(S04bCrossTypeTransfers)
+    results = await runner.run_all()
+    assert results[0].passed, f"S04b failed: {results[0].error_message}"
 
 
 @pytest.mark.asyncio

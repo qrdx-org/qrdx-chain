@@ -1,69 +1,83 @@
-x-qrdx-node-base: &qrdx-node-base
+# =============================================================================
+# QRDX — single-node development stack
+#
+#   docker compose -f docker/docker-compose.yml up --build -d
+#   docker compose -f docker/docker-compose.yml logs -f
+#   docker compose -f docker/docker-compose.yml down          # keep chain data
+#   docker compose -f docker/docker-compose.yml down -v       # wipe chain data
+#
+# One port serves everything: the REST API, JSON-RPC (/rpc), Prometheus metrics
+# (/metrics), health probes (/healthz, /readyz) and, when QRDX_ENABLE_STREAMING
+# is set, the realtime WebSocket (/ws) and SSE (/stream) feeds.
+#
+# For a multi-node local network use docker-compose.testnet.yml instead.
+# =============================================================================
+
+x-qrdx-node: &qrdx-node
   build:
     context: ".."
-    dockerfile: "./docker/Dockerfile"
+    dockerfile: "docker/Dockerfile"
+  image: qrdx-node:local
   restart: unless-stopped
-  working_dir: /app
-  env_file: ["../.env"]
+  stop_grace_period: 30s
   labels: ["qrdx.node=true"]
   networks: [qrdx-net]
-  volumes:
-    - type: volume
-      target: /app
-    - type: volume
-      source: node-registry
-      target: /shared/node-registry
-    - type: volume
-      source: node-topology
-      target: /shared/node-topology
-      read_only: true
-  environment:
-    &qrdx-node-env
-    qrdx_NODE_HOST: '0.0.0.0'
-    QRDX_DATABASE_PATH: '/app/data/qrdx.db'
+  env_file:
+    - path: "../.env"
+      required: false
+  logging:
+    driver: json-file
+    options: { max-size: "50m", max-file: "5" }
 
 services:
-  topology:
-    image: python:3.12-alpine
-    working_dir: /app
-    command: >
-      sh -c "pip install --no-cache-dir pyyaml >/dev/null && python /app/generate-topology.py"
-    volumes:
-      - ./generate-topology.py:/app/generate-topology.py:ro
-      - ./docker-compose.yml:/project/docker-compose.yml:ro
-      - node-topology:/shared/node-topology
-    networks: [qrdx-net]
+  node:
+    <<: *qrdx-node
+    container_name: qrdx-node
+    hostname: node
 
-  node-3006:
-    <<: *qrdx-node-base
-    hostname: node-3006
-    volumes: [node_3006_data:/app, node-registry:/shared/node-registry, node-topology:/shared/node-topology:ro]
-    depends_on:
-      topology: { condition: service_completed_successfully }
-    ports: ["3006:3006"]
+    ports:
+      - "${QRDX_NODE_PORT:-3007}:${QRDX_NODE_PORT:-3007}"
+
+    volumes:
+      # ONLY the data directory is a volume. Mounting a volume over /app would
+      # shadow the application code baked into the image and go stale on rebuild.
+      - node-data:/app/data
+      # Shared peer registry — only used by the Pinggy tunnel / 'discover' flow.
+      - node-registry:/shared/node-registry
+
     environment:
-      <<: *qrdx-node-env
-      NODE_NAME: 'node-3006'
-      qrdx_NODE_PORT: '3006'
-      QRDX_DATABASE_PATH: '/app/data/qrdx.db'
-      
-      # This variable specifies either the selection criteria or a fixed address for the bootstrap-node.
-      # Accepted values:
-      #   - 'self': Uses the node's own internal address.
-      #   - 'discover': Selects an address from the shared peer registry.
-      #   - The address of a qrdx Node that is reachable via the Internet or internal network.
-      qrdx_BOOTSTRAP_NODE: 'https://node.qrdx.network'
-      
-      # This variable enables public tunneling via Pinggy.io for up to 60 minutes.
-      #ENABLE_PINGGY_TUNNEL: 'true'
- 
-      # This variable specifies the publicly reachable address of the node itself.
-      qrdx_SELF_URL: ''
+      NODE_NAME: "node"
+      QRDX_NODE_HOST: "0.0.0.0"
+      QRDX_NODE_PORT: "${QRDX_NODE_PORT:-3007}"
+
+      # Persisted under the data volume so the chain and this node's PQ identity
+      # survive `up --build`.
+      QRDX_DATABASE_PATH: "/app/data/qrdx.db"
+      QRDX_NODE_KEY_DIR: "/app/data/keys"
+
+      # Publicly reachable URL of this node. Leave empty to advertise the
+      # in-network address (http://node:<port>).
+      QRDX_SELF_URL: "${QRDX_SELF_URL:-}"
+
+      # 'self'     — standalone; do not dial out (local genesis)
+      # 'discover' — pick a peer from the shared registry
+      # <url>      — an explicit peer, e.g. https://node.qrdx.network
+      QRDX_BOOTSTRAP_NODE: "${QRDX_BOOTSTRAP_NODE:-https://node.qrdx.network}"
+
+      # EVM / eth_* JSON-RPC modules (served at /rpc).
+      QRDX_RPC_ENABLED: "${QRDX_RPC_ENABLED:-false}"
+      # Realtime /ws + /stream feeds.
+      QRDX_ENABLE_STREAMING: "${QRDX_ENABLE_STREAMING:-}"
+
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+
+      # Uncomment to expose this node on the public Internet for up to 60 minutes
+      # through a Pinggy.io SSH reverse tunnel.
+      # ENABLE_PINGGY_TUNNEL: "true"
 
 volumes:
-  node-topology:
+  node-data:
   node-registry:
-  node_3006_data:
 
 networks:
   qrdx-net:

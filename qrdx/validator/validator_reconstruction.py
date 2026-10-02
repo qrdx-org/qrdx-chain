@@ -66,7 +66,11 @@ async def reconstruct_validators_state(
     # module-load cycle. The reset below un-slashes everyone; re-applying the recorded slashing
     # events during the walk restores the penalty — slashing is itself a pure function of the
     # chain's slashing_events (evidence-in-blocks), so this keeps the rebuild fully canonical.
-    from .epoch_loop import apply_epoch_slashings
+    from .epoch_loop import (
+        _ENFORCE_STAKE_FLOOR_EJECTION,
+        _eject_validators_below_stake_floor,
+        apply_epoch_slashings,
+    )
 
     await db.seed_genesis_validators(genesis_validators)
     # The reset dropped/rebased every validator, so any previously-applied slashing must be
@@ -114,6 +118,15 @@ async def reconstruct_validators_state(
         # Re-apply slashing offences finalized by this epoch (slashes + ejects; marks processed
         # so a later epoch's call is a no-op) — same call the forward epoch loop makes.
         await apply_epoch_slashings(db, epoch, enforce=True)
+        # Stake-floor ejection, per epoch, AFTER that epoch's rewards/penalties/slashing so
+        # it reads settled stake. It must live HERE: with reconstruction on (the live
+        # configuration) the epoch loop never reaches the incremental path, so ejection
+        # placed only there never ran. It reads and writes only the validators table, so
+        # it is a deterministic function of the chain like everything else in this walk.
+        # log=False: the walk replays from genesis every finalized epoch, so logging here
+        # would re-announce every historical ejection each time.
+        if _ENFORCE_STAKE_FLOOR_EJECTION:
+            await _eject_validators_below_stake_floor(db, epoch, log=False)
 
     if commit:
         await db.connection.commit()

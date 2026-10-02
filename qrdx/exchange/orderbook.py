@@ -17,21 +17,28 @@ Security features:
   - Owner-only cancel — authorization enforced on every cancel
   - Rate limiting — max orders per block per address
   - Deterministic trade IDs — blake2b(maker:taker:seq), no uuid4
-  - Expiry / GTC — orders auto-cleaned at block boundary
+  - Expiry / GTC — orders auto-cleaned at block boundary, judged by BLOCK time
   - Emergency pause — blocks all new orders
 
 Order book depth is configurable per pool (default 500 price levels/side).
+
+Determinism: matching runs in a pinned Decimal context (never the caller's), the only clock is
+the block time handed to ``new_block``, and ``state_digest`` commits every consensus-relevant
+field. The trade history kept for display is bounded and never consensus state.
 """
 
 from __future__ import annotations
 
+import copy
+import functools
 import hashlib
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Context, Decimal, ROUND_DOWN, ROUND_HALF_EVEN, ROUND_HALF_UP, localcontext
 from enum import Enum, IntEnum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +52,19 @@ MAX_ORDERS_PER_ADDRESS = 200           # per book
 MAX_ORDERS_PER_BLOCK_PER_ADDRESS = 50  # rate limit
 MIN_ORDER_SIZE = Decimal("0.00000001") # 1 sat equivalent
 MAX_STOP_ORDERS_PER_ADDRESS = 50
+MAX_RECENT_TRADES = 1000               # display history per book — bounded, never consensus
+
+# Every book computation runs in this context, whatever the caller's: a result must not depend
+# on the precision of the thread or task that happens to call in.
+_CTX = Context(prec=78, rounding=ROUND_HALF_EVEN)
+
+
+def _pinned(method):
+    @functools.wraps(method)
+    def wrapper(*args, **kwargs):
+        with localcontext(_CTX):
+            return method(*args, **kwargs)
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +92,13 @@ class OrderStatus(str, Enum):
 
 class SelfTradeAction(str, Enum):
     """What to do when maker and taker are the same address."""
-    REJECT = "reject"              # skip the resting maker order
+    REJECT = "reject"              # skip the resting maker order (the taker may then rest
+                                   # ACROSS its own order: a crossed book — not for consensus)
     CANCEL_MAKER = "cancel_maker"  # cancel the resting maker
     CANCEL_BOTH = "cancel_both"    # cancel both sides
+    CANCEL_TAKER = "cancel_taker"  # stop matching and cancel the taker's remainder; fills
+                                   # already made stand, resting orders are untouched. The
+                                   # consensus books use this: the book can never cross.
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +130,9 @@ class Order:
     def is_active(self) -> bool:
         return self.status in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
 
-    @property
-    def is_expired(self) -> bool:
-        if self.expire_time <= 0:
-            return False
-        return time.time() > self.expire_time
+    def expired(self, now: Optional[float]) -> bool:
+        """Past its expiry at block time ``now`` (None — no block yet — expires nothing)."""
+        return self.expire_time > 0 and now is not None and now > self.expire_time
 
 
 @dataclass
@@ -198,7 +220,9 @@ class OrderBook:
         self._asks: Dict[Decimal, PriceLevel] = {}
         self._orders: Dict[str, Order] = {}
         self._stop_orders: Dict[str, Order] = {}
-        self._trades: List[Trade] = []
+        self._trades: Deque[Trade] = deque(maxlen=MAX_RECENT_TRADES)
+        self.last_price: Optional[Decimal] = None   # the stop-order trigger (consensus)
+        self._now: Optional[float] = None           # the current block's time
 
         # --- Security state ---
         self._owner_order_count: Dict[str, int] = {}
@@ -232,6 +256,7 @@ class OrderBook:
         return None
 
     @property
+    @_pinned
     def mid_price(self) -> Optional[Decimal]:
         bb, ba = self.best_bid, self.best_ask
         if bb is not None and ba is not None:
@@ -262,19 +287,62 @@ class OrderBook:
         self._paused = False
         logger.info("Order book %s resumed", self.pool_id)
 
-    def new_block(self) -> None:
-        """Call at the start of each block to reset rate limits and clean up expired orders."""
+    @_pinned
+    def new_block(self, now: Optional[float] = None) -> None:
+        """Start a block: reset the per-block rate limits and drop the orders that have expired
+        by ``now`` — the block's timestamp, never the wall clock."""
         self._block_order_count.clear()
+        if now is not None:
+            self._now = float(now)
         self._cleanup_expired()
+
+    # -- Atomicity and commitment -------------------------------------------
+
+    def snapshot(self) -> Any:
+        """Everything but the display history, which is append-only and copied shallowly."""
+        state = {k: v for k, v in self.__dict__.items() if k != "_trades"}
+        return copy.deepcopy(state), list(self._trades)
+
+    def restore(self, snap: Any) -> None:
+        state, trades = snap
+        self.__dict__.clear()
+        self.__dict__.update(state)
+        self._trades = deque(trades, maxlen=MAX_RECENT_TRADES)
+
+    @_pinned
+    def state_digest(self) -> bytes:
+        """Every consensus-relevant field: each resting order in priority order (price level,
+        then time), each parked stop order, the owners' order nonces, the trade sequence, the
+        last trade price and the totals — not the display history or any wall-clock stamp."""
+        parts = [self.pool_id, str(self._trade_sequence), str(self.total_trades),
+                 str(self.total_volume), str(self.last_price)]
+        for tag, levels, best_first in (("b", self._bids, True), ("a", self._asks, False)):
+            for price in sorted(levels, reverse=best_first):
+                parts.append(f"{tag}{price}")
+                for o in levels[price].orders:
+                    parts.append(f"{o.id}:{o.owner}:{o.side.value}:{o.order_type.value}:"
+                                 f"{o.price}:{o.amount}:{o.filled}:{o.status.value}:{o.nonce}:"
+                                 f"{o.expire_time}")
+        for oid in sorted(self._stop_orders):
+            o = self._stop_orders[oid]
+            parts.append(f"s{o.id}:{o.owner}:{o.side.value}:{o.stop_price}:{o.amount}:"
+                         f"{o.filled}:{o.status.value}:{o.nonce}:{o.expire_time}")
+        for owner in sorted(self._owner_nonces):
+            parts.append(f"n{owner}:{self._owner_nonces[owner]}")
+        return hashlib.blake2b("|".join(parts).encode(), digest_size=32).digest()
 
     # -- Order placement ----------------------------------------------------
 
-    def place_order(self, order: Order) -> List[Trade]:
+    @_pinned
+    def place_order(self, order: Order, *, protocol: bool = False) -> List[Trade]:
         """
         Place an order on the book. Attempts immediate matching.
 
         Args:
             order: Order to place
+            protocol: the protocol's own order (a liquidation), not the owner's. It is not
+                subject to the owner's per-block rate limit or nonce sequence — a liquidation
+                must not fail because the account traded heavily this block.
 
         Returns:
             List of trades generated (empty if fully resting)
@@ -286,8 +354,9 @@ class OrderBook:
             raise ValueError("Order book is paused — emergency mode")
 
         self._validate_order(order)
-        self._check_rate_limit(order.owner)
-        self._check_nonce(order)
+        if not protocol:
+            self._check_rate_limit(order.owner)
+            self._check_nonce(order)
 
         # Stop-loss: park it until trigger price hit
         if order.order_type == OrderType.STOP_LOSS:
@@ -300,6 +369,7 @@ class OrderBook:
         # Limit order: match what we can, rest goes on the book
         return self._match_limit(order)
 
+    @_pinned
     def cancel_order(self, order_id: str, caller: str = "") -> Optional[Order]:
         """
         Cancel an open order.
@@ -357,7 +427,7 @@ class OrderBook:
         prices = sorted(opposite.keys()) if taker.side == OrderSide.BUY else sorted(opposite.keys(), reverse=True)
 
         for price in list(prices):
-            if taker.remaining <= 0:
+            if taker.remaining <= 0 or taker.status == OrderStatus.CANCELLED:
                 break
             level = opposite[price]
             trades.extend(self._match_at_level(taker, level, price))
@@ -365,7 +435,9 @@ class OrderBook:
                 del opposite[price]
 
         # Market orders: remaining is discarded (no resting)
-        if taker.remaining > 0:
+        if taker.status == OrderStatus.CANCELLED:
+            pass                                  # self-trade prevention cancelled it
+        elif taker.remaining > 0:
             taker.status = OrderStatus.FILLED if taker.filled > 0 else OrderStatus.CANCELLED
         else:
             taker.status = OrderStatus.FILLED
@@ -384,15 +456,17 @@ class OrderBook:
             matchable_prices = sorted([p for p in opposite if p >= taker.price], reverse=True)
 
         for price in list(matchable_prices):
-            if taker.remaining <= 0:
+            if taker.remaining <= 0 or taker.status == OrderStatus.CANCELLED:
                 break
             level = opposite[price]
             trades.extend(self._match_at_level(taker, level, price))
             if level.total_amount == 0:
                 del opposite[price]
 
-        # Rest on the book if unfilled
-        if taker.remaining > 0:
+        # Rest on the book if unfilled (never once self-trade prevention cancelled it)
+        if taker.status == OrderStatus.CANCELLED:
+            pass
+        elif taker.remaining > 0:
             taker.status = OrderStatus.OPEN if taker.filled == 0 else OrderStatus.PARTIALLY_FILLED
             self._add_to_book(taker)
         else:
@@ -427,6 +501,9 @@ class OrderBook:
                     self._orders.pop(maker.id, None)
                     self._decrement_owner_count(maker.owner)
                     return trades
+                elif self.self_trade_action == SelfTradeAction.CANCEL_TAKER:
+                    taker.status = OrderStatus.CANCELLED
+                    return trades
 
             fill_amount = min(taker.remaining, maker.remaining)
 
@@ -457,6 +534,7 @@ class OrderBook:
             )
             trades.append(trade)
             self._trades.append(trade)
+            self.last_price = price
             self.total_volume += fill_amount * price
             self.total_trades += 1
 
@@ -488,7 +566,7 @@ class OrderBook:
 
     def _check_stop_triggers(self) -> None:
         """Check if any stop-loss orders should trigger."""
-        last_price = self._trades[-1].price if self._trades else None
+        last_price = self.last_price
         if last_price is None:
             return
 
@@ -553,8 +631,8 @@ class OrderBook:
         # Check for duplicate order ID
         if order.id in self._orders or order.id in self._stop_orders:
             raise ValueError(f"Duplicate order ID: {order.id}")
-        # Check expiry
-        if order.expire_time > 0 and order.is_expired:
+        # Check expiry (against the block's time)
+        if order.expired(self._now):
             raise ValueError("Order has already expired")
 
     def _check_nonce(self, order: Order) -> None:
@@ -585,10 +663,11 @@ class OrderBook:
             self._owner_order_count[owner] = max(0, c - 1)
 
     def _cleanup_expired(self) -> None:
-        """Remove expired orders during new_block."""
+        """Remove expired orders during new_block. (No exchange operation sets an expiry today;
+        one that did would also have to refund an expired spot order's escrow.)"""
         for oid in list(self._orders):
             order = self._orders[oid]
-            if order.expire_time > 0 and order.is_expired and order.is_active:
+            if order.expired(self._now) and order.is_active:
                 self.cancel_order(oid)
 
     @staticmethod
@@ -605,12 +684,14 @@ class OrderBook:
             order = self._stop_orders.get(order_id)
         return order
 
+    @_pinned
     def get_bids(self, depth: int = 10) -> List[Tuple[Decimal, Decimal]]:
         """Top N bid levels as (price, total_amount)."""
         active = [(p, lvl.total_amount) for p, lvl in self._bids.items() if lvl.total_amount > 0]
         active.sort(key=lambda x: x[0], reverse=True)
         return active[:depth]
 
+    @_pinned
     def get_asks(self, depth: int = 10) -> List[Tuple[Decimal, Decimal]]:
         """Top N ask levels as (price, total_amount)."""
         active = [(p, lvl.total_amount) for p, lvl in self._asks.items() if lvl.total_amount > 0]
@@ -618,7 +699,7 @@ class OrderBook:
         return active[:depth]
 
     def get_recent_trades(self, count: int = 50) -> List[Trade]:
-        return self._trades[-count:]
+        return list(self._trades)[-count:] if count > 0 else []
 
     def get_open_orders(self, owner: Optional[str] = None) -> List[Order]:
         """All open orders, optionally filtered by owner."""

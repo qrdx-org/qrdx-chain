@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
-from .evm_mempool import parse_eth_raw_tx
+from .evm_mempool import parse_eth_raw_tx, verify_delegated_spend
 from .state import ContractStateManager
 
 logger = logging.getLogger(__name__)
@@ -216,6 +216,12 @@ async def apply_block_evm_section(
             parse_eth_raw_tx(raw)
         except Exception as e:  # ValueError on malformed/forged/typed tx
             return False, f"evm tx {i} in block {block_height} failed verification: {e}"
+        # A DELEGATED spend (system wallet) must be authorised here too, not only at
+        # submission — otherwise a proposer could smuggle an unauthorised one into a
+        # block, exactly the hole the signature check above sits here to close.
+        ok, why = await verify_delegated_spend(db, raw)
+        if not ok:
+            return False, f"evm tx {i} in block {block_height}: {why}"
 
     # 2. Block-start snapshot (revert point for reject-on-mismatch).
     block_snap = await state_manager.snapshot()

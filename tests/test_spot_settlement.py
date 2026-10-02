@@ -108,9 +108,12 @@ def test_swap_enforce_rejects_insufficient():
     pool = _make_pool(mgr, A, B)
     spacing = pool.state.fee_tier.tick_spacing
     center = (pool.state.tick // spacing) * spacing
-    mgr._op_add_liquidity(_tx("0xPQlp", {
+    for t in (A, B):     # under enforcement every debit's balance is loaded with its block
+        mgr.set_available_token_balance("0xPQlp", t, Decimal("1000000"))
+        mgr.set_available_token_balance(mgr.pool_holder_address(pool.state.id), t, Decimal(0))
+    assert mgr._op_add_liquidity(_tx("0xPQlp", {
         "pool_id": pool.state.id, "tick_lower": center - 10 * spacing,
-        "tick_upper": center + 10 * spacing, "amount": "100000"}))
+        "tick_upper": center + 10 * spacing, "amount": "100000"})).success
     trader = "0xPQpoor"
     mgr.set_available_token_balance(trader, A, Decimal("10"))
     # Clear deltas accumulated by add_liquidity so we isolate the swap.

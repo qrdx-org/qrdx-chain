@@ -34,7 +34,9 @@ eth-hash[pycryptodome]>=0.6.0
 pycryptodome>=3.20.0
 
 # RLP encoding
-pyrlp>=4.0.0
+# NOTE: the package is `rlp` (imported as `rlp` by qrdx/contracts/*). `pyrlp` is a
+# different, abandoned distribution capped at Python <3.11 and is NOT installable here.
+rlp>=4.0.0
 eth-rlp>=2.1.0
 
 # ============================================================================

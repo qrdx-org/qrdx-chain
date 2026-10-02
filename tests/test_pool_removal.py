@@ -64,10 +64,14 @@ def test_remove_pool_rejects_with_active_liquidity():
     mgr.set_available_balance(creator, Decimal("1000000"))
     cr = mgr._op_create_pool(_create_tx(creator))
     pool_id = cr.data["pool_id"]
-    # Simulate active liquidity on the pool.
-    mgr.pool_manager.get_pool(pool_id).state.liquidity = Decimal("500")
+    # A position OUT of range (no active liquidity) still owns tokens in the pool: removing
+    # the pool would strand them, so any position blocks it.
+    pool = mgr.pool_manager.get_pool(pool_id)
+    pool.add_liquidity(creator, pool.state.tick // 60 * 60 + 600, pool.state.tick // 60 * 60 + 1200,
+                       Decimal("500"))
+    assert pool.state.liquidity == 0 and pool.state.positions
     rr = mgr._op_remove_pool(_remove_tx(creator, pool_id))
-    assert not rr.success and "liquidity" in (rr.error or "")
+    assert not rr.success and "position" in (rr.error or "")
     assert mgr.pool_manager.get_pool(pool_id) is not None
 
 

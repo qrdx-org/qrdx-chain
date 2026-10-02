@@ -1,0 +1,218 @@
+# =============================================================================
+# QRDX — public node behind a Cloudflare Tunnel
+#
+# Runs a QRDX node plus a `cloudflared` sidecar, so the node is reachable on a
+# real hostname over HTTPS without opening a single inbound port on the host.
+# Both services are `restart: unless-stopped` — they come back after a crash or
+# a host reboot and stay up until you explicitly stop them.
+#
+#   export CLOUDFLARE_TUNNEL_TOKEN='eyJhIjoi...'     # from the Cloudflare dashboard
+#   export QRDX_PUBLIC_HOSTNAME='node.example.com'   # hostname routed to the tunnel
+#   docker compose -f docker/docker-compose.tunnel.yml up --build -d
+#
+# The stack runs as a VALIDATOR by default. On first start the `validator-init`
+# service generates an ML-DSA-65 keypair into the data volume and logs its
+# address; the node then runs with validator mode on. Set
+# QRDX_VALIDATOR_ENABLED=false to run a plain full node instead.
+#
+#   docker compose -f docker/docker-compose.tunnel.yml logs validator-init
+#
+#   docker compose -f docker/docker-compose.tunnel.yml logs -f
+#   docker compose -f docker/docker-compose.tunnel.yml down        # stop, keep chain data
+#   docker compose -f docker/docker-compose.tunnel.yml down -v     # stop and wipe chain data
+#
+# -----------------------------------------------------------------------------
+# ONE-TIME CLOUDFLARE SETUP
+# -----------------------------------------------------------------------------
+# A token-based tunnel takes its routing from the Cloudflare dashboard, not from
+# this file. In Zero Trust -> Networks -> Tunnels:
+#
+#   1. Create a tunnel (type: Cloudflared) and copy the token it shows you.
+#      That token IS a credential — it can proxy traffic into this network.
+#      Export it in your shell; never commit it or bake it into an image.
+#   2. Under the tunnel's "Public Hostname" tab, add a hostname pointing at the
+#      node's in-network address:
+#
+#        Subdomain/Domain : node.example.com
+#        Service type     : HTTP
+#        URL              : node:3007        <- the compose service name + port
+#
+#   3. Export that same hostname as QRDX_PUBLIC_HOSTNAME below so the node
+#      advertises the correct public URL to its peers.
+#
+# Cloudflare terminates TLS at the edge; the tunnel leg to the node is plain
+# HTTP inside the compose network, which never leaves the Docker bridge.
+#
+# -----------------------------------------------------------------------------
+# VALIDATOR — what "spooled up" does and does not mean
+# -----------------------------------------------------------------------------
+# Starting the validator process is NOT the same as joining the active validator
+# set. The node signs and proposes only once its address holds at least the
+# minimum stake (MIN_VALIDATOR_STAKE = 100,000 QRDX in qrdx/constants.py), which
+# is established by a STAKE_DEPOSIT transaction from that address. Until then the
+# validator loop runs but the node behaves as a full node: it syncs, serves and
+# attests nothing.
+#
+# So the first-run sequence is:
+#   1. `up -d`  -> validator-init logs the generated validator address
+#   2. fund that address and submit a STAKE_DEPOSIT of >= 100,000 QRDX
+#   3. the node enters the set at the next activation boundary
+#
+# KEY CUSTODY: the wallet format this node loads is UNENCRYPTED — the Dilithium
+# secret key is plain hex in the JSON, and QRDX_VALIDATOR_PASSWORD is accepted by
+# that code path but never used to encrypt it. The `node-data` volume therefore
+# holds a live private key. Back it up, restrict access to the Docker host, and
+# do not put this volume on shared storage.
+#
+# To use your OWN wallet instead of a generated one, add the wallet overlay --
+# it mounts a host directory read-only at /app/wallet:
+#
+#   mkdir -p /secure/path && cp my-validator.json /secure/path/
+#   export QRDX_VALIDATOR_WALLET_DIR=/secure/path
+#   export QRDX_VALIDATOR_WALLET=/app/wallet/my-validator.json
+#   docker compose -f docker/docker-compose.tunnel.yml \
+#                  -f docker/docker-compose.tunnel-wallet.yml up -d
+#
+# validator-init will validate that wallet and leave it alone. The directory MUST
+# already exist on the host; Compose will not create it for you.
+#
+# -----------------------------------------------------------------------------
+# EXPOSURE — read before pointing this at a real domain
+# -----------------------------------------------------------------------------
+# The hostname you route publishes the node's ENTIRE HTTP surface: the REST API,
+# JSON-RPC at /rpc, /metrics, /healthz, /readyz and the /ws + /stream feeds. The
+# host port below is bound to 127.0.0.1 so the tunnel is the only public path.
+# Restrict what the public gets with a Cloudflare WAF rule or Cloudflare Access
+# policy on paths you do not want open (/metrics is the usual first one), and
+# set QRDX_RPC_ADMIN_TOKEN if you enable admin RPC methods.
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Validator identity bootstrap (runs once, then exits)
+  # ---------------------------------------------------------------------------
+  # Generates the validator wallet into the data volume if it is not there yet,
+  # or validates the one you mounted. Never overwrites an existing wallet, so a
+  # restart always reuses the same validator identity.
+  validator-init:
+    build:
+      context: ".."
+      dockerfile: "docker/Dockerfile"
+    image: qrdx-node:local
+    container_name: qrdx-validator-init
+    restart: "no"
+    networks: [qrdx-net]
+    entrypoint: ["python", "/app/docker/validator-init.py"]
+    volumes:
+      - node-data:/app/data
+    environment:
+      QRDX_VALIDATOR_ENABLED: "${QRDX_VALIDATOR_ENABLED:-true}"
+      QRDX_VALIDATOR_WALLET: "${QRDX_VALIDATOR_WALLET:-/app/data/validator/validator.json}"
+      QRDX_VALIDATOR_LABEL: "${QRDX_VALIDATOR_LABEL:-QRDX Validator}"
+
+  # ---------------------------------------------------------------------------
+  # QRDX Node
+  # ---------------------------------------------------------------------------
+  node:
+    build:
+      context: ".."
+      dockerfile: "docker/Dockerfile"
+    image: qrdx-node:local
+    container_name: qrdx-node-tunnel
+    hostname: node
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks: [qrdx-net]
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+
+    # Loopback-bound on purpose: public reachability comes from the tunnel, not
+    # from an open host port. Drop the 127.0.0.1 prefix only if you deliberately
+    # want the node exposed on the host's LAN address as well.
+    ports:
+      - "127.0.0.1:${QRDX_NODE_PORT:-3007}:${QRDX_NODE_PORT:-3007}"
+
+    volumes:
+      # Named volume only. This stack deliberately has NO host bind mounts: a
+      # bind mount whose source directory does not exist makes Docker create it,
+      # and on Docker Desktop / WSL two services binding the same missing path
+      # race in the bind-mount shim and the stack fails to start. To supply your
+      # own validator wallet, overlay docker-compose.tunnel-wallet.yml.
+      - node-data:/app/data
+
+    environment:
+      NODE_NAME: "node"
+      QRDX_NODE_HOST: "0.0.0.0"
+      QRDX_NODE_PORT: "${QRDX_NODE_PORT:-3007}"
+      QRDX_DATABASE_PATH: "/app/data/qrdx.db"
+      QRDX_NODE_KEY_DIR: "/app/data/keys"
+
+      # The public URL peers should dial. This MUST match the hostname you routed
+      # in the Cloudflare dashboard, or peers will record an address they cannot
+      # reach and this node will look unreachable to the rest of the network.
+      QRDX_SELF_URL: "https://${QRDX_PUBLIC_HOSTNAME:?set QRDX_PUBLIC_HOSTNAME to the hostname you routed to this tunnel, e.g. node.example.com}"
+
+      QRDX_BOOTSTRAP_NODE: "${QRDX_BOOTSTRAP_NODE:-https://node.qrdx.network}"
+      QRDX_CHAIN_ID: "${QRDX_CHAIN_ID:-1}"
+      QRDX_RPC_ENABLED: "${QRDX_RPC_ENABLED:-true}"
+      QRDX_ENABLE_STREAMING: "true"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+
+      # Validator. On by default — set QRDX_VALIDATOR_ENABLED=false for a plain
+      # full node. The wallet is the one validator-init prepared, unless you
+      # point QRDX_VALIDATOR_WALLET at your own file under /app/wallet.
+      QRDX_VALIDATOR_ENABLED: "${QRDX_VALIDATOR_ENABLED:-true}"
+      QRDX_VALIDATOR_WALLET: "${QRDX_VALIDATOR_WALLET:-/app/data/validator/validator.json}"
+      # Accepted by the wallet loader but unused: this wallet format is not
+      # encrypted. See the KEY CUSTODY note in the header.
+      QRDX_VALIDATOR_PASSWORD: "${QRDX_VALIDATOR_PASSWORD:-}"
+      QRDX_RPC_ADMIN_TOKEN: "${QRDX_RPC_ADMIN_TOKEN:-}"
+
+    # Do not start the node until the validator identity exists on the volume.
+    depends_on:
+      validator-init: { condition: service_completed_successfully }
+
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # Cloudflare Tunnel
+  # ---------------------------------------------------------------------------
+  # The image's entrypoint is already `cloudflared --no-autoupdate`, so the
+  # command here is just the subcommand. The token is passed as TUNNEL_TOKEN
+  # rather than `--token` so it does not sit in the container's argv.
+  cloudflared:
+    image: cloudflare/cloudflared:2026.9.1
+    container_name: qrdx-cloudflared
+    restart: unless-stopped
+    networks: [qrdx-net]
+    command: ["tunnel", "run"]
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+
+    environment:
+      TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN:?export CLOUDFLARE_TUNNEL_TOKEN with the token from Cloudflare Zero Trust -> Networks -> Tunnels}"
+      # cloudflared's own metrics + /ready endpoint, reachable from the host at
+      # http://127.0.0.1:2000/ready for debugging.
+      TUNNEL_METRICS: "0.0.0.0:2000"
+      TUNNEL_LOGLEVEL: "${CLOUDFLARE_TUNNEL_LOGLEVEL:-info}"
+
+    ports:
+      - "127.0.0.1:2000:2000"
+
+    # Wait until the node can actually serve chain data before advertising it to
+    # the edge, so the public hostname never briefly serves a dead backend.
+    depends_on:
+      node: { condition: service_healthy }
+
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  node-data:
+
+networks:
+  qrdx-net:
+    driver: bridge

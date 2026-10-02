@@ -25,24 +25,94 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Set,
 # ─────────────────────────────────────────────────────────────────────────────
 # Pub/sub event hub
 # ─────────────────────────────────────────────────────────────────────────────
+# Channels a stream client may subscribe to. Every event names its ``channel`` (block events:
+# "blocks") and may carry a ``key`` (a market id, an address); a subscription to "<channel>"
+# receives every event on it, one to "<channel>:<key>" only that key's. A client that never
+# subscribes receives DEFAULT_CHANNELS — the block feed, exactly as before channels existed.
+DEFAULT_CHANNELS = frozenset({"blocks"})
+STREAM_CHANNELS = frozenset({"blocks", "perp_markets", "perp_book", "perp_events", "perp_account",
+                             "spot_pools", "spot_book", "spot_account", "tokens"})
+# Channels that only make sense for one market / pair / address.
+KEYED_CHANNELS = frozenset({"perp_book", "perp_account", "spot_book", "spot_account"})
+MAX_CHANNELS_PER_CLIENT = 64
+MAX_CHANNEL_LEN = 160
+
+
+def valid_channel(name: Any) -> bool:
+    if not isinstance(name, str) or not name or len(name) > MAX_CHANNEL_LEN:
+        return False
+    base, _, key = name.partition(":")
+    if base not in STREAM_CHANNELS:
+        return False
+    if base in KEYED_CHANNELS and not key:
+        return False                     # a book / account stream is per market or address
+    return all(c.isalnum() or c in "-_:." for c in key)
+
+
+def canonical_channel(name: str) -> str:
+    """The form events are published under: a spot pair in sorted order (token0:token1, as
+    pools and books key it), so either order subscribes to the same book; a token address in
+    lowercase."""
+    base, _, key = name.partition(":")
+    if base == "spot_book" and key.count(":") == 1:
+        a, b = key.split(":")
+        return f"{base}:{min(a, b)}:{max(a, b)}"
+    if base == "tokens" and key:
+        return f"{base}:{key.lower()}"       # token addresses are lowercase
+    return name
+
+
+def event_matches(channels: Set[str], event: Dict[str, Any]) -> bool:
+    channel = event.get("channel", "blocks")
+    if channel in channels:
+        return True
+    key = event.get("key")
+    if key is None:
+        return False
+    return any(f"{channel}:{k}" in channels for k in str(key).split(","))
+
+
 class EventHub:
     """In-process fan-out of realtime events to any number of subscribers (WebSocket/SSE clients).
 
-    Each subscriber gets its own bounded ``asyncio.Queue``; on overflow the OLDEST queued event is
-    dropped so a slow consumer can never grow node memory or back-pressure the publisher."""
+    Each subscriber gets its own bounded ``asyncio.Queue`` and its own channel set (see
+    STREAM_CHANNELS); on overflow the OLDEST queued event is dropped so a slow consumer can never
+    grow node memory or back-pressure the publisher."""
 
     def __init__(self, max_queue: int = 256):
         self._max_queue = max_queue
         self._subs: Set[asyncio.Queue] = set()
+        self._channels: Dict[asyncio.Queue, Set[str]] = {}
         self._dropped = 0
 
-    def subscribe(self) -> asyncio.Queue:
+    def subscribe(self, channels: Optional[Set[str]] = None) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=self._max_queue)
         self._subs.add(q)
+        self._channels[q] = set(channels) if channels else set(DEFAULT_CHANNELS)
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
         self._subs.discard(q)
+        self._channels.pop(q, None)
+
+    def channels(self, q: asyncio.Queue) -> Set[str]:
+        return set(self._channels.get(q, DEFAULT_CHANNELS))
+
+    def set_channels(self, q: asyncio.Queue, channels: Set[str]) -> None:
+        if q in self._subs:
+            self._channels[q] = set(channels)
+
+    def wants(self, channel: str, key: Optional[str] = None) -> bool:
+        """Whether any subscriber would receive an event on ``channel`` (for ``key``) — so a
+        publisher can skip building events nobody listens to."""
+        probe = {"channel": channel, "key": key}
+        return any(event_matches(ch, probe) for ch in self._channels.values())
+
+    def keys(self, channel: str) -> Set[str]:
+        """Every key subscribed to on ``channel`` ("perp_account:0xPQ…" → "0xPQ…")."""
+        prefix = channel + ":"
+        return {c[len(prefix):] for chans in self._channels.values() for c in chans
+                if c.startswith(prefix)}
 
     @property
     def subscriber_count(self) -> int:
@@ -52,20 +122,77 @@ class EventHub:
     def dropped_count(self) -> int:
         return self._dropped
 
-    async def publish(self, event: Dict[str, Any]) -> None:
-        """Fan ``event`` out to every subscriber (drop-oldest on a full queue). Never raises."""
-        for q in list(self._subs):
+    def _offer(self, q: asyncio.Queue, event: Dict[str, Any]) -> None:
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
             try:
+                q.get_nowait()          # drop oldest
+                self._dropped += 1
                 q.put_nowait(event)
-            except asyncio.QueueFull:
-                try:
-                    q.get_nowait()          # drop oldest
-                    self._dropped += 1
-                    q.put_nowait(event)
-                except Exception:
-                    pass
             except Exception:
                 pass
+        except Exception:
+            pass
+
+    def publish_nowait(self, event: Dict[str, Any]) -> None:
+        """Fan ``event`` out to every subscriber whose channels match it (drop-oldest on a full
+        queue). Never raises, never waits."""
+        for q in list(self._subs):
+            if event_matches(self._channels.get(q, DEFAULT_CHANNELS), event):
+                self._offer(q, event)
+
+    async def publish(self, event: Dict[str, Any]) -> None:
+        self.publish_nowait(event)
+
+    def deliver(self, q: asyncio.Queue, event: Dict[str, Any]) -> None:
+        """Send ``event`` to one subscriber only (e.g. the reply to its subscribe request)."""
+        if q in self._subs:
+            self._offer(q, event)
+
+
+def handle_client_frame(hub: EventHub, q: asyncio.Queue, frame: Any) -> Dict[str, Any]:
+    """A stream client's control message → the reply to send it.
+
+    ``{"op": "subscribe" | "unsubscribe" | "set", "channels": [...]}`` adds, removes or replaces
+    channels; ``{"op": "channels"}`` lists them. Unknown channels are refused, and a client may
+    hold at most MAX_CHANNELS_PER_CLIENT."""
+    if not isinstance(frame, dict):
+        return {"type": "error", "error": "expected a JSON object"}
+    op = frame.get("op")
+    current = hub.channels(q)
+    if op == "channels":
+        return {"type": "channels", "channels": sorted(current)}
+    if op not in ("subscribe", "unsubscribe", "set"):
+        return {"type": "error", "error": f"unknown op {op!r}"}
+    requested = frame.get("channels")
+    if isinstance(requested, str):
+        requested = [requested]
+    if not isinstance(requested, list) or not requested:
+        return {"type": "error", "error": "channels must be a non-empty list"}
+    bad = [c for c in requested if not valid_channel(c)]
+    if bad:
+        return {"type": "error", "error": f"invalid channel(s): {bad[:5]}"}
+    requested = [canonical_channel(c) for c in requested]
+    if op == "subscribe":
+        updated = current | set(requested)
+    elif op == "unsubscribe":
+        updated = current - set(requested)
+    else:
+        updated = set(requested)
+    if len(updated) > MAX_CHANNELS_PER_CLIENT:
+        return {"type": "error", "error": f"at most {MAX_CHANNELS_PER_CLIENT} channels"}
+    hub.set_channels(q, updated)
+    return {"type": "subscribed", "channels": sorted(updated)}
+
+
+def parse_channels(spec: Optional[str]) -> Optional[Set[str]]:
+    """A comma-separated channel list (the SSE ``?channels=`` query) → a valid set, or None for
+    the default. Invalid names are dropped; the list is capped."""
+    if not spec:
+        return None
+    chans = [canonical_channel(c.strip()) for c in spec.split(",") if valid_channel(c.strip())]
+    return set(chans[:MAX_CHANNELS_PER_CLIENT]) or None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,7 +338,7 @@ async def chain_event_poller(
                 start = last_height + 1 if last_height >= 0 else tip
                 for h in range(max(start, tip - 63), tip + 1):
                     await hub.publish({
-                        "type": "block", "height": h, "ts": time.time(),
+                        "type": "block", "channel": "blocks", "height": h, "ts": time.time(),
                         "finalized_epoch": int(fin.get("finalized_epoch", -1)) if fin else None,
                     })
                     metrics.inc("qrdx_blocks_streamed_total")
@@ -263,12 +390,17 @@ def sse_frame(event: Dict[str, Any]) -> str:
     return f"data: {json.dumps(event, default=str)}\n\n"
 
 
-async def sse_stream(hub: EventHub, *, keepalive: float = 15.0) -> AsyncIterator[str]:
-    """Yield SSE frames from the hub, with periodic keepalive comments so idle proxies don't cut
-    the connection. Always unsubscribes on exit."""
-    q = hub.subscribe()
+async def sse_stream(hub: EventHub, *, keepalive: float = 15.0,
+                     channels: Optional[Set[str]] = None,
+                     initial: Optional[list] = None) -> AsyncIterator[str]:
+    """Yield SSE frames from the hub for ``channels`` (None: the default block feed) — first any
+    ``initial`` snapshot events — with periodic keepalive comments so idle proxies don't cut the
+    connection. Always unsubscribes on exit."""
+    q = hub.subscribe(channels)
     try:
-        yield sse_frame({"type": "hello", "ts": time.time()})
+        yield sse_frame({"type": "hello", "ts": time.time(), "channels": sorted(hub.channels(q))})
+        for event in initial or ():
+            yield sse_frame(event)
         while True:
             try:
                 event = await asyncio.wait_for(q.get(), timeout=keepalive)

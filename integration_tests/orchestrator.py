@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from integration_tests.config import (
+    ORACLE_FEED_FILE,
     PROJECT_ROOT, TESTNET_DIR, WALLETS_DIR, DATABASES_DIR, CONFIGS_DIR,
     LOGS_DIR, DATA_DIR, GENESIS_FILE,
     CHAIN_ID, NETWORK_NAME, BASE_NODE_PORT, NUM_NODES, NUM_VALIDATORS,
@@ -152,6 +153,9 @@ class TestnetOrchestrator:
         for d in [TESTNET_DIR, WALLETS_DIR, DATABASES_DIR, CONFIGS_DIR, LOGS_DIR, DATA_DIR]:
             os.makedirs(d, exist_ok=True)
 
+        # A fresh run starts with no scripted prices: validators vote only what scenarios set.
+        ORACLE_FEED_FILE.unlink(missing_ok=True)
+
         # Step 1: Generate wallets
         logger.info("\n[1/4] Generating wallets...")
         self.wallets = generate_all_wallets(
@@ -186,6 +190,14 @@ class TestnetOrchestrator:
         logger.info("\nSetup complete!")
         self._print_summary()
 
+    def _stablecoin_address(self) -> str:
+        """The testnet stablecoin's token address: TOKEN_DEPLOY derives it from the issuer, its
+        nonce (0 — the deploy is its first exchange transaction) and the symbol."""
+        from qrdx.exchange.state_manager import ExchangeStateManager
+        from integration_tests.config import STABLECOIN_SYMBOL
+        issuer = self.wallets.get("Stablecoin Issuer", {}).get("address", "")
+        return ExchangeStateManager.derive_token_address(issuer, 0, STABLECOIN_SYMBOL) if issuer else ""
+
     def _create_node_config(self, spec: NodeSpec) -> dict:
         """Create environment variables for a node."""
         # Create key directory
@@ -211,6 +223,23 @@ class TestnetOrchestrator:
             "QRDX_MIN_VALIDATORS": "1",
             "QRDX_CHAIN_ID": str(CHAIN_ID),
             "QRDX_NETWORK_NAME": NETWORK_NAME,
+            # Prices come from the validators' votes (docs/PERPS_CLEARINGHOUSE.md §8): each
+            # validator reads the scripted feed file and attaches its signed vote to the blocks it
+            # proposes. No trusted reporter is configured.
+            "QRDX_ORACLE_REPORTERS": "",
+            "QRDX_ORACLE_FEED": f"file:{ORACLE_FEED_FILE}",
+            # Perps backstop vault: the reporter doubles as the treasury seeder (its vault
+            # deposit is protocol-owned), and deposits unlock after 20 s instead of 4 days so
+            # S19 can redeem within the run. Consensus parameters: same on every node.
+            "QRDX_PERP_VAULT_SEEDERS": self.wallets.get("Oracle Reporter", {}).get("address", ""),
+            "QRDX_PERP_VAULT_LOCKUP_SECONDS": "20",
+            # Funding every minute of block time (production: hourly), so a run sees several.
+            "QRDX_PERP_FUNDING_INTERVAL_SECONDS": "60",
+            # Perps settle in the testnet stablecoin and quote in USD, as production settles in
+            # the bridged stablecoin. The token does not exist until S13 deploys it; its address
+            # is fixed in advance by the issuer's first nonce.
+            "QRDX_PERP_COLLATERAL_TOKEN": self._stablecoin_address(),
+            "QRDX_PERP_QUOTE": "USD",
             "LOG_LEVEL": "DEBUG",
             "PYTHONWARNINGS": "ignore",
             "QRDX_RPC_ENABLED": "true",
@@ -229,6 +258,9 @@ class TestnetOrchestrator:
             # Same value on every node → deterministic scheduling preserved.
             "QRDX_ACTIVATION_DELAY_EPOCHS": "1",
             "QRDX_UNBONDING_PERIOD_EPOCHS": "2",
+            # Withdrawability delay after exit (production 256): long enough to cover the
+            # finality lag, short enough that a soak sees the principal come back.
+            "QRDX_WITHDRAWAL_DELAY_EPOCHS": "4",
             # Operational-readiness: exercise the realtime stream (/ws + /stream) in-suite.
             "QRDX_ENABLE_STREAMING": "true",
         }

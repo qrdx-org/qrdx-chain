@@ -18,6 +18,7 @@ logs/
 ref/
 testnet/
 testnet*
+!docker/testnet-init.py
 *.db
 *.log
 *.env
@@ -34,6 +35,8 @@ testnet*
 *secret_key*
 *_privkey*
 *.keystore
+docker/wallet/
+wallet/
 validator_wallet.json
 slashing_protection.db
 data/

@@ -9,6 +9,22 @@
 
 ---
 
+## 📌 October 2026 — see docs/KNOWN_ISSUES.md for the live register
+
+The open-defect register is now `docs/KNOWN_ISSUES.md`; it supersedes the status sections
+below wherever they differ. Since August, audits and soaks found and fixed (each entry there
+has the mechanism, fix, tests and soak evidence): unlimited QRDX minting through perp
+positions; any validator able to get any other slashed; E-D4 not binding on sync; the proposer
+building blocks mid-rebuild; rebuilds replaying domains out of order; restarts replaying
+exchange state unenforced; exchange rules reading the wall clock; `eth_sendTransaction`
+executing outside consensus; stake forfeiture reading node-local state; fork-choice
+reconciliation failing on most attempts. Perps were then rebuilt Hyperliquid-style
+(docs/PERPS_CLEARINGHOUSE.md) — the "perp margin + PnL" settlement described below belonged to
+the retired engine, which had no counterparty. The spot exchange was audited and fixed (anyone
+could remove anyone's liquidity, failed swaps moved prices for free, order books were not
+committed in the state root, …), tokens became one native standard (docs/NATIVE_TOKENS.md), and
+a token debit whose balance was not preloaded now fails closed instead of going unchecked.
+
 ## 📌 CURRENT STATUS — August 2026 (supersedes the June snapshot below)
 
 The consensus-hardening arc has continued well past the June baseline. The detailed
@@ -80,7 +96,11 @@ external gates, not by remaining protocol code.**
 
 ## ⏳ Remaining — consensus / state
 
-1. **E-D4 sync-path enforcement (settled-state). — ✅ DONE (defense-in-depth) + finding.**
+1. **E-D4 sync-path enforcement. — ✅ DONE, now at the tip too (October 2026).** The finding
+   below led to leaving the churning tip observe-only; that made E-D4 non-binding (a block
+   rejected live re-entered through sync). With rollback rebuilds made exact and the proposer
+   serialized against them, the tip is now enforced — see KNOWN_ISSUES "E-D4 bound nothing".
+   *History:* **E-D4 sync-path enforcement (settled-state). — ✅ DONE (defense-in-depth) + finding.**
    Unblocked once finality became real (item 3 / attestation gossip). The bulk-sync
    path now ENFORCES the unified root for a block at/under the node's `finalized_block_height`
    (`_ED4_ENFORCE_SYNC_FINALIZED=True`): such a block is settled (the reorg guard refuses to
