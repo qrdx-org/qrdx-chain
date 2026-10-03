@@ -67,7 +67,7 @@ class S12ExchangeConsensus(Scenario):
             params={"token0": "qBTC", "token1": "qUSD", "fee_tier": int(FeeTier.MEDIUM),
                     "pool_type": int(PoolType.STANDARD), "initial_sqrt_price": "173.205080756",
                     "stake_amount": "10000"},
-            gas_limit=1_000_000, gas_price=Decimal("1"),
+            gas_limit=1_000_000, gas_price=10**9,
         )
         tx.public_key = key.public_key.to_bytes()
         tx.signature = key.sign(tx.signing_bytes()).to_bytes()

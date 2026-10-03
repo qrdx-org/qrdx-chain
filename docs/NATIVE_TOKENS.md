@@ -6,9 +6,9 @@ Solana or a HIP-1 token on Hyperliquid, a token is data and authorities. Spot po
 books and perps collateral all move native tokens; the code is `qrdx/exchange/tokens.py`.
 
 Status (2026-10-02): the standard is live in consensus (operations, API, CLI, forward ≡ rebuild
-equivalence, integration scenario S20), and web3 wallets read native tokens as ERC-20s (§6).
-Not yet: contracts using native tokens, and retiring the old `qrdx/tokens/qrc20.py` class
-([KNOWN_ISSUES.md](KNOWN_ISSUES.md)).
+equivalence, integration scenario S20), and every native token is an ERC-20 inside the EVM
+(§6) — wallets send it, contracts hold and move it. Not yet: retiring the old
+`qrdx/tokens/qrc20.py` class ([KNOWN_ISSUES.md](KNOWN_ISSUES.md)).
 
 ---
 
@@ -100,32 +100,32 @@ qrdx-wallet token receipt <tx_hash>
 
 Writes accept `--wait` (print the receipt) and `--yes` (no confirmation).
 
-## 6. Web3 wallets: the ERC-20 read view
+## 6. In the EVM: every native token is an ERC-20
 
-A wallet that adds a token by its address (MetaMask's "import token") reads it with `eth_call`:
-`name()`, `symbol()`, `decimals()`, `totalSupply()`, `balanceOf(owner)`,
-`allowance(owner, spender)`. For a native token's address the node answers those from the
-registry and the ledger (`qrdx/exchange/erc20_view.py`), in the token's base units
-(10^-`decimals`, rounded down — the ledger counts 1e-18, so dust below a token's decimals is
-not shown). A `0x` account's balance is its account id's balance; a PQ account's EVM-visible id
-is its derived account id.
+A call to a native token's address runs a precompile over the native ledger
+(`qrdx/contracts/native_token_evm.py`): `name()`, `symbol()`, `decimals()`, `totalSupply()`,
+`balanceOf(owner)`, `allowance(owner, spender)`, `transfer(to, amount)`,
+`approve(spender, amount)`, `transferFrom(from, to, amount)`, with the standard `Transfer` and
+`Approval` logs. There is one ledger and one set of allowances: an `approve` from the EVM is
+the allowance `TOKEN_TRANSFER_FROM` spends, and a balance moved by either side is the other's.
+So a web3 wallet adds the token by its address and sends it like any ERC-20, and contracts —
+DEXes, vaults, escrows — hold and move native tokens.
 
-What it is not:
+* **Units:** the token's base units, 10^-`decimals`; `balanceOf` rounds down (the ledger counts
+  1e-18 for every token, so dust below a token's decimals is neither shown nor movable here).
+* **Accounts:** a `0x` account is its own id; a PQ account's EVM id is its derived account id.
+  A contract's balance is keyed by the contract's address.
+* **Rules:** a frozen account cannot send; a transfer to the zero address, beyond the balance,
+  or beyond the allowance reverts with a reason; QRDX sent with the call, `DELEGATECALL` and
+  writes inside a static call revert.
+* **Consistency:** a transaction's moves are journaled on its EVM state, so a reverted call
+  frame undoes them; a block's moves are written to the ledger only when its EVM section is
+  accepted, and later transactions in the block see earlier ones'.
+* **No code:** `extcodesize` is 0 at a token's address, as at any precompile — call it with the
+  standard interface (which expects return data).
 
-* **Not a write path.** `transfer` / `approve` / `transferFrom` called on a native token revert
-  with a pointer to the exchange operations, and an EVM transaction sent to a native token's
-  address is refused at mempool admission and by `eth_estimateGas` — there is no EVM code
-  there, so it would run as a no-op that still costs gas while the tokens never move.
-* **Not visible to contracts.** The view lives in the RPC layer, not in EVM execution: a
-  contract calling a native token's address sees an empty account.
+## 7. Next
 
-## 7. Next: contracts, and one token system
-
-* **Contracts.** Letting EVM contracts hold and move native tokens means EVM execution reading
-  and writing this ledger synchronously, and undoing a move when an enclosing call reverts. The
-  alternative Hyperliquid's HyperEVM uses is a linked ERC-20 contract per token, with explicit
-  transfers between the two ledgers through a system address at block boundaries — no shared
-  state inside execution. The choice is open.
 * **Retire** `qrdx/tokens/qrc20.py` (used by no consensus path; integration scenarios S05/S06
   still drive it on a scratch database). The simulated EVM exchange precompiles 0x0100–0x0104
   are retired already: reserved, they revert.

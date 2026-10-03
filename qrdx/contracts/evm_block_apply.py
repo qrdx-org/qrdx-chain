@@ -39,6 +39,7 @@ import logging
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 from .evm_mempool import parse_eth_raw_tx, verify_delegated_spend
+from .native_token_evm import CURRENT_SECTION, EvmSection
 from .state import ContractStateManager
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,10 @@ async def produce_block_evm_section(
     if not raw_txs:
         return None, []
 
+    # Fresh reads: other writers (the exchange, withdrawals) changed the database directly.
+    state_manager.reset_cache()
+    section = EvmSection()                 # this section's native token moves, pending
+    token = CURRENT_SECTION.set(section)
     block_snap = await state_manager.snapshot()
     try:
         for i, raw in enumerate(raw_txs):
@@ -88,13 +93,17 @@ async def produce_block_evm_section(
     except Exception:
         await state_manager.revert(block_snap)
         return None, []
+    finally:
+        CURRENT_SECTION.reset(token)
 
     await state_manager.commit(block_height, flush_only=True)
     root = await db.get_account_state_root()
     await db.connection.commit()
     state_manager._dirty_accounts.clear()
     state_manager._dirty_storage.clear()
+    state_manager._destroyed.clear()
     state_manager._snapshots.clear()
+    await section.commit(db)
     return root, list(raw_txs)
 
 
@@ -126,6 +135,7 @@ async def rebuild_account_state_from_chain(
     state_manager._code_cache.clear()
     state_manager._dirty_accounts.clear()
     state_manager._dirty_storage.clear()
+    state_manager._destroyed.clear()
     state_manager._snapshots.clear()
 
     # Phase E (unified ledger): re-seed the genesis allocations that form the
@@ -223,7 +233,11 @@ async def apply_block_evm_section(
         if not ok:
             return False, f"evm tx {i} in block {block_height}: {why}"
 
-    # 2. Block-start snapshot (revert point for reject-on-mismatch).
+    # 2. Block-start snapshot (revert point for reject-on-mismatch), on fresh reads (other
+    #    writers changed the database directly), with a pending section for token moves.
+    state_manager.reset_cache()
+    section = EvmSection()
+    token = CURRENT_SECTION.set(section)
     block_snap = await state_manager.snapshot()
 
     # 3. Replay deterministically, deferring per-tx commits.
@@ -242,6 +256,8 @@ async def apply_block_evm_section(
     except Exception as e:
         await state_manager.revert(block_snap)
         return False, f"evm execution raised in block {block_height}: {e}"
+    finally:
+        CURRENT_SECTION.reset(token)
 
     # 4. Flush-read-decide on a single connection (no competing commit here).
     await state_manager.commit(block_height, flush_only=True)
@@ -254,9 +270,12 @@ async def apply_block_evm_section(
             f"declared {declared_state_root[:16]}..., computed {computed_root[:16]}..."
         )
 
-    # 5. Accept: persist atomically and discard the revert bookkeeping.
+    # 5. Accept: persist atomically and discard the revert bookkeeping; the section's token
+    #    moves go to the ledger (committed with the block).
     await db.connection.commit()
     state_manager._dirty_accounts.clear()
     state_manager._dirty_storage.clear()
+    state_manager._destroyed.clear()
     state_manager._snapshots.clear()
+    await section.commit(db)
     return True, ""

@@ -52,12 +52,12 @@ def _block_section():
         params={"token0": "qBTC", "token1": "qUSD", "fee_tier": int(FeeTier.MEDIUM),
                 "pool_type": int(PoolType.STANDARD), "initial_sqrt_price": "173.205080756",
                 "stake_amount": "10000"},
-        gas_limit=1_000_000, gas_price=Decimal("1")), lpk)
+        gas_limit=1_000_000, gas_price=10**9), lpk)
     order = _sign(ExchangeTransaction(
         op_type=ExchangeOpType.PLACE_ORDER, sender=mk, nonce=0,
         params={"pair": "qBTC:qUSD", "side": "sell", "order_type": "limit",
                 "price": "30000", "amount": "1"},
-        gas_limit=1_000_000, gas_price=Decimal("1")), mk_k)
+        gas_limit=1_000_000, gas_price=10**9), mk_k)
     return [create, order]
 
 

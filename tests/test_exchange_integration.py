@@ -88,7 +88,7 @@ def make_tx(
         nonce=nonce,
         params=params or {},
         gas_limit=gas_limit,
-        gas_price=Decimal("1"),
+        gas_price=10**9,
     )
 
 
@@ -109,12 +109,12 @@ class TestExchangeTransaction:
         tx1 = ExchangeTransaction(
             op_type=ExchangeOpType.SWAP, sender=ALICE, nonce=0,
             params={"token_in": "A", "token_out": "B", "amount_in": "1"},
-            gas_limit=65_000, gas_price=Decimal("1"), timestamp=1000.0,
+            gas_limit=65_000, gas_price=10**9, timestamp=1000.0,
         )
         tx2 = ExchangeTransaction(
             op_type=ExchangeOpType.SWAP, sender=ALICE, nonce=0,
             params={"token_in": "A", "token_out": "B", "amount_in": "1"},
-            gas_limit=65_000, gas_price=Decimal("1"), timestamp=2000.0,
+            gas_limit=65_000, gas_price=10**9, timestamp=2000.0,
         )
         # Timestamp is NOT included in canonical bytes → same hash
         assert tx1.tx_hash() == tx2.tx_hash()
@@ -148,8 +148,9 @@ class TestExchangeTransaction:
     def test_fee_calculation(self):
         tx = make_tx(ExchangeOpType.SWAP, params={"token_in": "A", "token_out": "B", "amount_in": "1"})
         tx.gas_used = 65_000
-        assert tx.fee() == Decimal("65000")
-        assert tx.max_fee() == Decimal("65000")
+        # gas_price is in wei (10**9 = 1 gwei): 65,000 gas costs 0.000065 QRDX
+        assert tx.fee() == Decimal("0.000065")
+        assert tx.max_fee() == Decimal(tx.gas_limit) * 10**9 / Decimal(10**18)
 
     def test_is_exchange_transaction_marker(self):
         tx = make_tx(ExchangeOpType.SWAP, params={"token_in": "A", "token_out": "B", "amount_in": "1"})
@@ -181,7 +182,7 @@ class TestExchangeTransactionValidation:
         tx = ExchangeTransaction(
             op_type=ExchangeOpType.SWAP, sender=ALICE, nonce=0,
             params={"token_in": "A", "token_out": "B", "amount_in": "1"},
-            gas_limit=0, gas_price=Decimal("1"),
+            gas_limit=0, gas_price=10**9,
         )
         with pytest.raises(ValueError, match="Gas limit"):
             tx.validate_basic()
@@ -376,7 +377,7 @@ class TestGasEnforcement:
                 "stake_amount": "10000",
             },
             gas_limit=100,  # way too low for CREATE_POOL
-            gas_price=Decimal("1"),
+            gas_price=10**9,
         )
         result = mgr.process_transaction(tx)
         assert not result.success
@@ -924,7 +925,7 @@ class TestEdgeCases:
         mgr.begin_block(1, 1000.0)
         tx = ExchangeTransaction(
             op_type=ExchangeOpType.SWAP, sender="", nonce=0,
-            params={}, gas_limit=65000, gas_price=Decimal("1"),
+            params={}, gas_limit=65000, gas_price=10**9,
         )
         result = mgr.process_transaction(tx)
         assert not result.success

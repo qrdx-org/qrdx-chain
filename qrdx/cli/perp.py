@@ -65,13 +65,24 @@ def _signer(wallet_file: str):
     return wallet
 
 
-def build_tx(signer, op_name: str, params: Dict[str, Any], nonce: int):
+def build_tx(signer, op_name: str, params: Dict[str, Any], nonce: int,
+             gas_price: Optional[int] = None):
     from qrdx.exchange import ExchangeOpType, ExchangeTransaction
+    price = {} if gas_price is None else {"gas_price": int(gas_price)}   # wei per gas
     tx = ExchangeTransaction(op_type=ExchangeOpType[op_name], sender=signer.address, nonce=nonce,
-                             params=params, gas_limit=1_000_000, gas_price=Decimal("1"))
+                             params=params, gas_limit=1_000_000, **price)
     tx.public_key = signer.public_key
     tx.signature = signer.sign(tx.signing_bytes())
     return tx
+
+
+def _gas_price(node: str) -> Optional[int]:
+    """The node's exchange gas price (wei per gas); None — the built-in floor — if it cannot
+    say (an older node)."""
+    try:
+        return int(rpc(node, "exchange_gasPrice"))
+    except Exception:
+        return None
 
 
 def _send(node: str, wallet_file: str, op_name: str, params: Any, summary: str,
@@ -86,7 +97,7 @@ def _send(node: str, wallet_file: str, op_name: str, params: Any, summary: str,
         click.echo("Cancelled.")
         return None
     nonce = int(rpc(node, "exchange_getNonce", [signer.address]))
-    tx = build_tx(signer, op_name, params, nonce)
+    tx = build_tx(signer, op_name, params, nonce, gas_price=_gas_price(node))
     tx_hash = rpc(node, "exchange_sendTransaction", [tx.to_dict()])
     click.echo(click.style("✓ Submitted", fg="green") + f"  tx {tx_hash}  (nonce {nonce})")
     if not wait:

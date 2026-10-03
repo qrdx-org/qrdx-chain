@@ -9,6 +9,7 @@ from the same views as the REST endpoints (qrdx/exchange/views.py), so all surfa
     exchange_getSigningPayload(tx)          → the exact bytes to sign + the resulting hash
     exchange_getTransactionReceipt(hash)    → the executed result, or null while pending
     exchange_getNonce(address)              → the next exchange nonce
+    exchange_gasPrice()                     → wei per gas to offer (the floor)
     exchange_getTokenBalance(token, addr)   → a token balance (any address form)
     exchange_getTokenAccount(token, addr)   → {balance, frozen}
     exchange_getTokens()   exchange_getToken(token)   exchange_getAllowance(token, owner, spender)
@@ -65,6 +66,12 @@ class ExchangeModule(RPCModule):
     async def getTransactionReceipt(self, tx_hash: str) -> Optional[Dict[str, Any]]:
         from ...exchange import views
         return views.receipt(_manager(), tx_hash)
+
+    @rpc_method
+    async def gasPrice(self) -> int:
+        """The exchange gas price to use, in wei per gas: the consensus floor."""
+        from ... import constants
+        return constants.EXCHANGE_MIN_GAS_PRICE_WEI
 
     @rpc_method
     async def getNonce(self, address: str) -> int:

@@ -157,7 +157,7 @@ def build_vote(wallet, nonce: int, prices: Dict[str, Decimal]):
     tx = ExchangeTransaction(
         op_type=ExchangeOpType.ORACLE_VOTE, sender=wallet.address, nonce=nonce,
         params={"prices": {b: str(p) for b, p in sorted(prices.items())}},
-        gas_limit=100_000, gas_price=Decimal("1"))
+        gas_limit=100_000)                      # gas_price: the floor (default)
     tx.public_key = wallet.public_key
     tx.signature = wallet.sign(tx.signing_bytes())
     return tx

@@ -318,7 +318,7 @@ async def test_forward_and_rebuild_liquidate_identically(monkeypatch):
     def tx(i, op, params):
         addr = keys[i].public_key.to_address()
         t = ExchangeTransaction(op_type=op, sender=addr, nonce=nonces[addr], params=params,
-                                gas_limit=2_000_000, gas_price=D("1"))
+                                gas_limit=2_000_000, gas_price=10**9)
         nonces[addr] += 1
         t.public_key = keys[i].public_key.to_bytes()
         t.signature = keys[i].sign(t.signing_bytes()).to_bytes()
@@ -336,7 +336,8 @@ async def test_forward_and_rebuild_liquidate_identically(monkeypatch):
             if txs:
                 await db.add_block_exchange_txs(bh, encode_exchange_txs(txs))
 
-        await add(0, alloc=[(alice, "3500"), (bob, "1000000")])
+        # every sender pays gas: Alice keeps a little beyond her deposit, the reporter is funded
+        await add(0, alloc=[(alice, "3500.01"), (bob, "1000000"), (rep, "1000")])
         await add(1, [tx(0, ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"}),
                       tx(0, ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": "30000"}),
                       tx(1, ExchangeOpType.PERP_DEPOSIT, {"amount": "3500"}),
@@ -354,7 +355,7 @@ async def test_forward_and_rebuild_liquidate_identically(monkeypatch):
         await db.connection.commit()
         ExchangeStateManager.reset_instance()
         mgr = ExchangeStateManager.get_instance()
-        mgr.enforce_collateral = True
+        BP.apply_enforcement(mgr)                      # the production gates, as the rebuild
         for h in range(1, tip + 1):
             section = await db.get_block_exchange_txs(f"{h:064x}")
             ts = float(int(T0) + 2 * h)

@@ -77,6 +77,11 @@ class ExchangeMempool:
         ok, err = verify_exchange_tx(tx)
         if not ok:
             return False, err
+        # 1b. A gas price of at least the floor (whole wei) — execution refuses anything less.
+        try:
+            tx.validate_fee()
+        except ValueError as e:
+            return False, str(e)
 
         tx_hash = tx.tx_hash()
 

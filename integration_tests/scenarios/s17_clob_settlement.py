@@ -93,7 +93,7 @@ class S17ClobSettlement(Scenario):
 
         def _tx(op, nonce, params):
             return ExchangeTransaction(op_type=op, sender=sender, nonce=nonce,
-                                       params=params, gas_limit=2_000_000, gas_price=Decimal("1"))
+                                       params=params, gas_limit=2_000_000, gas_price=10**9)
 
         base = await self._token_roots(node_urls)
         base_root = next(iter(set(base.values())), None) if base else None

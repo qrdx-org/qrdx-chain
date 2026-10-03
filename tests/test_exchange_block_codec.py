@@ -40,7 +40,7 @@ def _signed_tx(nonce, side="buy", amount="1"):
         params={"pair": "qBTC:qUSD", "side": side, "order_type": "limit",
                 "price": "30000", "amount": amount},
         gas_limit=1_000_000,
-        gas_price=Decimal("1"),
+        gas_price=10**9,
     )
     tx.public_key = key.public_key.to_bytes()
     tx.signature = key.sign(tx.signing_bytes()).to_bytes()

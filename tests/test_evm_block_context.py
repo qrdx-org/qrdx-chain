@@ -69,8 +69,8 @@ def test_block_timestamps_map_to_evm_seconds(value, expected):
 def test_eth_call_uses_the_latest_block():
     from qrdx.node import main as node_main
     src = inspect.getsource(node_main.startup)
-    call = src[src.index("result = evm_executor.call("):]
-    call = call[:call.index(")\n")]
+    call = src[src.index("evm_executor.call("):]
+    call = call[:call.index("), preload=")]
     assert "block_number=max(tip, 1)" in call and "timestamp=_evm_block_timestamp(" in call
 
 

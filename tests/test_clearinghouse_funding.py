@@ -165,7 +165,7 @@ async def test_forward_and_rebuild_pay_the_same_funding(monkeypatch):
     def tx(i, op, params):
         addr = keys[i].public_key.to_address()
         t = ExchangeTransaction(op_type=op, sender=addr, nonce=nonces[addr], params=params,
-                                gas_limit=2_000_000, gas_price=D("1"))
+                                gas_limit=2_000_000, gas_price=10**9)
         nonces[addr] += 1
         t.public_key = keys[i].public_key.to_bytes()
         t.signature = keys[i].sign(t.signing_bytes()).to_bytes()
@@ -183,7 +183,7 @@ async def test_forward_and_rebuild_pay_the_same_funding(monkeypatch):
             if txs:
                 await db.add_block_exchange_txs(bh, encode_exchange_txs(txs))
 
-        await add(0, alloc=[(alice, "100000"), (bob, "100000")])
+        await add(0, alloc=[(alice, "100000"), (bob, "100000"), (rep, "1000")])  # rep pays gas
         await add(1, [tx(0, ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"}),
                       tx(0, ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": "30000"}),
                       tx(1, ExchangeOpType.PERP_DEPOSIT, {"amount": "50000"}),
@@ -203,6 +203,7 @@ async def test_forward_and_rebuild_pay_the_same_funding(monkeypatch):
         ExchangeStateManager.reset_instance()
         mgr = ExchangeStateManager.get_instance()
         mgr.enforce_collateral = True
+        mgr.enforce_fees = BP.ENFORCE_EXCHANGE_FEES          # as the rebuild does
         for h in range(1, tip + 1):
             section = await db.get_block_exchange_txs(f"{h:064x}")
             ts = float(int(T0) + 7 * h)

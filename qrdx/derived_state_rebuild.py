@@ -62,7 +62,7 @@ async def rebuild_derived_state_interleaved(db, evm_state_manager=None, execute_
         ENFORCE_ORDERBOOK_SETTLEMENT,
         ENFORCE_POOL_STAKE,
         ENFORCE_SPOT_SETTLEMENT,
-        ENFORCE_VALIDATOR_STAKE,
+        ENFORCE_VALIDATOR_STAKE, ENFORCE_EXCHANGE_FEES, apply_enforcement,
         decode_exchange_txs,
         flush_exchange_balance_deltas,
         flush_token_balance_deltas,
@@ -82,6 +82,7 @@ async def rebuild_derived_state_interleaved(db, evm_state_manager=None, execute_
         sm._dirty_accounts.clear()
         sm._dirty_storage.clear()
         sm._snapshots.clear()
+        sm._destroyed.clear()
     await db.seed_genesis_account_state()
     await db.connection.commit()
     await db.clear_token_balances()
@@ -91,11 +92,7 @@ async def rebuild_derived_state_interleaved(db, evm_state_manager=None, execute_
     # The forward path's EXACT enforce-flag set. A rebuild running with a different set is
     # this codebase's most-repeated divergence: it accepts an op the network rejected.
     # Guarded by tests/test_reorg_rebuild_equivalence.py::test_rebuild_sets_every_forward_enforce_flag.
-    mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
-    mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
-    mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
-    mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
-    mgr.enforce_validator_stake = ENFORCE_VALIDATOR_STAKE
+    apply_enforcement(mgr)
 
     # Withdrawals already paid, grouped by the block that paid them.
     cur = await db.connection.execute(

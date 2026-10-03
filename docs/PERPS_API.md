@@ -24,7 +24,7 @@ post-quantum (Dilithium / ML-DSA-65) key. A traditional `0x` key cannot sign one
   "nonce": 4,                        // the sender's next EXCHANGE nonce (not its account nonce)
   "params": {"market_id": "BTC-USD-PERP", "side": "buy", "size": "0.5", "price": "65000"},
   "gas_limit": 1000000,
-  "gas_price": "1",
+  "gas_price": "1000000000",         // WEI per gas: at least the floor (exchange_gasPrice)
   "public_key": "<hex>",             // must derive to sender
   "signature": "<hex>"               // over the signing bytes below
 }
@@ -47,7 +47,12 @@ transaction hash (the receipt also returns it).
 
 **Nonce.** `GET /get_exchange_nonce?address=` or `exchange_getNonce`. A transaction that
 executes consumes its nonce whether it succeeds or fails (e.g. an order refused for margin); one
-rejected before execution (bad signature, wrong nonce) does not.
+rejected before execution (bad signature, wrong nonce, under-priced, unaffordable gas) does not.
+
+**Fees.** Gas is priced in wei (1 QRDX = 10^18 wei), at least the floor `exchange_gasPrice`
+returns (1 gwei). Every executed transaction — success or failure — pays its operation's gas ×
+`gas_price` in QRDX, burned (about 0.00004–0.00015 QRDX); the sender needs QRDX for
+`gas_limit × gas_price`, reserved while it runs. The receipt reports `fee` and `gas_price`.
 
 **Signing bytes** — what the signature covers, concatenated:
 
@@ -58,7 +63,7 @@ rejected before execution (bad signature, wrong nonce) does not.
 | `nonce` | 8 bytes, big-endian |
 | `params` | Python `json.dumps(params, sort_keys=True, default=str)` (note the `", "` / `": "` separators) |
 | `gas_limit` | 8 bytes, big-endian |
-| `gas_price` | the decimal string, UTF-8 |
+| `gas_price` | the integer wei amount as a decimal string, UTF-8 (`"1000000000"`) |
 
 The transaction hash is BLAKE2b-256 of the same bytes, in hex. Reproducing the params rendering
 outside Python is error-prone, so the node serves it: **`POST /exchange_signing_payload`** (or

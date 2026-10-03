@@ -67,7 +67,7 @@ ZERO = Decimal("0")
 class ExchangeExecResult:
     """Result of executing a single exchange transaction."""
 
-    __slots__ = ("success", "gas_used", "data", "error", "logs")
+    __slots__ = ("success", "gas_used", "data", "error", "logs", "fee")
 
     def __init__(
         self,
@@ -82,6 +82,7 @@ class ExchangeExecResult:
         self.data = data or {}
         self.error = error
         self.logs = logs or []
+        self.fee = ZERO                  # QRDX paid for gas (burned)
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +227,11 @@ class ExchangeStateManager:
         # enforce_pool_stake this must gate the delta RECORDING, because the shared
         # account_state flush is already enforced for collateral.
         self.enforce_validator_stake: bool = False
+        # Exchange fees: every executed operation pays gas_used × gas_price (wei) in QRDX,
+        # burned like EVM gas. The gas_limit × gas_price maximum is reserved before the
+        # operation runs and the unused part refunded. Like the stake gates it governs the
+        # delta RECORDING (the account_state flush is already enforced for collateral).
+        self.enforce_fees: bool = False
 
         # --- Counters ---
         self._total_swaps: int = 0
@@ -375,6 +381,23 @@ class ExchangeStateManager:
                 error=f"Gas limit too low: need {base_gas}, got {tx.gas_limit}",
             )
 
+        # 3b. Fees: a price of at least the floor, and QRDX for the whole gas limit at that
+        #     price, reserved before the operation runs (so the operation cannot spend it).
+        #     Refused here, an operation is not includable and consumes nothing.
+        reserved = ZERO
+        if self.enforce_fees:
+            try:
+                tx.validate_fee()
+            except ValueError as e:
+                return ExchangeExecResult(success=False, gas_used=0, error=str(e))
+            reserved = tx.max_fee()
+            avail = self.available_balance(tx.sender)
+            if avail is None or avail < reserved:
+                return ExchangeExecResult(
+                    success=False, gas_used=0,
+                    error=f"insufficient QRDX for gas: need {reserved}, available {avail}")
+            self._record_balance_delta(tx.sender, -reserved)
+
         # 4. Execute the operation
         try:
             result = self._execute_op(tx)
@@ -391,10 +414,14 @@ class ExchangeStateManager:
         #    under-gassed — steps 1-3) are not includable and consume nothing.
         self._nonces[tx.sender] = tx.nonce + 1
 
-        # 6. Charge gas
+        # 6. Charge gas: gas_used × gas_price, burned; the rest of the reservation comes back.
         if result.gas_used == 0:
             result.gas_used = base_gas
-        fee = Decimal(result.gas_used) * tx.gas_price
+        tx.gas_used = result.gas_used
+        fee = tx.fee()
+        if self.enforce_fees:
+            self._record_balance_delta(tx.sender, reserved - fee)
+            result.fee = fee
         self._block_fees += fee
 
         # 7. Record for block tracking

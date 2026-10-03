@@ -23,7 +23,7 @@ def _tx(sender, op, **params):
     n = _nonces.get(sender, 0)
     _nonces[sender] = n + 1
     return ExchangeTransaction(op_type=op, sender=sender, nonce=n, params=params,
-                               gas_limit=10_000_000, gas_price=D("1"))
+                               gas_limit=10_000_000, gas_price=10**9)
 
 
 @pytest.fixture
@@ -409,90 +409,52 @@ def test_the_cli_deploys_a_bridge_token_and_renounces_an_authority(monkeypatch, 
     assert r.exit_code == 0 and "5" in r.output and "frozen" in r.output
 
 
-# ── the ERC-20 read view for web3 wallets ──────────────────────────────────
+# ── web3: native tokens are ERC-20s inside the EVM (tests/test_evm_world.py) ──
 
-class _LedgerDB:
-    def __init__(self, balances):
-        self.balances = balances
-
-    async def get_token_balance(self, token_address, address):
-        return self.balances.get((token_address, to_account_id(address)), D(0))
-
-
-def _sel(signature):
-    from eth_utils import keccak
-    return keccak(text=signature)[:4]
-
-
-def _addr_word(address):
-    return bytes(12) + bytes.fromhex(to_account_id(address)[2:])
-
-
-async def test_wallets_read_a_native_token_as_an_erc20(mgr):
-    from eth_abi import decode
-    from qrdx.exchange import erc20_view as V
-    token = deploy(mgr, supply="1234.5678919")          # 6 decimals: dust below 1e-6 hidden
-    assert run(mgr, MINTER, ExchangeOpType.TOKEN_APPROVE, token_address=token, spender=BOB,
-               amount="2.5").success
-    db = _LedgerDB({(token, to_account_id(ALICE)): D("10.0000019")})
-    ask = lambda sig, *words: V.call(db, token.upper().replace("0X", "0x"), _sel(sig) + b"".join(words))
-    assert decode(["string"], await ask("name()")) == ("Quantum USD",)
-    assert decode(["string"], await ask("symbol()")) == ("qUSD",)
-    assert decode(["uint8"], await ask("decimals()")) == (6,)
-    assert decode(["uint256"], await ask("totalSupply()")) == (1234567891,)
-    assert decode(["uint256"], await ask("balanceOf(address)", _addr_word(ALICE))) == (10000001,)
-    assert decode(["uint256"], await ask("balanceOf(address)", _addr_word(BOB))) == (0,)
-    assert decode(["uint256"], await ask("allowance(address,address)", _addr_word(MINTER),
-                                         _addr_word(BOB))) == (2500000,)
-    for sig in ("transfer(address,uint256)", "approve(address,uint256)",
-                "transferFrom(address,address,uint256)"):
-        with pytest.raises(V.NativeTokenCallError, match="exchange transactions"):
-            await ask(sig, bytes(64))
-    with pytest.raises(V.NativeTokenCallError, match="answers name"):
-        await ask("owner()")
-    with pytest.raises(V.NativeTokenCallError, match="malformed"):
-        await ask("balanceOf(address)", b"\x01" * 32)
-    assert await V.call(db, "0x" + "77" * 20, _sel("name()")) is None    # not a native token
-    assert V.revert_data("x")[:4].hex() == "08c379a0"
-
-
-async def test_eth_call_serves_the_view_without_an_evm(mgr):
+async def test_eth_call_reads_a_native_token_through_the_evm(mgr, tmp_path):
+    """MetaMask's import-token reads go through eth_call: the EVM runs the token's precompile
+    over the ledger."""
     from types import SimpleNamespace
     from eth_abi import decode
+    from qrdx.contracts.evm_executor_v2 import QRDXEVMExecutor
+    from qrdx.contracts.state import ContractStateManager
+    from qrdx.database_sqlite import DatabaseSQLite
     from qrdx.rpc.modules.eth import EthModule
     from qrdx.rpc.server import RPCError
     token = deploy(mgr, supply="5")
-    module = EthModule()
-    module.context = SimpleNamespace(db=_LedgerDB({(token, to_account_id(MINTER)): D(5)}),
-                                     state_manager=None, evm_executor=None)
-    out = await module.call({"to": token, "data": "0x" + (_sel("balanceOf(address)") +
-                                                           _addr_word(MINTER)).hex()})
-    assert decode(["uint256"], bytes.fromhex(out[2:])) == (5_000_000,)
-    with pytest.raises(RPCError, match="exchange transactions"):
-        await module.call({"to": token, "data": "0x" + (_sel("transfer(address,uint256)") +
-                                                         bytes(64)).hex()})
-    with pytest.raises(RPCError, match="native token qUSD"):
-        await module.estimateGas({"to": token, "data": "0xa9059cbb" + "00" * 64})
+    db = await DatabaseSQLite.create(db_path=str(tmp_path / "n.db"))
+    try:
+        await db.apply_token_balance_delta(token, MINTER, D("5.0000019"))
+        await db.connection.commit()
+        sm = ContractStateManager(db)
+        module = EthModule()
+        module.context = SimpleNamespace(db=db, state_manager=sm,
+                                         evm_executor=QRDXEVMExecutor(sm))
+        who = to_account_id(MINTER)[2:]
+        out = await module.call({"to": token, "data": "0x70a08231" + "00" * 12 + who})
+        assert decode(["uint256"], bytes.fromhex(out[2:])) == (5_000_001,)   # 6 decimals, floor
+        out = await module.call({"to": token, "data": "0x95d89b41"})
+        assert decode(["string"], bytes.fromhex(out[2:])) == ("qUSD",)
+        with pytest.raises(RPCError, match="execution reverted"):
+            await module.call({"to": token, "data": "0xdeadbeef"})          # not ERC-20
+    finally:
+        await db.close()
 
 
-def test_an_evm_transaction_to_a_native_token_is_refused(mgr):
-    """A wallet's "send token" to a native token's address would run as a no-op that still
-    costs gas while the tokens never moved."""
+def test_the_mempool_admits_a_token_transfer(mgr):
+    """Native tokens move from the EVM now: a wallet's "send token" is an ordinary EVM
+    transaction to the token's address (it used to be refused)."""
     from eth_account import Account
     from eth_utils import to_checksum_address
     from qrdx.contracts.evm_mempool import EVMMempool
     token = deploy(mgr, supply="5")
-    key = "0x" + "11" * 32
-    acct = Account.from_key(key)
     signed = Account.sign_transaction({
         "nonce": 0, "gasPrice": 10 ** 9, "gas": 60_000, "to": to_checksum_address(token),
-        "value": 0,
-        "data": bytes.fromhex("a9059cbb") + bytes(64), "chainId": 1}, key)
+        "value": 0, "data": bytes.fromhex("a9059cbb") + bytes(64), "chainId": 1},
+        "0x" + "11" * 32)
     raw = "0x" + bytes(getattr(signed, "raw_transaction", None) or signed.rawTransaction).hex()
-    mp = EVMMempool(nonce_provider=lambda addr: 0)
-    ok, err, _ = mp.admit(raw)
-    assert not ok and "native token qUSD" in err and mp.size() == 0
-    assert acct.address                                          # (the sender was valid)
+    ok, err, _ = EVMMempool(nonce_provider=lambda addr: 0).admit(raw)
+    assert ok, err
 
 
 # ── fail-closed debits: the preload list covers every debit path ──────────

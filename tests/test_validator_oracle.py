@@ -40,7 +40,7 @@ class Key:
 
     def tx(self, op, params):
         t = ExchangeTransaction(op_type=op, sender=self.addr, nonce=self.nonce, params=params,
-                                gas_limit=2_000_000, gas_price=D("1"))
+                                gas_limit=2_000_000, gas_price=10**9)
         t.public_key = self.key.public_key.to_bytes()
         t.signature = self.key.sign(t.signing_bytes()).to_bytes()
         self.nonce += 1
@@ -254,6 +254,9 @@ async def test_forward_and_rebuild_agree_on_voted_prices(monkeypatch):
                 await db.add_block_exchange_txs(bh, encode_exchange_txs(list(txs)))
 
         await add(0, content=_genesis([(v1.addr, 100), (v2.addr, 100), (v3.addr, 300)]))
+        for i, who in enumerate((v1, v2, v3, rep)):        # QRDX to pay their gas
+            await db.add_transaction(tx_hash=f"alloc{i}", block_hash=f"{0:064x}", tx_hex=json.dumps(
+                {"type": "genesis_allocation", "recipient": who.addr, "amount": "1000"}))
         for h in range(1, 4):                              # quiet blocks before anything
             await add(h)
         await add(4, [rep.tx(ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"})])
@@ -265,8 +268,11 @@ async def test_forward_and_rebuild_agree_on_voted_prices(monkeypatch):
         await add(13)
         tip = 13
 
+        await db.seed_genesis_account_state()
+        await db.connection.commit()
         ExchangeStateManager.reset_instance()
         mgr = ExchangeStateManager.get_instance()
+        BP.apply_enforcement(mgr)                          # the production gates, as the rebuild
         for h in range(1, tip + 1):
             section = await db.get_block_exchange_txs(f"{h:064x}")
             ts = float(T0 + 2 * h)

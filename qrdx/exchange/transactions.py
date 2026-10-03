@@ -24,7 +24,9 @@ Transaction Types:
 Security:
   - All operations are signed by the sender's PQ key (Dilithium)
   - Nonce prevents replay attacks
-  - Gas metering limits execution cost
+  - Gas metering limits execution cost; gas is priced in wei, at least
+    constants.EXCHANGE_MIN_GAS_PRICE_WEI, and every executed operation pays
+    gas_used × gas_price (burned)
   - Deterministic execution — every node produces identical state
 """
 
@@ -39,6 +41,16 @@ from enum import IntEnum
 from typing import Any, Dict, List, Optional
 
 ZERO = Decimal("0")
+
+
+def _min_gas_price() -> int:
+    from .. import constants
+    return constants.EXCHANGE_MIN_GAS_PRICE_WEI
+
+
+def _wei_per_qrdx() -> Decimal:
+    from .. import constants
+    return Decimal(constants.WEI_PER_QRDX)
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +112,7 @@ class ExchangeTransaction:
     nonce: int                          # per-sender monotonic nonce
     params: Dict[str, Any]              # operation-specific parameters
     gas_limit: int = 100_000            # max gas for this operation
-    gas_price: Decimal = Decimal("1")   # gas price in QRDX
+    gas_price: int = field(default_factory=_min_gas_price)   # WEI per gas (1 QRDX = 10^18 wei)
     timestamp: float = 0.0             # submission timestamp
     signature: bytes = b""              # Dilithium signature
     public_key: bytes = b""             # Dilithium public key
@@ -114,6 +126,15 @@ class ExchangeTransaction:
     def __post_init__(self):
         if self.timestamp == 0.0:
             self.timestamp = time.time()
+        # Wei are whole: hold the price as an int, so it hashes and signs as "1000000000"
+        # however the caller wrote it. A fractional price is left as given and refused by
+        # validate_fee.
+        try:
+            d = Decimal(str(self.gas_price))
+            if d == d.to_integral_value():
+                self.gas_price = int(d)
+        except Exception:
+            pass
 
     # -- Hashing ------------------------------------------------------------
 
@@ -209,7 +230,7 @@ class ExchangeTransaction:
             nonce=data["nonce"],
             params=data["params"],
             gas_limit=data.get("gas_limit", 100_000),
-            gas_price=Decimal(data.get("gas_price", "1")),
+            gas_price=data.get("gas_price", _min_gas_price()),
             timestamp=data.get("timestamp", 0.0),
             signature=bytes.fromhex(data["signature"]) if data.get("signature") else b"",
             public_key=bytes.fromhex(data["public_key"]) if data.get("public_key") else b"",
@@ -228,12 +249,20 @@ class ExchangeTransaction:
     # -- Gas ----------------------------------------------------------------
 
     def fee(self) -> Decimal:
-        """Total fee = gas_used * gas_price."""
-        return Decimal(self.gas_used) * self.gas_price
+        """What the executed operation paid, in QRDX: gas_used × gas_price wei."""
+        return Decimal(self.gas_used) * Decimal(self.gas_price) / _wei_per_qrdx()
 
     def max_fee(self) -> Decimal:
-        """Max fee = gas_limit * gas_price."""
-        return Decimal(self.gas_limit) * self.gas_price
+        """The most it can pay, in QRDX: gas_limit × gas_price wei — reserved up front."""
+        return Decimal(self.gas_limit) * Decimal(self.gas_price) / _wei_per_qrdx()
+
+    def validate_fee(self, min_gas_price: Optional[int] = None) -> None:
+        """Raises ValueError unless gas_price is a whole number of wei at or above the floor."""
+        floor = _min_gas_price() if min_gas_price is None else int(min_gas_price)
+        if not isinstance(self.gas_price, int) or isinstance(self.gas_price, bool):
+            raise ValueError(f"gas_price must be a whole number of wei, got {self.gas_price}")
+        if self.gas_price < floor:
+            raise ValueError(f"gas_price {self.gas_price} wei is below the minimum {floor} wei")
 
     # -- Validation ---------------------------------------------------------
 

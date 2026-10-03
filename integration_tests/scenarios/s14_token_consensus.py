@@ -82,7 +82,7 @@ class S14TokenConsensus(Scenario):
             op_type=ExchangeOpType.TOKEN_DEPLOY, sender=sender, nonce=0,
             params={"name": "Quantum Spot", "symbol": symbol,
                     "total_supply": "1000000", "decimals": 18},
-            gas_limit=1_000_000, gas_price=Decimal("1"),
+            gas_limit=1_000_000, gas_price=10**9,
         )
         token_address = ExchangeStateManager.derive_token_address(sender, 0, symbol)
         root_after_deploy = await self._submit_and_wait(
@@ -95,7 +95,7 @@ class S14TokenConsensus(Scenario):
         transfer = ExchangeTransaction(
             op_type=ExchangeOpType.TOKEN_TRANSFER, sender=sender, nonce=1,
             params={"token_address": token_address, "to": recipient, "amount": "1000"},
-            gas_limit=1_000_000, gas_price=Decimal("1"),
+            gas_limit=1_000_000, gas_price=10**9,
         )
         root_after_transfer = await self._submit_and_wait(
             node_urls, target, _sign(transfer), root_after_deploy, "TOKEN_TRANSFER")

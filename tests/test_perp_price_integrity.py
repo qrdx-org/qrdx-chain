@@ -36,7 +36,7 @@ def mgr(monkeypatch):
 def _tx(mgr, op, sender, params):
     return mgr.process_transaction(ExchangeTransaction(
         op_type=op, sender=sender, nonce=mgr._nonces.get(sender, 0), params=params,
-        gas_limit=2_000_000, gas_price=D("1")))
+        gas_limit=2_000_000, gas_price=10**9))
 
 
 def _oracle(mgr, sender, price):

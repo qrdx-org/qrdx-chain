@@ -48,7 +48,7 @@ def _sign(tx, key):
 
 def _tx(op, sender, nonce, params):
     return ExchangeTransaction(op_type=op, sender=sender, nonce=nonce, params=params,
-                               gas_limit=2_000_000, gas_price=Decimal("1"))
+                               gas_limit=2_000_000, gas_price=10**9)
 
 
 async def _add_block(db, height, ex_section=None, genesis_alloc=None):
@@ -118,62 +118,49 @@ async def _build_chain(db, k1, k2):
 
 
 def _set_flags(mgr):
+    """The production enforcement set — through the one function every path uses."""
+    BP.apply_enforcement(mgr)
+
+
+def test_every_path_sets_the_gates_through_one_function():
     """
-    Match the production FORWARD import path's enforcement set — EXACTLY.
-
-    Every flag the forward path sets must be set here, because the whole point of
-    these tests is that the rebuild's flag set equals the forward path's. A flag
-    missing from one side is the divergence bug this file exists to catch (it is how
-    the enforce_spot_settlement asymmetry was found).
-    """
-    mgr.enforce_collateral = BP.ENFORCE_EXCHANGE_COLLATERAL
-    mgr.enforce_spot_settlement = BP.ENFORCE_SPOT_SETTLEMENT
-    mgr.enforce_orderbook_settlement = BP.ENFORCE_ORDERBOOK_SETTLEMENT
-    mgr.enforce_pool_stake = BP.ENFORCE_POOL_STAKE
-    mgr.enforce_validator_stake = BP.ENFORCE_VALIDATOR_STAKE
-
-
-def _forward_flag_names():
-    """The flags the production forward path sets, for the coverage guard below."""
-    return (
-        "enforce_collateral",
-        "enforce_spot_settlement",
-        "enforce_orderbook_settlement",
-        "enforce_pool_stake",
-        "enforce_validator_stake",
-    )
-
-
-def test_rebuild_sets_every_forward_enforce_flag():
-    """
-    Guard against the recurring bug directly: the rebuild must set the SAME flags the
-    forward path does. Reads both source sites rather than behaviour, so a newly added
-    gate that is wired into only one path fails here immediately instead of surfacing as
-    an equal-tip state divergence in a soak.
+    Guard against the recurring bug directly: a gate set on the forward path but not on a
+    rebuild (or the reverse) makes the rebuild accept what the network refused and diverge at
+    equal tip. Every path that runs exchange sections calls ``apply_enforcement`` and assigns
+    no gate itself; and ``apply_enforcement`` sets every ``enforce_*`` gate the manager has, so
+    a new gate cannot be forgotten either.
     """
     import inspect
     import pathlib
     import re
 
     from qrdx import derived_state_rebuild
+    from qrdx.exchange import ExchangeStateManager
 
-    # The forward set is read from the importer itself, so a gate added there and nowhere
-    # else is caught — not just one that is missing from a hardcoded list.
-    main_src = (pathlib.Path(BP.__file__).parents[1] / "node" / "main.py").read_text()
+    root = pathlib.Path(BP.__file__).parents[1]
+    main_src = (root / "node" / "main.py").read_text()
     start = main_src.index("async def _apply_exchange_section_on_import(")
-    body = main_src[start:main_src.index("\nasync def ", start + 1)]
-    forward = set(re.findall(r"mgr\.(enforce_\w+) =", body))
-    assert forward == set(_forward_flag_names()), (
-        f"forward importer sets {sorted(forward)}; update _forward_flag_names")
+    importer = main_src[start:main_src.index("\nasync def ", start + 1)]
+    proposer_src = (root / "validator" / "node_integration.py").read_text()
+    bodies = {
+        "importer": importer,
+        "proposer": proposer_src,
+        "rebuild": inspect.getsource(BP.rebuild_exchange_state_from_chain),
+        "interleaved rebuild": inspect.getsource(
+            derived_state_rebuild.rebuild_derived_state_interleaved),
+    }
+    for name, body in bodies.items():
+        assert "apply_enforcement(mgr)" in body, f"the {name} does not call apply_enforcement"
+        assert not re.findall(r"mgr\.(enforce_\w+) =", body), (
+            f"the {name} sets a gate itself: {re.findall(r'mgr[.](enforce_[a-z_]+) =', body)}")
 
-    for fn in (BP.rebuild_exchange_state_from_chain,
-               derived_state_rebuild.rebuild_derived_state_interleaved):
-        rebuild_src = inspect.getsource(fn)
-        for flag in forward:
-            assert f"mgr.{flag} =" in rebuild_src, (
-                f"{fn.__name__} does not set {flag!r} — a canonical op the forward path "
-                f"rejected could be ACCEPTED on rebuild, diverging the reorged node at "
-                f"equal tip")
+    ExchangeStateManager.reset_instance()
+    try:
+        gates = {k for k in vars(ExchangeStateManager.get_instance()) if k.startswith("enforce_")}
+    finally:
+        ExchangeStateManager.reset_instance()
+    setter = set(re.findall(r"mgr\.(enforce_\w+) =", inspect.getsource(BP.apply_enforcement)))
+    assert setter == gates, f"apply_enforcement misses {gates - setter}, extra {setter - gates}"
 
 
 async def _run_forward(db, tip):

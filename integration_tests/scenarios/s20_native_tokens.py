@@ -35,7 +35,7 @@ class S20NativeTokens(Scenario):
         nonce = (await self._get(target, "/get_exchange_nonce", address=wallet["address"])
                  or {}).get("nonce", 0)
         tx = ExchangeTransaction(op_type=op, sender=wallet["address"], nonce=int(nonce),
-                                 params=params, gas_limit=2_000_000, gas_price=Decimal("1"))
+                                 params=params, gas_limit=2_000_000, gas_price=10**9)
         tx.public_key = key.public_key.to_bytes()
         tx.signature = key.sign(tx.signing_bytes()).to_bytes()
         async with NodeRPCClient(target) as c:
@@ -165,43 +165,69 @@ class S20NativeTokens(Scenario):
         await self._erc20_view(nodes, target, token, holder)
 
     async def _erc20_view(self, nodes, target, token, holder):
-        """Web3 wallets read the token as an ERC-20 — eth_call of decimals() and
-        balanceOf(holder) at its address answers from the ledger on every node — and an EVM
-        transaction sent there is refused instead of running as a gas-burning no-op."""
+        """Native tokens are ERC-20s inside the EVM: a 0x wallet — funded with the token by an
+        exchange transfer — sends it with an ordinary EVM transaction (what a web3 wallet's
+        "send" builds), and every node shows the move through both the native ledger and
+        eth_call's balanceOf."""
         from eth_account import Account
         from eth_utils import to_checksum_address
-        from qrdx.crypto.account_id import to_account_id
+        from qrdx.exchange import ExchangeOpType
+        from integration_tests.tx_sender import _private_key_to_bytes
 
-        holder_id = to_account_id(holder["address"])
-        balance_of = "0x70a08231" + "00" * 12 + holder_id[2:]
-        want = (6, 690 * 10 ** 6)
+        user = self.ctx.wallets.get("Token EVM User")
+        if not user or not user.get("private_key"):
+            self.check(False, "Token EVM User wallet available")
+            return
+        key = _private_key_to_bytes(user["private_key"])
+        user_addr = Account.from_key(key).address
+        recipient = "0x" + "e7" * 20
+        await self._ok(target, holder, ExchangeOpType.TOKEN_TRANSFER, {
+            "token_address": token, "to": user_addr, "amount": "50"},
+            "The holder sends 50 to a 0x wallet")
+
+        async with NodeRPCClient(target) as c:
+            nonce = int(await c.json_rpc("eth_getTransactionCount", [user_addr, "pending"]), 16)
+            chain_id = int(await c.json_rpc("eth_chainId", []), 16)
+            signed = Account.sign_transaction({
+                "nonce": nonce, "gasPrice": 10 ** 9, "gas": 120_000,
+                "to": to_checksum_address(token), "value": 0, "chainId": chain_id,
+                "data": bytes.fromhex("a9059cbb") + bytes(12) + bytes.fromhex(recipient[2:])
+                        + (20 * 10 ** 6).to_bytes(32, "big")}, key)
+            raw = "0x" + bytes(getattr(signed, "raw_transaction", None)
+                               or signed.rawTransaction).hex()
+            tx_hash = await c.json_rpc("eth_sendRawTransaction", [raw])
+            receipt = None
+            for _ in range(60):
+                receipt = await c.json_rpc("eth_getTransactionReceipt", [tx_hash])
+                if receipt:
+                    break
+                await asyncio.sleep(2)
+        self.check(bool(receipt) and int(str(receipt.get("status", "0x0")), 16) == 1,
+                   f"The EVM token transfer executed ({receipt and receipt.get('status')})")
+
+        want = (Decimal(30), Decimal(20), 20 * 10 ** 6)
         reads = {}
-        for url in nodes:
-            try:
-                async with NodeRPCClient(url) as c:
-                    dec = await c.json_rpc("eth_call", [{"to": token, "data": "0x313ce567"},
-                                                        "latest"])
-                    bal = await c.json_rpc("eth_call", [{"to": token, "data": balance_of},
-                                                        "latest"])
-                reads[url] = (int(dec, 16), int(bal, 16))
-            except Exception as e:
-                reads[url] = str(e)[:120]
+        for _ in range(30):
+            reads = {}
+            for url in nodes:
+                u = await self._get(url, "/get_token_balance", token_address=token,
+                                    address=user_addr)
+                r = await self._get(url, "/get_token_balance", token_address=token,
+                                    address=recipient)
+                try:
+                    async with NodeRPCClient(url) as c:
+                        out = await c.json_rpc("eth_call", [{
+                            "to": token, "data": "0x70a08231" + "00" * 12 + recipient[2:]},
+                            "latest"])
+                    erc20 = int(out, 16)
+                except Exception as e:
+                    erc20 = str(e)[:80]
+                if u and r:
+                    reads[url] = (Decimal(u["balance"]), Decimal(r["balance"]), erc20)
+            if len(reads) == len(nodes) and all(v == want for v in reads.values()):
+                break
+            await asyncio.sleep(2)
         agree = sum(1 for v in reads.values() if v == want)
         self.check(agree >= max(2, len(nodes) - 1),
-                   f"eth_call reads the token as an ERC-20: decimals 6, balanceOf(holder) "
-                   f"690·10^6 ({agree}/{len(nodes)}: {reads.get(target)})")
-
-        acct = Account.create()
-        signed = Account.sign_transaction({
-            "nonce": 0, "gasPrice": 10 ** 9, "gas": 60_000, "to": to_checksum_address(token),
-            "value": 0, "data": bytes.fromhex("a9059cbb") + bytes(64), "chainId": 88888},
-            acct.key)
-        raw = "0x" + bytes(getattr(signed, "raw_transaction", None) or signed.rawTransaction).hex()
-        refused = ""
-        try:
-            async with NodeRPCClient(target) as c:
-                await c.json_rpc("eth_sendRawTransaction", [raw])
-        except Exception as e:
-            refused = str(e)
-        self.check("native token" in refused,
-                   f"An EVM transaction to the token's address is refused ({refused[:100]})")
+                   f"Every node shows the EVM move: 30 / 20 natively, balanceOf 20·10^6 "
+                   f"({agree}/{len(nodes)}: {reads.get(target)})")

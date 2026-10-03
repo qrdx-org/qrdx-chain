@@ -54,7 +54,10 @@ class ExchangeJournal:
             self.receipts[tx_hash] = {
                 "tx_hash": tx_hash, **when, "op": tx.op_type.name, "sender": tx.sender,
                 "nonce": tx.nonce, "success": bool(result.success), "error": result.error or "",
-                "gas_used": int(result.gas_used or 0), "data": data,
+                "gas_used": int(result.gas_used or 0),
+                "gas_price": int(getattr(tx, "gas_price", 0) or 0),          # wei per gas
+                "fee": str(getattr(result, "fee", 0) or 0),                    # QRDX, burned
+                "data": data,
             }
             self.receipts.move_to_end(tx_hash)
             while len(self.receipts) > self.max_receipts:

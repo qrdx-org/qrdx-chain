@@ -32,7 +32,7 @@ def _failing_close(nonce, gas_limit=1_000_000):
     """Closing a position that does not exist: well-formed and signed, fails in execution."""
     tx = ExchangeTransaction(op_type=ExchangeOpType.CLOSE_POSITION, sender=SENDER, nonce=nonce,
                              params={"position_id": "nope", "price": "1"},
-                             gas_limit=gas_limit, gas_price=Decimal("1"))
+                             gas_limit=gas_limit, gas_price=10**9)
     tx.public_key = KEY.public_key.to_bytes()
     tx.signature = KEY.sign(tx.signing_bytes()).to_bytes()
     return tx

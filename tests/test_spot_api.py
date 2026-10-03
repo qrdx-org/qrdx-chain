@@ -24,7 +24,7 @@ def _tx(sender, op, params):
     n = _nonces.get(sender, 0)
     _nonces[sender] = n + 1
     return ExchangeTransaction(op_type=op, sender=sender, nonce=n, params=params,
-                               gas_limit=10_000_000, gas_price=D("1"))
+                               gas_limit=10_000_000, gas_price=10**9)
 
 
 @pytest.fixture

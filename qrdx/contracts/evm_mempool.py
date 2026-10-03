@@ -333,16 +333,6 @@ class EVMMempool:
         sender = str(parsed["sender"]).lower()
         nonce = int(parsed["nonce"])
 
-        # A native token's address has no EVM code: a wallet's "send token" there would run as
-        # a no-op that still costs gas while the tokens never move (qrdx/exchange/erc20_view.py).
-        try:
-            from ..exchange.erc20_view import refuse_transaction_to
-            refusal = refuse_transaction_to(parsed.get("to"))
-        except Exception:
-            refusal = None
-        if refusal:
-            return False, refusal, None
-
         # Replay / dedup.
         if tx_hash in self._txs:
             return False, "duplicate: transaction already in mempool", None

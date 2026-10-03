@@ -57,7 +57,7 @@ def _create_pool_tx(sender: str, nonce: int = 0) -> ExchangeTransaction:
             "stake_amount": "10000",
         },
         gas_limit=1_000_000,
-        gas_price=Decimal("1"),
+        gas_price=10**9,
     )
 
 
@@ -141,13 +141,13 @@ class TestExchangeConsensusStateRoot:
                 op_type=ExchangeOpType.PLACE_ORDER, sender=mk, nonce=1,
                 params={"pair": "qBTC:qUSD", "side": "sell",
                         "order_type": "limit", "price": "30000", "amount": "1"},
-                gas_limit=1_000_000, gas_price=Decimal("1"),
+                gas_limit=1_000_000, gas_price=10**9,
             ),
             ExchangeTransaction(
                 op_type=ExchangeOpType.PLACE_ORDER, sender=tk, nonce=0,
                 params={"pair": "qBTC:qUSD", "side": "buy",
                         "order_type": "limit", "price": "30000", "amount": "1"},
-                gas_limit=1_000_000, gas_price=Decimal("1"),
+                gas_limit=1_000_000, gas_price=10**9,
             ),
         ]
 

@@ -30,6 +30,8 @@ import tempfile
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from exchange_fees import fee_of
+
 from eth_account import Account as EthAccount
 
 from qrdx.constants import MIN_VALIDATOR_STAKE
@@ -89,7 +91,7 @@ def _stake_deposit(key, nonce=0):
         op_type=ExchangeOpType.STAKE_DEPOSIT, sender=addr, nonce=nonce,
         params={"validator_public_key": key.public_key.to_hex(),
                 "stake_amount": str(MIN_VALIDATOR_STAKE)},
-        gas_limit=2_000_000, gas_price=Decimal("1"))
+        gas_limit=2_000_000, gas_price=10**9)
     tx.public_key = key.public_key.to_bytes()
     tx.signature = key.sign(tx.signing_bytes()).to_bytes()
     return encode_exchange_txs([tx])
@@ -126,11 +128,8 @@ def _executor(db, sm):
 
 
 def _set_flags(mgr):
-    mgr.enforce_collateral = BP.ENFORCE_EXCHANGE_COLLATERAL
-    mgr.enforce_spot_settlement = BP.ENFORCE_SPOT_SETTLEMENT
-    mgr.enforce_orderbook_settlement = BP.ENFORCE_ORDERBOOK_SETTLEMENT
-    mgr.enforce_pool_stake = BP.ENFORCE_POOL_STAKE
-    mgr.enforce_validator_stake = BP.ENFORCE_VALIDATOR_STAKE
+    """The production enforcement set, through the one function every path uses."""
+    BP.apply_enforcement(mgr)
 
 
 # ── the three paths ───────────────────────────────────────────────────────
@@ -191,6 +190,9 @@ async def _balances(db, *addrs):
 
 # ── chains ────────────────────────────────────────────────────────────────
 
+STAKE_GAS = fee_of(ExchangeOpType.STAKE_DEPOSIT)
+
+
 async def _stake_then_spend_chain(db):
     """Genesis 150k; block 1 stakes 100k; block 2 tries to EVM-spend 120k."""
     key = PQPrivateKey.generate()
@@ -217,8 +219,9 @@ async def test_stake_debit_then_evm_spend_rebuilds_like_forward():
         addr = await _stake_then_spend_chain(db)
         fwd_root = await _forward(db, 2)
         fwd = await _balances(db, addr, RECIPIENT)
-        # Forward semantics: the stake is locked, so the 120k spend cannot be covered.
-        assert fwd == (Decimal("50000"), Decimal("0")), fwd
+        # Forward semantics: the stake is locked (and its gas paid), so the 120k spend
+        # cannot be covered.
+        assert fwd == (Decimal("50000") - STAKE_GAS, Decimal("0")), fwd
 
         assert await _interleaved(db) == fwd_root, "interleaved rebuild diverges from forward"
         assert await _balances(db, addr, RECIPIENT) == fwd
@@ -297,7 +300,7 @@ async def test_interleaved_rebuild_without_evm_orders_exchange_and_withdrawals()
         await _add_block(db, 1)
         await _add_block(db, 2, ex_section=_stake_deposit(key))
         fwd_root = await _forward(db, 2, withdrawals_at={1: [(addr, 3, MIN_VALIDATOR_STAKE)]})
-        assert await db.get_address_balance(addr) == Decimal("10000"), (
+        assert await db.get_address_balance(addr) == Decimal("10000") - STAKE_GAS, (
             "forward: the withdrawal funds the deposit, which then locks it again")
 
         res = await rebuild_derived_state_interleaved(db)
@@ -337,7 +340,7 @@ async def test_the_real_rollback_hook_replays_in_forward_order():
         await _add_block(db, 3)
         paid = {1: [(addr, 3, MIN_VALIDATOR_STAKE)], 3: [(addr, 4, Decimal("5000"))]}
         await _forward(db, 3, withdrawals_at=paid)
-        assert await db.get_address_balance(addr) == Decimal("15000")
+        assert await db.get_address_balance(addr) == Decimal("15000") - STAKE_GAS
 
         await db.remove_blocks(3)
         await db.connection.commit()
@@ -352,8 +355,8 @@ async def test_the_real_rollback_hook_replays_in_forward_order():
         cur = await db.connection.execute(
             "SELECT block_height FROM validator_withdrawals ORDER BY block_height")
         assert [r[0] for r in await cur.fetchall()] == [1], "orphaned withdrawal survived"
-        # 10k genesis + 100k withdrawal − 100k stake: the deposit was accepted again.
-        assert await db.get_address_balance(addr) == Decimal("10000")
+        # 10k genesis + 100k withdrawal − 100k stake − its gas: the deposit was accepted again.
+        assert await db.get_address_balance(addr) == Decimal("10000") - STAKE_GAS
     finally:
         await db.close()
         os.remove(path)

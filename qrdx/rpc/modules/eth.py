@@ -223,6 +223,16 @@ class EthModule(RPCModule):
             )
         return ex
 
+    async def _run_world(self, execute, preload=()):
+        """Run a read-only EVM execution (``execute(world)``) on state loaded on demand —
+        accounts, storage and native token balances (contracts/evm_world.py)."""
+        from ...contracts.evm_world import EvmWorld, run
+        from ...contracts.native_token_evm import TokenWorld
+        evm = self._evm()
+        db = getattr(self.context, "db", None) if self.context else None
+        world = EvmWorld(evm.state_manager, tokens=TokenWorld(db) if db is not None else None)
+        return await run(world, lambda: execute(world), preload=[p for p in preload if p])
+
     def _state(self):
         sm = getattr(self.context, "state_manager", None) if self.context else None
         if not sm:
@@ -1331,26 +1341,15 @@ class EthModule(RPCModule):
         value = _parse_hex_int(value_str)
         gas = _parse_hex_int(gas_str)
 
-        # A native token answers the ERC-20 reads itself (qrdx/exchange/erc20_view.py).
-        from ...exchange import erc20_view
-        db = getattr(self.context, "db", None) if self.context else None
-        if db is not None:
-            try:
-                native = await erc20_view.call(db, to_hex, data)
-            except erc20_view.NativeTokenCallError as e:
-                raise RPCError(RPCErrorCode.EXECUTION_ERROR, f"execution reverted: {e}",
-                               data=encode_hex(erc20_view.revert_data(str(e))))
-            if native is not None:
-                return encode_hex(native)
-
         evm = self._evm()
-        result = evm.call(
+        result = await self._run_world(lambda world: evm.call(
             sender=sender,
             to=to,
             data=data,
             value=value,
             gas=gas,
-        )
+            world=world,
+        ), preload=[sender, to])
 
         if not result.success:
             error_data = encode_hex(result.output) if result.output else None
@@ -1396,11 +1395,6 @@ class EthModule(RPCModule):
                 is_pq = str(tx_type).lower() in (hex(PQ_TX_TYPE), str(PQ_TX_TYPE))
 
         has_data = data_hex and data_hex != "0x" and data_hex != "0x0"
-
-        from ...exchange.erc20_view import refuse_transaction_to
-        refusal = refuse_transaction_to(to_hex)
-        if refusal:
-            raise RPCError(RPCErrorCode.EXECUTION_ERROR, f"execution reverted: {refusal}")
 
         if is_pq:
             # The floor dominates for a PQ transaction (≈145k for a plain transfer), so
@@ -1448,12 +1442,13 @@ class EthModule(RPCModule):
         data = decode_hex(data_hex) if has_data else b""
         value = _parse_hex_int(value_str)
 
-        estimated = evm.estimate_gas(
+        estimated = await self._run_world(lambda world: evm.estimate_gas(
             sender=sender,
             to=to,
             data=data,
             value=value,
-        )
+            world=world,
+        ), preload=[sender, to])
 
         return _to_hex(estimated)
 

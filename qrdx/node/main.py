@@ -1351,7 +1351,6 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
     from eth_keys import keys
     import rlp
     from eth_hash.auto import keccak
-    from ..contracts.state_sync import StateSyncManager, ExecutionContext
 
     evm_executor = EVM_EXECUTOR
     state_manager = EVM_STATE_MANAGER
@@ -1409,44 +1408,52 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
                 "tx_hash": tx_hash_hex, "sender": sender_hex, "nonce": nonce,
             }
 
-    sync_manager = StateSyncManager(db, state_manager)
-    await sync_manager.ensure_tables_exist()
-    context_exec = ExecutionContext(
-        block_height=block_height, block_hash=block_hash, block_timestamp=block_timestamp,
-        db=db, evm_state=state_manager, sync_manager=sync_manager,
-    )
-    await context_exec.prepare_execution(sender_hex)
-    if spend_hex != sender_hex:
-        # Load the delegated source's balance too — the EVM debits it for the transfer.
-        await sync_manager.sync_address_to_evm(
-            address=spend_hex, block_height=block_height, block_hash=block_hash)
-    if to_hex:
-        await sync_manager.sync_address_to_evm(address=to_hex, block_height=block_height, block_hash=block_hash)
+    # The EVM reads state on demand from the state manager (this block's pending changes over
+    # the database) and writes back everything it touched (contracts/evm_world.py). Native
+    # token moves join the block's EvmSection, written to the token ledger only when the
+    # section is accepted (contracts/native_token_evm.py).
+    from ..contracts.evm_world import EvmWorld, run as run_evm
+    from ..contracts.native_token_evm import CURRENT_SECTION, EvmSection, TokenWorld
+    section = CURRENT_SECTION.get()
+    standalone = section is None
+    if standalone:
+        section = EvmSection()
+    await state_manager.get_account(sender_hex)        # the payer is in the cache
+    snap = await state_manager.snapshot()
+    world = EvmWorld(state_manager, tokens=TokenWorld(db, section))
+
+    def _receipt(result, success, error):
+        section.record(
+            tx_hash=tx_hash_hex, block_number=int(block_height or 0), **{"from": sender_hex},
+            to=to_hex, value=value_wei, gas_limit=gas,
+            gas_used=min(gas, max(int(getattr(result, "gas_used", gas) or 0),
+                                  int(parsed.get("intrinsic_gas") or 0))),
+            gas_price=gas_price_wei, nonce=nonce, data=data,
+            contract_address=(encode_hex(result.created_address)
+                              if result is not None and result.created_address else None),
+            success=success, error=error, logs=(result.logs if result is not None else []),
+            timestamp=_evm_block_timestamp(block_timestamp))
 
     try:
         # The EVM moves value from the account named as `sender`, so a delegated spend
-        # runs with the SOURCE as the EVM sender and `origin` kept as the real signer
-        # (so a contract still sees who authorised it via tx.origin). Gas is charged to
-        # the signer separately below, via the ExecutionContext.
-        result = evm_executor.execute(
+        # runs with the SOURCE as the EVM sender and `origin` kept as the real signer (so a
+        # contract still sees who authorised it via tx.origin); the signer — `payer` — pays
+        # the gas and consumes its nonce.
+        result = await run_evm(world, lambda: evm_executor.execute(
             spend_from, to_bytes if to_bytes else None, value_wei, data, gas,
             gas_price_wei,
             origin=sender,
             intrinsic_gas=int(parsed.get("intrinsic_gas") or 0),
             block_number=int(block_height or 1),
             timestamp=_evm_block_timestamp(block_timestamp),
-        )
-        await context_exec.finalize_execution(
-            sender=sender_hex, tx_hash=tx_hash_hex, success=result.success,
-            gas_used=result.gas_used, gas_price=gas_price_wei, value=value_wei,
-            defer_commit=defer_commit,
-        )
+            world=world, payer=sender,
+        ), preload=[sender, spend_from, to_bytes])
+        _receipt(result, result.success, result.error)
         if not result.success:
-            # Re-apply what a failure must still cost. finalize_execution has just
-            # reverted the snapshot, which rolled back the gas charge and nonce bump
-            # along with the state changes; only the state changes should roll back.
-            # Deterministic: every node takes this branch for the same transaction with
-            # the same gas figure, so the account root still agrees.
+            # Undo the state changes but not what a failure must still cost: the gas
+            # charge and the nonce. Deterministic: every node takes this branch for the same
+            # transaction with the same gas figure, so the account root still agrees.
+            await state_manager.revert(snap)
             if _ENFORCE_FAILED_TX_COSTS:
                 await _charge_failed_tx(
                     state_manager, sender_hex, nonce,
@@ -1454,18 +1461,25 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
                     intrinsic=int(parsed.get("intrinsic_gas") or 0),
                     defer_commit=defer_commit,
                 )
+            if not defer_commit:
+                await state_manager.commit(block_height)
             return {"success": False, "error": result.error, "tx_hash": tx_hash_hex,
                     "sender": sender_hex, "nonce": nonce,
                     "gas_charged": min(gas, max(result.gas_used,
                                                 int(parsed.get("intrinsic_gas") or 0)))}
+        section.absorb(result.token_journal or [])
+        if not defer_commit:
+            await state_manager.commit(block_height)
+        if standalone:
+            await section.commit(db)
         created = encode_hex(result.created_address) if result.created_address else None
         EVM_PENDING_NONCE[sender_hex.lower()] = max(EVM_PENDING_NONCE.get(sender_hex.lower(), 0), nonce + 1)
         return {"success": True, "tx_hash": tx_hash_hex, "sender": sender_hex,
                 "nonce": nonce, "created_address": created}
     except Exception as e:
-        await context_exec.finalize_execution(
-            sender=sender_hex, tx_hash=tx_hash_hex, success=False, gas_used=0, gas_price=0, value=0,
-        )
+        logger.error(f"EVM execution of {tx_hash_hex} raised: {e}")
+        await state_manager.revert(snap)
+        _receipt(None, False, str(e))
         # A transaction that raised (out of gas, insufficient funds mid-execution, a VM
         # error) must cost the same as one that reverted — otherwise the cheapest way to
         # spam the network is to make execution throw. The full gas limit is charged, as
@@ -1478,6 +1492,8 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
                 intrinsic=int(parsed.get("intrinsic_gas") or 0),
                 defer_commit=defer_commit,
             )
+        if not defer_commit:
+            await state_manager.commit(block_height)
         return {"success": False, "error": str(e), "tx_hash": tx_hash_hex,
                 "sender": sender_hex, "nonce": nonce}
 
@@ -1533,15 +1549,11 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
         flush_exchange_balance_deltas, flush_token_balance_deltas,
         flush_validator_lifecycle_deltas,
         ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT, ENFORCE_ORDERBOOK_SETTLEMENT,
-        ENFORCE_POOL_STAKE, ENFORCE_VALIDATOR_STAKE,
+        ENFORCE_POOL_STAKE, ENFORCE_VALIDATOR_STAKE, ENFORCE_EXCHANGE_FEES, apply_enforcement,
     )
     from ..exchange.state_manager import ExchangeStateManager
     mgr = ExchangeStateManager.get_instance()
-    mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
-    mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
-    mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
-    mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
-    mgr.enforce_validator_stake = ENFORCE_VALIDATOR_STAKE
+    apply_enforcement(mgr)
     # Phase E: pre-load senders' real QRDX + token balances so the collateral and
     # spot-sufficiency checks can read them during the sync section processing.
     try:
@@ -4081,6 +4093,9 @@ async def startup():
             logger.info("Initializing contract execution system...")
             EVM_STATE_MANAGER = ContractStateManager(db)
             EVM_EXECUTOR = QRDXEVMExecutor(EVM_STATE_MANAGER)
+            # Writers that change account_state directly (the exchange's balance flush,
+            # withdrawals) make the manager forget its cached copy of that account.
+            db.account_write_listeners = [EVM_STATE_MANAGER.invalidate]
             logger.info("✅ Contract system initialized")
         except Exception as e:
             EVM_STATE_MANAGER = EVM_EXECUTOR = None
@@ -4328,19 +4343,15 @@ async def startup():
                 to = to_canonical_address(to_hex)
                 data = decode_hex(data_hex)
 
-                # A native token answers the ERC-20 reads itself (qrdx/exchange/erc20_view.py).
-                from ..exchange import erc20_view
-                try:
-                    native = await erc20_view.call(db, to_hex, data)
-                except erc20_view.NativeTokenCallError as e:
-                    raise Exception(f"Call failed: execution reverted: {e}")
-                if native is not None:
-                    return encode_hex(native)
-                
-                # "latest" semantics: the tip block's number and timestamp, as geth does.
+                # "latest" semantics: the tip block's number and timestamp, as geth does. The
+                # state is loaded on demand, native tokens included (their precompile answers
+                # ERC-20 calls at the token's address); nothing is written.
+                from ..contracts.evm_world import EvmWorld, run as run_evm
+                from ..contracts.native_token_evm import TokenWorld
                 tip = (await db.get_next_block_id()) - 1
                 tip_block = await db.get_block_by_id(tip) if tip >= 0 else None
-                result = evm_executor.call(
+                world = EvmWorld(evm_executor.state_manager, tokens=TokenWorld(db))
+                result = await run_evm(world, lambda: evm_executor.call(
                     sender=sender,
                     to=to,
                     data=data,
@@ -4348,7 +4359,8 @@ async def startup():
                     gas=10000000,
                     block_number=max(tip, 1),
                     timestamp=_evm_block_timestamp((tip_block or {}).get('timestamp')),
-                )
+                    world=world,
+                ), preload=[sender, to])
                 
                 if not result.success:
                     raise Exception(f"Call failed: {result.error}")

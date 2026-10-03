@@ -101,7 +101,7 @@ class S18ClobMatch(Scenario):
 
         def _tx(sender, op, nonce, params):
             return ExchangeTransaction(op_type=op, sender=sender, nonce=nonce,
-                                       params=params, gas_limit=2_000_000, gas_price=Decimal("1"))
+                                       params=params, gas_limit=2_000_000, gas_price=10**9)
 
         addrA = ExchangeStateManager.derive_token_address(m_addr, 0, "qMKA")
         addrB = ExchangeStateManager.derive_token_address(m_addr, 1, "qMKB")

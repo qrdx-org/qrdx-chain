@@ -782,7 +782,15 @@ class DatabaseSQLite:
             ORDER BY address ASC
         """)
         rows = await cursor.fetchall()
-        if not rows:
+        # Contract storage is account state too. The root used to hash only the account rows,
+        # so two nodes whose contracts held different storage agreed on it.
+        cursor = await self.connection.execute("""
+            SELECT contract_address, storage_key, storage_value
+            FROM contract_storage
+            ORDER BY contract_address ASC, storage_key ASC
+        """)
+        storage = await cursor.fetchall()
+        if not rows and not storage:
             return "0" * 128  # BLAKE3-512 width
         import blake3
         hasher = blake3.blake3()
@@ -791,6 +799,8 @@ class DatabaseSQLite:
             hasher.update(
                 f"{addr}:{balance}:{nonce}:{code_hash or ''}:{storage_root or ''}".encode()
             )
+        for addr, key, value in storage:
+            hasher.update(f"s:{addr}:{key}:{value}".encode())
         return hasher.digest(length=64).hex()
 
     async def clear_account_state(self) -> None:
@@ -812,6 +822,13 @@ class DatabaseSQLite:
         """
         await self.connection.execute("DELETE FROM account_state")
         await self.connection.execute("DELETE FROM contract_storage")
+        # The EVM's receipts and logs index (rewritten as the replay re-executes each section,
+        # so an orphaned block's receipts do not survive).
+        for tbl in ("contract_logs", "contract_transactions"):
+            try:
+                await self.connection.execute(f"DELETE FROM {tbl}")
+            except Exception:
+                pass
         for tbl in ("evm_balance_sync_registry", "evm_balance_changes"):
             try:
                 await self.connection.execute(f"DELETE FROM {tbl}")
@@ -835,6 +852,9 @@ class DatabaseSQLite:
             return False
         # Canonical key: a PQ sender's delta lands on the same row the EVM uses.
         address = to_account_id(address)
+        # A cached copy of this account (the EVM's state manager) is now stale.
+        for listener in getattr(self, "account_write_listeners", ()):
+            listener(address)
         cur = await self.connection.execute(
             "SELECT address, balance FROM account_state WHERE LOWER(address) = LOWER(?)",
             (address,),

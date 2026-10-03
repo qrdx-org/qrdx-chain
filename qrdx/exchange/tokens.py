@@ -260,6 +260,19 @@ class TokenRegistry:
         else:
             self.allowance_counts.pop(owner_id, None)
 
+    def set_allowance(self, token: str, owner: str, spender: str, value: Decimal) -> None:
+        """Set an allowance the EVM interface already validated (its ``approve`` /
+        ``transferFrom``, when the block's EVM section is accepted)."""
+        key = (str(token).lower(), account(owner), account(spender))
+        existed = key in self.allowances
+        if value:
+            self.allowances[key] = Decimal(value)
+            if not existed:
+                self._count(key[1], +1)
+        elif existed:
+            del self.allowances[key]
+            self._count(key[1], -1)
+
     def spend_allowance(self, token: str, owner: str, spender: str, value: Decimal) -> Decimal:
         key = (str(token).lower(), account(owner), account(spender))
         have = self.allowances.get(key, ZERO)

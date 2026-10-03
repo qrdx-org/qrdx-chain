@@ -66,10 +66,10 @@ def test_validation_requires_base_token():
     # validate_basic() runs the per-op param checks: missing base_token raises.
     bad = ExchangeTransaction(
         op_type=ExchangeOpType.CREATE_MARKET, sender="0xPQaa", nonce=0,
-        params={}, gas_limit=1_000_000, gas_price=Decimal("1"))
+        params={}, gas_limit=1_000_000, gas_price=10**9)
     with pytest.raises(ValueError):
         bad.validate_basic()
     ok = ExchangeTransaction(
         op_type=ExchangeOpType.CREATE_MARKET, sender="0xPQaa", nonce=0,
-        params={"base_token": "ETH"}, gas_limit=1_000_000, gas_price=Decimal("1"))
+        params={"base_token": "ETH"}, gas_limit=1_000_000, gas_price=10**9)
     assert ok.validate_basic()  # should not raise

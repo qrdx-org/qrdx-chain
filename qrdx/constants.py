@@ -595,6 +595,13 @@ PERP_ORACLE_STALE_SECONDS = int(os.getenv("QRDX_PERP_ORACLE_STALE_SECONDS", "300
 # CONSENSUS parameter; env-overridable only so a fast testnet sees several settlements.
 PERP_FUNDING_INTERVAL_SECONDS = int(os.getenv("QRDX_PERP_FUNDING_INTERVAL_SECONDS", "3600"))
 
+# --- Exchange fees ---
+# Exchange transactions pay gas like EVM ones: gas_price is in WEI (1 QRDX = 10^18 wei), at least
+# this floor (1 gwei, eth_gasPrice's answer). Every executed operation pays gas_used × gas_price
+# in QRDX, and the fee is burned, as EVM gas is. A CONSENSUS parameter.
+EXCHANGE_MIN_GAS_PRICE_WEI = int(os.getenv("QRDX_EXCHANGE_MIN_GAS_PRICE_WEI", "1000000000"))
+WEI_PER_QRDX = 10 ** 18
+
 # --- Finality ---
 ATTESTATION_THRESHOLD = Decimal('0.667')  # 2/3 + 1 of stake for finality
 MIN_ATTESTATION_INCLUSION_DELAY = 1    # Minimum slots before attestation included

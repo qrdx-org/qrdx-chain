@@ -84,7 +84,7 @@ class S13PerpCollateral(Scenario):
         acct = await self._account(target, wallet["address"])
         nonce = acct["exchange_nonce"] if acct else 0
         tx = ExchangeTransaction(op_type=op, sender=wallet["address"], nonce=nonce, params=params,
-                                 gas_limit=2_000_000, gas_price=Decimal("1"))
+                                 gas_limit=2_000_000, gas_price=10**9)
         tx.public_key = key.public_key.to_bytes()
         tx.signature = key.sign(tx.signing_bytes()).to_bytes()
         async with NodeRPCClient(target) as c:

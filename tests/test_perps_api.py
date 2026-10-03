@@ -37,7 +37,7 @@ class Key:
     def tx(self, op, params, nonce=None):
         t = ExchangeTransaction(op_type=op, sender=self.addr,
                                 nonce=self.nonce if nonce is None else nonce, params=params,
-                                gas_limit=2_000_000, gas_price=D("1"))
+                                gas_limit=2_000_000, gas_price=10**9)
         t.public_key = self.key.public_key.to_bytes()
         t.signature = self.key.sign(t.signing_bytes()).to_bytes()
         if nonce is None:

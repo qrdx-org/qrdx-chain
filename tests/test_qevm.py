@@ -712,7 +712,8 @@ class TestExecutorUsesQRDXVM:
         mock_state.get_all_storage_sync = MagicMock(return_value={})
         executor = QRDXEVMExecutor(mock_state)
         assert executor.state_manager is mock_state
-        assert executor.state_root is not None
+        # No state is held between executions: each runs on a world loaded from the manager.
+        assert not hasattr(executor, "state_root") and not hasattr(executor, "state_db")
 
 
 class TestExecutorSimpleStorageContract:

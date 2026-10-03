@@ -72,7 +72,7 @@ def make_tx(sender_addr, op_type, params, nonce, gas_limit=1_000_000):
         nonce=nonce,
         params=params,
         gas_limit=gas_limit,
-        gas_price=Decimal("1"),
+        gas_price=10**9,
     )
 
 

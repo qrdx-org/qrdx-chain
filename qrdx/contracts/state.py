@@ -93,6 +93,9 @@ class ContractStateManager:
         self._snapshots: List[Dict] = []
         self._dirty_accounts: set[str] = set()
         self._dirty_storage: set[Tuple[str, bytes]] = set()
+        # Accounts destroyed (SELFDESTRUCT) since the last commit: their stored slots are
+        # deleted at commit, including slots never loaded into the cache.
+        self._destroyed: set[str] = set()
     
     async def get_account(self, address: str) -> Account:
         """
@@ -277,7 +280,9 @@ class ContractStateManager:
         # Check cache
         if cache_key in self._storage_cache:
             return self._storage_cache[cache_key]
-        
+        if address in self._destroyed:
+            return b'\x00' * 32
+
         # Load from database
         cursor = await self.db.connection.execute(
             """
@@ -312,6 +317,61 @@ class ContractStateManager:
         self._storage_cache[cache_key] = value
         self._dirty_storage.add(cache_key)
     
+    async def get_all_storage(self, address: str, limit: Optional[int] = None
+                              ) -> Optional[Dict[bytes, bytes]]:
+        """Every non-zero slot of ``address`` — the database's, overlaid with this block's
+        pending changes — as {key: value} (32-byte each); None if it holds more than ``limit``
+        (load slot by slot instead). Caches what it reads."""
+        address = to_account_id(address)
+        rows = []
+        if address not in self._destroyed:
+            cursor = await self.db.connection.execute(
+                "SELECT storage_key, storage_value FROM contract_storage WHERE contract_address = ?"
+                + (" LIMIT ?" if limit is not None else ""),
+                (address, limit + 1) if limit is not None else (address,))
+            rows = await cursor.fetchall()
+            if limit is not None and len(rows) > limit:
+                return None
+        out: Dict[bytes, bytes] = {}
+        for key_hex, value_hex in rows:
+            key = bytes.fromhex(key_hex)
+            if (address, key) not in self._storage_cache:
+                self._storage_cache[(address, key)] = bytes.fromhex(value_hex)
+        for (addr, key), value in self._storage_cache.items():
+            if addr == address and value != b'\x00' * 32:
+                out[key] = value
+        return out
+
+    def destroy_sync(self, address: str) -> None:
+        """An account SELFDESTRUCTed: empty it and drop its storage — every slot, loaded or
+        not, is deleted at commit."""
+        address = to_account_id(address)
+        self._accounts_cache[address] = Account(address=address)
+        self._dirty_accounts.add(address)
+        for key in [k for k in self._storage_cache if k[0] == address]:
+            del self._storage_cache[key]
+            self._dirty_storage.discard(key)
+        self._destroyed.add(address)
+
+    def reset_cache(self) -> bool:
+        """Drop the cached accounts and storage (code is content-addressed and stays) so the
+        next reads come from the database — which other writers (the exchange, withdrawals)
+        update directly. Refused (False) while changes are pending."""
+        if self._dirty_accounts or self._dirty_storage or self._destroyed or self._snapshots:
+            return False
+        self._accounts_cache.clear()
+        self._storage_cache.clear()
+        return True
+
+    def invalidate(self, address: str) -> None:
+        """Another writer changed ``address`` in the database: forget a clean cached copy."""
+        try:
+            address = to_account_id(address)
+        except ValueError:
+            return
+        if address not in self._dirty_accounts:
+            self._accounts_cache.pop(address, None)
+
     async def clear_storage(self, address: str) -> None:
         """
         Clear all storage for a contract.
@@ -352,6 +412,7 @@ class ContractStateManager:
             'code': dict(self._code_cache),
             'dirty_accounts': set(self._dirty_accounts),
             'dirty_storage': set(self._dirty_storage),
+            'destroyed': set(self._destroyed),
         }
         self._snapshots.append(snapshot)
         return len(self._snapshots) - 1
@@ -372,6 +433,7 @@ class ContractStateManager:
         self._code_cache = snapshot['code']
         self._dirty_accounts = snapshot['dirty_accounts']
         self._dirty_storage = snapshot['dirty_storage']
+        self._destroyed = snapshot.get('destroyed', set())
         
         # Remove newer snapshots
         self._snapshots = self._snapshots[:snapshot_id]
@@ -396,8 +458,13 @@ class ContractStateManager:
         """
         conn = self.db.connection
 
+        # Destroyed accounts lose every stored slot, before this block's writes land.
+        for address in sorted(self._destroyed):
+            await conn.execute("DELETE FROM contract_storage WHERE contract_address = ?",
+                               (address,))
+
         # Commit account changes
-        for address in self._dirty_accounts:
+        for address in sorted(self._dirty_accounts):
             if address in self._accounts_cache:
                 account = self._accounts_cache[address]
 
@@ -433,8 +500,18 @@ class ContractStateManager:
                         )
                     )
 
+        # The code itself, content-addressed (the account row holds only its hash).
+        for address in sorted(self._dirty_accounts):
+            account = self._accounts_cache.get(address)
+            if account is not None and account.code_hash and account.code_hash in self._code_cache:
+                code = self._code_cache[account.code_hash]
+                await conn.execute(
+                    """INSERT OR IGNORE INTO contract_code
+                       (code_hash, bytecode, deployed_at, deployer, size) VALUES (?, ?, ?, ?, ?)""",
+                    (account.code_hash.hex(), code, block_number, "", len(code)))
+
         # Commit storage changes
-        for (address, key) in self._dirty_storage:
+        for (address, key) in sorted(self._dirty_storage):
             if (address, key) in self._storage_cache:
                 value = self._storage_cache[(address, key)]
 
@@ -469,6 +546,7 @@ class ContractStateManager:
         # Clear dirty sets
         self._dirty_accounts.clear()
         self._dirty_storage.clear()
+        self._destroyed.clear()
         self._snapshots.clear()
 
     async def get_state_root(self) -> bytes:
@@ -593,6 +671,7 @@ class ContractStateManager:
             'code': dict(self._code_cache),
             'dirty_accounts': set(self._dirty_accounts),
             'dirty_storage': set(self._dirty_storage),
+            'destroyed': set(self._destroyed),
         }
         self._snapshots.append(snapshot)
         return len(self._snapshots) - 1
@@ -608,6 +687,7 @@ class ContractStateManager:
         self._code_cache = snapshot['code']
         self._dirty_accounts = snapshot['dirty_accounts']
         self._dirty_storage = snapshot['dirty_storage']
+        self._destroyed = snapshot.get('destroyed', set())
         
         # Remove snapshots after this one
         self._snapshots = self._snapshots[:snapshot_id]

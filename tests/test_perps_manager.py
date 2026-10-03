@@ -32,7 +32,7 @@ class Trader:
 
     def tx(self, op, params):
         tx = ExchangeTransaction(op_type=op, sender=self.addr, nonce=self.nonce, params=params,
-                                 gas_limit=2_000_000, gas_price=D("1"))
+                                 gas_limit=2_000_000, gas_price=10**9)
         tx.public_key = self.key.public_key.to_bytes()
         tx.signature = self.key.sign(tx.signing_bytes()).to_bytes()
         self.nonce += 1

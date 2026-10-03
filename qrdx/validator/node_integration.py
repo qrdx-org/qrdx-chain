@@ -489,15 +489,11 @@ class ValidatorNode:
                                     flush_token_balance_deltas, flush_validator_lifecycle_deltas,
                                     ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT,
                                     ENFORCE_ORDERBOOK_SETTLEMENT, ENFORCE_POOL_STAKE,
-                                    ENFORCE_VALIDATOR_STAKE,
+                                    ENFORCE_VALIDATOR_STAKE, ENFORCE_EXCHANGE_FEES, apply_enforcement,
                                 )
                                 from ..exchange.state_manager import ExchangeStateManager
                                 mgr = ExchangeStateManager.get_instance()
-                                mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
-                                mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
-                                mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
-                                mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
-                                mgr.enforce_validator_stake = ENFORCE_VALIDATOR_STAKE
+                                apply_enforcement(mgr)
                                 # Phase E: pre-load senders' real QRDX + token balances for
                                 # the collateral + spot-sufficiency checks during processing.
                                 await preload_sender_balances(self.db, exchange_txs, mgr)

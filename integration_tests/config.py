@@ -117,6 +117,7 @@ WALLET_ROSTER: List[WalletSpec] = [
     WalletSpec("Token Issuer", "pq", Decimal("1000")),
     WalletSpec("Token Holder", "pq", Decimal("1000")),
     WalletSpec("Token Spender", "pq", Decimal("1000")),
+    WalletSpec("Token EVM User", "traditional", Decimal("1000")),   # sends a token from the EVM
     WalletSpec("CLOB Trader", "pq", VALIDATOR_GENESIS_BALANCE),     # S17
     WalletSpec("CLOB Maker", "pq", VALIDATOR_GENESIS_BALANCE),      # S18
 ]

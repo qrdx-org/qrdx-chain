@@ -123,7 +123,7 @@ class S15SpotSettlement(Scenario):
 
         def _tx(op, nonce, params):
             return ExchangeTransaction(op_type=op, sender=sender, nonce=nonce,
-                                       params=params, gas_limit=2_000_000, gas_price=Decimal("1"))
+                                       params=params, gas_limit=2_000_000, gas_price=10**9)
 
         base = await self._token_roots(node_urls)
         base_root = next(iter(set(base.values())), None) if base else None
@@ -264,7 +264,7 @@ class S15SpotSettlement(Scenario):
             tx = ExchangeTransaction(op_type=ExchangeOpType.REMOVE_LIQUIDITY,
                                      sender=w["address"], nonce=int((nonce or {}).get("nonce", 0)),
                                      params={"pool_id": pool_id, "position_id": position_id},
-                                     gas_limit=2_000_000, gas_price=Decimal("1"))
+                                     gas_limit=2_000_000, gas_price=10**9)
             tx.public_key = key.public_key.to_bytes()
             tx.signature = key.sign(tx.signing_bytes()).to_bytes()
             rec = await self._receipt(target, await self._submit(

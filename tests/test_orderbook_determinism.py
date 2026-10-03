@@ -143,7 +143,7 @@ def test_a_failed_book_operation_leaves_the_book_and_history_unchanged():
         def tx(who, op, params):
             nonces[who] += 1
             return ExchangeTransaction(op_type=op, sender=who, nonce=nonces[who] - 1,
-                                       params=params, gas_limit=10_000_000, gas_price=D("1"))
+                                       params=params, gas_limit=10_000_000, gas_price=10**9)
 
         assert m.process_transaction(tx(ALICE, ExchangeOpType.CREATE_POOL, {
             "token0": T0, "token1": T1, "fee_tier": 3000, "pool_type": "STANDARD",

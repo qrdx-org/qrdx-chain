@@ -19,6 +19,8 @@ import os
 import tempfile
 from decimal import Decimal
 
+from exchange_fees import fee_of
+
 from qrdx.constants import MIN_VALIDATOR_STAKE
 from qrdx.crypto.pq.dilithium import PQPrivateKey
 from qrdx.database_sqlite import DatabaseSQLite
@@ -41,7 +43,7 @@ def _sign(tx, key):
 
 def _tx(op, sender, nonce, params):
     return ExchangeTransaction(op_type=op, sender=sender, nonce=nonce, params=params,
-                              gas_limit=2_000_000, gas_price=Decimal("1"))
+                              gas_limit=2_000_000, gas_price=10**9)
 
 
 async def _add_block(db, height, ex_section=None, genesis_alloc=None):
@@ -61,12 +63,8 @@ async def _add_block(db, height, ex_section=None, genesis_alloc=None):
 
 
 def _set_flags(mgr):
-    """Production forward-path enforcement set."""
-    mgr.enforce_collateral = BP.ENFORCE_EXCHANGE_COLLATERAL
-    mgr.enforce_spot_settlement = BP.ENFORCE_SPOT_SETTLEMENT
-    mgr.enforce_orderbook_settlement = BP.ENFORCE_ORDERBOOK_SETTLEMENT
-    mgr.enforce_pool_stake = BP.ENFORCE_POOL_STAKE
-    mgr.enforce_validator_stake = BP.ENFORCE_VALIDATOR_STAKE
+    """The production enforcement set, through the one function every path uses."""
+    BP.apply_enforcement(mgr)
 
 
 async def _run_forward(db, tip):
@@ -127,9 +125,11 @@ async def test_rebuild_matches_forward_with_staking_deposits():
         forward_rich = await db.get_address_balance(rich_addr)
         forward_poor = await db.get_address_balance(poor_addr)
 
-        # Forward path: the affordable stake is locked, the unaffordable one is not.
-        assert forward_rich == Decimal("1000000") - MIN_VALIDATOR_STAKE
-        assert forward_poor == Decimal("1000"), "a rejected deposit must take nothing"
+        # Forward path: the affordable stake is locked, the unaffordable one is not; both
+        # executed, so both paid their gas.
+        gas = fee_of(ExchangeOpType.STAKE_DEPOSIT)
+        assert forward_rich == Decimal("1000000") - MIN_VALIDATOR_STAKE - gas
+        assert forward_poor == Decimal("1000") - gas, "a rejected deposit takes only its gas"
 
         rebuild_root = await _run_rebuild(db)
 
@@ -203,7 +203,7 @@ async def test_a_deposit_is_still_registered_when_affordable_after_rebuild():
         await _run_forward(db, 1)
         await _run_rebuild(db)
 
-        expected = Decimal("1000000") - MIN_VALIDATOR_STAKE
+        expected = Decimal("1000000") - MIN_VALIDATOR_STAKE - fee_of(ExchangeOpType.STAKE_DEPOSIT)
         assert await db.get_address_balance(addr) == expected, (
             "rebuild applied the stake debit a different number of times than forward")
     finally:

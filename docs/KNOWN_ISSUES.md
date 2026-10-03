@@ -131,57 +131,18 @@ funding paid none (caught by S19's funding check). The duplicate is gone and
   only if it falls under maintenance); after a halt spanning several funding intervals, one is
   paid; anyone may create a market (it trades only once validators price it).
 
-## OPEN — EVM contracts cannot use native tokens; a second, unused token class remains
+## OPEN — A second, unused token class remains
 
-**Severity: high.** What remains of the 2026-10-02 audit of the spot exchange — its first seven
-findings are fixed ([below](#fixed-spot-exchange-liquidity-could-be-stolen-or-lost-pools-moved-for-free-replays-diverged)),
-and the consensus token ledger now has a real token standard
-([NATIVE_TOKENS.md](NATIVE_TOKENS.md): mint and freeze authorities, mint, burn, approvals and
-`transfer_from`, handing over or renouncing an authority, freezing — committed in the state
-roots and covered by the reorg rebuild). Bridge minting of the perps stablecoin is now possible.
+**Severity: low.** What remains of the 2026-10-02 audit of the spot exchange: its spot findings
+are fixed ([below](#fixed-spot-exchange-liquidity-could-be-stolen-or-lost-pools-moved-for-free-replays-diverged)),
+tokens are one native standard ([NATIVE_TOKENS.md](NATIVE_TOKENS.md)) that is also a real ERC-20
+inside the EVM ([below](#fixed-evm-state-lived-in-a-per-node-trie)), and the simulated EVM
+exchange precompiles are retired.
 
-1. **Contracts cannot use native tokens.** Web3 wallets now read native tokens as ERC-20s
-   (`eth_call` of `balanceOf`, `decimals`, … at the token's address answers from the ledger —
-   [NATIVE_TOKENS.md §6](NATIVE_TOKENS.md)), and an EVM transaction sent to a token address is
-   refused rather than run as a gas-burning no-op. But the view is in the RPC layer, not in EVM
-   execution: a contract sees an empty account there, and EVM transactions cannot move native
-   tokens. The two designs (a shared ledger inside execution, or HyperEVM-style linked ERC-20s
-   with block-boundary transfers) are in [NATIVE_TOKENS.md §7](NATIVE_TOKENS.md).
-2. **`qrdx/tokens/qrc20.py` still exists** — an in-memory token class (approvals, permits, bridge
-   mint/burn, freeze) used by no consensus path; integration scenarios S05/S06 drive it on a
-   scratch database. To be retired once nothing needs it.
-3. **Fixed — the EVM exchange precompiles (0x0100–0x0104) were a separate, simulated
-   exchange**: their own pools keyed by symbol strings, no tokens moved, free liquidity, state in
-   no root. Retired: the addresses stay reserved and revert with a reason (a contract written
-   against them fails loudly). `verifyExternalProof` (0x0201) used to return *valid* for any
-   non-zero 32 bytes; it now fails closed until a chain adapter verifies proofs. The cross-chain
-   oracle precompiles remain unfed (`getChainState` returns zeros).
-   (`tests/test_qevm.py::TestRetiredExchangePrecompiles`,
-   `tests/test_cross_chain_shielding.py::TestVerifyExternalProofPrecompile`.)
-
-## OPEN — Exchange operations are free
-
-**Severity: medium (spam vector; no fee market).** Found while auditing
-EXCHANGE_PRODUCTION_READINESS.md item E1.
-
-`ExchangeStateManager.process_transaction` computes `fee = gas_used × gas_price` and adds it
-to `_block_fees`, which is only logged — nothing is ever debited from the sender.
-(`get_validator_fee_share` is exported but never called, so nothing is minted either: the fees
-are simply never collected.) Any account can fill blocks with exchange operations at zero cost.
-
-**Already fixed — replay of a failed operation.** The exchange nonce advanced only on success,
-so one signed failing operation could be re-submitted and re-included indefinitely. It now
-advances once an operation executes, success or failure; transactions rejected before
-execution (malformed, wrong nonce, under-gassed) still consume nothing.
-`tests/test_exchange_nonce_on_failure.py`; soaked (19/19, all four nodes byte-identical at the
-same tip, 8/8 reconciliations converged).
-
-**To close — needs a decision on fee units.** `gas_price` is a Decimal in QRDX per gas and every
-caller passes `1`, so charging as-is would cost 50,000 QRDX for a 50,000-gas operation. Pricing
-in wei per gas (as the EVM does) with a minimum price — e.g. 1 gwei, about 0.00005 QRDX per
-operation — then debiting the fee on every executed operation (burned, or paid to the proposer)
-would close it. Exact-balance assertions in the scenarios and soak checks would then account
-for fees.
+`qrdx/tokens/qrc20.py` still exists — an in-memory token class (approvals, permits, bridge
+mint/burn, freeze) used by no consensus path. The Doomsday trading hook (Whitepaper §9.2) reads
+its per-token flag, and integration scenarios S05/S06 drive it on a scratch database. To retire
+it, give native tokens the Doomsday flag and move S05/S06 onto them.
 
 ---
 
@@ -293,6 +254,10 @@ These are not defects, but they are the reason two real bugs survived a green su
 * **"Balance decreased" is not an amount check.** `s04` asserted only that the sender's
   balance went down and the recipient's went up, so it passed for years while every
   native transfer moved **twice** the value.
+* **An equivalence test with a stand-in executor proves the orchestration, not the
+  execution.** Every EVM rebuild-equivalence test replaced the executor with a few lines that
+  moved a balance, so nothing exercised contract storage — which the real executor never wrote
+  to the database at all. `tests/test_evm_native_token_rebuild.py` drives the real one.
 * **A unit test of an RPC module may not test what the node serves.** `qrdx/node/main.py`
   registers its own `eth_call` and `eth_sendRawTransaction` handlers over `EthModule`'s, so
   module tests passed while the node's `eth_call` refused every standard call. Test what
@@ -342,6 +307,8 @@ These are not defects, but they are the reason two real bugs survived a green su
 | The rollback rebuild replayed state domains out of forward order | [below](#fixed-the-rollback-rebuild-replayed-state-domains-out-of-forward-order) |
 | E-D4 rejected a bad block but kept its effects | [below](#fixed-e-d4-rejected-a-bad-block-but-kept-its-effects) |
 | Block history did not converge — nodes on genuinely different chains | [below](#fixed-block-history-did-not-converge) |
+| EVM state lived in a per-node trie (storage never persisted, third-party payments lost) | [below](#fixed-evm-state-lived-in-a-per-node-trie) |
+| Exchange operations were free | [below](#fixed-exchange-operations-were-free) |
 | `eth_call` failed for every standard web3 client | [below](#fixed-eth_call-failed-for-every-standard-web3-client) |
 | Nodes started from one directory shared peer and DHT state | [below](#fixed-nodes-started-from-the-same-directory-shared-peer-and-dht-state) |
 | Spot exchange: liquidity could be stolen or lost, pools moved for free, replays diverged | [below](#fixed-spot-exchange-liquidity-could-be-stolen-or-lost-pools-moved-for-free-replays-diverged) |
@@ -355,6 +322,94 @@ These are not defects, but they are the reason two real bugs survived a green su
 | Malformed `TOKEN_TRANSFER` recipient burned tokens | same, §1.3(a) |
 
 ---
+
+## FIXED — EVM state lived in a per-node trie
+
+**Severity: critical.** The executor kept its own in-memory state trie. Before a transaction it
+copied in only the sender and the recipient; afterwards it copied back only their balances and
+nonces. So:
+* **contract storage never reached the database** — it lived in that trie, which a restart
+  emptied and a reorg rebuild never cleared (an orphaned block's storage survived);
+* **the account root did not cover storage**: two nodes whose contracts held different storage
+  agreed on it;
+* **a contract's payment to any other account was lost** — the trie held it, the database did
+  not, and the next time that account transacted its stale database balance was copied over it;
+* code a contract created (a factory's child) was not saved, and the account row of a
+  deployed contract held its code hash while the code bytes themselves were never written;
+* the state manager's synchronous reads returned 0 or empty code for anything not cached;
+* SELFDESTRUCT never deleted the account (the executor skips py-evm's transaction
+  finalization, which does that);
+* a delegated (system-wallet) spend charged gas and consumed the nonce of the *source*, not of
+  the signer who authorised it, contrary to its own documented design;
+* **no transaction included through a block had a receipt or logs**: `eth_getTransactionReceipt`
+  and `eth_getLogs` read tables only a legacy RPC path wrote (with topics stored as decimal
+  integers), so a wallet waiting on a receipt waited forever. Found by S20's live EVM transfer.
+
+**Fixed** (`qrdx/contracts/evm_world.py`): every execution — a block's transactions,
+`eth_call`, gas estimation — runs on a fresh state built from what the state manager holds
+(pending block changes over the database). A read of anything not loaded raises `StateMiss`;
+the caller loads it (a contract's whole storage at once when small, otherwise slot by slot)
+and runs again from the start, so the result is what it would have been with everything
+loaded. Afterwards every account and slot the execution touched is written back; commit writes
+storage, code bytes, and deletes a destroyed account's every slot; the account root hashes
+contract storage. Writers that change balances in the database directly (the exchange flush,
+withdrawals) invalidate the cached account, and each EVM section starts from fresh reads.
+Self-destructed accounts are deleted; the signer pays a delegated spend's gas. Each section
+records its transactions' receipts and logs (topics as 32-byte hex) when it is accepted —
+rewritten by a rebuild, orphaned ones cleared with the rest of the EVM state.
+
+**Native tokens are ERC-20s inside the EVM** (`qrdx/contracts/native_token_evm.py`): a call to
+a native token's address runs a precompile over the one native ledger — `balanceOf`, `transfer`,
+`approve`, `transferFrom`, … with `Transfer` / `Approval` logs — so a wallet's "send" works and
+contracts can hold and move native tokens. A transaction's token moves are journaled on its
+state (a reverted frame undoes them), join its block's section overlay (later transactions in
+the block read through it), and reach the token ledger only when the section is accepted. This
+replaces the RPC-only read view and the refusal of EVM transactions to token addresses.
+
+**Verified:** `tests/test_evm_world.py` (storage persists and survives a restart, a contract
+writing another's storage, a payment to a third account kept when that account transacts,
+slot-by-slot loading, SELFDESTRUCT, a reverted transaction writes nothing, a direct database
+write is not shadowed; native tokens read and sent by a wallet, held and moved by a contract,
+undone by a reverting frame, refused when frozen or short, approve/transferFrom through a
+contract, a dropped section moves nothing, a later transaction in a section spends an earlier
+one's delivery); `tests/test_evm_native_token_rebuild.py` drives the node's real executor
+forward and then through the rebuild — token root, account root (with storage), exchange root
+and the receipts (statuses, indexes, created contract, Transfer log) identical. Until now every
+EVM rebuild-equivalence test used a stand-in executor. Live: S20 sends a native token from a 0x
+wallet as an ordinary EVM transaction, gets its receipt, and all four nodes show the move
+natively and through `balanceOf`; 21/21 scenarios, then the fault-injecting soak (a killed node
+re-synced to the tip) — SOAK PASS, no root mismatch, failed execution or receipt error in any
+node's log.
+
+## FIXED — Exchange operations were free
+
+**Severity: medium (spam vector; no fee market).** `process_transaction` computed
+`gas_used × gas_price` and only logged it; nothing was debited, so any account could fill blocks
+with exchange operations at no cost. `gas_price` was a Decimal in QRDX per gas that every caller
+set to 1 — charging it as-is would have cost 50,000 QRDX for a 50,000-gas operation.
+
+**Fixed:** exchange gas is priced like EVM gas, in **wei** per gas (1 QRDX = 10^18 wei), at no
+less than `EXCHANGE_MIN_GAS_PRICE_WEI` (1 gwei, `eth_gasPrice`'s answer; `exchange_gasPrice`
+returns it). Every executed operation — success or failure — pays `gas_used × gas_price` in
+QRDX, **burned** as EVM gas is (about 0.00004–0.00015 QRDX per operation). `gas_limit ×
+gas_price` is reserved before the operation runs, so it cannot spend its own gas, and the rest
+is refunded. An operation priced below the floor or not whole wei, or whose sender cannot cover
+the reservation, is refused before it executes and consumes nothing, nonce included; the
+mempool refuses an under-priced one at admission. Receipts carry `fee` and `gas_price`.
+`tests/test_exchange_fees.py`; soaked with every scenario now paying gas (21/21, SOAK PASS).
+
+**Found on the way: the enforcement gates were set in four places.** The proposer, the
+importer and both rebuilds each set every `enforce_*` gate by hand, and several tests kept their
+own copies of the list — the structure behind this codebase's most repeated divergence (a gate
+on one path and not another makes a rebuild accept what the network refused). They now all call
+one `block_processor.apply_enforcement`, and
+`tests/test_reorg_rebuild_equivalence.py::test_every_path_sets_the_gates_through_one_function`
+requires every path to call it, none to set a gate itself, and the function to cover every gate
+the manager has.
+
+**Already fixed earlier — replay of a failed operation.** The exchange nonce advanced only on
+success, so one signed failing operation could be re-submitted indefinitely; it now advances
+once an operation executes (`tests/test_exchange_nonce_on_failure.py`).
 
 ## FIXED — `eth_call` failed for every standard web3 client
 

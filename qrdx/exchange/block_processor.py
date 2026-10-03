@@ -100,6 +100,27 @@ ENFORCE_POOL_STAKE = True
 # rebuild_exchange_state_from_chain, and tests/test_validator_stake_enforcement.py.
 ENFORCE_VALIDATOR_STAKE = True
 
+# Exchange fees (ExchangeStateManager.enforce_fees): every executed operation pays
+# gas_used × gas_price wei in QRDX, burned; operations priced under
+# constants.EXCHANGE_MIN_GAS_PRICE_WEI, or whose sender cannot cover gas_limit × gas_price, are
+# refused before they execute. Deterministic (a constant floor, balances preloaded on every
+# path); the debit rides the enforced collateral flush. Every path sets it, rebuilds included.
+ENFORCE_EXCHANGE_FEES = True
+
+
+def apply_enforcement(mgr: "ExchangeStateManager") -> None:
+    """Set every consensus enforcement gate exactly as the network runs it. Every path that
+    executes exchange sections — the proposer, each importer, both rebuilds — calls this and sets
+    no gate itself, so a gate cannot be on for one path and off for another: a rebuild that
+    accepts an operation the forward path refused diverges at equal tip, this codebase's most
+    repeated consensus bug. Reads the module's flags at call time (tests patch them)."""
+    mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
+    mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
+    mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
+    mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
+    mgr.enforce_validator_stake = ENFORCE_VALIDATOR_STAKE
+    mgr.enforce_fees = ENFORCE_EXCHANGE_FEES
+
 
 async def ensure_oracle_committee(db, mgr: ExchangeStateManager) -> None:
     """Load the validator oracle's committee from the genesis block's validator set, once per
@@ -551,11 +572,7 @@ async def rebuild_exchange_state_from_chain(
         # reconstructs that same balance, so enforcing here re-accepts it (no false
         # reject) — the flags only make the REJECTIONS match too. Verified by
         # tests/test_reorg_rebuild_equivalence.py.
-        mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
-        mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
-        mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
-        mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
-        mgr.enforce_validator_stake = ENFORCE_VALIDATOR_STAKE
+        apply_enforcement(mgr)
 
     try:
         tip = (await db.get_next_block_id()) - 1
@@ -871,7 +888,6 @@ def build_oracle_update_tx(
         nonce=nonce,
         params={"pair": pair, "price": str(price)},
         gas_limit=20_000,
-        gas_price=Decimal("1"),
     )
 
 

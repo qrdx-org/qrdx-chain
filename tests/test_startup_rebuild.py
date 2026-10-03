@@ -15,6 +15,8 @@ import logging
 import os
 from decimal import Decimal
 
+from exchange_fees import fee_of
+
 from qrdx.crypto.pq.dilithium import PQPrivateKey
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, encode_exchange_txs
 from qrdx.exchange import block_processor as BP
@@ -68,7 +70,8 @@ async def test_restart_reproduces_the_forward_exchange_root(caplog, monkeypatch)
         fwd_account = await db.get_account_state_root()
         fwd_token = await db.get_token_balances_root()
         fwd_balances = (await db.get_address_balance(t1), await db.get_address_balance(t2))
-        assert fwd_balances[1] == Decimal("10"), "forward must reject t2's deposit"
+        assert fwd_balances[1] == Decimal("10") - fee_of(ExchangeOpType.PERP_DEPOSIT), (
+            "forward must reject t2's deposit (it pays only its gas)")
 
         with caplog.at_level(logging.INFO):
             restart_exchange = await _restart(db)

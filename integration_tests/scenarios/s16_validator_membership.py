@@ -104,7 +104,7 @@ class S16ValidatorMembership(Scenario):
 
         def _signed(op_type, params, nonce):
             tx = ExchangeTransaction(op_type=op_type, sender=new_val, nonce=nonce,
-                                     params=params, gas_limit=1_000_000, gas_price=Decimal("1"))
+                                     params=params, gas_limit=1_000_000, gas_price=10**9)
             tx.public_key = key.public_key.to_bytes()
             tx.signature = key.sign(tx.signing_bytes()).to_bytes()
             return tx.to_hex()
