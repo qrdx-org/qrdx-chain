@@ -29,6 +29,12 @@ services:
     volumes:
       - ${QRDX_VALIDATOR_WALLET_DIR:?set QRDX_VALIDATOR_WALLET_DIR to an EXISTING host directory holding your validator wallet}:/app/wallet:ro
 
+  # genesis-init reads the wallet's address and public key to make it the genesis
+  # validator, so it needs the same mount.
+  genesis-init:
+    volumes:
+      - ${QRDX_VALIDATOR_WALLET_DIR:?set QRDX_VALIDATOR_WALLET_DIR to an EXISTING host directory holding your validator wallet}:/app/wallet:ro
+
   node:
     volumes:
       - ${QRDX_VALIDATOR_WALLET_DIR:?set QRDX_VALIDATOR_WALLET_DIR to an EXISTING host directory holding your validator wallet}:/app/wallet:ro

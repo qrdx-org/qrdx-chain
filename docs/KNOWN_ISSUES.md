@@ -323,6 +323,23 @@ These are not defects, but they are the reason two real bugs survived a green su
 
 ---
 
+## FIXED — A rolled-back block's EVM receipts outlived it
+
+**Severity: medium (wrong answers to wallets, not consensus).** `remove_blocks` dropped the
+removed blocks and their exchange / EVM sections but left their rows in `contract_transactions`
+and `contract_logs`. A transaction that existed only on the abandoned branch kept answering
+`eth_getTransactionReceipt` and `eth_getLogs` as if it had executed; one included again at a
+different height on the new branch had its receipt overwritten, but the orphan's logs could
+linger.
+
+**Fixed (2026-10-06):** `remove_blocks` deletes the receipts and logs at and above the cut
+height, and cuts the new transaction index (`qrdx/tx_index.py`) with them; a block applied on
+the new branch writes its own. The index additionally re-checks the block hashes it indexed
+near the tip, so a branch switch that did not go through `remove_blocks` re-indexes too
+(`tests/test_tx_index.py::test_a_reorg_cuts_the_index_and_reindexes`).
+
+---
+
 ## FIXED — EVM state lived in a per-node trie
 
 **Severity: critical.** The executor kept its own in-memory state trie. Before a transaction it

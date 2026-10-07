@@ -1099,7 +1099,7 @@ class _ExchangeRPCContext:
         return _get_exchange_submitter()
 
 
-from qrdx.rpc.modules.exchange import ExchangeModule, PerpModule
+from qrdx.rpc.modules.exchange import ExchangeModule, MarketModule, PerpModule
 
 exchange_rpc_module = ExchangeModule()
 exchange_rpc_module.context = _ExchangeRPCContext()
@@ -1107,6 +1107,13 @@ rpc_server.register_module(exchange_rpc_module)
 perp_rpc_module = PerpModule()
 perp_rpc_module.context = _ExchangeRPCContext()
 rpc_server.register_module(perp_rpc_module)
+market_rpc_module = MarketModule()
+market_rpc_module.context = _ExchangeRPCContext()
+rpc_server.register_module(market_rpc_module)
+from qrdx.rpc.modules.history import HistoryModule
+history_rpc_module = HistoryModule()
+history_rpc_module.context = _ExchangeRPCContext()
+rpc_server.register_module(history_rpc_module)
 
 @app.post("/rpc")
 async def rpc_endpoint(body: dict = Body(...)):
@@ -1420,7 +1427,7 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
         section = EvmSection()
     await state_manager.get_account(sender_hex)        # the payer is in the cache
     snap = await state_manager.snapshot()
-    world = EvmWorld(state_manager, tokens=TokenWorld(db, section))
+    world = EvmWorld(state_manager, tokens=TokenWorld(db, section, height=block_height))
 
     def _receipt(result, success, error):
         section.record(
@@ -4238,6 +4245,18 @@ async def startup():
     except Exception as e:
         logger.warning(f"Could not start observability poller: {e}")
 
+    # ---- Transaction index (qrdx/tx_index.py): wallet history + latest transactions ----
+    if os.getenv("QRDX_TX_INDEX", "1").strip().lower() not in ("0", "false", "no", "off"):
+        try:
+            from qrdx.exchange import ExchangeStateManager
+            from qrdx.tx_index import tx_index_poller
+            app.state.tx_index_task = asyncio.create_task(tx_index_poller(
+                lambda: db, block_processing_lock,
+                get_journal=lambda: ExchangeStateManager.get_instance().journal, interval=1.0))
+            logger.info("✅ Transaction indexer scheduled")
+        except Exception as e:
+            logger.warning(f"Could not start the transaction indexer: {e}")
+
     # ---- Wire module-level RPC server into app.state ----
     app.state.dht_rpc_module = dht_rpc_module
     app.state.rpc_server = rpc_server
@@ -4938,11 +4957,107 @@ async def get_spot_orderbook(pair: str, depth: int = Query(default=20, ge=1, le=
     return {'ok': True, 'result': book}
 
 
+@app.get("/get_nft_collections")
+async def get_nft_collections():
+    """Every native NFT collection: metadata, size, royalties, authorities."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.nft_collections(ExchangeStateManager.get_instance())}
+
+
+@app.get("/get_nft_collection")
+async def get_nft_collection(collection: str):
+    from qrdx.exchange import ExchangeStateManager, views
+    found = views.nft_collection(ExchangeStateManager.get_instance(), collection)
+    if found is None:
+        return {'ok': False, 'error': f'collection {collection} not found'}
+    return {'ok': True, 'result': found}
+
+
+@app.get("/get_nft")
+async def get_nft(collection: str, token_id: str):
+    """One NFT: its owner, metadata uri, name, approval, and its collection's royalties."""
+    from qrdx.exchange import ExchangeStateManager, views
+    found = views.nft(ExchangeStateManager.get_instance(), collection, token_id)
+    if found is None:
+        return {'ok': False, 'error': f'NFT {collection} #{token_id} not found'}
+    return {'ok': True, 'result': found}
+
+
+@app.get("/get_nfts")
+async def get_nfts(owner: str, collection: Optional[str] = None,
+                   limit: int = Query(default=500, ge=1, le=5000)):
+    """An owner's NFTs (its 0x or 0xPQ address), every collection or one."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.nfts_of(ExchangeStateManager.get_instance(), owner,
+                                                collection, limit)}
+
+
 @app.get("/get_spot_orders")
 async def get_spot_orders(address: str):
     """An address's resting spot orders, every pair."""
     from qrdx.exchange import ExchangeStateManager, views
     return {'ok': True, 'result': views.spot_open_orders(ExchangeStateManager.get_instance(), address)}
+
+
+# ── market data: one shape for spot pairs and perps markets (docs/PERPS_API.md §8) ──
+
+@app.get("/get_markets")
+async def get_markets(kind: Optional[str] = None):
+    """Every market's ticker — spot pairs (order book and/or AMM pools) and perps markets:
+    top of book, last price, 24h open/high/low/change/volume. ``kind`` = spot | perp."""
+    from qrdx.exchange import ExchangeStateManager, views
+    return {'ok': True, 'result': views.market_tickers(ExchangeStateManager.get_instance(), kind)}
+
+
+@app.get("/get_ticker")
+async def get_ticker(market: str):
+    """One market's ticker. ``market`` is a spot pair ``base:quote`` (addresses, unique
+    symbols or QRDX, either order) or a perps market id."""
+    from qrdx.exchange import ExchangeStateManager, views
+    found = views.market_ticker(ExchangeStateManager.get_instance(), market)
+    if found is None:
+        return {'ok': False, 'error': f'no market {market}'}
+    return {'ok': True, 'result': found}
+
+
+@app.get("/get_orderbook")
+async def get_orderbook(market: str, depth: int = Query(default=50, ge=1, le=1000),
+                        level: int = Query(default=2, ge=2, le=3)):
+    """A market's order book: level 2 = price levels with running base/quote totals, level 3 =
+    every resting order per level in time priority; plus best bid/ask, spread (and in bps),
+    mid, last price, the block height it reflects and, for a spot pair, its AMM pools."""
+    from qrdx.exchange import ExchangeStateManager, views
+    found = views.market_book(ExchangeStateManager.get_instance(), market, depth, level)
+    if found is None:
+        return {'ok': False, 'error': f'no market {market}'}
+    return {'ok': True, 'result': found}
+
+
+@app.get("/get_trades")
+async def get_trades(market: str, limit: int = Query(default=100, ge=1, le=1000),
+                     since: Optional[int] = None):
+    """A market's recent trades, oldest first — order-book fills, AMM swaps, perps fills — with
+    the taker's side and the transaction. ``since`` (a trade ``seq``) returns only newer ones."""
+    from qrdx.exchange import ExchangeStateManager, views
+    found = views.market_trades(ExchangeStateManager.get_instance(), market, limit, since)
+    if found is None:
+        return {'ok': False, 'error': f'no market {market}'}
+    return {'ok': True, 'result': found}
+
+
+@app.get("/get_candles")
+async def get_candles(market: str, interval: str = "1m",
+                      limit: int = Query(default=200, ge=1, le=1500), end: Optional[float] = None):
+    """OHLCV candles by block time (1m 5m 15m 1h 4h 1d)."""
+    from qrdx.exchange import ExchangeStateManager, views
+    try:
+        found = views.market_candles(ExchangeStateManager.get_instance(), market, interval,
+                                     limit, end)
+    except ValueError as e:
+        return {'ok': False, 'error': str(e)}
+    if found is None:
+        return {'ok': False, 'error': f'no market {market}'}
+    return {'ok': True, 'result': found}
 
 
 @app.get("/get_perp_market")
@@ -5962,6 +6077,56 @@ async def get_address_info(
             media_type="application/json"
         )
     return result
+
+
+# ── transaction history (qrdx/tx_index.py) ───────────────────────────────
+
+def _history_kinds(kinds: Optional[str]):
+    return [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+
+
+@app.get("/get_address_history")
+@limiter.limit("8/second")
+async def get_address_history(request: Request, address: str,
+                              limit: int = Query(default=50, ge=1, le=500),
+                              cursor: Optional[str] = None, kinds: Optional[str] = None):
+    """Everything an address did or received — legacy transfers, exchange operations (token
+    moves, swaps, orders and the fills of its resting orders, pools, perps, staking), EVM
+    transactions and the token transfers they emitted — newest first, with each transaction's
+    status, fee and the address's roles. ``0x`` and ``0xPQ`` forms of an account share one
+    history. Page with ``cursor`` (the previous page's ``next_cursor``); ``kinds`` filters
+    (comma-separated: genesis, transfer, coinbase, exchange, evm)."""
+    from qrdx import tx_index
+    try:
+        return {'ok': True, 'result': await tx_index.history(
+            db, address, limit=limit, cursor=cursor, kinds=_history_kinds(kinds))}
+    except ValueError as e:
+        return {'ok': False, 'error': str(e)}
+
+
+@app.get("/get_latest_transactions")
+@limiter.limit("8/second")
+async def get_latest_transactions(request: Request, limit: int = Query(default=50, ge=1, le=500),
+                                  cursor: Optional[str] = None, kinds: Optional[str] = None):
+    """The chain's latest transactions of every kind, newest first (paged like
+    ``/get_address_history``)."""
+    from qrdx import tx_index
+    try:
+        return {'ok': True, 'result': await tx_index.recent(
+            db, limit=limit, cursor=cursor, kinds=_history_kinds(kinds))}
+    except ValueError as e:
+        return {'ok': False, 'error': str(e)}
+
+
+@app.get("/get_indexed_transaction")
+async def get_indexed_transaction(tx_hash: str):
+    """One indexed transaction of any kind — its block, status, fee, summary and every
+    account it touched with their roles."""
+    from qrdx import tx_index
+    found = await tx_index.lookup(db, tx_hash)
+    if found is None:
+        return {'ok': False, 'error': f'transaction {tx_hash} not indexed'}
+    return {'ok': True, 'result': found}
 
 
 @app.get("/get_nodes")

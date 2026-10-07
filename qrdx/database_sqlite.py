@@ -450,6 +450,43 @@ class DatabaseSQLite:
         CREATE INDEX IF NOT EXISTS idx_token_balances_holder ON token_balances(holder_address);
         CREATE INDEX IF NOT EXISTS idx_token_balances_token ON token_balances(token_address);
 
+        -- Transaction index (qrdx/tx_index.py): every transaction of every canonical block —
+        -- legacy transfers, exchange operations, EVM transactions — with the accounts each
+        -- one touched, for wallet history and the recent-transactions feed. Derived and
+        -- node-local (never hashed): written by the indexer behind the tip, cut back by
+        -- remove_blocks, and re-indexed when the indexed block hash at a height changes.
+        CREATE TABLE IF NOT EXISTS tx_index_blocks (
+            block_height INTEGER PRIMARY KEY,
+            block_hash TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS tx_index (
+            block_height INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            tx_hash TEXT NOT NULL,
+            block_hash TEXT NOT NULL,
+            timestamp INTEGER,
+            kind TEXT NOT NULL,
+            op TEXT,
+            sender TEXT,
+            target TEXT,
+            asset TEXT,
+            amount TEXT,
+            status INTEGER,
+            fee TEXT,
+            error TEXT,
+            detail TEXT,
+            PRIMARY KEY (block_height, position)
+        );
+        CREATE TABLE IF NOT EXISTS tx_participants (
+            account TEXT NOT NULL,
+            block_height INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            roles TEXT NOT NULL,
+            PRIMARY KEY (account, block_height, position)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tx_index_hash ON tx_index(tx_hash);
+        CREATE INDEX IF NOT EXISTS idx_tx_index_kind ON tx_index(kind, block_height);
+
         CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(block_height);
         CREATE INDEX IF NOT EXISTS idx_block_exchange_txs ON block_exchange_transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_block_evm_txs ON block_evm_transactions(block_hash);
@@ -1961,7 +1998,126 @@ class DatabaseSQLite:
             "DELETE FROM block_evm_transactions "
             "WHERE block_hash NOT IN (SELECT block_hash FROM blocks)"
         )
+        # The removed blocks' EVM receipts and indexed transactions are no longer canonical:
+        # a re-applied block writes its own (an orphaned transaction must not keep a receipt).
+        await self.connection.execute(
+            "DELETE FROM contract_logs WHERE block_number >= ?", (start_id,))
+        await self.connection.execute(
+            "DELETE FROM contract_transactions WHERE block_number >= ?", (start_id,))
+        await self._tx_index_cut(start_id)
         await self.connection.commit()
+
+    # ── transaction index (qrdx/tx_index.py) ─────────────────────────────
+
+    async def _tx_index_cut(self, height: int) -> None:
+        for table in ("tx_participants", "tx_index", "tx_index_blocks"):
+            await self.connection.execute(
+                f"DELETE FROM {table} WHERE block_height >= ?", (int(height),))
+
+    async def tx_index_cut(self, height: int) -> None:
+        """Forget every indexed block at or above ``height``."""
+        await self._tx_index_cut(height)
+        await self.connection.commit()
+
+    async def tx_index_blocks_from(self, height: int) -> list:
+        """``[(height, block_hash)]`` of the indexed blocks at or above ``height``."""
+        cursor = await self.connection.execute(
+            "SELECT block_height, block_hash FROM tx_index_blocks WHERE block_height >= ? "
+            "ORDER BY block_height", (int(height),))
+        return [(int(r[0]), r[1]) for r in await cursor.fetchall()]
+
+    async def tx_index_head(self) -> int:
+        """The highest indexed block height (-1 when nothing is indexed)."""
+        cursor = await self.connection.execute("SELECT MAX(block_height) FROM tx_index_blocks")
+        row = await cursor.fetchone()
+        return -1 if row is None or row[0] is None else int(row[0])
+
+    async def tx_index_write_block(self, height: int, block_hash: str, rows: list,
+                                   participants: list) -> None:
+        """Replace a height's indexed transactions. ``rows``: dicts with the tx_index columns;
+        ``participants``: ``(account, position, roles)``."""
+        await self._tx_index_cut_one(height)
+        cols = ("block_height", "position", "tx_hash", "block_hash", "timestamp", "kind", "op",
+                "sender", "target", "asset", "amount", "status", "fee", "error", "detail")
+        await self.connection.executemany(
+            f"INSERT INTO tx_index ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+            [tuple([int(height), r["position"], r["tx_hash"], block_hash]
+                   + [r.get(c) for c in cols[4:]]) for r in rows])
+        await self.connection.executemany(
+            "INSERT OR REPLACE INTO tx_participants (account, block_height, position, roles) "
+            "VALUES (?, ?, ?, ?)", [(a, int(height), pos, roles) for a, pos, roles in participants])
+        await self.connection.execute(
+            "INSERT OR REPLACE INTO tx_index_blocks (block_height, block_hash) VALUES (?, ?)",
+            (int(height), block_hash))
+        await self.connection.commit()
+
+    async def _tx_index_cut_one(self, height: int) -> None:
+        for table in ("tx_participants", "tx_index", "tx_index_blocks"):
+            await self.connection.execute(
+                f"DELETE FROM {table} WHERE block_height = ?", (int(height),))
+
+    _TX_INDEX_COLS = ("i.block_height, i.position, i.tx_hash, i.block_hash, i.timestamp, i.kind, "
+                      "i.op, i.sender, i.target, i.asset, i.amount, i.status, i.fee, i.error, "
+                      "i.detail")
+
+    @staticmethod
+    def _tx_index_row(row) -> dict:
+        keys = ("block_height", "position", "tx_hash", "block_hash", "timestamp", "kind", "op",
+                "sender", "target", "asset", "amount", "status", "fee", "error", "detail")
+        out = dict(zip(keys, tuple(row)[:len(keys)]))
+        if len(tuple(row)) > len(keys):
+            out["roles"] = tuple(row)[len(keys)]
+        return out
+
+    @staticmethod
+    def _tx_index_filters(before, kinds, alias="i"):
+        sql, args = "", []
+        if before is not None:
+            h, pos = before
+            sql += (f" AND ({alias}.block_height < ? OR ({alias}.block_height = ? "
+                    f"AND {alias}.position < ?))")
+            args += [int(h), int(h), int(pos)]
+        if kinds:
+            sql += f" AND i.kind IN ({', '.join('?' * len(kinds))})"
+            args += list(kinds)
+        return sql, args
+
+    async def get_account_history(self, account: str, limit: int = 50, before=None,
+                                  kinds=None) -> list:
+        """An account's indexed transactions, newest first; ``before`` = (height, position)
+        continues a previous page."""
+        where, args = self._tx_index_filters(before, kinds, alias="p")
+        cursor = await self.connection.execute(
+            f"SELECT {self._TX_INDEX_COLS}, p.roles FROM tx_participants p "
+            f"JOIN tx_index i ON i.block_height = p.block_height AND i.position = p.position "
+            f"WHERE p.account = ?{where} "
+            f"ORDER BY p.block_height DESC, p.position DESC LIMIT ?",
+            [account] + args + [int(limit)])
+        return [self._tx_index_row(r) for r in await cursor.fetchall()]
+
+    async def get_indexed_transactions(self, limit: int = 50, before=None, kinds=None) -> list:
+        """The chain's indexed transactions, newest first."""
+        where, args = self._tx_index_filters(before, kinds)
+        cursor = await self.connection.execute(
+            f"SELECT {self._TX_INDEX_COLS} FROM tx_index i WHERE 1 = 1{where} "
+            f"ORDER BY i.block_height DESC, i.position DESC LIMIT ?", args + [int(limit)])
+        return [self._tx_index_row(r) for r in await cursor.fetchall()]
+
+    async def get_indexed_transaction(self, tx_hash: str) -> list:
+        """Every indexed occurrence of a transaction hash (normally one), with its accounts."""
+        h = str(tx_hash).lower()
+        cursor = await self.connection.execute(
+            f"SELECT {self._TX_INDEX_COLS} FROM tx_index i WHERE i.tx_hash IN (?, ?)",
+            (h.removeprefix("0x"), "0x" + h.removeprefix("0x")))
+        out = []
+        for r in await cursor.fetchall():
+            row = self._tx_index_row(r)
+            parts = await self.connection.execute(
+                "SELECT account, roles FROM tx_participants WHERE block_height = ? AND "
+                "position = ? ORDER BY account", (row["block_height"], row["position"]))
+            row["accounts"] = {a: roles for a, roles in await parts.fetchall()}
+            out.append(row)
+        return out
     
     async def get_pending_transactions_limit(self, limit: int):
         """Get limited pending transactions"""

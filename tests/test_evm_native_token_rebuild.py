@@ -122,6 +122,7 @@ async def test_forward_and_rebuild_agree_on_evm_token_moves_and_storage(monkeypa
                 await BP.preload_token_balances(db, txs, mgr)
                 ok, err, _ = BP.process_exchange_transactions(h, float(TS0 + h), txs, mgr)
                 assert ok, err
+                assert len(mgr._block_results) == len(txs), "refused before it ran"
                 assert all(r.success for r in mgr._block_results), [r.error for r in mgr._block_results]
                 mgr.commit_block()
                 await BP.flush_exchange_balance_deltas(db, mgr, enforce=True)

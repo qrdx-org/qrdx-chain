@@ -19,6 +19,7 @@ Usage:
     qrdx-wallet verify <address> <message> <signature>
     qrdx-wallet perp …   (perpetual futures: markets, book, account, deposit, order, …)
     qrdx-wallet token …  (native tokens: list, info, balance, deploy, mint, transfer, approve, …)
+    qrdx-wallet nft …    (native NFTs: collections, create, mint, transfer, approve, burn, …)
     qrdx-wallet spot …   (spot: pools, quote, swap, liquidity, order books)
 """
 
@@ -924,6 +925,11 @@ cli.add_command(_perp_commands)
 from qrdx.cli.token import token as _token_commands  # noqa: E402
 
 cli.add_command(_token_commands)
+
+# Native NFTs: qrdx-wallet nft … (qrdx/cli/nft.py)
+from qrdx.cli.nft import nft as _nft_commands  # noqa: E402
+
+cli.add_command(_nft_commands)
 
 # Spot: qrdx-wallet spot … (qrdx/cli/spot.py)
 from qrdx.cli.spot import spot as _spot_commands  # noqa: E402

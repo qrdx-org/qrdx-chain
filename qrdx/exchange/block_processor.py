@@ -180,18 +180,24 @@ async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateM
         op = getattr(tx, "op_type", None)
         if not sender:
             continue
+        asset = mgr.canonical_asset          # "QRDX" for native, canonical token addresses
         if op == ExchangeOpType.SWAP and p.get("token_in"):
-            wanted.add((sender, str(p["token_in"])))
+            wanted.add((sender, asset(p["token_in"])))
         elif op in (ExchangeOpType.TOKEN_TRANSFER, ExchangeOpType.TOKEN_BURN) \
                 and p.get("token_address"):
-            # Native tokens are keyed by their canonical (lowercase) address.
-            wanted.add((sender, str(p["token_address"]).lower()))
+            # Native tokens are keyed by their canonical (lowercase) address. A burn may name
+            # another holder (``from``: an operator's or the permanent delegate's burn).
+            wanted.add((str(p.get("from") or sender), str(p["token_address"]).lower()))
+        elif op == ExchangeOpType.TOKEN_WITHDRAW_FEES and p.get("token_address"):
+            # Withheld transfer fees are held by the token's own address.
+            token = str(p["token_address"]).lower()
+            wanted.add((token, token))
         elif op == ExchangeOpType.TOKEN_TRANSFER_FROM and p.get("token_address") and p.get("from"):
             wanted.add((str(p["from"]), str(p["token_address"]).lower()))
         elif op == ExchangeOpType.ADD_LIQUIDITY:
             for k in ("token0", "token1"):
                 if p.get(k):
-                    wanted.add((sender, str(p[k])))
+                    wanted.add((sender, asset(p[k])))
             # Named by pool id alone: the deposit spends that pool's two tokens.
             pool = mgr.pool_manager.get_pool(str(p["pool_id"])) if p.get("pool_id") else None
             if pool is not None:
@@ -199,7 +205,7 @@ async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateM
                 wanted.add((sender, pool.state.token1))
         elif op == ExchangeOpType.PLACE_ORDER and ":" in str(p.get("pair", "")):
             # CLOB sufficiency: a buy spends quote, a sell spends base — load both.
-            b, q = str(p["pair"]).split(":", 1)
+            b, q = mgr._canonical_pair(str(p["pair"])).split(":", 1)
             wanted.add((sender, b))
             wanted.add((sender, q))
         elif op == ExchangeOpType.PERP_DEPOSIT:
@@ -214,7 +220,7 @@ async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateM
         # The protocol's holders this operation may DEBIT — a pool's reserves, a book's
         # escrow — so the manager can refuse an operation they cannot cover.
         if op == ExchangeOpType.SWAP and p.get("token_in") and p.get("token_out"):
-            a, b = str(p["token_in"]), str(p["token_out"])
+            a, b = asset(p["token_in"]), asset(p["token_out"])
             for pool in mgr.pool_manager.get_pools_for_pair(a, b):
                 holder = mgr.pool_holder_address(pool.state.id)
                 wanted.add((holder, a))
@@ -234,8 +240,12 @@ async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateM
                 escrow = mgr.orderbook_escrow_address(pair)
                 for tok in pair.split(":", 1):
                     wanted.add((escrow, tok))
-    for holder, token in wanted:
+    from .tokens import is_native_asset
+    for holder, token in sorted(wanted):
         try:
+            if is_native_asset(token):        # native QRDX: the account balance
+                mgr.set_available_balance(holder, await db.get_address_balance(holder))
+                continue
             mgr.set_available_token_balance(holder, token, await db.get_token_balance(token, holder))
         except Exception as e:
             logger.debug("preload_token_balances: %s for (%s,%s)", e, str(holder)[:16], str(token)[:16])

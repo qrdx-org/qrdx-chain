@@ -39,6 +39,10 @@ FULL_STORAGE_LIMIT = 4096
 # Each re-run loads at least one more item; gas bounds what one execution can touch.
 MAX_LOAD_ROUNDS = 100_000
 EMPTY_CODE = b""
+# What a native token's or NFT collection's address reports as its code: its precompile runs
+# instead of any code, but a non-zero EXTCODESIZE lets Solidity call functions that return
+# nothing (ERC-721 transfers, ERC-777 send). Never written back (INVALID if it ever ran).
+NATIVE_STUB_CODE = b"\xfe"
 
 
 class StateMiss(Exception):
@@ -68,6 +72,13 @@ class WorldAccountDB(AccountDB):
             raise StateMiss(accounts=[address])
         return super()._get_encoded_account(address, from_journal)
 
+    def get_code(self, address) -> bytes:
+        code = super().get_code(address)
+        world = self.world
+        if not code and world is not None and world.is_native(address):
+            return NATIVE_STUB_CODE
+        return code
+
     def get_storage(self, address, slot: int, from_journal: bool = True) -> int:
         world = self.world
         if world is not None:
@@ -78,7 +89,8 @@ class WorldAccountDB(AccountDB):
 
 
 class _PrecompilesWithTokens(Mapping):
-    """The fork's precompiles, plus every native token's address (when tokens are in play)."""
+    """The fork's precompiles, plus every native token's and NFT collection's address (when
+    tokens are in play)."""
 
     def __init__(self, base, tokens):
         self.base, self.tokens = base, tokens
@@ -90,6 +102,9 @@ class _PrecompilesWithTokens(Mapping):
         if self.tokens.is_token(address):
             from .native_token_evm import native_token_precompile
             return native_token_precompile
+        if self.tokens.is_collection(address):
+            from .nft_evm import nft_precompile
+            return nft_precompile
         return default
 
     def __getitem__(self, address):
@@ -202,6 +217,11 @@ class EvmWorld:
         if miss.tokens and self.tokens is not None:
             await self.tokens.load(miss.tokens)
 
+    def is_native(self, address) -> bool:
+        """Is ``address`` a native token or NFT collection (its precompile, not code)?"""
+        tokens = self.tokens
+        return tokens is not None and (tokens.is_token(address) or tokens.is_collection(address))
+
     # -- a state for one execution ------------------------------------------
 
     def build_state(self, execution_context) -> WorldState:
@@ -248,7 +268,8 @@ class EvmWorld:
                 sm.set_balance_sync(h, final_balance)
             if final_nonce != nonce or address in forced:
                 sm.set_nonce_sync(h, final_nonce)
-            if final_code != code:
+            if final_code != code and not (final_code == NATIVE_STUB_CODE
+                                           and self.is_native(address)):
                 sm.set_code_sync(h, final_code)
         for address, slot in sorted(self.touched_slots | set(self.storage)):
             if address not in self.accounts or not state.account_exists(address):

@@ -31,9 +31,13 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Set,
 # subscribes receives DEFAULT_CHANNELS — the block feed, exactly as before channels existed.
 DEFAULT_CHANNELS = frozenset({"blocks"})
 STREAM_CHANNELS = frozenset({"blocks", "perp_markets", "perp_book", "perp_events", "perp_account",
-                             "spot_pools", "spot_book", "spot_account", "tokens"})
+                             "spot_pools", "spot_book", "spot_account", "tokens",
+                             "orderbook", "trades", "tickers"})
 # Channels that only make sense for one market / pair / address.
-KEYED_CHANNELS = frozenset({"perp_book", "perp_account", "spot_book", "spot_account"})
+KEYED_CHANNELS = frozenset({"perp_book", "perp_account", "spot_book", "spot_account",
+                            "orderbook"})
+# Channels keyed by a market: a spot pair "a:b" (either order) or a perps market id.
+MARKET_CHANNELS = frozenset({"spot_book", "orderbook", "trades", "tickers"})
 MAX_CHANNELS_PER_CLIENT = 64
 MAX_CHANNEL_LEN = 160
 
@@ -54,12 +58,19 @@ def canonical_channel(name: str) -> str:
     pools and books key it), so either order subscribes to the same book; a token address in
     lowercase."""
     base, _, key = name.partition(":")
-    if base == "spot_book" and key.count(":") == 1:
-        a, b = key.split(":")
+    if base in MARKET_CHANNELS and key.count(":") == 1:
+        a, b = (_asset_key(x) for x in key.split(":"))
         return f"{base}:{min(a, b)}:{max(a, b)}"
     if base == "tokens" and key:
         return f"{base}:{key.lower()}"       # token addresses are lowercase
     return name
+
+
+def _asset_key(asset: str) -> str:
+    """An asset as spot names it: native QRDX in capitals, a token address in lowercase."""
+    if asset.upper() == "QRDX":
+        return "QRDX"
+    return asset.lower() if asset.lower().startswith("0x") else asset
 
 
 def event_matches(channels: Set[str], event: Dict[str, Any]) -> bool:

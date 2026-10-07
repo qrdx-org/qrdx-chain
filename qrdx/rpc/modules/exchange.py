@@ -13,6 +13,10 @@ from the same views as the REST endpoints (qrdx/exchange/views.py), so all surfa
     exchange_getTokenBalance(token, addr)   → a token balance (any address form)
     exchange_getTokenAccount(token, addr)   → {balance, frozen}
     exchange_getTokens()   exchange_getToken(token)   exchange_getAllowance(token, owner, spender)
+    exchange_isTokenOperator(token, holder, operator)
+    exchange_getNftCollections()   exchange_getNftCollection(collection)
+    exchange_getNft(collection, token_id)   exchange_getNftsOf(owner, collection, limit)
+    exchange_isNftOperator(collection, owner, operator)
     exchange_getStateRoot()
 
     exchange_getPools(token_a, token_b)   exchange_getPool(pool_id, twap_window)
@@ -23,6 +27,9 @@ from the same views as the REST endpoints (qrdx/exchange/views.py), so all surfa
     perp_getMarkets()   perp_getMarket(id)   perp_getOrderBook(id, depth)
     perp_getAccount(address)   perp_getOpenOrders(address)   perp_getVault()
     perp_getTrades(id, limit)   perp_getEvents(market_id, address, types, since, limit)
+
+    market_getMarkets(kind)   market_getTicker(market)   market_getOrderBook(market, depth, level)
+    market_getTrades(market, limit, since)   market_getCandles(market, interval, limit, end)
 """
 from __future__ import annotations
 
@@ -117,6 +124,46 @@ class ExchangeModule(RPCModule):
             return views.token_allowance(_manager(), token_address, owner, spender)
         except ValueError as e:
             raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e))
+
+    @rpc_method
+    async def getNftCollections(self) -> List[Dict[str, Any]]:
+        from ...exchange import views
+        return views.nft_collections(_manager())
+
+    @rpc_method
+    async def getNftCollection(self, collection: str) -> Dict[str, Any]:
+        from ...exchange import views
+        found = views.nft_collection(_manager(), collection)
+        if found is None:
+            raise RPCError(RPCErrorCode.RESOURCE_NOT_FOUND, f"collection {collection} not found")
+        return found
+
+    @rpc_method
+    async def getNft(self, collection: str, token_id: Any) -> Dict[str, Any]:
+        from ...exchange import views
+        found = views.nft(_manager(), collection, token_id)
+        if found is None:
+            raise RPCError(RPCErrorCode.RESOURCE_NOT_FOUND,
+                           f"NFT {collection} #{token_id} not found")
+        return found
+
+    @rpc_method
+    async def getNftsOf(self, owner: str, collection: Optional[str] = None,
+                        limit: int = 500) -> List[Dict[str, Any]]:
+        from ...exchange import views
+        return views.nfts_of(_manager(), owner, collection, limit)
+
+    @rpc_method
+    async def isNftOperator(self, collection: str, owner: str, operator: str) -> bool:
+        from ...exchange import views
+        return views.nft_operator(_manager(), collection, owner, operator)
+
+    @rpc_method
+    async def isTokenOperator(self, token_address: str, holder: str, operator: str) -> bool:
+        try:
+            return _manager().tokens.is_operator(token_address, holder, operator)
+        except Exception:
+            return False
 
     @rpc_method
     async def getStateRoot(self) -> Dict[str, Any]:
@@ -238,3 +285,48 @@ class PerpModule(RPCModule):
         from ...exchange import views
         return views.events(_manager(), market=market_id, address=address, types=types,
                             since=since, limit=limit)
+
+
+class MarketModule(RPCModule):
+    """Market data for interfaces, one shape for spot pairs and perps markets (the REST
+    ``/get_markets`` family; docs/PERPS_API.md §8). A market is a spot pair ``base:quote``
+    (token addresses, unique symbols or QRDX, either order) or a perps market id."""
+
+    namespace = "market"
+
+    @staticmethod
+    def _found(value, market: str):
+        if value is None:
+            raise RPCError(RPCErrorCode.RESOURCE_NOT_FOUND, f"no market {market}")
+        return value
+
+    @rpc_method
+    async def getMarkets(self, kind: Optional[str] = None) -> List[Dict[str, Any]]:
+        from ...exchange import views
+        return views.market_tickers(_manager(), kind)
+
+    @rpc_method
+    async def getTicker(self, market: str) -> Dict[str, Any]:
+        from ...exchange import views
+        return self._found(views.market_ticker(_manager(), market), market)
+
+    @rpc_method
+    async def getOrderBook(self, market: str, depth: int = 50, level: int = 2) -> Dict[str, Any]:
+        from ...exchange import views
+        return self._found(views.market_book(_manager(), market, depth, level), market)
+
+    @rpc_method
+    async def getTrades(self, market: str, limit: int = 100,
+                        since: Optional[int] = None) -> Dict[str, Any]:
+        from ...exchange import views
+        return self._found(views.market_trades(_manager(), market, limit, since), market)
+
+    @rpc_method
+    async def getCandles(self, market: str, interval: str = "1m", limit: int = 200,
+                         end: Optional[float] = None) -> Dict[str, Any]:
+        from ...exchange import views
+        try:
+            found = views.market_candles(_manager(), market, interval, limit, end)
+        except ValueError as e:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e))
+        return self._found(found, market)

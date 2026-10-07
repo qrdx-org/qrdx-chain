@@ -60,6 +60,58 @@ def token_frozen(mgr, token_address: str, address: str) -> bool:
     return mgr.tokens.is_frozen(token_address, address)
 
 
+# ── native NFTs (qrdx/exchange/nfts.py) ─────────────────────────────────────
+
+def nft_collections(mgr) -> List[Dict[str, Any]]:
+    reg = mgr.nfts
+    return [reg.collections[a].summary() for a in sorted(reg.collections)]
+
+
+def nft_collection(mgr, collection: str) -> Optional[Dict[str, Any]]:
+    c = mgr.nfts.get(collection)
+    return None if c is None else c.summary()
+
+
+def nft(mgr, collection: str, token_id) -> Optional[Dict[str, Any]]:
+    from .nfts import NftError, token_id as parse_id
+    c = mgr.nfts.get(collection)
+    if c is None:
+        return None
+    try:
+        i = parse_id(token_id)
+    except NftError:
+        return None
+    item = mgr.nfts.find(c.address, i)
+    if item is None:
+        return None
+    out = item.summary(c.address, i)
+    out.update(symbol=c.symbol, collection_name=c.name, royalty_bps=c.royalty_bps,
+               royalty_recipient=c.royalty_recipient, non_transferable=c.non_transferable)
+    return out
+
+
+def nfts_of(mgr, owner: str, collection: Optional[str] = None, limit: int = 500
+            ) -> List[Dict[str, Any]]:
+    """An owner's NFTs (any address form of the account), every collection or one."""
+    try:
+        keys = mgr.nfts.owned(owner, collection)
+    except Exception:
+        return []
+    out = []
+    for coll, i in keys[:max(1, min(int(limit), 5000))]:
+        item = mgr.nfts.find(coll, i)
+        c = mgr.nfts.get(coll)
+        out.append(dict(item.summary(coll, i), symbol=c.symbol, collection_name=c.name))
+    return out
+
+
+def nft_operator(mgr, collection: str, owner: str, operator: str) -> bool:
+    try:
+        return mgr.nfts.is_operator(collection, owner, operator)
+    except Exception:
+        return False
+
+
 # ── spot: AMM pools ─────────────────────────────────────────────────────────
 
 def _same(a: str, b: str) -> bool:
@@ -414,3 +466,198 @@ def events(mgr, *, market: Optional[str] = None, address: Optional[str] = None,
 
 def trades(mgr, market_id: str, limit: int = 50) -> List[Dict[str, Any]]:
     return events(mgr, market=market_id, types=["fill"], limit=limit)["events"]
+
+
+# ── market data: one shape for every market (spot pairs and perps) ─────────
+#
+# A market is named as the exchange names it: a spot pair by its assets, "base:quote" (either
+# order, "/" also accepted; an asset is a token address, a uniquely registered token symbol, or
+# QRDX — the canonical name puts the lower address first, so QRDX pairs are quoted in QRDX), or
+# a perps market id. Prices are quote per base; amounts are base units.
+
+def _asset(mgr, text: str) -> str:
+    asset = mgr.canonical_asset(text)
+    if asset == text.strip() and mgr.tokens.get(asset) is None and not asset.startswith("0x"):
+        matches = [t.address for t in mgr.tokens.tokens.values()
+                   if t.symbol.lower() == asset.lower()]
+        if len(matches) == 1:
+            return matches[0]
+    return asset
+
+
+def resolve_market(mgr, market: str) -> Optional[Dict[str, Any]]:
+    """``{"market", "type": "spot" | "perp", "base", "quote"}`` — None if no such market (a
+    spot pair is a market once it has an order book or an AMM pool)."""
+    text = str(market or "").strip()
+    if not text:
+        return None
+    ch = mgr.clearinghouse
+    perp = text if text in ch.markets else next(
+        (mid for mid in ch.markets if mid.lower() == text.lower()), None)
+    if perp is not None:
+        m = ch.markets[perp]
+        return {"market": perp, "type": "perp", "base": m.base, "quote": m.quote}
+    sep = ":" if ":" in text else "/" if "/" in text else None
+    if sep is None:
+        return None
+    a, b = (_asset(mgr, x) for x in text.split(sep, 1))
+    base, quote_asset = (b, a) if a > b else (a, b)
+    key = f"{base}:{quote_asset}"
+    if key not in mgr._order_books and not mgr.pool_manager.get_pools_for_pair(base, quote_asset):
+        return None
+    return {"market": key, "type": "spot", "base": base, "quote": quote_asset}
+
+
+def spot_pairs(mgr) -> List[str]:
+    keys = set(mgr._order_books)
+    keys.update(f"{p.state.token0}:{p.state.token1}" for p in mgr.pool_manager.get_all_pools())
+    return sorted(keys)
+
+
+def _asset_info(mgr, asset: str) -> Dict[str, Any]:
+    from .tokens import is_native_asset
+    if is_native_asset(asset):
+        return {"symbol": "QRDX", "name": "QRDX", "decimals": 18}
+    t = mgr.tokens.get(asset)
+    if t is None:
+        return {"symbol": None, "name": None, "decimals": None}
+    return {"symbol": t.symbol, "name": t.name, "decimals": t.decimals}
+
+
+def _book_of(mgr, info: Dict[str, Any]):
+    if info["type"] == "perp":
+        return mgr.clearinghouse.markets[info["market"]].book
+    return mgr._order_books.get(info["market"])
+
+
+def _levels(levels, best_first_desc: bool, depth: int, l3: bool, owner_of) -> List[Dict[str, Any]]:
+    rows = [(p, lvl) for p, lvl in levels.items() if lvl.total_amount > 0]
+    rows.sort(key=lambda r: r[0], reverse=best_first_desc)
+    out, total, notional = [], ZERO, ZERO
+    for price, lvl in rows[:depth]:
+        live = [o for o in lvl.orders if o.is_active and o.remaining > 0]
+        amount = sum((o.remaining for o in live), ZERO)
+        total += amount
+        notional += amount * price
+        row = {"price": str(price), "amount": str(amount), "total": str(total),
+               "notional_total": str(notional), "orders": len(live)}
+        if l3:
+            row["orders"] = [{"order_id": o.id, "owner": owner_of(o), "remaining": str(o.remaining),
+                              "amount": str(o.amount)} for o in live]
+        out.append(row)
+    return out
+
+
+def market_book(mgr, market: str, depth: int = 50, level: int = 2) -> Optional[Dict[str, Any]]:
+    """A market's order book for interfaces. ``level`` 2: aggregated price levels with running
+    totals (base and quote), best first. ``level`` 3: every resting order at each level, in
+    time priority. Plus the top of book (best bid/ask, spread, mid), the last trade, and the
+    block height the book reflects (it changes only when a block applies). A spot pair also
+    lists its AMM pools, the other venue a swap routes through."""
+    info = resolve_market(mgr, market)
+    if info is None:
+        return None
+    depth = max(1, min(int(depth), 1000))
+    l3 = int(level) >= 3
+    book = _book_of(mgr, info)
+    out = dict(info, level=3 if l3 else 2, block_height=mgr._current_block_height,
+               base_info=_asset_info(mgr, info["base"]) if info["type"] == "spot" else None,
+               quote_info=_asset_info(mgr, info["quote"]) if info["type"] == "spot" else None)
+    if info["type"] == "perp":
+        metas = mgr.clearinghouse.markets[info["market"]].orders
+        owner_of = lambda o: getattr(metas.get(o.id), "owner", o.owner)  # noqa: E731
+    else:
+        owner_of = lambda o: o.owner  # noqa: E731
+    if book is None:
+        out.update(bids=[], asks=[], best_bid=None, best_ask=None, spread=None,
+                   spread_bps=None, mid=None, sequence=0)
+    else:
+        bid, ask = book.best_bid, book.best_ask
+        mid = (bid + ask) / 2 if bid is not None and ask is not None else None
+        spread = ask - bid if mid is not None else None
+        out.update(
+            bids=_levels(book._bids, True, depth, l3, owner_of),
+            asks=_levels(book._asks, False, depth, l3, owner_of),
+            best_bid=_s(bid), best_ask=_s(ask), mid=_s(mid), spread=_s(spread),
+            spread_bps=(str((spread / mid * 10000).quantize(Decimal("0.01")))
+                        if mid else None),
+            sequence=book._trade_sequence)
+    stats = mgr.journal.market.stats_24h(info["market"])
+    out["last_price"] = stats["last_price"] or (_s(book.last_price) if book is not None else None)
+    if info["type"] == "spot":
+        out["amm"] = [{"pool_id": p.state.id, "price": str(p.state.price),
+                       "liquidity": str(p.state.liquidity), "fee_rate": str(p.state.fee_tier.rate)}
+                      for p in sorted(mgr.pool_manager.get_pools_for_pair(info["base"], info["quote"]),
+                                      key=lambda p: p.state.id)]
+    else:
+        m = mgr.clearinghouse.markets[info["market"]]
+        out.update(mark_price=_s(m.mark_price), oracle_price=_s(m.oracle_price))
+    return out
+
+
+def market_ticker(mgr, market: str) -> Optional[Dict[str, Any]]:
+    """Top of book, last price and 24-hour statistics (by block time) for one market; a spot
+    pair adds its deepest pool's price, a perps market its mark, oracle, funding and open
+    interest."""
+    info = resolve_market(mgr, market)
+    if info is None:
+        return None
+    book = _book_of(mgr, info)
+    bid = book.best_bid if book is not None else None
+    ask = book.best_ask if book is not None else None
+    out = dict(info, best_bid=_s(bid), best_ask=_s(ask),
+               mid=_s((bid + ask) / 2) if bid is not None and ask is not None else None,
+               **mgr.journal.market.stats_24h(info["market"]))
+    if info["type"] == "spot":
+        best = mgr.pool_manager.get_best_pool(info["base"], info["quote"])
+        out.update(base_info=_asset_info(mgr, info["base"]),
+                   quote_info=_asset_info(mgr, info["quote"]),
+                   amm_price=_s(best.state.price) if best is not None else None,
+                   pools=len(mgr.pool_manager.get_pools_for_pair(info["base"], info["quote"])),
+                   has_order_book=book is not None)
+        if out["last_price"] is None:
+            out["last_price"] = _s(book.last_price) if book is not None and book.last_price else None
+    else:
+        m = mgr.clearinghouse.markets[info["market"]]
+        out.update(mark_price=_s(m.mark_price), oracle_price=_s(m.oracle_price),
+                   funding_rate=_s(m.funding_rate), open_interest=_s(m.open_interest))
+        if out["last_price"] is None:
+            out["last_price"] = _s(m.last_trade_price)
+    return out
+
+
+def market_tickers(mgr, kind: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Every market's ticker — spot pairs then perps; ``kind`` = spot | perp narrows it."""
+    names = []
+    if kind in (None, "", "spot"):
+        names += spot_pairs(mgr)
+    if kind in (None, "", "perp"):
+        names += sorted(mgr.clearinghouse.markets)
+    return [t for t in (market_ticker(mgr, n) for n in names) if t is not None]
+
+
+def market_trades(mgr, market: str, limit: int = 100, since: Optional[int] = None
+                  ) -> Optional[Dict[str, Any]]:
+    """A market's recent trades, oldest first, each with the taker's side, its venue (clob,
+    amm or perp) and its transaction. ``since`` (a trade ``seq``) returns only newer ones."""
+    info = resolve_market(mgr, market)
+    if info is None:
+        return None
+    md = mgr.journal.market
+    return dict(info, trades=md.trades(info["market"], limit, since), last_seq=md.seq)
+
+
+def market_candles(mgr, market: str, interval: str = "1m", limit: int = 200,
+                   end: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """OHLCV candles by block time: ``interval`` 1m 5m 15m 1h 4h 1d; ``end`` caps the newest
+    candle's start time. Only intervals with trades appear."""
+    info = resolve_market(mgr, market)
+    if info is None:
+        return None
+    return dict(info, interval=interval,
+                candles=mgr.journal.market.candles(info["market"], interval, limit, end))
+
+
+def address_trades(mgr, address: str, limit: int = 100) -> List[Dict[str, Any]]:
+    """An address's recent trades, maker or taker, on every market."""
+    return mgr.journal.market.trades_of(address, limit)

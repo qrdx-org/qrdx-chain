@@ -19,6 +19,15 @@ can never stall or diverge block processing — publishes to the event hub:
     tokens                  every native token's registry entry (supply, authorities) when it
                             changes; "tokens:<address>" for one
 
+  Market data — one shape for spot pairs and perps (a market is "base:quote" by token
+  address or QRDX, either order, or a perps market id):
+
+    orderbook:<market>      the market's level-2 book (views.market_book) when it changes
+    trades                  every trade as it commits — order-book fills, AMM swaps, perps
+                            fills; "trades:<market>" for one market
+    tickers                 every market's ticker (top of book, last price, 24h stats) when it
+                            changes; "tickers:<market>" for one
+
 Books and accounts are only built for channels someone has subscribed to. The shapes are the
 REST / JSON-RPC views' (qrdx/exchange/views.py). This is a display feed: a reading may catch a
 block mid-application, so wallets confirm with ``/get_exchange_receipt`` and re-read state over
@@ -49,6 +58,10 @@ class PerpStreamPublisher:
         self.spot_accounts: Dict[str, Dict[str, Any]] = {}
         self.journal_id: Optional[int] = None
         self.last_seq = 0
+        self.market_books: Dict[str, Dict[str, Any]] = {}
+        self.tickers: Dict[str, Dict[str, Any]] = {}
+        self.trades_id: Optional[int] = None
+        self.trade_seq = 0
 
     def step(self, mgr) -> None:
         hub = self.hub
@@ -93,6 +106,35 @@ class PerpStreamPublisher:
                 del self.accounts[address]
 
         self._step_spot(mgr)
+        self._step_market(mgr)
+
+    def _step_market(self, mgr) -> None:
+        hub = self.hub
+        md = mgr.journal.market
+        if id(md) != self.trades_id:                 # a rebuilt manager: resume from its head
+            self.trades_id, self.trade_seq = id(md), md.seq
+        elif md.seq > self.trade_seq:
+            if hub.wants("trades") or hub.keys("trades"):
+                for trade in md.since(self.trade_seq):
+                    hub.publish_nowait({"type": "trade", "channel": "trades",
+                                        "key": trade["market"], "trade": trade})
+            self.trade_seq = md.seq
+        if hub.wants("tickers") or hub.keys("tickers"):
+            for ticker in views.market_tickers(mgr):
+                if self._changed(self.tickers, ticker["market"], ticker):
+                    hub.publish_nowait({"type": "ticker", "channel": "tickers",
+                                        "key": ticker["market"], "ticker": ticker})
+        else:
+            self.tickers.clear()
+        markets = hub.keys("orderbook")
+        for market in markets:
+            book = views.market_book(mgr, market, self.book_depth)
+            if book is not None and self._changed(self.market_books, market, book):
+                hub.publish_nowait({"type": "orderbook", "channel": "orderbook",
+                                    "key": market, "book": book})
+        for market in list(self.market_books):
+            if market not in markets:
+                del self.market_books[market]
 
     def _changed(self, cache: Dict[str, Any], key: str, value: Any) -> bool:
         if cache.get(key) == value:
@@ -204,4 +246,19 @@ def initial_snapshots(mgr, channels, book_depth: int = 20):
         elif base == "spot_account" and key:
             out.append({"type": "spot_account", "channel": "spot_account", "key": key,
                         "account": spot_account(mgr, key), "snapshot": True})
+        elif base == "orderbook" and key:
+            book = views.market_book(mgr, key, book_depth)
+            if book is not None:
+                out.append({"type": "orderbook", "channel": "orderbook", "key": key,
+                            "book": book, "snapshot": True})
+        elif base == "tickers":
+            for ticker in views.market_tickers(mgr):
+                if not key or ticker["market"] == key:
+                    out.append({"type": "ticker", "channel": "tickers", "key": ticker["market"],
+                                "ticker": ticker, "snapshot": True})
+        elif base == "trades":
+            found = views.market_trades(mgr, key, 100) if key else None
+            if found is not None:
+                out.append({"type": "trades", "channel": "trades", "key": found["market"],
+                            "trades": found["trades"], "snapshot": True})
     return out

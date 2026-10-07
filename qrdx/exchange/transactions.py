@@ -94,6 +94,23 @@ class ExchangeOpType(IntEnum):
     TOKEN_SET_AUTHORITY = 30   # hand over or renounce the mint / freeze authority
     TOKEN_FREEZE = 31          # the freeze authority freezes an account's balance
     TOKEN_THAW = 32            # … and thaws it
+    # Token-2022-style extensions and ERC-777 operators (docs/NATIVE_TOKENS.md §7).
+    TOKEN_UPDATE_METADATA = 33     # the metadata authority edits name, symbol, uri, fields
+    TOKEN_SET_TRANSFER_FEE = 34    # the fee authority sets a new rate (applies later)
+    TOKEN_WITHDRAW_FEES = 35       # the withdraw authority collects withheld transfer fees
+    TOKEN_PAUSE = 36               # the pause authority stops transfers, mints and burns
+    TOKEN_RESUME = 37              # … and lets them run again
+    TOKEN_AUTHORIZE_OPERATOR = 38  # a holder lets an operator move its balance
+    TOKEN_REVOKE_OPERATOR = 39     # … and stops it (a default operator too)
+    # Native NFTs (qrdx/exchange/nfts.py): collections of supply-1 tokens.
+    NFT_CREATE_COLLECTION = 40     # a collection: metadata, royalties, update + mint authorities
+    NFT_MINT = 41                  # the mint authority adds an NFT to the collection
+    NFT_TRANSFER = 42              # the owner (or its approved account / operator) moves one
+    NFT_BURN = 43                  # … or burns it
+    NFT_APPROVE = 44               # the owner approves one account for one NFT
+    NFT_SET_APPROVAL_FOR_ALL = 45  # the owner approves an operator for all its NFTs in a collection
+    NFT_UPDATE = 46                # the update authority edits the collection's or an NFT's metadata
+    NFT_SET_AUTHORITY = 47         # hand over or renounce the update / mint authority
 
 
 # ---------------------------------------------------------------------------
@@ -304,9 +321,11 @@ class ExchangeTransaction:
                 raise ValueError("CREATE_POOL missing param: initial_price (or initial_sqrt_price)")
 
         elif op == ExchangeOpType.ADD_LIQUIDITY:
-            for key in ("pool_id", "tick_lower", "tick_upper", "amount"):
+            for key in ("tick_lower", "tick_upper", "amount"):
                 if key not in p:
                     raise ValueError(f"ADD_LIQUIDITY missing param: {key}")
+            if "pool_id" not in p and not (p.get("token0") and p.get("token1")):
+                raise ValueError("ADD_LIQUIDITY needs pool_id, or token0 and token1")
 
         elif op == ExchangeOpType.REMOVE_LIQUIDITY:
             for key in ("pool_id", "position_id"):
@@ -427,6 +446,33 @@ class ExchangeTransaction:
                 if key not in p:
                     raise ValueError(f"TOKEN_TRANSFER missing param: {key}")
 
+        elif op == ExchangeOpType.TOKEN_UPDATE_METADATA:
+            if "token_address" not in p:
+                raise ValueError("TOKEN_UPDATE_METADATA missing param: token_address")
+            if not any(k in p for k in ("name", "symbol", "uri", "fields")):
+                raise ValueError("TOKEN_UPDATE_METADATA changes nothing: give name, symbol, "
+                                 "uri or fields")
+
+        elif op == ExchangeOpType.TOKEN_SET_TRANSFER_FEE:
+            for key in ("token_address", "transfer_fee_bps"):
+                if key not in p:
+                    raise ValueError(f"TOKEN_SET_TRANSFER_FEE missing param: {key}")
+
+        elif op in (ExchangeOpType.TOKEN_WITHDRAW_FEES, ExchangeOpType.TOKEN_PAUSE,
+                    ExchangeOpType.TOKEN_RESUME):
+            if "token_address" not in p:
+                raise ValueError(f"{op.name} missing param: token_address")
+
+        elif op in (ExchangeOpType.TOKEN_AUTHORIZE_OPERATOR, ExchangeOpType.TOKEN_REVOKE_OPERATOR):
+            for key in ("token_address", "operator"):
+                if key not in p:
+                    raise ValueError(f"{op.name} missing param: {key}")
+
+        elif op in _NFT_REQUIRED:
+            for key in _NFT_REQUIRED[op]:
+                if key not in p:
+                    raise ValueError(f"{op.name} missing param: {key}")
+
         elif op == ExchangeOpType.STAKE_DEPOSIT:
             for key in ("validator_public_key", "stake_amount"):
                 if key not in p:
@@ -487,4 +533,30 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.TOKEN_SET_AUTHORITY: 25_000,
     ExchangeOpType.TOKEN_FREEZE: 25_000,
     ExchangeOpType.TOKEN_THAW: 25_000,
+    ExchangeOpType.TOKEN_UPDATE_METADATA: 30_000,
+    ExchangeOpType.TOKEN_SET_TRANSFER_FEE: 25_000,
+    ExchangeOpType.TOKEN_WITHDRAW_FEES: 40_000,
+    ExchangeOpType.TOKEN_PAUSE: 25_000,
+    ExchangeOpType.TOKEN_RESUME: 25_000,
+    ExchangeOpType.TOKEN_AUTHORIZE_OPERATOR: 25_000,
+    ExchangeOpType.TOKEN_REVOKE_OPERATOR: 25_000,
+    ExchangeOpType.NFT_CREATE_COLLECTION: 120_000,
+    ExchangeOpType.NFT_MINT: 60_000,
+    ExchangeOpType.NFT_TRANSFER: 35_000,
+    ExchangeOpType.NFT_BURN: 25_000,
+    ExchangeOpType.NFT_APPROVE: 25_000,
+    ExchangeOpType.NFT_SET_APPROVAL_FOR_ALL: 25_000,
+    ExchangeOpType.NFT_UPDATE: 30_000,
+    ExchangeOpType.NFT_SET_AUTHORITY: 25_000,
+}
+
+_NFT_REQUIRED = {
+    ExchangeOpType.NFT_CREATE_COLLECTION: ("name", "symbol"),
+    ExchangeOpType.NFT_MINT: ("collection",),
+    ExchangeOpType.NFT_TRANSFER: ("collection", "token_id", "to"),
+    ExchangeOpType.NFT_BURN: ("collection", "token_id"),
+    ExchangeOpType.NFT_APPROVE: ("collection", "token_id", "spender"),
+    ExchangeOpType.NFT_SET_APPROVAL_FOR_ALL: ("collection", "operator"),
+    ExchangeOpType.NFT_UPDATE: ("collection",),
+    ExchangeOpType.NFT_SET_AUTHORITY: ("collection", "authority", "new_authority"),
 }

@@ -48,7 +48,11 @@ from .orderbook import Order, OrderBook, OrderSide, OrderType, SelfTradeAction, 
 from .clearinghouse import Clearinghouse, ClearinghouseError
 from .perpetual import PerpEngine, PerpSide
 from .router import FillSource, UnifiedRouter
-from .tokens import TokenError, TokenRegistry, account as token_account, amount as token_amount
+from .nfts import NftError, NftRegistry, token_id as nft_token_id
+from .tokens import (
+    NATIVE_ASSET, TokenError, TokenRegistry, account as token_account, amount as token_amount,
+    canonical_asset, is_native_asset, memo as token_memo,
+)
 from .transactions import (
     EXCHANGE_GAS_COSTS,
     ExchangeOpType,
@@ -188,6 +192,8 @@ class ExchangeStateManager:
         # replayed on every path and committed in the exchange root; the balances live in
         # the token ledger. Tokens it changes in a block are mirrored to the DB registry.
         self.tokens = TokenRegistry()
+        # Native NFTs (qrdx/exchange/nfts.py): collections, their NFTs, approvals, operators.
+        self.nfts = NftRegistry()
         # Per-block validator-lifecycle ops (STAKE_DEPOSIT / STAKE_EXIT) to flush to
         # the consensus validators table. Deterministic (same txs on every node),
         # reset per block. See qrdx.validator.epoch_loop for activation scheduling.
@@ -467,6 +473,21 @@ class ExchangeStateManager:
             ExchangeOpType.TOKEN_SET_AUTHORITY: self._op_token_set_authority,
             ExchangeOpType.TOKEN_FREEZE: self._op_token_freeze,
             ExchangeOpType.TOKEN_THAW: self._op_token_freeze,
+            ExchangeOpType.TOKEN_UPDATE_METADATA: self._op_token_update_metadata,
+            ExchangeOpType.TOKEN_SET_TRANSFER_FEE: self._op_token_set_transfer_fee,
+            ExchangeOpType.TOKEN_WITHDRAW_FEES: self._op_token_withdraw_fees,
+            ExchangeOpType.TOKEN_PAUSE: self._op_token_pause,
+            ExchangeOpType.TOKEN_RESUME: self._op_token_pause,
+            ExchangeOpType.TOKEN_AUTHORIZE_OPERATOR: self._op_token_operator,
+            ExchangeOpType.TOKEN_REVOKE_OPERATOR: self._op_token_operator,
+            ExchangeOpType.NFT_CREATE_COLLECTION: self._op_nft_create_collection,
+            ExchangeOpType.NFT_MINT: self._op_nft_mint,
+            ExchangeOpType.NFT_TRANSFER: self._op_nft_transfer,
+            ExchangeOpType.NFT_BURN: self._op_nft_burn,
+            ExchangeOpType.NFT_APPROVE: self._op_nft_approve,
+            ExchangeOpType.NFT_SET_APPROVAL_FOR_ALL: self._op_nft_set_approval_for_all,
+            ExchangeOpType.NFT_UPDATE: self._op_nft_update,
+            ExchangeOpType.NFT_SET_AUTHORITY: self._op_nft_set_authority,
             ExchangeOpType.STAKE_DEPOSIT: self._op_stake_deposit,
             ExchangeOpType.STAKE_EXIT: self._op_stake_exit,
         }
@@ -511,10 +532,18 @@ class ExchangeStateManager:
                 tx.sender[:20], stake, avail,
             )
 
+        for asset in (self.canonical_asset(p["token0"]), self.canonical_asset(p["token1"])):
+            t = self.tokens.get(asset)
+            if t is not None and (t.fee_enabled or t.non_transferable):
+                # Spot moves are exact (a pool's reserves, a book's escrow): a fee withheld
+                # on the way in would break their accounting; a soulbound token cannot move.
+                kind = "charges a transfer fee" if t.fee_enabled else "is non-transferable"
+                return ExchangeExecResult(
+                    success=False, error=f"{t.symbol} {kind}: it cannot be pooled or traded")
         try:
             pool = self.pool_manager.create_pool(
-                p["token0"], p["token1"], fee_tier, pool_type,
-                sqrt_price, tx.sender, stake,
+                self.canonical_asset(p["token0"]), self.canonical_asset(p["token1"]), fee_tier,
+                pool_type, sqrt_price, tx.sender, stake,
             )
         except ValueError as e:
             return ExchangeExecResult(success=False, error=str(e))
@@ -618,7 +647,8 @@ class ExchangeStateManager:
         p = tx.params
         pool = self.pool_manager.get_pool(p["pool_id"]) if p.get("pool_id") else None
         if pool is None and p.get("token0") and p.get("token1"):
-            pool = self._find_pool_for_pair(str(p["token0"]), str(p["token1"]), p.get("fee_tier"))
+            pool = self._find_pool_for_pair(self.canonical_asset(p["token0"]),
+                                            self.canonical_asset(p["token1"]), p.get("fee_tier"))
         if pool is None:
             return ExchangeExecResult(success=False, error="Pool not found")
         tick_lower, tick_upper = int(p["tick_lower"]), int(p["tick_upper"])
@@ -720,8 +750,8 @@ class ExchangeStateManager:
         router's exact quote before anything changes, and the fill settles with its real
         counterparty: the pool's holder, or the matched makers' escrow."""
         p = tx.params
-        token_in = str(p["token_in"])
-        token_out = str(p["token_out"])
+        token_in = self.canonical_asset(p["token_in"])
+        token_out = self.canonical_asset(p["token_out"])
         amount_in = Decimal(str(p["amount_in"]))
         min_out = Decimal(str(p.get("min_amount_out", "0") or "0"))
         deadline = float(p.get("deadline", 0) or 0)
@@ -768,6 +798,10 @@ class ExchangeStateManager:
             return ExchangeExecResult(success=False, error=str(e))
 
         self._total_swaps += 1
+        if route.source == FillSource.AMM:
+            fills = [self._amm_fill(route, tx.sender)]
+        else:
+            fills = self._clob_fills(route.pair, result.trades, tx.sender, route.side)
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.SWAP],
@@ -778,18 +812,50 @@ class ExchangeStateManager:
                 "price": str(route.price),
                 "source": route.source.value,
                 "pool_id": route.pool_id,
+                "fills": fills,
             },
         )
 
+    # A spot trade as the market-data feed sees it (journal.py → market_data.py): the pair in
+    # canonical "base:quote" order, the price in quote per base, the base amount, and the
+    # TAKER's side. Result data only — never hashed.
+
     @staticmethod
-    def _canonical_pair(pair: str) -> str:
-        """Order books (like AMM pools) are keyed by the SORTED token pair — create_pool
-        canonicalizes ``token0:token1`` (swaps if token0 > token1). Normalize a caller's
-        pair the same way so PLACE_ORDER/CANCEL_ORDER find the book in either input order."""
+    def _clob_fills(pair: str, trades, taker: str, side) -> List[Dict[str, Any]]:
+        side = getattr(side, "value", side)
+        return [{"market": pair, "venue": "clob", "trade_id": t.id, "price": str(t.price),
+                 "amount": str(t.amount), "buyer": t.buyer, "seller": t.seller,
+                 "maker": t.seller if t.buyer == taker else t.buyer, "taker": taker,
+                 "side": side} for t in trades]
+
+    def _amm_fill(self, route, taker: str) -> Dict[str, Any]:
+        pair = self._canonical_pair(f"{route.token_in}:{route.token_out}")
+        base = pair.split(":", 1)[0]
+        holder = self.pool_holder_address(route.pool_id)
+        if route.token_in == base:          # selling base into the pool
+            amount, quote_amount, side = route.amount_in, route.amount_out, "sell"
+            buyer, seller = holder, taker
+        else:
+            amount, quote_amount, side = route.amount_out, route.amount_in, "buy"
+            buyer, seller = taker, holder
+        return {"market": pair, "venue": "amm", "pool_id": route.pool_id,
+                "price": str(quote_amount / amount) if amount > 0 else "0",
+                "amount": str(amount), "quote_amount": str(quote_amount), "buyer": buyer,
+                "seller": seller, "maker": holder, "taker": taker, "side": side}
+
+    def canonical_asset(self, value) -> str:
+        """Spot's name for an asset: "QRDX" for native QRDX, a registered token's canonical
+        address, anything else as given (qrdx/exchange/tokens.py)."""
+        return canonical_asset(value, self.tokens)
+
+    def _canonical_pair(self, pair: str) -> str:
+        """Order books (like AMM pools) are keyed by the SORTED pair of canonical asset names —
+        create_pool canonicalizes ``token0:token1`` (swaps if token0 > token1). Normalize a
+        caller's pair the same way so PLACE_ORDER/CANCEL_ORDER find the book in either input
+        order and with any spelling of QRDX or a token address."""
         if ":" in pair:
-            a, b = pair.split(":", 1)
-            if a > b:
-                return f"{b}:{a}"
+            a, b = (self.canonical_asset(x) for x in pair.split(":", 1))
+            return f"{b}:{a}" if a > b else f"{a}:{b}"
         return pair
 
     def _op_place_order(self, tx: ExchangeTransaction) -> ExchangeExecResult:
@@ -860,6 +926,7 @@ class ExchangeStateManager:
                 "order_id": order.id,
                 "trades": len(trades),
                 "filled": str(order.filled),
+                "fills": self._clob_fills(pair, trades, tx.sender, side),
             },
         )
 
@@ -981,8 +1048,12 @@ class ExchangeStateManager:
         enclosing operation fails whole (see ``_atomic``) instead of the ledger flush clamping a
         debit while its credit lands, which would mint the difference."""
         if amount and amount > ZERO:
-            if self.tokens.is_frozen(token, frm):
-                raise ValueError(f"{frm[:16]}…'s {token[:12]}… balance is frozen")
+            if not is_native_asset(token):
+                if self.tokens.is_frozen(token, frm):
+                    raise ValueError(f"{frm[:16]}…'s {token[:12]}… balance is frozen")
+                t = self.tokens.get(token)
+                if t is not None and t.paused:
+                    raise ValueError(f"{t.symbol} is paused")
             avail = self.available_token_balance(frm, token)
             if avail is None:
                 # Every debit's balance is loaded with its block (block_processor.
@@ -999,8 +1070,13 @@ class ExchangeStateManager:
                 if self.enforce_spot_settlement or is_synthetic_holder(frm):
                     raise ValueError(f"{frm[:16]}… cannot cover {amount} of {token[:12]}… "
                                      f"(holds {avail})")
-            self._record_token_delta(frm, token, -amount)
-            self._record_token_delta(to, token, amount)
+            if is_native_asset(token):
+                # Native QRDX lives in account_state: the move rides the balance flush.
+                self._record_balance_delta(frm, -amount)
+                self._record_balance_delta(to, amount)
+            else:
+                self._record_token_delta(frm, token, -amount)
+                self._record_token_delta(to, token, amount)
 
     def _op_token_deploy(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Deploy a native token (qrdx/exchange/tokens.py): its registry entry — name, symbol,
@@ -1017,7 +1093,7 @@ class ExchangeStateManager:
                 name=p.get("name", ""), symbol=symbol, decimals=p.get("decimals", 18),
                 initial_supply=p.get("initial_supply", p.get("total_supply", 0)),
                 max_supply=p.get("max_supply"), mint_authority=p.get("mint_authority"),
-                freeze_authority=p.get("freeze_authority"))
+                freeze_authority=p.get("freeze_authority"), extensions=p)
         except TokenError as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_DEPLOY: {e}")
         if token.supply > 0:
@@ -1028,61 +1104,92 @@ class ExchangeStateManager:
             data={"token_address": token.address, "symbol": token.symbol,
                   "total_supply": str(token.supply), "decimals": token.decimals,
                   "mint_authority": token.mint_authority,
-                  "freeze_authority": token.freeze_authority},
+                  "freeze_authority": token.freeze_authority,
+                  "extensions": token.extensions()},
         )
 
-    def _token_move(self, op: str, token: str, frm: str, to: str, value) -> Tuple[Any, Decimal]:
+    def _token_move(self, op: str, token: str, frm: str, to: str, value) -> Tuple[Any, Decimal, Decimal]:
         """Validate a holder-to-holder move of a registered token: the token, the amount, a
         keyable recipient (an unkeyable one would have its credit dropped while the debit
-        applied — burning the tokens), the sender's balance and freeze. Raises TokenError."""
+        applied — burning the tokens), the token's transfer rules (paused, non-transferable,
+        a frozen sender) and the sender's balance. Returns the token, the amount and the
+        transfer fee it withholds. Raises TokenError."""
         t = self.tokens.require(token)
         v = token_amount(value)
         token_account(to)
+        fee = self.tokens.check_transfer(t.address, frm, self._current_block_height, v)
         avail = self.available_token_balance(frm, t.address)
         if avail is not None and avail < v:
             if self.enforce_spot_settlement:
                 raise TokenError(f"insufficient token balance: need {v}, available {avail}")
             logger.warning("[Phase E observe] %s by %s: amount %s exceeds available %s — would "
                            "REJECT once spot settlement is enforced", op, frm[:20], v, avail)
-        return t, v
+        return t, v, fee
+
+    def _transfer_with_fee(self, frm: str, to: str, t, v: Decimal, fee: Decimal) -> None:
+        """``to`` receives ``v`` less the fee; the fee is withheld at the token's own address
+        (the withdraw authority collects it with TOKEN_WITHDRAW_FEES)."""
+        self._settle_token_move(frm, to, t.address, v - fee)
+        if fee > ZERO:
+            self._settle_token_move(frm, t.address, t.address, fee)
 
     def _op_token_transfer(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """Move tokens from the sender to ``to`` in the token ledger."""
+        """Move tokens from the sender to ``to`` in the token ledger (less any transfer fee),
+        with an optional ``memo``."""
         p = tx.params
         to = str(p["to"])
         try:
-            t, v = self._token_move("token_transfer", str(p["token_address"]), tx.sender, to,
-                                    p["amount"])
-            self._settle_token_move(tx.sender, to, t.address, v)
+            note = token_memo(p.get("memo"))
+            t, v, fee = self._token_move("token_transfer", str(p["token_address"]), tx.sender,
+                                         to, p["amount"])
+            self._transfer_with_fee(tx.sender, to, t, v, fee)
         except (TokenError, ValueError) as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_TRANSFER: {e}")
+        data = {"token_address": t.address, "to": to, "amount": str(v)}
+        if fee:
+            data.update(fee=str(fee), received=str(v - fee))
+        if note:
+            data["memo"] = note
         return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER],
-            data={"token_address": t.address, "to": to, "amount": str(v)},
-        )
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER], data=data)
+
+    def _spend_authority(self, t, owner: str, spender: str, v: Decimal) -> str:
+        """How ``spender`` may move ``owner``'s tokens: as the permanent delegate, as an
+        operator (ERC-777), or within an allowance. Raises TokenError if none."""
+        if self.tokens.is_permanent_delegate(t.address, spender):
+            return "permanent_delegate"
+        if self.tokens.is_operator(t.address, owner, spender):
+            return "operator"
+        have = self.tokens.allowance(t.address, owner, spender)
+        if have < v:
+            raise TokenError(f"allowance {have} is less than {v}")
+        return "allowance"
 
     def _op_token_transfer_from(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """The sender — a spender ``from`` approved — moves ``from``'s tokens to ``to``,
-        within the allowance, which it consumes."""
+        """The sender moves ``from``'s tokens to ``to``: within the allowance ``from``
+        approved (which it consumes), as one of ``from``'s operators, or as the token's
+        permanent delegate."""
         p = tx.params
         owner, to = str(p["from"]), str(p["to"])
         try:
-            t, v = self._token_move("token_transfer_from", str(p["token_address"]), owner, to,
-                                    p["amount"])
-            have = self.tokens.allowance(t.address, owner, tx.sender)
-            if have < v:
-                raise TokenError(f"allowance {have} is less than {v}")
-            self._settle_token_move(owner, to, t.address, v)
+            note = token_memo(p.get("memo"))
+            t, v, fee = self._token_move("token_transfer_from", str(p["token_address"]), owner,
+                                         to, p["amount"])
+            via = self._spend_authority(t, owner, tx.sender, v)
+            self._transfer_with_fee(owner, to, t, v, fee)
         except (TokenError, ValueError) as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_TRANSFER_FROM: {e}")
-        left = self.tokens.spend_allowance(t.address, owner, tx.sender, v)
+        data = {"token_address": t.address, "from": owner, "to": to, "amount": str(v), "via": via}
+        if via == "allowance":
+            data["allowance_left"] = str(self.tokens.spend_allowance(t.address, owner,
+                                                                     tx.sender, v))
+        if fee:
+            data.update(fee=str(fee), received=str(v - fee))
+        if note:
+            data["memo"] = note
         return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER_FROM],
-            data={"token_address": t.address, "from": owner, "to": to, "amount": str(v),
-                  "allowance_left": str(left)},
-        )
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER_FROM],
+            data=data)
 
     def _op_token_mint(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """The mint authority mints ``amount`` to ``to`` (default: itself), within any cap."""
@@ -1101,23 +1208,36 @@ class ExchangeStateManager:
                   "total_supply": str(t.supply)})
 
     def _op_token_burn(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """A holder burns ``amount`` of its own balance; the supply falls by as much."""
+        """A holder burns ``amount`` of its own balance — or, naming ``from``, an operator or
+        the permanent delegate burns another holder's; the supply falls by as much."""
         p = tx.params
+        holder = str(p.get("from") or tx.sender)
         try:
             t = self.tokens.require(str(p["token_address"]))
             v = token_amount(p["amount"])
-            if self.tokens.is_frozen(t.address, tx.sender):
-                raise TokenError("the sender's balance is frozen")
-            avail = self.available_token_balance(tx.sender, t.address)
+            via = "holder"
+            if token_account(holder) != token_account(tx.sender):
+                if self.tokens.is_permanent_delegate(t.address, tx.sender):
+                    via = "permanent_delegate"
+                elif self.tokens.is_operator(t.address, holder, tx.sender):
+                    via = "operator"
+                else:
+                    raise TokenError("only the holder, its operators or the permanent delegate "
+                                     "may burn its balance")
+            if self.tokens.is_frozen(t.address, holder):
+                raise TokenError("the holder's balance is frozen")
+            avail = self.available_token_balance(holder, t.address)
             if self.enforce_spot_settlement and (avail is None or avail < v):
                 raise TokenError(f"insufficient token balance: need {v}, available {avail}")
             self.tokens.burn(t.address, v)
         except TokenError as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_BURN: {e}")
-        self._record_token_delta(tx.sender, t.address, -v)
+        self._record_token_delta(holder, t.address, -v)
+        data = {"token_address": t.address, "amount": str(v), "total_supply": str(t.supply)}
+        if via != "holder":
+            data.update(**{"from": holder, "via": via})
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_BURN],
-            data={"token_address": t.address, "amount": str(v), "total_supply": str(t.supply)})
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_BURN], data=data)
 
     def _op_token_approve(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Set ``spender``'s allowance over the sender's tokens to ``amount`` (0 revokes)."""
@@ -1159,6 +1279,172 @@ class ExchangeStateManager:
         return ExchangeExecResult(
             success=True, gas_used=EXCHANGE_GAS_COSTS[tx.op_type],
             data={"token_address": t.address, "account": str(p["account"]), "frozen": frozen})
+
+    def _op_token_update_metadata(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """The metadata authority edits the token's name, symbol, uri and extra fields."""
+        p = tx.params
+        try:
+            t = self.tokens.update_metadata(str(p["token_address"]), tx.sender, p)
+        except (TokenError, KeyError) as e:
+            return ExchangeExecResult(success=False, error=f"TOKEN_UPDATE_METADATA: {e}")
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_UPDATE_METADATA],
+            data={"token_address": t.address, "name": t.name, "symbol": t.symbol,
+                  "uri": t.uri, "fields": dict(t.fields)})
+
+    def _op_token_set_transfer_fee(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """The fee authority sets a new transfer-fee rate and cap, effective
+        FEE_UPDATE_DELAY_BLOCKS later."""
+        p = tx.params
+        try:
+            bps, cap, height = self.tokens.set_transfer_fee(
+                str(p["token_address"]), tx.sender, self._current_block_height,
+                p["transfer_fee_bps"], p.get("max_transfer_fee"))
+        except TokenError as e:
+            return ExchangeExecResult(success=False, error=f"TOKEN_SET_TRANSFER_FEE: {e}")
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_SET_TRANSFER_FEE],
+            data={"token_address": str(p["token_address"]).lower(), "transfer_fee_bps": bps,
+                  "max_transfer_fee": None if cap is None else str(cap), "from_height": height})
+
+    def _op_token_withdraw_fees(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """The withdraw authority moves every withheld transfer fee to ``to`` (default: itself)."""
+        p = tx.params
+        to = str(p.get("to") or tx.sender)
+        try:
+            token_account(to)
+            t = self.tokens.check_withdraw_authority(str(p["token_address"]), tx.sender)
+            withheld = self.available_token_balance(t.address, t.address)
+            if withheld is None:
+                raise TokenError("the withheld balance was not loaded for this block")
+            if withheld > ZERO:
+                self._settle_token_move(t.address, to, t.address, withheld)
+        except (TokenError, ValueError) as e:
+            return ExchangeExecResult(success=False, error=f"TOKEN_WITHDRAW_FEES: {e}")
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_WITHDRAW_FEES],
+            data={"token_address": t.address, "to": to, "amount": str(withheld)})
+
+    def _op_token_pause(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """TOKEN_PAUSE / TOKEN_RESUME: the pause authority stops (or restarts) every transfer,
+        mint and burn of the token — spot and perps moves of it included."""
+        p = tx.params
+        paused = tx.op_type == ExchangeOpType.TOKEN_PAUSE
+        try:
+            self.tokens.set_paused(str(p["token_address"]), tx.sender, paused)
+        except TokenError as e:
+            return ExchangeExecResult(success=False, error=f"{tx.op_type.name}: {e}")
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[tx.op_type],
+            data={"token_address": str(p["token_address"]).lower(), "paused": paused})
+
+    def _op_token_operator(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """TOKEN_AUTHORIZE_OPERATOR / TOKEN_REVOKE_OPERATOR (ERC-777): the sender lets
+        ``operator`` move (and burn) its balance of the token without an allowance — or stops
+        it, a default operator included."""
+        p = tx.params
+        authorized = tx.op_type == ExchangeOpType.TOKEN_AUTHORIZE_OPERATOR
+        try:
+            self.tokens.set_operator(str(p["token_address"]), tx.sender, str(p["operator"]),
+                                     authorized)
+        except TokenError as e:
+            return ExchangeExecResult(success=False, error=f"{tx.op_type.name}: {e}")
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[tx.op_type],
+            data={"token_address": str(p["token_address"]).lower(),
+                  "operator": str(p["operator"]), "authorized": authorized})
+
+    # ── native NFTs (qrdx/exchange/nfts.py) ─────────────────────────────
+
+    @staticmethod
+    def derive_collection_address(sender: str, nonce: int, symbol: str) -> str:
+        """Deterministic NFT collection address from the creating transaction (a different
+        domain from token addresses, so the two never collide)."""
+        seed = f"nft-collection:{sender}:{int(nonce)}:{symbol}".encode()
+        return "0x" + hashlib.blake2b(seed, digest_size=20).hexdigest()
+
+    def _nft(self, tx: ExchangeTransaction, fn) -> ExchangeExecResult:
+        try:
+            data = fn(tx.params)
+        except (NftError, TokenError) as e:
+            return ExchangeExecResult(success=False, error=f"{tx.op_type.name}: {e}")
+        return ExchangeExecResult(success=True, gas_used=EXCHANGE_GAS_COSTS[tx.op_type],
+                                  data=data)
+
+    def _op_nft_create_collection(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Create an NFT collection: name, symbol, uri, optional size cap, royalties, update and
+        mint authorities (both the creator unless given), optionally soulbound."""
+        def go(p):
+            address = self.derive_collection_address(tx.sender, tx.nonce, str(p.get("symbol", "")))
+            if self.tokens.get(address) is not None:
+                raise NftError(f"{address} is a token")
+            return self.nfts.create(address, tx.sender, self._current_block_height, p).summary()
+        return self._nft(tx, go)
+
+    def _op_nft_mint(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """The collection's mint authority mints the next NFT (or ``token_id``) to ``to``
+        (default: itself), with its own uri and name."""
+        def go(p):
+            to = str(p.get("to") or tx.sender)
+            i = self.nfts.mint(str(p["collection"]), tx.sender, to, self._current_block_height,
+                               uri=p.get("uri", ""), name=p.get("name", ""),
+                               tid=p.get("token_id"))
+            return {"collection": str(p["collection"]).lower(), "token_id": str(i), "to": to}
+        return self._nft(tx, go)
+
+    def _op_nft_transfer(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Move an NFT to ``to``: by its owner, its approved account or an operator of the
+        owner's (``from`` names the owner when the sender is not it)."""
+        def go(p):
+            note = token_memo(p.get("memo"))
+            frm = str(p.get("from") or tx.sender)
+            self.nfts.transfer(str(p["collection"]), p["token_id"], tx.sender, frm, str(p["to"]))
+            out = {"collection": str(p["collection"]).lower(),
+                   "token_id": str(nft_token_id(p["token_id"])), "from": frm, "to": str(p["to"])}
+            if note:
+                out["memo"] = note
+            return out
+        return self._nft(tx, go)
+
+    def _op_nft_burn(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        def go(p):
+            owner = self.nfts.item(str(p["collection"]), p["token_id"]).owner
+            self.nfts.burn(str(p["collection"]), p["token_id"], tx.sender)
+            return {"collection": str(p["collection"]).lower(),
+                    "token_id": str(nft_token_id(p["token_id"])), "owner": owner}
+        return self._nft(tx, go)
+
+    def _op_nft_approve(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """The owner (or an operator) approves one account for one NFT ("" clears it)."""
+        def go(p):
+            spender = self.nfts.approve(str(p["collection"]), p["token_id"], tx.sender,
+                                        p.get("spender"))
+            return {"collection": str(p["collection"]).lower(),
+                    "token_id": str(nft_token_id(p["token_id"])), "spender": spender}
+        return self._nft(tx, go)
+
+    def _op_nft_set_approval_for_all(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """The sender approves (``approved``, default true) or revokes an operator for all its
+        NFTs in the collection."""
+        def go(p):
+            approved = p.get("approved", True)
+            approved = (str(approved).lower() in ("1", "true", "yes")
+                        if isinstance(approved, str) else bool(approved))
+            self.nfts.set_operator(str(p["collection"]), tx.sender, str(p["operator"]), approved)
+            return {"collection": str(p["collection"]).lower(), "operator": str(p["operator"]),
+                    "approved": approved}
+        return self._nft(tx, go)
+
+    def _op_nft_update(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        return self._nft(tx, lambda p: self.nfts.update(str(p["collection"]), tx.sender, p))
+
+    def _op_nft_set_authority(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        def go(p):
+            new = self.nfts.set_authority(str(p["collection"]), tx.sender, str(p["authority"]),
+                                          p.get("new_authority"))
+            return {"collection": str(p["collection"]).lower(),
+                    "authority": str(p["authority"]).lower(), "new_authority": new}
+        return self._nft(tx, go)
 
     def token_registry_ops(self) -> List[Dict[str, Any]]:
         """The registry rows of the tokens this block deployed or changed (supply,
@@ -1621,6 +1907,8 @@ class ExchangeStateManager:
 
         # 4d. Native tokens: registry (supply, authorities), allowances, frozen accounts.
         hasher.update(self.tokens.state_hash())
+        if self.nfts.collections:            # (nothing until the first collection exists)
+            hasher.update(self.nfts.state_hash())
 
         # 5. Nonce state
         for addr in sorted(self._nonces.keys()):
@@ -1669,6 +1957,7 @@ class ExchangeStateManager:
             "oracle_committee": copy.deepcopy(self.oracle_committee),
             "oracle_votes": copy.deepcopy(self.oracle_votes),
             "tokens": copy.deepcopy(self.tokens),
+            "nfts": copy.deepcopy(self.nfts),
             "router_clob_sequence": self.router._clob_sequence,
         }
         self._snapshot = snapshot
@@ -1727,6 +2016,7 @@ class ExchangeStateManager:
         self.oracle_votes = copy.deepcopy(snapshot.get("oracle_votes", {}))
 
         self.tokens = copy.deepcopy(snapshot.get("tokens", TokenRegistry()))
+        self.nfts = copy.deepcopy(snapshot.get("nfts", NftRegistry()))
         self.router._clob_sequence = snapshot.get("router_clob_sequence", 0)
 
     # =====================================================================
@@ -1779,12 +2069,18 @@ class ExchangeStateManager:
 
     def set_available_token_balance(self, holder: str, token: str, amount: Decimal) -> None:
         """Pre-load a holder's available balance of ``token`` (from the
-        token_balances ledger) for the spot sufficiency check. Called by the async
-        block paths before processing."""
-        self._available_token_balances[(holder, token)] = Decimal(amount)
+        token_balances ledger, or account_state for native QRDX) for the spot sufficiency
+        check. Called by the async block paths before processing."""
+        if is_native_asset(token):
+            self.set_available_balance(holder, amount)
+        else:
+            self._available_token_balances[(holder, token)] = Decimal(amount)
 
     def available_token_balance(self, holder: str, token: str) -> Optional[Decimal]:
-        """Pre-loaded available token balance, or None if not loaded (check skipped)."""
+        """Pre-loaded available balance of an asset (native QRDX: the account balance), or
+        None if not loaded."""
+        if is_native_asset(token):
+            return self.available_balance(holder)
         return self._available_token_balances.get((holder, token))
 
     def clear_available_token_balances(self) -> None:

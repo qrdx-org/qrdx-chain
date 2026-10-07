@@ -7,6 +7,8 @@ The exchange journal — what each committed block did, for wallets, the API and
   block includes them; the receipt is how a wallet learns what happened.
 * **Events:** a sequenced feed of perps fills (including liquidation fills), liquidations and
   funding settlements.
+* **Market data** (``self.market``, qrdx/exchange/market_data.py): every trade on every market —
+  spot order-book fills, AMM swaps and perps fills — with candles and 24-hour statistics.
 
 This is NOT consensus state: it is never hashed or snapshotted, and it is recorded only when a
 block commits (a reverted block leaves nothing behind). It lives on the ExchangeStateManager, so
@@ -18,6 +20,8 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 from decimal import Decimal
 from typing import Any, Deque, Dict, Iterable, List, Optional
+
+from .market_data import MarketData
 
 MAX_RECEIPTS = 50_000
 MAX_EVENTS = 10_000
@@ -42,6 +46,7 @@ class ExchangeJournal:
         self.receipts: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.events: Deque[Dict[str, Any]] = deque(maxlen=max_events)
         self.seq = 0                     # last event sequence number (monotonic per journal)
+        self.market = MarketData()
 
     # ── recording (at block commit) ────────────────────────────────────
 
@@ -66,6 +71,14 @@ class ExchangeJournal:
                 for fill in data.get("fills", []):
                     self._event("fill", when, tx_hash=tx_hash, order_id=data.get("order_id"),
                                 taker=tx.sender, liquidation=False, **fill)
+                    self._perp_trade(fill, when, tx_hash, tx.sender)
+            elif tx.op_type.name in ("PLACE_ORDER", "SWAP") and result.success:
+                for fill in data.get("fills", []):
+                    self.market.record_trade(
+                        fill["market"], price=fill["price"], amount=fill["amount"],
+                        side=fill["side"], venue=fill["venue"], tx_hash=tx_hash,
+                        maker=fill.get("maker"), taker=fill.get("taker"),
+                        pool_id=fill.get("pool_id"), **when)
         for ev in tick_events or ():
             ev = jsonable(ev)
             if ev.get("type") == "liquidation":
@@ -75,8 +88,17 @@ class ExchangeJournal:
                 for fill in fills:
                     self._event("fill", when, tx_hash=None, order_id=None,
                                 taker=ev.get("owner"), liquidation=True, **fill)
+                    self._perp_trade(fill, when, None, ev.get("owner"))
             elif ev.get("type") == "funding":
                 self._event("funding", when, **{k: v for k, v in ev.items() if k != "type"})
+        self.market.advance(timestamp)
+
+    def _perp_trade(self, fill: Dict[str, Any], when: Dict[str, Any], tx_hash, taker) -> None:
+        maker = fill.get("maker")
+        side = "sell" if maker is not None and fill.get("buyer") == maker else "buy"
+        self.market.record_trade(fill["market"], price=fill["price"], amount=fill["amount"],
+                                 side=side, venue="perp", tx_hash=tx_hash, maker=maker,
+                                 taker=taker, **when)
 
     def _event(self, kind: str, when: Dict[str, Any], **fields) -> None:
         self.seq += 1

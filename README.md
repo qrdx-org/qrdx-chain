@@ -147,7 +147,7 @@ To test public node behavior over the Internet, the Docker setup includes option
 | `docker/docker-compose.yml` | Single node — development / joining an existing network |
 | `docker/docker-compose.testnet.yml` | Self-contained 4-node local testnet (3 validators + 1 full node) |
 | `docker/docker-compose.prod.yml` | Production node + Prometheus + Grafana |
-| `docker/docker-compose.tunnel.yml` | Public **validator** behind a Cloudflare Tunnel — no inbound ports |
+| `docker/docker-compose.tunnel.yml` | Public **genesis validator** behind a Cloudflare Tunnel: starts its own chain, no inbound ports |
 | `docker/docker-compose.tunnel-wallet.yml` | Overlay for `tunnel.yml`: supply your own validator wallet |
 | `docker/docker-compose.prod-secrets.yml` | Overlay for `prod.yml`: mount TLS certs / validator wallet |
 
@@ -232,7 +232,13 @@ Prometheus scrapes `qrdx-node:3007/metrics` and is published on `${PROMETHEUS_PO
 
 `docker-compose.tunnel.yml` runs a **validator** node alongside a `cloudflared` sidecar, so the node is reachable on a real hostname over HTTPS with **no inbound port open on the host**. Both services use `restart: unless-stopped`, so they survive crashes and host reboots and run until you stop them.
 
-On first start a `validator-init` service generates an ML-DSA-65 validator keypair into the data volume and logs its address. It never overwrites an existing wallet, so restarts reuse the same identity. Set `QRDX_VALIDATOR_ENABLED=false` to run a plain full node.
+The node **starts its own chain** — it is the genesis node, not a node that joins an existing network. On first start:
+
+1. `validator-init` generates an ML-DSA-65 validator keypair into the data volume (or validates the wallet you mounted) and logs its address. It never overwrites an existing wallet, so restarts reuse the same identity.
+2. `genesis-init` writes `genesis_config.json` onto the same volume. It funds `QRDX_GENESIS_ALLOCATIONS` (default: `0xPQ4Bd03Abf07B8302EA2547c881F597530638848a3d245296da543A40F8b05884C` = **1,000,000,000 QRDX**) and makes this node's validator the genesis validator with `QRDX_GENESIS_VALIDATOR_STAKE` (default 100,000 QRDX).
+3. The node creates block 0 from that file and proposes from block 1. No `STAKE_DEPOSIT` is needed.
+
+`QRDX_GENESIS_ALLOCATIONS` takes `address:amount[,address:amount...]`, with amounts in QRDX. Addresses must be checksummed (mixed case, exactly as the wallet shows them).
 
 The stack uses **named volumes only — no host bind mounts**, so it starts identically on Linux, Docker Desktop and WSL. To supply your own validator wallet instead, add the wallet overlay:
 
@@ -253,8 +259,8 @@ export QRDX_PUBLIC_HOSTNAME='node.example.com'
 
 docker compose -f docker/docker-compose.tunnel.yml up --build -d
 
-# The generated validator address is logged here — fund and stake it.
-docker compose -f docker/docker-compose.tunnel.yml logs validator-init
+# The validator address, the genesis hash and the funded allocations.
+docker compose -f docker/docker-compose.tunnel.yml logs validator-init genesis-init
 docker compose -f docker/docker-compose.tunnel.yml logs -f
 
 # The node's host port is bound to 127.0.0.1 — the tunnel is the only public path.
@@ -266,7 +272,7 @@ docker compose -f docker/docker-compose.tunnel.yml down
 
 `QRDX_PUBLIC_HOSTNAME` must match the hostname you routed: it becomes `QRDX_SELF_URL`, the address this node advertises to peers. Both variables are required — Compose fails with an explanatory message if either is unset.
 
-> **Staking:** starting the validator process is not the same as joining the active set. The node proposes and attests only once its address holds at least `MIN_VALIDATOR_STAKE` (100,000 QRDX), established by a `STAKE_DEPOSIT` transaction from that address. Until then the validator loop runs but the node behaves as a full node.
+> **Genesis is fixed once the chain exists.** `genesis-init` writes it once and never regenerates it. If you change `QRDX_GENESIS_ALLOCATIONS` later, it only logs a warning. A different genesis needs a fresh chain: `down -v`, which **also deletes the validator key** on the volume, so back that up first. Every other node joining this chain must start from the same file: copy it out with `docker compose -f docker/docker-compose.tunnel.yml cp node:/app/data/genesis_config.json .` and place it two directories above that node's `QRDX_DATABASE_PATH`. A node that builds its own default genesis has a different block 0 and rejects this chain's blocks.
 
 > **Key custody:** the wallet format this node loads is **unencrypted** — the Dilithium secret key is plain hex in the JSON, and `QRDX_VALIDATOR_PASSWORD` is accepted by the loader but never used to encrypt it. The `node-data` volume therefore holds a live private key: back it up, restrict host access, and keep it off shared storage.
 
@@ -342,7 +348,7 @@ If it persists, a stale shim directory is cached; restart Docker Desktop. When y
 
 **Validator never proposes a block**
 
-Expected until the validator address holds at least 100,000 QRDX of stake. `docker compose ... logs validator-init` prints the address; check it is funded and that a `STAKE_DEPOSIT` has been submitted.
+On a node joining an existing chain, this is expected until the validator address holds at least 100,000 QRDX of stake. `docker compose ... logs validator-init` prints the address; check it is funded and that a `STAKE_DEPOSIT` has been submitted. The tunnel stack's validator is a genesis validator and proposes from block 1. If it does not, check `logs genesis-init` and look for `Found genesis configuration` in the node log.
 
 </dd></dl>
 </details>

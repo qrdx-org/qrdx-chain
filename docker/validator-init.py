@@ -108,9 +108,10 @@ def generate(path: Path) -> int:
     log.info("validator address: %s", wallet["address"])
     log.warning("This file holds an UNENCRYPTED private key. Back it up and keep it secret.")
     log.warning(
-        "The node will run as a validator, but it only enters the active set once this "
-        "address holds at least %s QRDX of stake (a STAKE_DEPOSIT transaction). Until "
-        "then it syncs and serves like a full node.", MIN_STAKE
+        "If genesis-init writes this chain's genesis next, this address becomes its genesis "
+        "validator and proposes from block 1. Joining an EXISTING chain instead, it only "
+        "enters the active set once it holds at least %s QRDX of stake (a STAKE_DEPOSIT "
+        "transaction); until then it syncs and serves like a full node.", MIN_STAKE
     )
     return 0
 

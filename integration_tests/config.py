@@ -120,6 +120,11 @@ WALLET_ROSTER: List[WalletSpec] = [
     WalletSpec("Token EVM User", "traditional", Decimal("1000")),   # sends a token from the EVM
     WalletSpec("CLOB Trader", "pq", VALIDATOR_GENESIS_BALANCE),     # S17
     WalletSpec("CLOB Maker", "pq", VALIDATOR_GENESIS_BALANCE),      # S18
+    # S21: interfaces — a QRDX pool + book (maker, taker), market data, history, NFTs.
+    WalletSpec("Market Maker", "pq", VALIDATOR_GENESIS_BALANCE),
+    WalletSpec("Market Taker", "pq", Decimal("1000")),
+    WalletSpec("NFT Artist", "pq", Decimal("1000")),
+    WalletSpec("NFT Collector", "pq", Decimal("1000")),
 ]
 
 # The testnet stablecoin perps settle in (S13 deploys it; S13/S19 trade in it).

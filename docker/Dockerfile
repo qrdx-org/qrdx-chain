@@ -116,12 +116,12 @@ WORKDIR /app
 COPY qrdx ./qrdx
 COPY run_node.py ./
 COPY docker/docker-entrypoint.sh docker/docker-healthcheck.py \
-     docker/testnet-init.py docker/validator-init.py ./docker/
+     docker/testnet-init.py docker/validator-init.py docker/genesis-init.py ./docker/
 
 # Fail the BUILD (not production) if the post-quantum stack is not usable:
 # ML-DSA-65 must be present, and importing oqs must not trigger a source build.
 RUN chmod +x ./docker/docker-entrypoint.sh ./docker/docker-healthcheck.py \
-        ./docker/testnet-init.py ./docker/validator-init.py \
+        ./docker/testnet-init.py ./docker/validator-init.py ./docker/genesis-init.py \
     && python -c "\
 import oqs;\
 mechs = oqs.get_enabled_sig_mechanisms();\
