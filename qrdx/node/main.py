@@ -906,7 +906,7 @@ self_node_id: str = None
 self_is_public: bool = False 
 
 app_servers = [{"url": str(DENARO_SELF_URL)}] if DENARO_SELF_URL else []
-app = FastAPI(servers=app_servers, title="Denaro Node", description="Full node for the Denaro blockchain.", version=NODE_VERSION)
+app = FastAPI(servers=app_servers, title="QRDX Node", description="Full node for the QRDX blockchain.", version=NODE_VERSION)
 
 limiter = Limiter(key_func=rate_limit_key_func)
 # Allow testnet / integration-test environments to disable rate limiting
