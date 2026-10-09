@@ -421,6 +421,9 @@ class NodeInterface:
     """
 
     _rpc_id_counter = 0
+    # async () -> this node's network identity (chain spec, genesis, fork id); set by
+    # main.startup. Sent with every handshake so the remote can refuse another network.
+    network_identity_provider = None
 
     def __init__(self, url: str, client: httpx.AsyncClient, db):
         self.url = url.strip('/')
@@ -522,6 +525,15 @@ class NodeInterface:
             "timestamp": current_time,
             "nonce": nonce
         }
+        # Name our genesis block (signed, as x-denaro-genesis): the receiver adds an unknown
+        # caller as a peer only if it is on the same chain.
+        if NodeInterface.network_identity_provider is not None:
+            try:
+                ident = await NodeInterface.network_identity_provider()
+                signed_headers_data = {**(signed_headers_data or {}),
+                                       "genesis": ident["genesis_hash"]}
+            except Exception:
+                pass
         if signed_headers_data:
             payload_to_sign.update(signed_headers_data)
 
@@ -630,9 +642,12 @@ class NodeInterface:
             if last_block:
                 last_block_hash = last_block.get('hash') or last_block.get('block_hash')
 
+        network = None
+        if NodeInterface.network_identity_provider is not None:
+            network = await NodeInterface.network_identity_provider()
         resp = await self._rpc_call(
             "p2p_handshakeResponse",
-            [challenge, current_height, last_block_hash],
+            [challenge, current_height, last_block_hash, network],
         )
         return self._unwrap(resp)
 

@@ -19,6 +19,7 @@ import pytest
 
 from qrdx.contracts.state import ContractStateManager
 from qrdx.crypto.account_id import to_account_id
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 WEI = 10 ** 18
 ALICE = "0x" + "11" * 20
@@ -151,7 +152,7 @@ def test_pq_envelope_is_charged_its_larger_floor():
     from qrdx.transactions.pq_tx import PQTransaction
 
     priv, pub = generate_keypair()
-    tx = PQTransaction(chain_id=1, nonce=0, gas_price=10 ** 9, gas_limit=500_000,
+    tx = PQTransaction(chain_id=CHAIN_ID, nonce=0, gas_price=10 ** 9, gas_limit=500_000,
                        to=_addr(BOB), value=WEI, data=b"").sign(priv)
     parsed = parse_eth_raw_tx("0x" + tx.encode().hex())
     pq_floor = int(parsed["intrinsic_gas"])

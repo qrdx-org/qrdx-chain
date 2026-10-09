@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 
 from ..logger import get_logger
+from .. import chain_spec as chain_spec_mod
+from ..chain_spec import ChainSpec, ChainSpecError
 from ..constants import (
     GENESIS_PREFUNDED_ACCOUNTS,
     GENESIS_TOTAL_PREFUNDED,
@@ -78,152 +80,77 @@ class GenesisInitializer:
     async def initialize_genesis(
         self,
         prefunded_accounts: Optional[Dict[str, Tuple[Decimal, str]]] = None,
-        validators: Optional[List[Tuple[str, str, Decimal]]] = None,
+        validators: Optional[List[tuple]] = None,  # (address, pubkey, stake[, withdrawal_address])
         genesis_time: Optional[int] = None,
-        network_name: str = "qrdx-mainnet",
-        chain_id: int = 1,
         system_wallet_controller: Optional[str] = None,
         enable_system_wallets: bool = True,
-    ) -> bool:
+        chain_spec: Optional[ChainSpec] = None,
+        expected_block_hash: Optional[str] = None,
+        min_genesis_validators: int = 0,
+        initial_supply: Optional[Decimal] = None,
+    ) -> GenesisBlock:
         """
-        Initialize the database with genesis state.
-        
-        Args:
-            prefunded_accounts: Dict of {address: (balance, label)}
-            validators: List of (address, public_key, stake) tuples
-            genesis_time: Unix timestamp for genesis (default: now)
-            network_name: Name of the network
-            chain_id: Chain ID
-            
-        Returns:
-            True if initialization succeeded
+        Create the genesis block and initialise the database from it.
+
+        The genesis is computed from ``chain_spec`` (default: the process's spec) and the
+        allocations, by the same ``GenesisCreator`` that wrote the network's genesis file —
+        so ``expected_block_hash`` (the file's own ``block.block_hash``) must come out
+        identical. A mismatch means the file was edited, or was produced under a different
+        spec or release: the node refuses rather than starting a different chain.
+
+        Raises on any failure. A node that cannot create its network's genesis must not start
+        (returning False used to read as "genesis already exists").
         """
         if self._genesis_initialized:
-            logger.warning("Genesis already initialized in this session")
-            return True
-        
-        # Use default prefunded accounts if not provided
+            raise RuntimeError("genesis was already initialised in this session")
+
+        spec = chain_spec or chain_spec_mod.active()
         if prefunded_accounts is None:
             prefunded_accounts = GENESIS_PREFUNDED_ACCOUNTS
-        
-        logger.info(f"Initializing genesis for {network_name} (chain_id={chain_id})")
+
+        logger.info(f"Initializing genesis for {spec.network} (chain_id={spec.chain_id}, "
+                    f"spec {spec.genesis_hash()[:16]}…)")
         logger.info(f"Prefunded accounts: {len(prefunded_accounts)}")
         logger.info(f"Total prefunded: {sum(amt for amt, _ in prefunded_accounts.values())} QRDX")
-        
-        try:
-            # Create genesis config
-            pre_allocations = {
-                addr: amount 
-                for addr, (amount, _) in prefunded_accounts.items()
-            }
-            
-            config = GenesisConfig(
-                chain_id=chain_id,
-                network_name=network_name,
-                genesis_time=genesis_time or int(datetime.now(timezone.utc).timestamp()),
-                pre_allocations=pre_allocations,
-                min_genesis_validators=0,  # Allow genesis without validators
-                system_wallet_controller=system_wallet_controller,
-                enable_system_wallets=enable_system_wallets,
-            )
-            
-            creator = GenesisCreator(config)
-            
-            # Add prefunded accounts with labels
-            for address, (balance, label) in prefunded_accounts.items():
-                creator.add_account(address, balance, label)
-            
-            # Add validators if provided
-            if validators:
-                for address, pubkey, stake in validators:
-                    creator.add_validator(address, pubkey, stake)
-            
-            # Create genesis state and block
-            # Note: If no validators, we skip the validator check
-            if validators and len(validators) >= config.min_genesis_validators:
-                state, block = creator.create_genesis(config.genesis_time)
-            else:
-                # Create simplified genesis without validator check
-                state, block = self._create_minimal_genesis(creator, config)
-            
-            # Initialize database with genesis data
-            await self._init_database_from_genesis(state, block, prefunded_accounts)
-            
-            self._genesis_initialized = True
-            logger.info("Genesis initialization complete!")
-            logger.info(f"Genesis block hash: {block.block_hash}")
-            logger.info(f"Genesis state root: {state.state_root}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Genesis initialization failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def _create_minimal_genesis(
-        self,
-        creator: GenesisCreator,
-        config: GenesisConfig,
-    ) -> Tuple[GenesisState, GenesisBlock]:
-        """
-        Create minimal genesis without validators.
-        
-        Used when bootstrapping a network without initial validators.
-        """
-        import time
-        
-        genesis_time = config.genesis_time or int(time.time())
-        
-        # Create state
-        state = GenesisState(
-            chain_id=config.chain_id,
-            network_name=config.network_name,
-            genesis_time=genesis_time,
-            genesis_slot=GENESIS_SLOT,
+
+        config = GenesisConfig(
+            chain_spec=spec,
+            genesis_time=genesis_time or int(datetime.now(timezone.utc).timestamp()),
+            pre_allocations={addr: amount for addr, (amount, _) in prefunded_accounts.items()},
+            min_genesis_validators=min_genesis_validators,
+            system_wallet_controller=system_wallet_controller,
+            enable_system_wallets=enable_system_wallets,
         )
-        
-        # Add accounts
-        for address, account in creator._accounts.items():
-            state.accounts[address] = {
-                "balance": str(account.balance),
-                "label": account.label,
-            }
-        
-        # Compute state root
-        state_root = creator._compute_state_root(state)
-        state.state_root = state_root.hex()
-        
-        # Generate RANDAO
-        randao_seed = creator._generate_randao_seed()
-        state.randao_seed = randao_seed.hex()
-        
-        # Set totals
-        total_prefunded = sum(
-            Decimal(a['balance']) for a in state.accounts.values()
-        )
-        state.total_supply = str(config.initial_supply)
-        
-        # Create genesis block
-        block = GenesisBlock(
-            slot=GENESIS_SLOT,
-            epoch=GENESIS_EPOCH,
-            state_root=state.state_root,
-            timestamp=genesis_time,
-        )
-        
-        # Compute block hash
-        block_data = (
-            block.slot.to_bytes(8, 'little') +
-            bytes.fromhex(block.parent_root) +
-            bytes.fromhex(block.state_root) +
-            block.timestamp.to_bytes(8, 'little')
-        )
-        block.block_hash = hashlib.sha256(block_data).hexdigest()
-        
-        return state, block
-    
+        if initial_supply is not None:
+            config.initial_supply = Decimal(str(initial_supply))
+        creator = GenesisCreator(config)
+        # pre_allocations already funded each account; set only the display labels here
+        # (add_account would ADD the balance a second time).
+        for address, (_balance, label) in prefunded_accounts.items():
+            if label:
+                creator._accounts[address].label = label
+        for entry in validators or []:
+            address, pubkey, stake = entry[0], entry[1], entry[2]
+            withdrawal = entry[3] if len(entry) > 3 else None
+            if not creator.add_validator(address, pubkey, stake, withdrawal):
+                raise ChainSpecError(f"genesis validator {address[:20]}… was rejected "
+                                     f"(stake {stake}); see the log above")
+
+        state, block = creator.create_genesis(config.genesis_time)
+        if expected_block_hash and expected_block_hash.lower() != block.block_hash.lower():
+            raise ChainSpecError(
+                f"the genesis file records block hash {expected_block_hash[:16]}…, but this "
+                f"release computes {block.block_hash[:16]}… from it. The file was edited or "
+                f"produced by an incompatible release; refusing to start a different chain.")
+
+        await self._init_database_from_genesis(state, block, prefunded_accounts)
+
+        self._genesis_initialized = True
+        logger.info("Genesis initialization complete!")
+        logger.info(f"Genesis block hash: {block.block_hash}")
+        logger.info(f"Genesis state root: {state.state_root}")
+        return block
+
     async def _init_database_from_genesis(
         self,
         state: GenesisState,
@@ -260,8 +187,12 @@ class GenesisInitializer:
                 key=lambda v: v["address"]),
             "system_wallets": len(state.system_wallets),
             "system_wallet_controller": state.system_wallet_controller,
+            # The chain spec this chain was created under. A node refuses to start on this
+            # database with any other (main._verify_chain_identity).
+            "chain_spec_hash": state.chain_spec_hash,
+            "chain_spec_format": chain_spec_mod.SPEC_FORMAT,
         }
-        
+
         # Calculate total reward (sum of all prefunded balances + system wallet balances)
         total_reward = sum(amount for amount, _ in prefunded_accounts.values())
         if state.system_wallets:
@@ -424,12 +355,16 @@ class GenesisInitializer:
                 fees=Decimal("0"),
             )
             
-            # Create unspent output (controlled by controller wallet)
-            await self.db.add_unspent_output(
-                tx_hash=tx_hash,
-                index=0,
-                address=address,
-                amount=int(balance * 1000000),
+            # Fund it in the unified ledger (account_state, wei), like every other genesis
+            # allocation. It used to be a UTXO output, which balance READS fell back to while
+            # account_state had no row — so a debit through the balance-delta flush (a governance
+            # system_spend) found nothing to debit and was dropped, while its credit landed.
+            from ..crypto.account_id import to_account_id
+            await self.db.connection.execute(
+                "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, is_contract) "
+                "VALUES (?, ?, 0, 0, 0, 0) "
+                "ON CONFLICT(address) DO UPDATE SET balance = excluded.balance",
+                (to_account_id(address), str(int(balance * Decimal(10 ** 18)))),
             )
             
             # Store system wallet metadata
@@ -544,123 +479,91 @@ class GenesisInitializer:
             "total_system_wallets": state.total_system_wallets,
         }
         
-        # Try to store in a metadata table if it exists
-        try:
-            # Try PostgreSQL syntax first
-            await self.db.execute("""
-                INSERT INTO chain_metadata (key, value)
-                VALUES ('genesis', $1)
-                ON CONFLICT (key) DO UPDATE SET value = $1
-            """, json.dumps(metadata))
-        except Exception:
-            try:
-                # Fall back to SQLite syntax
-                meta_json = json.dumps(metadata)
-                await self.db.execute("""
-                    INSERT OR REPLACE INTO chain_metadata (key, value)
-                    VALUES ('genesis', ?)
-                """, meta_json)
-            except Exception as e:
-                # Table might not exist, log and continue
-                logger.debug(f"Could not store genesis metadata in DB: {e}")
-            
-            # Fallback: write to file
-            try:
-                import os
-                genesis_file = os.path.join(
-                    os.path.dirname(os.path.dirname(__file__)),
-                    'genesis_metadata.json'
-                )
-                with open(genesis_file, 'w') as f:
-                    json.dump(metadata, f, indent=2)
-                logger.info(f"Genesis metadata written to {genesis_file}")
-            except Exception as fe:
-                logger.warning(f"Could not write genesis metadata file: {fe}")
+        metadata["chain_spec_hash"] = state.chain_spec_hash
+        # In the node's own database (chain_metadata), never beside the package: a file there
+        # is shared by every node started from this checkout, and was dirtied by each one.
+        await self.db.connection.execute(
+            "INSERT OR REPLACE INTO chain_metadata (key, value) VALUES ('genesis', ?)",
+            (json.dumps(metadata, sort_keys=True),))
+        await self.db.connection.commit()
 
 
 async def initialize_genesis_if_needed(
     db,
     prefunded_accounts: Optional[Dict[str, Tuple[Decimal, str]]] = None,
     genesis_file: Optional[str] = None,
+    chain_spec: Optional[ChainSpec] = None,
 ) -> bool:
     """
-    Convenience function to initialize genesis if the chain is empty.
-    
-    Args:
-        db: Database connection
-        prefunded_accounts: Optional custom prefunded accounts
-        genesis_file: Optional path to genesis configuration JSON file
-        
-    Returns:
-        True if genesis was initialized or already existed
+    Create the genesis block if the chain is empty.
+
+    With a genesis file, genesis is built from it — and must reproduce the file's recorded
+    genesis block hash under the process's chain spec. Without one, this is a DEV network and
+    the built-in allocations are used. Every failure raises: there is no fallback genesis,
+    because a node that started one would be running a different chain from its network.
+
+    Returns True if genesis was created now, False if the chain already had one.
     """
+    spec = chain_spec or chain_spec_mod.active()
     initializer = GenesisInitializer(db)
-    
-    if await initializer.is_genesis_needed():
-        # Try to load genesis from file if provided
-        if genesis_file and os.path.exists(genesis_file):
-            try:
-                import json
-                with open(genesis_file, 'r') as f:
-                    genesis_data = json.load(f)
-                
-                # Extract config, state, and block from genesis file
-                config_data = genesis_data.get('config', {})
-                state = genesis_data.get('state', {})
-                block_data = genesis_data.get('block', {})
-                
-                accounts = state.get('accounts', {})
-                validators_data = state.get('validators', [])
-                system_wallet_controller = state.get('system_wallet_controller')
-                
-                # Convert accounts to prefunded_accounts format
-                if accounts and not prefunded_accounts:
-                    prefunded_accounts = {}
-                    for addr, info in accounts.items():
-                        balance = Decimal(info.get('balance', info) if isinstance(info, dict) else info)
-                        label = info.get('label', 'genesis-allocation') if isinstance(info, dict) else 'genesis-allocation'
-                        prefunded_accounts[addr] = (balance, label)
-                    logger.info(f"Loaded {len(prefunded_accounts)} prefunded accounts from genesis file")
-                
-                # Convert validators list to tuple format if present
-                validators = []
-                if validators_data:
-                    for v in validators_data:
-                        address = v['address']
-                        pubkey = v['public_key']
-                        stake = Decimal(v['stake'])
-                        validators.append((address, pubkey, stake))
-                    logger.info(f"Loaded {len(validators)} validators from genesis file")
-                
-                # Extract genesis time and chain info
-                genesis_time = state.get('genesis_time', block_data.get('timestamp'))
-                network_name = state.get('network_name', config_data.get('network_name', 'qrdx-mainnet'))
-                chain_id = state.get('chain_id', config_data.get('chain_id', 1))
-                
-                logger.info(f"Loading genesis for {network_name} (chain_id={chain_id})")
-                if system_wallet_controller:
-                    logger.info(f"System wallet controller: {system_wallet_controller}")
-                
-                return await initializer.initialize_genesis(
-                    prefunded_accounts=prefunded_accounts,
-                    validators=validators if validators else None,
-                    genesis_time=genesis_time,
-                    network_name=network_name,
-                    chain_id=chain_id,
-                    system_wallet_controller=system_wallet_controller,
-                    enable_system_wallets=bool(system_wallet_controller),
-                )
-            except Exception as e:
-                logger.warning(f"Failed to load genesis file {genesis_file}: {e}")
-                logger.info("Falling back to default genesis")
-                import traceback
-                traceback.print_exc()
-        
-        # Use default or provided prefunded accounts
-        return await initializer.initialize_genesis(
+    if not await initializer.is_genesis_needed():
+        return False
+
+    if genesis_file is None:
+        if not spec.dev:
+            raise ChainSpecError(f"{spec.network} is not a dev network; its genesis must come "
+                                 f"from its genesis file")
+        await initializer.initialize_genesis(
             prefunded_accounts=prefunded_accounts or GENESIS_PREFUNDED_ACCOUNTS,
-        )
-    
+            chain_spec=spec)
+        return True
+
+    genesis_data, file_spec = chain_spec_mod.load_genesis_file(genesis_file)
+    if file_spec.genesis_hash() != spec.genesis_hash():
+        raise ChainSpecError(f"genesis file {genesis_file} defines a different chain spec "
+                             f"from the one this process loaded")
+    state = genesis_data.get("state") or {}
+    block_data = genesis_data.get("block") or {}
+    if state.get("chain_id") not in (None, spec.chain_id):
+        raise ChainSpecError(f"genesis state chain_id {state.get('chain_id')} disagrees with the "
+                             f"chain spec ({spec.chain_id})")
+    if state.get("network_name") not in (None, spec.network):
+        raise ChainSpecError(f"genesis state network {state.get('network_name')!r} disagrees "
+                             f"with the chain spec ({spec.network!r})")
+
+    if not prefunded_accounts:
+        prefunded_accounts = {}
+        for addr, info in (state.get("accounts") or {}).items():
+            if isinstance(info, dict):
+                balance, label = Decimal(str(info["balance"])), info.get("label", "genesis-allocation")
+            else:
+                balance, label = Decimal(str(info)), "genesis-allocation"
+            prefunded_accounts[addr] = (balance, label)
+        logger.info(f"Loaded {len(prefunded_accounts)} prefunded accounts from genesis file")
+
+    validators = [(v["address"], v["public_key"], Decimal(str(v["stake"])),
+                   v.get("withdrawal_address") or None)
+                  for v in (state.get("validators") or [])]
+    logger.info(f"Loaded {len(validators)} validators from genesis file")
+
+    genesis_time = state.get("genesis_time", block_data.get("timestamp"))
+    if genesis_time is None:
+        raise ChainSpecError(f"genesis file {genesis_file} has no genesis time")
+    controller = state.get("system_wallet_controller") or None
+    logger.info(f"Loading genesis for {spec.network} (chain_id={spec.chain_id})")
+    if controller:
+        logger.info(f"System wallet controller: {controller}")
+
+    await initializer.initialize_genesis(
+        prefunded_accounts=prefunded_accounts,
+        validators=validators or None,
+        genesis_time=int(genesis_time),
+        system_wallet_controller=controller,
+        enable_system_wallets=bool(controller),
+        chain_spec=spec,
+        expected_block_hash=block_data.get("block_hash") or None,
+        initial_supply=Decimal(str(state["total_supply"])) if state.get("total_supply") else None,
+    )
     return True
 
 

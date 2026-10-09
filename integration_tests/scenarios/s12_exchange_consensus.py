@@ -17,6 +17,7 @@ from decimal import Decimal
 
 from integration_tests.scenarios.base import Scenario
 from integration_tests.rpc_client import NodeRPCClient
+from integration_tests.config import CHAIN_ID  # exchange txs are signed for the testnet's chain
 
 
 class S12ExchangeConsensus(Scenario):
@@ -63,7 +64,7 @@ class S12ExchangeConsensus(Scenario):
 
         # 2. Build + PQ-sign a real exchange transaction (create a trading pair).
         tx = ExchangeTransaction(
-            op_type=ExchangeOpType.CREATE_POOL, sender=sender, nonce=0,
+            chain_id=CHAIN_ID, op_type=ExchangeOpType.CREATE_POOL, sender=sender, nonce=0,
             params={"token0": "qBTC", "token1": "qUSD", "fee_tier": int(FeeTier.MEDIUM),
                     "pool_type": int(PoolType.STANDARD), "initial_sqrt_price": "173.205080756",
                     "stake_amount": "10000"},

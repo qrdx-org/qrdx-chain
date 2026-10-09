@@ -22,6 +22,7 @@ from qrdx.contracts.evm_mempool import intrinsic_gas_legacy
 from qrdx.crypto.pq.dilithium import PUBLIC_KEY_SIZE, SIGNATURE_SIZE
 from qrdx.rpc.modules.qrdx import QRDXModule
 from qrdx.transactions.pq_tx import PQ_TX_TYPE, PQTransaction, intrinsic_gas_pq
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 
 def _module():
@@ -106,13 +107,13 @@ def test_the_quoted_pq_floor_matches_what_a_real_transaction_requires():
     priv, _pub = generate_keypair()
     floor = _pq_floor()
 
-    exact = PQTransaction(chain_id=1, nonce=0, gas_price=10 ** 9, gas_limit=floor,
+    exact = PQTransaction(chain_id=CHAIN_ID, nonce=0, gas_price=10 ** 9, gas_limit=floor,
                           to=bytes.fromhex("cd" * 20), value=1, data=b"").sign(priv)
     parsed = parse_eth_raw_tx("0x" + exact.encode().hex())
     assert parsed["intrinsic_gas"] == floor
     assert parsed["gas"] == floor
 
-    short = PQTransaction(chain_id=1, nonce=0, gas_price=10 ** 9, gas_limit=floor - 1,
+    short = PQTransaction(chain_id=CHAIN_ID, nonce=0, gas_price=10 ** 9, gas_limit=floor - 1,
                           to=bytes.fromhex("cd" * 20), value=1, data=b"").sign(priv)
     with pytest.raises(ValueError, match="intrinsic gas too low"):
         parse_eth_raw_tx("0x" + short.encode().hex())
@@ -128,7 +129,7 @@ def test_the_quoted_legacy_floor_matches_the_parser():
     signed = EthAccount.sign_transaction(
         {"nonce": 0, "gasPrice": 10 ** 9, "gas": 21_000,
          "to": to_checksum_address("0x" + "cd" * 20), "value": 1, "data": b"",
-         "chainId": 1}, key)
+         "chainId": CHAIN_ID}, key)
     raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
     parsed = parse_eth_raw_tx("0x" + bytes(raw).hex())
     assert parsed["intrinsic_gas"] == intrinsic_gas_legacy(b"") == 21_000

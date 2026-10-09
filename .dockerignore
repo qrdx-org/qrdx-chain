@@ -28,9 +28,11 @@ testnet/
 testnet*/
 miner/
 dvm/
-*.db
-*.log
-*.pid
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.log
+**/*.pid
 
 # --- Vendored reference material (1.5 GB, not used at runtime) ---
 ref/
@@ -54,33 +56,34 @@ py-evm/.git
 py-evm/.tox
 
 # --- Secrets & keys: MUST NOT be baked into an image ---
-.env
-*.env
-.postgres-env
-*.priv
-*.key
-*.pem
-*.pq
-*.pq.pub
-*.keystore
-node_key.*
-validator_wallet.json
-slashing_protection.db
+# Patterns without "**/" match only at the context root; these must match at any depth (a node
+# started from the checkout writes its identity key to qrdx/node/node_key.priv).
+**/.env
+**/*.env
+**/.postgres-env
+**/*.priv
+**/*.key
+**/*.pem
+**/*.pq
+**/*.pq.pub
+**/*.keystore
+**/node_key.*
+**/validator_wallet.json
+**/slashing_protection.db
 
-# --- Python build artifacts ---
-__pycache__
+# --- Python build artifacts (at any depth: a stale py-evm/*.egg-info changes the built wheel) ---
 **/__pycache__
-*.py[cod]
+**/*.py[cod]
 venv
 .venv
-build/
+**/build/
 dist/
-*.egg-info
+**/*.egg-info
 
 # --- Misc ---
-*.bak
+**/*.bak
 *.html
-nodes.json
+**/nodes.json
 postgres/
 target-openapi.json
 test_results.txt

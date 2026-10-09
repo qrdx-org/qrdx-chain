@@ -13,6 +13,7 @@ import pytest
 from qrdx.crypto.account_id import to_account_id
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransaction
 from qrdx.exchange import tokens as TK
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 D = Decimal
 ALICE, BOB, CAROL, MINTER, FREEZER = ("0xPQ" + c * 64 for c in "abcde")
@@ -370,6 +371,12 @@ def test_the_cli_deploys_a_bridge_token_and_renounces_an_authority(monkeypatch, 
     calls = []
 
     def fake_rpc(node, method, params=None, timeout=20.0):
+
+        if method == "p2p_getStatus":      # the CLI signs for the node's network
+
+            from qrdx.constants import CHAIN_ID
+
+            return {"network": {"chain_id": CHAIN_ID}}
         calls.append((method, params))
         if method == "exchange_getNonce":
             return 3
@@ -450,7 +457,7 @@ def test_the_mempool_admits_a_token_transfer(mgr):
     token = deploy(mgr, supply="5")
     signed = Account.sign_transaction({
         "nonce": 0, "gasPrice": 10 ** 9, "gas": 60_000, "to": to_checksum_address(token),
-        "value": 0, "data": bytes.fromhex("a9059cbb") + bytes(64), "chainId": 1},
+        "value": 0, "data": bytes.fromhex("a9059cbb") + bytes(64), "chainId": CHAIN_ID},
         "0x" + "11" * 32)
     raw = "0x" + bytes(getattr(signed, "raw_transaction", None) or signed.rawTransaction).hex()
     ok, err, _ = EVMMempool(nonce_provider=lambda addr: 0).admit(raw)

@@ -1,0 +1,6 @@
+# What the node image installs: the node's dependencies and those of the QRDX EVM fork
+# (the py-evm submodule, installed from source with --no-deps). Compiled into
+# release/requirements.lock — exact versions, every artifact's sha256 — by
+# scripts/release/lock-deps.sh. Edit requirements-v3.txt, then re-lock; never edit the lock.
+-r ../requirements-v3.txt
+../py-evm

@@ -24,10 +24,14 @@ services:
   # QRDX Node
   # ---------------------------------------------------------------------------
   qrdx-node:
+    # Production runs a VERIFIED release image, by digest (docs/RELEASES.md §5):
+    #   scripts/release/verify-release.sh vX.Y.Z            # prints the image reference
+    #   QRDX_IMAGE=ghcr.io/qrdx-org/qrdx-chain@sha256:… docker compose -f … up -d --no-build
+    # `build:` is for development images only; a local build is not a release.
     build:
       context: ".."
       dockerfile: "docker/Dockerfile"
-    image: qrdx-node:${QRDX_IMAGE_TAG:-latest}
+    image: ${QRDX_IMAGE:-qrdx-node:${QRDX_IMAGE_TAG:-latest}}
     container_name: qrdx-node
     restart: unless-stopped
     logging: *default-logging
@@ -65,7 +69,10 @@ services:
       QRDX_NODE_KEY_DIR: "/app/data/keys"
       QRDX_SELF_URL: "${QRDX_SELF_URL:-}"
       QRDX_BOOTSTRAP_NODE: "${QRDX_BOOTSTRAP_NODE:-https://node.qrdx.network}"
-      QRDX_CHAIN_ID: "${QRDX_CHAIN_ID:-1}"
+      # The network's genesis file: its chain spec (chain id, consensus parameters, upgrade
+      # schedule) and genesis allocations. Required — without it the node would start a dev
+      # network of its own. Chain id and parameters come from this file, not the environment.
+      QRDX_GENESIS_FILE: "${QRDX_GENESIS_FILE:-/app/data/genesis_config.json}"
       QRDX_LOG_LEVEL: "${QRDX_LOG_LEVEL:-INFO}"
       LOG_LEVEL: "${QRDX_LOG_LEVEL:-INFO}"
       QRDX_METRICS_ENABLED: "true"
@@ -96,7 +103,9 @@ services:
       retries: 5
       start_period: 120s
 
-    # The image already runs as the unprivileged `qrdx` user (UID 1000).
+    # Unprivileged. The image's own user is the same; stating it here means no image run by
+    # this file can quietly run the node as root. Bind-mounted data must be writable by it.
+    user: "1000:1000"
     security_opt:
       - no-new-privileges:true
     tmpfs:

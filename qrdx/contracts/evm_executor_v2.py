@@ -47,6 +47,8 @@ from eth_utils import (
 )
 import rlp
 
+from ..constants import CHAIN_ID
+
 logger = logging.getLogger(__name__)
 
 
@@ -124,7 +126,7 @@ class QRDXEVMExecutor:
             mix_hash=b'\x00' * 32,
             gas_limit=10_000_000,
             prev_hashes=[b'\x00' * 32] * 256,
-            chain_id=88888,  # QRDX chain ID
+            chain_id=CHAIN_ID,  # the network's chain id (chain spec) — the CHAINID opcode
             base_fee_per_gas=1000000000,  # 1 gwei
         )
 

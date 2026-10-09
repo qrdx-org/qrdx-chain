@@ -504,6 +504,32 @@ BOOTSTRAP_NODES = [node.url for node in BOOTSTRAP_NODES_PARSED]
 
 
 # ==================================================================================
+# CHAIN SPEC — network identity, consensus parameters, upgrade schedule
+# ==================================================================================
+# Every consensus parameter below that a network may choose comes from the network's chain
+# spec (the ``chain_spec`` section of its genesis file; qrdx/chain_spec.py,
+# docs/PROTOCOL_UPGRADES.md). A node started without a genesis file runs a DEV network whose
+# spec is built from the environment, as these values always were. On any other network the
+# environment cannot change them: CHAIN_SPEC_ENV_CONFLICTS lists attempts, and the node refuses
+# to start while it is non-empty. A genesis file that exists but cannot be used raises here —
+# a node never falls back to rules other than its network's.
+from . import chain_spec as _chain_spec
+
+_PROCESS_SPEC = _chain_spec.load_process_spec(
+    dotenv=_config, database_path=str(namespace.get('QRDX_DATABASE_PATH') or '') or None)
+CHAIN_SPEC = _PROCESS_SPEC.spec
+CHAIN_SPEC_FILE = _PROCESS_SPEC.genesis_file
+CHAIN_SPEC_ENV_CONFLICTS = _PROCESS_SPEC.env_conflicts
+_chain_spec.set_active(CHAIN_SPEC)
+_NETWORK_PARAMS = CHAIN_SPEC.params
+
+# The EVM / EIP-155 chain id, and the network's name. Every signed transaction is bound to the
+# chain id, which is what stops a transaction signed for one network executing on another.
+CHAIN_ID = CHAIN_SPEC.chain_id
+NETWORK_NAME = CHAIN_SPEC.network
+
+
+# ==================================================================================
 # PROOF OF STAKE (PoS) CONSTANTS
 # ==================================================================================
 # These constants define the QR-PoS (Quantum-Resistant Proof-of-Stake) consensus.
@@ -511,15 +537,14 @@ BOOTSTRAP_NODES = [node.url for node in BOOTSTRAP_NODES_PARSED]
 
 # --- Slot and Epoch Configuration ---
 # Seconds per slot. All nodes on a network MUST agree (it defines the slot clock + the backup-
-# proposer wait = SLOT_DURATION/2). Overridable via env so a network can size the slot above
-# worst-case block-production+propagation time — which is what makes ENFORCE_RANDAO_SELECTION
-# cleanly convergent (backups then never fire competing blocks). Default 2 (unchanged).
-SLOT_DURATION = int(os.getenv("QRDX_SLOT_DURATION", "2"))
+# proposer wait = SLOT_DURATION/2). A network sizes the slot above worst-case block-production
+# + propagation time — which is what makes RANDAO selection cleanly convergent (backups then
+# never fire competing blocks). Chain-spec parameter (dev default 2).
+SLOT_DURATION = _NETWORK_PARAMS["SLOT_DURATION"]
 # Network parameter: all nodes on a network MUST agree on this (it defines epoch
-# boundaries → finality + validator-lifecycle processing). Overridable via env for
-# test networks that want faster epochs (the integration harness sets it small so
-# epochs fire several times within a short run); production uses the default 32.
-SLOTS_PER_EPOCH = int(os.getenv("QRDX_SLOTS_PER_EPOCH", "32"))
+# boundaries → finality + validator-lifecycle processing). Test networks choose small
+# values so epochs fire several times within a short run; production uses 32.
+SLOTS_PER_EPOCH = _NETWORK_PARAMS["SLOTS_PER_EPOCH"]
 EPOCHS_PER_SYNC_COMMITTEE = 256        # ~4.5 hours per sync committee period
 
 # --- Sync Committee ---
@@ -527,7 +552,7 @@ SYNC_COMMITTEE_SIZE = 512              # Number of validators in sync committee
 SYNC_COMMITTEE_SUBNET_COUNT = 4        # Number of subnets for distribution
 
 # --- Validator Set ---
-MIN_VALIDATORS = int(os.environ.get('QRDX_MIN_VALIDATORS', '4'))  # Mainnet: 4, testnet override via env
+MIN_VALIDATORS = _NETWORK_PARAMS["MIN_VALIDATORS"]  # Chain-spec parameter (mainnet: 4)
 MAX_VALIDATORS = 150                   # Maximum active validators
 MIN_VALIDATOR_STAKE = Decimal('100000')  # 100,000 QRDX minimum stake to ACTIVATE
 MAX_EFFECTIVE_STAKE = Decimal('1000000')  # 1,000,000 QRDX max effective stake
@@ -545,61 +570,73 @@ MAX_EFFECTIVE_STAKE = Decimal('1000000')  # 1,000,000 QRDX max effective stake
 VALIDATOR_EJECTION_STAKE = MIN_VALIDATOR_STAKE / 2   # 50,000 QRDX
 
 # --- Staking Parameters ---
-# Env-overridable (like SLOTS_PER_EPOCH) so an integration/Phase-4 run can observe the
-# full exiting→exited unbonding completion within a short soak; production default ~7 days.
-UNBONDING_PERIOD_EPOCHS = int(os.getenv("QRDX_UNBONDING_PERIOD_EPOCHS", "5040"))  # 5040 epochs * 64 sec
+# Chain-spec parameter (test networks shorten it so a soak observes the full exiting→exited
+# unbonding completion); production ~7 days.
+UNBONDING_PERIOD_EPOCHS = _NETWORK_PARAMS["UNBONDING_PERIOD_EPOCHS"]  # 5040 epochs * 64 sec
 MIN_DEPOSIT = Decimal('10000')         # Minimum deposit amount
 MAX_DEPOSIT = Decimal('10000000')      # Maximum single deposit
-ACTIVATION_DELAY_EPOCHS = int(os.getenv("QRDX_ACTIVATION_DELAY_EPOCHS", "4"))  # Epochs until deposit becomes active
+ACTIVATION_DELAY_EPOCHS = _NETWORK_PARAMS["ACTIVATION_DELAY_EPOCHS"]  # Epochs until deposit becomes active
 # Epochs between a validator's exit_epoch and the first block that may return its principal
 # (Ethereum's MIN_VALIDATOR_WITHDRAWABILITY_DELAY). An exiting validator stays eligible until
 # the FINALIZED epoch reaches exit_epoch, and evidence of an offence needs time to be carried
 # in a block; paying before both would let it misbehave after its stake had left. Enforced by
-# qrdx/validator/withdrawals.py. Env-overridable only so a fast testnet can observe a payout.
-WITHDRAWAL_DELAY_EPOCHS = int(os.getenv("QRDX_WITHDRAWAL_DELAY_EPOCHS", "256"))
+# qrdx/validator/withdrawals.py. Chain-spec parameter (a fast testnet shortens it to observe a
+# payout); production 256.
+WITHDRAWAL_DELAY_EPOCHS = _NETWORK_PARAMS["WITHDRAWAL_DELAY_EPOCHS"]
 
 # Addresses allowed to submit UPDATE_ORACLE. Oracle prices drive perp execution, margin,
 # PnL and liquidations — all settled into real balances — so an unrestricted update let any
-# user set the price their own position closed at. A CONSENSUS parameter: every node must
+# user set the price their own position closed at. A chain-spec parameter: every node must
 # hold the same list (like SLOTS_PER_EPOCH). Empty (the default) means no one can set a
 # price, so perp markets cannot trade until reporters are configured.
-ORACLE_REPORTERS = tuple(
-    a.strip() for a in os.getenv("QRDX_ORACLE_REPORTERS", "").split(",") if a.strip())
+ORACLE_REPORTERS = tuple(_NETWORK_PARAMS["ORACLE_REPORTERS"])
 
 # Perps backstop vault (docs/PERPS_CLEARINGHOUSE.md). Deposits are locked for this much block
 # time (Hyperliquid's HLP: 4 days) so capital cannot leave the moment a loss is in sight.
-# CONSENSUS parameters: every node must hold the same values. Env-overridable only so a fast
-# testnet can exercise a withdrawal.
-PERP_VAULT_LOCKUP_SECONDS = int(os.getenv("QRDX_PERP_VAULT_LOCKUP_SECONDS", str(4 * 24 * 3600)))
+# Chain-spec parameters: every node must hold the same values (a fast testnet shortens the
+# lockup to exercise a withdrawal).
+PERP_VAULT_LOCKUP_SECONDS = _NETWORK_PARAMS["PERP_VAULT_LOCKUP_SECONDS"]
 # Treasury seeders: a VAULT_DEPOSIT from one of these is the protocol's own capital — its shares
 # belong to the protocol and never unlock. (The treasury multisig cannot sign exchange
 # transactions, which are PQ-only, so a designated PQ key seeds on its behalf.)
-PERP_VAULT_SEEDERS = tuple(
-    a.strip() for a in os.getenv("QRDX_PERP_VAULT_SEEDERS", "").split(",") if a.strip())
+PERP_VAULT_SEEDERS = tuple(_NETWORK_PARAMS["PERP_VAULT_SEEDERS"])
 # Perps settlement asset (docs/PERPS_CLEARINGHOUSE.md §2). Production: the bridged USD
 # stablecoin's QRC-20 token address — Hyperliquid's USDC model: prices, PnL, fees and funding are
 # all in USD, which validators can observe on any exchange. "QRDX" settles in native QRDX
 # (development and tests only). Empty (the default): no collateral is configured and perps
-# deposits are refused. CONSENSUS parameters, like the two below.
-PERP_COLLATERAL_TOKEN = os.getenv("QRDX_PERP_COLLATERAL_TOKEN", "").strip()
+# deposits are refused. Chain-spec parameters, like the two below.
+PERP_COLLATERAL_TOKEN = _NETWORK_PARAMS["PERP_COLLATERAL_TOKEN"]
 # The unit perp markets are quoted in: "BTC-USD-PERP", priced by oracle pair "BTC:USD".
-PERP_QUOTE = os.getenv("QRDX_PERP_QUOTE", "USD").strip() or "USD"
+PERP_QUOTE = _NETWORK_PARAMS["PERP_QUOTE"] or "USD"
 # Validator price oracle (docs/PERPS_CLEARINGHOUSE.md §8). Each block, a market's oracle is the
 # stake-weighted median of the committee's votes no older than PERP_ORACLE_VOTE_MAX_AGE seconds
 # of block time, provided they carry a majority of the committee's stake. A market whose oracle
 # has not been set for PERP_ORACLE_STALE_SECONDS refuses new exposure (reduce-only orders still
-# work). CONSENSUS parameters.
-PERP_ORACLE_VOTE_MAX_AGE = int(os.getenv("QRDX_PERP_ORACLE_VOTE_MAX_AGE", "60"))
-PERP_ORACLE_STALE_SECONDS = int(os.getenv("QRDX_PERP_ORACLE_STALE_SECONDS", "300"))
+# work). Chain-spec parameters.
+PERP_ORACLE_VOTE_MAX_AGE = _NETWORK_PARAMS["PERP_ORACLE_VOTE_MAX_AGE"]
+PERP_ORACLE_STALE_SECONDS = _NETWORK_PARAMS["PERP_ORACLE_STALE_SECONDS"]
 # Perp funding is paid at every boundary of this much block time (Hyperliquid: hourly). A
-# CONSENSUS parameter; env-overridable only so a fast testnet sees several settlements.
-PERP_FUNDING_INTERVAL_SECONDS = int(os.getenv("QRDX_PERP_FUNDING_INTERVAL_SECONDS", "3600"))
+# chain-spec parameter (a fast testnet shortens it to see several settlements).
+PERP_FUNDING_INTERVAL_SECONDS = _NETWORK_PARAMS["PERP_FUNDING_INTERVAL_SECONDS"]
 
 # --- Exchange fees ---
 # Exchange transactions pay gas like EVM ones: gas_price is in WEI (1 QRDX = 10^18 wei), at least
 # this floor (1 gwei, eth_gasPrice's answer). Every executed operation pays gas_used × gas_price
-# in QRDX, and the fee is burned, as EVM gas is. A CONSENSUS parameter.
-EXCHANGE_MIN_GAS_PRICE_WEI = int(os.getenv("QRDX_EXCHANGE_MIN_GAS_PRICE_WEI", "1000000000"))
+# in QRDX, and the fee is burned, as EVM gas is. A chain-spec parameter.
+EXCHANGE_MIN_GAS_PRICE_WEI = _NETWORK_PARAMS["EXCHANGE_MIN_GAS_PRICE_WEI"]
+
+# --- On-chain governance (qrdx/exchange/governance.py, docs/GOVERNANCE.md) ---
+# Chain-spec parameters, in blocks. Validators propose and decide by stake; holders veto by
+# locking QRDX during the timelock.
+GOV_VOTING_PERIOD_BLOCKS = _NETWORK_PARAMS["GOV_VOTING_PERIOD_BLOCKS"]
+GOV_TIMELOCK_BLOCKS = _NETWORK_PARAMS["GOV_TIMELOCK_BLOCKS"]
+GOV_EXECUTION_WINDOW_BLOCKS = _NETWORK_PARAMS["GOV_EXECUTION_WINDOW_BLOCKS"]
+GOV_APPROVAL_THRESHOLD_BPS = _NETWORK_PARAMS["GOV_APPROVAL_THRESHOLD_BPS"]
+GOV_VETO_THRESHOLD_QRDX = _NETWORK_PARAMS["GOV_VETO_THRESHOLD_QRDX"]
+GOV_FORK_APPROVAL_LEAD_BLOCKS = _NETWORK_PARAMS["GOV_FORK_APPROVAL_LEAD_BLOCKS"]
+# The genesis master controller may move system-wallet funds only below this height (and only
+# until governance freezes it). Chain-spec parameter; 100,000 by default.
+SYSTEM_WALLET_MASTER_SUNSET_HEIGHT = _NETWORK_PARAMS["SYSTEM_WALLET_MASTER_SUNSET_HEIGHT"]
 WEI_PER_QRDX = 10 ** 18
 
 # --- Finality ---

@@ -16,6 +16,7 @@ from decimal import Decimal
 
 from integration_tests.scenarios.base import Scenario
 from integration_tests.rpc_client import NodeRPCClient
+from integration_tests.config import CHAIN_ID  # exchange txs are signed for the testnet's chain
 
 
 class S14TokenConsensus(Scenario):
@@ -79,7 +80,7 @@ class S14TokenConsensus(Scenario):
         # 1. TOKEN_DEPLOY (nonce 0): mint 1,000,000 qSPOT to the deployer.
         symbol = "qSPOT"
         deploy = ExchangeTransaction(
-            op_type=ExchangeOpType.TOKEN_DEPLOY, sender=sender, nonce=0,
+            chain_id=CHAIN_ID, op_type=ExchangeOpType.TOKEN_DEPLOY, sender=sender, nonce=0,
             params={"name": "Quantum Spot", "symbol": symbol,
                     "total_supply": "1000000", "decimals": 18},
             gas_limit=1_000_000, gas_price=10**9,
@@ -93,7 +94,7 @@ class S14TokenConsensus(Scenario):
         # 2. TOKEN_TRANSFER (nonce 1): move 1,000 qSPOT to another wallet.
         recipient = (wallets.get("Pool Creator") or {}).get("address") or (sender[:-4] + "dead")
         transfer = ExchangeTransaction(
-            op_type=ExchangeOpType.TOKEN_TRANSFER, sender=sender, nonce=1,
+            chain_id=CHAIN_ID, op_type=ExchangeOpType.TOKEN_TRANSFER, sender=sender, nonce=1,
             params={"token_address": token_address, "to": recipient, "amount": "1000"},
             gas_limit=1_000_000, gas_price=10**9,
         )

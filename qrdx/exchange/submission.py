@@ -60,7 +60,8 @@ def signing_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     (both hex) are added."""
     unsigned = {k: v for k, v in dict(fields).items() if k not in ("signature", "public_key")}
     unsigned.setdefault("gas_limit", 100_000)
-    from .. import constants
+    from .. import chain_spec, constants
+    unsigned.setdefault("chain_id", chain_spec.active().chain_id)   # sign for this network
     unsigned.setdefault("gas_price", str(constants.EXCHANGE_MIN_GAS_PRICE_WEI))   # wei per gas
     tx = parse_exchange_tx(unsigned)
     body = tx.to_dict()

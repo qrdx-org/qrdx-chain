@@ -21,8 +21,12 @@ restarting the stack never regenerates keys under a live chain.
 Environment
   QRDX_TESTNET_DIR       [/testnet]
   QRDX_TESTNET_VALIDATORS[3]
-  QRDX_CHAIN_ID          [9999]
-  QRDX_NETWORK_NAME      [qrdx-integration-testnet]
+  QRDX_CHAIN_ID          [7620]   the QRDX testnet's chain id
+  QRDX_NETWORK_NAME      [qrdx-testnet]
+  QRDX_MIN_VALIDATORS, QRDX_SLOT_DURATION, ... — any network parameter
+                         (qrdx/chain_spec.py PARAMS). They are written into the genesis
+                         file's chain spec, which is where every node reads them from; set
+                         them HERE, on the init service, not on the nodes.
   QRDX_GENESIS_BALANCE   [1000000]   prefunded QRDX per validator
   QRDX_VALIDATOR_STAKE   [100000]    genesis stake per validator
   QRDX_VALIDATOR_PASSWORD_PREFIX [testnet_validator_]
@@ -43,8 +47,8 @@ log = logging.getLogger("testnet-init")
 
 TESTNET_DIR = Path(os.getenv("QRDX_TESTNET_DIR", "/testnet"))
 NUM_VALIDATORS = int(os.getenv("QRDX_TESTNET_VALIDATORS", "3"))
-CHAIN_ID = int(os.getenv("QRDX_CHAIN_ID", "9999"))
-NETWORK_NAME = os.getenv("QRDX_NETWORK_NAME", "qrdx-integration-testnet")
+CHAIN_ID = int(os.getenv("QRDX_CHAIN_ID", "7620"))
+NETWORK_NAME = os.getenv("QRDX_NETWORK_NAME", "qrdx-testnet")
 GENESIS_BALANCE = Decimal(os.getenv("QRDX_GENESIS_BALANCE", "1000000"))
 VALIDATOR_STAKE = Decimal(os.getenv("QRDX_VALIDATOR_STAKE", "100000"))
 
@@ -108,11 +112,13 @@ def main() -> int:
         for i in range(NUM_VALIDATORS)
     ]
 
+    from qrdx import chain_spec as cs
     from qrdx.validator.genesis import GenesisConfig, GenesisCreator
 
+    # The network's consensus definition, committed to by genesis (docs/PROTOCOL_UPGRADES.md).
+    spec = cs.build_spec(NETWORK_NAME, CHAIN_ID, cs.params_from_environment())
     config = GenesisConfig(
-        chain_id=CHAIN_ID,
-        network_name=NETWORK_NAME,
+        chain_spec=spec,
         min_genesis_validators=1,
         initial_supply=Decimal("100000000"),  # 100M QRDX
         system_wallet_controller=controller["address"],
@@ -133,6 +139,7 @@ def main() -> int:
     state, block = creator.create_genesis()
     creator.export_genesis(state, block, str(GENESIS_FILE))
 
+    log.info("chain spec   : %s (chain id %d)", spec.genesis_hash()[:16], spec.chain_id)
     log.info("genesis hash : %s", block.block_hash)
     log.info("state root   : %s", state.state_root)
     log.info("validators   : %d", len(state.validators))

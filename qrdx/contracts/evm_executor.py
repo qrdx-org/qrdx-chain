@@ -91,7 +91,7 @@ class EVMExecutor:
             vm_configuration = (
                 (BlockNumber(0), QRDXVM),
             )
-            chain_id = 88888  # QRDX chain ID
+            from ..constants import CHAIN_ID as chain_id  # the network's chain id (chain spec)
         
         # Initialize chain with in-memory database
         self.chain = QRDXChain.configure(

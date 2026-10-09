@@ -19,6 +19,7 @@ from decimal import Decimal
 
 from integration_tests.scenarios.base import Scenario
 from integration_tests.rpc_client import NodeRPCClient
+from integration_tests.config import CHAIN_ID  # exchange txs are signed for the testnet's chain
 
 MARKET = "qBTC-USD-PERP"
 
@@ -83,7 +84,7 @@ class S13PerpCollateral(Scenario):
         from qrdx.exchange import ExchangeTransaction
         acct = await self._account(target, wallet["address"])
         nonce = acct["exchange_nonce"] if acct else 0
-        tx = ExchangeTransaction(op_type=op, sender=wallet["address"], nonce=nonce, params=params,
+        tx = ExchangeTransaction(chain_id=CHAIN_ID, op_type=op, sender=wallet["address"], nonce=nonce, params=params,
                                  gas_limit=2_000_000, gas_price=10**9)
         tx.public_key = key.public_key.to_bytes()
         tx.signature = key.sign(tx.signing_bytes()).to_bytes()

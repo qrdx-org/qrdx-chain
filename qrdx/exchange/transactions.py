@@ -48,6 +48,15 @@ def _min_gas_price() -> int:
     return constants.EXCHANGE_MIN_GAS_PRICE_WEI
 
 
+def _network_chain_id() -> int:
+    """The chain id of this process's network (its chain spec)."""
+    from .. import chain_spec
+    return chain_spec.active().chain_id
+
+
+_SIGNING_TAG = b"QRDX-EXCHANGE-TX-v1\x00"
+
+
 def _wei_per_qrdx() -> Decimal:
     from .. import constants
     return Decimal(constants.WEI_PER_QRDX)
@@ -111,6 +120,11 @@ class ExchangeOpType(IntEnum):
     NFT_SET_APPROVAL_FOR_ALL = 45  # the owner approves an operator for all its NFTs in a collection
     NFT_UPDATE = 46                # the update authority edits the collection's or an NFT's metadata
     NFT_SET_AUTHORITY = 47         # hand over or renounce the update / mint authority
+    # On-chain governance (qrdx/exchange/governance.py, docs/GOVERNANCE.md).
+    GOV_PROPOSE = 48               # a validator proposes: system_spend, freeze_master, approve_fork
+    GOV_VOTE = 49                  # a validator votes, weighted by its committee stake
+    GOV_VETO = 50                  # a holder locks QRDX against a passed proposal (timelock only)
+    GOV_EXECUTE = 51               # anyone executes a proposal whose timelock has ended
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +147,10 @@ class ExchangeTransaction:
     timestamp: float = 0.0             # submission timestamp
     signature: bytes = b""              # Dilithium signature
     public_key: bytes = b""             # Dilithium public key
+    # The network this transaction is for (EIP-155's role): signed, part of the hash, and
+    # checked against the verifying node's chain id — a transaction signed for another network
+    # never verifies here. Defaults to this process's network.
+    chain_id: int = field(default_factory=_network_chain_id)
 
     # --- Computed after execution ---
     gas_used: int = 0
@@ -143,6 +161,13 @@ class ExchangeTransaction:
     def __post_init__(self):
         if self.timestamp == 0.0:
             self.timestamp = time.time()
+        if isinstance(self.chain_id, bool) or not isinstance(self.chain_id, int):
+            try:
+                self.chain_id = int(str(self.chain_id))
+            except ValueError:
+                raise ValueError(f"chain_id must be an integer, got {self.chain_id!r}") from None
+        if not 0 <= self.chain_id < 2 ** 63:
+            raise ValueError(f"chain_id out of range: {self.chain_id}")
         # Wei are whole: hold the price as an int, so it hashes and signs as "1000000000"
         # however the caller wrote it. A fractional price is left as given and refused by
         # validate_fee.
@@ -167,6 +192,8 @@ class ExchangeTransaction:
             self.params, sort_keys=True, default=str
         ).encode("utf-8")
         parts = [
+            _SIGNING_TAG,
+            int(self.chain_id).to_bytes(8, "big"),
             self.op_type.to_bytes(1, "big"),
             self.sender.encode("utf-8"),
             self.nonce.to_bytes(8, "big"),
@@ -207,6 +234,8 @@ class ExchangeTransaction:
         """
         if not self.signature or not self.public_key:
             return False
+        if self.chain_error():
+            return False
         try:
             from ..crypto.pq.dilithium import PQPublicKey, PQSignature, verify as pq_verify
 
@@ -220,6 +249,17 @@ class ExchangeTransaction:
         except Exception:
             # Malformed key/signature material → unauthenticated.
             return False
+
+    def chain_error(self) -> str:
+        """Why this transaction is not for this network ("" if it is)."""
+        expected = _network_chain_id()
+        if not self.chain_id:
+            return (f"exchange transaction is not bound to a chain id; sign it for chain id "
+                    f"{expected}")
+        if self.chain_id != expected:
+            return (f"exchange transaction is signed for chain id {self.chain_id}, but this "
+                    f"network's chain id is {expected}")
+        return ""
 
     # -- Serialization ------------------------------------------------------
 
@@ -235,6 +275,7 @@ class ExchangeTransaction:
             "timestamp": self.timestamp,
             "signature": self.signature.hex() if self.signature else "",
             "public_key": self.public_key.hex() if self.public_key else "",
+            "chain_id": self.chain_id,
             "tx_hash": self.tx_hash(),
         }
 
@@ -251,6 +292,9 @@ class ExchangeTransaction:
             timestamp=data.get("timestamp", 0.0),
             signature=bytes.fromhex(data["signature"]) if data.get("signature") else b"",
             public_key=bytes.fromhex(data["public_key"]) if data.get("public_key") else b"",
+            # Absent means unbound (0): such a transaction never verifies. Never defaulted to
+            # this network's id — that would make an unbound signature valid everywhere.
+            chain_id=data.get("chain_id") or 0,
         )
 
     def to_hex(self) -> str:
@@ -396,6 +440,18 @@ class ExchangeTransaction:
         elif op == ExchangeOpType.ORACLE_VOTE:
             if not isinstance(p.get("prices"), dict) or not p["prices"]:
                 raise ValueError("ORACLE_VOTE needs a non-empty prices map")
+
+        elif op == ExchangeOpType.GOV_PROPOSE:
+            if not isinstance(p.get("action"), str):
+                raise ValueError("GOV_PROPOSE missing param: action")
+
+        elif op in (ExchangeOpType.GOV_VOTE, ExchangeOpType.GOV_VETO, ExchangeOpType.GOV_EXECUTE):
+            if "proposal_id" not in p:
+                raise ValueError(f"{op.name} missing param: proposal_id")
+            if op == ExchangeOpType.GOV_VOTE and not isinstance(p.get("support"), bool):
+                raise ValueError("GOV_VOTE needs support: true or false")
+            if op == ExchangeOpType.GOV_VETO and "amount" not in p:
+                raise ValueError("GOV_VETO missing param: amount")
 
         elif op == ExchangeOpType.UPDATE_ORACLE:
             for key in ("pair", "price"):
@@ -548,6 +604,10 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.NFT_SET_APPROVAL_FOR_ALL: 25_000,
     ExchangeOpType.NFT_UPDATE: 30_000,
     ExchangeOpType.NFT_SET_AUTHORITY: 25_000,
+    ExchangeOpType.GOV_PROPOSE: 100_000,
+    ExchangeOpType.GOV_VOTE: 30_000,
+    ExchangeOpType.GOV_VETO: 50_000,
+    ExchangeOpType.GOV_EXECUTE: 80_000,
 }
 
 _NFT_REQUIRED = {

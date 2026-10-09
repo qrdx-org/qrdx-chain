@@ -36,10 +36,8 @@ x-node-base: &node-base
     start_period: 60s
 
 x-node-env: &node-env
-  QRDX_CHAIN_ID: "9999"
-  QRDX_NETWORK_NAME: "qrdx-integration-testnet"
-  # A 3-validator set is below the production minimum; allow it for testing.
-  QRDX_MIN_VALIDATORS: "1"
+  QRDX_CHAIN_ID: "7620"
+  QRDX_NETWORK_NAME: "qrdx-testnet"
   QRDX_NODE_HOST: "0.0.0.0"
   QRDX_RPC_ENABLED: "true"
   QRDX_ENABLE_STREAMING: "1"
@@ -59,6 +57,10 @@ services:
       <<: *node-env
       QRDX_TESTNET_DIR: "/testnet"
       QRDX_TESTNET_VALIDATORS: "3"
+      # Network parameters go into the genesis chain spec, which every node reads; a node whose
+      # environment set a different value would refuse to start. A 3-validator set is below
+      # the production minimum.
+      QRDX_MIN_VALIDATORS: "1"
     entrypoint: ["python", "/app/docker/testnet-init.py"]
 
   # ── Bootstrap Node (Validator 0) ──────────────────────────────────────────

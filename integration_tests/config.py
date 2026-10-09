@@ -35,8 +35,9 @@ GENESIS_FILE = TESTNET_DIR / "genesis_config.json"
 #  Chain Parameters
 # ──────────────────────────────────────────────────────────────────
 
-CHAIN_ID = 9999
-NETWORK_NAME = "qrdx-testnet-integration"
+# The QRDX testnet's chain id and name (chain_spec.TESTNET_CHAIN_ID / TESTNET_NETWORK_NAME).
+CHAIN_ID = 7620
+NETWORK_NAME = "qrdx-testnet"
 SLOT_DURATION = 2  # seconds
 SLOTS_PER_EPOCH = 8  # 16 seconds per epoch (faster for testing)
 MIN_VALIDATORS = 1

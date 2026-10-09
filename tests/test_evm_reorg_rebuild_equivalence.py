@@ -29,6 +29,7 @@ from qrdx.contracts.state import ContractStateManager
 from qrdx.contracts.evm_block_apply import (
     apply_block_evm_section, produce_block_evm_section, rebuild_account_state_from_chain,
 )
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 
 def _raw(i, nonce=0, value=1):
@@ -36,7 +37,7 @@ def _raw(i, nonce=0, value=1):
     key = "0x" + f"{i:064x}"
     acct = EthAccount.from_key(key)
     tx = {"nonce": nonce, "gasPrice": 10 ** 9, "gas": 21000,
-          "to": acct.address, "value": value, "data": b"", "chainId": 1}
+          "to": acct.address, "value": value, "data": b"", "chainId": CHAIN_ID}
     signed = EthAccount.sign_transaction(tx, key)
     raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
     return "0x" + bytes(raw).hex(), to_checksum_address(acct.address)

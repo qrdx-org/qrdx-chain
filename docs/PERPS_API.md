@@ -25,6 +25,7 @@ post-quantum (Dilithium / ML-DSA-65) key. A traditional `0x` key cannot sign one
   "params": {"market_id": "BTC-USD-PERP", "side": "buy", "size": "0.5", "price": "65000"},
   "gas_limit": 1000000,
   "gas_price": "1000000000",         // WEI per gas: at least the floor (exchange_gasPrice)
+  "chain_id": 7620,                  // the network's chain id (p2p_getStatus → network.chain_id)
   "public_key": "<hex>",             // must derive to sender
   "signature": "<hex>"               // over the signing bytes below
 }
@@ -58,6 +59,8 @@ returns (1 gwei). Every executed transaction — success or failure — pays its
 
 | field | encoding |
 |---|---|
+| tag | the ASCII bytes `QRDX-EXCHANGE-TX-v1` followed by one zero byte |
+| `chain_id` | 8 bytes, big-endian — the network the transaction is for |
 | `op_type` | 1 byte |
 | `sender` | UTF-8 |
 | `nonce` | 8 bytes, big-endian |
@@ -65,7 +68,9 @@ returns (1 gwei). Every executed transaction — success or failure — pays its
 | `gas_limit` | 8 bytes, big-endian |
 | `gas_price` | the integer wei amount as a decimal string, UTF-8 (`"1000000000"`) |
 
-The transaction hash is BLAKE2b-256 of the same bytes, in hex. Reproducing the params rendering
+The transaction hash is BLAKE2b-256 of the same bytes, in hex. A transaction signed for another
+network's chain id — or carrying none — is refused (docs/PROTOCOL_UPGRADES.md §7); the signing
+payload endpoint fills in the node's own. Reproducing the params rendering
 outside Python is error-prone, so the node serves it: **`POST /exchange_signing_payload`** (or
 `exchange_getSigningPayload`) takes the unsigned fields and returns `signing_bytes` (hex),
 `tx_hash`, and the normalized `tx` to which you add `signature` and `public_key`.

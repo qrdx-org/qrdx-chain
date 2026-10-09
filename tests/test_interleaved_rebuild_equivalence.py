@@ -51,6 +51,7 @@ from qrdx.exchange import (
 from qrdx.exchange import block_processor as BP
 from qrdx.transactions.pq_tx import PQTransaction
 from qrdx.validator import withdrawals as WD
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 WEI = 10 ** 18
 TS0 = 1_700_000_000
@@ -99,7 +100,7 @@ def _stake_deposit(key, nonce=0):
 
 def _pq_spend(key, qrdx, nonce=0):
     """A signed type-0x51 value transfer from ``key``'s account to RECIPIENT."""
-    tx = PQTransaction(chain_id=1, nonce=nonce, gas_price=0, gas_limit=300_000,
+    tx = PQTransaction(chain_id=CHAIN_ID, nonce=nonce, gas_price=0, gas_limit=300_000,
                        to=bytes.fromhex(RECIPIENT[2:]), value=int(qrdx) * WEI, data=b"")
     return "0x" + tx.sign(key).encode().hex()
 

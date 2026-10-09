@@ -102,18 +102,15 @@ class PoSBlock:
     
     @property
     def signing_root(self) -> bytes:
-        """Compute the signing root for proposer signature."""
-        data = (
-            self.number.to_bytes(8, 'little') +
-            bytes.fromhex(self.parent_hash) +
-            bytes.fromhex(self.state_root) +
-            bytes.fromhex(self.transactions_root) +
-            self.timestamp.to_bytes(8, 'little') +
-            self.slot.to_bytes(8, 'little') +
-            self.epoch.to_bytes(8, 'little') +
-            self.randao_reveal
-        )
-        return hashlib.sha256(data).digest()
+        """The root the proposer signs: the network's block signing domain, then the header
+        fields. One definition with the importers' reconstruction."""
+        from .block_verification import reconstruct_signing_root
+        return reconstruct_signing_root({
+            "number": self.number, "parent_hash": self.parent_hash,
+            "state_root": self.state_root, "transactions_root": self.transactions_root,
+            "timestamp": self.timestamp, "slot": self.slot, "epoch": self.epoch,
+            "randao_reveal": self.randao_reveal.hex(),
+        })
     
     def to_dict(self) -> dict:
         return {
@@ -460,15 +457,31 @@ class ValidatorManager:
     # BLOCK PROPOSAL
     # =========================================================================
     
-    async def _selection_mix(self, slot: Optional[int]) -> bytes:
-        """The proposer-selection RANDAO mix for ``slot``. When RANDAO selection is ENFORCED
+    async def _randao_active(self, height: Optional[int]) -> bool:
+        """Whether RANDAO selection governs the block at ``height`` (the chain spec's
+        ``randao_selection`` feature, or the dev override). Without a height — no database to
+        read the tip from — only the dev override can turn it on."""
+        from .randao import ENFORCE_RANDAO_SELECTION, randao_selection_active
+        if height is None:
+            return bool(ENFORCE_RANDAO_SELECTION)
+        return randao_selection_active(int(height))
+
+    async def _next_height(self) -> Optional[int]:
+        """The height of the block this validator would propose next (its tip + 1)."""
+        if self.database is None:
+            return None
+        return int(await self.database.get_next_block_id())
+
+    async def _selection_mix(self, slot: Optional[int], randao_active: bool) -> bytes:
+        """The proposer-selection RANDAO mix for ``slot``. When RANDAO selection is active
         this is the per-EPOCH checkpoint mix (`epoch_checkpoint_mix` — keyed off the slot's
         epoch, so it is TIP-INDEPENDENT: every validator computes the same mix for a slot
         regardless of its current height); otherwise the legacy zero constant — exactly
-        behaviour-neutral while the gate is off. (Keying off height was tip-dependent and
-        halted the chain — see docs item 5.)"""
-        from .randao import ENFORCE_RANDAO_SELECTION, selection_mix_for_slot
-        if not ENFORCE_RANDAO_SELECTION or self.database is None or slot is None:
+        behaviour-neutral while the rule is off. (Keying the MIX off height was tip-dependent
+        and halted the chain — see docs item 5. Whether the rule applies at all is decided by
+        the height of the block in question: ``_randao_active``.)"""
+        from .randao import selection_mix_for_slot
+        if not randao_active or self.database is None or slot is None:
             return self._randao_mix
         try:
             return await selection_mix_for_slot(self.database, int(slot))
@@ -488,9 +501,11 @@ class ValidatorManager:
         if current_stake < self.config.staking.min_validator_stake:
             return None
         validators = self._validator_set.validators if self._validator_set else [self._validator]
-        mix = await self._selection_mix(slot)
-        from .randao import ENFORCE_RANDAO_SELECTION, RANDAO_PROPOSER_ELIGIBLE_K
-        if ENFORCE_RANDAO_SELECTION:
+        # The block this validator would propose is at its tip + 1: that height's rules apply.
+        randao_active = await self._randao_active(await self._next_height())
+        mix = await self._selection_mix(slot, randao_active)
+        from .randao import RANDAO_PROPOSER_ELIGIBLE_K
+        if randao_active:
             return self.selector.proposer_rank(
                 slot, self.wallet.address, validators, mix, RANDAO_PROPOSER_ELIGIBLE_K)
         # Gate off: single primary only (rank 0 or None) — exactly today's behaviour.
@@ -550,10 +565,9 @@ class ValidatorManager:
         slots_per_epoch = POS_CONSTANTS['SLOTS_PER_EPOCH']
         epoch = slot // slots_per_epoch
         
-        # Generate RANDAO reveal
-        randao_domain = b'RANDAO_REVEAL'
-        randao_message = slot.to_bytes(8, 'little') + randao_domain
-        randao_reveal = self._sign_message(randao_message)
+        # Generate RANDAO reveal (network-bound: randao.randao_reveal_message)
+        from .randao import randao_reveal_message
+        randao_reveal = self._sign_message(randao_reveal_message(slot))
         
         # CRITICAL: Execute contract transactions BEFORE creating block
         # This sets gas_used on each transaction for validation
@@ -1019,9 +1033,11 @@ class ValidatorManager:
         validators = self._validator_set.validators if self._validator_set else []
         
         if validators:
-            mix = await self._selection_mix(getattr(block, "slot", None))
-            from .randao import ENFORCE_RANDAO_SELECTION, RANDAO_PROPOSER_ELIGIBLE_K
-            if ENFORCE_RANDAO_SELECTION:
+            # Judged under the rules of the block's own height.
+            randao_active = await self._randao_active(getattr(block, "number", None))
+            mix = await self._selection_mix(getattr(block, "slot", None), randao_active)
+            from .randao import RANDAO_PROPOSER_ELIGIBLE_K
+            if randao_active:
                 # Accept any of the slot's eligible top-K (primary or a backup).
                 eligible = {v.address for v in self.selector.proposer_ranking(
                     block.slot, validators, mix, RANDAO_PROPOSER_ELIGIBLE_K)}

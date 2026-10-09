@@ -18,6 +18,7 @@ from decimal import Decimal
 
 from integration_tests.scenarios.base import Scenario
 from integration_tests.rpc_client import NodeRPCClient
+from integration_tests.config import CHAIN_ID  # exchange txs are signed for the testnet's chain
 
 
 class S17ClobSettlement(Scenario):
@@ -92,7 +93,7 @@ class S17ClobSettlement(Scenario):
             return tx.to_hex()
 
         def _tx(op, nonce, params):
-            return ExchangeTransaction(op_type=op, sender=sender, nonce=nonce,
+            return ExchangeTransaction(chain_id=CHAIN_ID, op_type=op, sender=sender, nonce=nonce,
                                        params=params, gas_limit=2_000_000, gas_price=10**9)
 
         base = await self._token_roots(node_urls)

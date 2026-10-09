@@ -471,7 +471,8 @@ class EthereumRPCModule:
     
     async def eth_chainId(self) -> str:
         """Get chain ID."""
-        return hex(88888)  # QRDX chain ID
+        from ...constants import CHAIN_ID
+        return hex(CHAIN_ID)  # the network's chain id (chain spec)
     
     async def eth_accounts(self) -> List[str]:
         """Get list of available accounts."""

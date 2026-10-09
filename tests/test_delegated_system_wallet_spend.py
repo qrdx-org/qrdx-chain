@@ -30,13 +30,14 @@ from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.transactions.pq_tx import InvalidPQTransaction, PQTransaction, decode_pq_tx
 
 from pq_addrs import pq
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 RECIPIENT = bytes.fromhex("cd" * 20)
 
 
 def _tx(priv, on_behalf_of=None, nonce=0, value=10 ** 18):
     return PQTransaction(
-        chain_id=1, nonce=nonce, gas_price=10 ** 9, gas_limit=500_000,
+        chain_id=CHAIN_ID, nonce=nonce, gas_price=10 ** 9, gas_limit=500_000,
         to=RECIPIENT, value=value, data=b"", on_behalf_of=on_behalf_of,
     ).sign(priv)
 
@@ -112,7 +113,7 @@ def test_a_legacy_transaction_reports_itself_as_its_own_source():
     signed = EthAccount.sign_transaction(
         {"nonce": 0, "gasPrice": 10 ** 9, "gas": 21000,
          "to": to_checksum_address("0x" + "cd" * 20), "value": 1, "data": b"",
-         "chainId": 1}, key)
+         "chainId": CHAIN_ID}, key)
     raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
     parsed = parse_eth_raw_tx("0x" + bytes(raw).hex())
     assert parsed["spend_from"] == parsed["sender"]

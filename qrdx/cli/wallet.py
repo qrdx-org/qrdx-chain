@@ -936,6 +936,11 @@ from qrdx.cli.spot import spot as _spot_commands  # noqa: E402
 
 cli.add_command(_spot_commands)
 
+# Governance: qrdx-wallet gov … (qrdx/cli/gov.py)
+from qrdx.cli.gov import gov as _gov_commands  # noqa: E402
+
+cli.add_command(_gov_commands)
+
 
 @cli.command("generate-mnemonic")
 @click.option("--words", "-w", type=click.Choice(["12", "24"]), default="12", help="Number of words")

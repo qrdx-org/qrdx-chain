@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "maintainer_threshold": 2,
+  "signing_namespace": "qrdx-release",
+  "ci_identity": {
+    "issuer": "https://token.actions.githubusercontent.com",
+    "identity_regexp": "^https://github\\.com/qrdx-org/qrdx-chain/\\.github/workflows/release\\.yml@refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$"
+  },
+  "github_repository": "qrdx-org/qrdx-chain",
+  "image_repository": "ghcr.io/qrdx-org/qrdx-chain"
+}

@@ -36,8 +36,8 @@ from ..server import RPCModule, rpc_method, RPCError, RPCErrorCode
 
 logger = logging.getLogger(__name__)
 
-# QRDX chain defaults
-_CHAIN_ID = 88888
+# The network's chain id, from its chain spec (EIP-155 / EIP-695).
+from ...constants import CHAIN_ID as _CHAIN_ID
 _ZERO_ADDR_HEX = "0x" + "0" * 40
 _ZERO_HASH = "0x" + "0" * 64
 _EMPTY_BLOOM = "0x" + "00" * 256
@@ -538,10 +538,10 @@ class EthModule(RPCModule):
     @rpc_method
     async def chainId(self) -> str:
         """Returns the chain ID (EIP-695)."""
-        cid = _CHAIN_ID
-        if self.context and hasattr(self.context, "config") and self.context.config:
-            cid = getattr(self.context.config, "chain_id", _CHAIN_ID)
-        return _to_hex(cid)
+        # Always the chain spec's id: it is the id the node ENFORCES on every transaction
+        # (contracts/evm_mempool.parse_eth_raw_tx), so a wallet that signs with what this
+        # returns produces a transaction the network accepts — and only this network.
+        return _to_hex(_CHAIN_ID)
 
     @rpc_method
     async def blockNumber(self) -> str:

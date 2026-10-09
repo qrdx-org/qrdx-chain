@@ -543,6 +543,26 @@ class ValidatorNode:
                         except Exception as e:
                             logger.warning(f"EVM tx selection failed: {e}")
                             evm_raws = []
+                        # A delegated (system-wallet) spend whose controller's authority has
+                        # ended — sunset height reached, or frozen by governance — can never be
+                        # included again: evict it, so the controller's later nonces do not
+                        # queue behind it forever.
+                        if evm_raws:
+                            from ..contracts.evm_mempool import parse_eth_raw_tx, verify_delegated_spend
+                            kept, refused = [], []
+                            for raw in evm_raws:
+                                ok, why = await verify_delegated_spend(self.db, raw, next_height)
+                                (kept if ok else refused).append((raw, why))
+                            if refused:
+                                hashes = []
+                                for raw, why in refused:
+                                    try:
+                                        hashes.append(parse_eth_raw_tx(raw)["tx_hash"])
+                                    except Exception:
+                                        pass
+                                    logger.warning(f"Evicting delegated spend from the EVM mempool: {why}")
+                                self._evm_tx_source.remove(hashes)
+                            evm_raws = [raw for raw, _why in kept]
                         if evm_raws:
                             try:
                                 account_state_root, evm_txs = await self._evm_section_producer(

@@ -17,6 +17,7 @@ from enum import IntEnum
 import struct
 
 from .state import ContractStateManager
+from ..constants import CHAIN_ID
 
 
 class VMOpcode(IntEnum):
@@ -186,7 +187,7 @@ class VMContext:
     timestamp: int
     coinbase: str
     gas_limit: int
-    chain_id: int = 88888  # QRDX chain ID
+    chain_id: int = CHAIN_ID  # the network's chain id (chain spec)
     calldata: bytes = b''
     code: bytes = b''
 

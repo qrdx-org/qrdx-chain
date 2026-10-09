@@ -79,6 +79,18 @@ async def produce_block_evm_section(
     if not raw_txs:
         return None, []
 
+    # A delegated spend admitted earlier may no longer be authorised in THIS block (the master
+    # controller's sunset height arrived, or governance froze it since). Importers would refuse
+    # the whole block for it (apply_block_evm_section), so leave it out here.
+    authorised = []
+    for raw in raw_txs:
+        ok, _why = await verify_delegated_spend(db, raw, block_height)
+        if ok:
+            authorised.append(raw)
+    raw_txs = authorised
+    if not raw_txs:
+        return None, []
+
     # Fresh reads: other writers (the exchange, withdrawals) changed the database directly.
     state_manager.reset_cache()
     section = EvmSection()                 # this section's native token moves, pending
@@ -229,7 +241,7 @@ async def apply_block_evm_section(
         # A DELEGATED spend (system wallet) must be authorised here too, not only at
         # submission — otherwise a proposer could smuggle an unauthorised one into a
         # block, exactly the hole the signature check above sits here to close.
-        ok, why = await verify_delegated_spend(db, raw)
+        ok, why = await verify_delegated_spend(db, raw, block_height)
         if not ok:
             return False, f"evm tx {i} in block {block_height}: {why}"
 

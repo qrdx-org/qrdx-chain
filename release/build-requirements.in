@@ -1,0 +1,5 @@
+# Build backends for the dependencies that ship only as source (fastecdsa, netifaces, pickledb)
+# and for the py-evm submodule. Pinned with hashes in build-requirements.lock, and installed
+# instead of letting pip fetch whatever is newest into an isolated build environment.
+setuptools
+wheel

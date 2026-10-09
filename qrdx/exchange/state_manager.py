@@ -49,6 +49,7 @@ from .clearinghouse import Clearinghouse, ClearinghouseError
 from .perpetual import PerpEngine, PerpSide
 from .router import FillSource, UnifiedRouter
 from .nfts import NftError, NftRegistry, token_id as nft_token_id
+from .governance import Governance, GovernanceError, veto_escrow_address
 from .tokens import (
     NATIVE_ASSET, TokenError, TokenRegistry, account as token_account, amount as token_amount,
     canonical_asset, is_native_asset, memo as token_memo,
@@ -194,6 +195,10 @@ class ExchangeStateManager:
         self.tokens = TokenRegistry()
         # Native NFTs (qrdx/exchange/nfts.py): collections, their NFTs, approvals, operators.
         self.nfts = NftRegistry()
+        # On-chain governance (qrdx/exchange/governance.py): proposals, votes, vetoes, the
+        # master controller's freeze and fork approvals. Exchange state like the rest — replayed
+        # on every path, committed in the root, snapshotted, rebuilt after a reorg.
+        self.governance = Governance()
         # Per-block validator-lifecycle ops (STAKE_DEPOSIT / STAKE_EXIT) to flush to
         # the consensus validators table. Deterministic (same txs on every node),
         # reset per block. See qrdx.validator.epoch_loop for activation scheduling.
@@ -490,6 +495,10 @@ class ExchangeStateManager:
             ExchangeOpType.NFT_SET_AUTHORITY: self._op_nft_set_authority,
             ExchangeOpType.STAKE_DEPOSIT: self._op_stake_deposit,
             ExchangeOpType.STAKE_EXIT: self._op_stake_exit,
+            ExchangeOpType.GOV_PROPOSE: self._op_gov_propose,
+            ExchangeOpType.GOV_VOTE: self._op_gov_vote,
+            ExchangeOpType.GOV_VETO: self._op_gov_veto,
+            ExchangeOpType.GOV_EXECUTE: self._op_gov_execute,
         }
         handler = handlers.get(tx.op_type)
         if handler is None:
@@ -1566,6 +1575,68 @@ class ExchangeStateManager:
         return list(self._validator_lifecycle_ops)
 
     # =====================================================================
+    #  On-chain governance (qrdx/exchange/governance.py, docs/GOVERNANCE.md)
+    # =====================================================================
+
+    def _gov(self, tx: ExchangeTransaction, fn) -> ExchangeExecResult:
+        try:
+            data = fn()
+        except GovernanceError as e:
+            return ExchangeExecResult(success=False, error=str(e))
+        return ExchangeExecResult(success=True, gas_used=EXCHANGE_GAS_COSTS[tx.op_type], data=data)
+
+    def _release_vetoes(self, refunds: Dict[str, Decimal]) -> None:
+        """Return locked veto QRDX from the escrow holder to each holder."""
+        escrow = veto_escrow_address()
+        for holder in sorted(refunds):
+            amount = refunds[holder]
+            if amount > 0:
+                self._record_balance_delta(escrow, -amount)
+                self._record_balance_delta(holder, amount)
+
+    def _op_gov_propose(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """A validator opens a proposal; its committee's stake is snapshotted for the vote."""
+        def go():
+            p = self.governance.propose(tx.sender, tx.params, self._current_block_height,
+                                        self.oracle_committee)
+            return {"proposal_id": p.id, "action": p.action, "params": p.params,
+                    "voting_ends": p.voting_ends}
+        return self._gov(tx, go)
+
+    def _op_gov_vote(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        def go():
+            p = self.governance.vote(tx.sender, tx.params, self._current_block_height)
+            return {"proposal_id": p.id, "status": p.status, "yes": str(p.yes), "no": str(p.no),
+                    "timelock_ends": p.timelock_ends}
+        return self._gov(tx, go)
+
+    def _op_gov_veto(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """A holder locks QRDX in the veto escrow against a passed proposal. Reaching the veto
+        threshold stops the proposal and returns every holder's QRDX."""
+        def go():
+            p, amount, refunds = self.governance.veto(
+                tx.sender, tx.params, self._current_block_height, self.available_balance(tx.sender))
+            self._record_balance_delta(tx.sender, -amount)
+            self._record_balance_delta(veto_escrow_address(), amount)
+            self._release_vetoes(refunds)
+            return {"proposal_id": p.id, "status": p.status, "locked": str(amount),
+                    "veto_total": str(p.veto_total)}
+        return self._gov(tx, go)
+
+    def _op_gov_execute(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Anyone executes a passed proposal once its timelock has ended (or closes an expired
+        one). A system_spend reads the wallet's balance pre-loaded for this transaction
+        (block_processor.preload_sender_balances)."""
+        def go():
+            p, result, moves, refunds = self.governance.execute(
+                tx.params, self._current_block_height, self.available_balance)
+            for address, delta in moves:
+                self._record_balance_delta(address, delta)
+            self._release_vetoes(refunds)
+            return {"proposal_id": p.id, "status": p.status, **result}
+        return self._gov(tx, go)
+
+    # =====================================================================
     #  Perps clearinghouse (docs/PERPS_CLEARINGHOUSE.md)
     # =====================================================================
 
@@ -1909,6 +1980,8 @@ class ExchangeStateManager:
         hasher.update(self.tokens.state_hash())
         if self.nfts.collections:            # (nothing until the first collection exists)
             hasher.update(self.nfts.state_hash())
+        if self.governance.touched:          # (nothing until the first proposal)
+            hasher.update(self.governance.state_hash())
 
         # 5. Nonce state
         for addr in sorted(self._nonces.keys()):
@@ -1958,6 +2031,7 @@ class ExchangeStateManager:
             "oracle_votes": copy.deepcopy(self.oracle_votes),
             "tokens": copy.deepcopy(self.tokens),
             "nfts": copy.deepcopy(self.nfts),
+            "governance": copy.deepcopy(self.governance),
             "router_clob_sequence": self.router._clob_sequence,
         }
         self._snapshot = snapshot
@@ -2017,6 +2091,7 @@ class ExchangeStateManager:
 
         self.tokens = copy.deepcopy(snapshot.get("tokens", TokenRegistry()))
         self.nfts = copy.deepcopy(snapshot.get("nfts", NftRegistry()))
+        self.governance = copy.deepcopy(snapshot.get("governance", Governance()))
         self.router._clob_sequence = snapshot.get("router_clob_sequence", 0)
 
     # =====================================================================

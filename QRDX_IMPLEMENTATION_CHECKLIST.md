@@ -68,12 +68,12 @@ Every feature is tracked through **six gates** in order. A feature **cannot** ad
 ### 0.5 Docker Requirements File Mismatch
 - **File:** `docker/Dockerfile` installs `requirements-v3.txt` (fixed from `requirements.txt`)
 - **Risk:** Docker images lacked `liboqs-python` — PQ crypto silently disabled
-- [x] Implemented — Dockerfile now `COPY ./requirements-v3.txt .` and `pip install -r ./requirements-v3.txt`
-- [x] Verified — `TestDockerSecurity.test_requirements_v3_includes_liboqs` + `test_dockerfile_uses_requirements_v3` in `test_security_adversarial.py`
+- [x] Implemented — The image installs `release/requirements.lock`: compiled from `requirements-v3.txt` (+ the py-evm submodule), every package pinned by version and sha256, installed with `--require-hashes` (2026-10-09; before that it installed `requirements-v3.txt` ranges, i.e. whatever was newest on build day)
+- [x] Verified — `TestDockerSecurity.test_requirements_v3_includes_liboqs` + `test_the_image_installs_the_pq_stack_from_the_hashed_lock` in `test_security_adversarial.py`
 - [x] Security Tested — Container scan via `.pre-commit-config.yaml` hadolint hook; PQ dependencies verified
 - [ ] Consensus / Decentralized — N/A (build-time concern)
 - [x] No Stubs — liboqs is mandatory; module import fails hard without it
-- [ ] Production Ready — Multi-stage Docker build with pinned dependency hashes
+- [x] Production Ready — Multi-stage, reproducible Docker build with every input pinned (base image digest, Debian snapshot, liboqs commit, hashed locks); release images signed (k-of-n maintainers + Sigstore CI identity), SBOM + SLSA provenance; docs/RELEASES.md
 
 ---
 
@@ -281,7 +281,7 @@ Every feature is tracked through **six gates** in order. A feature **cannot** ad
 - [x] Implemented — `executor_v2.py` switched to use `QRDXVM`, `QRDXComputation`, `QRDXState`; module-level logger added
 - [x] Verified — 6 import verification tests + 1 instantiation test + 1 contract deploy test
 - [x] Security Tested — Source-level assertion that no Shanghai imports remain; executor cannot fall back
-- [x] Consensus / Decentralized — All nodes run identical QRDXVM version; chain ID 88888 verified
+- [x] Consensus / Decentralized — All nodes run identical QRDXVM version; chain ID comes from the network's chain spec and is enforced on every transaction (2026-10-09: it was a hardcoded 88888 — another chain's id — and never checked; see docs/PROTOCOL_UPGRADES.md §7)
 - [x] No Stubs — `executor_v1.py` removed; single production executor `executor_v2.py` using `QRDXVM`; `_sync_state_from_vm()` reads modified account balances, nonces, code, and storage back from VM state to `ContractStateManager`
 - [ ] Production Ready — EVM compatibility test suite passes (Ethereum execution spec tests)
 
@@ -451,11 +451,11 @@ Every feature is tracked through **six gates** in order. A feature **cannot** ad
 - [ ] Production Ready — Cross-chain transaction confirmation time benchmarked and documented
 
 ### 7.5 Bridge Lock/Unlock Mechanism
-- **Status:** ✅ Complete — `ShieldingManager` in `qrdx/bridge/shielding.py` with full lifecycle
+- **Status:** ⚠️ Not consensus-backed — `ShieldingManager` in `qrdx/bridge/shielding.py` models the lifecycle, but `BridgeMinter` only tallies totals in memory and credits no ledger (docs/KNOWN_ISSUES.md, perps entry "The bridged stablecoin does not exist yet")
 - [x] Implemented — Lock assets on source chain → threshold-signed confirmation → mint on QRDX (and reverse)
 - [x] Verified — Test: full bridge cycle both directions; insufficient lock rejected; double-mint prevented
 - [x] Security Tested — Bridge fraud proof mechanism; locked amount audit; timeout/refund for stalled bridges
-- [x] Consensus / Decentralized — Bridge transactions require ≥2/3 validator threshold signatures
+- [ ] Consensus / Decentralized — ~~Bridge transactions require ≥2/3 validator threshold signatures~~ No consensus path mints or releases bridged value yet
 - [x] No Stubs — Lock/unlock operations use real adapter RPC calls (`eth_sendRawTransaction`, `sendrawtransaction`, `sendTransaction`) via `_json_rpc_call()` transport
 - [ ] Production Ready — Bridge TVL limits during initial launch; insurance fund
 
@@ -526,12 +526,12 @@ Every feature is tracked through **six gates** in order. A feature **cannot** ad
 ## Step 10 — Governance Model (Whitepaper §13)
 
 ### 10.1 On-Chain Governance
-- **Status:** ✅ Complete (Phase 7)
+- **Status:** ✅ Consensus governance (2026-10-09): `qrdx/exchange/governance.py`, docs/GOVERNANCE.md. Validators propose and decide by stake (2/3), holders veto by locking QRDX during a timelock, system-wallet spends need a proposal, the master controller's authority ends at block 100,000 (or earlier by vote), forks need on-chain approval. The earlier `qrdx/governance/` library below was never connected and remains unused.
 - [x] Implemented — Proposal lifecycle (DRAFT→DISCUSSION→TEMPERATURE→ACTIVE→PASSED→QUEUED→EXECUTED); stake-weighted voting (1 QRDX=1 vote, delegation); quorum (10%) & approval (60%/75%) thresholds; TimelockQueue with guardian veto (3-of-5); GovernanceExecutor with parameter mutation
 - [x] Verified — 80+ tests: proposal creation/lifecycle, vote casting, quorum/approval, finalization, delegation, timelock queue/veto, parameter execution, end-to-end cycle
 - [x] Security Tested — Double-vote rejection; zero-stake rejection; invalid transitions; guardian veto; timelock not-ready/expired; vetoed proposal cancellation
-- [x] Consensus / Decentralized — Any staker can propose (with 10M deposit); no admin veto; guardian veto requires 3-of-5 PQ multisig; time-lock allows exit
-- [x] No Stubs — Governance execution triggers real parameter state changes (fee tiers, bridge fees, validator stake, etc.)
+- [x] Consensus / Decentralized — Proposals, votes, vetoes and executions are exchange transactions in blocks, replayed by every node and committed in the state root (`qrdx/exchange/governance.py`); deadlines by block height
+- [x] No Stubs — Executions move real QRDX (system_spend), end the master controller's authority (freeze_master), and gate fork activation (approve_fork); tests/test_governance.py + live scenario s22
 - [ ] Production Ready — Governance forum + on-chain voting UI; initial parameters set via genesis governance
 
 ---
@@ -567,6 +567,7 @@ Every feature is tracked through **six gates** in order. A feature **cannot** ad
 - [x] Security Tested — `TestDockerSecurity` (4 tests) in `test_security_adversarial.py`; `.pre-commit-config.yaml` hadolint hook for Dockerfile linting
 - [x] Consensus / Decentralized — `docker/docker-compose.yml` supports multi-node; `MIN_VALIDATORS=4` default
 - [x] No Stubs — Uses `requirements-v3.txt` with all PQ dependencies; `.pre-commit-config.yaml` prevents secret leakage
+- [x] Release pipeline — reproducible builds (two builds of a commit are bit-identical; CI builds twice and compares, maintainers rebuild before signing), unit suite run inside the release image, signed releases verified by operators against a trusted policy (`scripts/release/verify-release.sh`), images run by digest; docs/RELEASES.md. First release blocked on the items in docs/KNOWN_ISSUES.md ("Three things block the first release")
 - [ ] Production Ready — Helm chart or production Compose with TLS, monitoring, log aggregation
 
 ### 12.2 Config Loading (TOML)
@@ -650,14 +651,14 @@ Every feature is tracked through **six gates** in order. A feature **cannot** ad
 | 4 | QEVM | 5 | 5/5 ✅ | 5/5 ✅ | 5/5 ✅ | 5/5 ✅ | 5/5 ✅ | 0/5 |
 | 5 | Exchange Engine | 7 | 7/7 ✅ | 7/7 ✅ | 7/7 ✅ | 7/7 ✅ | 6/7 | 0/7 |
 | 6 | PQ Multisig & Wallets | 3 | 3/3 ✅ | 3/3 ✅ | 3/3 ✅ | 3/3 ✅ | 3/3 ✅ | 0/3 |
-| 7 | Cross-Chain Bridge | 6 | 6/6 ✅ | 6/6 ✅ | 4/6 | 6/6 ✅ | 6/6 ✅ | 0/6 |
+| 7 | Cross-Chain Bridge | 6 | 6/6 ✅ | 6/6 ✅ | 4/6 | 5/6 | 6/6 ✅ | 0/6 |
 | 8 | Asset Shielding | 3 | 3/3 ✅ | 3/3 ✅ | 2/3 | 3/3 ✅ | 3/3 ✅ | 0/3 |
 | 9 | qRC20 Token Standard | 2 | 2/2 ✅ | 2/2 ✅ | 1/2 | 2/2 ✅ | 2/2 ✅ | 0/2 |
 | 10 | Governance | 1 | 1/1 ✅ | 1/1 ✅ | 1/1 ✅ | 1/1 ✅ | 1/1 ✅ | 0/1 |
 | 11 | RPC & Dev Interface | 2 | 2/2 ✅ | 2/2 ✅ | 2/2 ✅ | 2/2 ✅ | 2/2 ✅ | 0/2 |
 | 12 | Deployment & Ops | 4 | 4/4 ✅ | 4/4 ✅ | 4/4 ✅ | 4/4 ✅ | 4/4 ✅ | 0/4 |
 | 13 | Testing Infrastructure | 3 | 3/3 ✅ | 2/3 | 1/3 | 0/3 | 2/3 | 0/3 |
-| **TOTAL** | | **61** | **61/61 (100%)** | **60/61 (98%)** | **52/61 (85%)** | **56/61 (92%)** | **58/61 (95%)** | **0/61 (0%)** |
+| **TOTAL** | | **61** | **61/61 (100%)** | **60/61 (98%)** | **52/61 (85%)** | **55/61 (90%)** | **58/61 (95%)** | **0/61 (0%)** |
 
 **Tests: 1615 pass** (79 crypto + 58 P2P + 195 consensus + 89 QEVM + 116 multisig + 141 cross-chain + 156 token/governance + 155 production readiness + 303 exchange engine + 80 adversarial security + 57 exchange precompiles + 34 exchange-blockchain integration + 152 DHT discovery)
 

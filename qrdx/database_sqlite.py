@@ -487,6 +487,13 @@ class DatabaseSQLite:
         CREATE INDEX IF NOT EXISTS idx_tx_index_hash ON tx_index(tx_hash);
         CREATE INDEX IF NOT EXISTS idx_tx_index_kind ON tx_index(kind, block_height);
 
+        -- Node-local chain records: the genesis summary, and the forks this node has passed
+        -- (checked against the chain spec on every start — docs/PROTOCOL_UPGRADES.md).
+        CREATE TABLE IF NOT EXISTS chain_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(block_height);
         CREATE INDEX IF NOT EXISTS idx_block_exchange_txs ON block_exchange_transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_block_evm_txs ON block_evm_transactions(block_hash);
@@ -942,7 +949,9 @@ class DatabaseSQLite:
                 d = _json.loads(tx_hex)
             except Exception:
                 continue
-            if d.get("type") != "genesis_allocation" or not d.get("recipient"):
+            # Prefunded accounts and system wallets: both are genesis balances in account_state.
+            if d.get("type") not in ("genesis_allocation", "genesis_system_wallet") \
+                    or not d.get("recipient"):
                 continue
             wei = int(_D(str(d["amount"])) * _D(10 ** 18))
             await self.connection.execute(

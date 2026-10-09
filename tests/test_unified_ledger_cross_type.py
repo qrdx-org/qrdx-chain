@@ -31,6 +31,7 @@ from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.transactions.pq_tx import PQTransaction
 
 from pq_addrs import pq
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 WEI = 10 ** 18
 TRADITIONAL = "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
@@ -251,7 +252,7 @@ async def test_pq_transaction_sender_matches_the_funded_ledger_row():
         await db.apply_account_balance_delta(pub.to_address(), Decimal("1000"))
         await db.connection.commit()
 
-        tx = PQTransaction(chain_id=7117, nonce=0, gas_price=10 ** 9, gas_limit=500_000,
+        tx = PQTransaction(chain_id=CHAIN_ID, nonce=0, gas_price=10 ** 9, gas_limit=500_000,
                            to=bytes.fromhex(to_account_id(TRADITIONAL)[2:]),
                            value=3 * WEI, data=b"").sign(priv)
         parsed = parse_eth_raw_tx("0x" + tx.encode().hex())
@@ -277,14 +278,14 @@ def test_both_transaction_families_share_one_mempool_and_nonce_space():
     mp = EVMMempool()
     priv, _pub = generate_keypair()
     pq_raw = "0x" + PQTransaction(
-        chain_id=1, nonce=0, gas_price=10 ** 9, gas_limit=500_000,
+        chain_id=CHAIN_ID, nonce=0, gas_price=10 ** 9, gas_limit=500_000,
         to=bytes.fromhex("cd" * 20), value=1, data=b"").sign(priv).encode().hex()
 
     key = "0x" + "22" * 32
     acct = EthAccount.from_key(key)
     signed = EthAccount.sign_transaction(
         {"nonce": 0, "gasPrice": 10 ** 9, "gas": 21000, "to": acct.address,
-         "value": 1, "data": b"", "chainId": 1}, key)
+         "value": 1, "data": b"", "chainId": CHAIN_ID}, key)
     legacy_raw = "0x" + bytes(
         getattr(signed, "raw_transaction", None) or signed.rawTransaction).hex()
 

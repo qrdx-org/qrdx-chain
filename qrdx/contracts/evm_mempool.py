@@ -55,7 +55,8 @@ def intrinsic_gas_legacy(data: bytes, is_create: bool = False) -> int:
     return gas
 
 
-async def verify_delegated_spend(db, raw_tx_hex: str) -> Tuple[bool, str]:
+async def verify_delegated_spend(db, raw_tx_hex: str,
+                                 block_height: Optional[int] = None) -> Tuple[bool, str]:
     """
     Authorise a delegated spend: may the signer move value out of ``on_behalf_of``?
 
@@ -63,6 +64,12 @@ async def verify_delegated_spend(db, raw_tx_hex: str) -> Tuple[bool, str]:
     address or an m-of-n multisig). The registry is the genesis-populated
     ``system_wallets`` table, which every node holds identically — so admission and block
     import reach the same verdict, and the decision is deterministic.
+
+    The controller's authority is temporary (docs/GOVERNANCE.md): it ends at
+    SYSTEM_WALLET_MASTER_SUNSET_HEIGHT, or earlier when governance freezes it
+    (``governance.master_authority``). ``block_height`` is the block the spend would be in
+    (import and proposal pass it; admission uses the next block). From then on system-wallet
+    funds move only by an executed governance proposal.
 
     Returns ``(True, "")`` immediately for an ordinary (non-delegated) transaction, so
     callers can apply it unconditionally.
@@ -92,6 +99,7 @@ async def verify_delegated_spend(db, raw_tx_hex: str) -> Tuple[bool, str]:
         return True, ""          # structural failure is the parser's business
     if not tx.is_delegated():
         return True, ""
+
 
     source, signer = tx.spend_from(), tx.sender()
     try:
@@ -133,6 +141,18 @@ async def verify_delegated_spend(db, raw_tx_hex: str) -> Tuple[bool, str]:
     if not authorised:
         return False, (f"signer {signer[:20]} is not the controller of {source[:20]} "
                        f"(controller {str(controller)[:20]})")
+
+    # The controller's authority is temporary: it ends at the sunset height, or when
+    # governance freezes it (docs/GOVERNANCE.md).
+    try:
+        from ..exchange.governance import master_authority
+        if block_height is None:
+            block_height = int(await db.get_next_block_id())
+        allowed, why = master_authority(int(block_height))
+    except Exception as e:
+        return False, f"cannot establish the master controller's authority ({e})"
+    if not allowed:
+        return False, why
     return True, ""
 
 
@@ -165,6 +185,10 @@ def _parse_pq_raw_tx(raw_tx: bytes) -> Dict[str, object]:
     if not tx.verify():
         raise ValueError("PQ signature verification failed")
 
+    # Replay protection across networks: the signed envelope names its chain, and only this
+    # network's id is valid here (see _require_chain_id).
+    _require_chain_id(tx.chain_id or None)
+
     # Intrinsic gas is a VALIDITY rule, not a revert condition (as in Ethereum): a
     # transaction supplying less than its floor is invalid, so a block carrying one
     # is rejected outright rather than executing it as a revert. Raising here —
@@ -192,6 +216,27 @@ def _parse_pq_raw_tx(raw_tx: bytes) -> Dict[str, object]:
         "intrinsic_gas": tx.intrinsic_gas(),
         "pq_address": tx.pq_address(),
     }
+
+
+def _require_chain_id(chain_id) -> None:
+    """
+    A transaction must be signed for THIS network's chain id (EIP-155; the PQ envelope carries
+    it too). Without the check a signature is valid on every chain: a transaction signed on a
+    testnet — or on any other EVM network where the same key holds an account — would execute
+    here as soon as the nonce lined up. Pre-EIP-155 legacy transactions name no chain at all
+    and are refused for the same reason.
+
+    Lives in the shared parser, so mempool admission, execution and block import all apply it:
+    a proposer cannot include what admission would refuse.
+    """
+    from ..constants import CHAIN_ID
+    if chain_id is None:
+        raise ValueError(
+            f"transaction is not bound to a chain id (pre-EIP-155 signature); sign it for "
+            f"chain id {CHAIN_ID}")
+    if int(chain_id) != CHAIN_ID:
+        raise ValueError(f"transaction is signed for chain id {chain_id}, but this network's "
+                         f"chain id is {CHAIN_ID}")
 
 
 def parse_eth_raw_tx(raw_tx_hex: str) -> Dict[str, object]:
@@ -267,6 +312,7 @@ def parse_eth_raw_tx(raw_tx_hex: str) -> Dict[str, object]:
 
     if recovery_id not in (0, 1):
         raise ValueError(f"invalid recovery id {recovery_id}")
+    _require_chain_id(chain_id)
 
     message_hash = keccak(rlp.encode(unsigned))
     try:

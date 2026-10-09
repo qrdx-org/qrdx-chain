@@ -19,6 +19,7 @@ from qrdx.exchange import (
     verify_exchange_tx,
     BLOCK_EXCHANGE_TXS_KEY,
 )
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 
 class _FakeBlock:
@@ -91,7 +92,7 @@ def _signed_evm_raw(i, nonce=0):
     key = "0x" + f"{i:064x}"
     acct = EthAccount.from_key(key)
     tx = {"nonce": nonce, "gasPrice": 10 ** 9, "gas": 21000,
-          "to": acct.address, "value": 1, "data": b"", "chainId": 1}
+          "to": acct.address, "value": 1, "data": b"", "chainId": CHAIN_ID}
     signed = EthAccount.sign_transaction(tx, key)
     raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
     return "0x" + bytes(raw).hex()

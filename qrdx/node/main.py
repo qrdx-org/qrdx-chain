@@ -59,8 +59,9 @@ from qrdx.constants import (
     DENARO_DATABASE_PATH, MAX_TX_DATA_SIZE, DENARO_NODE_HOST, 
     DENARO_NODE_PORT, MAX_REORG_DEPTH,
     LOG_INCLUDE_REQUEST_CONTENT, LOG_INCLUDE_RESPONSE_CONTENT, LOG_MAX_PATH_LENGTH,
-    BOOTSTRAP_NODES
+    BOOTSTRAP_NODES, CHAIN_SPEC, CHAIN_SPEC_FILE, CHAIN_SPEC_ENV_CONFLICTS,
 )
+from qrdx import chain_spec as chain_spec_mod
 from qrdx.node.identity import (
     initialize_identity, get_node_id, get_public_key_hex,
     verify_signature, get_canonical_json_bytes, sign_message,
@@ -943,8 +944,16 @@ _chain_poller_task: Optional[asyncio.Task] = None
 @app.get("/healthz")
 async def healthz():
     """Liveness probe — the process is up and serving. Always 200."""
-    return {"status": "ok", "version": NODE_VERSION,
+    return {"status": "ok", "version": NODE_VERSION, "build": _build_info(),
             "uptime_s": round(time.time() - startup_time, 1)}
+
+
+def _build_info() -> dict:
+    """The release this node was built from — set by the reproducible image build
+    (docker/Dockerfile); "unknown" outside it. Compare with a release manifest
+    (docs/RELEASES.md) to confirm what is actually running."""
+    return {"version": os.getenv("QRDX_BUILD_VERSION", "unknown"),
+            "commit": os.getenv("QRDX_BUILD_COMMIT", "unknown")}
 
 
 @app.get("/readyz")
@@ -960,12 +969,47 @@ async def readyz():
                         status_code=200 if ready else 503)
 
 
+@app.get("/chain_spec")
+async def chain_spec_endpoint():
+    """The network this node follows and its upgrade schedule: chain id, parameters, which
+    rules are active, the next fork and how many blocks away it is, this node's fork id and
+    software version (docs/PROTOCOL_UPGRADES.md). Read-only."""
+    if GENESIS_BLOCK_HASH is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "chain identity not verified yet")
+    tip = max(0, (await db.get_next_block_id()) - 1)
+    out = chain_spec_mod.report(CHAIN_SPEC, GENESIS_BLOCK_HASH, tip, NODE_VERSION)
+    out["build"] = _build_info()
+    out["peers"] = _fork_readiness(out["next_fork"])
+    return out
+
+
+def _fork_readiness(next_fork) -> dict:
+    """How many known peers announce the next fork (their status's fork_next): the
+    readiness signal to watch before an activation height."""
+    peers = list(NodesManager.peers.values()) if hasattr(NodesManager, "peers") else []
+    seen = [p for p in peers if "fork_next" in p]
+    ready = [p for p in seen if next_fork and p.get("fork_next") == next_fork["height"]]
+    return {"known": len(peers), "reporting": len(seen), "ready_for_next_fork": len(ready)}
+
+
 @app.get("/metrics")
 async def metrics_endpoint():
     """Prometheus text exposition — chain height, finality, peers, stream subscribers, etc."""
     try:
         METRICS.set("qrdx_uptime_seconds", round(time.time() - startup_time, 1))
         METRICS.set("qrdx_streaming_enabled", 1 if STREAMING_ENABLED else 0)
+    except Exception:
+        pass
+    try:
+        # Upgrade schedule: alert when a fork is near and peers have not announced it.
+        tip = max(0, (await db.get_next_block_id()) - 1)
+        nxt = CHAIN_SPEC.next_fork(tip)
+        readiness = _fork_readiness(nxt)
+        METRICS.set("qrdx_fork_next_height", nxt["height"] if nxt else 0)
+        METRICS.set("qrdx_fork_blocks_until_next", (nxt["height"] - tip) if nxt else -1)
+        METRICS.set("qrdx_fork_ready_peers", readiness["ready_for_next_fork"])
+        METRICS.set("qrdx_fork_reporting_peers", readiness["reporting"])
+        METRICS.set("qrdx_forks_active", sum(1 for f in CHAIN_SPEC.forks if f["height"] <= tip))
     except Exception:
         pass
     return Response(METRICS.render_prometheus(), media_type="text/plain; version=0.0.4")
@@ -1114,6 +1158,11 @@ from qrdx.rpc.modules.history import HistoryModule
 history_rpc_module = HistoryModule()
 history_rpc_module.context = _ExchangeRPCContext()
 rpc_server.register_module(history_rpc_module)
+# On-chain governance reads (governance_*); its writes are exchange transactions.
+from qrdx.rpc.modules.governance import GovernanceModule
+governance_rpc_module = GovernanceModule()
+governance_rpc_module.context = _ExchangeRPCContext()
+rpc_server.register_module(governance_rpc_module)
 
 @app.post("/rpc")
 async def rpc_endpoint(body: dict = Body(...)):
@@ -2289,6 +2338,9 @@ async def _follow_up_sync(sender_node_id: str):
         remote_status = await interface.get_status()
         if not (remote_status and remote_status.get('ok')):
             return
+        if not await _drop_if_incompatible(sender_node_id, remote_status['result'].get('network'),
+                                           "follow-up sync"):
+            return
 
         remote_height = remote_status['result']['height']
         local_height = await db.get_next_block_id() - 1
@@ -2328,6 +2380,9 @@ async def check_peer_and_sync(peer_info: dict):
             await security.reputation_manager.record_violation(
                 peer_id, 'status_unavailable', severity=1
             )
+            return
+        if not await _drop_if_incompatible(peer_id, remote_status_resp['result'].get('network'),
+                                           "status check"):
             return
 
         remote_height = remote_status_resp['result']['height']
@@ -2383,7 +2438,15 @@ async def get_verified_sender(request: Request):
     pubkey = request.headers.get('x-public-key')
     
     is_unknown = NodesManager.get_peer(peer_id) is None
-    
+
+    # Only a node on our chain becomes a peer implicitly. Its signed x-denaro-genesis header
+    # names its genesis block; anything else stays a one-off caller (the full identity check
+    # happens in the handshake).
+    if is_unknown and (GENESIS_BLOCK_HASH is None
+                       or (request.headers.get('x-denaro-genesis') or '').lower()
+                       != GENESIS_BLOCK_HASH.lower()):
+        return peer_id
+
     if is_unknown and pubkey:
         is_peer_public = False
         url_to_store = None
@@ -2446,7 +2509,14 @@ async def do_handshake_with_peer(peer_url_to_connect: str):
         if not all([challenge, peer_id, peer_pubkey, peer_is_public is not None]):
             logger.warning(f"Handshake failed: Incomplete challenge data from {peer_url_to_connect}.")
             return
-                   
+
+        # Same network and a compatible fork history, or no peering at all — checked before
+        # the peer is stored, so a node of another network (or one that missed an upgrade)
+        # never enters the peer list, the peer exchange, or a sync.
+        if not await _drop_if_incompatible(peer_id, challenge_data.get('network'),
+                                           f"handshake with {peer_url_to_connect}"):
+            return
+
         # Add or update the peer in our manager AS SOON as we have their info.
         # This makes them "known" before we attempt any sync logic.
         url_to_store = peer_advertised_url if peer_is_public and peer_advertised_url else peer_url_to_connect
@@ -2458,7 +2528,13 @@ async def do_handshake_with_peer(peer_url_to_connect: str):
 
         # 2. Respond to Challenge
         response_resp = await interface.handshake_response(challenge)
-        
+
+        if response_resp and response_resp.get('error') == 'network_mismatch':
+            logger.warning(f"[chain-spec] peer {peer_id} refused our handshake: "
+                           f"{response_resp.get('detail')}")
+            NodesManager.remove_peer(peer_id)
+            return
+
         # 3. Handle the peer's response. Now we are guaranteed to find the peer in our manager.
         
         # Case A: Peer told us that WE are behind ('sync_required'). We must PULL.
@@ -3682,8 +3758,10 @@ async def _sync_blockchain(node_id: str = None):
                 return
                 
             remote_status = remote_status_resp['result']
+            if not await _drop_if_incompatible(peer_id, remote_status.get('network'), "sync"):
+                return
             remote_height = remote_status['height']
-            
+
             logger.info(f"[SYNC] Local height: {local_height}, Remote height: {remote_height}")
 
             if remote_height <= local_height:
@@ -4033,14 +4111,161 @@ async def fork_choice_reconcile_pass(enforce: bool = False) -> dict:
 
 
 # ============================================================================
+# CHAIN IDENTITY — chain spec, genesis, fork id (docs/PROTOCOL_UPGRADES.md)
+# ============================================================================
+
+# This chain's genesis block hash, set once startup has verified the database against the
+# chain spec. With the spec, it is the identity every peer must share.
+GENESIS_BLOCK_HASH: Optional[str] = None
+_PASSED_FORKS_KEY = "passed_forks"
+
+
+class ChainIdentityError(RuntimeError):
+    """The database, the chain spec and the environment disagree: the node must not start."""
+
+
+async def _read_chain_metadata(key: str):
+    cur = await db.connection.execute("SELECT value FROM chain_metadata WHERE key = ?", (key,))
+    row = await cur.fetchone()
+    return json.loads(row[0]) if row else None
+
+
+async def _verify_chain_identity() -> str:
+    """
+    Refuse to start unless this database belongs to the chain spec the node loaded. Called at
+    startup, after genesis is created or found and before anything applies a block.
+
+    * The genesis block records the spec it was created under; it must be ours. A database
+      from before chain specs records none and is refused (its parameters are unknowable).
+    * A network pinned by this release (chain_spec.PINNED_NETWORKS) must have exactly its
+      published genesis block.
+    * Forks are append-only. Every fork this chain had passed at the node's previous start must
+      still be in the spec, unchanged, and no fork may be scheduled at or below the height the
+      chain had then reached — either would re-judge blocks already applied under other rules.
+
+    Returns the genesis block hash. Records the forks passed so far for the next start.
+    """
+    genesis = await db.get_block_by_id(0)
+    if not genesis:
+        raise ChainIdentityError("the database has no genesis block")
+    genesis_hash = genesis.get('hash') or genesis.get('block_hash')
+    content = genesis.get('content') or genesis.get('block_content') or {}
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except ValueError:
+            content = {}
+    spec_hash = CHAIN_SPEC.genesis_hash()
+    recorded = content.get("chain_spec_hash") if isinstance(content, dict) else None
+    if not recorded:
+        raise ChainIdentityError(
+            "this database was created before chain specs existed, so the consensus "
+            "parameters it was started with are unknown. Start the node on a new database "
+            "(it will sync from the network).")
+    if recorded != spec_hash:
+        raise ChainIdentityError(
+            f"this database was created under chain spec {recorded[:16]}…, but the node loaded "
+            f"{spec_hash[:16]}… ({CHAIN_SPEC.network}, "
+            f"{CHAIN_SPEC_FILE or 'built-in dev spec from the environment'}). Running it would "
+            f"apply different consensus rules to the same chain. Use the network's genesis file "
+            f"(and, on a dev network, the environment the database was created with), or start "
+            f"on a new database.")
+    if content.get("chain_id") != CHAIN_SPEC.chain_id:
+        raise ChainIdentityError(f"genesis records chain id {content.get('chain_id')}, the chain "
+                                 f"spec {CHAIN_SPEC.chain_id}")
+    pinned = chain_spec_mod.PINNED_NETWORKS.get(CHAIN_SPEC.network)
+    if pinned and pinned.lower() != str(genesis_hash).lower():
+        raise ChainIdentityError(
+            f"{CHAIN_SPEC.network} is pinned to genesis {pinned[:16]}… by this release, but this "
+            f"database holds {str(genesis_hash)[:16]}…")
+
+    tip = await db.get_next_block_id() - 1
+    record = await _read_chain_metadata(_PASSED_FORKS_KEY)
+    if record:
+        spec_forks = {f["name"]: f for f in CHAIN_SPEC.forks}
+        for f in record.get("forks", []):
+            if spec_forks.get(f["name"]) != f:
+                change = "defines it differently" if f["name"] in spec_forks else "omits it"
+                raise ChainIdentityError(
+                    f"fork {f['name']} (height {f['height']}) has passed on this chain, but the "
+                    f"chain spec now {change}. A passed fork can never change: restore the "
+                    f"network's chain spec.")
+        reached = int(record.get("tip", -1))
+        for f in CHAIN_SPEC.forks:
+            if f["height"] <= reached and f not in record.get("forks", []):
+                raise ChainIdentityError(
+                    f"the chain spec schedules fork {f['name']} at height {f['height']}, but this "
+                    f"chain passed that height (it had reached {reached}) without it. Forks are "
+                    f"scheduled ahead of the chain, never behind it.")
+        tip = max(tip, reached)
+    passed = [f for f in CHAIN_SPEC.forks if f["height"] <= tip]
+    await db.connection.execute(
+        "INSERT OR REPLACE INTO chain_metadata (key, value) VALUES (?, ?)",
+        (_PASSED_FORKS_KEY, json.dumps({"tip": tip, "forks": passed}, sort_keys=True)))
+    await db.connection.commit()
+    return str(genesis_hash)
+
+
+async def _local_network_identity() -> dict:
+    """What this node advertises to peers (handshake, status): its network, genesis, fork id,
+    software version and the features its software can execute."""
+    if GENESIS_BLOCK_HASH is None:
+        raise ChainIdentityError("chain identity is not verified yet")
+    tip = max(0, await db.get_next_block_id() - 1)
+    return chain_spec_mod.network_identity(CHAIN_SPEC, GENESIS_BLOCK_HASH, tip, NODE_VERSION)
+
+
+async def _check_peer_identity(remote) -> Tuple[bool, str]:
+    """Does a peer advertising ``remote`` follow our chain (same genesis, chain id and fork
+    history — chain_spec.check_peer_compatibility)?"""
+    if GENESIS_BLOCK_HASH is None:
+        return False, "this node's chain identity is not verified yet"
+    tip = max(0, await db.get_next_block_id() - 1)
+    return chain_spec_mod.check_peer_compatibility(CHAIN_SPEC, GENESIS_BLOCK_HASH, tip, remote)
+
+
+async def _drop_if_incompatible(peer_id: Optional[str], remote_identity, context: str) -> bool:
+    """Check a peer's advertised identity; forget the peer if it follows another chain (a
+    different network, or a fork history ours does not share — e.g. it missed an upgrade).
+    Returns True if the peer is compatible."""
+    ok, reason = await _check_peer_identity(remote_identity)
+    if ok and peer_id and isinstance(remote_identity, dict):
+        peer = NodesManager.get_peer(peer_id)
+        if peer is not None:
+            # In-memory readiness signal for the next fork (/chain_spec, /metrics).
+            peer["fork_next"] = int(remote_identity.get("fork_next") or 0)
+            peer["node_version"] = str(remote_identity.get("node_version") or "")[:32]
+    if not ok:
+        METRICS.inc("qrdx_peer_identity_rejections_total")
+        logger.warning(f"[chain-spec] {context}: peer {peer_id or '?'} is incompatible — {reason}")
+        if peer_id and NodesManager.get_peer(peer_id) is not None:
+            NodesManager.remove_peer(peer_id)
+    return ok
+
+
+# ============================================================================
 # APPLICATION STARTUP/SHUTDOWN
 # ============================================================================
 
 @app.on_event("startup")
 async def startup():
-    global db, self_node_id, http_client, EVM_EXECUTOR, EVM_STATE_MANAGER
-    
+    global db, self_node_id, http_client, EVM_EXECUTOR, EVM_STATE_MANAGER, GENESIS_BLOCK_HASH
+
     logger.info("Starting Denaro Node Server...")
+
+    # Consensus comes from the chain spec alone on a non-dev network. An environment setting that
+    # tries to change it would make this node apply different rules from its network.
+    if CHAIN_SPEC_ENV_CONFLICTS:
+        for problem in CHAIN_SPEC_ENV_CONFLICTS:
+            logger.critical(f"[chain-spec] {problem}")
+        raise ChainIdentityError(
+            f"{len(CHAIN_SPEC_ENV_CONFLICTS)} environment setting(s) conflict with the "
+            f"{CHAIN_SPEC.network} chain spec ({CHAIN_SPEC_FILE}); remove them to start")
+    logger.info(
+        f"[chain-spec] network {CHAIN_SPEC.network} (chain id {CHAIN_SPEC.chain_id}"
+        f"{', dev' if CHAIN_SPEC.dev else ''}), spec {CHAIN_SPEC.genesis_hash()[:16]}… from "
+        f"{CHAIN_SPEC_FILE or 'the environment (no genesis file)'}; "
+        f"{len(CHAIN_SPEC.forks)} scheduled fork(s)")
 
     # Initialize the shared HTTP client for the application's lifespan
     http_client = httpx.AsyncClient(timeout=CONNECTION_TIMEOUT)
@@ -4069,26 +4294,28 @@ async def startup():
     await db.remove_all_pending_transactions()
     logger.info("Pending transaction pool cleared.")
     
-    # Initialize genesis if needed (PoS)
+    # Initialize genesis if needed (PoS). The genesis file is the one the chain spec was loaded
+    # from (QRDX_GENESIS_FILE, or genesis_config.json two levels above the database); without
+    # one this is a dev network. Any failure stops startup — there is no fallback genesis.
     logger.info("Checking genesis state...")
     from ..validator.genesis_init import initialize_genesis_if_needed
-    
-    # Look for genesis configuration file in testnet directory
-    genesis_file = None
-    if DENARO_DATABASE_PATH:
-        # Extract directory from database path
-        db_dir = os.path.dirname(DENARO_DATABASE_PATH)
-        testnet_dir = os.path.dirname(db_dir)  # Go up one level from databases/
-        potential_genesis = os.path.join(testnet_dir, 'genesis_config.json')
-        if os.path.exists(potential_genesis):
-            genesis_file = potential_genesis
-            logger.info(f"Found genesis configuration: {genesis_file}")
-    
-    genesis_created = await initialize_genesis_if_needed(db, genesis_file=genesis_file)
+
+    if CHAIN_SPEC_FILE:
+        logger.info(f"Genesis configuration: {CHAIN_SPEC_FILE}")
+    genesis_created = await initialize_genesis_if_needed(
+        db, genesis_file=CHAIN_SPEC_FILE, chain_spec=CHAIN_SPEC)
     if genesis_created:
         logger.info("Genesis block created for PoS network")
     else:
         logger.info("Genesis block already exists")
+
+    # The database must belong to this chain spec before anything applies a block to it.
+    GENESIS_BLOCK_HASH = await _verify_chain_identity()
+    _next = CHAIN_SPEC.next_fork(max(0, await db.get_next_block_id() - 1))
+    logger.info(
+        f"[chain-spec] genesis {GENESIS_BLOCK_HASH[:16]}… verified; "
+        + (f"next fork {_next['name']} at height {_next['height']} "
+           f"(features: {', '.join(_next['features']) or '—'})" if _next else "no fork scheduled"))
 
     # Contract system (EVM executor + account-state manager). Initialised here, ahead of
     # the RPC modules that also use it, because the startup rebuild below replays EVM
@@ -4283,7 +4510,10 @@ async def startup():
 
         enforce_proposer_eligibility=_ENFORCE_PROPOSER_ELIGIBILITY,  # slot-eligibility gate
         add_remote_attestation=_add_remote_attestation,  # attestation-gossip receive hook
+        network_identity=_local_network_identity,  # chain spec: advertised in handshake/status
+        check_peer_identity=_check_peer_identity,  # chain spec: refuse other networks / fork histories
     )
+    NodeInterface.network_identity_provider = _local_network_identity
 
     logger.info(f"✅ JSON-RPC server initialized (dht_* + p2p_* always-on): {len(rpc_server.get_methods())} methods")
     logger.info(f"   RPC endpoint: http://{DENARO_NODE_HOST}:{DENARO_NODE_PORT}/rpc")
@@ -5628,7 +5858,8 @@ async def handshake_challenge(request: Request):
             "is_public": NodesManager.self_is_public,
             "url": DENARO_SELF_URL,
             "height": height,
-            "last_hash": last_hash
+            "last_hash": last_hash,
+            "network": await _local_network_identity(),
         }
     }
 
@@ -5662,6 +5893,11 @@ async def handshake_response(
     if not await security.handshake_manager.verify_and_consume_challenge(challenge):
         await security.reputation_manager.record_violation(verified_sender, 'invalid_handshake', severity=6)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid or expired challenge.")
+
+    # Another network, or an incompatible fork history: refuse before negotiating any sync.
+    if not await _drop_if_incompatible(verified_sender, body.get('network'), "REST handshake"):
+        return JSONResponse(status_code=status.HTTP_409_CONFLICT,
+                            content={'ok': False, 'error': 'network_mismatch'})
     
     logger.info(f"Received handshake from {verified_sender} (Height: {peer_height})")
 

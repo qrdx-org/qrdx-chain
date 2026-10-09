@@ -21,12 +21,13 @@ from qrdx.transactions.pq_tx import (
     intrinsic_gas_pq,
     is_pq_tx,
 )
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 RECIPIENT = bytes.fromhex("cd" * 20)
 
 
 def _signed(priv, **overrides):
-    params = dict(chain_id=7117, nonce=0, gas_price=10 ** 9, gas_limit=500_000,
+    params = dict(chain_id=CHAIN_ID, nonce=0, gas_price=10 ** 9, gas_limit=500_000,
                   to=RECIPIENT, value=10 ** 18, data=b"")
     params.update(overrides)
     return PQTransaction(**params).sign(priv)
@@ -148,7 +149,7 @@ def test_corrupted_signature_is_rejected(keypair):
 
 
 def test_unsigned_transaction_cannot_be_encoded():
-    tx = PQTransaction(chain_id=1, nonce=0, gas_price=1, gas_limit=21000,
+    tx = PQTransaction(chain_id=CHAIN_ID, nonce=0, gas_price=1, gas_limit=21000,
                        to=RECIPIENT, value=0, data=b"")
     with pytest.raises(InvalidPQTransaction):
         tx.encode()
@@ -272,7 +273,7 @@ def test_legacy_transactions_still_parse_unchanged():
     acct = EthAccount.from_key(key)
     signed = EthAccount.sign_transaction(
         {"nonce": 0, "gasPrice": 10 ** 9, "gas": 21000, "to": acct.address,
-         "value": 1, "data": b"", "chainId": 1}, key)
+         "value": 1, "data": b"", "chainId": CHAIN_ID}, key)
     raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
     parsed = parse_eth_raw_tx("0x" + bytes(raw).hex())
     assert parsed["sender"].lower() == acct.address.lower()

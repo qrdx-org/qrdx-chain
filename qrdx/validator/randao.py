@@ -112,7 +112,32 @@ RANDAO_PROPOSER_ELIGIBLE_K = 2
 # occasionally collide). Full reliability needs a production-scale set (variance averages out).
 # ENV-GATED, default OFF (fast 2s dev testnet stays green); enable in production with
 # QRDX_ENFORCE_RANDAO=1 + QRDX_SLOT_DURATION≥6. See docs item 5 / [[randao-fork-choice-status]].
+#
+# Scheduling: RANDAO selection is the chain-spec feature ``randao_selection`` — a network turns
+# it on at a fork height (docs/PROTOCOL_UPGRADES.md). QRDX_ENFORCE_RANDAO remains as a
+# DEV-network override (a non-dev node refuses to start with it set; chain_spec
+# CONSENSUS_ENV_SWITCHES). Every caller asks ``randao_selection_active(height)``.
 ENFORCE_RANDAO_SELECTION = os.getenv("QRDX_ENFORCE_RANDAO", "").lower() in ("1", "true", "yes")
+
+
+def randao_reveal_message(slot: int, spec=None) -> bytes:
+    """What a proposer signs as its RANDAO reveal for ``slot``: the network's RANDAO signing
+    domain, the slot, and a purpose tag. One definition for the proposer and every verifier."""
+    from ..chain_spec import signing_domain
+    return signing_domain("randao", spec) + int(slot).to_bytes(8, "little") + b"RANDAO_REVEAL"
+
+
+def randao_selection_active(height: int) -> bool:
+    """Is RANDAO proposer selection in force for the block at ``height``?
+
+    ``height`` is the number of the block being proposed (the proposer's tip + 1) or verified
+    (the block's own, signed, ``number``). A block is always judged under the rules of its own
+    height, so the proposer, every importer and a node replaying history reach the same verdict
+    — whatever their own tips are."""
+    if ENFORCE_RANDAO_SELECTION:
+        return True
+    from .. import chain_spec
+    return chain_spec.is_active("randao_selection", int(height))
 
 # Genesis seed for the fold. Equal to the current constant proposer mix, so the
 # accumulated mix at height 0 (no reveals) reproduces today's selection input —

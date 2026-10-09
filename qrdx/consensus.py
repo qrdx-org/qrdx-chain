@@ -533,8 +533,9 @@ class Consensus_V2_PoS(BaseConsensusRules):
         try:
             from .crypto.pq import PQPublicKey, PQSignature, verify as pq_verify
             
-            # RANDAO reveal is a signature of the slot
-            message = slot.to_bytes(8, 'little') + b'RANDAO_REVEAL'
+            # RANDAO reveal is a signature of the slot, under this network's domain
+            from .validator.randao import randao_reveal_message
+            message = randao_reveal_message(slot)
             
             pk = PQPublicKey.from_bytes(proposer_public_key)
             sig = PQSignature.from_bytes(randao_reveal)

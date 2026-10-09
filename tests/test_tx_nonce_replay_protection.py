@@ -29,6 +29,7 @@ from qrdx.contracts.state import ContractStateManager
 from qrdx.crypto.account_id import to_account_id
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.node import main as node_main
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 WEI = 10 ** 18
 SENDER_KEY = "0x" + "a1" * 32
@@ -40,7 +41,7 @@ def _signed_tx(nonce, value=WEI, key=SENDER_KEY, gas=100_000):
     signed = EthAccount.sign_transaction(
         {"nonce": nonce, "gasPrice": 0, "gas": gas,
          "to": to_checksum_address(RECIPIENT), "value": value, "data": b"",
-         "chainId": 1}, key)
+         "chainId": CHAIN_ID}, key)
     raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
     return "0x" + bytes(raw).hex()
 

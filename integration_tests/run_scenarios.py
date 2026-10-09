@@ -49,6 +49,7 @@ from integration_tests.scenarios.s18_clob_match import S18ClobMatch
 from integration_tests.scenarios.s19_perp_liquidation import S19PerpLiquidation
 from integration_tests.scenarios.s20_native_tokens import S20NativeTokens
 from integration_tests.scenarios.s21_interfaces_nfts import S21InterfacesNfts
+from integration_tests.scenarios.s22_governance import S22Governance
 
 
 ALL_SCENARIOS = [
@@ -74,6 +75,7 @@ ALL_SCENARIOS = [
     S19PerpLiquidation,
     S20NativeTokens,
     S21InterfacesNfts,
+    S22Governance,       # last: freezing the master controller is irreversible
 ]
 
 

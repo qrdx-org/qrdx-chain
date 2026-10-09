@@ -258,6 +258,12 @@ def test_the_spot_cli_swaps_with_a_quoted_minimum_and_adds_quoted_liquidity(monk
     calls = []
 
     def fake_rpc(node, method, params=None, timeout=20.0):
+
+        if method == "p2p_getStatus":      # the CLI signs for the node's network
+
+            from qrdx.constants import CHAIN_ID
+
+            return {"network": {"chain_id": CHAIN_ID}}
         calls.append((method, params))
         if method == "exchange_getNonce":
             return 4

@@ -129,12 +129,15 @@ async def ensure_oracle_committee(db, mgr: ExchangeStateManager) -> None:
     place before any vote or staking op is judged — on every node, whatever height it loaded at.
     That is also why the committee is not hashed into the state root: a restarted node loads it
     at height 0, a long-running one at its first section, and between them it decides nothing."""
-    if mgr.oracle_committee is not None:
+    if mgr.oracle_committee is not None and mgr.governance.genesis_loaded:
         return
     try:
         genesis = await db.get_block_by_id(0)
         if genesis:
-            mgr.load_oracle_committee(genesis.get("content") or genesis.get("block_content"))
+            content = genesis.get("content") or genesis.get("block_content")
+            mgr.load_oracle_committee(content)
+            # Governance's genesis facts (whether system wallets exist) come from block 0 too.
+            mgr.governance.load_genesis(content)
     except Exception as e:
         logger.debug("oracle committee not loaded: %s", e)
 
@@ -160,6 +163,25 @@ async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeState
             mgr.set_available_balance(sender, await db.get_address_balance(sender))
         except Exception as e:
             logger.debug("preload_sender_balances: %s for %s", e, str(sender)[:20])
+    # A governance system_spend debits a system wallet, not its sender: pre-load that wallet's
+    # balance too, under the key the execution debits (the wallet's lowercase address).
+    for tx in txs or []:
+        if getattr(tx, "op_type", None) != ExchangeOpType.GOV_EXECUTE:
+            continue
+        try:
+            proposal = mgr.governance.proposals.get(int((tx.params or {}).get("proposal_id")))
+        except (TypeError, ValueError):
+            proposal = None
+        if proposal is None or proposal.action != "system_spend":
+            continue
+        wallet = proposal.params["wallet"]
+        if wallet in seen:
+            continue
+        seen.add(wallet)
+        try:
+            mgr.set_available_balance(wallet, await db.get_address_balance(wallet))
+        except Exception as e:
+            logger.debug("preload_sender_balances: %s for system wallet %s", e, wallet)
 
 
 async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:
@@ -273,7 +295,12 @@ async def flush_exchange_balance_deltas(db, state_manager: Optional[ExchangeStat
         return
     for addr, delta in deltas.items():
         try:
-            await db.apply_account_balance_delta(addr, delta)
+            applied = await db.apply_account_balance_delta(addr, delta)
+            if not applied and delta < 0:
+                # A debit on an account with no ledger row: nothing was taken, while the
+                # paired credit (if any) still lands — value created from nothing.
+                logger.error("[VALUE-LOST] flush_exchange_balance_deltas: debit of %s on %s "
+                             "found no account_state row", delta, str(addr)[:24])
         except Exception as e:
             # A dropped delta LOSES VALUE silently. It is deterministic (every node
             # drops the same one, so no fork) which is exactly why it can hide: the
@@ -407,6 +434,9 @@ def verify_exchange_tx(tx: ExchangeTransaction) -> Tuple[bool, str]:
         tx.validate_basic()
     except ValueError as e:
         return False, f"invalid structure: {e}"
+    chain_err = tx.chain_error()
+    if chain_err:
+        return False, chain_err
     if not tx.verify():
         return False, "signature verification failed (bad signature or sender mismatch)"
     return True, ""

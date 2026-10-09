@@ -1140,27 +1140,34 @@ class TestRPCInputValidation:
 class TestDockerSecurity:
     """Step 12.1: Docker image security basics."""
 
+    REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _read(self, *parts):
+        with open(os.path.join(self.REPO, *parts)) as f:
+            return f.read()
+
     def test_requirements_v3_includes_liboqs(self):
         """requirements-v3.txt must include liboqs-python."""
-        req_path = "/workspaces/qrdx-chain-denaro/requirements-v3.txt"
-        if os.path.exists(req_path):
-            with open(req_path) as f:
-                content = f.read()
-            assert "liboqs" in content.lower(), \
-                "requirements-v3.txt must include liboqs-python"
+        assert "liboqs" in self._read("requirements-v3.txt").lower(), \
+            "requirements-v3.txt must include liboqs-python"
 
-    def test_dockerfile_uses_requirements_v3(self):
-        """Dockerfile must use requirements-v3.txt, not requirements.txt."""
-        dockerfile_path = "/workspaces/qrdx-chain-denaro/docker/Dockerfile"
-        if os.path.exists(dockerfile_path):
-            with open(dockerfile_path) as f:
-                content = f.read()
-            assert "requirements-v3" in content, \
-                "Dockerfile must reference requirements-v3.txt"
+    def test_the_image_installs_the_pq_stack_from_the_hashed_lock(self):
+        """The image installs exactly release/requirements.lock — compiled from
+        requirements-v3.txt, every package pinned by sha256 — so it cannot silently lack
+        liboqs-python or pick up an untested version (docs/RELEASES.md)."""
+        dockerfile = self._read("docker", "Dockerfile")
+        assert "release/requirements.lock" in dockerfile
+        assert "--require-hashes" in dockerfile
+        assert "-r ../requirements-v3.txt" in self._read("release", "requirements.in")
+        lock = self._read("release", "requirements.lock")
+        entry = lock[lock.index("liboqs-python=="):].split("\n\n")[0]
+        assert "--hash=sha256:" in entry.split("# via")[0], "liboqs-python must be pinned by hash"
+        # ...and the build fails, rather than shipping, if ML-DSA-65 is missing.
+        assert "ML-DSA-65" in dockerfile
 
     def test_no_hardcoded_credentials_in_config(self):
         """config.example.toml must not contain literal default passwords."""
-        config_path = "/workspaces/qrdx-chain-denaro/config.example.toml"
+        config_path = os.path.join(self.REPO, "config.example.toml")
         if os.path.exists(config_path):
             with open(config_path) as f:
                 content = f.read().lower()
@@ -1177,7 +1184,7 @@ class TestDockerSecurity:
             result = subprocess.run(
                 ["git", "ls-files", "--", "*.priv", "*.key", "*.pem", "*private_key*"],
                 capture_output=True, text=True,
-                cwd="/workspaces/qrdx-chain-denaro",
+                cwd=self.REPO,
             )
             tracked_key_files = [f for f in result.stdout.strip().split('\n')
                                 if f and 'ref/' not in f and 'example' not in f.lower()]

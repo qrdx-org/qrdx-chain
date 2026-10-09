@@ -56,7 +56,9 @@ class Attestation:
         
         This is what gets signed by the validator.
         """
+        from ..chain_spec import signing_domain
         data = (
+            signing_domain("attestation") +       # bound to this network (no cross-network replay)
             self.slot.to_bytes(8, 'little') +
             self.epoch.to_bytes(8, 'little') +
             bytes.fromhex(self.block_hash) +

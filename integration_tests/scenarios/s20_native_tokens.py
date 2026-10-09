@@ -15,6 +15,7 @@ from decimal import Decimal
 
 from integration_tests.rpc_client import NodeRPCClient
 from integration_tests.scenarios.base import Scenario
+from integration_tests.config import CHAIN_ID  # exchange txs are signed for the testnet's chain
 
 
 class S20NativeTokens(Scenario):
@@ -34,7 +35,7 @@ class S20NativeTokens(Scenario):
         key = PQPrivateKey.from_hex(wallet["private_key"], wallet["public_key"])
         nonce = (await self._get(target, "/get_exchange_nonce", address=wallet["address"])
                  or {}).get("nonce", 0)
-        tx = ExchangeTransaction(op_type=op, sender=wallet["address"], nonce=int(nonce),
+        tx = ExchangeTransaction(chain_id=CHAIN_ID, op_type=op, sender=wallet["address"], nonce=int(nonce),
                                  params=params, gas_limit=2_000_000, gas_price=10**9)
         tx.public_key = key.public_key.to_bytes()
         tx.signature = key.sign(tx.signing_bytes()).to_bytes()

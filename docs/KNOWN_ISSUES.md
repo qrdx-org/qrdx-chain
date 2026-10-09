@@ -6,7 +6,8 @@ only as a comment in a diff.
 
 Companions: [UNIFIED_ACCOUNT_IDENTITY.md](UNIFIED_ACCOUNT_IDENTITY.md),
 [EXCHANGE_AND_VALIDATOR_STAKE_AUDIT.md](EXCHANGE_AND_VALIDATOR_STAKE_AUDIT.md),
-[CONSENSUS_REMAINING_WORK.md](CONSENSUS_REMAINING_WORK.md).
+[CONSENSUS_REMAINING_WORK.md](CONSENSUS_REMAINING_WORK.md),
+[PROTOCOL_UPGRADES.md](PROTOCOL_UPGRADES.md) (chain specs, forks, network identity).
 
 ---
 
@@ -131,6 +132,57 @@ funding paid none (caught by S19's funding check). The duplicate is gone and
   only if it falls under maintenance); after a halt spanning several funding intervals, one is
   paid; anyone may create a market (it trades only once validators price it).
 
+## OPEN — Three things block the first release
+
+**Severity: high (blocks every release).** Signed releases and reproducible builds are in place
+([RELEASES.md](RELEASES.md)), but no release can be cut until these are fixed:
+
+1. **`dvm` is recorded as a submodule that no clone can fetch.** The tree has a gitlink at
+   `dvm` (commit `ddc8868`, the legacy denaro-coin VM, added in `ff83360`) with no
+   `.gitmodules` entry. It works only in checkouts that happen to have a `dvm/` repository.
+   Every fresh clone with submodules fails with "No url found for submodule path 'dvm'",
+   including `actions/checkout` with `submodules: recursive` in the release workflow. Nothing
+   in `qrdx/` uses it. `release.py preflight` now refuses it. **To close:**
+   `git rm --cached dvm`, then add `dvm/` to `.gitignore` (or declare it in `.gitmodules` if it
+   is meant to ship).
+2. **The EVM change the tests ran against is not committed.** `py-evm` has an uncommitted
+   change to `eth/vm/forks/qrdx/precompiles.py` (+41/−635). The test suite and every
+   working-tree image so far ran *with* it. A release built from a tag gets the submodule's
+   recorded commit, *without* it. **To close:** commit it in `py-evm`, push it to
+   `qrdx-org/py-evm`, and commit the new submodule pointer here. A fresh clone must be able to
+   fetch every recorded commit.
+3. **No maintainer keys are registered.** `release/allowed_signers` is empty on purpose, so
+   nothing verifies. **To close:** at least `maintainer_threshold` (2) maintainers add their
+   keys ([RELEASES.md §5](RELEASES.md#5-cutting-a-release-maintainers)), and the GitHub
+   settings listed there are applied: branch protection, a `v*` tag ruleset, and a public GHCR
+   package.
+
+The full flow (preflight, build from the tag, source tarball, manifest, two maintainer
+signatures, an operator `verify --rebuild` reproducing the image) was rehearsed end to end on a
+scratch clone where items 1 and 2 were fixed.
+
+## OPEN — QRDX's chain ids are not registered yet
+
+**Severity: low (process).** Mainnet is chain id **762** (`qrdx-mainnet`) and the testnet
+**7620** (`qrdx-testnet`). Both were unassigned in ethereum-lists/chains and chainid.network on
+2026-10-09. The code reserves them: only those networks' specs may use them, and a dev node
+can't (`chain_spec.QRDX_NETWORKS`). But an id is only "ours" once it is registered. Every
+signed transaction is bound to it, so another chain taking 762 would make keys used on both
+replayable.
+
+**To close:** submit `eip155-762.json` and `eip155-7620.json` to ethereum-lists/chains.
+
+## OPEN — The peer RPC transport is unauthenticated
+
+**Severity: medium.** Node-to-node calls go over plain JSON-RPC (`NodeInterface._rpc_call`): no
+request signature, and `p2p_handshakeResponse` consumes a challenge without verifying that the
+caller signed it. A peer's node id, URL and advertised chain identity are therefore
+self-declared. The chain-identity check ([PROTOCOL_UPGRADES.md §5](PROTOCOL_UPGRADES.md)) keeps
+honest-but-misconfigured nodes — another network, a missed upgrade — apart, but a malicious peer
+can claim any identity; block validity (proposer signature, eligibility, parent linkage, E-D4)
+remains the real defence. **To close:** sign RPC requests the way the legacy REST path does
+(`get_verified_sender`), and verify the challenge signature in the handshake.
+
 ## OPEN — A second, unused token class remains
 
 **Severity: low.** What remains of the 2026-10-02 audit of the spot exchange: its spot findings
@@ -222,20 +274,25 @@ operations through contracts so the EVM's own authentication covers them.
 
 ## ACCEPTED — RANDAO proposer selection is off on small validator sets
 
-`ENFORCE_RANDAO_SELECTION` is env-gated and off. Safe when enabled (no halt, no
-divergence, 0 eligibility rejects) but not cleanly passable on a 3-validator/2-second-slot
-testnet: K=1 dips on missed slots and K=2 churns on competing blocks. A small-N,
-short-slot artifact rather than a consensus bug — enable on a production-scale set or a
-larger slot.
+RANDAO selection is the chain-spec feature `randao_selection`, off unless a network's spec
+schedules it (`QRDX_ENFORCE_RANDAO` survives only as a dev-network override). Safe when
+enabled (no halt, no divergence, 0 eligibility rejects) but not cleanly passable on a
+3-validator/2-second-slot testnet: K=1 dips on missed slots and K=2 churns on competing
+blocks. A small-N, short-slot artifact rather than a consensus bug — schedule it on a
+production-scale set or a larger slot ([PROTOCOL_UPGRADES.md](PROTOCOL_UPGRADES.md)).
 
 ---
 
 ## ACCEPTED — The legacy UTXO ledger is vestigial
 
-`unspent_outputs` is still read as a fallback in `get_address_balance` and is never
-written after genesis. `qrdx/transactions/transaction_output.py` cannot represent `0x` or
-`0xPQ` addresses at all (it needs base58 secp256k1 curve points). Kept only for legacy
-reads; a dedicated removal pass would simplify the balance path.
+`unspent_outputs` is still read as a fallback in `get_address_balance`, but nothing writes
+to it: genesis funds every allocation, system wallets included, in `account_state`. Until
+2026-10-09 the system wallets were the exception, and that fallback is what hid a
+value-creation bug ([below](#fixed-system-wallet-balances-lived-only-in-the-legacy-utxo-ledger)).
+
+`qrdx/transactions/transaction_output.py` cannot represent `0x` or `0xPQ` addresses at all
+(it needs base58 secp256k1 curve points). Kept only for legacy reads. Removing the fallback
+would make any future gap fail loudly rather than read as a balance.
 
 ---
 
@@ -288,6 +345,14 @@ These are not defects, but they are the reason two real bugs survived a green su
 
 | Issue | Where |
 |---|---|
+| Release images were neither reproducible nor signed, and never ran the tested dependency versions | [below](#fixed-release-images-were-neither-reproducible-nor-signed) |
+| Locally built images could contain the node's private key | [below](#fixed-locally-built-images-could-contain-the-nodes-private-key) |
+| System-wallet balances lived only in the legacy UTXO ledger (a debit through the balance flush was dropped) | [below](#fixed-system-wallet-balances-lived-only-in-the-legacy-utxo-ledger) |
+| Governance was not connected to consensus; one key controlled the system wallets forever | [below](#fixed-governance-was-not-connected-to-consensus) |
+| No way to change a consensus rule after launch; consensus parameters set per node by environment | [below](#fixed-there-was-no-way-to-change-a-consensus-rule-after-launch) |
+| Consensus signatures were not bound to a network (cross-network slashing replay) | [below](#fixed-consensus-signatures-were-not-bound-to-a-network) |
+| Transactions signed for any chain (or none) executed here | [below](#fixed-transactions-signed-for-any-chain-executed-here) |
+| Genesis did not identify the network (accounts uncommitted, random RANDAO seed, silent fallback genesis) | [below](#fixed-genesis-did-not-identify-the-network) |
 | Native transfers moved 2× the value | [UNIFIED_ACCOUNT_IDENTITY.md §5](UNIFIED_ACCOUNT_IDENTITY.md) |
 | Plain transfers were free (no gas charged) | same |
 | Account nonce never advanced → web3 clients broke on their 2nd tx | same |
@@ -322,6 +387,171 @@ These are not defects, but they are the reason two real bugs survived a green su
 | Malformed `TOKEN_TRANSFER` recipient burned tokens | same, §1.3(a) |
 
 ---
+
+## FIXED — Release images were neither reproducible nor signed
+
+**Severity: critical for mainnet.**
+
+- **Unverifiable.** No two builds of the image were the same, and nothing was signed. An
+  operator could not tell a genuine image from a modified one.
+- **Not the tested versions.** The image ran dependency versions nobody had tested. The
+  Dockerfile ran `pip wheel -r requirements-v3.txt`, which takes the newest version each range
+  allows on the day of the build. The base image was a moving tag (`python:3.11-slim`), apt
+  installed whatever Debian served that day, and pip, setuptools and wheel were upgraded to
+  the latest at build time.
+- **Release tags pushed unverified images.** CI's `docker-build` job published every `v*` tag
+  to Docker Hub as an unsigned image under the release's own version. It also checked out
+  without submodules, so it had no `py-evm` to build.
+
+**Fixed** ([RELEASES.md](RELEASES.md)):
+
+- **Reproducible build.** Every input is pinned: the base image by digest, Debian by snapshot,
+  liboqs by commit, and every Python package by sha256 (`release/*.lock`, the tested
+  versions). Time, modes and ownership are normalised. Two builds of a commit give the same
+  image, and the CI build, a perturbed checkout and an operator's rebuild were all verified
+  bit-identical.
+- **Release workflow** (`.github/workflows/release.yml`), from a maintainer-signed tag: it
+  builds twice and compares, tests inside the image, and pushes by digest. It then
+  cosign-signs the image and attaches an SBOM and SLSA provenance, Sigstore-signs a manifest
+  of every artifact, and opens a draft release. The release is published only after k-of-n
+  maintainers have reproduced it and signed it (`sign-release.sh`).
+- **Operator check.** Operators verify with `verify-release.sh` against their own trusted
+  policy and run the image by digest.
+- **CI.** `ci.yml` no longer publishes tags, and it fails when a lock is stale.
+
+Tests: `tests/test_release_tooling.py`, plus the unit suite run inside the built image
+(`scripts/release/test-image.sh`: 2925 passed, 0 failed, in an image built from a tag).
+
+## FIXED — Locally built images could contain the node's private key
+
+**Severity: high.** `.dockerignore` listed key and state files with root-only patterns
+(`*.priv`, `nodes.json`). A node started from a checkout writes its identity key to
+`qrdx/node/node_key.priv` and its peers to `qrdx/node/nodes.json`, and both were copied into
+any image built from that checkout. **Fixed:** the patterns are recursive (`**/`), and release
+images are built from a clean export of a commit, so untracked files cannot reach them at all.
+**If an image built locally before this fix was ever pushed or shared, rotate the node identity
+key of the checkout it was built from.**
+
+## FIXED — System-wallet balances lived only in the legacy UTXO ledger
+
+**Severity: critical (value creation), found by the live governance scenario (S22).** Genesis
+funded the ten system wallets as UTXO outputs, not in `account_state`. Reads hid it, because
+`get_address_balance` falls back to the UTXO table when an account has no row, so the developer
+fund showed its 10M. But a debit through the exchange balance flush
+(`apply_account_balance_delta`) on an account without a row did nothing and reported nothing,
+while its paired credit created the recipient's row.
+
+The first governance treasury spend credited the recipient 1,234.5 QRDX on all four nodes and
+debited the fund nothing: QRDX created from nothing. Every node did it identically, so no state
+root diverged. This is the conservation blind spot in "Test-coverage gaps worth knowing" again.
+
+**Fixed:**
+
+- Genesis funds system wallets in `account_state` like every other allocation, and
+  `seed_genesis_account_state` restores them after a reorg.
+- The flush logs any debit that finds no row as `[VALUE-LOST]`.
+
+Test: `tests/test_governance.py::test_a_system_spend_debits_the_wallet_in_the_ledger_and_conserves_value`
+drives a spend through genesis, preload, execution and the flush, and asserts the ledger
+amounts.
+
+## FIXED — Governance was not connected to consensus
+
+**Severity: high for mainnet.** `qrdx/governance/` was imported by nothing outside itself: state
+in memory, wall-clock timelocks, and a `PROTOCOL_UPGRADE` that only recorded a version string.
+QRDX_IMPLEMENTATION_CHECKLIST §10.1 claimed otherwise. Meanwhile the genesis master controller,
+a single key, controlled all ten system wallets (75M QRDX) with no way to remove it.
+
+**Fixed** ([GOVERNANCE.md](GOVERNANCE.md)):
+
+- **Governance is consensus state.** It runs as four exchange operations (`GOV_PROPOSE`,
+  `GOV_VOTE`, `GOV_VETO`, `GOV_EXECUTE`), replayed on every path and committed in the state
+  root.
+- **Validators decide; holders can veto.** Validators propose and decide by stake (2/3). Holders
+  veto by locking real QRDX during a timelock, which is refunded when the proposal resolves.
+- **System-wallet spends need a proposal.**
+- **The master controller's authority ends automatically** at block 100,000, or earlier by vote.
+  It is enforced at admission, at the proposer and at block import.
+- **Forks need validator approval** to activate (PROTOCOL_UPGRADES.md §4a).
+
+Tests: `tests/test_governance.py`; live: `integration_tests/scenarios/s22_governance.py`. The old
+`qrdx/governance/` library remains, unused.
+
+## FIXED — There was no way to change a consensus rule after launch
+
+**Severity: critical for mainnet.** Every consensus rule was a module-level boolean or an
+environment variable with no activation height, and every node replays the whole chain under its
+current code on restart (`derived_state_rebuild.py`, which keeps the replayed state when it
+differs). Any rule change shipped after launch would have rewritten history on the upgraded
+nodes and split them from the rest. The one fork schedule in the code (`consensus.py`'s
+`ConsensusSchedule`) had a single entry and was read only by legacy checks. Fifteen consensus
+parameters (slot length, epoch length, staking delays, perps settings, the gas floor) and six
+consensus A/B switches were read from each node's environment, so one operator's typo forked
+their node off silently — the class of bug behind the two-epoch-definitions incident. Peers on
+other networks or other rules were accepted as long as they answered.
+
+**Fixed** — design and operator procedure in [PROTOCOL_UPGRADES.md](PROTOCOL_UPGRADES.md):
+a chain spec in the genesis file defines the network (chain id, every parameter, an append-only
+fork schedule); rules switch on at fork heights (`chain_spec.is_active(feature, height)`, each
+block judged under its own height's rules); peers compare EIP-2124 fork ids and drop each other
+at a fork one of them missed; on a non-dev network the environment cannot change consensus
+(startup error); a node refuses a database created under another spec, a changed or removed
+passed fork, or a fork inserted behind the chain. RANDAO proposer selection is the first rule on
+the schedule. Tests: `tests/test_chain_spec.py`, `tests/test_chain_identity_startup.py`,
+`tests/test_protocol_upgrade_activation.py`.
+
+## FIXED — Consensus signatures were not bound to a network
+
+**Severity: high.** Block signing roots, attestation signing roots, RANDAO reveals and
+exchange-transaction signing bytes carried no chain id or genesis domain. A validator using one
+key on two networks could have two of its headers (or attestations) from one network submitted
+on the other as DOUBLE_SIGN (or surround-vote) evidence, and be slashed there. An exchange
+transaction signed on a testnet verified on any network where its sender's nonce lined up.
+Ethereum prevents both with a signing domain.
+
+**Fixed** ([PROTOCOL_UPGRADES.md §7](PROTOCOL_UPGRADES.md)):
+
+- Node signatures are taken over `chain_spec.signing_domain(purpose)`, a hash of purpose, chain
+  id and chain-spec hash, plus the fields. There is one definition each:
+  `reconstruct_signing_root` (the legacy `manager.py` copy now calls it),
+  `Attestation.signing_root` and `randao.randao_reveal_message` (the proposer and
+  `consensus.py` used to build the reveal message separately).
+- Exchange transactions carry a signed `chain_id`, checked in `verify_exchange_tx`. A missing
+  one is never defaulted.
+
+Tests: `tests/test_signing_domains.py`, including that another network's headers are not
+slashing evidence here.
+
+## FIXED — Transactions signed for any chain executed here
+
+**Severity: critical.** The EIP-155 chain id was parsed out of every legacy transaction and
+never compared, the PQ envelope's chain id was never checked, and pre-EIP-155 transactions (no
+chain id) were accepted. Any transaction signed on another network — another QRDX network, or
+Ethereum itself for a key used there — executed here once its nonce lined up. The chain id the
+node reported was a hardcoded `88888` (another chain's) in five places, independent of the
+genesis.
+
+**Fixed:** the chain id comes from the chain spec (`constants.CHAIN_ID`: `eth_chainId`, the
+EVM's `CHAINID`), and the shared transaction parser refuses any other id and unprotected
+legacy transactions (`contracts/evm_mempool._require_chain_id`) — so admission, execution and
+block import all apply it. 17 test files had been signing for chain id 1 and passing.
+Tests: `tests/test_chain_id_replay_protection.py`.
+
+## FIXED — Genesis did not identify the network
+
+**Severity: high.** The genesis state root covered validator stakes and system wallets but not
+the prefunded accounts, so two genesis files funding different accounts produced the same
+genesis block. `GenesisCreator` drew a random RANDAO seed on every node. A genesis file that
+failed to load fell back to a built-in genesis with placeholder allocations — and a failure to
+create genesis returned `False`, which startup logged as "genesis already exists". The
+initializer counted every prefunded account twice in the state it hashed (harmless only because
+the root ignored accounts), and genesis metadata was written into the package directory, shared
+by every node started from one checkout.
+
+**Fixed:** the root (`QRDX_GENESIS_STATE_V2`) commits to the chain spec and every allocation in
+integer wei; the RANDAO seed is derived; a node recomputes genesis from its file and refuses
+unless it reproduces the file's recorded block hash; every failure raises; metadata lives in the
+node's own `chain_metadata` table. Tests: `tests/test_genesis_chain_spec.py`.
 
 ## FIXED — A rolled-back block's EVM receipts outlived it
 

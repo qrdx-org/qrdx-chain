@@ -175,8 +175,12 @@ def epoch_from_block(block_like: Dict[str, Any]) -> Optional[int]:
 
 
 def reconstruct_signing_root(bc: Dict[str, Any]) -> bytes:
-    """Reproduce ``PoSBlock.signing_root`` from a block-content dict."""
-    data = (
+    """The block signing root (``PoSBlock.signing_root``) for a block-content dict: this
+    network's block signing domain (chain_spec.signing_domain), then the signed header fields.
+    The domain makes a header signed on another network fail verification here — including as
+    DOUBLE_SIGN evidence."""
+    from ..chain_spec import signing_domain
+    data = signing_domain("block") + (
         int(bc["number"]).to_bytes(8, "little") +
         bytes.fromhex(bc["parent_hash"]) +
         bytes.fromhex(bc["state_root"]) +
@@ -217,6 +221,7 @@ async def verify_proposer_eligibility(
         return True, ""
     try:
         slot = int(bc["slot"])
+        height = int(bc["number"])
         proposer = bc.get("proposer_address")
     except Exception:
         return True, ""
@@ -240,16 +245,17 @@ async def verify_proposer_eligibility(
     # selection is enforced — keyed off the block's SLOT via the SAME entry point the
     # proposer uses (selection_mix_for_slot), so it is tip-independent and matches what the
     # proposer computed. Behaviour-neutral while the gate is off. See docs item 5.
-    randao_enforced = False
+    # Whether RANDAO selection applies is decided by the block's own HEIGHT (chain-spec feature
+    # randao_selection), never by this node's tip.
+    from .randao import randao_selection_active, selection_mix_for_slot
+    randao_enforced = randao_selection_active(height)
     mix = PROPOSER_RANDAO_MIX
-    try:
-        from .randao import ENFORCE_RANDAO_SELECTION, selection_mix_for_slot
-        if ENFORCE_RANDAO_SELECTION:
+    if randao_enforced:
+        try:
             mix = await selection_mix_for_slot(db, slot)
-            randao_enforced = True
-    except Exception as e:
-        logger.debug("eligibility: checkpoint mix fallback (zero): %s", e)
-        mix, randao_enforced = PROPOSER_RANDAO_MIX, False
+        except Exception as e:
+            logger.debug("eligibility: checkpoint mix fallback (zero): %s", e)
+            mix, randao_enforced = PROPOSER_RANDAO_MIX, False
 
     if randao_enforced:
         # Accept ANY of the slot's top-K eligible proposers (primary or a backup) — the

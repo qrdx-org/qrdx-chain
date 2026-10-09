@@ -39,6 +39,25 @@ from integration_tests.rpc_client import NodeRPCClient, MultiNodeClient
 logger = logging.getLogger(__name__)
 
 
+def _inherited_env() -> dict:
+    """This process's environment minus everything a chain spec governs. A node takes its
+    network's consensus parameters from the genesis file and refuses to start if its environment
+    tries to change them — so a harness knob set on this process (QRDX_SLOT_DURATION,
+    QRDX_ENFORCE_RANDAO, ...) must reach the genesis spec, never a node."""
+    from qrdx import chain_spec as cs
+    governed = {p.env for p in cs.PARAMS.values()} | set(cs.CONSENSUS_ENV_SWITCHES) | {
+        "QRDX_CHAIN_ID", "QRDX_NETWORK_NAME", "QRDX_GENESIS_FILE"}
+    return {k: v for k, v in os.environ.items() if k not in governed}
+
+
+def _genesis_hash_of(path) -> Optional[str]:
+    try:
+        with open(path) as fh:
+            return (json.load(fh).get("block") or {}).get("block_hash")
+    except (OSError, ValueError):
+        return None
+
+
 class NodeProcess:
     """Manages a single QRDX node subprocess."""
 
@@ -62,7 +81,7 @@ class NodeProcess:
         self.process = await asyncio.create_subprocess_exec(
             sys.executable, "-W", "ignore", "run_node.py",
             cwd=self.project_root,
-            env={**os.environ, **self.env},
+            env={**_inherited_env(), **self.env},
             stdout=self._log_fd,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -166,18 +185,32 @@ class TestnetOrchestrator:
 
         # Step 2: Create genesis
         logger.info("\n[2/4] Creating genesis configuration...")
+        previous_genesis = _genesis_hash_of(GENESIS_FILE)
         self.genesis_summary = create_genesis(
             self.wallets,
             genesis_path=str(GENESIS_FILE),
         )
+        # A database belongs to the genesis it was created from: a node refuses to start on
+        # one from another genesis (main._verify_chain_identity). Every setup writes a new
+        # genesis, so the old databases go with the old one.
+        new_genesis = self.genesis_summary["genesis_hash"]
+        fresh_chain = previous_genesis != new_genesis
+        if fresh_chain:
+            logger.info("  New genesis %s… — node databases start empty", new_genesis[:16])
+        if self.genesis_summary.get("forks"):
+            for f in self.genesis_summary["forks"]:
+                logger.info("  Scheduled fork %s at height %d: %s", f["name"], f["height"],
+                            ", ".join(f["features"]))
 
         # Step 3: Initialize databases
         logger.info("\n[3/4] Initializing databases...")
         for spec in self.node_specs:
             db_path = spec.db_path
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
-            if self.force_regenerate and os.path.exists(db_path):
-                os.remove(db_path)
+            if self.force_regenerate or fresh_chain:
+                for suffix in ("", "-wal", "-shm"):
+                    if os.path.exists(db_path + suffix):
+                        os.remove(db_path + suffix)
             # Create empty DB file — schema is initialized at node startup
             Path(db_path).touch()
             logger.info("  Database ready: %s", db_path)
@@ -189,14 +222,6 @@ class TestnetOrchestrator:
 
         logger.info("\nSetup complete!")
         self._print_summary()
-
-    def _stablecoin_address(self) -> str:
-        """The testnet stablecoin's token address: TOKEN_DEPLOY derives it from the issuer, its
-        nonce (0 — the deploy is its first exchange transaction) and the symbol."""
-        from qrdx.exchange.state_manager import ExchangeStateManager
-        from integration_tests.config import STABLECOIN_SYMBOL
-        issuer = self.wallets.get("Stablecoin Issuer", {}).get("address", "")
-        return ExchangeStateManager.derive_token_address(issuer, 0, STABLECOIN_SYMBOL) if issuer else ""
 
     def _create_node_config(self, spec: NodeSpec) -> dict:
         """Create environment variables for a node."""
@@ -220,47 +245,19 @@ class TestnetOrchestrator:
             "QRDX_NODE_KEY_DIR": spec.key_dir,
             "QRDX_BOOTSTRAP_NODE": f"http://127.0.0.1:{BASE_NODE_PORT}",
             "QRDX_BOOTSTRAP_NODES": bootstrap_urls,
-            "QRDX_MIN_VALIDATORS": "1",
-            "QRDX_CHAIN_ID": str(CHAIN_ID),
-            "QRDX_NETWORK_NAME": NETWORK_NAME,
-            # Prices come from the validators' votes (docs/PERPS_CLEARINGHOUSE.md §8): each
-            # validator reads the scripted feed file and attaches its signed vote to the blocks it
-            # proposes. No trusted reporter is configured.
-            "QRDX_ORACLE_REPORTERS": "",
+            # Consensus parameters (slot clock, epochs, staking delays, perps settings, the
+            # fork schedule) are NOT set here: every node takes them from the genesis file's
+            # chain spec (genesis_generator.testnet_chain_spec), and refuses to start if its
+            # environment tries to change them.
+            "QRDX_GENESIS_FILE": str(GENESIS_FILE),
+            # Validators vote prices from the scripted feed file and attach their signed votes
+            # to the blocks they propose (docs/PERPS_CLEARINGHOUSE.md §8). Node-local, not a
+            # consensus parameter.
             "QRDX_ORACLE_FEED": f"file:{ORACLE_FEED_FILE}",
-            # Perps backstop vault: the reporter doubles as the treasury seeder (its vault
-            # deposit is protocol-owned), and deposits unlock after 20 s instead of 4 days so
-            # S19 can redeem within the run. Consensus parameters: same on every node.
-            "QRDX_PERP_VAULT_SEEDERS": self.wallets.get("Oracle Reporter", {}).get("address", ""),
-            "QRDX_PERP_VAULT_LOCKUP_SECONDS": "20",
-            # Funding every minute of block time (production: hourly), so a run sees several.
-            "QRDX_PERP_FUNDING_INTERVAL_SECONDS": "60",
-            # Perps settle in the testnet stablecoin and quote in USD, as production settles in
-            # the bridged stablecoin. The token does not exist until S13 deploys it; its address
-            # is fixed in advance by the issuer's first nonce.
-            "QRDX_PERP_COLLATERAL_TOKEN": self._stablecoin_address(),
-            "QRDX_PERP_QUOTE": "USD",
             "LOG_LEVEL": "DEBUG",
             "PYTHONWARNINGS": "ignore",
             "QRDX_RPC_ENABLED": "true",
             "QRDX_DISABLE_RATE_LIMIT": "true",
-            # Faster epochs so epoch-boundary processing (finality + validator
-            # lifecycle) fires several times within a short test run. All nodes get
-            # the same value → consensus-consistent.
-            # Fast defaults for dev velocity; a RANDAO enforce experiment overrides via the parent
-            # env: QRDX_ENFORCE_RANDAO=1 QRDX_SLOT_DURATION=6 QRDX_SLOTS_PER_EPOCH=4 (the proven
-            # cleanly-convergent larger-slot config). Passed through to every node so all agree.
-            "QRDX_SLOT_DURATION": os.environ.get("QRDX_SLOT_DURATION", str(SLOT_DURATION)),
-            "QRDX_SLOTS_PER_EPOCH": os.environ.get("QRDX_SLOTS_PER_EPOCH", str(SLOTS_PER_EPOCH)),
-            "QRDX_ENFORCE_RANDAO": os.environ.get("QRDX_ENFORCE_RANDAO", ""),
-            # Short activation/unbonding so the dynamic-membership scenario (S16) can
-            # observe a deposit→active→exit→exited round-trip within a short soak.
-            # Same value on every node → deterministic scheduling preserved.
-            "QRDX_ACTIVATION_DELAY_EPOCHS": "1",
-            "QRDX_UNBONDING_PERIOD_EPOCHS": "2",
-            # Withdrawability delay after exit (production 256): long enough to cover the
-            # finality lag, short enough that a soak sees the principal come back.
-            "QRDX_WITHDRAWAL_DELAY_EPOCHS": "4",
             # Operational-readiness: exercise the realtime stream (/ws + /stream) in-suite.
             "QRDX_ENABLE_STREAMING": "true",
         }

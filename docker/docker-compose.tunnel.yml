@@ -143,7 +143,9 @@ services:
       - node-data:/app/data
     environment:
       QRDX_DATABASE_PATH: "/app/data/databases/qrdx.db"
-      QRDX_CHAIN_ID: "${QRDX_CHAIN_ID:-1}"
+      # The chain id is bound into every signed transaction, so it must be one no other EVM
+      # network uses (1 is Ethereum's). genesis-init writes it into the genesis chain spec.
+      QRDX_CHAIN_ID: "${QRDX_CHAIN_ID:?set QRDX_CHAIN_ID to this chain's id, one no other EVM network uses}"
       QRDX_NETWORK_NAME: "${QRDX_NETWORK_NAME:-qrdx-mainnet}"
       # address:amount[,address:amount...], amounts in QRDX.
       QRDX_GENESIS_ALLOCATIONS: "${QRDX_GENESIS_ALLOCATIONS:-0xPQ4Bd03Abf07B8302EA2547c881F597530638848a3d245296da543A40F8b05884C:1000000000}"
@@ -202,7 +204,8 @@ services:
       # A peer on another chain has a different block 0. Leave this alone unless
       # the peer was started from this node's genesis_config.json.
       QRDX_BOOTSTRAP_NODE: "${QRDX_BOOTSTRAP_NODE:-self}"
-      QRDX_CHAIN_ID: "${QRDX_CHAIN_ID:-1}"
+      # Must match the genesis chain spec (the node refuses to start otherwise).
+      QRDX_CHAIN_ID: "${QRDX_CHAIN_ID:?set QRDX_CHAIN_ID to this chain's id, one no other EVM network uses}"
       QRDX_NETWORK_NAME: "${QRDX_NETWORK_NAME:-qrdx-mainnet}"
       QRDX_RPC_ENABLED: "${QRDX_RPC_ENABLED:-true}"
       QRDX_ENABLE_STREAMING: "true"

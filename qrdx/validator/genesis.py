@@ -13,7 +13,6 @@ This is used to bootstrap a new network.
 
 import hashlib
 import json
-import secrets
 import time
 from dataclasses import dataclass, field, asdict
 from decimal import Decimal
@@ -22,6 +21,8 @@ from datetime import datetime, timezone
 
 from ..logger import get_logger
 from ..crypto.hashing import sha256
+from .. import chain_spec as chain_spec_mod
+from ..chain_spec import ChainSpec, ChainSpecError
 from ..constants import (
     SLOTS_PER_EPOCH,
     MIN_VALIDATOR_STAKE,
@@ -34,10 +35,23 @@ logger = get_logger(__name__)
 
 
 # Genesis constants
-GENESIS_VERSION = "1.0.0"
+GENESIS_VERSION = "2.0.0"
 GENESIS_FORK_VERSION = b"\x00\x00\x00\x01"  # Version 1
 GENESIS_VALIDATORS_ROOT_PREFIX = b"QRDX_GENESIS_VALIDATORS_V1"
-GENESIS_STATE_ROOT_PREFIX = b"QRDX_GENESIS_STATE_V1"
+# V2: the root commits to the chain spec and to every allocation (V1 left out the prefunded
+# accounts, so two genesis files funding different accounts produced the same genesis block).
+GENESIS_STATE_ROOT_PREFIX = b"QRDX_GENESIS_STATE_V2"
+GENESIS_RANDAO_PREFIX = b"QRDX_GENESIS_RANDAO_V1"
+_WEI = Decimal(10) ** 18
+
+
+def _wei(amount: Any) -> str:
+    """An allocation as an exact integer number of wei — the form the state root commits to, so
+    "1000000", "1000000.0" and "1E+6" are the same allocation."""
+    value = Decimal(str(amount)) * _WEI
+    if value != value.to_integral_value():
+        raise ValueError(f"genesis amount {amount} has more than 18 decimal places")
+    return str(int(value))
 
 # Minimum validators to start
 MIN_GENESIS_VALIDATORS = 4
@@ -69,10 +83,16 @@ class GenesisAccount:
 
 @dataclass
 class GenesisConfig:
-    """Configuration for genesis creation."""
-    # Chain identification
-    chain_id: int = 1
-    network_name: str = "qrdx-mainnet"
+    """Configuration for genesis creation.
+
+    ``chain_spec`` defines the network (chain id, name, consensus parameters, upgrade schedule)
+    and genesis commits to it. Without one, the creator uses the process's spec when
+    ``chain_id`` and ``network_name`` are left unset, and otherwise builds a DEV spec from them
+    (with the process's parameters) — tooling that creates a real network passes its spec."""
+    # Chain identification (taken from chain_spec when one is given; must agree with it)
+    chain_id: Optional[int] = None
+    network_name: Optional[str] = None
+    chain_spec: Optional[ChainSpec] = None
     
     # Timing
     genesis_time: int = 0  # Unix timestamp
@@ -128,7 +148,10 @@ class GenesisState:
     
     # Fork info
     fork_version: str = GENESIS_FORK_VERSION.hex()
-    
+
+    # The chain spec this genesis commits to (chain_spec.ChainSpec.genesis_hash)
+    chain_spec_hash: str = ""
+
     # Accounts
     accounts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     
@@ -180,6 +203,9 @@ class GenesisCreator:
     
     def __init__(self, config: GenesisConfig):
         self.config = config
+        self.spec = self._resolve_spec(config)
+        config.chain_id = self.spec.chain_id
+        config.network_name = self.spec.network
         self._validators: List[GenesisValidator] = list(config.validators)
         self._accounts: Dict[str, GenesisAccount] = {}
         self._system_wallet_manager = None
@@ -196,6 +222,25 @@ class GenesisCreator:
         if config.enable_system_wallets and config.system_wallet_controller:
             self._init_system_wallets(config.system_wallet_controller)
     
+    @staticmethod
+    def _resolve_spec(config: GenesisConfig) -> ChainSpec:
+        spec = config.chain_spec
+        if spec is not None:
+            if config.chain_id is not None and config.chain_id != spec.chain_id:
+                raise ChainSpecError(f"genesis chain_id {config.chain_id} disagrees with its "
+                                     f"chain spec ({spec.chain_id})")
+            if config.network_name is not None and config.network_name != spec.network:
+                raise ChainSpecError(f"genesis network {config.network_name!r} disagrees with "
+                                     f"its chain spec ({spec.network!r})")
+            return spec
+        process = chain_spec_mod.active()
+        if config.chain_id is None and config.network_name is None:
+            return process
+        return chain_spec_mod.build_spec(
+            config.network_name or process.network,
+            config.chain_id if config.chain_id is not None else process.chain_id,
+            process.params, dev=True)
+
     def _init_system_wallets(self, controller_address: str):
         """Initialize system wallets with controller."""
         from ..crypto.system_wallets import initialize_system_wallets
@@ -327,33 +372,42 @@ class GenesisCreator:
         ).digest()
     
     def _compute_state_root(self, state: GenesisState) -> bytes:
-        """Compute state root from genesis state."""
-        # Serialize relevant state
+        """The genesis state root: a commitment to everything a genesis node initialises — the
+        network's chain spec, every allocation (prefunded accounts, validator stakes, system
+        wallets and their controller), the validator set and the genesis time. The genesis block
+        hash covers this root, so nodes that disagree on any of it cannot share a genesis block.
+        Labels are display-only and excluded."""
         state_data = {
+            "version": state.version,
+            "chain_spec_hash": state.chain_spec_hash,
             "chain_id": state.chain_id,
+            "network_name": state.network_name,
             "genesis_time": state.genesis_time,
             "validators_root": state.genesis_validators_root,
-            "balances": state.balances,
-            "total_supply": state.total_supply,
+            "validators": [
+                {"address": v["address"], "public_key": v["public_key"],
+                 "stake_wei": _wei(v["stake"]), "withdrawal_address": v["withdrawal_address"]}
+                for v in sorted(state.validators, key=lambda v: v["address"])],
+            "balances_wei": {a: _wei(b) for a, b in state.balances.items()},
+            "accounts_wei": {a: _wei(info["balance"]) for a, info in state.accounts.items()},
+            "system_wallets": {
+                a: {"balance_wei": _wei(w["balance"]), "type": w.get("type"),
+                    "is_burner": bool(w.get("is_burner")), "category": w.get("category")}
+                for a, w in state.system_wallets.items()},
+            "system_wallet_controller": state.system_wallet_controller,
+            "total_supply_wei": _wei(state.total_supply),
         }
-        
-        state_json = json.dumps(state_data, sort_keys=True)
-        
+        state_json = json.dumps(state_data, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(GENESIS_STATE_ROOT_PREFIX + state_json.encode()).digest()
+
+    def _generate_randao_seed(self, validators_root: bytes, genesis_time: int) -> bytes:
+        """The initial RANDAO mix. Derived, not random: every node that loads the same genesis
+        file must arrive at the same seed (a per-node random seed would make any consumer of it
+        diverge). Unpredictability comes later, from the proposers' RANDAO reveals."""
         return hashlib.sha256(
-            GENESIS_STATE_ROOT_PREFIX + state_json.encode()
+            GENESIS_RANDAO_PREFIX + bytes.fromhex(self.spec.genesis_hash()) + validators_root
+            + int(genesis_time).to_bytes(8, "little")
         ).digest()
-    
-    def _generate_randao_seed(self) -> bytes:
-        """Generate initial RANDAO seed."""
-        # Combine various entropy sources
-        entropy = (
-            secrets.token_bytes(32) +
-            str(self.config.genesis_time).encode() +
-            self.config.network_name.encode() +
-            str(len(self._validators)).encode()
-        )
-        
-        return hashlib.sha256(entropy).digest()
     
     def create_genesis(
         self,
@@ -377,7 +431,7 @@ class GenesisCreator:
         
         # Set genesis time
         if genesis_time is None:
-            genesis_time = int(time.time())
+            genesis_time = self.config.genesis_time or int(time.time())
         
         logger.info(f"Creating genesis for {self.config.network_name}")
         logger.info(f"Genesis time: {datetime.fromtimestamp(genesis_time, tz=timezone.utc)}")
@@ -385,14 +439,14 @@ class GenesisCreator:
         
         # Calculate totals
         total_staked = sum(v.stake for v in self._validators)
-        total_pre_allocated = sum(a.balance for a in self._accounts.values())
-        
+
         # Create state
         state = GenesisState(
-            chain_id=self.config.chain_id,
-            network_name=self.config.network_name,
+            chain_id=self.spec.chain_id,
+            network_name=self.spec.network,
             genesis_time=genesis_time,
             genesis_slot=self.config.genesis_slot,
+            chain_spec_hash=self.spec.genesis_hash(),
         )
         
         # Add validators
@@ -438,8 +492,8 @@ class GenesisCreator:
         validators_root = self._compute_validators_root(self._validators)
         state.genesis_validators_root = validators_root.hex()
         
-        # Generate RANDAO
-        randao_seed = self._generate_randao_seed()
+        # Initial RANDAO mix (derived — identical on every node)
+        randao_seed = self._generate_randao_seed(validators_root, genesis_time)
         state.randao_seed = randao_seed.hex()
         
         # Set totals
@@ -493,51 +547,62 @@ class GenesisCreator:
             block: Genesis block
             filepath: Output file path
         """
+        params = self.spec.params
         genesis_data = {
+            # The network's consensus definition. The genesis state root commits to it (minus
+            # its upgrade schedule), so a node refuses to start on this genesis under any other.
+            "chain_spec": self.spec.to_dict(),
             "state": asdict(state),
             "block": asdict(block),
+            # Informational summary of the chain spec (nodes read the chain_spec section).
             "config": {
-                "chain_id": self.config.chain_id,
-                "network_name": self.config.network_name,
-                "slots_per_epoch": self.config.slots_per_epoch,
-                "seconds_per_slot": self.config.seconds_per_slot,
+                "chain_id": self.spec.chain_id,
+                "network_name": self.spec.network,
+                "slots_per_epoch": params["SLOTS_PER_EPOCH"],
+                "seconds_per_slot": params["SLOT_DURATION"],
                 "min_validator_stake": str(self.config.min_validator_stake),
                 "max_validators": self.config.max_validators,
             },
         }
-        
+
         with open(filepath, 'w') as f:
             json.dump(genesis_data, f, indent=2)
-        
+
         logger.info(f"Genesis exported to {filepath}")
 
 
 def create_testnet_genesis(
     validators: List[Tuple[str, str, Decimal]],  # (address, pubkey, stake)
     genesis_time: Optional[int] = None,
+    chain_spec: Optional[ChainSpec] = None,
 ) -> Tuple[GenesisState, GenesisBlock]:
     """
     Create a testnet genesis with the given validators.
-    
+
     Args:
         validators: List of (address, public_key, stake) tuples
         genesis_time: Optional genesis timestamp
-        
+        chain_spec: The testnet's chain spec (default: qrdx-testnet, chain id 7620, with this
+            process's parameters)
+
     Returns:
         Tuple of (GenesisState, GenesisBlock)
     """
+    if chain_spec is None:
+        chain_spec = chain_spec_mod.build_spec(
+            chain_spec_mod.TESTNET_NETWORK_NAME, chain_spec_mod.TESTNET_CHAIN_ID,
+            chain_spec_mod.active().params)
     config = GenesisConfig(
-        chain_id=9999,
-        network_name="qrdx-testnet",
+        chain_spec=chain_spec,
         min_genesis_validators=1,  # Lower for testnet
         initial_supply=Decimal("1000000000"),  # 1B for testnet
     )
-    
+
     creator = GenesisCreator(config)
-    
+
     for address, pubkey, stake in validators:
         creator.add_validator(address, pubkey, stake)
-    
+
     return creator.create_genesis(genesis_time)
 
 
@@ -545,33 +610,44 @@ def create_mainnet_genesis(
     validators: List[Tuple[str, str, Decimal]],
     pre_allocations: Dict[str, Decimal],
     genesis_time: int,
+    chain_spec: ChainSpec,
 ) -> Tuple[GenesisState, GenesisBlock]:
     """
     Create mainnet genesis.
-    
+
     Args:
         validators: List of (address, public_key, stake) tuples
         pre_allocations: Pre-funded accounts
         genesis_time: Genesis timestamp (must be in future)
-        
+        chain_spec: Mainnet's chain spec — required: mainnet's chain id and parameters are a
+            launch decision, never a default (a non-dev spec cannot use another EVM network's
+            chain id)
+
     Returns:
         Tuple of (GenesisState, GenesisBlock)
     """
     if genesis_time < int(time.time()):
         raise ValueError("Genesis time must be in the future")
-    
+    if not isinstance(chain_spec, ChainSpec) or chain_spec.dev:
+        raise ChainSpecError("mainnet genesis needs a non-dev chain spec")
+    if (chain_spec.chain_id, chain_spec.network) != (chain_spec_mod.MAINNET_CHAIN_ID,
+                                                     chain_spec_mod.MAINNET_NETWORK_NAME):
+        raise ChainSpecError(
+            f"mainnet genesis needs chain id {chain_spec_mod.MAINNET_CHAIN_ID} and network "
+            f"{chain_spec_mod.MAINNET_NETWORK_NAME!r}; got {chain_spec.chain_id} / "
+            f"{chain_spec.network!r}")
+
     config = GenesisConfig(
-        chain_id=1,
-        network_name="qrdx-mainnet",
+        chain_spec=chain_spec,
         genesis_time=genesis_time,
         min_genesis_validators=MIN_GENESIS_VALIDATORS,
         initial_supply=Decimal("100000000"),  # 100M QRDX
         pre_allocations=pre_allocations,
     )
-    
+
     creator = GenesisCreator(config)
-    
+
     for address, pubkey, stake in validators:
         creator.add_validator(address, pubkey, stake)
-    
+
     return creator.create_genesis(genesis_time)

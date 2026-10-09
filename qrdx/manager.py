@@ -648,18 +648,9 @@ async def validate_pos_block(block_data: dict, validators: list, randao_mix: byt
     block.timestamp = block_data.get('timestamp', 0)
     block.exchange_state_root = block_data.get('exchange_state_root', '0' * 64)
     
-    # Compute signing root
-    signing_data = (
-        block_data['number'].to_bytes(8, 'little') +
-        bytes.fromhex(block_data['parent_hash']) +
-        bytes.fromhex(block_data['state_root']) +
-        bytes.fromhex(block_data['transactions_root']) +
-        block_data['timestamp'].to_bytes(8, 'little') +
-        block_data['slot'].to_bytes(8, 'little') +
-        block_data['epoch'].to_bytes(8, 'little') +
-        bytes.fromhex(block_data.get('randao_reveal', ''))
-    )
-    block.signing_root = hashlib.sha256(signing_data).digest()
+    # Signing root: the one definition (network-bound) the proposer and importers use.
+    from .validator.block_verification import reconstruct_signing_root
+    block.signing_root = reconstruct_signing_root(block_data)
     
     return await consensus_validate(block, validators, randao_mix)
 

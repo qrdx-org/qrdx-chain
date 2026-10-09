@@ -72,6 +72,8 @@ class P2PModule(RPCModule):
         self._enforce_equal_height_tiebreak = False  # mechanism-2 enforce gate (observe-first)
         self._enforce_proposer_eligibility = False  # slot-eligibility gate (observe-first)
         self._add_remote_attestation = None    # attestation-gossip receive hook (main._add_remote_attestation)
+        self._network_identity = None          # async () -> this node's network identity (main)
+        self._check_peer_identity = None       # async (remote) -> (ok, reason) (main)
 
     # ---- wiring (called once at startup from main.py) --------------------
 
@@ -97,6 +99,8 @@ class P2PModule(RPCModule):
         enforce_equal_height_tiebreak=False,
         enforce_proposer_eligibility=False,
         add_remote_attestation=None,
+        network_identity=None,
+        check_peer_identity=None,
     ):
         self._db = db
         self._security = security
@@ -117,6 +121,8 @@ class P2PModule(RPCModule):
         self._enforce_equal_height_tiebreak = enforce_equal_height_tiebreak
         self._enforce_proposer_eligibility = enforce_proposer_eligibility
         self._add_remote_attestation = add_remote_attestation
+        self._network_identity = network_identity
+        self._check_peer_identity = check_peer_identity
 
     def _require_db(self):
         if self._db is None:
@@ -580,6 +586,10 @@ class P2PModule(RPCModule):
             'last_block_hash': None,
             'node_id': self._self_node_id,
         }
+        if self._network_identity is not None:
+            # Network, genesis and fork id (docs/PROTOCOL_UPGRADES.md): what a peer checks
+            # before following this node, and how an operator sees who is ready for a fork.
+            response['network'] = await self._network_identity()
 
         if height >= 0:
             last_block = await self._db.get_block_by_id(height)
@@ -790,20 +800,23 @@ class P2PModule(RPCModule):
         challenge = await self._security.handshake_manager.create_challenge()
         height = await self._db.get_next_block_id() - 1
 
-        return {
-            'ok': True,
-            'result': {
-                'challenge': challenge,
-                'node_id': self._self_node_id,
-                'pubkey': get_public_key_hex(),
-                'is_public': self._nodes_manager.self_is_public if self._nodes_manager else False,
-                'url': DENARO_SELF_URL or None,
-                'height': height,
-            },
+        result = {
+            'challenge': challenge,
+            'node_id': self._self_node_id,
+            'pubkey': get_public_key_hex(),
+            'is_public': self._nodes_manager.self_is_public if self._nodes_manager else False,
+            'url': DENARO_SELF_URL or None,
+            'height': height,
         }
+        if self._network_identity is not None:
+            # The caller checks this BEFORE it adds us as a peer (main.do_handshake_with_peer).
+            result['network'] = await self._network_identity()
+        return {'ok': True, 'result': result}
 
     @rpc_method
-    async def handshakeResponse(self, challenge: str, peer_height: int = -1, peer_hash: Optional[str] = None) -> Dict:
+    async def handshakeResponse(self, challenge: str, peer_height: int = -1,
+                                peer_hash: Optional[str] = None,
+                                network: Optional[Dict] = None) -> Dict:
         """
         Verify a handshake response and negotiate sync direction.
 
@@ -811,6 +824,9 @@ class P2PModule(RPCModule):
             challenge:   The challenge string from ``handshakeChallenge``.
             peer_height: The caller's chain height.
             peer_hash:   The caller's tip block hash (optional).
+            network:     The caller's network identity (chain_spec.network_identity). A caller
+                         on another network, or with an incompatible fork history, is refused
+                         before any sync is negotiated.
         """
         self._require_db()
 
@@ -819,6 +835,11 @@ class P2PModule(RPCModule):
 
         if not await self._security.handshake_manager.verify_and_consume_challenge(challenge):
             return {'ok': False, 'error': 'Invalid or expired challenge'}
+
+        if self._check_peer_identity is not None:
+            ok, reason = await self._check_peer_identity(network)
+            if not ok:
+                return {'ok': False, 'error': 'network_mismatch', 'detail': reason}
 
         local_height = await self._db.get_next_block_id() - 1
 

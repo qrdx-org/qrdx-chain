@@ -15,9 +15,9 @@ node's consensus ``validators`` table tracks the same transitions:
              (keeps validating through unbonding — no proposer-selection flip)
   remove   → at the finalized exit_epoch every node drops it to 'exited' together
 
-Activation/unbonding delays are shortened via QRDX_ACTIVATION_DELAY_EPOCHS /
-QRDX_UNBONDING_PERIOD_EPOCHS (set by the orchestrator, identical on every node) so
-the full round-trip would be observable in a short soak.
+Activation/unbonding delays are shortened in the testnet's chain spec
+(ACTIVATION_DELAY_EPOCHS / UNBONDING_PERIOD_EPOCHS — genesis_generator.testnet_chain_spec,
+identical on every node by construction) so the full round-trip is observable in a short soak.
 
 HARD-asserted: the JOIN pipeline end-to-end (admit → include → flush → register as
 PENDING on the submission node, with a deterministic non-NULL activation_epoch),
@@ -37,6 +37,7 @@ from decimal import Decimal
 
 from integration_tests.scenarios.base import Scenario
 from integration_tests.rpc_client import NodeRPCClient
+from integration_tests.config import CHAIN_ID  # exchange txs are signed for the testnet's chain
 
 
 class S16ValidatorMembership(Scenario):
@@ -103,7 +104,7 @@ class S16ValidatorMembership(Scenario):
                    "New account is not a validator at baseline")
 
         def _signed(op_type, params, nonce):
-            tx = ExchangeTransaction(op_type=op_type, sender=new_val, nonce=nonce,
+            tx = ExchangeTransaction(chain_id=CHAIN_ID, op_type=op_type, sender=new_val, nonce=nonce,
                                      params=params, gas_limit=1_000_000, gas_price=10**9)
             tx.public_key = key.public_key.to_bytes()
             tx.signature = key.sign(tx.signing_bytes()).to_bytes()

@@ -426,6 +426,22 @@ class QRDXModule(RPCModule):
             "reward": str(reward),
         }
     
+    @rpc_method
+    async def chainSpec(self) -> Dict[str, Any]:
+        """The network this node follows and its upgrade schedule: chain id, parameters, active
+        rules, scheduled forks (with blocks until activation), fork id and node version
+        (docs/PROTOCOL_UPGRADES.md)."""
+        from ... import chain_spec
+        from ...constants import CHAIN_SPEC, NODE_VERSION
+        if not self.context or not self.context.db:
+            raise RPCError(RPCErrorCode.RESOURCE_UNAVAILABLE, "Node not ready")
+        genesis = await self.context.db.get_block_by_id(0)
+        if not genesis:
+            raise RPCError(RPCErrorCode.RESOURCE_UNAVAILABLE, "no genesis block")
+        tip = max(0, (await self.context.db.get_next_block_id()) - 1)
+        return chain_spec.report(CHAIN_SPEC, genesis.get("hash") or genesis.get("block_hash"),
+                                 tip, NODE_VERSION)
+
     # Helper methods
     
     def _calculate_reward(self, block_height: int) -> Decimal:

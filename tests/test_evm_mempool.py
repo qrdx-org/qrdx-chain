@@ -12,9 +12,10 @@ import pytest
 from eth_account import Account
 
 from qrdx.contracts.evm_mempool import EVMMempool, parse_eth_raw_tx
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 
-def _raw_tx(key_hex, nonce, to=None, value=0, chain_id=1, gas_price=10 ** 9, gas=21000):
+def _raw_tx(key_hex, nonce, to=None, value=0, chain_id=CHAIN_ID, gas_price=10 ** 9, gas=21000):
     acct = Account.from_key(key_hex)
     tx = {
         "nonce": nonce, "gasPrice": gas_price, "gas": gas,

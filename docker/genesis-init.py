@@ -18,15 +18,21 @@ fixed for the life of the chain — changing QRDX_GENESIS_ALLOCATIONS afterwards
 only logs a warning; a different genesis needs a wiped data volume.
 
 The file is written atomically. A half-written file would fail to parse, and the
-node then falls back to its built-in default genesis — which funds none of the
-configured allocations.
+node would refuse to start on it.
+
+The genesis file carries the chain's spec (docs/PROTOCOL_UPGRADES.md): its chain id,
+name and every network parameter, taken from this script's environment. Every node of
+the chain reads them from the file; a node whose environment disagrees refuses to start.
 
 Environment
   QRDX_DATABASE_PATH            Node database path      [/app/data/databases/qrdx.db]
   QRDX_GENESIS_ALLOCATIONS      address:amount[,address:amount...] in QRDX (required)
   QRDX_GENESIS_VALIDATOR_STAKE  Genesis stake of this node's validator   [100000]
-  QRDX_CHAIN_ID                 [1]
+  QRDX_CHAIN_ID                 required — 762 for qrdx-mainnet, 7620 for qrdx-testnet,
+                                otherwise an id no other EVM network uses (every signed
+                                transaction is bound to it)
   QRDX_NETWORK_NAME             [qrdx-mainnet]
+  QRDX_SLOT_DURATION, ...       any network parameter (qrdx/chain_spec.py PARAMS)
   QRDX_VALIDATOR_ENABLED        must be true — a genesis node has to propose
   QRDX_VALIDATOR_WALLET         [/app/data/validator/validator.json]
 """
@@ -54,7 +60,7 @@ GENESIS_FILE = DATABASE_PATH.parent.parent / "genesis_config.json"
 
 ALLOCATIONS_RAW = os.getenv("QRDX_GENESIS_ALLOCATIONS", "")
 VALIDATOR_STAKE_RAW = os.getenv("QRDX_GENESIS_VALIDATOR_STAKE", "100000")
-CHAIN_ID = int(os.getenv("QRDX_CHAIN_ID", "1"))
+CHAIN_ID_RAW = os.getenv("QRDX_CHAIN_ID", "").strip()
 NETWORK_NAME = os.getenv("QRDX_NETWORK_NAME", "qrdx-mainnet")
 VALIDATOR_ENABLED = os.getenv("QRDX_VALIDATOR_ENABLED", "false").lower() in TRUTHY
 WALLET_PATH = Path(os.getenv("QRDX_VALIDATOR_WALLET") or "/app/data/validator/validator.json")
@@ -152,16 +158,26 @@ def main() -> int:
         log.error("cannot read the validator wallet at %s: %s", WALLET_PATH, e)
         return 1
 
+    from qrdx import chain_spec as cs
     from qrdx.constants import MIN_VALIDATOR_STAKE
     from qrdx.validator.genesis import GenesisConfig, GenesisCreator
+
+    if not CHAIN_ID_RAW.isdigit():
+        log.error("QRDX_CHAIN_ID must be set to this chain's id (a positive integer no other EVM "
+                  "network uses — every signed transaction is bound to it); got %r", CHAIN_ID_RAW)
+        return 1
+    try:
+        spec = cs.build_spec(NETWORK_NAME, int(CHAIN_ID_RAW), cs.params_from_environment())
+    except cs.ChainSpecError as e:
+        log.error("invalid chain spec: %s", e)
+        return 1
 
     if validator_stake < MIN_VALIDATOR_STAKE:
         log.error("QRDX_GENESIS_VALIDATOR_STAKE %s is below the minimum %s", validator_stake, MIN_VALIDATOR_STAKE)
         return 1
 
     config = GenesisConfig(
-        chain_id=CHAIN_ID,
-        network_name=NETWORK_NAME,
+        chain_spec=spec,
         min_genesis_validators=1,
         pre_allocations=dict(allocations),
         enable_system_wallets=False,
@@ -179,7 +195,8 @@ def main() -> int:
     os.replace(tmp, GENESIS_FILE)
 
     log.info("wrote %s", GENESIS_FILE)
-    log.info("chain        : %s (chain_id=%d)", NETWORK_NAME, CHAIN_ID)
+    log.info("chain        : %s (chain_id=%d, spec %s)", spec.network, spec.chain_id,
+             spec.genesis_hash()[:16])
     log.info("genesis hash : %s", block.block_hash)
     for address, amount in allocations.items():
         log.info("allocation   : %s = %s QRDX", address, amount)

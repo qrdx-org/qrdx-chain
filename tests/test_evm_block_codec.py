@@ -17,13 +17,14 @@ from qrdx.contracts.evm_block import (
     extract_evm_transactions_from_dict, BLOCK_EVM_TXS_KEY,
 )
 from qrdx.contracts.evm_mempool import parse_eth_raw_tx
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 
 def _raw(i, nonce=0):
     key = "0x" + f"{i:064x}"
     acct = Account.from_key(key)
     tx = {"nonce": nonce, "gasPrice": 10 ** 9, "gas": 21000,
-          "to": acct.address, "value": 1, "data": b"", "chainId": 1}
+          "to": acct.address, "value": 1, "data": b"", "chainId": CHAIN_ID}
     signed = Account.sign_transaction(tx, key)
     raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
     return "0x" + bytes(raw).hex()

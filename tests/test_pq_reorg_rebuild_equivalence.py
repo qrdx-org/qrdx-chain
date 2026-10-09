@@ -35,6 +35,7 @@ from qrdx.crypto.account_id import to_account_id
 from qrdx.crypto.pq.dilithium import generate_keypair
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.transactions.pq_tx import PQTransaction
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 WEI = 10 ** 18
 RECIPIENT = bytes.fromhex("cd" * 20)
@@ -46,14 +47,14 @@ def _legacy_raw(i, nonce=0, value=1):
     acct = EthAccount.from_key(key)
     signed = EthAccount.sign_transaction(
         {"nonce": nonce, "gasPrice": 10 ** 9, "gas": 21000, "to": acct.address,
-         "value": value, "data": b"", "chainId": 1}, key)
+         "value": value, "data": b"", "chainId": CHAIN_ID}, key)
     raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
     return "0x" + bytes(raw).hex(), to_account_id(acct.address)
 
 
 def _pq_raw(priv, nonce=0, value=1):
     """A validly-signed type-0x51 PQ tx."""
-    tx = PQTransaction(chain_id=1, nonce=nonce, gas_price=10 ** 9, gas_limit=500_000,
+    tx = PQTransaction(chain_id=CHAIN_ID, nonce=nonce, gas_price=10 ** 9, gas_limit=500_000,
                        to=RECIPIENT, value=value, data=b"").sign(priv)
     return "0x" + tx.encode().hex()
 

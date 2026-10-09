@@ -1,0 +1,7 @@
+# Test-only dependencies: what scripts/release/test-image.sh adds to a throwaway container of a
+# release image, to run the unit suite against exactly what ships. Compiled into
+# test-requirements.lock against requirements.lock as a constraint, so a test tool can never
+# pull a shipped package to a different version than the image has.
+pytest==9.0.2
+pytest-asyncio==1.3.0
+pytest-timeout==2.4.0

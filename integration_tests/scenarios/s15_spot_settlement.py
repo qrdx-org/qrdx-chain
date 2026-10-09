@@ -21,6 +21,7 @@ from decimal import Decimal
 
 from integration_tests.scenarios.base import Scenario
 from integration_tests.rpc_client import NodeRPCClient
+from integration_tests.config import CHAIN_ID  # exchange txs are signed for the testnet's chain
 
 
 class S15SpotSettlement(Scenario):
@@ -122,7 +123,7 @@ class S15SpotSettlement(Scenario):
             return tx.to_hex()
 
         def _tx(op, nonce, params):
-            return ExchangeTransaction(op_type=op, sender=sender, nonce=nonce,
+            return ExchangeTransaction(chain_id=CHAIN_ID, op_type=op, sender=sender, nonce=nonce,
                                        params=params, gas_limit=2_000_000, gas_price=10**9)
 
         base = await self._token_roots(node_urls)
@@ -261,7 +262,7 @@ class S15SpotSettlement(Scenario):
         if w and w.get("private_key"):
             key = PQPrivateKey.from_hex(w["private_key"], w["public_key"])
             nonce = await self._get(target, "/get_exchange_nonce", address=w["address"])
-            tx = ExchangeTransaction(op_type=ExchangeOpType.REMOVE_LIQUIDITY,
+            tx = ExchangeTransaction(chain_id=CHAIN_ID, op_type=ExchangeOpType.REMOVE_LIQUIDITY,
                                      sender=w["address"], nonce=int((nonce or {}).get("nonce", 0)),
                                      params={"pool_id": pool_id, "position_id": position_id},
                                      gas_limit=2_000_000, gas_price=10**9)

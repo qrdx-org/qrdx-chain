@@ -697,10 +697,12 @@ class TestExecutorUsesQRDXVM:
         assert mod.logger is not None
 
     def test_executor_chain_id(self):
-        """Chain ID must be 88888 (QRDX)."""
+        """The EVM's CHAINID is the network's chain id from its chain spec, never a literal."""
         import qrdx.contracts.evm_executor_v2 as mod
+        from qrdx.constants import CHAIN_ID
         source = open(mod.__file__).read()
-        assert '88888' in source
+        assert '88888' not in source
+        assert mod.CHAIN_ID == CHAIN_ID
 
     def test_executor_instantiation(self):
         """Can instantiate QRDXEVMExecutor with a mock state manager."""

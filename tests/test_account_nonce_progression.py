@@ -23,6 +23,7 @@ from qrdx.contracts.state import ContractStateManager
 from qrdx.crypto.account_id import to_account_id
 from qrdx.crypto.pq.dilithium import generate_keypair
 from qrdx.transactions.pq_tx import PQTransaction
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 WEI = 10 ** 18
 ALICE = "0x" + "11" * 20
@@ -99,7 +100,7 @@ def _legacy_raw(key_hex, nonce):
     acct = EthAccount.from_key(key_hex)
     signed = EthAccount.sign_transaction(
         {"nonce": nonce, "gasPrice": 10 ** 9, "gas": 21000, "to": acct.address,
-         "value": 1, "data": b"", "chainId": 1}, key_hex)
+         "value": 1, "data": b"", "chainId": CHAIN_ID}, key_hex)
     raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
     return "0x" + bytes(raw).hex(), to_account_id(acct.address)
 
@@ -134,13 +135,13 @@ def test_pending_nonce_counts_pq_and_legacy_in_one_space():
     mp = EVMMempool()
     sender = pub.to_account_id()
 
-    tx0 = PQTransaction(chain_id=1, nonce=0, gas_price=10 ** 9, gas_limit=500_000,
+    tx0 = PQTransaction(chain_id=CHAIN_ID, nonce=0, gas_price=10 ** 9, gas_limit=500_000,
                         to=bytes.fromhex(to_account_id(BOB)[2:]), value=1,
                         data=b"").sign(priv)
     assert mp.admit("0x" + tx0.encode().hex())[0]
     assert mp.next_nonce(sender, 0) == 1
 
-    tx1 = PQTransaction(chain_id=1, nonce=1, gas_price=10 ** 9, gas_limit=500_000,
+    tx1 = PQTransaction(chain_id=CHAIN_ID, nonce=1, gas_price=10 ** 9, gas_limit=500_000,
                         to=bytes.fromhex(to_account_id(BOB)[2:]), value=1,
                         data=b"").sign(priv)
     assert mp.admit("0x" + tx1.encode().hex())[0]

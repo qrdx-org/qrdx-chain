@@ -66,14 +66,27 @@ def _signer(wallet_file: str):
 
 
 def build_tx(signer, op_name: str, params: Dict[str, Any], nonce: int,
-             gas_price: Optional[int] = None):
+             gas_price: Optional[int] = None, chain_id: Optional[int] = None):
     from qrdx.exchange import ExchangeOpType, ExchangeTransaction
     price = {} if gas_price is None else {"gas_price": int(gas_price)}   # wei per gas
+    chain = {} if chain_id is None else {"chain_id": int(chain_id)}
     tx = ExchangeTransaction(op_type=ExchangeOpType[op_name], sender=signer.address, nonce=nonce,
-                             params=params, gas_limit=1_000_000, **price)
+                             params=params, gas_limit=1_000_000, **price, **chain)
     tx.public_key = signer.public_key
     tx.signature = signer.sign(tx.signing_bytes())
     return tx
+
+
+def _chain_id(node: str) -> int:
+    """The chain id of the network ``node`` follows. Every exchange transaction is signed for
+    one network; signing with this process's own default would produce a transaction that
+    network refuses (or, worse, one valid on a different network)."""
+    status = rpc(node, "p2p_getStatus") or {}
+    try:
+        return int(status["network"]["chain_id"])
+    except (KeyError, TypeError, ValueError):
+        raise click.ClickException(f"{node} did not report its network's chain id "
+                                   f"(p2p_getStatus); refusing to guess which chain to sign for")
 
 
 def _gas_price(node: str) -> Optional[int]:
@@ -97,7 +110,8 @@ def _send(node: str, wallet_file: str, op_name: str, params: Any, summary: str,
         click.echo("Cancelled.")
         return None
     nonce = int(rpc(node, "exchange_getNonce", [signer.address]))
-    tx = build_tx(signer, op_name, params, nonce, gas_price=_gas_price(node))
+    tx = build_tx(signer, op_name, params, nonce, gas_price=_gas_price(node),
+                  chain_id=_chain_id(node))
     tx_hash = rpc(node, "exchange_sendTransaction", [tx.to_dict()])
     click.echo(click.style("✓ Submitted", fg="green") + f"  tx {tx_hash}  (nonce {nonce})")
     if not wait:
