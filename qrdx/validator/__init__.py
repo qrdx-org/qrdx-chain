@@ -19,184 +19,174 @@ Components:
 
 Usage:
     from qrdx.validator import ValidatorManager, ValidatorConfig
-    
+
     config = ValidatorConfig.from_file("config.toml")
     manager = await ValidatorManager.create(config)
     await manager.start()
 """
 
-from .config import (
-    ValidatorConfig,
-    StakingConfig,
-    SlashingProtectionConfig,
-)
-from .manager import ValidatorManager
-from .stake import StakeManager, StakeDeposit, StakeWithdrawal
-from .selection import ValidatorSelector
 from .attestation import Attestation, AttestationPool
-from .slashing import (
-    SlashingConditions,
-    SlashingEvidence,
-    SlashingExecutor,
-    SLASHING_PENALTIES,
-)
-from .types import (
-    Validator,
-    ValidatorStatus,
-    ValidatorSet,
-    EpochInfo,
-    SlotInfo,
-    ValidatorError,
-    InsufficientStakeError,
-    InvalidValidatorError,
-    NotPQWalletError,
-    ValidatorNotActiveError,
-    AlreadyProposedError,
-    AlreadyAttestedError,
-)
-from .fork_choice import (
-    ForkChoice,
-    ForkChoiceStore,
-    BlockNode,
-    Checkpoint,
+from .config import (
+    SlashingProtectionConfig,
+    StakingConfig,
+    ValidatorConfig,
 )
 from .epoch_processing import (
-    EpochProcessor,
     EpochProcessingResult,
+    EpochProcessor,
     ValidatorRecord,
     ValidatorShuffling,
 )
-from .rewards import (
-    RewardsCalculator,
-    RewardSummary,
-    EpochRewardReport,
-    InflationSchedule,
+from .fork_choice import (
+    BlockNode,
+    Checkpoint,
+    ForkChoice,
+    ForkChoiceStore,
 )
 from .genesis import (
-    GenesisCreator,
-    GenesisConfig,
-    GenesisState,
     GenesisBlock,
+    GenesisConfig,
+    GenesisCreator,
+    GenesisState,
     GenesisValidator,
-    create_testnet_genesis,
     create_mainnet_genesis,
+    create_testnet_genesis,
 )
-from .sync_committee import (
-    SyncCommittee,
-    SyncCommitteeManager,
-    SyncAggregate,
-    LightClientUpdate,
+from .gossip import (
+    AttestationMessage,
+    BeaconBlockMessage,
+    BeaconGossip,
+    GossipHandler,
+    GossipMessage,
+    GossipTopic,
+    MessageValidation,
+    MessageValidator,
+    SlashingMessage,
+    VoluntaryExitMessage,
 )
 from .lifecycle import (
+    DepositRequest,
+    ExitRequest,
     LifecycleManager,
-    ValidatorLifecycle,
     LifecycleState,
     ValidatorActivationQueue,
     ValidatorExitQueue,
-    DepositRequest,
-    ExitRequest,
+    ValidatorLifecycle,
     WithdrawalRequest,
 )
-from .gossip import (
-    GossipHandler,
-    GossipTopic,
-    GossipMessage,
-    BeaconGossip,
-    BeaconBlockMessage,
-    AttestationMessage,
-    VoluntaryExitMessage,
-    SlashingMessage,
-    MessageValidator,
-    MessageValidation,
+from .manager import ValidatorManager
+from .rewards import (
+    EpochRewardReport,
+    InflationSchedule,
+    RewardsCalculator,
+    RewardSummary,
+)
+from .selection import ValidatorSelector
+from .slashing import (
+    SLASHING_PENALTIES,
+    SlashingConditions,
+    SlashingEvidence,
+    SlashingExecutor,
+)
+from .stake import StakeDeposit, StakeManager, StakeWithdrawal
+from .sync_committee import (
+    LightClientUpdate,
+    SyncAggregate,
+    SyncCommittee,
+    SyncCommitteeManager,
+)
+from .types import (
+    AlreadyAttestedError,
+    AlreadyProposedError,
+    EpochInfo,
+    InsufficientStakeError,
+    InvalidValidatorError,
+    NotPQWalletError,
+    SlotInfo,
+    Validator,
+    ValidatorError,
+    ValidatorNotActiveError,
+    ValidatorSet,
+    ValidatorStatus,
 )
 
 __all__ = [
     # Configuration
-    'ValidatorConfig',
-    'StakingConfig',
-    'SlashingProtectionConfig',
-    
+    "ValidatorConfig",
+    "StakingConfig",
+    "SlashingProtectionConfig",
     # Core Components
-    'ValidatorManager',
-    'StakeManager',
-    'ValidatorSelector',
-    'AttestationPool',
-    'SlashingExecutor',
-    
+    "ValidatorManager",
+    "StakeManager",
+    "ValidatorSelector",
+    "AttestationPool",
+    "SlashingExecutor",
     # Types & Data Classes
-    'Validator',
-    'ValidatorStatus',
-    'ValidatorSet',
-    'EpochInfo',
-    'SlotInfo',
-    'StakeDeposit',
-    'StakeWithdrawal',
-    'Attestation',
-    'SlashingConditions',
-    'SlashingEvidence',
-    'SLASHING_PENALTIES',
-    
+    "Validator",
+    "ValidatorStatus",
+    "ValidatorSet",
+    "EpochInfo",
+    "SlotInfo",
+    "StakeDeposit",
+    "StakeWithdrawal",
+    "Attestation",
+    "SlashingConditions",
+    "SlashingEvidence",
+    "SLASHING_PENALTIES",
     # Fork Choice & Finality
-    'ForkChoice',
-    'ForkChoiceStore',
-    'BlockNode',
-    'Checkpoint',
-    
+    "ForkChoice",
+    "ForkChoiceStore",
+    "BlockNode",
+    "Checkpoint",
     # Epoch Processing
-    'EpochProcessor',
-    'EpochProcessingResult',
-    'ValidatorRecord',
-    'ValidatorShuffling',
-    
+    "EpochProcessor",
+    "EpochProcessingResult",
+    "ValidatorRecord",
+    "ValidatorShuffling",
     # Rewards
-    'RewardsCalculator',
-    'RewardSummary',
-    'EpochRewardReport',
-    'InflationSchedule',
-    
+    "RewardsCalculator",
+    "RewardSummary",
+    "EpochRewardReport",
+    "InflationSchedule",
     # Genesis
-    'GenesisCreator',
-    'GenesisConfig',
-    'GenesisState',
-    'GenesisBlock',
-    'GenesisValidator',
-    'create_testnet_genesis',
-    'create_mainnet_genesis',
-    
+    "GenesisCreator",
+    "GenesisConfig",
+    "GenesisState",
+    "GenesisBlock",
+    "GenesisValidator",
+    "create_testnet_genesis",
+    "create_mainnet_genesis",
     # Sync Committee
-    'SyncCommittee',
-    'SyncCommitteeManager',
-    'SyncAggregate',
-    'LightClientUpdate',
-    
+    "SyncCommittee",
+    "SyncCommitteeManager",
+    "SyncAggregate",
+    "LightClientUpdate",
     # Lifecycle Management
-    'LifecycleManager',
-    'ValidatorLifecycle',
-    'LifecycleState',
-    'ValidatorActivationQueue',
-    'ValidatorExitQueue',
-    'DepositRequest',
-    'ExitRequest',
-    'WithdrawalRequest',
-    
+    "LifecycleManager",
+    "ValidatorLifecycle",
+    "LifecycleState",
+    "ValidatorActivationQueue",
+    "ValidatorExitQueue",
+    "DepositRequest",
+    "ExitRequest",
+    "WithdrawalRequest",
     # P2P Gossip
-    'GossipHandler',
-    'GossipTopic',
-    'GossipMessage',
-    'BeaconGossip',
-    'BeaconBlockMessage',
-    'AttestationMessage',
-    'VoluntaryExitMessage',
-    'SlashingMessage',
-    'MessageValidator',
-    'MessageValidation',
-    
+    "GossipHandler",
+    "GossipTopic",
+    "GossipMessage",
+    "BeaconGossip",
+    "BeaconBlockMessage",
+    "AttestationMessage",
+    "VoluntaryExitMessage",
+    "SlashingMessage",
+    "MessageValidator",
+    "MessageValidation",
     # Exceptions
-    'ValidatorError',
-    'InsufficientStakeError',
-    'InvalidValidatorError',
-    'NotPQWalletError',
-    'ValidatorNotActiveError',
-    'AlreadyProposedError',
-    'AlreadyAttestedError',
+    "ValidatorError",
+    "InsufficientStakeError",
+    "InvalidValidatorError",
+    "NotPQWalletError",
+    "ValidatorNotActiveError",
+    "AlreadyProposedError",
+    "AlreadyAttestedError",
 ]

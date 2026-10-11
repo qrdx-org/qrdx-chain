@@ -25,16 +25,19 @@ logger = get_logger(__name__)
 #  ENUMS
 # ══════════════════════════════════════════════════════════════════════
 
+
 class DoomsdayTradingMode(IntEnum):
     """Client enforcement mode (§9.3)."""
-    STRICT = 1          # Block trading UI for tokens returning False
-    WARNING = 2         # Show warning, allow user to proceed (recommended)
+
+    STRICT = 1  # Block trading UI for tokens returning False
+    WARNING = 2  # Show warning, allow user to proceed (recommended)
     PERMISSIONLESS = 3  # Ignore flag entirely
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  PREFERENCE RECORD
 # ══════════════════════════════════════════════════════════════════════
+
 
 @dataclass
 class DoomsdayTradingPreference:
@@ -48,6 +51,7 @@ class DoomsdayTradingPreference:
         doomsday_active:    Whether the Doomsday Protocol is currently triggered
         updated_at:         Timestamp of last evaluation
     """
+
     token_symbol: str
     should_trade: bool
     reason: str
@@ -67,6 +71,7 @@ class DoomsdayTradingPreference:
 # ══════════════════════════════════════════════════════════════════════
 #  DOOMSDAY HOOK
 # ══════════════════════════════════════════════════════════════════════
+
 
 class DoomsdayHook:
     """
@@ -147,8 +152,7 @@ class DoomsdayHook:
         )
         self._preference_cache[token.symbol] = pref
         logger.info(
-            f"Doomsday trade advisory: {token.symbol} → "
-            f"{'TRADE' if should else 'NO_TRADE'}"
+            f"Doomsday trade advisory: {token.symbol} → " f"{'TRADE' if should else 'NO_TRADE'}"
         )
         return pref
 
@@ -204,9 +208,7 @@ class DoomsdayHook:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "doomsdayActive": self.is_doomsday_active,
-            "cachedPreferences": {
-                s: p.to_dict() for s, p in self._preference_cache.items()
-            },
+            "cachedPreferences": {s: p.to_dict() for s, p in self._preference_cache.items()},
         }
 
     def __repr__(self) -> str:

@@ -23,13 +23,12 @@ Validator Duties:
 from __future__ import annotations
 
 import logging
-import time
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from .state_manager import ExchangeExecResult, ExchangeStateManager
-from .transactions import ExchangeOpType, ExchangeTransaction
 from ..constants import ACTIVATION_DELAY_EPOCHS, UNBONDING_PERIOD_EPOCHS
+from .state_manager import ExchangeStateManager
+from .transactions import ExchangeOpType, ExchangeTransaction
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +141,9 @@ async def ensure_oracle_committee(db, mgr: ExchangeStateManager) -> None:
         logger.debug("oracle committee not loaded: %s", e)
 
 
-async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:
+async def preload_sender_balances(
+    db, txs, state_manager: Optional[ExchangeStateManager] = None
+) -> None:
     """
     Phase E: pre-load each exchange-tx sender's real account_state balance into the
     state manager's balance bridge BEFORE the (sync) section is processed, so the
@@ -169,7 +170,8 @@ async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeState
         if getattr(tx, "op_type", None) != ExchangeOpType.GOV_EXECUTE:
             continue
         try:
-            proposal = mgr.governance.proposals.get(int((tx.params or {}).get("proposal_id")))
+            raw_id = (tx.params or {}).get("proposal_id")
+            proposal = mgr.governance.proposals.get(int(raw_id)) if raw_id is not None else None
         except (TypeError, ValueError):
             proposal = None
         if proposal is None or proposal.action != "system_spend":
@@ -184,7 +186,9 @@ async def preload_sender_balances(db, txs, state_manager: Optional[ExchangeState
             logger.debug("preload_sender_balances: %s for system wallet %s", e, wallet)
 
 
-async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateManager] = None) -> None:
+async def preload_token_balances(
+    db, txs, state_manager: Optional[ExchangeStateManager] = None
+) -> None:
     """
     Phase E (spot): pre-load the (holder, token) balances the block's spot ops will
     spend, from the real token ledger, BEFORE the (sync) section runs — so the
@@ -195,6 +199,7 @@ async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateM
     mgr = state_manager or ExchangeStateManager.get_instance()
     mgr.clear_available_token_balances()
     from .transactions import ExchangeOpType
+
     wanted = set()
     for tx in txs or []:
         sender = getattr(tx, "sender", None)
@@ -202,11 +207,12 @@ async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateM
         op = getattr(tx, "op_type", None)
         if not sender:
             continue
-        asset = mgr.canonical_asset          # "QRDX" for native, canonical token addresses
+        asset = mgr.canonical_asset  # "QRDX" for native, canonical token addresses
         if op == ExchangeOpType.SWAP and p.get("token_in"):
             wanted.add((sender, asset(p["token_in"])))
-        elif op in (ExchangeOpType.TOKEN_TRANSFER, ExchangeOpType.TOKEN_BURN) \
-                and p.get("token_address"):
+        elif op in (ExchangeOpType.TOKEN_TRANSFER, ExchangeOpType.TOKEN_BURN) and p.get(
+            "token_address"
+        ):
             # Native tokens are keyed by their canonical (lowercase) address. A burn may name
             # another holder (``from``: an operator's or the permanent delegate's burn).
             wanted.add((str(p.get("from") or sender), str(p["token_address"]).lower()))
@@ -250,7 +256,9 @@ async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateM
             escrow = mgr.orderbook_escrow_address(min(a, b) + ":" + max(a, b))
             wanted.add((escrow, a))
             wanted.add((escrow, b))
-        elif op in (ExchangeOpType.REMOVE_LIQUIDITY, ExchangeOpType.REMOVE_POOL) and p.get("pool_id"):
+        elif op in (ExchangeOpType.REMOVE_LIQUIDITY, ExchangeOpType.REMOVE_POOL) and p.get(
+            "pool_id"
+        ):
             pool = mgr.pool_manager.get_pool(str(p["pool_id"]))
             if pool is not None:
                 holder = mgr.pool_holder_address(pool.state.id)
@@ -263,18 +271,24 @@ async def preload_token_balances(db, txs, state_manager: Optional[ExchangeStateM
                 for tok in pair.split(":", 1):
                     wanted.add((escrow, tok))
     from .tokens import is_native_asset
+
     for holder, token in sorted(wanted):
         try:
-            if is_native_asset(token):        # native QRDX: the account balance
+            if is_native_asset(token):  # native QRDX: the account balance
                 mgr.set_available_balance(holder, await db.get_address_balance(holder))
                 continue
-            mgr.set_available_token_balance(holder, token, await db.get_token_balance(token, holder))
+            mgr.set_available_token_balance(
+                holder, token, await db.get_token_balance(token, holder)
+            )
         except Exception as e:
-            logger.debug("preload_token_balances: %s for (%s,%s)", e, str(holder)[:16], str(token)[:16])
+            logger.debug(
+                "preload_token_balances: %s for (%s,%s)", e, str(holder)[:16], str(token)[:16]
+            )
 
 
-async def flush_exchange_balance_deltas(db, state_manager: Optional[ExchangeStateManager] = None,
-                                        enforce: bool = False) -> None:
+async def flush_exchange_balance_deltas(
+    db, state_manager: Optional[ExchangeStateManager] = None, enforce: bool = False
+) -> None:
     """
     Phase E: apply this block's accumulated exchange balance deltas (e.g. locked
     margin) to real ``account_state``. Called by the async block paths AFTER the
@@ -290,8 +304,11 @@ async def flush_exchange_balance_deltas(db, state_manager: Optional[ExchangeStat
     if not deltas:
         return
     if not enforce:
-        logger.info("[Phase E observe] would apply %d balance delta(s): %s",
-                    len(deltas), {a[:12]: str(d) for a, d in deltas.items()})
+        logger.info(
+            "[Phase E observe] would apply %d balance delta(s): %s",
+            len(deltas),
+            {a[:12]: str(d) for a, d in deltas.items()},
+        )
         return
     for addr, delta in deltas.items():
         try:
@@ -299,8 +316,12 @@ async def flush_exchange_balance_deltas(db, state_manager: Optional[ExchangeStat
             if not applied and delta < 0:
                 # A debit on an account with no ledger row: nothing was taken, while the
                 # paired credit (if any) still lands — value created from nothing.
-                logger.error("[VALUE-LOST] flush_exchange_balance_deltas: debit of %s on %s "
-                             "found no account_state row", delta, str(addr)[:24])
+                logger.error(
+                    "[VALUE-LOST] flush_exchange_balance_deltas: debit of %s on %s "
+                    "found no account_state row",
+                    delta,
+                    str(addr)[:24],
+                )
         except Exception as e:
             # A dropped delta LOSES VALUE silently. It is deterministic (every node
             # drops the same one, so no fork) which is exactly why it can hide: the
@@ -308,11 +329,17 @@ async def flush_exchange_balance_deltas(db, state_manager: Optional[ExchangeStat
             # ERROR-level and explicitly marked so a log scan or soak catches it —
             # this is how the 0xPOOL/0xCLOB holder break went unnoticed through a
             # green integration run.
-            logger.error("[VALUE-LOST] flush_exchange_balance_deltas dropped %s for %s: %s",
-                         delta, str(addr)[:24], e)
+            logger.error(
+                "[VALUE-LOST] flush_exchange_balance_deltas dropped %s for %s: %s",
+                delta,
+                str(addr)[:24],
+                e,
+            )
 
 
-async def flush_token_balance_deltas(db, state_manager: Optional[ExchangeStateManager] = None) -> None:
+async def flush_token_balance_deltas(
+    db, state_manager: Optional[ExchangeStateManager] = None
+) -> None:
     """
     Phase E (spot): apply this block's token-registry changes (deploys, supply, authorities
     — the DB mirror of the manager's registry) + token-balance deltas (token ops, spot,
@@ -342,13 +369,21 @@ async def flush_token_balance_deltas(db, state_manager: Optional[ExchangeStateMa
         except Exception as e:
             # See the note in flush_exchange_balance_deltas: a dropped token delta
             # BURNS tokens while its paired debit applies. Loud and marked.
-            logger.error("[VALUE-LOST] flush_token dropped %s of %s for holder %s: %s",
-                         delta, str(token)[:24], str(holder)[:24], e)
+            logger.error(
+                "[VALUE-LOST] flush_token dropped %s of %s for holder %s: %s",
+                delta,
+                str(token)[:24],
+                str(holder)[:24],
+                e,
+            )
 
 
 async def flush_validator_lifecycle_deltas(
-    db, state_manager: Optional[ExchangeStateManager] = None, block_epoch: Optional[int] = None,
-    block_height: Optional[int] = None, block_hash: Optional[str] = None,
+    db,
+    state_manager: Optional[ExchangeStateManager] = None,
+    block_epoch: Optional[int] = None,
+    block_height: Optional[int] = None,
+    block_hash: Optional[str] = None,
 ) -> None:
     """
     Validator-lifecycle Phase 3: apply this block's staking ops to the consensus
@@ -381,8 +416,13 @@ async def flush_validator_lifecycle_deltas(
                 # (db.undo_validator_deposits_above) — the validators table itself is
                 # not reconstructed from the chain.
                 await db.register_pending_validator(
-                    op["address"], op["public_key"], op["stake"], activation_epoch=act_epoch,
-                    block_height=block_height, block_hash=block_hash)
+                    op["address"],
+                    op["public_key"],
+                    op["stake"],
+                    activation_epoch=act_epoch,
+                    block_height=block_height,
+                    block_hash=block_hash,
+                )
             elif op.get("type") == "exit":
                 # Phase 3c: a STAKE_EXIT moves an active validator to 'exiting'. This is
                 # SAFE at live-import because 'exiting' stays ELIGIBLE for proposer
@@ -402,10 +442,14 @@ async def flush_validator_lifecycle_deltas(
                 # asynchronously, so its state here can differ between nodes.
                 if block_height is not None and exit_epoch is not None:
                     from ..validator.withdrawals import record_validator_exit
+
                     await record_validator_exit(db, op["address"], exit_epoch, block_height)
-                logger.info("[Phase 3c] STAKE_EXIT by %s → %s (exit_epoch=%s)",
-                            str(op.get("address"))[:20],
-                            "exiting" if moved else "no-op (not active)", exit_epoch)
+                logger.info(
+                    "[Phase 3c] STAKE_EXIT by %s → %s (exit_epoch=%s)",
+                    str(op.get("address"))[:20],
+                    "exiting" if moved else "no-op (not active)",
+                    exit_epoch,
+                )
         except Exception as e:
             logger.warning("flush_validator_lifecycle: %s for %s", e, str(op.get("address"))[:20])
 
@@ -413,6 +457,7 @@ async def flush_validator_lifecycle_deltas(
 # ---------------------------------------------------------------------------
 # Admission: authenticate exchange transactions
 # ---------------------------------------------------------------------------
+
 
 def verify_exchange_tx(tx: ExchangeTransaction) -> Tuple[bool, str]:
     """
@@ -445,6 +490,7 @@ def verify_exchange_tx(tx: ExchangeTransaction) -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Block-level exchange processing
 # ---------------------------------------------------------------------------
+
 
 def process_exchange_transactions(
     block_height: int,
@@ -488,7 +534,8 @@ def process_exchange_transactions(
                 failed_txs.append((i, tx.tx_hash(), result.error))
                 logger.debug(
                     "Exchange tx %d failed (non-critical): %s",
-                    i, result.error,
+                    i,
+                    result.error,
                 )
         except Exception as e:
             # Critical failure: block is invalid
@@ -508,7 +555,9 @@ def process_exchange_transactions(
     if failed_txs:
         logger.info(
             "Block %d: %d/%d exchange txs failed (non-critical)",
-            block_height, len(failed_txs), len(exchange_txs),
+            block_height,
+            len(failed_txs),
+            len(exchange_txs),
         )
 
     return True, "", state_root
@@ -537,7 +586,10 @@ def validate_exchange_state_root(
         Tuple of (is_valid, error_message)
     """
     success, error, computed_root = process_exchange_transactions(
-        block_height, block_timestamp, exchange_txs, state_manager,
+        block_height,
+        block_timestamp,
+        exchange_txs,
+        state_manager,
     )
 
     if not success:
@@ -665,8 +717,7 @@ async def rebuild_exchange_state_from_chain(
                 # Re-apply this block's collateral debits to the freshly reseeded
                 # account_state ledger (enforce mode applies; observe just logs)
                 # AND its token moves to the freshly cleared token ledger.
-                await flush_exchange_balance_deltas(
-                    db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
+                await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
                 await flush_token_balance_deltas(db, mgr)
                 flushed += 1
         else:
@@ -680,8 +731,13 @@ async def rebuild_exchange_state_from_chain(
 
     # [reorg-diag] log UNCONDITIONALLY (incl. applied=0) so a heavy-reorg run reveals
     # whether the reflush re-applied the activity sections after a rollback+reseed.
-    logger.info("[reorg-diag] rebuild_exchange: tip=%d applied=%d flushed=%d (flush_to_account=%s)",
-                tip, applied, flushed, flush_to_account_state)
+    logger.info(
+        "[reorg-diag] rebuild_exchange: tip=%d applied=%d flushed=%d (flush_to_account=%s)",
+        tip,
+        applied,
+        flushed,
+        flush_to_account_state,
+    )
     return mgr.compute_state_root()
 
 
@@ -733,7 +789,10 @@ def apply_block_exchange_section(
 
     # 2–4. Execute (snapshots internally), compare, revert on mismatch.
     success, error, computed_root = process_exchange_transactions(
-        block_height, block_timestamp, txs, mgr,
+        block_height,
+        block_timestamp,
+        txs,
+        mgr,
     )
     if not success:
         # process_exchange_transactions already reverted on critical failure.
@@ -754,8 +813,10 @@ def apply_block_exchange_section(
 # Block boundary duties (executed by every validator)
 # ---------------------------------------------------------------------------
 
-def run_exchange_tick(block_height: int, block_timestamp: float,
-                      state_manager: Optional[ExchangeStateManager] = None) -> str:
+
+def run_exchange_tick(
+    block_height: int, block_timestamp: float, state_manager: Optional[ExchangeStateManager] = None
+) -> str:
     """
     The exchange's per-block tick for a block that carries no exchange transactions.
 
@@ -789,15 +850,24 @@ def _execute_block_boundary_duties(
     # Perps clearinghouse: mark prices, funding at interval boundaries, then liquidations at
     # the new marks — all judged by block time.
     from .. import constants
+
     mgr.apply_oracle_votes(Decimal(str(block_timestamp)))
-    events = mgr.clearinghouse.tick(Decimal(str(block_timestamp)),
-                                    funding_interval=constants.PERP_FUNDING_INTERVAL_SECONDS)
+    events = mgr.clearinghouse.tick(
+        Decimal(str(block_timestamp)), funding_interval=constants.PERP_FUNDING_INTERVAL_SECONDS
+    )
     for ev in events:
         if ev["type"] == "liquidation":
-            logger.info("Perp liquidation at height %d: %s %s (%s, filled %s on the book) "
-                        "equity=%s maintenance=%s", block_height, ev["owner"],
-                        ",".join(ev["markets"]), ev["stage"], ev["filled"], ev["equity"],
-                        ev["maintenance"])
+            logger.info(
+                "Perp liquidation at height %d: %s %s (%s, filled %s on the book) "
+                "equity=%s maintenance=%s",
+                block_height,
+                ev["owner"],
+                ",".join(ev["markets"]),
+                ev["stage"],
+                ev["filled"],
+                ev["equity"],
+                ev["maintenance"],
+            )
     # The node-local journal (receipts + events for wallets, the API and streams) records them
     # once the block commits.
     mgr.record_tick_events(events)
@@ -806,6 +876,7 @@ def _execute_block_boundary_duties(
 # ---------------------------------------------------------------------------
 # Utility: extract exchange transactions from a block
 # ---------------------------------------------------------------------------
+
 
 def extract_exchange_transactions(block: Any) -> List[ExchangeTransaction]:
     """
@@ -820,7 +891,7 @@ def extract_exchange_transactions(block: Any) -> List[ExchangeTransaction]:
     Returns:
         List of ExchangeTransaction objects
     """
-    exchange_txs = []
+    exchange_txs: List[Any] = []
     if not hasattr(block, "transactions") or not block.transactions:
         return exchange_txs
 
@@ -878,6 +949,7 @@ def exchange_txs_canonical_bytes(txs: List[ExchangeTransaction]) -> bytes:
     any reordering or mutation changes the result. BLAKE3 per Whitepaper §3.6.
     """
     import blake3
+
     h = blake3.blake3()
     for tx in txs:
         h.update(bytes.fromhex(tx.tx_hash()))
@@ -899,6 +971,7 @@ def extract_exchange_transactions_from_dict(block: Dict[str, Any]) -> List[Excha
 # ---------------------------------------------------------------------------
 # Validator duty: build oracle update transactions
 # ---------------------------------------------------------------------------
+
 
 def build_oracle_update_tx(
     validator_address: str,
@@ -948,6 +1021,8 @@ def get_validator_fee_share(
         The validator's fee share in QRDX
     """
     from ..constants import EXCHANGE_FEE_VALIDATOR_SHARE
+
     return (block_fees * EXCHANGE_FEE_VALIDATOR_SHARE).quantize(
-        Decimal("0.00000001"), rounding=ROUND_HALF_UP,
+        Decimal("0.00000001"),
+        rounding=ROUND_HALF_UP,
     )

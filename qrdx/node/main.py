@@ -1,72 +1,92 @@
 # denaro/node/main.py - SECURE IMPLEMENTATION
-import random
 import asyncio
-from asyncio import gather, Lock
-from collections import deque, defaultdict
-import os
-import re
-import json
-from decimal import Decimal
-from datetime import datetime, timedelta
 import hashlib
-import hmac
-import traceback
-import time
-from typing import Optional, Set, Dict, List, Tuple, Any
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-
 import ipaddress
+import json
+import os
+import random
+import re
 import socket
 import sqlite3
+import time
+import traceback
+from asyncio import gather
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Body, Query, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
-from fastapi.responses import RedirectResponse, Response, StreamingResponse, JSONResponse
-
 import httpx
-from httpx import TimeoutException
-from icecream import ic
-from starlette.background import BackgroundTasks, BackgroundTask
+from fastapi import (
+    Body,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.background import BackgroundTasks
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
 
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-
-from qrdx.helpers import timestamp, sha256, transaction_to_json
-from qrdx.logger import get_logger
-
-from qrdx.manager import (
-    create_block, get_difficulty, Manager, get_transactions_merkle_tree, 
-    calculate_difficulty, clear_pending_transactions, block_to_bytes, split_block_content
-)
-
-from qrdx.node.nodes_manager import NodesManager, NodeInterface
-from qrdx.node.utils import ip_is_local
-from qrdx.node.bootstrap import BootstrapManager, get_bootstrap_manager, init_bootstrap_manager
-from qrdx.transactions import Transaction, CoinbaseTransaction
-from qrdx.transactions.contract_transaction import ContractTransaction
-from qrdx.database_sqlite import DatabaseSQLite as Database
-from qrdx.constants import (
-    MAX_MINING_CANDIDATES, NODE_VERSION, MAX_BLOCKS_PER_SUBMISSION,
-    MAX_BLOCK_CONTENT_SIZE, MAX_PEERS, MAX_CONCURRENT_SYNCS,
-    MAX_TX_FETCH_LIMIT, MAX_MEMPOOL_SIZE, CONNECTION_TIMEOUT,
-    MAX_BATCH_BYTES, VALID_HEX_PATTERN, VALID_ADDRESS_PATTERN,
-    DENARO_BOOTSTRAP_NODE, DENARO_SELF_URL,
-    DENARO_DATABASE_PATH, MAX_TX_DATA_SIZE, DENARO_NODE_HOST, 
-    DENARO_NODE_PORT, MAX_REORG_DEPTH,
-    LOG_INCLUDE_REQUEST_CONTENT, LOG_INCLUDE_RESPONSE_CONTENT, LOG_MAX_PATH_LENGTH,
-    BOOTSTRAP_NODES, CHAIN_SPEC, CHAIN_SPEC_FILE, CHAIN_SPEC_ENV_CONFLICTS,
-)
 from qrdx import chain_spec as chain_spec_mod
-from qrdx.node.identity import (
-    initialize_identity, get_node_id, get_public_key_hex,
-    verify_signature, get_canonical_json_bytes, sign_message,
-    get_public_key_bytes,
+from qrdx.constants import (
+    BOOTSTRAP_NODES,
+    CHAIN_SPEC,
+    CHAIN_SPEC_ENV_CONFLICTS,
+    CHAIN_SPEC_FILE,
+    CONNECTION_TIMEOUT,
+    DENARO_DATABASE_PATH,
+    DENARO_NODE_HOST,
+    DENARO_NODE_PORT,
+    DENARO_SELF_URL,
+    LOG_INCLUDE_REQUEST_CONTENT,
+    LOG_INCLUDE_RESPONSE_CONTENT,
+    LOG_MAX_PATH_LENGTH,
+    MAX_BATCH_BYTES,
+    MAX_BLOCK_CONTENT_SIZE,
+    MAX_BLOCKS_PER_SUBMISSION,
+    MAX_CONCURRENT_SYNCS,
+    MAX_MEMPOOL_SIZE,
+    MAX_MINING_CANDIDATES,
+    MAX_PEERS,
+    MAX_REORG_DEPTH,
+    MAX_TX_DATA_SIZE,
+    MAX_TX_FETCH_LIMIT,
+    NODE_VERSION,
+    SLOT_DURATION,
+    VALID_ADDRESS_PATTERN,
+    VALID_HEX_PATTERN,
 )
+from qrdx.database_sqlite import DatabaseSQLite as Database
+from qrdx.helpers import sha256, timestamp
+from qrdx.logger import get_logger
+from qrdx.manager import (
+    Manager,
+    clear_pending_transactions,
+    create_block,
+    get_difficulty,
+    get_transactions_merkle_tree,
+)
+from qrdx.node.identity import (
+    get_canonical_json_bytes,
+    get_node_id,
+    get_public_key_bytes,
+    initialize_identity,
+    node_id_for_public_key,
+    verify_signature,
+)
+from qrdx.node.nodes_manager import NodeInterface, NodesManager
+from qrdx.transactions import CoinbaseTransaction, Transaction
 from qrdx.validator.block_verification import verify_pos_block_proposer, verify_proposer_eligibility
 
 # Slot-proposer eligibility gate. Enabled after the validator-set convergence fix:
@@ -112,8 +132,11 @@ _ENFORCE_FINALITY_REORG_GUARD = True
 # all six soaks PASS 19/19 with derived state converged; liveness unchanged (tips 182-225
 # vs 184-237, tip spread 6-7 vs 6-15). Env-overridable (=0) for A/B testing only — it must
 # match on every node.
-_ENFORCE_PARENT_CONTINUITY = os.getenv(
-    "QRDX_ENFORCE_PARENT_CONTINUITY", "1").lower() not in ("0", "false", "no")
+_ENFORCE_PARENT_CONTINUITY = os.getenv("QRDX_ENFORCE_PARENT_CONTINUITY", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
 
 # Fork-choice mechanism-2 (equal-height tie-break). When a competing block arrives
 # at the just-filled tip (same parent, different hash) and WINS the lowest-hash
@@ -175,7 +198,8 @@ _ENFORCE_EQUAL_HEIGHT_TIEBREAK = False
 # run) where every earlier version logged none. See _ENFORCE_PARENT_CONTINUITY above and
 # docs/KNOWN_ISSUES.md. Env-overridable (=0) for A/B testing only.
 _ENFORCE_FORK_CHOICE_RECONCILE = os.getenv(
-    "QRDX_ENFORCE_FORK_CHOICE_RECONCILE", "1").lower() not in ("0", "false", "no")
+    "QRDX_ENFORCE_FORK_CHOICE_RECONCILE", "1"
+).lower() not in ("0", "false", "no")
 # How many recent heights (down from the tip) the active pass inspects per cycle. Forks
 # are tip-local (block-time ≈ propagation-time), so a bounded window catches them while
 # keeping the per-cycle peer-query cost small. Clamped to the finalized boundary.
@@ -196,11 +220,15 @@ _SEEN_ATTESTATIONS: set = set()
 _SEEN_ATTESTATIONS_MAX = 20000
 
 # Kademlia DHT integration
-from qrdx.p2p.node import Node as P2PNode, Address as P2PAddress, hex_to_node_id as p2p_hex_to_node_id
-from qrdx.p2p.routing import RoutingTable, KBucketEntry
+from qrdx.p2p.config import DiscoveryConfig
 from qrdx.p2p.discovery import KademliaDiscovery
 from qrdx.p2p.dns_seeds import DNSSeedDiscovery
-from qrdx.p2p.config import DiscoveryConfig
+from qrdx.p2p.node import (
+    Address as P2PAddress,
+    Node as P2PNode,
+    hex_to_node_id as p2p_hex_to_node_id,
+)
+from qrdx.p2p.routing import KBucketEntry, RoutingTable
 
 logger = get_logger(__name__)
 
@@ -208,15 +236,17 @@ logger = get_logger(__name__)
 # SECURITY COMPONENTS
 # ============================================================================
 
+
 class TimeBasedCache:
     """Thread-safe cache with automatic expiration"""
+
     def __init__(self, max_size: int = 1000, ttl_seconds: int = 300):
         self._cache: Dict[str, Tuple[Any, float]] = {}
-        self._access_order = deque(maxlen=max_size)
+        self._access_order: "deque[str]" = deque(maxlen=max_size)
         self._lock = asyncio.Lock()
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
-        
+
     async def get(self, key: str) -> Optional[Any]:
         async with self._lock:
             if key in self._cache:
@@ -226,42 +256,40 @@ class TimeBasedCache:
                 else:
                     del self._cache[key]
             return None
-    
 
     async def put(self, key: str, value: Any):
         async with self._lock:
             current_time = time.time()
-            
+
             # If the cache is full and we're adding a new key, we need to make space.
             # This loop handles both size enforcement and cleaning of old items in one pass.
             while len(self._cache) >= self.max_size and key not in self._cache:
                 if not self._access_order:
                     # Should not happen if cache is not empty, but a safeguard.
                     break
-                
+
                 # Get the oldest key from the access queue
                 oldest_key = self._access_order.popleft()
-                
+
                 # If this key is still in the cache, remove it.
                 # This check resolves the race condition, as the key might have
                 # been removed by another operation or expired.
                 if oldest_key in self._cache:
                     del self._cache[oldest_key]
-            
+
             # Now that there is space, add the new item.
             self._cache[key] = (value, current_time)
             self._access_order.append(key)
 
     async def contains(self, key: str) -> bool:
         return await self.get(key) is not None
-    
+
     async def clean(self):
         """Manual cleanup of expired entries"""
         async with self._lock:
             current_time = time.time()
             expired_keys = [
-                k for k, (_, ts) in self._cache.items() 
-                if current_time - ts >= self.ttl_seconds
+                k for k, (_, ts) in self._cache.items() if current_time - ts >= self.ttl_seconds
             ]
             for k in expired_keys:
                 del self._cache[k]
@@ -269,42 +297,47 @@ class TimeBasedCache:
 
 class HandshakeChallengeManager:
     """Secure challenge management with automatic cleanup"""
+
     def __init__(self, ttl_seconds: int = 300):
         self._challenges: Dict[str, float] = {}
+        # challenge -> the verified node it was issued to (None: issued without a caller)
+        self._issued_to: Dict[str, Optional[str]] = {}
         self._lock = asyncio.Lock()
         self.ttl_seconds = ttl_seconds
         self._cleanup_task = None
-        
+
     async def start(self):
         """Start periodic cleanup task"""
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
-        
+
     async def stop(self):
         """Stop cleanup task"""
         if self._cleanup_task:
             self._cleanup_task.cancel()
-            
+
     async def _periodic_cleanup(self):
         """Remove expired challenges every 60 seconds"""
         while True:
             await asyncio.sleep(60)
             await self.cleanup()
-            
+
     async def cleanup(self):
         """Remove expired challenges"""
         async with self._lock:
             current_time = time.time()
             expired = [
-                challenge for challenge, timestamp in self._challenges.items()
+                challenge
+                for challenge, timestamp in self._challenges.items()
                 if current_time - timestamp > self.ttl_seconds
             ]
             for challenge in expired:
                 del self._challenges[challenge]
-                
-    async def create_challenge(self) -> str:
+                self._issued_to.pop(challenge, None)
+
+    async def create_challenge(self, issued_to: Optional[str] = None) -> str:
         """Create a new challenge"""
         challenge = os.urandom(32).hex()
-        
+
         async with self._lock:
             # Prevent unlimited growth
             if len(self._challenges) > 10000:
@@ -312,61 +345,73 @@ class HandshakeChallengeManager:
                 sorted_challenges = sorted(self._challenges.items(), key=lambda x: x[1])
                 for challenge_to_remove, _ in sorted_challenges[:5000]:
                     del self._challenges[challenge_to_remove]
-                    
+                    self._issued_to.pop(challenge_to_remove, None)
+
             self._challenges[challenge] = time.time()
-            
+            self._issued_to[challenge] = issued_to
+
         return challenge
-        
-    async def verify_and_consume_challenge(self, challenge: str) -> bool:
-        """Verify challenge exists and immediately consume it"""
+
+    async def verify_and_consume_challenge(
+        self, challenge: str, caller: Optional[str] = None
+    ) -> bool:
+        """Verify challenge exists and immediately consume it. A challenge issued to a verified
+        node is answerable only by that node: another caller cannot complete its handshake."""
         async with self._lock:
             if challenge in self._challenges:
                 timestamp = self._challenges[challenge]
+                issued_to = self._issued_to.get(challenge)
                 current_time = time.time()
-                
+
                 # Check if expired
                 if current_time - timestamp > self.ttl_seconds:
                     del self._challenges[challenge]
+                    self._issued_to.pop(challenge, None)
                     return False
-                    
+
+                if issued_to is not None and caller != issued_to:
+                    return False  # not consumed: the node it was issued to may still answer
+
                 # Valid challenge - consume it immediately
                 del self._challenges[challenge]
+                self._issued_to.pop(challenge, None)
                 return True
-                
+
             return False
 
 
 class BoundedPeerSyncTracker:
     """Track peer sync operations with size limits"""
+
     def __init__(self, max_peers: int = MAX_PEERS):
         self._peers_in_sync: Set[str] = set()
         self._sync_timestamps: Dict[str, float] = {}
         self._lock = asyncio.Lock()
         self.max_peers = max_peers
-        
+
     async def add_peer(self, peer_id: str) -> bool:
         """Add peer to sync set if not at limit"""
         async with self._lock:
             if peer_id in self._peers_in_sync:
                 return False
-                
+
             if len(self._peers_in_sync) >= self.max_peers:
                 # Remove oldest peer
                 if self._sync_timestamps:
                     oldest_peer = min(self._sync_timestamps.items(), key=lambda x: x[1])[0]
                     self._peers_in_sync.discard(oldest_peer)
                     del self._sync_timestamps[oldest_peer]
-                    
+
             self._peers_in_sync.add(peer_id)
             self._sync_timestamps[peer_id] = time.time()
             return True
-            
+
     async def remove_peer(self, peer_id: str):
         """Remove peer from sync set"""
         async with self._lock:
             self._peers_in_sync.discard(peer_id)
             self._sync_timestamps.pop(peer_id, None)
-            
+
     async def is_syncing(self, peer_id: str) -> bool:
         """Check if peer is currently syncing"""
         async with self._lock:
@@ -375,13 +420,14 @@ class BoundedPeerSyncTracker:
 
 class SyncStateManager:
     """Thread-safe synchronization state management"""
+
     def __init__(self, max_concurrent_syncs: int = MAX_CONCURRENT_SYNCS):
         self.is_syncing = False
         self.active_sync_count = 0
         self.max_concurrent_syncs = max_concurrent_syncs
         self._sync_lock = asyncio.Lock()
         self._count_lock = asyncio.Lock()
-        
+
     @asynccontextmanager
     async def acquire_sync(self):
         """Context manager for sync operations"""
@@ -391,22 +437,22 @@ class SyncStateManager:
                 if self.is_syncing:
                     raise HTTPException(
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail="Node is already synchronizing"
+                        detail="Node is already synchronizing",
                     )
-                    
+
                 async with self._count_lock:
                     if self.active_sync_count >= self.max_concurrent_syncs:
                         raise HTTPException(
                             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                            detail="Maximum concurrent syncs reached"
+                            detail="Maximum concurrent syncs reached",
                         )
-                    
+
                     self.is_syncing = True
                     self.active_sync_count += 1
                     acquired = True
-                    
+
             yield
-            
+
         finally:
             if acquired:
                 async with self._sync_lock:
@@ -417,44 +463,46 @@ class SyncStateManager:
 
 class InputValidator:
     """Comprehensive input validation"""
-    
+
     @staticmethod
-    def validate_hex(hex_string: str, min_length: int = 1, max_length: int = None) -> bool:
+    def validate_hex(
+        hex_string: str, min_length: int = 1, max_length: Optional[int] = None
+    ) -> bool:
         """Validate hex string format and length"""
         if not hex_string:
             return False
-            
+
         if max_length and len(hex_string) > max_length:
             return False
-            
+
         if len(hex_string) < min_length:
             return False
-            
+
         try:
             # Ensure even length
             if len(hex_string) % 2 != 0:
                 return False
-                
+
             # Try to decode
             bytes.fromhex(hex_string)
             return True
         except ValueError:
             return False
-            
+
     @staticmethod
     async def validate_block_height(height: int, db, max_ahead: int = 10) -> bool:
         """Validate block height is reasonable"""
         if height < 0:
             return False
-            
+
         current_height = await db.get_next_block_id() - 1
-        
+
         # Don't accept blocks too far in the future
         if height > current_height + max_ahead:
             return False
-            
+
         return True
-        
+
     @staticmethod
     def validate_address(address: str) -> bool:
         """Validate address format using canonical pattern"""
@@ -469,44 +517,49 @@ class InputValidator:
             return False
 
         return bool(VALID_ADDRESS_PATTERN.match(address))
-        
+
     @staticmethod
     def validate_transaction_data(tx_hex: str) -> Tuple[bool, Optional[str]]:
         """Comprehensive transaction validation"""
         if not tx_hex:
             return False, "Empty transaction"
-            
+
         if len(tx_hex) > 2_075_000:
             return False, "Transaction too large"
-            
+
         if not InputValidator.validate_hex(tx_hex):
             return False, "Invalid hex format"
-            
+
         # Additional validation could go here
         return True, None
 
 
 class AuthenticatedRequestValidator:
     """Validate request signatures with timestamp checks"""
-    
+
     def __init__(self, max_age_seconds: int = 300):
         self.max_age_seconds = max_age_seconds
         self._nonce_cache = TimeBasedCache(max_size=10000, ttl_seconds=max_age_seconds)
-        
+
     async def validate_request(self, request: Request) -> Optional[str]:
         """
         Validates the request signature, timestamp, and nonce.
         Returns the verified node_id on success, or None on failure.
         """
-        node_id = request.headers.get('x-node-id')
-        pubkey = request.headers.get('x-public-key')
-        signature = request.headers.get('x-signature')
-        timestamp_header = request.headers.get('x-timestamp')
-        nonce = request.headers.get('x-nonce')
-        
-        if not all([node_id, pubkey, signature, timestamp_header, nonce]):
+        node_id = request.headers.get("x-node-id")
+        pubkey = request.headers.get("x-public-key")
+        signature = request.headers.get("x-signature")
+        timestamp_header = request.headers.get("x-timestamp")
+        nonce = request.headers.get("x-nonce")
+
+        if not node_id or not pubkey or not signature or not timestamp_header or not nonce:
             return None
-            
+
+        # A node id is BLAKE3(public key): one the key does not stand for is a false claim,
+        # whatever the signature says (it only proves the key, not the id).
+        if node_id_for_public_key(pubkey) != node_id:
+            return None
+
         # 1. Validate timestamp
         try:
             request_time = int(timestamp_header)
@@ -515,47 +568,47 @@ class AuthenticatedRequestValidator:
                 return None
         except (ValueError, TypeError):
             return None
-            
+
         # 2. Check nonce for replay attacks
         nonce_key = f"{node_id}:{nonce}"
         if await self._nonce_cache.contains(nonce_key):
             return None
-        
+
         # 3. Verify the cryptographic signature
         try:
             request_body_bytes = await request.body()
-            
+
             # Start with the base payload
             payload_to_verify = {
-                "body": request_body_bytes.decode('utf-8'),
+                "body": request_body_bytes.decode("utf-8"),
                 "timestamp": request_time,
-                "nonce": nonce
+                "nonce": nonce,
             }
 
             # Reconstruct the full payload by looking for our custom signed headers.
             # The client signed these, so we MUST include them for verification.
             for key, value in request.headers.items():
-                if key.lower().startswith('x-denaro-'):
+                if key.lower().startswith("x-denaro-"):
                     # The client added this key without the prefix to the signed dict.
                     # e.g., 'x-denaro-height' -> 'height'
-                    original_key = key.lower().replace('x-denaro-', '')
+                    original_key = key.lower().replace("x-denaro-", "")
                     # Attempt to convert numeric values back to numbers for a perfect match
                     try:
                         # Check if it looks like a number (int or float)
-                        if '.' in value:
-                             payload_to_verify[original_key] = float(value)
+                        if "." in value:
+                            payload_to_verify[original_key] = float(value)
                         else:
-                             payload_to_verify[original_key] = int(value)
+                            payload_to_verify[original_key] = int(value)
                     except ValueError:
                         # It's not a number, treat it as a string.
                         # Handle 'None' string specifically.
-                        if value == 'None':
+                        if value == "None":
                             payload_to_verify[original_key] = None
                         else:
                             payload_to_verify[original_key] = value
-            
+
             canonical_bytes = get_canonical_json_bytes(payload_to_verify)
-            
+
             if not verify_signature(pubkey, signature, canonical_bytes):
                 # The reconstructed signature does not match.
                 logger.error(f"Signature verification failed for peer {node_id}.")
@@ -567,52 +620,52 @@ class AuthenticatedRequestValidator:
 
         # All checks passed. Store the nonce and return the verified node_id.
         await self._nonce_cache.put(nonce_key, True)
-        
+
         return node_id
 
 
 class DNSSafeHTTPClient:
     """HTTP client with DNS rebinding protection"""
-    
+
     def __init__(self, timeout: float = 10.0):
         self._dns_cache: Dict[str, Tuple[str, float]] = {}
         self._cache_ttl = 300  # 5 minutes
         self._lock = asyncio.Lock()
         self.timeout = timeout
-        
+
     async def validate_and_resolve(self, url: str) -> Tuple[bool, Optional[str]]:
         """Validate URL and resolve with caching"""
         try:
             parsed = urlparse(url)
-            if parsed.scheme not in ['http', 'https']:
+            if parsed.scheme not in ["http", "https"]:
                 return False, None
-                
+
             hostname = parsed.hostname
             if not hostname:
                 return False, None
-                
+
             async with self._lock:
                 # Check cache
                 if hostname in self._dns_cache:
                     cached_ip, cache_time = self._dns_cache[hostname]
                     if time.time() - cache_time < self._cache_ttl:
                         return True, cached_ip
-                        
+
                 # Resolve
                 loop = asyncio.get_event_loop()
                 addr_info = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
                 resolved_ip = addr_info[0][4][0]
-                
+
                 # Validate IP
                 ip_obj = ipaddress.ip_address(resolved_ip)
                 if not ip_obj.is_global and not ip_obj.is_private:
                     return False, None
-                    
+
                 # Cache resolution
                 self._dns_cache[hostname] = (resolved_ip, time.time())
-                
+
                 return True, resolved_ip
-                
+
         except Exception:
             return False, None
 
@@ -627,7 +680,7 @@ class PeerViolation:
 
 class PeerReputationManager:
     """Track peer behavior and ban malicious peers"""
-    
+
     def __init__(self, ban_threshold: int = -100, violation_ttl: int = 86400):
         self._peer_scores: Dict[str, int] = defaultdict(int)
         self._violations: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
@@ -635,53 +688,54 @@ class PeerReputationManager:
         self._lock = asyncio.Lock()
         self.ban_threshold = ban_threshold
         self.violation_ttl = violation_ttl
-        
-    async def record_violation(self, peer_id: str, violation_type: str, 
-                             severity: int = 5, details: str = None):
+
+    async def record_violation(
+        self, peer_id: str, violation_type: str, severity: int = 5, details: Optional[str] = None
+    ):
         """Record a violation and update peer score"""
         async with self._lock:
             violation = PeerViolation(
                 timestamp=time.time(),
                 violation_type=violation_type,
                 severity=severity,
-                details=details
+                details=details,
             )
-            
+
             self._violations[peer_id].append(violation)
-            
+
             # Update score
             score_penalty = severity * 10
             self._peer_scores[peer_id] -= score_penalty
-            
+
             # Check if should ban
             if self._peer_scores[peer_id] <= self.ban_threshold:
                 self._banned_peers.add(peer_id)
-                
+
     async def record_good_behavior(self, peer_id: str, points: int = 1):
         """Reward good behavior"""
         async with self._lock:
             self._peer_scores[peer_id] = min(100, self._peer_scores[peer_id] + points)
-            
+
     async def is_banned(self, peer_id: str) -> bool:
         """Check if peer is banned"""
         async with self._lock:
             return peer_id in self._banned_peers
-            
+
     async def get_score(self, peer_id: str) -> int:
         """Get current peer score"""
         async with self._lock:
             return self._peer_scores.get(peer_id, 0)
-            
+
     async def cleanup_old_violations(self):
         """Remove old violations"""
         async with self._lock:
             current_time = time.time()
-            
+
             for peer_id, violations in list(self._violations.items()):
                 # Remove old violations
                 while violations and current_time - violations[0].timestamp > self.violation_ttl:
                     violations.popleft()
-                    
+
                 # Remove peer data if no violations
                 if not violations and peer_id not in self._banned_peers:
                     del self._violations[peer_id]
@@ -691,110 +745,106 @@ class PeerReputationManager:
 
 class QueryCostCalculator:
     """Calculate and limit database query costs"""
-    
+
     def __init__(self, max_cost_per_hour: int = 1000):
         self._costs: Dict[str, float] = defaultdict(float)
         self._reset_times: Dict[str, float] = defaultdict(time.time)
         self._lock = asyncio.Lock()
         self.max_cost_per_hour = max_cost_per_hour
-        
+
     async def check_and_update_cost(self, identifier: str, offset: int, limit: int):
         """Check if query is allowed and update cost"""
         async with self._lock:
             current_time = time.time()
-            
+
             # Reset if hour has passed
             if current_time - self._reset_times[identifier] > 3600:
                 self._costs[identifier] = 0
                 self._reset_times[identifier] = current_time
-                
+
             # Calculate cost (higher offset = higher cost)
             cost = (offset / 100) + (limit / 50)
-            
+
             if self._costs[identifier] + cost > self.max_cost_per_hour:
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Query cost limit exceeded. Try again later."
+                    detail="Query cost limit exceeded. Try again later.",
                 )
-                
+
             self._costs[identifier] += cost
 
 
 class SecurityMonitor:
     """Monitor and log security events"""
-    
+
     def __init__(self):
         self._metrics = {
-            'failed_validations': defaultdict(int),
-            'rate_limit_hits': defaultdict(int),
-            'banned_peers': 0,
-            'replay_attempts': 0,
-            'dns_rebinding_attempts': 0,
-            'resource_exhaustion_attempts': 0
+            "failed_validations": defaultdict(int),
+            "rate_limit_hits": defaultdict(int),
+            "banned_peers": 0,
+            "replay_attempts": 0,
+            "dns_rebinding_attempts": 0,
+            "resource_exhaustion_attempts": 0,
         }
         self._lock = asyncio.Lock()
-        
+
     async def log_event(self, event_type: str, details: dict):
         """Log security event"""
         async with self._lock:
             # Update metrics
             if event_type in self._metrics:
                 if isinstance(self._metrics[event_type], dict):
-                    key = details.get('subtype', 'default')
+                    key = details.get("subtype", "default")
                     self._metrics[event_type][key] += 1
                 else:
                     self._metrics[event_type] += 1
-                    
+
     async def get_metrics(self) -> dict:
         """Get current security metrics"""
         async with self._lock:
             return dict(self._metrics)
-            
+
     async def check_thresholds(self):
         """Check if any security thresholds are exceeded"""
         async with self._lock:
             alerts = []
-            
+
             # Check for high rate of failures
             for event_type, counts in self._metrics.items():
                 if isinstance(counts, dict):
                     total = sum(counts.values())
                     if total > 1000:  # Threshold
-                        alerts.append({
-                            'type': event_type,
-                            'count': total,
-                            'severity': 'high'
-                        })
-                        
+                        alerts.append({"type": event_type, "count": total, "severity": "high"})
+
             return alerts
 
 
 class SafeTransactionPool:
     """Thread-safe transaction pool with atomic operations"""
-    
+
     def __init__(self, max_size: int = 10000):
         self._pool: Dict[str, Any] = {}  # tx_hash -> transaction
         self._lock = asyncio.Lock()
         self.max_size = max_size
         self._insertion_time: Dict[str, float] = {}
-        
+
     async def add_transaction(self, tx_hash: str, transaction: Any, db) -> bool:
         """Add transaction atomically"""
         async with self._lock:
             if tx_hash in self._pool:
                 return False
-                
+
             if len(self._pool) >= self.max_size:
                 # Remove oldest transactions
                 sorted_txs = sorted(self._insertion_time.items(), key=lambda x: x[1])
-                for old_hash, _ in sorted_txs[:self.max_size // 10]:  # Remove 10%
+                for old_hash, _ in sorted_txs[: self.max_size // 10]:  # Remove 10%
                     del self._pool[old_hash]
                     del self._insertion_time[old_hash]
-                    
+
             # Add to pool
             self._pool[tx_hash] = transaction
             self._insertion_time[tx_hash] = time.time()
-            
+
             # Add to database
             try:
                 success = await db.add_pending_transaction(transaction)
@@ -803,15 +853,15 @@ class SafeTransactionPool:
                     del self._pool[tx_hash]
                     del self._insertion_time[tx_hash]
                     return False
-                    
+
                 return True
-                
+
             except Exception:
                 # Rollback on any error
                 del self._pool[tx_hash]
                 del self._insertion_time[tx_hash]
                 raise
-                
+
     async def remove_transactions(self, tx_hashes: List[str]):
         """Remove transactions atomically"""
         async with self._lock:
@@ -822,66 +872,68 @@ class SafeTransactionPool:
 
 class SecureNodeComponents:
     """Initialize all security components"""
-    
+
     def __init__(self):
         # Caches
         self.transaction_cache = TimeBasedCache(max_size=1000, ttl_seconds=300)
         self.block_cache = TimeBasedCache(max_size=500, ttl_seconds=600)
         self.reachability_cache = TimeBasedCache(max_size=1000, ttl_seconds=300)
-        
+
         # Managers
         self.handshake_manager = HandshakeChallengeManager()
         self.peer_sync_tracker = BoundedPeerSyncTracker(max_peers=MAX_PEERS)
         self.sync_state_manager = SyncStateManager(max_concurrent_syncs=MAX_CONCURRENT_SYNCS)
-        
+
         # Validation
         self.input_validator = InputValidator()
         self.auth_validator = AuthenticatedRequestValidator()
-        
+
         # Security
         self.dns_client = DNSSafeHTTPClient()
         self.reputation_manager = PeerReputationManager()
         self.query_calculator = QueryCostCalculator()
         self.security_monitor = SecurityMonitor()
-        
+
         # Safety
         self.transaction_pool = SafeTransactionPool()
-        
+
         # Semaphore for propagation
         self.propagation_semaphore = asyncio.Semaphore(50)
-        
+
     async def startup(self):
         """Initialize all components"""
         await self.handshake_manager.start()
-        
+
         # Start periodic cleanup tasks
         asyncio.create_task(self._periodic_cleanup())
-        
+
     async def shutdown(self):
         """Cleanup all components"""
         await self.handshake_manager.stop()
-        
+
     async def _periodic_cleanup(self):
         """Periodic cleanup of all components"""
         while True:
             await asyncio.sleep(300)  # Every 5 minutes
-            
+
             # Clean caches
             await self.transaction_cache.clean()
             await self.block_cache.clean()
             await self.reachability_cache.clean()
-            
+
             # Clean reputation data
             await self.reputation_manager.cleanup_old_violations()
-            
+
             # Check security thresholds
             alerts = await self.security_monitor.check_thresholds()
             if alerts:
                 logger.warning(f"SECURITY ALERTS: {alerts}")
 
+
 # ============================================================================
 # RATE LIMITING KEY FUNCTION
 # ============================================================================
+
 
 def rate_limit_key_func(request: Request) -> str:
     """
@@ -891,23 +943,30 @@ def rate_limit_key_func(request: Request) -> str:
     """
     # Prefer the node_id from the header if it exists. This correctly attributes
     # requests to a specific peer identity, even if their IP changes.
-    node_id = request.headers.get('x-node-id')
+    node_id = request.headers.get("x-node-id")
     if node_id:
         return node_id
-    
+
     # For all other requests (e.g., from wallets, miners), use the remote address.
     return get_remote_address(request)
+
 
 # ============================================================================
 # APPLICATION SETUP
 # ============================================================================
 
-db: Database = None
-self_node_id: str = None
-self_is_public: bool = False 
+# Both set at startup, before the app serves a request.
+db: Database = None  # type: ignore[assignment]
+self_node_id: str = None  # type: ignore[assignment]
+self_is_public: bool = False
 
 app_servers = [{"url": str(DENARO_SELF_URL)}] if DENARO_SELF_URL else []
-app = FastAPI(servers=app_servers, title="QRDX Node", description="Full node for the QRDX blockchain.", version=NODE_VERSION)
+app = FastAPI(
+    servers=app_servers,
+    title="QRDX Node",
+    description="Full node for the QRDX blockchain.",
+    version=NODE_VERSION,
+)
 
 limiter = Limiter(key_func=rate_limit_key_func)
 # Allow testnet / integration-test environments to disable rate limiting
@@ -915,7 +974,8 @@ limiter = Limiter(key_func=rate_limit_key_func)
 if os.environ.get("QRDX_DISABLE_RATE_LIMIT", "").lower() in ("1", "true", "yes"):
     limiter.enabled = False
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+# slowapi types its handler for RateLimitExceeded; Starlette's signature says Exception.
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
 
 app.add_middleware(
     CORSMiddleware,
@@ -935,8 +995,14 @@ startup_time = time.time()
 # TOGGLEABLE (opt-in per operator) via QRDX_ENABLE_STREAMING. The stream is fed by a consensus-
 # decoupled poller (reads chain tip/finality only) so it can never stall or diverge block import.
 from qrdx.node.observability import (
-    METRICS, EVENT_HUB, chain_event_poller, sse_stream, handle_client_frame, parse_channels,
+    EVENT_HUB,
+    METRICS,
+    chain_event_poller,
+    handle_client_frame,
+    parse_channels,
+    sse_stream,
 )
+
 STREAMING_ENABLED = os.environ.get("QRDX_ENABLE_STREAMING", "").lower() in ("1", "true", "yes")
 _chain_poller_task: Optional[asyncio.Task] = None
 
@@ -944,16 +1010,22 @@ _chain_poller_task: Optional[asyncio.Task] = None
 @app.get("/healthz")
 async def healthz():
     """Liveness probe — the process is up and serving. Always 200."""
-    return {"status": "ok", "version": NODE_VERSION, "build": _build_info(),
-            "uptime_s": round(time.time() - startup_time, 1)}
+    return {
+        "status": "ok",
+        "version": NODE_VERSION,
+        "build": _build_info(),
+        "uptime_s": round(time.time() - startup_time, 1),
+    }
 
 
 def _build_info() -> dict:
     """The release this node was built from — set by the reproducible image build
     (docker/Dockerfile); "unknown" outside it. Compare with a release manifest
     (docs/RELEASES.md) to confirm what is actually running."""
-    return {"version": os.getenv("QRDX_BUILD_VERSION", "unknown"),
-            "commit": os.getenv("QRDX_BUILD_COMMIT", "unknown")}
+    return {
+        "version": os.getenv("QRDX_BUILD_VERSION", "unknown"),
+        "commit": os.getenv("QRDX_BUILD_COMMIT", "unknown"),
+    }
 
 
 @app.get("/readyz")
@@ -965,8 +1037,9 @@ async def readyz():
         ready = tip is not None and tip >= 0
     except Exception:
         tip, ready = None, False
-    return JSONResponse({"ready": ready, "height": tip if ready else None},
-                        status_code=200 if ready else 503)
+    return JSONResponse(
+        {"ready": ready, "height": tip if ready else None}, status_code=200 if ready else 503
+    )
 
 
 @app.get("/chain_spec")
@@ -1023,6 +1096,7 @@ def _perp_snapshots(channels) -> list:
     try:
         from qrdx.exchange import ExchangeStateManager
         from qrdx.exchange.stream import initial_snapshots
+
         return initial_snapshots(ExchangeStateManager.get_instance(), wanted)
     except Exception as e:
         logger.debug(f"stream snapshot failed: {e}")
@@ -1036,14 +1110,16 @@ async def stream_endpoint(channels: Optional[str] = None):
     perp_events,perp_account:0xPQ…`` picks the feeds (default: blocks); perps channels start
     with a snapshot of the current state."""
     if not STREAMING_ENABLED:
-        return JSONResponse({"error": "streaming disabled", "hint": "set QRDX_ENABLE_STREAMING=1"},
-                            status_code=404)
+        return JSONResponse(
+            {"error": "streaming disabled", "hint": "set QRDX_ENABLE_STREAMING=1"}, status_code=404
+        )
     METRICS.inc("qrdx_stream_connections_total")
     chosen = parse_channels(channels)
-    return StreamingResponse(sse_stream(EVENT_HUB, channels=chosen,
-                                        initial=_perp_snapshots(chosen or ())),
-                             media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        sse_stream(EVENT_HUB, channels=chosen, initial=_perp_snapshots(chosen or ())),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.websocket("/ws")
@@ -1067,7 +1143,7 @@ async def ws_stream(websocket: WebSocket):
         # writes every frame (no concurrent sends on the socket).
         receive = getattr(websocket, "receive_json", None)
         if receive is None:
-            await asyncio.Event().wait()            # a socket that cannot receive: feed only
+            await asyncio.Event().wait()  # a socket that cannot receive: feed only
         while True:
             try:
                 frame = await receive()
@@ -1083,20 +1159,29 @@ async def ws_stream(websocket: WebSocket):
 
     reader = asyncio.create_task(_reader())
     try:
-        await websocket.send_json({"type": "hello", "ts": time.time(), "version": NODE_VERSION,
-                                   "channels": sorted(EVENT_HUB.channels(q))})
+        await websocket.send_json(
+            {
+                "type": "hello",
+                "ts": time.time(),
+                "version": NODE_VERSION,
+                "channels": sorted(EVENT_HUB.channels(q)),
+            }
+        )
         for event in _perp_snapshots(EVENT_HUB.channels(q)):
             await websocket.send_json(event)
         while not reader.done():
             getter = asyncio.ensure_future(q.get())
-            done, _ = await asyncio.wait({getter, reader}, timeout=30.0,
-                                         return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(
+                {getter, reader}, timeout=30.0, return_when=asyncio.FIRST_COMPLETED
+            )
             if getter in done:
                 await websocket.send_json(getter.result())
             else:
                 getter.cancel()
                 if not done:
-                    await websocket.send_json({"type": "ping", "ts": time.time()})  # detect dead peers
+                    await websocket.send_json(
+                        {"type": "ping", "ts": time.time()}
+                    )  # detect dead peers
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -1105,8 +1190,10 @@ async def ws_stream(websocket: WebSocket):
         reader.cancel()
         EVENT_HUB.unsubscribe(q)
 
+
 # Connection pool for HTTP requests
-http_client: Optional[httpx.AsyncClient] = None
+# Created at startup (and closed at shutdown); every peer call runs in between.
+http_client: httpx.AsyncClient = None  # type: ignore[assignment]
 
 # Kademlia DHT subsystem
 dht_discovery: Optional[KademliaDiscovery] = None
@@ -1114,9 +1201,9 @@ dht_dns_seeds: Optional[DNSSeedDiscovery] = None
 dht_config: DiscoveryConfig = DiscoveryConfig()
 
 # ---- Always-on JSON-RPC server (required for DHT inter-node protocol) ----
-from qrdx.rpc.server import RPCServer
 from qrdx.rpc.modules.dht import DHTModule
 from qrdx.rpc.modules.p2p import P2PModule
+from qrdx.rpc.server import RPCServer, rpc_caller
 
 rpc_server = RPCServer()
 
@@ -1155,23 +1242,54 @@ market_rpc_module = MarketModule()
 market_rpc_module.context = _ExchangeRPCContext()
 rpc_server.register_module(market_rpc_module)
 from qrdx.rpc.modules.history import HistoryModule
+
 history_rpc_module = HistoryModule()
 history_rpc_module.context = _ExchangeRPCContext()
 rpc_server.register_module(history_rpc_module)
 # On-chain governance reads (governance_*); its writes are exchange transactions.
 from qrdx.rpc.modules.governance import GovernanceModule
+
 governance_rpc_module = GovernanceModule()
 governance_rpc_module.context = _ExchangeRPCContext()
 rpc_server.register_module(governance_rpc_module)
 
+
+def _rpc_auth_error(request_body: Any, message: str) -> Response:
+    rid = request_body.get("id") if isinstance(request_body, dict) else None
+    payload = {"jsonrpc": "2.0", "id": rid, "error": {"code": -32099, "message": message}}
+    return Response(content=json.dumps(payload), media_type="application/json")
+
+
 @app.post("/rpc")
-async def rpc_endpoint(body: dict = Body(...)):
-    """JSON-RPC 2.0 endpoint"""
-    result = await rpc_server.handle_request(body)
+async def rpc_endpoint(request: Request):
+    """JSON-RPC 2.0 endpoint. A signed request (x-node-id / x-public-key / x-signature over the
+    exact body, timestamp and nonce) is attributed to the verified node (``rpc_caller``); a
+    signature that does not hold is refused outright. Methods marked ``@peer_only`` (blocks,
+    transactions, attestations, the handshake) are refused by the RPC server without a verified
+    caller; reads may come unsigned — what they return is verified by whoever uses it."""
+    raw = await request.body()
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None  # handle_request answers with the JSON-RPC parse error
+
+    caller: Optional[str] = None
+    if request.headers.get("x-signature"):
+        caller = await get_verified_sender(request)
+        if caller is None:
+            return _rpc_auth_error(parsed, "invalid or replayed peer signature")
+
+    token = rpc_caller.set(caller)
+    try:
+        client = caller or (request.client.host if request.client else "anonymous")
+        result = await rpc_server.handle_request(raw, client_id=client)
+    finally:
+        rpc_caller.reset(token)
     if result is None:
         return Response(status_code=204)
     # handle_request returns a JSON string; send it raw to avoid double-encoding
     return Response(content=result, media_type="application/json")
+
 
 LAST_PENDING_TRANSACTIONS_CLEAN = [0]
 block_processing_lock = asyncio.Lock()
@@ -1191,6 +1309,7 @@ def _get_exchange_mempool():
     global EXCHANGE_MEMPOOL
     if EXCHANGE_MEMPOOL is None:
         from qrdx.exchange import ExchangeMempool
+
         EXCHANGE_MEMPOOL = ExchangeMempool()
     return EXCHANGE_MEMPOOL
 
@@ -1207,14 +1326,16 @@ def _get_exchange_submitter():
         from qrdx.exchange.submission import ExchangeSubmitter
 
         def _peer_urls():
-            return [p.get('url') for p in NodesManager.get_propagate_peers()]
+            return [p.get("url") for p in NodesManager.get_propagate_peers()]
 
         async def _forward(url, tx_dict):
             return await NodeInterface(url, client=http_client, db=db)._rpc_call(
-                'exchange_sendTransaction', [tx_dict, True])
+                "exchange_sendTransaction", [tx_dict, True]
+            )
 
         EXCHANGE_SUBMITTER = ExchangeSubmitter(_get_exchange_mempool, _peer_urls, _forward)
     return EXCHANGE_SUBMITTER
+
 
 # EVM/account consensus path (Phase 2 / E-D3). The executor + state manager are
 # set when the contract RPC system initializes; the mempool admits eth txs for
@@ -1223,7 +1344,7 @@ def _get_exchange_submitter():
 EVM_EXECUTOR = None
 EVM_STATE_MANAGER = None
 EVM_MEMPOOL = None
-EVM_PENDING_NONCE = {}
+EVM_PENDING_NONCE: Dict[str, int] = {}
 
 # Transaction-nonce validity gate.
 #
@@ -1277,8 +1398,11 @@ _ENFORCE_TX_NONCE = True
 # bar for every change — so the gate was decided on the change's own
 # merits: deterministic, unit-tested including cross-node account-root agreement, and not
 # implicated in any observed failure.
-_ENFORCE_FAILED_TX_COSTS = os.getenv(
-    "QRDX_ENFORCE_FAILED_TX_COSTS", "1").lower() not in ("0", "false", "no")
+_ENFORCE_FAILED_TX_COSTS = os.getenv("QRDX_ENFORCE_FAILED_TX_COSTS", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
 
 
 async def _reset_evm_pending_nonces() -> int:
@@ -1310,8 +1434,9 @@ async def _rehydrate_evm_pending_nonces() -> int:
     global EVM_PENDING_NONCE
     try:
         cursor = await db.connection.execute(
-            "SELECT LOWER(address), nonce FROM account_state WHERE nonce > 0")
-        rows = await cursor.fetchall()
+            "SELECT LOWER(address), nonce FROM account_state WHERE nonce > 0"
+        )
+        rows = list(await cursor.fetchall())
     except Exception as e:
         logger.warning("EVM pending-nonce rehydrate skipped: %s", e)
         return 0
@@ -1321,8 +1446,7 @@ async def _rehydrate_evm_pending_nonces() -> int:
         except (TypeError, ValueError):
             continue
     if rows:
-        logger.info("Rehydrated %d account nonce(s) into the EVM mempool's expectations",
-                    len(rows))
+        logger.info("Rehydrated %d account nonce(s) into the EVM mempool's expectations", len(rows))
     return len(rows)
 
 
@@ -1330,14 +1454,21 @@ def _get_evm_mempool():
     global EVM_MEMPOOL
     if EVM_MEMPOOL is None:
         from qrdx.contracts.evm_mempool import EVMMempool
-        EVM_MEMPOOL = EVMMempool(
-            nonce_provider=lambda addr: EVM_PENDING_NONCE.get(addr.lower(), 0)
-        )
+
+        EVM_MEMPOOL = EVMMempool(nonce_provider=lambda addr: EVM_PENDING_NONCE.get(addr.lower(), 0))
     return EVM_MEMPOOL
 
 
-async def _charge_failed_tx(state_manager, sender_hex, tx_nonce, gas_used, gas_limit,
-                            gas_price, intrinsic, defer_commit=False):
+async def _charge_failed_tx(
+    state_manager,
+    sender_hex,
+    tx_nonce,
+    gas_used,
+    gas_limit,
+    gas_price,
+    intrinsic,
+    defer_commit=False,
+):
     """
     Apply the cost of a FAILED transaction: charge gas and consume the nonce.
 
@@ -1373,7 +1504,8 @@ async def _charge_failed_tx(state_manager, sender_hex, tx_nonce, gas_used, gas_l
         logger.error("could not charge failed tx for %s: %s", sender_hex[:20], e)
         return 0
     EVM_PENDING_NONCE[sender_hex.lower()] = max(
-        EVM_PENDING_NONCE.get(sender_hex.lower(), 0), int(tx_nonce) + 1)
+        EVM_PENDING_NONCE.get(sender_hex.lower(), 0), int(tx_nonce) + 1
+    )
     return charged
 
 
@@ -1386,8 +1518,9 @@ def _evm_block_timestamp(value) -> int:
         return 1
 
 
-async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timestamp,
-                              defer_commit=False):
+async def _execute_evm_raw_tx(
+    raw_tx_hex, block_height, block_hash, block_timestamp, defer_commit=False
+):
     """
     Execute a signed raw EVM transaction against EVM/account state (E-D3 core).
 
@@ -1404,9 +1537,6 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
     Returns a dict: {success, tx_hash, sender, nonce, created_address, error}.
     """
     from eth_utils import decode_hex, encode_hex
-    from eth_keys import keys
-    import rlp
-    from eth_hash.auto import keccak
 
     evm_executor = EVM_EXECUTOR
     state_manager = EVM_STATE_MANAGER
@@ -1421,8 +1551,8 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
     # Either way ``sender`` is 20 bytes, which is why the EVM below needs no
     # knowledge of PQ accounts at all.
     from ..contracts.evm_mempool import parse_eth_raw_tx
+
     try:
-        raw_tx = decode_hex(raw_tx_hex)
         parsed = parse_eth_raw_tx(raw_tx_hex)
         nonce = parsed["nonce"]
         gas_price_wei = parsed["gas_price"]
@@ -1437,7 +1567,7 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
         spend_hex = parsed.get("spend_from") or sender_hex
         spend_from = decode_hex(spend_hex)
         to_hex = parsed["to"]
-        to_bytes = decode_hex(to_hex) if to_hex else b''
+        to_bytes = decode_hex(to_hex) if to_hex else b""
         tx_hash_hex = parsed["tx_hash"]
     except Exception as e:
         return {"success": False, "error": f"decode/authenticate failed: {e}", "tx_hash": None}
@@ -1451,17 +1581,29 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
         try:
             expected_nonce = await state_manager.get_nonce(sender_hex)
         except Exception as e:
-            return {"success": False, "error": f"cannot read account nonce: {e}",
-                    "tx_hash": tx_hash_hex, "sender": sender_hex, "nonce": nonce}
+            return {
+                "success": False,
+                "error": f"cannot read account nonce: {e}",
+                "tx_hash": tx_hash_hex,
+                "sender": sender_hex,
+                "nonce": nonce,
+            }
         if nonce != expected_nonce:
             # No state is touched, so this is a deterministic no-op on every node.
             return {
                 "success": False,
-                "error": (f"invalid nonce: tx has {nonce}, account expects "
-                          f"{expected_nonce}" +
-                          (" (replay of an already-executed transaction)"
-                           if nonce < expected_nonce else "")),
-                "tx_hash": tx_hash_hex, "sender": sender_hex, "nonce": nonce,
+                "error": (
+                    f"invalid nonce: tx has {nonce}, account expects "
+                    f"{expected_nonce}"
+                    + (
+                        " (replay of an already-executed transaction)"
+                        if nonce < expected_nonce
+                        else ""
+                    )
+                ),
+                "tx_hash": tx_hash_hex,
+                "sender": sender_hex,
+                "nonce": nonce,
             }
 
     # The EVM reads state on demand from the state manager (this block's pending changes over
@@ -1470,40 +1612,67 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
     # section is accepted (contracts/native_token_evm.py).
     from ..contracts.evm_world import EvmWorld, run as run_evm
     from ..contracts.native_token_evm import CURRENT_SECTION, EvmSection, TokenWorld
+
     section = CURRENT_SECTION.get()
     standalone = section is None
     if standalone:
         section = EvmSection()
-    await state_manager.get_account(sender_hex)        # the payer is in the cache
+    await state_manager.get_account(sender_hex)  # the payer is in the cache
     snap = await state_manager.snapshot()
     world = EvmWorld(state_manager, tokens=TokenWorld(db, section, height=block_height))
 
     def _receipt(result, success, error):
         section.record(
-            tx_hash=tx_hash_hex, block_number=int(block_height or 0), **{"from": sender_hex},
-            to=to_hex, value=value_wei, gas_limit=gas,
-            gas_used=min(gas, max(int(getattr(result, "gas_used", gas) or 0),
-                                  int(parsed.get("intrinsic_gas") or 0))),
-            gas_price=gas_price_wei, nonce=nonce, data=data,
-            contract_address=(encode_hex(result.created_address)
-                              if result is not None and result.created_address else None),
-            success=success, error=error, logs=(result.logs if result is not None else []),
-            timestamp=_evm_block_timestamp(block_timestamp))
+            tx_hash=tx_hash_hex,
+            block_number=int(block_height or 0),
+            **{"from": sender_hex},
+            to=to_hex,
+            value=value_wei,
+            gas_limit=gas,
+            gas_used=min(
+                gas,
+                max(
+                    int(getattr(result, "gas_used", gas) or 0),
+                    int(parsed.get("intrinsic_gas") or 0),
+                ),
+            ),
+            gas_price=gas_price_wei,
+            nonce=nonce,
+            data=data,
+            contract_address=(
+                encode_hex(result.created_address)
+                if result is not None and result.created_address
+                else None
+            ),
+            success=success,
+            error=error,
+            logs=(result.logs if result is not None else []),
+            timestamp=_evm_block_timestamp(block_timestamp),
+        )
 
     try:
         # The EVM moves value from the account named as `sender`, so a delegated spend
         # runs with the SOURCE as the EVM sender and `origin` kept as the real signer (so a
         # contract still sees who authorised it via tx.origin); the signer — `payer` — pays
         # the gas and consumes its nonce.
-        result = await run_evm(world, lambda: evm_executor.execute(
-            spend_from, to_bytes if to_bytes else None, value_wei, data, gas,
-            gas_price_wei,
-            origin=sender,
-            intrinsic_gas=int(parsed.get("intrinsic_gas") or 0),
-            block_number=int(block_height or 1),
-            timestamp=_evm_block_timestamp(block_timestamp),
-            world=world, payer=sender,
-        ), preload=[sender, spend_from, to_bytes])
+        result = await run_evm(
+            world,
+            lambda: evm_executor.execute(
+                spend_from,
+                to_bytes if to_bytes else None,
+                value_wei,
+                data,
+                gas,
+                gas_price_wei,
+                origin=sender,
+                intrinsic_gas=int(parsed.get("intrinsic_gas") or 0),
+                block_number=int(block_height or 1),
+                timestamp=_evm_block_timestamp(block_timestamp),
+                world=world,
+                payer=sender,
+            ),
+            preload=[sender, spend_from, to_bytes],
+        )
         _receipt(result, result.success, result.error)
         if not result.success:
             # Undo the state changes but not what a failure must still cost: the gas
@@ -1512,26 +1681,43 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
             await state_manager.revert(snap)
             if _ENFORCE_FAILED_TX_COSTS:
                 await _charge_failed_tx(
-                    state_manager, sender_hex, nonce,
-                    gas_used=result.gas_used, gas_limit=gas, gas_price=gas_price_wei,
+                    state_manager,
+                    sender_hex,
+                    nonce,
+                    gas_used=result.gas_used,
+                    gas_limit=gas,
+                    gas_price=gas_price_wei,
                     intrinsic=int(parsed.get("intrinsic_gas") or 0),
                     defer_commit=defer_commit,
                 )
             if not defer_commit:
                 await state_manager.commit(block_height)
-            return {"success": False, "error": result.error, "tx_hash": tx_hash_hex,
-                    "sender": sender_hex, "nonce": nonce,
-                    "gas_charged": min(gas, max(result.gas_used,
-                                                int(parsed.get("intrinsic_gas") or 0)))}
+            return {
+                "success": False,
+                "error": result.error,
+                "tx_hash": tx_hash_hex,
+                "sender": sender_hex,
+                "nonce": nonce,
+                "gas_charged": min(
+                    gas, max(result.gas_used, int(parsed.get("intrinsic_gas") or 0))
+                ),
+            }
         section.absorb(result.token_journal or [])
         if not defer_commit:
             await state_manager.commit(block_height)
         if standalone:
             await section.commit(db)
         created = encode_hex(result.created_address) if result.created_address else None
-        EVM_PENDING_NONCE[sender_hex.lower()] = max(EVM_PENDING_NONCE.get(sender_hex.lower(), 0), nonce + 1)
-        return {"success": True, "tx_hash": tx_hash_hex, "sender": sender_hex,
-                "nonce": nonce, "created_address": created}
+        EVM_PENDING_NONCE[sender_hex.lower()] = max(
+            EVM_PENDING_NONCE.get(sender_hex.lower(), 0), nonce + 1
+        )
+        return {
+            "success": True,
+            "tx_hash": tx_hash_hex,
+            "sender": sender_hex,
+            "nonce": nonce,
+            "created_address": created,
+        }
     except Exception as e:
         logger.error(f"EVM execution of {tx_hash_hex} raised: {e}")
         await state_manager.revert(snap)
@@ -1543,15 +1729,24 @@ async def _execute_evm_raw_tx(raw_tx_hex, block_height, block_hash, block_timest
         # is not attributable to a partial execution.
         if _ENFORCE_FAILED_TX_COSTS:
             await _charge_failed_tx(
-                state_manager, sender_hex, nonce,
-                gas_used=gas, gas_limit=gas, gas_price=gas_price_wei,
+                state_manager,
+                sender_hex,
+                nonce,
+                gas_used=gas,
+                gas_limit=gas,
+                gas_price=gas_price_wei,
                 intrinsic=int(parsed.get("intrinsic_gas") or 0),
                 defer_commit=defer_commit,
             )
         if not defer_commit:
             await state_manager.commit(block_height)
-        return {"success": False, "error": str(e), "tx_hash": tx_hash_hex,
-                "sender": sender_hex, "nonce": nonce}
+        return {
+            "success": False,
+            "error": str(e),
+            "tx_hash": tx_hash_hex,
+            "sender": sender_hex,
+            "nonce": nonce,
+        }
 
 
 async def _apply_block_withdrawals_on_import(block_height, block_epoch):
@@ -1568,6 +1763,7 @@ async def _apply_block_withdrawals_on_import(block_height, block_epoch):
         return
     try:
         from ..validator.withdrawals import process_block_withdrawals
+
         await process_block_withdrawals(db, int(block_height), int(block_epoch))
     except Exception as e:
         logger.error(f"withdrawal processing failed on import of block {block_height}: {e}")
@@ -1584,13 +1780,15 @@ def _exchange_tick_on_import(block_height, block_timestamp) -> None:
         return
     try:
         from ..exchange.block_processor import run_exchange_tick
+
         run_exchange_tick(int(block_height), float(block_timestamp or 0))
     except Exception as e:
         logger.error(f"exchange tick failed at block {block_height}: {e}")
 
 
-async def _apply_exchange_section_on_import(block_height, block_timestamp,
-                                            ex_section, declared_root, block_epoch=None):
+async def _apply_exchange_section_on_import(
+    block_height, block_timestamp, ex_section, declared_root, block_epoch=None
+):
     """
     Importer hook for the exchange section, with the same strict/trust split as
     the EVM one (E-D3b). Strict (declared root present, live broadcast): validate
@@ -1601,13 +1799,17 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
     if not ex_section:
         return True, ""
     from ..exchange.block_processor import (
-        decode_exchange_txs, preload_sender_balances, preload_token_balances,
-        flush_exchange_balance_deltas, flush_token_balance_deltas,
+        ENFORCE_EXCHANGE_COLLATERAL,
+        apply_enforcement,
+        decode_exchange_txs,
+        flush_exchange_balance_deltas,
+        flush_token_balance_deltas,
         flush_validator_lifecycle_deltas,
-        ENFORCE_EXCHANGE_COLLATERAL, ENFORCE_SPOT_SETTLEMENT, ENFORCE_ORDERBOOK_SETTLEMENT,
-        ENFORCE_POOL_STAKE, ENFORCE_VALIDATOR_STAKE, ENFORCE_EXCHANGE_FEES, apply_enforcement,
+        preload_sender_balances,
+        preload_token_balances,
     )
     from ..exchange.state_manager import ExchangeStateManager
+
     mgr = ExchangeStateManager.get_instance()
     apply_enforcement(mgr)
     # Phase E: pre-load senders' real QRDX + token balances so the collateral and
@@ -1621,8 +1823,12 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
 
     if declared_root:
         from ..exchange.block_processor import apply_block_exchange_section
+
         ok, err = apply_block_exchange_section(
-            block_height, float(block_timestamp or 0), ex_section, declared_root,
+            block_height,
+            float(block_timestamp or 0),
+            ex_section,
+            declared_root,
         )
         if ok:
             # Phase E: flush margin debits to account_state + token moves to the
@@ -1630,21 +1836,27 @@ async def _apply_exchange_section_on_import(block_height, block_timestamp,
             await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
             await flush_token_balance_deltas(db, mgr)
             await flush_validator_lifecycle_deltas(
-                db, mgr, block_epoch=block_epoch, block_height=block_height)
+                db, mgr, block_epoch=block_epoch, block_height=block_height
+            )
         return ok, err
     # Trust-replay (sync): adopt the canonical section's computed root.
     try:
         from ..exchange.block_processor import process_exchange_transactions
+
         txs = decode_exchange_txs(ex_section)
         ok, err, _root = process_exchange_transactions(
-            block_height, float(block_timestamp or 0), txs, mgr,
+            block_height,
+            float(block_timestamp or 0),
+            txs,
+            mgr,
         )
         if ok:
             mgr.commit_block()
             await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
             await flush_token_balance_deltas(db, mgr)
             await flush_validator_lifecycle_deltas(
-                db, mgr, block_epoch=block_epoch, block_height=block_height)
+                db, mgr, block_epoch=block_epoch, block_height=block_height
+            )
         else:
             logger.warning(f"Exchange section trust-replay failed at block {block_height}: {err}")
         return True, ""
@@ -1687,8 +1899,7 @@ _ED4_ENFORCE_SYNC_FINALIZED = True
 # fixes logged zero observe mismatches. A node whose own state is wrong is not stuck either:
 # the rejection rebuilds derived state from the chain, and the next sync attempt re-applies
 # the block on clean state. Env-overridable (QRDX_ED4_ENFORCE_SYNC=0) for A/B testing only.
-_ED4_ENFORCE_SYNC_TIP = os.getenv(
-    "QRDX_ED4_ENFORCE_SYNC", "1").lower() not in ("0", "false", "no")
+_ED4_ENFORCE_SYNC_TIP = os.getenv("QRDX_ED4_ENFORCE_SYNC", "1").lower() not in ("0", "false", "no")
 
 
 def _sync_ed4_enforced(at_finalized: bool) -> bool:
@@ -1696,7 +1907,9 @@ def _sync_ed4_enforced(at_finalized: bool) -> bool:
     return _ED4_ENFORCE_SYNC_TIP or (at_finalized and _ED4_ENFORCE_SYNC_FINALIZED)
 
 
-async def _check_parent_continuity(block_height, block_content, enforce: Optional[bool] = None) -> Tuple[bool, str]:
+async def _check_parent_continuity(
+    block_height, block_content, enforce: Optional[bool] = None
+) -> Tuple[bool, str]:
     """
     Verify a block's declared ``parent_hash`` equals the local tip (the stored
     block at ``block_height - 1``). The import path otherwise only checks that
@@ -1715,6 +1928,7 @@ async def _check_parent_continuity(block_height, block_content, enforce: Optiona
     if not block_height or block_height <= 0:
         return True, ""
     from ..validator.block_verification import _parse_block_content
+
     try:
         bc = _parse_block_content(block_content)
         declared_parent = bc.get("parent_hash")
@@ -1723,14 +1937,19 @@ async def _check_parent_continuity(block_height, block_content, enforce: Optiona
     if not declared_parent:
         return True, ""
     try:
-        parent_block = await db.get_block_by_id(block_height - 1)
+        read = getattr(db, "get_block_header", None) or db.get_block_by_id  # no body needed
+        parent_block = await read(block_height - 1)
     except Exception:
         parent_block = None
-    local_tip = (parent_block.get("hash") or parent_block.get("block_hash")) if parent_block else None
+    local_tip = (
+        (parent_block.get("hash") or parent_block.get("block_hash")) if parent_block else None
+    )
     if local_tip and declared_parent != local_tip:
-        msg = (f"parent_hash mismatch at height {block_height}: declared "
-               f"{str(declared_parent)[:16]}..., local tip {str(local_tip)[:16]}... "
-               f"(block is on a fork)")
+        msg = (
+            f"parent_hash mismatch at height {block_height}: declared "
+            f"{str(declared_parent)[:16]}..., local tip {str(local_tip)[:16]}... "
+            f"(block is on a fork)"
+        )
         if enforce:
             return False, msg
         logger.warning(f"[parent-continuity observe] {msg}")
@@ -1738,7 +1957,57 @@ async def _check_parent_continuity(block_height, block_content, enforce: Optiona
     return True, ""
 
 
-async def _verify_unified_state_root(block_content, enforce: Optional[bool] = None) -> Tuple[bool, str]:
+_GENESIS_TIME: Dict[str, float] = {}
+
+
+async def _current_slot() -> Optional[int]:
+    """This node's wall-clock slot, from the genesis block's time (None before genesis)."""
+    if "t" not in _GENESIS_TIME:
+        from ..validator.node_integration import parse_block_timestamp
+
+        genesis = await db.get_block_by_id(0)
+        parsed = parse_block_timestamp(genesis.get("timestamp") if genesis else None)
+        if parsed is None:
+            return None
+        _GENESIS_TIME["t"] = parsed.timestamp()
+    from ..constants import SLOT_DURATION
+
+    return max(0, int((time.time() - _GENESIS_TIME["t"]) // SLOT_DURATION))
+
+
+async def _verify_chain_rules(block_content, block_height) -> Tuple[bool, str]:
+    """The rules a block must satisfy against the chain it extends, run by every import path
+    after the parent check and before anything is applied:
+
+    * its slot is later than its parent's and not ahead of the clock
+      (block_verification.verify_slot_progression);
+    * every attestation it carries is a valid Casper FFG vote for this chain — known key,
+      valid signature, target this chain's checkpoint (ffg.verify_block_votes)."""
+    from ..validator import ffg
+    from ..validator.block_verification import (
+        _parse_block_content,
+        epoch_from_block,
+        verify_slot_progression,
+    )
+
+    try:
+        bc = _parse_block_content(block_content)
+    except Exception as e:
+        return False, f"unparseable block: {e}"
+    if not isinstance(bc, dict):
+        return False, "unparseable block"
+    try:
+        ok, err = await verify_slot_progression(db, bc, int(block_height), await _current_slot())
+        if not ok:
+            return False, err
+        return await ffg.verify_block_votes(db, bc, int(block_height), epoch_from_block(bc))
+    except Exception as e:
+        return False, f"chain-rule verification error: {e}"
+
+
+async def _verify_unified_state_root(
+    block_content, enforce: Optional[bool] = None
+) -> Tuple[bool, str]:
     """
     E-D4: recompute the post-block unified state root (UTXO + account + exchange)
     and compare it to the block's signed ``state_root`` (in block_content).
@@ -1754,29 +2023,33 @@ async def _verify_unified_state_root(block_content, enforce: Optional[bool] = No
         enforce = _ED4_ENFORCE_UNIFIED_ROOT
     from ..crypto.hashing import unified_state_root
     from ..validator.block_verification import _parse_block_content
+
     try:
         bc = _parse_block_content(block_content)
         declared = bc.get("state_root")
+        # Each domain's root is judged under the rule of this block's height.
+        height: Optional[int] = int(bc["number"]) if bc.get("number") is not None else None
     except Exception:
         return True, ""  # malformed content is the proposer-sig check's job
     if not declared:
         return True, ""
 
     try:
-        utxo_root = await db.get_unspent_outputs_hash()
+        utxo_root = await db.get_unspent_outputs_hash(height)
     except Exception:
         utxo_root = "0" * 64
     try:
-        account_root = await db.get_account_state_root()
+        account_root = await db.get_account_state_root(height)
     except Exception:
         account_root = "0" * 128
     try:
         from ..exchange.state_manager import ExchangeStateManager
+
         exchange_root = ExchangeStateManager.get_instance().compute_state_root()
     except Exception:
         exchange_root = "0" * 128
     try:
-        token_root = await db.get_token_balances_root()
+        token_root = await db.get_token_balances_root(height)
     except Exception:
         token_root = "0" * 128
 
@@ -1784,8 +2057,10 @@ async def _verify_unified_state_root(block_content, enforce: Optional[bool] = No
     # consensus object that converges across nodes (Phase E spot inc4/inc4b).
     computed = unified_state_root(utxo_root or "0" * 64, account_root, exchange_root, token_root)
     if computed != declared:
-        msg = (f"unified state root mismatch: declared {str(declared)[:16]}..., "
-               f"computed {computed[:16]}...")
+        msg = (
+            f"unified state root mismatch: declared {str(declared)[:16]}..., "
+            f"computed {computed[:16]}..."
+        )
         if enforce:
             return False, msg
         logger.warning(f"[E-D4 observe] {msg}")
@@ -1795,8 +2070,10 @@ async def _verify_unified_state_root(block_content, enforce: Optional[bool] = No
 
 def _evm_defer_execute():
     """An execute_tx callable bound to the live executor, deferring per-tx commit."""
+
     async def _execute(raw, h, bh, bt):
         return await _execute_evm_raw_tx(raw, h, bh, bt, defer_commit=True)
+
     return _execute
 
 
@@ -1811,14 +2088,21 @@ async def _produce_evm_section(block_height, block_hash, block_timestamp, raw_tx
     if EVM_STATE_MANAGER is None or not raw_txs:
         return None, []
     from ..contracts.evm_block_apply import produce_block_evm_section
+
     return await produce_block_evm_section(
-        block_height, block_hash, block_timestamp, raw_txs,
-        db, EVM_STATE_MANAGER, _evm_defer_execute(),
+        block_height,
+        block_hash,
+        block_timestamp,
+        raw_txs,
+        db,
+        EVM_STATE_MANAGER,
+        _evm_defer_execute(),
     )
 
 
-async def _apply_evm_section_on_import(block_height, block_hash, block_timestamp,
-                                       evm_section, declared_root):
+async def _apply_evm_section_on_import(
+    block_height, block_hash, block_timestamp, evm_section, declared_root
+):
     """
     Importer hook (E-D3b): validate + replay a block's EVM section, rejecting on
     any mismatch (local state left untouched). Returns ``(ok, error)``.
@@ -1840,20 +2124,35 @@ async def _apply_evm_section_on_import(block_height, block_hash, block_timestamp
     if not evm_section:
         return True, ""
     if EVM_STATE_MANAGER is None:
-        logger.warning("EVM section present but EVM disabled on this node — storing without applying")
+        logger.warning(
+            "EVM section present but EVM disabled on this node — storing without applying"
+        )
         return True, ""
     if declared_root:
         from ..contracts.evm_block_apply import apply_block_evm_section
+
         return await apply_block_evm_section(
-            block_height, block_hash, block_timestamp, evm_section, declared_root,
-            db, EVM_STATE_MANAGER, _evm_defer_execute(),
+            block_height,
+            block_hash,
+            block_timestamp,
+            evm_section,
+            declared_root,
+            db,
+            EVM_STATE_MANAGER,
+            _evm_defer_execute(),
         )
     # Trust-replay (sync): adopt the canonical section's computed root.
     from ..contracts.evm_block_apply import produce_block_evm_section
+
     try:
         root, included = await produce_block_evm_section(
-            block_height, block_hash, block_timestamp, evm_section,
-            db, EVM_STATE_MANAGER, _evm_defer_execute(),
+            block_height,
+            block_hash,
+            block_timestamp,
+            evm_section,
+            db,
+            EVM_STATE_MANAGER,
+            _evm_defer_execute(),
         )
         if root is None:
             logger.warning(f"EVM section trust-replay produced no root at block {block_height}")
@@ -1879,15 +2178,16 @@ async def _gossip_evm_raw_tx(raw_tx_hex: str):
         logger.debug("EVM gossip: could not list peers: %s", e)
         return
     for peer in peers:
-        url = peer.get('url')
+        url = peer.get("url")
         if not url:
             continue
         try:
             ni = NodeInterface(url, client=http_client, db=db)
             # _propagated=True so the receiving peer does not re-broadcast on our behalf.
-            await ni._rpc_call('eth_sendRawTransaction', [raw_tx_hex, True])
+            await ni._rpc_call("eth_sendRawTransaction", [raw_tx_hex, True])
         except Exception as e:
             logger.debug("EVM tx gossip to %s failed: %s", url, e)
+
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -1895,41 +2195,48 @@ async def _gossip_evm_raw_tx(raw_tx_hex: str):
 # Request logging middleware
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all incoming HTTP requests using the logger."""
+    """Access log of every HTTP request, at DEBUG. Peers call each other constantly, and two
+    INFO lines per request through the rich console handler cost a validator a measurable
+    share of its event loop; with DEBUG off this returns straight away."""
+    import logging as _logging
     import time
+
+    if not logger.isEnabledFor(_logging.DEBUG):
+        return await call_next(request)
+
     start_time = time.time()
-    
+
     # Get client IP
     client_ip = request.client.host if request.client else "unknown"
-    
+
     # Build request path with query params
     method = request.method
     path = request.url.path
     query_params = str(request.query_params) if request.query_params else ""
     full_path = f"{path}?{query_params}" if query_params else path
-    
+
     # Truncate very long paths to prevent log spam from malicious requests
     if len(full_path) > LOG_MAX_PATH_LENGTH:
         full_path = full_path[:LOG_MAX_PATH_LENGTH] + "...[TRUNCATED]"
-    
+
     # Extract and format request body if present
     body = None
     body_bytes = None
     if LOG_INCLUDE_REQUEST_CONTENT:
         try:
             # Check if request has a body
-            content_length = request.headers.get('content-length')
-            
+            content_length = request.headers.get("content-length")
+
             if content_length and int(content_length) > 0:
                 # Read body bytes (this consumes the body, so we'll restore it)
                 body_bytes = await request.body()
-                
+
                 if body_bytes:
                     # Try to parse as JSON
                     try:
-                        body_str = body_bytes.decode('utf-8')
+                        body_str = body_bytes.decode("utf-8")
                         parsed_value = json.loads(body_str)
-                        
+
                         # Skip empty collections
                         if isinstance(parsed_value, (dict, list)) and len(parsed_value) == 0:
                             body = None
@@ -1938,7 +2245,7 @@ async def log_requests(request: Request, call_next):
                             body = json.dumps(parsed_value, indent=2)
                     except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
                         # Not JSON or not valid UTF-8, use raw string
-                        body_str = body_bytes.decode('utf-8', errors='replace')
+                        body_str = body_bytes.decode("utf-8", errors="replace")
                         if len(body_str) > 0:
                             body = body_str
                         else:
@@ -1947,47 +2254,49 @@ async def log_requests(request: Request, call_next):
             # Silently fail body extraction to not break request processing
             body = None
             body_bytes = None
-    
+
     # Restore request body if we read it (so endpoints can still access it)
     if body_bytes is not None:
+
         async def receive():
-            return {'type': 'http.request', 'body': body_bytes}
+            return {"type": "http.request", "body": body_bytes}
+
         request._receive = receive
-    
+
     # Log incoming request
     request_body_log = f"\n\nIncoming Request:\n{body}\n" if body else ""
-    logger.info(f"<-- {client_ip} - \"{method} {full_path} HTTP/1.1\"{request_body_log}")
-    
+    logger.debug(f'<-- {client_ip} - "{method} {full_path} HTTP/1.1"{request_body_log}')
+
     # Process request
     try:
         response = await call_next(request)
         process_time = time.time() - start_time
         status_code = response.status_code
-        
+
         # Extract and format response body if present
         response_body = None
-        if LOG_INCLUDE_RESPONSE_CONTENT and hasattr(response, 'body_iterator'):
+        if LOG_INCLUDE_RESPONSE_CONTENT and hasattr(response, "body_iterator"):
             try:
                 # Read response body
                 response_body_bytes = b""
                 async for chunk in response.body_iterator:
                     response_body_bytes += chunk
-                
+
                 # Always recreate response with the body so client still receives it
                 # (body_iterator is consumed after reading)
                 response = Response(
                     content=response_body_bytes,
                     status_code=status_code,
                     headers=dict(response.headers),
-                    media_type=response.media_type
+                    media_type=response.media_type,
                 )
-                
+
                 # Format body for logging
                 if response_body_bytes:
                     try:
-                        response_body_str = response_body_bytes.decode('utf-8')
+                        response_body_str = response_body_bytes.decode("utf-8")
                         parsed_value = json.loads(response_body_str)
-                        
+
                         # Skip empty collections
                         if isinstance(parsed_value, (dict, list)) and len(parsed_value) == 0:
                             response_body = None
@@ -1996,7 +2305,7 @@ async def log_requests(request: Request, call_next):
                             response_body = json.dumps(parsed_value, indent=2)
                     except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
                         # Not JSON or not valid UTF-8, use raw string
-                        response_body_str = response_body_bytes.decode('utf-8', errors='replace')
+                        response_body_str = response_body_bytes.decode("utf-8", errors="replace")
                         if len(response_body_str) > 0:
                             response_body = response_body_str
                         else:
@@ -2004,16 +2313,21 @@ async def log_requests(request: Request, call_next):
             except Exception:
                 # Silently fail response body extraction, return original response
                 response_body = None
-        
+
         # Log response
         response_body_log = f"\n\nOutgoing Response:\n{response_body}\n" if response_body else ""
-        logger.info(f"--> {client_ip} - \"{method} {full_path} HTTP/1.1\" {status_code}⁢ ({process_time:.3f}s){response_body_log}")
-        
+        logger.debug(
+            f'--> {client_ip} - "{method} {full_path} HTTP/1.1" {status_code}⁢ ({process_time:.3f}s){response_body_log}'
+        )
+
         return response
     except Exception as e:
         process_time = time.time() - start_time
-        logger.error(f"--> {client_ip} - \"{method} {full_path} HTTP/1.1\" ERROR ({process_time:.3f}s){request_body_log}: {e}")
+        logger.error(
+            f'--> {client_ip} - "{method} {full_path} HTTP/1.1" ERROR ({process_time:.3f}s){request_body_log}: {e}'
+        )
         raise
+
 
 async def validate_url_for_connection(url: str) -> bool:
     """Validate URL is safe for outbound connections with DNS rebinding protection"""
@@ -2021,13 +2335,13 @@ async def validate_url_for_connection(url: str) -> bool:
         return False
     is_valid, resolved_ip = await security.dns_client.validate_and_resolve(url)
     if not is_valid:
-        return False 
+        return False
     try:
         ip_obj = ipaddress.ip_address(resolved_ip)
         # Block connections to loopback, link-local, or reserved IPs
         if not ip_obj.is_global and not ip_obj.is_private:
-             logger.warning(f"Blocked connection to reserved/loopback/link-local IP: {resolved_ip}")
-             return False
+            logger.warning(f"Blocked connection to reserved/loopback/link-local IP: {resolved_ip}")
+            return False
         # If the node itself is public, it must not initiate connections to private networks
         if self_is_public and ip_obj.is_private:
             logger.warning(f"Public node blocked connection attempt to private IP: {resolved_ip}")
@@ -2038,62 +2352,68 @@ async def validate_url_for_connection(url: str) -> bool:
         return False
 
 
-async def propagate(path: str, data: dict, ignore_node_id: str = None, db: Database = None):
+async def propagate(
+    path: str, data: dict, ignore_node_id: Optional[str] = None, db: Optional[Database] = None
+):
     """Propagates a message with reputation tracking and rate limiting"""
     async with security.propagation_semaphore:
         all_peers = NodesManager.get_propagate_peers()
-        
+
         # Filter out banned peers
         non_banned_peers = []
         for peer in all_peers:
-            if not await security.reputation_manager.is_banned(peer['node_id']):
+            if not await security.reputation_manager.is_banned(peer["node_id"]):
                 non_banned_peers.append(peer)
-            
+
         # Limit number of peers
         max_peers_to_propagate = min(len(non_banned_peers), 20)
         if len(non_banned_peers) > max_peers_to_propagate:
             all_peers = random.sample(non_banned_peers, max_peers_to_propagate)
         else:
             all_peers = non_banned_peers
-        
+
         tasks = []
 
         for peer in all_peers:
-            if peer['node_id'] == ignore_node_id:
+            if peer["node_id"] == ignore_node_id:
                 continue
-            
+
             async def communication_task(peer_info: dict, p: str, d: dict):
-                peer_id = peer_info.get('node_id', 'Unknown')
-                peer_url = peer_info.get('url')
+                peer_id = peer_info.get("node_id", "Unknown")
+                peer_url = peer_info.get("url")
 
                 try:
-                    ni = NodeInterface(peer_info['url'], client=http_client, db=db)
-                    
-                    if p == 'submit_block':
+                    ni = NodeInterface(peer_info["url"], client=http_client, db=db)
+
+                    if p == "submit_block":
                         response = await ni.submit_block(d)
-                    elif p == 'push_tx':
-                        response = await ni.push_tx(d['tx_hex'])
-                    elif p == 'push_attestation':
-                        response = await ni.push_attestation(d['attestation'])
-                    
-                    if response and response.get('error') == 'sync_required':
+                    elif p == "push_tx":
+                        response = await ni.push_tx(d["tx_hex"])
+                    elif p == "push_attestation":
+                        response = await ni.push_attestation(d["attestation"])
+
+                    if response and response.get("error") == "sync_required":
                         if not db:
-                            logger.warning(f"Received sync_required from {peer_id} but no DB connection available.")
+                            logger.warning(
+                                f"Received sync_required from {peer_id} but no DB connection available."
+                            )
                             return
 
                         # Use secure peer sync tracker
                         if await security.peer_sync_tracker.add_peer(peer_id):
-                            remote_info = response.get('result', {})
-                            next_block_needed = remote_info.get('next_block_expected')
+                            remote_info = response.get("result", {})
+                            next_block_needed = remote_info.get("next_block_expected")
 
                             if next_block_needed is not None:
-                                asyncio.create_task(_push_sync_to_peer(peer_info, next_block_needed, db, d))
+                                asyncio.create_task(
+                                    _push_sync_to_peer(peer_info, next_block_needed, db, d)
+                                )
                         return
 
                     # Track successful propagation
                     await security.reputation_manager.record_good_behavior(peer_id)
-                    logger.debug(f'propagate response from {peer_id}: {response}')
-                
+                    logger.debug(f"propagate response from {peer_id}: {response}")
+
                 except httpx.RequestError:
                     # The peer is unreachable (timeout, connection refused, etc.).
                     # This is a network failure, not a protocol violation. Remove them non-punitively.
@@ -2102,9 +2422,9 @@ async def propagate(path: str, data: dict, ignore_node_id: str = None, db: Datab
                 except Exception as e:
                     # Track failed propagation
                     await security.reputation_manager.record_violation(
-                        peer_id, 'propagation_failure', severity=1, details=str(e)
+                        peer_id, "propagation_failure", severity=1, details=str(e)
                     )
-                    logger.warning(f'propagate EXCEPTION from {peer_id}: {e}')
+                    logger.warning(f"propagate EXCEPTION from {peer_id}: {e}")
 
             tasks.append(communication_task(peer, path, data))
 
@@ -2115,9 +2435,12 @@ async def propagate(path: str, data: dict, ignore_node_id: str = None, db: Datab
 # Attestation gossip (the missing finality wiring — see _ENABLE_ATTESTATION_GOSSIP)
 # ---------------------------------------------------------------------------
 
+
 def _attestation_seen_key(att_dict: dict) -> str:
     """Dedup key for gossip flooding — one vote per (validator, slot, block)."""
-    return f"{att_dict.get('validator_address')}:{att_dict.get('slot')}:{att_dict.get('block_hash')}"
+    return (
+        f"{att_dict.get('validator_address')}:{att_dict.get('slot')}:{att_dict.get('block_hash')}"
+    )
 
 
 def _mark_attestation_seen(key: str) -> bool:
@@ -2142,12 +2465,12 @@ async def _broadcast_attestation(attestation) -> None:
     try:
         att_dict = attestation.to_dict()
         _mark_attestation_seen(_attestation_seen_key(att_dict))  # don't re-accept our own echo
-        await propagate('push_attestation', {'attestation': att_dict}, db=db)
+        await propagate("push_attestation", {"attestation": att_dict}, db=db)
     except Exception as e:
         logger.debug(f"attestation broadcast failed: {e}")
 
 
-async def _add_remote_attestation(att_dict: dict, sender_node_id: str = None) -> bool:
+async def _add_remote_attestation(att_dict: dict, sender_node_id: Optional[str] = None) -> bool:
     """Receive hook (p2p pushAttestation): verify a gossiped attestation against the
     attester's pubkey from the validators table, add it to this node's attestation pool
     (if this node is a validator → the proposer will include it), and re-gossip it once
@@ -2162,6 +2485,7 @@ async def _add_remote_attestation(att_dict: dict, sender_node_id: str = None) ->
 
         from ..validator.attestation import Attestation
         from ..validator.finality import _validator_stakes_and_keys
+
         att = Attestation.from_dict(att_dict)
 
         # Verify the signature against the attester's registered pubkey (same path the
@@ -2182,8 +2506,9 @@ async def _add_remote_attestation(att_dict: dict, sender_node_id: str = None) ->
 
         # Re-gossip once to the rest of the mesh (flood), excluding the sender.
         asyncio.create_task(
-            propagate('push_attestation', {'attestation': att_dict},
-                      ignore_node_id=sender_node_id, db=db)
+            propagate(
+                "push_attestation", {"attestation": att_dict}, ignore_node_id=sender_node_id, db=db
+            )
         )
         return True
     except Exception as e:
@@ -2191,92 +2516,125 @@ async def _add_remote_attestation(att_dict: dict, sender_node_id: str = None) ->
         return False
 
 
-async def _push_sync_to_peer(peer_info: dict, start_block: int, db_conn: Database, trigger_data: dict):
+async def _push_sync_to_peer(
+    peer_info: dict, start_block: int, db_conn: Database, trigger_data: dict
+):
     """Push missing blocks to a lagging peer with proper resource management."""
-    peer_id = peer_info.get('node_id', 'Unknown')
-    peer_url = peer_info.get('url')
+    peer_id = peer_info.get("node_id", "Unknown")
+    peer_url = peer_info.get("url")
     sync_successful = False
     try:
-        target_block_id = trigger_data.get('id')
+        target_block_id = trigger_data.get("id")
         if target_block_id is None:
-            logger.warning(f"[PUSH-SYNC] Aborted for {peer_id}: No target block ID in trigger data.")
+            logger.warning(
+                f"[PUSH-SYNC] Aborted for {peer_id}: No target block ID in trigger data."
+            )
             return
 
-        logger.info(f"[PUSH-SYNC] Starting for {peer_id}. They need blocks from {start_block} up to (but not including) {target_block_id}.")
-        
+        logger.info(
+            f"[PUSH-SYNC] Starting for {peer_id}. They need blocks from {start_block} up to (but not including) {target_block_id}."
+        )
+
         # Pass the db object to the interface
-        node_interface = NodeInterface(peer_info['url'], client=http_client, db=db_conn)
+        node_interface = NodeInterface(peer_info["url"], client=http_client, db=db_conn)
         current_block_to_send = start_block
 
         while current_block_to_send < target_block_id:
             remaining_blocks = target_block_id - current_block_to_send
             batch_size_limit = min(MAX_REORG_DEPTH, remaining_blocks)
-            
-            structured_blocks_to_send = await db_conn.get_blocks(current_block_to_send, batch_size_limit)
+
+            structured_blocks_to_send = await db_conn.get_blocks(
+                current_block_to_send, batch_size_limit
+            )
             if not structured_blocks_to_send:
-                logger.warning(f"[PUSH-SYNC] to {peer_id} halted. Local DB has no more blocks in the required range.")
+                logger.warning(
+                    f"[PUSH-SYNC] to {peer_id} halted. Local DB has no more blocks in the required range."
+                )
                 sync_successful = False
                 break
 
-            payload_batch = []
+            payload_batch: List[Any] = []
             current_batch_bytes = 0
 
             for raw_block in structured_blocks_to_send:
                 # db.get_blocks() returns raw row dicts — normalise into
                 # the {block, transactions} structure the rest of the code expects.
-                if isinstance(raw_block, dict) and 'block' in raw_block:
-                    block_record = raw_block['block']
-                    tx_list = raw_block.get('transactions', [])
+                if isinstance(raw_block, dict) and "block" in raw_block:
+                    block_record = raw_block["block"]
+                    tx_list = raw_block.get("transactions", [])
                 else:
                     block_record = raw_block
-                    block_hash = block_record.get('hash') or block_record.get('block_hash')
+                    block_hash = block_record.get("hash") or block_record.get("block_hash")
                     try:
-                        tx_list = await db_conn.get_block_transactions(block_hash, hex_only=True) if block_hash else []
+                        tx_list = (
+                            await db_conn.get_block_transactions(block_hash, hex_only=True)
+                            if block_hash
+                            else []
+                        )
                     except Exception:
                         tx_list = []
-                block_size_estimate = len(block_record.get('content','')) + sum(len(str(tx)) for tx in tx_list)
+                block_size_estimate = len(block_record.get("content", "")) + sum(
+                    len(str(tx)) for tx in tx_list
+                )
 
                 if payload_batch and current_batch_bytes + block_size_estimate > MAX_BATCH_BYTES:
                     break
 
+                # The hash and proposer are what route a block to the PoS import path; without
+                # them p2p_submitBlocks handed every pushed block to the PoW parser, which
+                # failed on it, so a push-sync of a PoS chain never delivered a block.
                 payload_item = {
-                    'id': block_record['id'],
-                    'block_content': block_record['content'],
-                    'txs': tx_list
+                    "id": block_record["id"],
+                    "block_content": block_record["content"],
+                    "block_hash": block_record.get("hash") or block_record.get("block_hash"),
+                    "validator_address": block_record.get("address")
+                    or block_record.get("validator_address"),
+                    "timestamp": block_record.get("timestamp"),
+                    "txs": tx_list,
                 }
                 # Attach protocol sections so the syncing peer reconstructs
                 # exchange + EVM/account state (E-D3b). Trust-replayed there.
-                _bh = block_record.get('hash') or block_record.get('block_hash')
+                _bh = block_record.get("hash") or block_record.get("block_hash")
                 if _bh:
                     try:
                         _ex = await db_conn.get_block_exchange_txs(_bh)
                         if _ex:
-                            payload_item['exchange_transactions'] = _ex
+                            payload_item["exchange_transactions"] = _ex
                     except Exception:
                         pass
                     try:
                         _evm = await db_conn.get_block_evm_txs(_bh)
                         if _evm:
-                            payload_item['evm_transactions'] = _evm
+                            payload_item["evm_transactions"] = _evm
                     except Exception:
                         pass
                 payload_batch.append(payload_item)
                 current_batch_bytes += block_size_estimate
-            
+
             if not payload_batch:
-                logger.warning(f"[PUSH-SYNC] Could not form a batch for {peer_id} without exceeding size limits. Halting.")
+                logger.warning(
+                    f"[PUSH-SYNC] Could not form a batch for {peer_id} without exceeding size limits. Halting."
+                )
                 return
 
             response = await node_interface.submit_blocks(payload_batch)
-            
-            if not response or not response.get('ok'):
-                error_msg = response.get('error', '')
-                if 'Block sequence out of order' in error_msg or 'sequence desynchronized' in error_msg:
-                    logger.info(f"[PUSH-SYNC] to {peer_id} ceded. Peer's state changed, another node is likely already syncing them.")
+
+            if not response or not response.get("ok"):
+                error_msg = response.get("error", "")
+                if (
+                    "Block sequence out of order" in error_msg
+                    or "sequence desynchronized" in error_msg
+                ):
+                    logger.info(
+                        f"[PUSH-SYNC] to {peer_id} ceded. Peer's state changed, another node is likely already syncing them."
+                    )
                 else:
-                    logger.warning(f"[PUSH-SYNC] to {peer_id} failed. Peer responded with an unexpected error: {response}")
-                    await security.reputation_manager.record_violation(
-                        peer_id, 'sync_rejection', severity=3
+                    # Not a violation: a peer may refuse blocks we offered it (its view of the
+                    # chain differs, or it is still starting). Penalising it here banned a
+                    # catching-up node after four refused pushes, and a banned node's handshake
+                    # is refused, which stranded it with no peer to pull from.
+                    logger.warning(
+                        f"[PUSH-SYNC] to {peer_id} failed. Peer responded with an unexpected error: {response}"
                     )
                 return
 
@@ -2286,36 +2644,40 @@ async def _push_sync_to_peer(peer_info: dict, start_block: int, db_conn: Databas
             await asyncio.sleep(0.1)
 
         if current_block_to_send >= target_block_id:
-            logger.info(f"[PUSH-SYNC] to {peer_id} complete. Sent all blocks up to {target_block_id - 1}.")
-            sync_successful = True 
-    
+            logger.info(
+                f"[PUSH-SYNC] to {peer_id} complete. Sent all blocks up to {target_block_id - 1}."
+            )
+            sync_successful = True
+
     except httpx.RequestError:
         await handle_unreachable_peer(peer_id, peer_url, "push-sync")
-        
+
     except Exception as e:
         logger.error(f"Error during BULK push-sync to {peer_id}: {e}")
         traceback.print_exc()
-        
+
     finally:
         await security.peer_sync_tracker.remove_peer(peer_id)
-            
-        
+
         # Only attempt to resubmit if the trigger_data was a full block payload,
         # which we can check by looking for 'block_content'.
-        if sync_successful and trigger_data and 'block_content' in trigger_data:
-            logger.info(f"[PUSH-SYNC] Sync for {peer_id} complete. Retrying submission of triggering block {trigger_data.get('id')}...")
+        if sync_successful and trigger_data and "block_content" in trigger_data:
+            logger.info(
+                f"[PUSH-SYNC] Sync for {peer_id} complete. Retrying submission of triggering block {trigger_data.get('id')}..."
+            )
             try:
                 # Recreate the interface to be safe within the finally block
-                final_interface = NodeInterface(peer_info['url'], client=http_client, db=db_conn)
+                final_interface = NodeInterface(peer_info["url"], client=http_client, db=db_conn)
                 final_response = await final_interface.submit_block(trigger_data)
-                logger.debug(f"[PUSH-SYNC] Final submission response for block {trigger_data.get('id')} from {peer_id}: {final_response}")
-            
+                logger.debug(
+                    f"[PUSH-SYNC] Final submission response for block {trigger_data.get('id')} from {peer_id}: {final_response}"
+                )
+
             except httpx.RequestError:
                 await handle_unreachable_peer(peer_id, peer_url, "push-sync final submission")
 
             except Exception as e:
                 logger.error(f"[PUSH-SYNC] Error during final submission for {peer_id}: {e}")
-        
 
         logger.debug(f"Push-sync task for peer {peer_id} has finished.")
 
@@ -2330,19 +2692,20 @@ async def _follow_up_sync(sender_node_id: str):
         return  # Don't pile on if a full sync is already running
 
     peer_info = NodesManager.get_peer(sender_node_id)
-    if not peer_info or not peer_info.get('url'):
+    if not peer_info or not peer_info.get("url"):
         return
 
     try:
-        interface = NodeInterface(peer_info['url'], client=http_client, db=db)
+        interface = NodeInterface(peer_info["url"], client=http_client, db=db)
         remote_status = await interface.get_status()
-        if not (remote_status and remote_status.get('ok')):
+        if not (remote_status and remote_status.get("ok")):
             return
-        if not await _drop_if_incompatible(sender_node_id, remote_status['result'].get('network'),
-                                           "follow-up sync"):
+        if not await _drop_if_incompatible(
+            sender_node_id, remote_status["result"].get("network"), "follow-up sync"
+        ):
             return
 
-        remote_height = remote_status['result']['height']
+        remote_height = remote_status["result"]["height"]
         local_height = await db.get_next_block_id() - 1
 
         if remote_height > local_height:
@@ -2364,36 +2727,39 @@ async def check_peer_and_sync(peer_info: dict):
         # Don't start a new sync if one is already in progress to avoid race conditions.
         return
 
-    peer_id = peer_info.get('node_id', 'Unknown')
-    peer_url = peer_info.get('url')
-    
+    peer_id = peer_info.get("node_id", "Unknown")
+    peer_url = peer_info.get("url")
+
     try:
         # Ensure the peer is connectable
-        if not peer_info.get('url'):
-            return
-            
-        interface = NodeInterface(peer_info['url'], client=http_client, db=db)
-        remote_status_resp = await interface.get_status()
-        
-        if not (remote_status_resp and remote_status_resp.get('ok')):
-            logger.warning(f"Could not get status from peer {peer_id} during check.")
-            await security.reputation_manager.record_violation(
-                peer_id, 'status_unavailable', severity=1
-            )
-            return
-        if not await _drop_if_incompatible(peer_id, remote_status_resp['result'].get('network'),
-                                           "status check"):
+        if not peer_info.get("url"):
             return
 
-        remote_height = remote_status_resp['result']['height']
+        interface = NodeInterface(peer_info["url"], client=http_client, db=db)
+        remote_status_resp = await interface.get_status()
+
+        if not (remote_status_resp and remote_status_resp.get("ok")):
+            logger.warning(f"Could not get status from peer {peer_id} during check.")
+            await security.reputation_manager.record_violation(
+                peer_id, "status_unavailable", severity=1
+            )
+            return
+        if not await _drop_if_incompatible(
+            peer_id, remote_status_resp["result"].get("network"), "status check"
+        ):
+            return
+
+        remote_height = remote_status_resp["result"]["height"]
         local_height = await db.get_next_block_id() - 1
 
         if remote_height > local_height:
-            logger.info(f"Discovered longer chain on peer {peer_id} (Remote: {remote_height} > Local: {local_height}). Initiating sync.")
+            logger.info(
+                f"Discovered longer chain on peer {peer_id} (Remote: {remote_height} > Local: {local_height}). Initiating sync."
+            )
             # Trigger the main sync logic, targeting this specific peer
             await _sync_blockchain(node_id=peer_id)
         # If their chain is not longer, there's nothing to do.
-    
+
     except httpx.RequestError:
         await handle_unreachable_peer(peer_id, peer_url, "periodic status check")
 
@@ -2404,47 +2770,47 @@ async def check_peer_and_sync(peer_info: dict):
 async def get_verified_sender(request: Request):
     """Verifies a request's signature with timestamp validation and reputation tracking"""
     # First check if peer is banned
-    is_monitor_request = request.headers.get('x-monitor-request', 'false').lower() == 'true'
+    is_monitor_request = request.headers.get("x-monitor-request", "false").lower() == "true"
 
     # 2. Perform standard validation and banning checks for ALL requests.
-    node_id = request.headers.get('x-node-id')
+    node_id = request.headers.get("x-node-id")
     if node_id and await security.reputation_manager.is_banned(node_id):
-        await security.security_monitor.log_event('banned_peer_attempt', {
-            'peer_id': node_id,
-            'endpoint': request.url.path
-        })
+        await security.security_monitor.log_event(
+            "banned_peer_attempt", {"peer_id": node_id, "endpoint": request.url.path}
+        )
         return None
-    
+
     peer_id = await security.auth_validator.validate_request(request)
-    
+
     if not peer_id:
         return None
 
     # 3. If it's a monitor request, stop here and return the ID.
     # We have successfully verified them, but we will not treat them as a peer.
     if is_monitor_request:
-        if not node_id: # A monitor must still identify itself
+        if not node_id:  # A monitor must still identify itself
             return None
-        #print(f"Verified monitor request from node {node_id}. Skipping peer list update.")
+        # print(f"Verified monitor request from node {node_id}. Skipping peer list update.")
         return peer_id
 
     # 4. If it's a REGULAR peer request, proceed with the normal logic.
-    peer_count = len(NodesManager.peers) if hasattr(NodesManager, 'peers') else 0
+    peer_count = len(NodesManager.peers) if hasattr(NodesManager, "peers") else 0
     if peer_count >= MAX_PEERS:
         NodesManager.update_peer_last_seen(peer_id)
         return peer_id
-    
-    peer_url = request.headers.get('x-peer-url')
-    pubkey = request.headers.get('x-public-key')
-    
+
+    peer_url = request.headers.get("x-peer-url")
+    pubkey = request.headers.get("x-public-key")
+
     is_unknown = NodesManager.get_peer(peer_id) is None
 
     # Only a node on our chain becomes a peer implicitly. Its signed x-denaro-genesis header
     # names its genesis block; anything else stays a one-off caller (the full identity check
     # happens in the handshake).
-    if is_unknown and (GENESIS_BLOCK_HASH is None
-                       or (request.headers.get('x-denaro-genesis') or '').lower()
-                       != GENESIS_BLOCK_HASH.lower()):
+    if is_unknown and (
+        GENESIS_BLOCK_HASH is None
+        or (request.headers.get("x-denaro-genesis") or "").lower() != GENESIS_BLOCK_HASH.lower()
+    ):
         return peer_id
 
     if is_unknown and pubkey:
@@ -2458,15 +2824,20 @@ async def get_verified_sender(request: Request):
             else:
                 logger.warning(f"Rejected peer URL {peer_url} due to security validation")
                 await security.reputation_manager.record_violation(
-                    peer_id, 'invalid_url', severity=3
+                    peer_id, "invalid_url", severity=3
                 )
-        
+
         if NodesManager.add_or_update_peer(peer_id, pubkey, url_to_store, is_peer_public):
-            logger.info(f"Discovered new {'public' if is_peer_public else 'private'} peer {peer_id} from their incoming request.")
+            logger.info(
+                f"Discovered new {'public' if is_peer_public else 'private'} peer {peer_id} from their incoming request."
+            )
+
+    if peer_id in _FORMER_PEER_URLS:
+        _dial_back_if_known(peer_id)
 
     NodesManager.update_peer_last_seen(peer_id)
     await security.reputation_manager.record_good_behavior(peer_id)
-    
+
     return peer_id
 
 
@@ -2485,80 +2856,111 @@ async def do_handshake_with_peer(peer_url_to_connect: str):
         return
 
     if NodesManager.self_is_public and await is_url_local(peer_url_to_connect):
-        logger.debug(f"Public node skipping handshake attempt to private URL: {peer_url_to_connect}")
+        logger.debug(
+            f"Public node skipping handshake attempt to private URL: {peer_url_to_connect}"
+        )
         return
 
     logger.info(f"Attempting handshake with {peer_url_to_connect}")
     try:
         interface = NodeInterface(peer_url_to_connect, client=http_client, db=db)
-        
-        # 1. Get Challenge from peer (which includes their chain state)
-        challenge_resp = await interface.handshake_challenge()
-        if not (challenge_resp and challenge_resp.get('ok')):
-            logger.warning(f"Handshake failed: Did not receive challenge from {peer_url_to_connect}.")
+
+        # 1. Get Challenge from peer (which includes their chain state), with a fresh nonce the
+        # peer must sign: its identity is taken on proof, not on its word.
+        client_nonce = os.urandom(32).hex()
+        challenge_resp = await interface.handshake_challenge(client_nonce)
+        if not (challenge_resp and challenge_resp.get("ok")):
+            logger.warning(
+                f"Handshake failed: Did not receive challenge from {peer_url_to_connect}."
+            )
             return
 
-        challenge_data = challenge_resp['result']
-        challenge = challenge_data.get('challenge')
-        peer_id = challenge_data.get('node_id')
-        peer_pubkey = challenge_data.get('pubkey')
-        peer_is_public = challenge_data.get('is_public')
-        peer_advertised_url = challenge_data.get('url')
-        peer_height = challenge_data.get('height', -1)
+        challenge_data = challenge_resp["result"]
+        challenge = challenge_data.get("challenge")
+        peer_id = challenge_data.get("node_id")
+        peer_pubkey = challenge_data.get("pubkey")
+        peer_is_public = challenge_data.get("is_public")
+        peer_advertised_url = challenge_data.get("url")
+        peer_height = challenge_data.get("height", -1)
 
         if not all([challenge, peer_id, peer_pubkey, peer_is_public is not None]):
-            logger.warning(f"Handshake failed: Incomplete challenge data from {peer_url_to_connect}.")
+            logger.warning(
+                f"Handshake failed: Incomplete challenge data from {peer_url_to_connect}."
+            )
+            return
+
+        from qrdx.rpc.modules.p2p import verify_handshake_proof
+
+        proof_problem = verify_handshake_proof(client_nonce, challenge_data)
+        if proof_problem:
+            logger.warning(
+                f"Handshake failed: {peer_url_to_connect} did not prove its identity "
+                f"({proof_problem}); not adding it as a peer."
+            )
             return
 
         # Same network and a compatible fork history, or no peering at all — checked before
         # the peer is stored, so a node of another network (or one that missed an upgrade)
         # never enters the peer list, the peer exchange, or a sync.
-        if not await _drop_if_incompatible(peer_id, challenge_data.get('network'),
-                                           f"handshake with {peer_url_to_connect}"):
+        if not await _drop_if_incompatible(
+            peer_id, challenge_data.get("network"), f"handshake with {peer_url_to_connect}"
+        ):
             return
 
         # Add or update the peer in our manager AS SOON as we have their info.
         # This makes them "known" before we attempt any sync logic.
-        url_to_store = peer_advertised_url if peer_is_public and peer_advertised_url else peer_url_to_connect
+        url_to_store = (
+            peer_advertised_url if peer_is_public and peer_advertised_url else peer_url_to_connect
+        )
         if NodesManager.add_or_update_peer(peer_id, peer_pubkey, url_to_store, peer_is_public):
-            logger.info(f"Handshake Phase 1: Discovered and added new {'public' if peer_is_public else 'private'} peer {peer_id}")
+            logger.info(
+                f"Handshake Phase 1: Discovered and added new {'public' if peer_is_public else 'private'} peer {peer_id}"
+            )
         else:
-            logger.debug(f"Handshake Phase 1: Discovered and updated {'public' if peer_is_public else 'private'} peer {peer_id}")
-        
+            logger.debug(
+                f"Handshake Phase 1: Discovered and updated {'public' if peer_is_public else 'private'} peer {peer_id}"
+            )
 
         # 2. Respond to Challenge
         response_resp = await interface.handshake_response(challenge)
 
-        if response_resp and response_resp.get('error') == 'network_mismatch':
-            logger.warning(f"[chain-spec] peer {peer_id} refused our handshake: "
-                           f"{response_resp.get('detail')}")
+        if response_resp and response_resp.get("error") == "network_mismatch":
+            logger.warning(
+                f"[chain-spec] peer {peer_id} refused our handshake: "
+                f"{response_resp.get('detail')}"
+            )
             NodesManager.remove_peer(peer_id)
             return
 
         # 3. Handle the peer's response. Now we are guaranteed to find the peer in our manager.
-        
+
         # Case A: Peer told us that WE are behind ('sync_required'). We must PULL.
-        if response_resp and response_resp.get('error') == 'sync_required':
+        if response_resp and response_resp.get("error") == "sync_required":
             logger.info(f"Peer {peer_id} reported that WE are out of sync. Initiating PULL-sync.")
             await _sync_blockchain(node_id=peer_id)
             return
-            
+
         # Case B: Peer is behind and REQUESTED that we PUSH blocks to THEM ('sync_requested').
-        if response_resp and response_resp.get('result') == 'sync_requested':
+        if response_resp and response_resp.get("result") == "sync_requested":
             logger.info(f"Peer {peer_id} is behind and requested a PUSH-sync from us.")
-            sync_details = response_resp.get('detail', {})
-            start_block = sync_details.get('start_block')
-            target_block = sync_details.get('target_block')
+            sync_details = response_resp.get("detail", {})
+            start_block = sync_details.get("start_block")
+            target_block = sync_details.get("target_block")
             if start_block is not None and target_block is not None:
                 peer_info = NodesManager.get_peer(peer_id)
-                peer_info['node_id'] = peer_id
-                trigger_data = {'id': target_block}
+                if peer_info is None:
+                    logger.warning(f"Cannot push-sync unknown peer {peer_id}.")
+                    return
+                peer_info["node_id"] = peer_id
+                trigger_data = {"id": target_block}
                 asyncio.create_task(_push_sync_to_peer(peer_info, start_block, db, trigger_data))
             return
 
         # Case C: Other failure
-        if not (response_resp and response_resp.get('ok')):
-            logger.warning(f"Handshake failed: Peer {peer_id} rejected our response: {response_resp}")
+        if not (response_resp and response_resp.get("ok")):
+            logger.warning(
+                f"Handshake failed: Peer {peer_id} rejected our response: {response_resp}"
+            )
             return
 
         # Case D: Handshake was successful and no sync instruction was given.
@@ -2567,34 +2969,43 @@ async def do_handshake_with_peer(peer_url_to_connect: str):
         # Fallback PULL trigger: If peer didn't respond with instructions but we see they are ahead.
         local_height = await db.get_next_block_id() - 1
         if peer_height > local_height:
-             logger.info(f"Peer {peer_id} has longer chain ({peer_height} > {local_height}). Initiating PULL-sync.")
-             await _sync_blockchain(node_id=peer_id)
-        
+            logger.info(
+                f"Peer {peer_id} has longer chain ({peer_height} > {local_height}). Initiating PULL-sync."
+            )
+            await _sync_blockchain(node_id=peer_id)
+
         # 4. Perform peer exchange
         logger.debug(f"Performing peer exchange with {peer_id}")
         peers_resp = await interface.get_peers()
-        if peers_resp and peers_resp.get('ok'):
-            for discovered_peer in peers_resp['result']['peers']:
-                if discovered_peer.get('url') and discovered_peer['node_id'] not in NodesManager.peers and discovered_peer['node_id'] != self_node_id:
+        if peers_resp and peers_resp.get("ok"):
+            for discovered_peer in peers_resp["result"]["peers"]:
+                if (
+                    discovered_peer.get("url")
+                    and discovered_peer["node_id"] not in NodesManager.peers
+                    and discovered_peer["node_id"] != self_node_id
+                ):
                     if len(NodesManager.peers) < MAX_PEERS:
-                        logger.info(f"Found node {discovered_peer['node_id']} via exchange. Attempting handshake.")
-                        asyncio.create_task(do_handshake_with_peer(discovered_peer['url']))
-    
+                        logger.info(
+                            f"Found node {discovered_peer['node_id']} via exchange. Attempting handshake."
+                        )
+                        asyncio.create_task(do_handshake_with_peer(discovered_peer["url"]))
+
     except httpx.RequestError:
         peer_id = NodesManager.find_peer_by_url(peer_url_to_connect)
         if peer_id:
             await handle_unreachable_peer(peer_id, peer_url_to_connect, "handshake")
         else:
             # If we don't know them, we can't remove them, just log it.
-            logger.warning(f"Failed to connect to unknown or new peer at {peer_url_to_connect} during handshake.")
+            logger.warning(
+                f"Failed to connect to unknown or new peer at {peer_url_to_connect} during handshake."
+            )
 
     except Exception as e:
         logger.error(f"Error during handshake with {peer_url_to_connect}: {e}")
         traceback.print_exc()
-        await security.security_monitor.log_event('handshake_failure', {
-            'url': peer_url_to_connect,
-            'error': str(e)
-        })
+        await security.security_monitor.log_event(
+            "handshake_failure", {"url": peer_url_to_connect, "error": str(e)}
+        )
 
 
 # ============================================================================
@@ -2615,15 +3026,15 @@ async def _dht_bridge_sync() -> None:
     # --- Push: NodesManager → DHT routing table ---
     pushed = 0
     for peer_id, peer_data in list(NodesManager.peers.items()):
-        url = peer_data.get('url', '')
+        url = peer_data.get("url", "")
         if not url:
             continue
         try:
             parsed = urlparse(url)
-            host = parsed.hostname or 'localhost'
+            host = parsed.hostname or "localhost"
             port = parsed.port or 30303
             # Derive a node_id from the peer_id string if it looks like qx-hex
-            if peer_id.startswith('qx') and len(peer_id) >= 42:
+            if peer_id.startswith("qx") and len(peer_id) >= 42:
                 nid = p2p_hex_to_node_id(peer_id)
             else:
                 # Use a hash of the peer_id as a fallback node ID
@@ -2631,11 +3042,11 @@ async def _dht_bridge_sync() -> None:
 
             entry = KBucketEntry(
                 node_id=nid,
-                node_id_hex=peer_id if peer_id.startswith('qx') else 'qx' + nid.hex(),
+                node_id_hex=peer_id if peer_id.startswith("qx") else "qx" + nid.hex(),
                 host=host,
                 port=port,
-                public_key_hex=peer_data.get('pubkey', ''),
-                at_schema='',
+                public_key_hex=peer_data.get("pubkey", ""),
+                at_schema="",
                 last_seen=time.monotonic(),
                 added_at=time.monotonic(),
                 is_inbound=False,
@@ -2664,7 +3075,9 @@ async def _dht_bridge_sync() -> None:
             break
 
     if pushed or pulled:
-        logger.debug(f"DHT bridge sync: pushed {pushed} peers to DHT, pulled {pulled} for handshake")
+        logger.debug(
+            f"DHT bridge sync: pushed {pushed} peers to DHT, pulled {pulled} for handshake"
+        )
 
 
 async def _periodic_dht_bridge() -> None:
@@ -2694,7 +3107,7 @@ async def _init_dht() -> None:
     try:
         # Build the local P2P Node from existing identity
         pub_key = get_public_key_bytes()
-        listen_host = DENARO_NODE_HOST or '0.0.0.0'
+        listen_host = DENARO_NODE_HOST or "0.0.0.0"
         listen_port = int(DENARO_NODE_PORT) if DENARO_NODE_PORT else 30303
         local_addr = P2PAddress(ip=listen_host, tcp_port=listen_port)
         local_node = P2PNode(public_key=pub_key, address=local_addr)
@@ -2708,7 +3121,7 @@ async def _init_dht() -> None:
             persist_dir = _p2p_state_dir()
         os.makedirs(persist_dir, exist_ok=True)
 
-        rt_path = os.path.join(persist_dir, 'routing_table.json')
+        rt_path = os.path.join(persist_dir, "routing_table.json")
         if os.path.exists(rt_path):
             routing_table = RoutingTable.load(local_node.node_id, persist_dir)
             logger.info(f"Loaded persisted routing table: {routing_table.total_nodes} nodes")
@@ -2742,15 +3155,15 @@ async def _init_dht() -> None:
                 )
                 for addr in dns_addrs:
                     # Parse @-schema addresses or HTTP URLs
-                    if '@' in addr and addr.count('@') == 2:
+                    if "@" in addr and addr.count("@") == 2:
                         # @-schema: algo@id@host:port
-                        parts = addr.split('@')
+                        parts = addr.split("@")
                         host_port = parts[2]
-                        host, port_str = host_port.rsplit(':', 1)
+                        host, port_str = host_port.rsplit(":", 1)
                         seed_nodes.append((host, int(port_str)))
-                    elif '://' in addr:
+                    elif "://" in addr:
                         parsed = urlparse(addr)
-                        host = parsed.hostname or 'localhost'
+                        host = parsed.hostname or "localhost"
                         port = parsed.port or 30303
                         seed_nodes.append((host, port))
                 logger.info(f"DNS seed discovery returned {len(dns_addrs)} addresses")
@@ -2760,8 +3173,8 @@ async def _init_dht() -> None:
         # Always include hardcoded bootstrap nodes as fallback
         for url in BOOTSTRAP_NODES:
             try:
-                parsed = urlparse(str(url).strip().rstrip('/'))
-                host = parsed.hostname or 'localhost'
+                parsed = urlparse(str(url).strip().rstrip("/"))
+                host = parsed.hostname or "localhost"
                 port = parsed.port or 30303
                 if (host, port) not in seed_nodes:
                     seed_nodes.append((host, port))
@@ -2797,28 +3210,28 @@ async def _init_dht() -> None:
 async def bootstrap_from_all_nodes():
     """
     Bootstrap from all configured bootstrap nodes.
-    
+
     This attempts handshakes with all bootstrap nodes to ensure
     maximum peer discovery at startup.
     """
     logger.info(f"Bootstrapping from {len(BOOTSTRAP_NODES)} configured bootstrap nodes...")
-    
+
     successful = 0
     for node_url in BOOTSTRAP_NODES:
-        node_url = node_url.strip().rstrip('/')
+        node_url = node_url.strip().rstrip("/")
         if not node_url:
             continue
-        
+
         try:
             logger.info(f"Attempting bootstrap from {node_url}")
             await do_handshake_with_peer(node_url)
             successful += 1
         except Exception as e:
             logger.warning(f"Failed to bootstrap from {node_url}: {e}")
-        
+
         # Small delay between bootstrap attempts
         await asyncio.sleep(1)
-    
+
     logger.info(
         f"Bootstrap complete: {successful}/{len(BOOTSTRAP_NODES)} nodes successful, "
         f"{len(NodesManager.peers)} total peers"
@@ -2826,13 +3239,46 @@ async def bootstrap_from_all_nodes():
     return successful
 
 
+# How far behind a peer a starting validator may be and still begin: about a second of blocks
+# (a sync always ends behind by what the network produced while it ran).
+_CAUGHT_UP_BLOCKS = max(2, round(1 / SLOT_DURATION))
+
+
+async def _catch_up_before_validating() -> None:
+    """Sync until no connectable peer is more than _CAUGHT_UP_BLOCKS ahead (or the initial-sync
+    deadline passes). At 250 ms slots a restarted validator came out of its first sync six
+    blocks short of the network, and proposed on that."""
+    while time.monotonic() < _initial_sync_deadline:
+        peers = [p for p in NodesManager.get_all_peers() if p.get("url")][:3]
+        if not peers:
+            return
+        while security.sync_state_manager.is_syncing and time.monotonic() < _initial_sync_deadline:
+            await asyncio.sleep(0.25)
+        local_height = int(await db.get_next_block_id()) - 1
+        ahead = None
+        for peer_info in peers:
+            try:
+                resp = await NodeInterface(peer_info["url"], client=http_client, db=db).get_status()
+                height = int(resp["result"]["height"]) if resp and resp.get("ok") else -1
+            except Exception:
+                continue
+            if height > local_height + _CAUGHT_UP_BLOCKS:
+                ahead = peer_info
+                break
+        if ahead is None:
+            return
+        await check_peer_and_sync(ahead)
+        await asyncio.sleep(0.25)
+
+
 async def periodic_peer_discovery():
     """
     Periodically discovers new peers via gossip and verifies them via handshake.
     This version is now resilient to unreachable peers and supports multiple bootstrap nodes.
     """
+    global _initial_sync_pending
     await asyncio.sleep(5)  # Start peer discovery quickly
-    
+
     # Initial bootstrap from all configured nodes
     await bootstrap_from_all_nodes()
 
@@ -2841,57 +3287,81 @@ async def periodic_peer_discovery():
     # cycle (8s) before discovering they are behind.
     try:
         all_peers = NodesManager.get_all_peers()
-        connectable = [p for p in all_peers if p.get('url')]
+        connectable = [p for p in all_peers if p.get("url")]
         if connectable:
-            logger.info(f"Post-bootstrap sync check: probing {len(connectable)} peer(s) for longer chain")
+            logger.info(
+                f"Post-bootstrap sync check: probing {len(connectable)} peer(s) for longer chain"
+            )
             for peer_info in connectable[:3]:
                 await check_peer_and_sync(peer_info)
                 await asyncio.sleep(0.5)
     except Exception as e:
         logger.warning(f"Post-bootstrap sync check failed: {e}")
+    # The validator may now propose and vote (_validator_wait_reason), once it has caught up.
+    try:
+        await _catch_up_before_validating()
+    except Exception as e:
+        logger.warning(f"Catching up before validating failed: {e}")
+    _initial_sync_pending = False
 
     while True:
         await asyncio.sleep(30)  # Refresh peers every 30s
         logger.debug("Running periodic peer discovery...")
-        
-        if not NodesManager.peers:
-            logger.info("Peer list is empty. Re-bootstrapping from configured nodes.")
+
+        # Peers learned only from their own requests have no URL (a private node does not
+        # advertise one), so a node knowing only those cannot sync from anyone.
+        if not any(p.get("url") for p in NodesManager.peers.values()):
+            logger.info("No connectable peer. Re-bootstrapping from configured nodes.")
             await bootstrap_from_all_nodes()
             continue
+        # A configured node that no peer entry reaches (dropped while it was down, then back
+        # as a URL-less inbound peer) is handshaken again, which records its URL.
+        known_urls = {(p.get("url") or "").rstrip("/") for p in NodesManager.peers.values()}
+        for node_url in BOOTSTRAP_NODES:
+            node_url = node_url.strip().rstrip("/")
+            if node_url and node_url != DENARO_SELF_URL and node_url not in known_urls:
+                asyncio.create_task(do_handshake_with_peer(node_url))
 
         connectable_peers_tuples = [
-            (node_id, peer_data) for node_id, peer_data in NodesManager.peers.items() if peer_data.get('url')
+            (node_id, peer_data)
+            for node_id, peer_data in NodesManager.peers.items()
+            if peer_data.get("url")
         ]
 
         if not connectable_peers_tuples:
-            logger.debug("No connectable peers to ask for discovery. Waiting for new inbound connections.")
+            logger.debug(
+                "No connectable peers to ask for discovery. Waiting for new inbound connections."
+            )
             continue
 
-        
         # Define peer_id and peer_url here so they are in scope for the entire loop iteration.
         peer_id, peer_data_to_ask = random.choice(connectable_peers_tuples)
-        peer_url = peer_data_to_ask['url']
-        
-        
+        peer_url = peer_data_to_ask["url"]
+
         logger.debug(f"Asking peer {peer_id} for their peer list")
         try:
             # Use the correctly scoped variables
             interface = NodeInterface(peer_url, client=http_client, db=db)
             peers_resp = await interface.get_peers()
-            
-            if not (peers_resp and peers_resp.get('ok')):
+
+            if not (peers_resp and peers_resp.get("ok")):
                 # Peer responded but with an error. This is a minor protocol violation.
-                await security.reputation_manager.record_violation(peer_id, 'get_peers_failed', 1)
+                await security.reputation_manager.record_violation(peer_id, "get_peers_failed", 1)
                 continue
-            
-            discovered_peers = peers_resp['result']['peers']
+
+            discovered_peers = peers_resp["result"]["peers"]
             logger.debug(f"Discovered {len(discovered_peers)} peers from {peer_id}.")
             for discovered_peer in discovered_peers:
-                if discovered_peer['node_id'] not in NodesManager.peers and discovered_peer['node_id'] != self_node_id:
-                    if len(NodesManager.peers) < MAX_PEERS and discovered_peer.get('url'):
-                        logger.info(f"Found new peer {discovered_peer['node_id']} via exchange. Attempting handshake.")
-                        asyncio.create_task(do_handshake_with_peer(discovered_peer['url']))
-        
+                if (
+                    discovered_peer["node_id"] not in NodesManager.peers
+                    and discovered_peer["node_id"] != self_node_id
+                ):
+                    if len(NodesManager.peers) < MAX_PEERS and discovered_peer.get("url"):
+                        logger.info(
+                            f"Found new peer {discovered_peer['node_id']} via exchange. Attempting handshake."
+                        )
+                        asyncio.create_task(do_handshake_with_peer(discovered_peer["url"]))
+
         except httpx.RequestError:
             await handle_unreachable_peer(peer_id, peer_url, "peer discovery")
 
@@ -2903,10 +3373,14 @@ async def periodic_peer_discovery():
         if dht_discovery is not None and len(NodesManager.peers) < MAX_PEERS:
             try:
                 from qrdx.p2p.node import derive_node_id as _dni
+
                 local_nid = _dni(get_public_key_bytes())
                 dht_found = await dht_discovery.iterative_find_node(local_nid, count=10)
                 for entry in dht_found:
-                    if entry.node_id_hex not in NodesManager.peers and entry.node_id_hex != self_node_id:
+                    if (
+                        entry.node_id_hex not in NodesManager.peers
+                        and entry.node_id_hex != self_node_id
+                    ):
                         if len(NodesManager.peers) < MAX_PEERS and entry.host:
                             peer_url_dht = f"http://{entry.host}:{entry.port}"
                             asyncio.create_task(do_handshake_with_peer(peer_url_dht))
@@ -2917,8 +3391,11 @@ async def periodic_peer_discovery():
 async def is_url_local(url: str) -> bool:
     try:
         hostname = urlparse(url).hostname
-        if not hostname: return False
-        addr_info = await asyncio.get_event_loop().getaddrinfo(hostname, None, family=socket.AF_INET)
+        if not hostname:
+            return False
+        addr_info = await asyncio.get_event_loop().getaddrinfo(
+            hostname, None, family=socket.AF_INET
+        )
         ip_obj = ipaddress.ip_address(addr_info[0][4][0])
         return ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
     except (socket.gaierror, ValueError, IndexError):
@@ -2939,28 +3416,32 @@ async def check_own_reachability():
         return
 
     if await is_url_local(DENARO_SELF_URL):
-        logger.info(f"DENARO_SELF_URL is a local address ({DENARO_SELF_URL}). Operating as a private node.")
+        logger.info(
+            f"DENARO_SELF_URL is a local address ({DENARO_SELF_URL}). Operating as a private node."
+        )
         self_is_public = False
         NodesManager.set_public_status(False)
         return
 
     logger.info(f"Potential public URL is {DENARO_SELF_URL}. Asking bootstrap nodes to verify")
-    
+
     # Try each bootstrap node until one can verify reachability
     for bootstrap_url in BOOTSTRAP_NODES:
-        bootstrap_url = bootstrap_url.strip().rstrip('/')
+        bootstrap_url = bootstrap_url.strip().rstrip("/")
         if not bootstrap_url:
             continue
-            
+
         logger.debug(f"Checking reachability via {bootstrap_url}")
         bootstrap_interface = NodeInterface(bootstrap_url, client=http_client, db=db)
-        
+
         try:
             is_reachable = await bootstrap_interface.check_peer_reachability(DENARO_SELF_URL)
             if is_reachable:
                 self_is_public = True
                 NodesManager.set_public_status(True)
-                logger.info(f"SUCCESS: Node confirmed to be publicly reachable at {DENARO_SELF_URL}")
+                logger.info(
+                    f"SUCCESS: Node confirmed to be publicly reachable at {DENARO_SELF_URL}"
+                )
                 return
             else:
                 logger.debug(f"Bootstrap node {bootstrap_url} reports us as not reachable")
@@ -2968,11 +3449,11 @@ async def check_own_reachability():
         except httpx.RequestError:
             logger.debug(f"Bootstrap node at {bootstrap_url} is unreachable, trying next...")
             continue
-        
+
         except Exception as e:
             logger.debug(f"Error checking reachability via {bootstrap_url}: {e}")
             continue
-    
+
     # None of the bootstrap nodes could verify us
     self_is_public = False
     NodesManager.set_public_status(False)
@@ -2993,11 +3474,11 @@ async def periodic_update_fetcher():
     logger.info("Starting periodic update fetcher for this node...")
     while True:
         await asyncio.sleep(8)  # Poll every 8s for fast chain convergence
-        
+
         # 1. CHECK FOR LONGER CHAINS (BLOCK SYNC)
         if not security.sync_state_manager.is_syncing:
             all_peers = NodesManager.get_all_peers()
-            connectable_peers = [p for p in all_peers if p.get('url')]
+            connectable_peers = [p for p in all_peers if p.get("url")]
 
             if connectable_peers:
                 # Probe up to 2 random peers to find a potentially longer chain
@@ -3005,7 +3486,7 @@ async def periodic_update_fetcher():
                 logger.debug(f"Probing {len(peers_to_probe)} peer(s) for a longer chain")
                 for peer_info in peers_to_probe:
                     await check_peer_and_sync(peer_info)
-                    await asyncio.sleep(1) # Small delay between probes
+                    await asyncio.sleep(1)  # Small delay between probes
 
         # 1b. FORK-CHOICE ACTIVE RECONCILIATION (mechanism-2). After the longest-chain
         #     check, actively reconcile equal-height block-history forks (which the
@@ -3018,61 +3499,79 @@ async def periodic_update_fetcher():
 
         # 2. CHECK FOR NEW TRANSACTIONS (MEMPOOL SYNC)
         all_peers = NodesManager.get_all_peers()
-        connectable_peers = [p for p in all_peers if p.get('url')]
+        connectable_peers = [p for p in all_peers if p.get("url")]
 
         if not connectable_peers:
             continue
 
         # Ask one random peer for their mempool
         peer_to_ask = random.choice(connectable_peers)
-        interface = NodeInterface(peer_to_ask['url'], client=http_client, db=db)
-        peer_id = peer_to_ask['node_id']
-        peer_url = peer_to_ask['url']
-        
+        interface = NodeInterface(peer_to_ask["url"], client=http_client, db=db)
+        peer_id = peer_to_ask["node_id"]
+        peer_url = peer_to_ask["url"]
+
         logger.debug(f"Polling peer {peer_id} for new transactions")
         try:
             mempool_hashes_resp = await interface.get_mempool_hashes()
-            
-            if mempool_hashes_resp is None or not mempool_hashes_resp.get('ok'):
-                logger.warning(f"Could not get mempool hashes from {peer_id}. Skipping transaction sync.")
-                continue 
 
-            remote_hashes = set(mempool_hashes_resp['result'])
+            if mempool_hashes_resp is None or not mempool_hashes_resp.get("ok"):
+                logger.warning(
+                    f"Could not get mempool hashes from {peer_id}. Skipping transaction sync."
+                )
+                continue
+
+            remote_hashes = set(mempool_hashes_resp["result"])
             local_hashes = set(await db.get_all_pending_transaction_hashes())
             needed_hashes = list(remote_hashes - local_hashes)
 
             if needed_hashes:
-                logger.debug(f"Discovered {len(needed_hashes)} new transaction(s) from {peer_id}. Fetching...")
-                
+                logger.debug(
+                    f"Discovered {len(needed_hashes)} new transaction(s) from {peer_id}. Fetching..."
+                )
+
                 for i in range(0, len(needed_hashes), MAX_TX_FETCH_LIMIT):
-                    batch = needed_hashes[i:i+MAX_TX_FETCH_LIMIT]
+                    batch = needed_hashes[i : i + MAX_TX_FETCH_LIMIT]
                     fetched_txs_resp = await interface.get_transactions_by_hash(batch)
-                    
-                    if fetched_txs_resp and fetched_txs_resp.get('ok'):
+
+                    if fetched_txs_resp and fetched_txs_resp.get("ok"):
                         transactions_to_propagate = []
-                        for tx_hex in fetched_txs_resp['result']:
+                        for tx_hex in fetched_txs_resp["result"]:
                             try:
-                                is_valid, error_msg = security.input_validator.validate_transaction_data(tx_hex)
+                                is_valid, error_msg = (
+                                    security.input_validator.validate_transaction_data(tx_hex)
+                                )
                                 if not is_valid:
-                                    logger.warning(f"Skipping invalid transaction from peer: {error_msg}")
+                                    logger.warning(
+                                        f"Skipping invalid transaction from peer: {error_msg}"
+                                    )
                                     continue
-                                    
+
                                 tx = await Transaction.from_hex(tx_hex)
-                                if await security.transaction_pool.add_transaction(tx.hash(), tx, db):
-                                    logger.debug(f"  -> Accepted new pending transaction {tx.hash()[:10]}")
+                                if await security.transaction_pool.add_transaction(
+                                    tx.hash(), tx, db
+                                ):
+                                    logger.debug(
+                                        f"  -> Accepted new pending transaction {tx.hash()[:10]}"
+                                    )
                                     transactions_to_propagate.append(tx_hex)
                             except Exception as e:
                                 logger.error(f"Error processing fetched transaction: {e}")
-                        
+
                         if transactions_to_propagate:
-                            logger.debug(f"Propagating {len(transactions_to_propagate)} newly learned transactions...")
+                            logger.debug(
+                                f"Propagating {len(transactions_to_propagate)} newly learned transactions..."
+                            )
                             for tx_hex in transactions_to_propagate:
                                 asyncio.create_task(
-                                    propagate('push_tx', {'tx_hex': tx_hex}, ignore_node_id=peer_to_ask['node_id'])
+                                    propagate(
+                                        "push_tx",
+                                        {"tx_hex": tx_hex},
+                                        ignore_node_id=peer_to_ask["node_id"],
+                                    )
                                 )
                     else:
-                        logger.warning(f"Failed to fetch full transaction data for batch.")
-        
+                        logger.warning("Failed to fetch full transaction data for batch.")
+
         except httpx.RequestError:
             await handle_unreachable_peer(peer_id, peer_url, "periodic mempool fetch")
 
@@ -3083,17 +3582,17 @@ async def periodic_update_fetcher():
 
 async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False) -> bool:
     """Processes a single block dictionary with validation.
-    
+
     Supports both PoW blocks (hex content → manager.create_block) and
     PoS blocks (already-committed dict data → direct DB insert).
     """
-    block = block_info['block']
-    txs_hex = block_info.get('transactions', [])
-    block_content = block.get('content', '')
+    block = block_info["block"]
+    txs_hex = block_info.get("transactions", [])
+    block_content = block.get("content", "")
 
-    block_height = block.get('id') or block.get('block_height', 0)
-    block_hash = block.get('hash') or block.get('block_hash', '')
-    validator_address = block.get('address') or block.get('validator_address', '')
+    block_height = block.get("id") or block.get("block_height", 0)
+    block_hash = block.get("hash") or block.get("block_hash", "")
+    validator_address = block.get("address") or block.get("validator_address", "")
 
     # ---- PoS fast-path ----
     # If we already have a block_hash (produced by a validator) we store it
@@ -3119,7 +3618,9 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
         # produced by that validator.
         ok_prop, prop_err = verify_pos_block_proposer(block_content, validator_address)
         if not ok_prop:
-            logger.warning(f"[SYNC] Rejecting PoS block {block_height}: proposer auth failed: {prop_err}")
+            logger.warning(
+                f"[SYNC] Rejecting PoS block {block_height}: proposer auth failed: {prop_err}"
+            )
             return False
 
         # Security: verify the proposer is the validator selected for this slot
@@ -3133,7 +3634,9 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
         # like the E-D4 unified-root check does; live-broadcast import (p2p/REST) still
         # enforces. See the reorg-derived-state divergence in phase_e_invariants.
         ok_elig, elig_err = await verify_proposer_eligibility(
-            db, block_content, enforce=(_ENFORCE_PROPOSER_ELIGIBILITY and not is_bulk_sync),
+            db,
+            block_content,
+            enforce=(_ENFORCE_PROPOSER_ELIGIBILITY and not is_bulk_sync),
         )
         if not ok_elig:
             logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {elig_err}")
@@ -3143,109 +3646,148 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
         # must equal the local tip's hash, else this block is on a fork and
         # appending it would break the height→block linkage. OBSERVE: warn only.
         ok_par, par_err = await _check_parent_continuity(
-            block_height, block_content, enforce=_ENFORCE_PARENT_CONTINUITY,
+            block_height,
+            block_content,
+            enforce=_ENFORCE_PARENT_CONTINUITY,
         )
         if not ok_par:
             logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {par_err}")
             return False
 
-        # D3/E-D3b: replay the exchange section (if any) before storing. Strict
-        # (reject-on-mismatch) when a root is declared (live broadcast); trust-
-        # replay (adopt) when syncing canonical history with no bound root.
-        ex_section = block.get('exchange_transactions') or block_info.get('exchange_transactions')
-        if ex_section:
-            declared = block.get('exchange_state_root') or block_info.get('exchange_state_root')
-            from ..validator.block_verification import epoch_from_block
-            ok, verr = await _apply_exchange_section_on_import(
-                block_height, block.get('timestamp', 0) or 0, ex_section, declared,
-                block_epoch=epoch_from_block(block) or epoch_from_block(block_info),
-            )
-            if not ok:
-                logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr}")
-                return False
-        else:
-            # No exchange transactions — the exchange still ticks (mark prices, ...).
-            _exchange_tick_on_import(block_height, block.get('timestamp', 0) or 0)
-
-        # E-D3b: validate + replay the EVM section (execute-on-mine) before
-        # storing — reject any block whose account_state_root doesn't match.
-        evm_section = block.get('evm_transactions') or block_info.get('evm_transactions')
-        if evm_section:
-            ts_evm = block.get('timestamp', 0) or 0
-            if hasattr(ts_evm, 'timestamp'):
-                ts_evm = int(ts_evm.timestamp())
-            declared_acc = block.get('account_state_root') or block_info.get('account_state_root')
-            ok_evm, verr_evm = await _apply_evm_section_on_import(
-                block_height, block_hash, int(ts_evm), evm_section, declared_acc,
-            )
-            if not ok_evm:
-                logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr_evm}")
-                await _restore_after_rejected_block(block_height, f"EVM section: {verr_evm}")
-                return False
-
-        # Stake withdrawals — same point as the proposer: after EVM, before E-D4.
-        from ..validator.block_verification import epoch_from_block as _efb
-        _wd_epoch = _efb(block)
-        if _wd_epoch is None:
-            _wd_epoch = _efb(block_info)
-        await _apply_block_withdrawals_on_import(block_height, _wd_epoch)
-
-        # E-D4 on the bulk-sync path — binding at the tip too (see _ED4_ENFORCE_SYNC_TIP):
-        # without it, a block the live paths rejected for a bad root re-entered here.
-        try:
-            from ..validator.finality import finalized_block_height
-            final_h = await finalized_block_height(db)
-            at_finalized = final_h is not None and final_h >= 0 and block_height <= final_h
-            ok_ed4, verr_ed4 = await _verify_unified_state_root(
-                block_content, enforce=_sync_ed4_enforced(at_finalized))
-            if not ok_ed4:
-                logger.warning(f"[SYNC] Rejecting block {block_height}: E-D4 {verr_ed4}")
-                await _restore_after_rejected_block(block_height, f"E-D4: {verr_ed4}")
-                return False
-        except Exception as e:
-            logger.debug(f"[SYNC] E-D4 check skipped for block {block_height}: {e}")
-
-        try:
-            timestamp_val = block.get('timestamp', 0)
-            await db.add_block(
-                block_hash=block_hash,
-                block_height=block_height,
-                block_content=block_content or '',
-                validator_address=validator_address,
-                timestamp=timestamp_val,
-            )
-            # Store accompanying transactions
-            for tx_hex in (txs_hex or []):
-                try:
-                    tx = await Transaction.from_hex(tx_hex)
-                    await db.add_transaction(tx, block_hash)
-                except Exception:
-                    pass  # Non-critical during sync
-            # D2.2b: persist the (now-validated) exchange section so a node rebuilt
-            # from peers carries the same protocol-level state.
-            if ex_section:
-                try:
-                    await db.add_block_exchange_txs(block_hash, ex_section)
-                except Exception as e:
-                    logger.warning(f"[SYNC] Failed to store exchange section for block {block_height}: {e}")
-            # E-D3b: persist the (now-validated) EVM section for durability/rebuild.
-            if evm_section:
-                try:
-                    await db.add_block_evm_txs(block_hash, evm_section)
-                except Exception as e:
-                    logger.warning(f"[SYNC] Failed to store EVM section for block {block_height}: {e}")
-            # Finality (observe): record this block's attestation votes + recompute
-            # justified/finalized. Best-effort; never blocks block storage.
-            try:
-                from ..validator.finality import record_finality_from_block
-                await record_finality_from_block(db, block_content)
-            except Exception as e:
-                logger.debug(f"[SYNC] finality record skipped for block {block_height}: {e}")
-            logger.debug(f"[SYNC] Stored PoS block {block_height} ({block_hash[:16]}...) validator={validator_address[:20]}")
-            return True
-        except Exception as e:
-            logger.error(f"[SYNC] Failed to store PoS block {block_height}: {e}")
+        # Slot progression and FFG votes (qrdx/validator/ffg.py) — _verify_chain_rules.
+        ok_votes, votes_err = await _verify_chain_rules(block_content, block_height)
+        if not ok_votes:
+            logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {votes_err}")
             return False
+
+        # Everything the block changes from here is recorded in the undo journal under its
+        # height (a checkpoint first if it opens an epoch) — what makes a later reorg cheap.
+        from ..derived_state_rebuild import before_block
+        from ..validator.block_verification import epoch_from_block as _block_epoch
+
+        _epoch = _block_epoch(block)
+        async with await before_block(
+            db, block_height, _epoch if _epoch is not None else _block_epoch(block_info)
+        ):
+            # D3/E-D3b: replay the exchange section (if any) before storing. Strict
+            # (reject-on-mismatch) when a root is declared (live broadcast); trust-
+            # replay (adopt) when syncing canonical history with no bound root.
+            ex_section = block.get("exchange_transactions") or block_info.get(
+                "exchange_transactions"
+            )
+            if ex_section:
+                declared = block.get("exchange_state_root") or block_info.get("exchange_state_root")
+                from ..validator.block_verification import epoch_from_block
+
+                ok, verr = await _apply_exchange_section_on_import(
+                    block_height,
+                    block.get("timestamp", 0) or 0,
+                    ex_section,
+                    declared,
+                    block_epoch=epoch_from_block(block) or epoch_from_block(block_info),
+                )
+                if not ok:
+                    logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr}")
+                    return False
+            else:
+                # No exchange transactions — the exchange still ticks (mark prices, ...).
+                _exchange_tick_on_import(block_height, block.get("timestamp", 0) or 0)
+
+            # E-D3b: validate + replay the EVM section (execute-on-mine) before
+            # storing — reject any block whose account_state_root doesn't match.
+            evm_section = block.get("evm_transactions") or block_info.get("evm_transactions")
+            if evm_section:
+                ts_evm = block.get("timestamp", 0) or 0
+                if hasattr(ts_evm, "timestamp"):
+                    ts_evm = int(ts_evm.timestamp())
+                declared_acc = block.get("account_state_root") or block_info.get(
+                    "account_state_root"
+                )
+                ok_evm, verr_evm = await _apply_evm_section_on_import(
+                    block_height,
+                    block_hash,
+                    int(ts_evm),
+                    evm_section,
+                    declared_acc,
+                )
+                if not ok_evm:
+                    logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr_evm}")
+                    await _restore_after_rejected_block(block_height, f"EVM section: {verr_evm}")
+                    return False
+
+            # Stake withdrawals — same point as the proposer: after EVM, before E-D4.
+            from ..validator.block_verification import epoch_from_block as _efb
+
+            _wd_epoch = _efb(block)
+            if _wd_epoch is None:
+                _wd_epoch = _efb(block_info)
+            await _apply_block_withdrawals_on_import(block_height, _wd_epoch)
+
+            # E-D4 on the bulk-sync path — binding at the tip too (see _ED4_ENFORCE_SYNC_TIP):
+            # without it, a block the live paths rejected for a bad root re-entered here.
+            try:
+                from ..validator.finality import finalized_block_height
+
+                final_h = await finalized_block_height(db)
+                at_finalized = final_h is not None and final_h >= 0 and block_height <= final_h
+                ok_ed4, verr_ed4 = await _verify_unified_state_root(
+                    block_content, enforce=_sync_ed4_enforced(at_finalized)
+                )
+                if not ok_ed4:
+                    logger.warning(f"[SYNC] Rejecting block {block_height}: E-D4 {verr_ed4}")
+                    await _restore_after_rejected_block(block_height, f"E-D4: {verr_ed4}")
+                    return False
+            except Exception as e:
+                logger.debug(f"[SYNC] E-D4 check skipped for block {block_height}: {e}")
+
+            try:
+                timestamp_val = block.get("timestamp", 0)
+                await db.add_block(
+                    block_hash=block_hash,
+                    block_height=block_height,
+                    block_content=block_content or "",
+                    validator_address=validator_address,
+                    timestamp=timestamp_val,
+                )
+                # Store accompanying transactions
+                for tx_hex in txs_hex or []:
+                    try:
+                        tx = await Transaction.from_hex(tx_hex)
+                        await db.add_transaction(tx, block_hash)
+                    except Exception:
+                        pass  # Non-critical during sync
+                # D2.2b: persist the (now-validated) exchange section so a node rebuilt
+                # from peers carries the same protocol-level state.
+                if ex_section:
+                    try:
+                        await db.add_block_exchange_txs(block_hash, ex_section)
+                    except Exception as e:
+                        logger.warning(
+                            f"[SYNC] Failed to store exchange section for block {block_height}: {e}"
+                        )
+                # E-D3b: persist the (now-validated) EVM section for durability/rebuild.
+                if evm_section:
+                    try:
+                        await db.add_block_evm_txs(block_hash, evm_section)
+                    except Exception as e:
+                        logger.warning(
+                            f"[SYNC] Failed to store EVM section for block {block_height}: {e}"
+                        )
+                # Finality (observe): record this block's attestation votes + recompute
+                # justified/finalized. Best-effort; never blocks block storage.
+                try:
+                    from ..validator.finality import record_finality_from_block
+
+                    await record_finality_from_block(db, block_content)
+                except Exception as e:
+                    logger.debug(f"[SYNC] finality record skipped for block {block_height}: {e}")
+                logger.debug(
+                    f"[SYNC] Stored PoS block {block_height} ({block_hash[:16]}...) validator={validator_address[:20]}"
+                )
+                return True
+            except Exception as e:
+                logger.error(f"[SYNC] Failed to store PoS block {block_height}: {e}")
+                return False
 
     # ---- Legacy PoW path ----
     if not block_content:
@@ -3256,18 +3798,22 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
     if len(block_content) > MAX_BLOCK_CONTENT_SIZE:
         logger.warning(f"Sync failed: Block content too large for block {block_height}.")
         return False
-    
+
     try:
         transactions = []
         for tx_hex in txs_hex:
             is_valid, error_msg = security.input_validator.validate_transaction_data(tx_hex)
             if not is_valid:
-                logger.warning(f"Sync failed: Invalid transaction in block {block_height}: {error_msg}")
+                logger.warning(
+                    f"Sync failed: Invalid transaction in block {block_height}: {error_msg}"
+                )
                 return False
             transactions.append(await Transaction.from_hex(tx_hex))
 
     except Exception as e:
-        logger.error(f"Sync failed: Could not deserialize transactions for block {block_height}: {e}")
+        logger.error(
+            f"Sync failed: Could not deserialize transactions for block {block_height}: {e}"
+        )
         return False
 
     if not await create_block(block_content, transactions):
@@ -3315,8 +3861,11 @@ _ENFORCE_DEPOSIT_REORG_UNDO = True
 # earlier block's effect in another domain (a stake debit, a withdrawal credit, perp margin)
 # replays with a different outcome and the reorged node diverges at equal tip.
 # Env-overridable (QRDX_INTERLEAVED_REBUILD=0) only to A/B against the old by-domain rebuild.
-_INTERLEAVED_DERIVED_REBUILD = os.getenv(
-    "QRDX_INTERLEAVED_REBUILD", "1").lower() not in ("0", "false", "no")
+_INTERLEAVED_DERIVED_REBUILD = os.getenv("QRDX_INTERLEAVED_REBUILD", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
 
 
 async def _rebuild_derived_state_by_domain():
@@ -3326,6 +3875,7 @@ async def _rebuild_derived_state_by_domain():
     if EVM_STATE_MANAGER is not None:
         try:
             from ..contracts.evm_block_apply import rebuild_account_state_from_chain
+
             await rebuild_account_state_from_chain(db, EVM_STATE_MANAGER, _evm_defer_execute())
         except Exception as e:
             logger.error(f"[REORG] EVM/account state rebuild failed: {e}")
@@ -3344,12 +3894,14 @@ async def _rebuild_derived_state_by_domain():
 
     try:
         from ..exchange.block_processor import rebuild_exchange_state_from_chain
+
         await rebuild_exchange_state_from_chain(db, flush_to_account_state=True)
     except Exception as e:
         logger.error(f"[REORG] Exchange state rebuild failed: {e}")
 
     try:
         from ..validator.withdrawals import reapply_withdrawal_ledger
+
         _recredited = await reapply_withdrawal_ledger(db)
         await db.connection.commit()
         if _recredited:
@@ -3370,6 +3922,7 @@ async def _rebuild_derived_state_after_rollback():
     # block that paid it. An orphaned row left in place would be paid as if canonical.
     try:
         from ..validator.withdrawals import undo_withdrawal_logs_above
+
         _wd_tip = (await db.get_next_block_id()) - 1
         await undo_withdrawal_logs_above(db, _wd_tip)
         await db.connection.commit()
@@ -3378,10 +3931,15 @@ async def _rebuild_derived_state_after_rollback():
 
     if _INTERLEAVED_DERIVED_REBUILD:
         try:
-            from ..derived_state_rebuild import rebuild_derived_state_interleaved
-            await rebuild_derived_state_interleaved(
-                db, EVM_STATE_MANAGER,
-                _evm_defer_execute() if EVM_STATE_MANAGER is not None else None)
+            # The fast path (undo journal back to an epoch checkpoint, then replay the blocks
+            # above it) when it applies, else the full replay from genesis — same result.
+            from ..derived_state_rebuild import rebuild_to_tip
+
+            await rebuild_to_tip(
+                db,
+                EVM_STATE_MANAGER,
+                _evm_defer_execute() if EVM_STATE_MANAGER is not None else None,
+            )
         except Exception as e:
             logger.error(f"[REORG] derived-state rebuild failed: {e}")
     else:
@@ -3416,7 +3974,11 @@ async def _rebuild_derived_state_after_rollback():
                 logger.warning(
                     "[REORG] reversed %d orphaned validator deposit(s) above h=%d "
                     "(%d validator(s) removed, %d stake top-up(s) reduced)",
-                    res["reversed"], tip, res["removed"], res["reduced"])
+                    res["reversed"],
+                    tip,
+                    res["removed"],
+                    res["reduced"],
+                )
         except Exception as e:
             logger.error(f"[REORG] orphaned validator-deposit undo failed: {e}")
 
@@ -3427,12 +3989,14 @@ async def _rebuild_derived_state_after_rollback():
         try:
             from ..validator.finality import update_finality
             from ..validator.validator_reconstruction import reconstruct_validators_live
+
             fin = await update_finality(db)
             finalized_epoch = int(fin.get("finalized_epoch", -1))
             if finalized_epoch >= 0:
                 await reconstruct_validators_live(db, finalized_epoch)
-                logger.info("[REORG] validators reconstructed through finalized epoch %d",
-                            finalized_epoch)
+                logger.info(
+                    "[REORG] validators reconstructed through finalized epoch %d", finalized_epoch
+                )
         except Exception as e:
             logger.error(f"[REORG] validators reconstruction failed: {e}")
 
@@ -3440,8 +4004,11 @@ async def _rebuild_derived_state_after_rollback():
 # Startup rebuild (docs/KNOWN_ISSUES.md — "a restart replayed exchange state without
 # enforcement"). Env-overridable (QRDX_STARTUP_REBUILD=0) only to A/B against the old
 # exchange-only replay.
-_STARTUP_DERIVED_REBUILD = os.getenv(
-    "QRDX_STARTUP_REBUILD", "1").lower() not in ("0", "false", "no")
+_STARTUP_DERIVED_REBUILD = os.getenv("QRDX_STARTUP_REBUILD", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
 
 
 async def _rebuild_derived_state_on_startup():
@@ -3468,6 +4035,7 @@ async def _rebuild_derived_state_on_startup():
     if not _STARTUP_DERIVED_REBUILD:
         try:
             from ..exchange.block_processor import rebuild_exchange_state_from_chain
+
             root = await rebuild_exchange_state_from_chain(db)
             logger.info(f"Exchange state initialized from chain (root={root[:16]}...)")
         except Exception as e:
@@ -3479,16 +4047,16 @@ async def _rebuild_derived_state_on_startup():
         from ..exchange.state_manager import ExchangeStateManager
         from ..validator.withdrawals import undo_withdrawal_logs_above
 
-        durable_account = await db.get_account_state_root()
-        durable_token = await db.get_token_balances_root()
         tip = (await db.get_next_block_id()) - 1
+        durable_account = await db.get_account_state_root(tip)
+        durable_token = await db.get_token_balances_root(tip)
         await undo_withdrawal_logs_above(db, tip)
         await db.connection.commit()
 
         res = await rebuild_derived_state_interleaved(
-            db, EVM_STATE_MANAGER,
-            _evm_defer_execute() if EVM_STATE_MANAGER is not None else None)
-        rebuilt_token = await db.get_token_balances_root()
+            db, EVM_STATE_MANAGER, _evm_defer_execute() if EVM_STATE_MANAGER is not None else None
+        )
+        rebuilt_token = await db.get_token_balances_root(tip)
         exchange_root = ExchangeStateManager.get_instance().compute_state_root()
         if res["account_root"] != durable_account or rebuilt_token != durable_token:
             logger.error(
@@ -3497,11 +4065,19 @@ async def _rebuild_derived_state_on_startup():
                 "interrupted (a crash or stop mid-rebuild leaves partial state), or rebuild "
                 "and forward application disagree on this chain. The chain-derived state is "
                 "kept, as every reorg would produce it.",
-                tip, durable_account[:16], res["account_root"][:16],
-                durable_token[:16], rebuilt_token[:16])
+                tip,
+                durable_account[:16],
+                res["account_root"][:16],
+                durable_token[:16],
+                rebuilt_token[:16],
+            )
         else:
-            logger.info("[startup] derived state rebuilt from chain (tip=%d, matches durable "
-                        "state; exchange root=%s...)", tip, exchange_root[:16])
+            logger.info(
+                "[startup] derived state rebuilt from chain (tip=%d, matches durable "
+                "state; exchange root=%s...)",
+                tip,
+                exchange_root[:16],
+            )
     except Exception as e:
         logger.error(f"[startup] derived-state rebuild failed: {e}")
 
@@ -3515,7 +4091,7 @@ def _p2p_state_dir() -> str:
     explicit = os.environ.get("QRDX_P2P_STATE_DIR")
     if explicit:
         return explicit
-    db_path = str(DENARO_DATABASE_PATH) if DENARO_DATABASE_PATH else 'data/qrdx.db'
+    db_path = str(DENARO_DATABASE_PATH) if DENARO_DATABASE_PATH else "data/qrdx.db"
     return os.path.splitext(db_path)[0] + ".p2p"
 
 
@@ -3541,7 +4117,9 @@ async def _restore_after_rejected_block(block_height, reason: str) -> None:
     slot it owns. Must be called with the block-processing lock held (every import path
     holds it), since it does not acquire it.
     """
-    logger.warning(f"[REJECT] restoring derived state after rejecting block {block_height}: {reason}")
+    logger.warning(
+        f"[REJECT] restoring derived state after rejecting block {block_height}: {reason}"
+    )
     try:
         await db.connection.rollback()
     except Exception as e:
@@ -3560,11 +4138,15 @@ async def _tiebreak_rollback(block_no: int) -> None:
     call site (p2p.submitBlock)."""
     await db.remove_blocks(block_no)
     await _rebuild_derived_state_after_rollback()
-    logger.warning("[fork-choice ENFORCE] rolled back contested tip h=%d for equal-height replacement", block_no)
+    logger.warning(
+        "[fork-choice ENFORCE] rolled back contested tip h=%d for equal-height replacement",
+        block_no,
+    )
 
 
-async def handle_reorganization(node_interface: NodeInterface, local_height: int,
-                                search_from: Optional[int] = None):
+async def handle_reorganization(
+    node_interface: NodeInterface, local_height: int, search_from: Optional[int] = None
+):
     """Handles blockchain reorganization with proper validation.
 
     ``local_height`` is the local tip: everything above the common ancestor up to it is
@@ -3575,7 +4157,9 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
     reorg aborted ("Could not get remote block"). That was 18 of the 24 failed
     reconciliations across three soaks."""
     METRICS.inc("qrdx_reorgs_total")
-    logger.warning(f"[REORG] Fork detected! Starting reorganization process from local height {local_height}.")
+    logger.warning(
+        f"[REORG] Fork detected! Starting reorganization process from local height {local_height}."
+    )
 
     last_common_block_id = -1
     check_height = local_height if search_from is None else min(local_height, int(search_from))
@@ -3584,58 +4168,91 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
     while check_height >= 0:
         local_block = await db.get_block_by_id(check_height)
         if not local_block:
-            logger.error(f"[REORG] Error: Could not retrieve local block at height {check_height}. Halting search.")
+            logger.error(
+                f"[REORG] Error: Could not retrieve local block at height {check_height}. Halting search."
+            )
             break
 
         try:
             remote_block_info = await node_interface.get_block(str(check_height))
-            if remote_block_info and remote_block_info.get('ok'):
-                remote_hash = remote_block_info['result']['block']['hash']
-                if remote_hash == local_block['hash']:
+            if remote_block_info and remote_block_info.get("ok"):
+                remote_hash = remote_block_info["result"]["block"]["hash"]
+                if remote_hash == local_block["hash"]:
                     last_common_block_id = check_height
-                    logger.info(f"[REORG] Found common ancestor at block height: {last_common_block_id}")
+                    logger.info(
+                        f"[REORG] Found common ancestor at block height: {last_common_block_id}"
+                    )
                     break
             else:
-                logger.warning(f"[REORG] Could not get remote block at height {check_height}. Aborting search.")
+                logger.warning(
+                    f"[REORG] Could not get remote block at height {check_height}. Aborting search."
+                )
                 return None
-        
+
         except httpx.RequestError:
-            logger.warning(f"[REORG] Peer became unreachable during common ancestor search. Aborting.")
+            logger.warning(
+                "[REORG] Peer became unreachable during common ancestor search. Aborting."
+            )
             # Let the caller handle the peer removal.
             return None
 
         except Exception as e:
-            logger.error(f"[REORG] Network error while finding common ancestor at height {check_height}: {e}")
+            logger.error(
+                f"[REORG] Network error while finding common ancestor at height {check_height}: {e}"
+            )
             return None
 
         if (local_height - check_height) > 200:
             logger.warning("[REORG] Reorganization depth exceeds 200 blocks. Aborting for safety.")
             return None
-        
+
         check_height -= 1
 
     if last_common_block_id == -1:
-        logger.warning("[REORG] Could not find a common ancestor. Local chain appears invalid. Will perform a full rollback.")
+        logger.warning(
+            "[REORG] Could not find a common ancestor. Local chain appears invalid. Will perform a full rollback."
+        )
+    return await _rollback_to(last_common_block_id, local_height)
 
-    logger.info(f"[REORG] Collecting transactions from orphaned blocks between {last_common_block_id + 1} and {local_height}.")
+
+@asynccontextmanager
+async def _block_lock(held: bool):
+    """block_processing_lock, unless the caller already holds it (asyncio locks don't nest)."""
+    if held:
+        yield
+    else:
+        async with block_processing_lock:
+            yield
+
+
+async def _rollback_to(
+    last_common_block_id: int, local_height: int, *, lock_held: bool = False
+) -> Optional[int]:
+    """Roll the chain back to ``last_common_block_id``: re-queue the orphaned blocks'
+    transactions, refuse if that would cross the finalized checkpoint, remove the blocks and
+    rebuild derived state under the block-processing lock (``lock_held``: the caller holds it).
+    Returns the new tip, or None when the finality guard refuses."""
+    logger.info(
+        f"[REORG] Collecting transactions from orphaned blocks between {last_common_block_id + 1} and {local_height}."
+    )
     orphaned_txs = []
     orphaned_exchange_sections = []
     orphaned_evm_sections = []
     for height in range(last_common_block_id + 1, local_height + 1):
         block = await db.get_block_by_id(height)
         if block:
-            block_txs = await db.get_block_transactions(block['hash'], hex_only=False)
+            block_txs = await db.get_block_transactions(block["hash"], hex_only=False)
             orphaned_txs.extend([tx for tx in block_txs if not isinstance(tx, CoinbaseTransaction)])
             # Capture orphaned exchange sections so their txs can be re-queued.
             try:
-                section = await db.get_block_exchange_txs(block['hash'])
+                section = await db.get_block_exchange_txs(block["hash"])
                 if section:
                     orphaned_exchange_sections.append(section)
             except Exception:
                 pass
             # Capture orphaned EVM sections so their txs can be re-queued (E-D3b).
             try:
-                evm_sec = await db.get_block_evm_txs(block['hash'])
+                evm_sec = await db.get_block_evm_txs(block["hash"])
                 if evm_sec:
                     orphaned_evm_sections.append(evm_sec)
             except Exception:
@@ -3650,6 +4267,7 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
     if _ENFORCE_FINALITY_REORG_GUARD:
         try:
             from ..validator.finality import finalized_block_height
+
             _final_h = await finalized_block_height(db)
         except Exception as e:
             logger.debug(f"[REORG] finality guard check skipped: {e}")
@@ -3668,7 +4286,7 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
     # (the same one the forward-sync apply loop and every import/propose path hold), so
     # the multi-step reseed→reflush is atomic w.r.t. a concurrent block on a busy node.
     # The ancestor search above stays OUTSIDE the lock (it does network I/O).
-    async with block_processing_lock:
+    async with _block_lock(lock_held):
         await db.remove_blocks(last_common_block_id + 1)
         # E-D3b + Phase E reorg safety: rebuild all derived state (account/EVM, token
         # ledger, exchange) from the canonical blocks up to the rolled-back tip. Shared
@@ -3687,6 +4305,7 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
     if orphaned_exchange_sections:
         try:
             from ..exchange.block_processor import decode_exchange_txs
+
             mp = _get_exchange_mempool()
             requeued = 0
             for section in orphaned_exchange_sections:
@@ -3703,6 +4322,7 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
     if orphaned_evm_sections:
         try:
             from ..contracts.evm_block import decode_evm_txs
+
             mp = _get_evm_mempool()
             requeued = 0
             for section in orphaned_evm_sections:
@@ -3717,7 +4337,205 @@ async def handle_reorganization(node_interface: NodeInterface, local_height: int
     return last_common_block_id
 
 
-async def _sync_blockchain(node_id: str = None): 
+# Fork resolution (resolve_fork_with_peer): how far back a competing branch is looked for, and
+# how many of its blocks are fetched. Deeper forks are below finality or are a stale node,
+# which ordinary sync handles.
+_FORK_SEARCH_DEPTH = 256
+_FORK_FETCH_LIMIT = 1024
+_fork_resolution_lock = asyncio.Lock()
+_fork_resolutions_pending: Set[str] = set()
+
+
+def _transfer_parent(block_info: dict) -> Optional[str]:
+    """The parent hash a block declares, as peers transfer it (None if unreadable)."""
+    from ..validator.block_verification import _parse_block_content
+
+    try:
+        b = block_info["block"]
+        return _parse_block_content(b.get("content") or b.get("block_content")).get("parent_hash")
+    except Exception:
+        return None
+
+
+def _parse_transfer_block(block_info: dict) -> Optional[Tuple[int, str, int, list]]:
+    """(height, hash, slot, attestations) of a block as peers transfer it (fork-choice
+    scoring), or None if it cannot be read."""
+    from ..validator.attestation_block import extract_attestations_from_dict
+    from ..validator.block_verification import _parse_block_content
+
+    try:
+        b = block_info["block"]
+        bc = _parse_block_content(b.get("content") or b.get("block_content"))
+        return (
+            int(b.get("id", b.get("block_height"))),
+            b.get("hash") or b.get("block_hash"),
+            int(bc["slot"]),
+            extract_attestations_from_dict(bc),
+        )
+    except Exception:
+        return None
+
+
+async def resolve_fork_with_peer(peer_id: str, reason: str = "") -> bool:
+    """Fork choice against one peer, applied at once (qrdx/validator/ffg.py ``prefer``: the
+    newest justified checkpoint, then height, then the lower tip hash).
+
+    1. Find the common ancestor from one exchange of block hashes (never below the finalized
+       checkpoint, never deeper than _FORK_SEARCH_DEPTH).
+    2. Fetch the peer's branch above it and score it from its own blocks — the justification
+       its votes give it — never from what the peer claims.
+    3. Only if it wins: roll back to the ancestor and apply it, block by block, under the import
+       rules. If one of its blocks is refused, roll back again and restore our own branch.
+
+    It used to happen only in a pass every ~8 s, by rules that disagreed (sync took the longer
+    chain, the reconcile pass the lower hash at the first divergent height). At sub-second slots
+    a node spent dozens of slots on a losing branch. Returns True if this node moved."""
+    if _fork_resolution_lock.locked() or security.sync_state_manager.is_syncing:
+        return False
+    peer = NodesManager.get_peer(peer_id)
+    if not peer or not peer.get("url"):
+        return False
+    from ..validator import ffg
+    from ..validator.finality import finalized_block_height
+
+    async with _fork_resolution_lock:
+        iface = NodeInterface(peer["url"], client=http_client, db=db)
+        status = await iface.get_status()
+        if not (status and status.get("ok")):
+            return False
+        remote = status["result"]
+        if not await _drop_if_incompatible(peer_id, remote.get("network"), "fork choice"):
+            return False
+        remote_height = int(remote.get("height", -1))
+        local_height = int(await db.get_next_block_id()) - 1
+        local_tip = (await db.get_block_hashes(local_height, local_height)).get(local_height)
+        if remote_height < 0 or remote.get("last_block_hash") == local_tip:
+            return False
+
+        # 1. The common ancestor.
+        final_h = await finalized_block_height(db)
+        hi = min(local_height, remote_height)
+        lo = max(0, final_h, hi - _FORK_SEARCH_DEPTH)
+        resp = await iface.get_block_hashes(lo, hi)
+        if not (resp and resp.get("ok")):
+            return False
+        theirs = {int(h): bh for h, bh in resp["result"].items()}
+        ours = await db.get_block_hashes(lo, hi)
+        ancestor = next((h for h in range(hi, lo - 1, -1) if theirs.get(h) == ours.get(h)), None)
+        if ancestor is None:
+            logger.warning(
+                "[fork-choice] %s diverges from us below height %d (the finalized checkpoint or "
+                "the search depth) — not following it",
+                peer_id[:16],
+                lo,
+            )
+            return False
+        if ancestor == local_height and remote_height > local_height:
+            # Not a fork: the peer is simply ahead on our chain.
+            asyncio.create_task(_sync_blockchain(node_id=peer_id))
+            return False
+
+        # 2. Their branch, scored from its own blocks.
+        branch: List[dict] = []
+        start = ancestor + 1
+        while start <= remote_height and len(branch) < _FORK_FETCH_LIMIT:
+            resp = await iface.get_blocks(start, min(512, remote_height - start + 1))
+            batch = resp.get("result") if resp and resp.get("ok") else None
+            if not batch:
+                break
+            branch.extend(batch)
+            start += len(batch)
+        parsed = [_parse_transfer_block(b) for b in branch]
+        if not branch or any(p is None for p in parsed):
+            return False
+        heights = [p[0] for p in parsed]  # type: ignore[index]
+        if heights != list(range(ancestor + 1, ancestor + 1 + len(branch))):
+            return False
+        candidate = await ffg.branch_score(db, ancestor, parsed)  # type: ignore[arg-type]
+        current = await ffg.local_score(db)
+        if not ffg.prefer(candidate, current, ancestor):
+            return False
+
+        # 3. Adopt it.
+        logger.warning(
+            "[fork-choice] switching to %s's branch at %d (justified %d, height %d, tip %s…) "
+            "from ours (justified %d, height %d, tip %s…)%s",
+            peer_id[:16],
+            ancestor,
+            candidate[0],
+            candidate[1],
+            candidate[2][:16],
+            current[0],
+            current[1],
+            current[2][:16],
+            f" — {reason}" if reason else "",
+        )
+        from ..rpc.modules.p2p import blocks_for_transfer
+
+        # The switch holds the block-processing lock throughout: another path (a block pushed
+        # over p2p, a sync, our own proposer) must not add a block between the rollback and the
+        # branch, or the branch no longer fits on top and our own cannot be restored either.
+        async with _adopting_peer_chain(), block_processing_lock:
+            now = int(await db.get_next_block_id()) - 1
+            if (await db.get_block_hashes(now, now)).get(now) != local_tip:
+                return False  # the chain moved while the branch was scored; the next block retries
+            ours_saved = await blocks_for_transfer(db, ancestor + 1, local_height - ancestor)
+            if (
+                ancestor < local_height
+                and await _rollback_to(ancestor, local_height, lock_held=True) is None
+            ):
+                return False
+            if await _apply_branch(branch, lock_held=True):
+                METRICS.inc("qrdx_fork_choice_reconciles_total")
+                return True
+            logger.warning(
+                "[fork-choice] %s's branch had a block we refuse — restoring our own", peer_id[:16]
+            )
+            await security.reputation_manager.record_violation(
+                peer_id, "invalid_fork_branch", severity=8
+            )
+            now = int(await db.get_next_block_id()) - 1
+            if now > ancestor:
+                await _rollback_to(ancestor, now, lock_held=True)
+            if not await _apply_branch(ours_saved, lock_held=True):
+                logger.error("[fork-choice] could not restore our own branch above %d", ancestor)
+            return False
+
+
+async def _apply_branch(blocks: List[dict], *, lock_held: bool = False) -> bool:
+    """Apply consecutive blocks on top of the tip under the sync import rules — every rule but
+    the two sync has always trust-replayed: slot eligibility, because the validator set it is
+    judged against is today's table, not the one the block was proposed under (see
+    docs/KNOWN_ISSUES.md, "Historical proposer eligibility cannot be re-checked"), and E-D4
+    below the tip. Proposer signatures, parent continuity, slot progression and FFG votes are
+    all enforced."""
+    async with _block_lock(lock_held):
+        for block_data in blocks:
+            if not await process_and_create_block(block_data, is_bulk_sync=True):
+                return False
+            await asyncio.sleep(0)
+    return True
+
+
+def schedule_fork_resolution(peer_id: Optional[str], reason: str) -> None:
+    """Resolve a fork with ``peer_id`` now, in the background (once per peer at a time) — called
+    when a peer sends a block that does not extend our tip."""
+    if not peer_id or peer_id in _fork_resolutions_pending:
+        return
+    _fork_resolutions_pending.add(peer_id)
+
+    async def run() -> None:
+        try:
+            await resolve_fork_with_peer(peer_id, reason)
+        except Exception as e:
+            logger.debug(f"fork resolution with {peer_id[:16]} failed: {e}")
+        finally:
+            _fork_resolutions_pending.discard(peer_id)
+
+    asyncio.create_task(run())
+
+
+async def _sync_blockchain(node_id: Optional[str] = None):
     """Synchronizes the local blockchain with proper state management"""
     # Bail out early if a sync is already running — don't raise an exception.
     if security.sync_state_manager.is_syncing:
@@ -3726,13 +4544,13 @@ async def _sync_blockchain(node_id: str = None):
 
     try:
         async with security.sync_state_manager.acquire_sync():
-            logger.info('[SYNC] Starting blockchain synchronization process...')
+            logger.info("[SYNC] Starting blockchain synchronization process...")
 
             peer_to_sync_from = None
             if node_id:
                 peer_to_sync_from = NodesManager.get_peer(node_id)
                 if peer_to_sync_from:
-                    peer_to_sync_from['node_id'] = node_id
+                    peer_to_sync_from["node_id"] = node_id
             else:
                 active_peers = NodesManager.get_propagate_peers(limit=1)
                 if active_peers:
@@ -3742,25 +4560,25 @@ async def _sync_blockchain(node_id: str = None):
                 logger.warning("[SYNC] Aborting: No known (or specified) peer to sync from.")
                 return
 
-            peer_url = peer_to_sync_from['url']
-            peer_id = peer_to_sync_from['node_id']
+            peer_url = peer_to_sync_from["url"]
+            peer_id = peer_to_sync_from["node_id"]
             logger.info(f"[SYNC] Attempting to sync with peer {peer_id} at {peer_url}")
-            
+
             node_interface = NodeInterface(peer_url, client=http_client, db=db)
 
             last_local_block = await db.get_last_block()
-            local_height = last_local_block['id'] if last_local_block else -1
-            
+            local_height = last_local_block["id"] if last_local_block else -1
+
             remote_status_resp = await node_interface.get_status()
 
-            if not (remote_status_resp and remote_status_resp.get('ok')):
+            if not (remote_status_resp and remote_status_resp.get("ok")):
                 logger.warning(f"[SYNC] Failed to get chain status from {peer_url}. Aborting.")
                 return
-                
-            remote_status = remote_status_resp['result']
-            if not await _drop_if_incompatible(peer_id, remote_status.get('network'), "sync"):
+
+            remote_status = remote_status_resp["result"]
+            if not await _drop_if_incompatible(peer_id, remote_status.get("network"), "sync"):
                 return
-            remote_height = remote_status['height']
+            remote_height = remote_status["height"]
 
             logger.info(f"[SYNC] Local height: {local_height}, Remote height: {remote_height}")
 
@@ -3769,53 +4587,64 @@ async def _sync_blockchain(node_id: str = None):
                 return
 
             logger.info("[SYNC] Remote chain is longer.")
-            
+
             fork_detected = False
             if local_height > -1:
-                local_last_hash = last_local_block['hash']
+                local_last_hash = last_local_block["hash"]
                 remote_block_resp = await node_interface.get_block(str(local_height))
-                
-                if not (remote_block_resp and remote_block_resp.get('ok')):
-                    logger.warning("[SYNC] Could not fetch remote block for integrity check. Aborting.")
+
+                if not (remote_block_resp and remote_block_resp.get("ok")):
+                    logger.warning(
+                        "[SYNC] Could not fetch remote block for integrity check. Aborting."
+                    )
                     return
-                
-                remote_block_at_our_height = remote_block_resp['result']
-                if remote_block_at_our_height['block']['hash'] != local_last_hash:
-                    logger.warning(f"[SYNC] Fork detected. Our tip is on a shorter fork.")
+
+                remote_block_at_our_height = remote_block_resp["result"]
+                if remote_block_at_our_height["block"]["hash"] != local_last_hash:
+                    logger.warning("[SYNC] Fork detected. Our tip is on a shorter fork.")
                     fork_detected = True
             else:
                 logger.info("[SYNC] Local chain is empty. Beginning initial block download.")
 
             # Everything from here to the end of the fetch loop adopts the peer's chain: the
             # local proposer must not build on the tip meanwhile (_adopting_peer_chain).
+            if fork_detected:
+                # A fork, not just a longer chain: fork choice decides whether to follow it
+                # (justification first — a longer branch does not win by length alone).
+                schedule_fork_resolution(peer_id, "sync found a fork")
+                return
+
             async with _adopting_peer_chain():
-                if fork_detected:
-                    reorg_result = await handle_reorganization(node_interface, local_height)
-                    if reorg_result is None:
-                        logger.error("[SYNC] Reorganization failed. Aborting sync cycle.")
-                        return
-            
+
                 logger.info("[SYNC] Starting block fetching process.")
                 while True:
                     start_block_id = await db.get_next_block_id()
 
                     if start_block_id > remote_height:
-                        logger.info("[SYNC] Local height now meets or exceeds remote height. Sync appears complete.")
+                        logger.info(
+                            "[SYNC] Local height now meets or exceeds remote height. Sync appears complete."
+                        )
                         break
 
-                    logger.debug(f"[SYNC] Fetching {MAX_REORG_DEPTH} blocks starting from block {start_block_id}...")
-                
+                    logger.debug(
+                        f"[SYNC] Fetching {MAX_REORG_DEPTH} blocks starting from block {start_block_id}..."
+                    )
+
                     blocks_resp = await node_interface.get_blocks(start_block_id, MAX_REORG_DEPTH)
-                
-                    if not (blocks_resp and blocks_resp.get('ok')):
-                        logger.warning("[SYNC] Failed to fetch a batch of blocks from peer. Aborting sync cycle.")
+
+                    if not (blocks_resp and blocks_resp.get("ok")):
+                        logger.warning(
+                            "[SYNC] Failed to fetch a batch of blocks from peer. Aborting sync cycle."
+                        )
                         break
-                
-                    blocks_batch = blocks_resp['result']
+
+                    blocks_batch = blocks_resp["result"]
                     if not blocks_batch:
-                        logger.info('[SYNC] No more blocks returned by peer. Sync presumed complete.')
+                        logger.info(
+                            "[SYNC] No more blocks returned by peer. Sync presumed complete."
+                        )
                         break
-                
+
                     # Serialize block APPLICATION under the same lock every other block-
                     # mutation path holds (p2p import, REST, proposer). The forward-sync loop
                     # was the ONE unlocked state-mutating path, so its process_and_create_block
@@ -3826,28 +4655,60 @@ async def _sync_blockchain(node_id: str = None):
                     # per-batch apply is serialized. See phase_e_invariants reorg divergence.
                     async with block_processing_lock:
                         for block_data in blocks_batch:
+                            # Blocks pushed to us while the batch was in flight are already
+                            # here: skip them. At 250 ms slots that race is routine; it used to
+                            # abort the sync as a fatal error and penalize the honest peer. A
+                            # different block at a height we have is a fork: fork choice decides.
+                            parsed = _parse_transfer_block(block_data)
+                            next_id = await db.get_next_block_id()
+                            if parsed is not None and parsed[0] < next_id:
+                                have = await db.get_block_hashes(parsed[0], parsed[0])
+                                if have.get(parsed[0]) == parsed[1]:
+                                    continue
+                                schedule_fork_resolution(
+                                    peer_to_sync_from["node_id"], "sync batch left our chain"
+                                )
+                                return
+                            # The peer can reorg between the check above and this batch: a block
+                            # whose parent is not our tip is on a fork, not an invalid block.
+                            if parsed is not None and parsed[0] == next_id:
+                                parent = _transfer_parent(block_data)
+                                tip = (await db.get_block_hashes(next_id - 1, next_id - 1)).get(
+                                    next_id - 1
+                                )
+                                if parent and tip and parent != tip:
+                                    schedule_fork_resolution(
+                                        peer_to_sync_from["node_id"], "sync batch left our chain"
+                                    )
+                                    return
                             if not await process_and_create_block(block_data, is_bulk_sync=True):
-                                logger.error("[SYNC] FATAL ERROR: Failed to create blocks during sync. Aborting.")
+                                logger.error(
+                                    "[SYNC] FATAL ERROR: Failed to create blocks during sync. Aborting."
+                                )
                                 await security.reputation_manager.record_violation(
-                                    peer_to_sync_from['node_id'], 'invalid_sync_block', severity=8
+                                    peer_to_sync_from["node_id"], "invalid_sync_block", severity=8
                                 )
                                 return
                             await asyncio.sleep(0)
 
-                    NodesManager.update_peer_last_seen(peer_to_sync_from['node_id'])
-    
+                    NodesManager.update_peer_last_seen(peer_to_sync_from["node_id"])
 
     except httpx.RequestError:
         if peer_to_sync_from:
-            await handle_unreachable_peer(peer_to_sync_from.get('node_id', 'unknown'),  peer_to_sync_from.get('url'), "blockchain sync")
+            await handle_unreachable_peer(
+                peer_to_sync_from.get("node_id", "unknown"),
+                peer_to_sync_from.get("url"),
+                "blockchain sync",
+            )
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"[SYNC] An unexpected error occurred during the sync process: {e}")
         import traceback
+
         traceback.print_exc()
     finally:
-        logger.info('[SYNC] Synchronization process finished.')
+        logger.info("[SYNC] Synchronization process finished.")
 
 
 # Peer-chain adoptions in flight (rollback → fetch → apply). The rollback and each applied batch
@@ -3870,17 +4731,79 @@ async def _adopting_peer_chain():
 
 
 def _peer_chain_adoption_in_progress() -> bool:
-    """Proposal guard for the validator node: True while this node is adopting a peer chain."""
+    """True while this node is adopting a peer chain."""
     return _PEER_CHAIN_ADOPTIONS > 0
 
 
-async def handle_unreachable_peer(peer_id: str, peer_url: str, context: str):
+# A validator that starts behind the network must neither propose nor vote before its first
+# sync with peers. At 250 ms slots, a validator that joined late built seconds of blocks on its
+# stale tip, which forked the network until fork choice undid them, and spent its one FFG vote
+# of the epoch on a checkpoint of that stale chain. Cleared once the post-bootstrap sync check
+# has run (periodic_peer_discovery; with no reachable peer there is nothing to wait for).
+# _INITIAL_SYNC_WAIT_S bounds the wait, so an isolated node still produces.
+_INITIAL_SYNC_WAIT_S = 120.0
+_initial_sync_pending = True
+_initial_sync_deadline = time.monotonic() + _INITIAL_SYNC_WAIT_S
+
+
+def _validator_wait_reason() -> Optional[str]:
+    """The validator node's guard: why it must not propose or vote in this slot, or None."""
+    if _peer_chain_adoption_in_progress():
+        return "adopting a peer's chain"
+    if _initial_sync_pending and time.monotonic() < _initial_sync_deadline:
+        return "waiting for the first sync with peers"
+    return None
+
+
+# Peers dropped as unreachable: node id → the URL they were reached at (verified by the handshake
+# it was learned in). A dropped peer that comes back connects in, and a peer that connects in is
+# recorded without a URL (a private node advertises none), so this node could then neither push
+# blocks to it nor resolve a fork with it. After a validator restarted on the 250 ms testnet the
+# network stayed split. get_verified_sender dials the remembered URL back.
+_FORMER_PEER_URLS: Dict[str, str] = {}
+_FORMER_PEER_URLS_MAX = 256
+_DIALBACK_INTERVAL_S = 5.0
+_dialback_at: Dict[str, float] = {}
+
+
+def _dial_back_if_known(peer_id: str) -> None:
+    """Re-handshake with a returning peer at the URL it had before it was dropped (at most every
+    _DIALBACK_INTERVAL_S per peer), which records that URL again."""
+    url = _FORMER_PEER_URLS.get(peer_id)
+    if not url or (NodesManager.get_peer(peer_id) or {}).get("url"):
+        _FORMER_PEER_URLS.pop(peer_id, None)
+        return
+    now = time.monotonic()
+    if now - _dialback_at.get(peer_id, 0.0) < _DIALBACK_INTERVAL_S:
+        return
+    _dialback_at[peer_id] = now
+
+    async def dial() -> None:
+        try:
+            await do_handshake_with_peer(url)
+        except Exception as e:
+            logger.debug(f"dial-back to {peer_id[:16]} at {url} failed: {e}")
+        if (NodesManager.get_peer(peer_id) or {}).get("url"):
+            _FORMER_PEER_URLS.pop(peer_id, None)
+            logger.info(f"Peer {peer_id[:16]} is back at {url}")
+
+    asyncio.create_task(dial())
+
+
+async def handle_unreachable_peer(peer_id: str, peer_url: Optional[str], context: str):
     """
     Centralized handler for when a peer is unreachable.
     This action is NOT punitive. It simply removes the peer from the active
-    list for this session to prevent wasting resources. The peer can be re-discovered later.
+    list for this session to prevent wasting resources. The peer can be re-discovered later:
+    its URL is remembered, and dialled back when it next connects in.
     """
-    logger.warning(f"Peer {peer_id} at {peer_url} is unreachable ({context}). Removing from active peer list.")
+    logger.warning(
+        f"Peer {peer_id} at {peer_url} is unreachable ({context}). Removing from active peer list."
+    )
+    if peer_url:
+        if len(_FORMER_PEER_URLS) >= _FORMER_PEER_URLS_MAX:
+            _FORMER_PEER_URLS.pop(next(iter(_FORMER_PEER_URLS)))
+        _FORMER_PEER_URLS[peer_id] = peer_url
     NodesManager.remove_peer(peer_id)
 
 
@@ -3902,16 +4825,22 @@ async def fork_choice_reconcile_pass(enforce: bool = False) -> dict:
     at every height). It never mutates state. Returns a small summary dict for the
     caller/probe. See the active-reconciliation redirect in FORK_CHOICE_CONVERGENCE.md.
     """
-    summary = {"window": None, "diverged_at": None, "randao_mix": None, "reconciled": None}
+    summary: Dict[str, Any] = {
+        "window": None,
+        "diverged_at": None,
+        "randao_mix": None,
+        "reconciled": None,
+    }
     try:
         if security.sync_state_manager.is_syncing:
             return summary
         last = await db.get_last_block()
         if not last:
             return summary
-        tip = int(last['id'])
+        tip = int(last["id"])
         try:
             from ..validator.finality import finalized_block_height
+
             fin = await finalized_block_height(db)
         except Exception:
             fin = -1
@@ -3920,194 +4849,34 @@ async def fork_choice_reconcile_pass(enforce: bool = False) -> dict:
             return summary
         summary["window"] = (low, tip)
 
-        peers = [p for p in NodesManager.get_all_peers() if p.get('url')]
-        # RANDAO-mix convergence probe (cheap, local) — logged every pass.
+        peers = [p for p in NodesManager.get_all_peers() if p.get("url")]
+        # RANDAO-mix convergence probe — a chain-index lookup (qrdx/chain_index.py).
         try:
             from ..validator.randao import compute_randao_mix
+
             mix = await compute_randao_mix(db, tip)
             mix_hex = mix.hex()[:16] if isinstance(mix, (bytes, bytearray)) else str(mix)[:16]
         except Exception:
             mix_hex = "?"
         summary["randao_mix"] = mix_hex
 
-        # RANDAO-selection observe (item 5): the enforce-readiness question is whether
-        # all nodes compute the SAME proposer for a slot under the REAL mix. Using the
-        # FINALIZED mix (settled — all nodes agree, below the churning tip) + the
-        # converged validator set, compute the real-mix proposer for a chain-anchored
-        # slot and log it for cross-node comparison. Selection is UNCHANGED (still the
-        # zero constant); this only measures. See docs item 5.
-        try:
-            from decimal import Decimal as _D
-            from ..validator.randao import checkpoint_mix_for_block
-            from ..validator.block_verification import expected_proposer_for_slot, _parse_block_content
-            if fin is not None and fin >= 0:
-                # Anchor to the agreed FINALIZED block and use the height-based CHECKPOINT
-                # mix (the actual enforce mechanism: cross-time-stable, settled), so this
-                # measures exactly what _ENFORCE_RANDAO_SELECTION would compute.
-                cp_mix = await checkpoint_mix_for_block(db, fin)
-                fin_block = await db.get_block_by_id(fin)
-                bc = _parse_block_content(
-                    (fin_block or {}).get("content") or (fin_block or {}).get("block_content") or "{}")
-                fslot = int(bc.get("slot") or 0)
-                actual = bc.get("proposer_address")
-                rows = await db.get_validators()
-                vset = [(r["address"], _D(str(r.get("effective_stake") or r.get("stake") or 0)))
-                        for r in rows if r.get("address")
-                        and str(r.get("status", "active")).upper() in ("ACTIVE", "PENDING", "EXITING")]
-                if vset:
-                    cp_prop = expected_proposer_for_slot(fslot, vset, cp_mix)
-                    zero_prop = expected_proposer_for_slot(fslot, vset)
-                    logger.info("[randao-observe] h=%d slot=%d cp_mix=%s checkpoint_proposer=%s "
-                                "actual=%s zero=%s match_actual=%s", fin, fslot, cp_mix.hex()[:12],
-                                str(cp_prop)[:18], str(actual)[:18], str(zero_prop)[:18],
-                                cp_prop == actual)
-        except Exception as e:
-            logger.debug("randao-observe skipped: %s", e)
-
         if not peers:
             return summary
 
-        # Local hashes across the window.
-        local_hashes = {}
-        for h in range(low, tip + 1):
-            b = await db.get_block_by_id(h)
-            if b:
-                local_hashes[h] = b.get('hash') or b.get('block_hash')
-        # candidates[h] = { block_hash: source_url_or_None(local) }
-        candidates = {h: {hh: None} for h, hh in local_hashes.items()}
+        # Fork choice with every peer (qrdx/validator/ffg.py prefer). Cheap when chains agree:
+        # one status call per peer. The same resolver runs at once when a peer sends a block
+        # that does not extend our tip (schedule_fork_resolution); this pass is the backstop.
+        if not enforce:
+            return summary
         for peer in peers:
-            iface = NodeInterface(peer['url'], client=http_client, db=db)
-            for h in range(low, tip + 1):
-                try:
-                    resp = await iface.get_block(str(h))
-                    if resp and resp.get('ok'):
-                        rh = resp['result']['block']['hash']
-                        if rh:
-                            candidates.setdefault(h, {}).setdefault(rh, peer['url'])
-                except Exception:
-                    break  # peer unreachable — skip the rest of its window
-
-        # Lowest height where local is not the canonical (lowest-hash) choice.
-        diverged = None
-        for h in range(low, tip + 1):
-            if h not in local_hashes or h not in candidates:
-                continue
-            winner = min(candidates[h].keys())
-            if winner != local_hashes[h]:
-                diverged = (h, winner, candidates[h][winner])
+            if await resolve_fork_with_peer(peer.get("node_id", ""), "fork-choice pass"):
+                summary["reconciled"] = True
+                summary["diverged_at"] = tip
                 break
-
-        if diverged is None:
-            logger.debug("[fork-choice observe] window=%d..%d converged; randao_mix=%s",
-                         low, tip, mix_hex)
-            return summary
-        h, winner, src = diverged
-        summary["diverged_at"] = h
-        logger.warning(
-            "[fork-choice %s] block-history divergence at h=%d: local=%s canonical(min-hash)=%s "
-            "from=%s; randao_mix=%s (window %d..%d)",
-            "ENFORCE" if enforce else "observe", h, str(local_hashes[h])[:16],
-            str(winner)[:16], src or "local", mix_hex, low, tip)
-        if not enforce or not src:
-            # Observe, or the canonical block is already local (nothing to pull).
-            return summary
-
-        # ENFORCE: adopt the canonical chain by reorganising onto the peer that holds it.
-        #
-        # Reuses handle_reorganization wholesale rather than hand-rolling a rollback: it
-        # already finds the common ancestor with that peer, applies the FINALITY REORG
-        # GUARD (never roll back below a finalized block), re-queues orphaned
-        # transactions and exchange/EVM sections, and rebuilds every derived-state domain
-        # under the block-processing lock.
-        #
-        # Convergence argument: every node computes the winner as min(hash) over the same
-        # candidate set (its own block plus every peer's at that height), so all nodes
-        # agree on the target and only the losers move. The rule is a pure function of
-        # the block hashes — no slot, stake or arrival-time input — so it cannot
-        # oscillate: the winner never reorgs onto a loser.
-        #
-        # This is the ACTIVE half that passive on-receipt replacement lacked. A node that
-        # only ever saw the losing fork never receives the winning block, so it never
-        # triggers a receive-time tie-break; here every node queries its peers each cycle
-        # regardless of what it received, so the whole network converges rather than just
-        # the nodes that happened to see both blocks.
-        # Adopt the canonical chain: reorg onto it, THEN fetch it.
-        #
-        # Neither existing primitive does this on its own:
-        #   * handle_reorganization only ROLLS BACK to the common ancestor — its caller in
-        #     _sync_blockchain runs the fetch loop. Calling it alone leaves the node short
-        #     with nothing re-fetched, so ordinary sync later pulls from an arbitrary peer
-        #     and often re-establishes the same fork.
-        #   * _sync_blockchain refuses any peer that is not strictly LONGER
-        #     ("Local chain is at or ahead of remote. No sync needed."). Equal-height fork
-        #     reconciliation is precisely the case it declines — which is why the first
-        #     attempt logged 204 enforce lines and converged nothing.
-        #
-        # So do both halves here, deliberately without the longest-chain gate: the
-        # canonical choice is min(hash), not max(height). The finality guard still applies
-        # (inside handle_reorganization), so this can never roll back below finality.
-        try:
-            iface = NodeInterface(src, client=http_client, db=db)
-            logger.warning(
-                "[fork-choice ENFORCE] adopting the canonical chain at h=%d from %s "
-                "(local=%s → canonical=%s)",
-                h, src, str(local_hashes[h])[:16], str(winner)[:16])
-
-            async with _adopting_peer_chain():
-                common = await handle_reorganization(iface, tip, search_from=h)
-                if common is None:
-                    logger.warning(
-                        "[fork-choice ENFORCE] rollback declined at h=%d (finality guard, "
-                        "depth cap, or peer unreachable) — will retry", h)
-                    summary["reconciled"] = False
-                    return summary
-
-                # Fetch the winner's chain from the common ancestor forward.
-                status = await iface.get_status()
-                remote_height = (status or {}).get('result', {}).get('height', -1)
-                applied = 0
-                while True:
-                    start_id = await db.get_next_block_id()
-                    if start_id > remote_height:
-                        break
-                    resp = await iface.get_blocks(start_id, MAX_REORG_DEPTH)
-                    if not (resp and resp.get('ok')) or not resp.get('result'):
-                        break
-                    rejected = False
-                    async with block_processing_lock:
-                        for block_data in resp['result']:
-                            if not await process_and_create_block(block_data, is_bulk_sync=True):
-                                logger.warning(
-                                    "[fork-choice ENFORCE] peer block rejected while adopting "
-                                    "the canonical chain at h=%d — stopping", h)
-                                rejected = True
-                                break
-                            applied += 1
-                            await asyncio.sleep(0)
-                    if rejected:
-                        break
-
-            after = await db.get_block_by_id(h)
-            now_hash = (after or {}).get('hash') or (after or {}).get('block_hash')
-            summary["reconciled"] = (now_hash == winner)
-            if summary["reconciled"]:
-                METRICS.inc("qrdx_fork_choice_reconciles_total")
-                logger.warning(
-                    "[fork-choice ENFORCE] converged at h=%d onto %s (%d block(s) adopted)",
-                    h, str(winner)[:16], applied)
-            else:
-                logger.warning(
-                    "[fork-choice ENFORCE] h=%d is %s after adopting %d block(s) from %s "
-                    "— not yet canonical, will retry",
-                    h, str(now_hash)[:16], applied, src)
-        except Exception as e:
-            logger.error("[fork-choice ENFORCE] reconciliation failed at h=%d: %s", h, e)
-            summary["reconciled"] = False
         return summary
     except Exception as e:
-        logger.debug("fork-choice reconcile pass error: %s", e)
+        logger.debug(f"fork-choice pass skipped: {e}")
         return summary
-
 
 
 # ============================================================================
@@ -4148,8 +4917,8 @@ async def _verify_chain_identity() -> str:
     genesis = await db.get_block_by_id(0)
     if not genesis:
         raise ChainIdentityError("the database has no genesis block")
-    genesis_hash = genesis.get('hash') or genesis.get('block_hash')
-    content = genesis.get('content') or genesis.get('block_content') or {}
+    genesis_hash = genesis.get("hash") or genesis.get("block_hash")
+    content = genesis.get("content") or genesis.get("block_content") or {}
     if isinstance(content, str):
         try:
             content = json.loads(content)
@@ -4161,7 +4930,8 @@ async def _verify_chain_identity() -> str:
         raise ChainIdentityError(
             "this database was created before chain specs existed, so the consensus "
             "parameters it was started with are unknown. Start the node on a new database "
-            "(it will sync from the network).")
+            "(it will sync from the network)."
+        )
     if recorded != spec_hash:
         raise ChainIdentityError(
             f"this database was created under chain spec {recorded[:16]}…, but the node loaded "
@@ -4169,15 +4939,19 @@ async def _verify_chain_identity() -> str:
             f"{CHAIN_SPEC_FILE or 'built-in dev spec from the environment'}). Running it would "
             f"apply different consensus rules to the same chain. Use the network's genesis file "
             f"(and, on a dev network, the environment the database was created with), or start "
-            f"on a new database.")
+            f"on a new database."
+        )
     if content.get("chain_id") != CHAIN_SPEC.chain_id:
-        raise ChainIdentityError(f"genesis records chain id {content.get('chain_id')}, the chain "
-                                 f"spec {CHAIN_SPEC.chain_id}")
+        raise ChainIdentityError(
+            f"genesis records chain id {content.get('chain_id')}, the chain "
+            f"spec {CHAIN_SPEC.chain_id}"
+        )
     pinned = chain_spec_mod.PINNED_NETWORKS.get(CHAIN_SPEC.network)
     if pinned and pinned.lower() != str(genesis_hash).lower():
         raise ChainIdentityError(
             f"{CHAIN_SPEC.network} is pinned to genesis {pinned[:16]}… by this release, but this "
-            f"database holds {str(genesis_hash)[:16]}…")
+            f"database holds {str(genesis_hash)[:16]}…"
+        )
 
     tip = await db.get_next_block_id() - 1
     record = await _read_chain_metadata(_PASSED_FORKS_KEY)
@@ -4189,19 +4963,22 @@ async def _verify_chain_identity() -> str:
                 raise ChainIdentityError(
                     f"fork {f['name']} (height {f['height']}) has passed on this chain, but the "
                     f"chain spec now {change}. A passed fork can never change: restore the "
-                    f"network's chain spec.")
+                    f"network's chain spec."
+                )
         reached = int(record.get("tip", -1))
         for f in CHAIN_SPEC.forks:
             if f["height"] <= reached and f not in record.get("forks", []):
                 raise ChainIdentityError(
                     f"the chain spec schedules fork {f['name']} at height {f['height']}, but this "
                     f"chain passed that height (it had reached {reached}) without it. Forks are "
-                    f"scheduled ahead of the chain, never behind it.")
+                    f"scheduled ahead of the chain, never behind it."
+                )
         tip = max(tip, reached)
     passed = [f for f in CHAIN_SPEC.forks if f["height"] <= tip]
     await db.connection.execute(
         "INSERT OR REPLACE INTO chain_metadata (key, value) VALUES (?, ?)",
-        (_PASSED_FORKS_KEY, json.dumps({"tip": tip, "forks": passed}, sort_keys=True)))
+        (_PASSED_FORKS_KEY, json.dumps({"tip": tip, "forks": passed}, sort_keys=True)),
+    )
     await db.connection.commit()
     return str(genesis_hash)
 
@@ -4247,6 +5024,7 @@ async def _drop_if_incompatible(peer_id: Optional[str], remote_identity, context
 # APPLICATION STARTUP/SHUTDOWN
 # ============================================================================
 
+
 @app.on_event("startup")
 async def startup():
     global db, self_node_id, http_client, EVM_EXECUTOR, EVM_STATE_MANAGER, GENESIS_BLOCK_HASH
@@ -4260,40 +5038,42 @@ async def startup():
             logger.critical(f"[chain-spec] {problem}")
         raise ChainIdentityError(
             f"{len(CHAIN_SPEC_ENV_CONFLICTS)} environment setting(s) conflict with the "
-            f"{CHAIN_SPEC.network} chain spec ({CHAIN_SPEC_FILE}); remove them to start")
+            f"{CHAIN_SPEC.network} chain spec ({CHAIN_SPEC_FILE}); remove them to start"
+        )
     logger.info(
         f"[chain-spec] network {CHAIN_SPEC.network} (chain id {CHAIN_SPEC.chain_id}"
         f"{', dev' if CHAIN_SPEC.dev else ''}), spec {CHAIN_SPEC.genesis_hash()[:16]}… from "
         f"{CHAIN_SPEC_FILE or 'the environment (no genesis file)'}; "
-        f"{len(CHAIN_SPEC.forks)} scheduled fork(s)")
+        f"{len(CHAIN_SPEC.forks)} scheduled fork(s)"
+    )
 
     # Initialize the shared HTTP client for the application's lifespan
     http_client = httpx.AsyncClient(timeout=CONNECTION_TIMEOUT)
     logger.info("Shared HTTP client initialized.")
-    
+
     # Initialize security components
     await security.startup()
-    
+
     os.makedirs(_p2p_state_dir(), exist_ok=True)
-    NodesManager.db_path = os.path.join(_p2p_state_dir(), 'nodes.json')
+    NodesManager.db_path = os.path.join(_p2p_state_dir(), "nodes.json")
     NodesManager.purge_peers()
     initialize_identity()
     self_node_id = get_node_id()
     NodesManager.init(self_node_id)
 
     # Initialize SQLite database
-    db_path = str(DENARO_DATABASE_PATH) if DENARO_DATABASE_PATH else 'data/qrdx.db'
+    db_path = str(DENARO_DATABASE_PATH) if DENARO_DATABASE_PATH else "data/qrdx.db"
     logger.info(f"Using SQLite database: {db_path}")
 
     # Ensure the database directory exists
-    os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else '.', exist_ok=True)
+    os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
 
     db = await Database.create(db_path=db_path)
-    
+
     logger.info("Clearing pending transaction pool.")
     await db.remove_all_pending_transactions()
     logger.info("Pending transaction pool cleared.")
-    
+
     # Initialize genesis if needed (PoS). The genesis file is the one the chain spec was loaded
     # from (QRDX_GENESIS_FILE, or genesis_config.json two levels above the database); without
     # one this is a dev network. Any failure stops startup — there is no fallback genesis.
@@ -4303,7 +5083,8 @@ async def startup():
     if CHAIN_SPEC_FILE:
         logger.info(f"Genesis configuration: {CHAIN_SPEC_FILE}")
     genesis_created = await initialize_genesis_if_needed(
-        db, genesis_file=CHAIN_SPEC_FILE, chain_spec=CHAIN_SPEC)
+        db, genesis_file=CHAIN_SPEC_FILE, chain_spec=CHAIN_SPEC
+    )
     if genesis_created:
         logger.info("Genesis block created for PoS network")
     else:
@@ -4314,16 +5095,22 @@ async def startup():
     _next = CHAIN_SPEC.next_fork(max(0, await db.get_next_block_id() - 1))
     logger.info(
         f"[chain-spec] genesis {GENESIS_BLOCK_HASH[:16]}… verified; "
-        + (f"next fork {_next['name']} at height {_next['height']} "
-           f"(features: {', '.join(_next['features']) or '—'})" if _next else "no fork scheduled"))
+        + (
+            f"next fork {_next['name']} at height {_next['height']} "
+            f"(features: {', '.join(_next['features']) or '—'})"
+            if _next
+            else "no fork scheduled"
+        )
+    )
 
     # Contract system (EVM executor + account-state manager). Initialised here, ahead of
     # the RPC modules that also use it, because the startup rebuild below replays EVM
     # sections through it — and because block production and sync, which start before the
     # RPC modules are registered, must never run with EVM state uninitialised.
-    if os.getenv('QRDX_RPC_ENABLED', 'false').lower() == 'true':
+    if os.getenv("QRDX_RPC_ENABLED", "false").lower() == "true":
         try:
             from ..contracts import ContractStateManager, QRDXEVMExecutor
+
             logger.info("Initializing contract execution system...")
             EVM_STATE_MANAGER = ContractStateManager(db)
             EVM_EXECUTOR = QRDXEVMExecutor(EVM_STATE_MANAGER)
@@ -4340,24 +5127,37 @@ async def startup():
     # accept/reject decisions (see _rebuild_derived_state_on_startup).
     await _rebuild_derived_state_on_startup()
 
+    # Bring the chain index (qrdx/chain_index.py) up to the tip now, once, before the validator
+    # starts — not inside a slot. It persists, so this is quick after the first start.
+    try:
+        from ..chain_index import sync as _sync_chain_index
+
+        _t0 = time.time()
+        _indexed = await _sync_chain_index(db)
+        await db.connection.commit()
+        logger.info("Chain index up to height %d (%.1fs)", _indexed, time.time() - _t0)
+    except Exception as e:
+        logger.warning(f"Chain index warm-up skipped: {e}")
+
     # Initialize PoS validator if enabled
     validator_node = None
-    validator_enabled = os.getenv('QRDX_VALIDATOR_ENABLED', 'false').lower() == 'true'
+    validator_enabled = os.getenv("QRDX_VALIDATOR_ENABLED", "false").lower() == "true"
     if validator_enabled:
         logger.info("🔷 PoS Validator Mode Enabled")
-        validator_wallet_path = os.getenv('QRDX_VALIDATOR_WALLET')
-        validator_password = os.getenv('QRDX_VALIDATOR_PASSWORD', '')
-        
+        validator_wallet_path = os.getenv("QRDX_VALIDATOR_WALLET")
+        validator_password = os.getenv("QRDX_VALIDATOR_PASSWORD", "")
+
         if validator_wallet_path and os.path.exists(validator_wallet_path):
             try:
                 from ..validator.node_integration import initialize_validator_node
+
                 validator_node = await initialize_validator_node(
-                    db, 
-                    validator_wallet_path, 
+                    db,
+                    validator_wallet_path,
                     validator_password,
-                    broadcast_callback=propagate  # Pass propagate function for block broadcasting
+                    broadcast_callback=propagate,  # Pass propagate function for block broadcasting
                 )
-                
+
                 if validator_node:
                     logger.info(f"✅ Validator node started: {validator_node.wallet.address}")
                     # Store globally for access in endpoints
@@ -4368,7 +5168,9 @@ async def startup():
                     # _ENABLE_ATTESTATION_GOSSIP.
                     try:
                         if validator_node.manager is not None:
-                            validator_node.manager.set_attestation_broadcast_fn(_broadcast_attestation)
+                            validator_node.manager.set_attestation_broadcast_fn(
+                                _broadcast_attestation
+                            )
                             logger.info("✅ Attestation gossip broadcast fn bound")
                     except Exception as e:
                         logger.warning(f"Could not bind attestation broadcast fn: {e}")
@@ -4386,7 +5188,7 @@ async def startup():
                         # Block production must never interleave with an import or a
                         # derived-state rebuild: share the lock they hold.
                         validator_node.set_block_processing_lock(block_processing_lock)
-                        validator_node.set_proposal_guard(_peer_chain_adoption_in_progress)
+                        validator_node.set_proposal_guard(_validator_wait_reason)
                     except Exception as e:
                         logger.warning(f"Could not attach EVM tx source/producer: {e}")
                 else:
@@ -4402,6 +5204,7 @@ async def startup():
     # node verifies proposer eligibility off this table, so it must evolve identically.
     try:
         from ..validator.epoch_loop import epoch_validator_update_loop
+
         app.state.epoch_validator_task = asyncio.create_task(epoch_validator_update_loop(db))
         logger.info("✅ Consensus epoch validator-update loop scheduled (all nodes)")
     except Exception as e:
@@ -4415,7 +5218,9 @@ async def startup():
         # HELP text for the RPC/p2p layer counters (incremented in their own modules).
         METRICS.describe("qrdx_rpc_requests_total", "JSON-RPC requests handled, by method")
         METRICS.describe("qrdx_rpc_errors_total", "JSON-RPC requests that errored, by method")
-        METRICS.describe("qrdx_rpc_ratelimited_total", "JSON-RPC requests rejected by the rate limiter")
+        METRICS.describe(
+            "qrdx_rpc_ratelimited_total", "JSON-RPC requests rejected by the rate limiter"
+        )
         METRICS.describe("qrdx_p2p_blocks_received_total", "Blocks accepted from peers via p2p")
         METRICS.describe("qrdx_reorgs_total", "Chain reorganizations handled")
 
@@ -4427,10 +5232,14 @@ async def startup():
                 cur = await db.connection.execute(
                     "SELECT COALESCE(MAX(CASE WHEN finalized=1 THEN epoch END), -1), "
                     "COALESCE(MAX(CASE WHEN justified=1 THEN epoch END), -1), "
-                    "COALESCE(MAX(epoch), -1) FROM epochs")
+                    "COALESCE(MAX(epoch), -1) FROM epochs"
+                )
                 row = await cur.fetchone()
-                return {"finalized_epoch": int(row[0]), "justified_epoch": int(row[1]),
-                        "max_epoch": int(row[2])}
+                return {
+                    "finalized_epoch": int(row[0]),
+                    "justified_epoch": int(row[1]),
+                    "max_epoch": int(row[2]),
+                }
             except Exception:
                 return {}
 
@@ -4453,22 +5262,40 @@ async def startup():
             except Exception:
                 return 0
 
-        METRICS.describe("qrdx_slashing_events", "Recorded slashing events (0 on an honest network)")
-        METRICS.describe("qrdx_finality_lag_epochs", "Epochs the tip is ahead of the finalized boundary")
+        METRICS.describe(
+            "qrdx_slashing_events", "Recorded slashing events (0 on an honest network)"
+        )
+        METRICS.describe(
+            "qrdx_finality_lag_epochs", "Epochs the tip is ahead of the finalized boundary"
+        )
         METRICS.describe("qrdx_mempool_pending", "Pending transactions in the mempool")
-        _chain_poller_task = asyncio.create_task(chain_event_poller(
-            EVENT_HUB, METRICS, get_tip=_poll_tip, get_peer_count=_poll_peers,
-            get_finality=_poll_finality, get_slashing_count=_poll_slashing,
-            get_mempool_depth=_poll_mempool, interval=2.0))
+        _chain_poller_task = asyncio.create_task(
+            chain_event_poller(
+                EVENT_HUB,
+                METRICS,
+                get_tip=_poll_tip,
+                get_peer_count=_poll_peers,
+                get_finality=_poll_finality,
+                get_slashing_count=_poll_slashing,
+                get_mempool_depth=_poll_mempool,
+                interval=2.0,
+            )
+        )
         app.state.chain_poller_task = _chain_poller_task
         if STREAMING_ENABLED:
             # Perps channels (qrdx/exchange/stream.py): read-only, like the chain poller.
             from qrdx.exchange import ExchangeStateManager
             from qrdx.exchange.stream import perp_stream_poller
-            app.state.perp_poller_task = asyncio.create_task(perp_stream_poller(
-                EVENT_HUB, get_manager=ExchangeStateManager.get_instance, interval=1.0))
-        logger.info("✅ Observability chain-event poller scheduled (streaming %s)",
-                    "ENABLED" if STREAMING_ENABLED else "disabled — /metrics + health still on")
+
+            app.state.perp_poller_task = asyncio.create_task(
+                perp_stream_poller(
+                    EVENT_HUB, get_manager=ExchangeStateManager.get_instance, interval=1.0
+                )
+            )
+        logger.info(
+            "✅ Observability chain-event poller scheduled (streaming %s)",
+            "ENABLED" if STREAMING_ENABLED else "disabled — /metrics + health still on",
+        )
     except Exception as e:
         logger.warning(f"Could not start observability poller: {e}")
 
@@ -4477,9 +5304,15 @@ async def startup():
         try:
             from qrdx.exchange import ExchangeStateManager
             from qrdx.tx_index import tx_index_poller
-            app.state.tx_index_task = asyncio.create_task(tx_index_poller(
-                lambda: db, block_processing_lock,
-                get_journal=lambda: ExchangeStateManager.get_instance().journal, interval=1.0))
+
+            app.state.tx_index_task = asyncio.create_task(
+                tx_index_poller(
+                    lambda: db,
+                    block_processing_lock,
+                    get_journal=lambda: ExchangeStateManager.get_instance().journal,
+                    interval=1.0,
+                )
+            )
             logger.info("✅ Transaction indexer scheduled")
         except Exception as e:
             logger.warning(f"Could not start the transaction indexer: {e}")
@@ -4507,25 +5340,28 @@ async def startup():
         tiebreak_rollback=_tiebreak_rollback,  # fork-choice mechanism-2 rollback hook
         restore_after_rejected_block=_restore_after_rejected_block,  # undo a rejected block's effects
         enforce_equal_height_tiebreak=_ENFORCE_EQUAL_HEIGHT_TIEBREAK,  # mechanism-2 gate
-
         enforce_proposer_eligibility=_ENFORCE_PROPOSER_ELIGIBILITY,  # slot-eligibility gate
         add_remote_attestation=_add_remote_attestation,  # attestation-gossip receive hook
         network_identity=_local_network_identity,  # chain spec: advertised in handshake/status
         check_peer_identity=_check_peer_identity,  # chain spec: refuse other networks / fork histories
+        verify_chain_rules=_verify_chain_rules,  # slot progression + FFG votes
+        on_fork=schedule_fork_resolution,  # a block off our tip: run fork choice now
     )
     NodeInterface.network_identity_provider = _local_network_identity
 
-    logger.info(f"✅ JSON-RPC server initialized (dht_* + p2p_* always-on): {len(rpc_server.get_methods())} methods")
+    logger.info(
+        f"✅ JSON-RPC server initialized (dht_* + p2p_* always-on): {len(rpc_server.get_methods())} methods"
+    )
     logger.info(f"   RPC endpoint: http://{DENARO_NODE_HOST}:{DENARO_NODE_PORT}/rpc")
 
     # ---- Optional EVM / chain RPC modules (gated by QRDX_RPC_ENABLED) ----
-    rpc_enabled = os.getenv('QRDX_RPC_ENABLED', 'false').lower() == 'true'
+    rpc_enabled = os.getenv("QRDX_RPC_ENABLED", "false").lower() == "true"
     if rpc_enabled:
         logger.info("🔷 EVM / chain JSON-RPC modules enabled")
         try:
             from ..rpc.modules.eth import EthModule
-            from ..rpc.modules.qrdx import QRDXModule
             from ..rpc.modules.net import NetModule
+            from ..rpc.modules.qrdx import QRDXModule
 
             # The contract system was initialised before the startup rebuild; the RPC
             # modules share that instance with the EVM consensus path (proposer inclusion
@@ -4539,9 +5375,10 @@ async def startup():
             # durable account nonces, so a restart does not reset them to 0 and let an
             # already-executed transaction back in.
             await _rehydrate_evm_pending_nonces()
-            
+
             # Create context for modules
             from dataclasses import dataclass
+
             @dataclass
             class RPCContext:
                 db: Any
@@ -4549,24 +5386,21 @@ async def startup():
                 helpers: Any = None
                 state_manager: Any = None
                 evm_executor: Any = None
-            
-            context = RPCContext(
-                db=db,
-                state_manager=state_manager,
-                evm_executor=evm_executor
-            )
-            
+
+            context = RPCContext(db=db, state_manager=state_manager, evm_executor=evm_executor)
+
             # Register Ethereum module (standard eth_* methods)
             eth_module = EthModule()
             eth_module.context = context
             rpc_server.register_module(eth_module)
-            
+
             # Register web3 utility module
             from ..rpc.modules.web3 import Web3Module
+
             web3_module = Web3Module()
             web3_module.context = context
             rpc_server.register_module(web3_module)
-            
+
             # Register contract methods manually (not a full module)
             # There is deliberately no eth_sendTransaction handler here. The one that stood
             # here executed a signed call straight against the EVM state manager — no block, no
@@ -4582,12 +5416,12 @@ async def startup():
                 it used to accept the transaction alone, so every web3 client's eth_call (which
                 always sends the block tag) failed with an internal error. Calls run against
                 the latest state."""
-                from eth_utils import to_canonical_address, encode_hex, decode_hex
-                
-                sender_hex = call_params.get('from', '0x' + '0' * 40)
-                to_hex = call_params['to']
-                data_hex = call_params.get('data', '0x')
-                
+                from eth_utils import decode_hex, encode_hex, to_canonical_address
+
+                sender_hex = call_params.get("from", "0x" + "0" * 40)
+                to_hex = call_params["to"]
+                data_hex = call_params.get("data", "0x")
+
                 sender = to_canonical_address(sender_hex)
                 to = to_canonical_address(to_hex)
                 data = decode_hex(data_hex)
@@ -4597,25 +5431,30 @@ async def startup():
                 # ERC-20 calls at the token's address); nothing is written.
                 from ..contracts.evm_world import EvmWorld, run as run_evm
                 from ..contracts.native_token_evm import TokenWorld
+
                 tip = (await db.get_next_block_id()) - 1
                 tip_block = await db.get_block_by_id(tip) if tip >= 0 else None
                 world = EvmWorld(evm_executor.state_manager, tokens=TokenWorld(db))
-                result = await run_evm(world, lambda: evm_executor.call(
-                    sender=sender,
-                    to=to,
-                    data=data,
-                    value=0,
-                    gas=10000000,
-                    block_number=max(tip, 1),
-                    timestamp=_evm_block_timestamp((tip_block or {}).get('timestamp')),
-                    world=world,
-                ), preload=[sender, to])
-                
+                result = await run_evm(
+                    world,
+                    lambda: evm_executor.call(
+                        sender=sender,
+                        to=to,
+                        data=data,
+                        value=0,
+                        gas=10000000,
+                        block_number=max(tip, 1),
+                        timestamp=_evm_block_timestamp((tip_block or {}).get("timestamp")),
+                        world=world,
+                    ),
+                    preload=[sender, to],
+                )
+
                 if not result.success:
                     raise Exception(f"Call failed: {result.error}")
-                
+
                 return encode_hex(result.output)
-            
+
             async def eth_sendRawTransaction_handler(raw_tx_hex, _propagated=False):
                 """
                 Submit a pre-signed raw EVM transaction (E-D3b: execute-on-mine).
@@ -4632,8 +5471,8 @@ async def startup():
                 next can include it. ``_propagated`` suppresses re-broadcast.
                 """
                 try:
-                    from eth_utils import decode_hex, encode_hex
                     from eth_hash.auto import keccak
+                    from eth_utils import decode_hex, encode_hex
 
                     raw_tx = decode_hex(raw_tx_hex)
                     _evm_tx_hash = encode_hex(keccak(raw_tx))
@@ -4651,6 +5490,7 @@ async def startup():
                     # other — but refusing here keeps an unauthorised transaction out of
                     # the mempool and off the gossip network in the first place.
                     from ..contracts.evm_mempool import verify_delegated_spend
+
                     deleg_ok, deleg_err = await verify_delegated_spend(db, raw_tx_hex)
                     if not deleg_ok:
                         raise Exception(f"rejected: {deleg_err}")
@@ -4670,26 +5510,28 @@ async def startup():
                     return _evm_tx_hash
                 except Exception as e:
                     logger.error(f"eth_sendRawTransaction error: {e}", exc_info=True)
-                    raise Exception(f"Transaction failed: {str(e)}")
-            
-            rpc_server.register_method('eth_call', eth_call_handler)
-            rpc_server.register_method('eth_sendRawTransaction', eth_sendRawTransaction_handler)
-            
+                    raise Exception(f"Transaction failed: {str(e)}") from e
+
+            rpc_server.register_method("eth_call", eth_call_handler)
+            rpc_server.register_method("eth_sendRawTransaction", eth_sendRawTransaction_handler)
+
             # Register QRDX-specific module
             qrdx_module = QRDXModule()
             qrdx_module.context = context
             rpc_server.register_module(qrdx_module)
-            
+
             # Register network module
             net_module = NetModule()
             net_module.context = context
             rpc_server.register_module(net_module)
-            
-            logger.info(f"✅ EVM / chain RPC modules registered: {len(rpc_server.get_methods())} total methods")
-            
+
+            logger.info(
+                f"✅ EVM / chain RPC modules registered: {len(rpc_server.get_methods())} total methods"
+            )
+
         except Exception as e:
             logger.error(f"❌ RPC server initialization error: {e}", exc_info=True)
-    
+
     logger.info("Starting background tasks.")
     asyncio.create_task(check_own_reachability())
     asyncio.create_task(periodic_peer_discovery())
@@ -4700,7 +5542,7 @@ async def startup():
 
     logger.info(f"Denaro node server started on http://{DENARO_NODE_HOST}:{DENARO_NODE_PORT}")
     logger.info("Application startup complete.")
-    
+
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -4711,10 +5553,10 @@ async def shutdown():
         logger.info("Kademlia DHT stopped and routing table persisted.")
 
     # Stop validator if running
-    if hasattr(app.state, 'validator') and app.state.validator:
+    if hasattr(app.state, "validator") and app.state.validator:
         await app.state.validator.stop()
         logger.info("Validator stopped.")
-    
+
     # Close the shared HTTP client
     if http_client:
         await http_client.aclose()
@@ -4735,13 +5577,13 @@ async def shutdown():
 async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {exc}")
     import traceback
+
     traceback.print_exc()
-    
-    await security.security_monitor.log_event('unhandled_exception', {
-        'endpoint': request.url.path,
-        'error': str(exc)
-    })
-    
+
+    await security.security_monitor.log_event(
+        "unhandled_exception", {"endpoint": request.url.path, "error": str(exc)}
+    )
+
     return JSONResponse(status_code=500, content={"ok": False, "error": "Internal Server Error"})
 
 
@@ -4749,17 +5591,20 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 # MIDDLEWARE
 # ============================================================================
 
+
 async def propagate_old_transactions(propagate_txs):
-    await db.update_pending_transactions_propagation_time([sha256(tx_hex) for tx_hex in propagate_txs])
+    await db.update_pending_transactions_propagation_time(
+        [sha256(tx_hex) for tx_hex in propagate_txs]
+    )
     for tx_hex in propagate_txs:
-        await propagate('push_tx', {'tx_hex': tx_hex})
+        await propagate("push_tx", {"tx_hex": tx_hex})
 
 
 @app.middleware("http")
 async def middleware(request: Request, call_next):
     """Simple middleware to handle URL normalization and attach background tasks"""
-    path = request.scope['path']
-    normalized_path = re.sub('/+', '/', path)
+    path = request.scope["path"]
+    normalized_path = re.sub("/+", "/", path)
     if normalized_path != path:
         new_url = str(request.url.replace(path=normalized_path))
         return RedirectResponse(url=new_url)
@@ -4767,12 +5612,12 @@ async def middleware(request: Request, call_next):
     try:
         propagate_txs = await db.get_need_propagate_transactions()
         response = await call_next(request)
-        
+
         if propagate_txs:
             existing_background = response.background or BackgroundTasks()
             existing_background.add_task(propagate_old_transactions, propagate_txs)
             response.background = existing_background
-            
+
         return response
     except Exception:
         raise
@@ -4782,9 +5627,13 @@ async def middleware(request: Request, call_next):
 # API ENDPOINTS
 # ============================================================================
 
+
 @app.get("/")
 async def root():
-    return {"node_version": NODE_VERSION, "unspent_outputs_hash": await db.get_unspent_outputs_hash()}
+    return {
+        "node_version": NODE_VERSION,
+        "unspent_outputs_hash": await db.get_unspent_outputs_hash(),
+    }
 
 
 @app.post("/push_tx")
@@ -4793,127 +5642,122 @@ async def push_tx(
     request: Request,
     background_tasks: BackgroundTasks,
     body: dict = Body(...),
-    verified_sender: str = Depends(get_verified_sender)
+    verified_sender: str = Depends(get_verified_sender),
 ):
     if not verified_sender:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Signed request required.")
 
-    tx_hex = body.get('tx_hex')
+    tx_hex = body.get("tx_hex")
     if not tx_hex:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "'tx_hex' not found in body.")
 
     is_valid, error_msg = security.input_validator.validate_transaction_data(tx_hex)
     if not is_valid:
         await security.reputation_manager.record_violation(
-            verified_sender, 'invalid_transaction', severity=2, details=error_msg
+            verified_sender, "invalid_transaction", severity=2, details=error_msg
         )
         raise HTTPException(status.HTTP_400_BAD_REQUEST, error_msg)
 
-    # Try to deserialize as Contract or Regular transaction
-    try:
-        tx = await ContractTransaction.from_hex(tx_hex)
-    except Exception:
-        # Fall back to regular transaction
-        tx = await Transaction.from_hex(tx_hex)
-    
-    
+    tx = await Transaction.from_hex(tx_hex)
+
     # Verify the transaction before accepting it into the mempool.
     try:
         if not await tx.verify():
             await security.reputation_manager.record_violation(
-                verified_sender, 'invalid_transaction_content', severity=5, details="Transaction failed full verification"
+                verified_sender,
+                "invalid_transaction_content",
+                severity=5,
+                details="Transaction failed full verification",
             )
-            return {'ok': False, 'error': 'Transaction verification failed'}
+            return {"ok": False, "error": "Transaction verification failed"}
     except Exception as e:
         await security.reputation_manager.record_violation(
-            verified_sender, 'invalid_transaction_content', severity=5, details=f"Verification error: {e}"
+            verified_sender,
+            "invalid_transaction_content",
+            severity=5,
+            details=f"Verification error: {e}",
         )
-        return {'ok': False, 'error': f'Transaction verification failed: {e}'}
-    
+        return {"ok": False, "error": f"Transaction verification failed: {e}"}
 
     if await security.transaction_cache.contains(tx.hash()):
-        return {'ok': False, 'error': 'Transaction just added'}
-    
+        return {"ok": False, "error": "Transaction just added"}
+
     pending_count = await db.get_pending_transaction_count()
     if pending_count >= MAX_MEMPOOL_SIZE:
-        await security.security_monitor.log_event('mempool_full', {
-            'peer_id': verified_sender,
-            'pending_count': pending_count
-        })
-        return {'ok': False, 'error': 'Mempool is full'}
-    
+        await security.security_monitor.log_event(
+            "mempool_full", {"peer_id": verified_sender, "pending_count": pending_count}
+        )
+        return {"ok": False, "error": "Mempool is full"}
+
     try:
         if await security.transaction_pool.add_transaction(tx.hash(), tx, db):
             background_tasks.add_task(
-                propagate, 'push_tx', {'tx_hex': tx_hex}, 
-                ignore_node_id=verified_sender
+                propagate, "push_tx", {"tx_hex": tx_hex}, ignore_node_id=verified_sender
             )
             await security.transaction_cache.put(tx.hash(), True)
-            return {'ok': True, 'result': 'Transaction has been accepted'}
+            return {"ok": True, "result": "Transaction has been accepted"}
         else:
-            return {'ok': False, 'error': 'Transaction has not been added'}
+            return {"ok": False, "error": "Transaction has not been added"}
     except sqlite3.IntegrityError:
-        return {'ok': False, 'error': 'Transaction already present'}
+        return {"ok": False, "error": "Transaction already present"}
     except Exception as e:
-        await security.security_monitor.log_event('transaction_error', {
-            'peer_id': verified_sender,
-            'error': str(e)
-        })
-        return {'ok': False, 'error': 'Transaction rejected'}
+        await security.security_monitor.log_event(
+            "transaction_error", {"peer_id": verified_sender, "error": str(e)}
+        )
+        return {"ok": False, "error": "Transaction rejected"}
 
 
 @app.post("/submit_tx")
-@limiter.limit("30/minute") 
-async def submit_tx(
-    request: Request, 
-    background_tasks: BackgroundTasks,
-    body: dict = Body(...)
-):
-    tx_hex = body.get('tx_hex')
+@limiter.limit("30/minute")
+async def submit_tx(request: Request, background_tasks: BackgroundTasks, body: dict = Body(...)):
+    tx_hex = body.get("tx_hex")
     if not tx_hex:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="'tx_hex' not found in body.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="'tx_hex' not found in body."
+        )
 
     is_valid, error_msg = security.input_validator.validate_transaction_data(tx_hex)
     if not is_valid:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error_msg)
 
     try:
-        # Try contract transaction first
-        try:
-            tx = await ContractTransaction.from_hex(tx_hex)
-        except Exception:
-            # Fall back to regular transaction
-            tx = await Transaction.from_hex(tx_hex)
-        
+        tx = await Transaction.from_hex(tx_hex)
+
         # Verify the transaction before accepting it.
         if not await tx.verify():
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transaction verification failed.")
-        
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="Transaction verification failed."
+            )
+
     except HTTPException:
         raise
     except Exception as e:
         # Catch verification errors or deserialization errors
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid transaction: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid transaction: {e}"
+        ) from e
 
     if await security.transaction_cache.contains(tx.hash()):
-        return {'ok': False, 'error': 'Transaction recently seen'}
+        return {"ok": False, "error": "Transaction recently seen"}
 
     pending_count = await db.get_pending_transaction_count()
     if pending_count >= MAX_MEMPOOL_SIZE:
-        return {'ok': False, 'error': 'Mempool is full'}
+        return {"ok": False, "error": "Mempool is full"}
 
     try:
         if await security.transaction_pool.add_transaction(tx.hash(), tx, db):
-            logger.info(f"Accepted transaction {tx.hash()} from external client. Propagating to network...")
-            background_tasks.add_task(propagate, 'push_tx', {'tx_hex': tx_hex}, ignore_node_id=None)
+            logger.info(
+                f"Accepted transaction {tx.hash()} from external client. Propagating to network..."
+            )
+            background_tasks.add_task(propagate, "push_tx", {"tx_hex": tx_hex}, ignore_node_id=None)
             await security.transaction_cache.put(tx.hash(), True)
-            return {'ok': True, 'result': 'Transaction has been accepted'}
+            return {"ok": True, "result": "Transaction has been accepted"}
         else:
-            return {'ok': False, 'error': 'Transaction failed validation'}
+            return {"ok": False, "error": "Transaction failed validation"}
     except sqlite3.IntegrityError:
-        return {'ok': False, 'error': 'Transaction already present in pending pool'}
-    except Exception as e:
-        return {'ok': False, 'error': 'Transaction rejected'}
+        return {"ok": False, "error": "Transaction already present in pending pool"}
+    except Exception:
+        return {"ok": False, "error": "Transaction rejected"}
 
 
 @app.post("/submit_exchange_tx")
@@ -4928,18 +5772,23 @@ async def submit_exchange_tx(request: Request, body: dict = Body(...)):
     executes when a validator includes it in a block. Poll ``/get_exchange_receipt`` for the
     result. ``POST /exchange_signing_payload`` returns the exact bytes to sign.
     """
-    tx = body.get('tx') if body.get('tx') is not None else body.get('tx_hex')
+    tx = body.get("tx") if body.get("tx") is not None else body.get("tx_hex")
     if tx is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                            detail="send the transaction as 'tx' (object) or 'tx_hex' (string)")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="send the transaction as 'tx' (object) or 'tx_hex' (string)",
+        )
     try:
         ok, error, tx_hash = await _get_exchange_submitter().submit(tx)
     except Exception as e:
         logger.error(f"submit_exchange_tx error: {e}")
-        return {'ok': False, 'error': 'Exchange transaction rejected'}
+        return {"ok": False, "error": "Exchange transaction rejected"}
     if not ok:
-        return {'ok': False, 'error': error}
-    return {'ok': True, 'result': {'tx_hash': tx_hash, 'mempool_size': _get_exchange_mempool().size()}}
+        return {"ok": False, "error": error}
+    return {
+        "ok": True,
+        "result": {"tx_hash": tx_hash, "mempool_size": _get_exchange_mempool().size()},
+    }
 
 
 @app.post("/exchange_signing_payload")
@@ -4949,10 +5798,11 @@ async def exchange_signing_payload(body: dict = Body(...)):
     and the hash the transaction will have. Sign ``signing_bytes`` with the sender's Dilithium
     key, add ``signature`` and ``public_key`` (hex) to ``tx``, and submit it."""
     from qrdx.exchange.submission import signing_payload
+
     try:
-        return {'ok': True, 'result': signing_payload(body.get('tx', body))}
+        return {"ok": True, "result": signing_payload(body.get("tx", body))}
     except Exception as e:
-        return {'ok': False, 'error': f'invalid transaction fields: {e}'}
+        return {"ok": False, "error": f"invalid transaction fields: {e}"}
 
 
 @app.get("/get_exchange_receipt")
@@ -4961,16 +5811,23 @@ async def get_exchange_receipt(tx_hash: str):
     operation's data (an order's id and fills, a deposit's collateral, …). ``null`` while it is
     pending (or after it ages out of this node's journal)."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.receipt(ExchangeStateManager.get_instance(), tx_hash)}
+
+    return {"ok": True, "result": views.receipt(ExchangeStateManager.get_instance(), tx_hash)}
 
 
 @app.get("/get_exchange_nonce")
 async def get_exchange_nonce(address: str):
     """The next exchange nonce for ``address`` (exchange transactions have their own sequence)."""
     from qrdx.exchange import ExchangeStateManager, views
+
     mgr = ExchangeStateManager.get_instance()
-    return {'ok': True, 'result': {'address': address, 'nonce': mgr.get_nonce(
-        views.account_key(mgr.clearinghouse, address) or address)}}
+    return {
+        "ok": True,
+        "result": {
+            "address": address,
+            "nonce": mgr.get_nonce(views.account_key(mgr.clearinghouse, address) or address),
+        },
+    }
 
 
 @app.get("/get_exchange_state_root")
@@ -4984,18 +5841,22 @@ async def get_exchange_state_root():
     """
     try:
         from qrdx.exchange import ExchangeStateManager
+
         mgr = ExchangeStateManager.get_instance()
-        return {'ok': True, 'result': {
-            'exchange_state_root': mgr.compute_state_root(),
-            # The root commits to the height, and the exchange ticks every block: compare
-            # roots between nodes only at the same height.
-            'block_height': mgr._current_block_height,
-            'pools': mgr.pool_count,
-            'pairs': mgr.pair_count,
-        }}
+        return {
+            "ok": True,
+            "result": {
+                "exchange_state_root": mgr.compute_state_root(),
+                # The root commits to the height, and the exchange ticks every block: compare
+                # roots between nodes only at the same height.
+                "block_height": mgr._current_block_height,
+                "pools": mgr.pool_count,
+                "pairs": mgr.pair_count,
+            },
+        }
     except Exception as e:
         logger.error(f"get_exchange_state_root error: {e}")
-        return {'ok': False, 'error': str(e)}
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/get_perp_account")
@@ -5008,63 +5869,84 @@ async def get_perp_account(address: str):
     """
     try:
         from qrdx.exchange import ExchangeStateManager, views
-        return {'ok': True, 'result': views.account(ExchangeStateManager.get_instance(), address)}
+
+        return {"ok": True, "result": views.account(ExchangeStateManager.get_instance(), address)}
     except Exception as e:
         logger.error(f"get_perp_account error: {e}")
-        return {'ok': False, 'error': str(e)}
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/get_perp_orders")
 async def get_perp_orders(address: str):
     """An address's resting perp orders, every market."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.open_orders(ExchangeStateManager.get_instance(), address)}
+
+    return {"ok": True, "result": views.open_orders(ExchangeStateManager.get_instance(), address)}
 
 
 @app.get("/get_perp_markets")
 async def get_perp_markets():
     """Every perps market: prices (oracle, mark, last), open interest, top of book, funding."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.markets(ExchangeStateManager.get_instance())}
+
+    return {"ok": True, "result": views.markets(ExchangeStateManager.get_instance())}
 
 
 @app.get("/get_perp_orderbook")
 async def get_perp_orderbook(market_id: str, depth: int = Query(default=20, ge=1, le=500)):
     """A market's order book: aggregated price levels, best first."""
     from qrdx.exchange import ExchangeStateManager, views
+
     book = views.order_book(ExchangeStateManager.get_instance(), market_id, depth)
     if book is None:
-        return {'ok': False, 'error': f'market {market_id} not found'}
-    return {'ok': True, 'result': book}
+        return {"ok": False, "error": f"market {market_id} not found"}
+    return {"ok": True, "result": book}
 
 
 @app.get("/get_perp_vault")
 async def get_perp_vault():
     """The backstop vault: NAV, shares, share value, the positions it carries, the lockup."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.vault(ExchangeStateManager.get_instance())}
+
+    return {"ok": True, "result": views.vault(ExchangeStateManager.get_instance())}
 
 
 @app.get("/get_perp_trades")
 async def get_perp_trades(market_id: str, limit: int = Query(default=50, ge=1, le=1000)):
     """A market's recent fills, oldest first (liquidation fills included, and flagged)."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.trades(ExchangeStateManager.get_instance(), market_id, limit)}
+
+    return {
+        "ok": True,
+        "result": views.trades(ExchangeStateManager.get_instance(), market_id, limit),
+    }
 
 
 @app.get("/get_perp_events")
-async def get_perp_events(market_id: Optional[str] = None, address: Optional[str] = None,
-                          types: Optional[str] = None, since: Optional[int] = None,
-                          limit: int = Query(default=100, ge=1, le=1000)):
+async def get_perp_events(
+    market_id: Optional[str] = None,
+    address: Optional[str] = None,
+    types: Optional[str] = None,
+    since: Optional[int] = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+):
     """The perps event feed — fills, liquidations, funding settlements — filtered by market,
     address (a fill's buyer or seller, a liquidation's owner), comma-separated ``types``, and
     ``since`` (a sequence number: return only newer events). ``last_seq`` is the newest
     sequence number, to resume from."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.events(
-        ExchangeStateManager.get_instance(), market=market_id, address=address,
-        types=[t.strip() for t in types.split(",") if t.strip()] if types else None,
-        since=since, limit=limit)}
+
+    return {
+        "ok": True,
+        "result": views.events(
+            ExchangeStateManager.get_instance(),
+            market=market_id,
+            address=address,
+            types=[t.strip() for t in types.split(",") if t.strip()] if types else None,
+            since=since,
+            limit=limit,
+        ),
+    }
 
 
 @app.get("/get_token_balance")
@@ -5073,14 +5955,20 @@ async def get_token_balance(token_address: str, address: str):
     including protocol holders (the perps clearinghouse, pool reserves, order-book escrow)."""
     try:
         from qrdx.exchange import ExchangeStateManager, views
-        return {'ok': True, 'result': {
-            'token_address': token_address, 'address': address,
-            'balance': str(await db.get_token_balance(token_address, address)),
-            'frozen': views.token_frozen(ExchangeStateManager.get_instance(), token_address,
-                                         address),
-        }}
+
+        return {
+            "ok": True,
+            "result": {
+                "token_address": token_address,
+                "address": address,
+                "balance": str(await db.get_token_balance(token_address, address)),
+                "frozen": views.token_frozen(
+                    ExchangeStateManager.get_instance(), token_address, address
+                ),
+            },
+        }
     except Exception as e:
-        return {'ok': False, 'error': str(e)}
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/get_tokens")
@@ -5088,28 +5976,35 @@ async def get_tokens():
     """Every native token: name, symbol, decimals, supply, max supply, mint and freeze
     authorities (docs/NATIVE_TOKENS.md)."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.tokens(ExchangeStateManager.get_instance())}
+
+    return {"ok": True, "result": views.tokens(ExchangeStateManager.get_instance())}
 
 
 @app.get("/get_token")
 async def get_token(token_address: str):
     """One native token's registry entry."""
     from qrdx.exchange import ExchangeStateManager, views
+
     found = views.token(ExchangeStateManager.get_instance(), token_address)
     if found is None:
-        return {'ok': False, 'error': f'token {token_address} not found'}
-    return {'ok': True, 'result': found}
+        return {"ok": False, "error": f"token {token_address} not found"}
+    return {"ok": True, "result": found}
 
 
 @app.get("/get_token_allowance")
 async def get_token_allowance(token_address: str, owner: str, spender: str):
     """How much of ``owner``'s tokens ``spender`` may move with TOKEN_TRANSFER_FROM."""
     from qrdx.exchange import ExchangeStateManager, views
+
     try:
-        return {'ok': True, 'result': views.token_allowance(
-            ExchangeStateManager.get_instance(), token_address, owner, spender)}
+        return {
+            "ok": True,
+            "result": views.token_allowance(
+                ExchangeStateManager.get_instance(), token_address, owner, spender
+            ),
+        }
     except ValueError as e:
-        return {'ok': False, 'error': str(e)}
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/get_pools")
@@ -5117,7 +6012,11 @@ async def get_pools(token_a: Optional[str] = None, token_b: Optional[str] = None
     """Spot AMM pools — all of them, or one pair's: price, tick, active liquidity, fee tier,
     protocol fees, volume, and the holder address that owns the pool's reserves."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.pools(ExchangeStateManager.get_instance(), token_a, token_b)}
+
+    return {
+        "ok": True,
+        "result": views.pools(ExchangeStateManager.get_instance(), token_a, token_b),
+    }
 
 
 @app.get("/get_pool")
@@ -5125,29 +6024,43 @@ async def get_pool(pool_id: str, twap_window: Optional[int] = Query(default=None
     """One AMM pool with its initialized ticks and positions. ``twap_window`` (seconds of block
     time) adds the pool's time-weighted price over that window."""
     from qrdx.exchange import ExchangeStateManager, views
+
     found = views.pool(ExchangeStateManager.get_instance(), pool_id, twap_window)
     if found is None:
-        return {'ok': False, 'error': f'pool {pool_id} not found'}
-    return {'ok': True, 'result': found}
+        return {"ok": False, "error": f"pool {pool_id} not found"}
+    return {"ok": True, "result": found}
 
 
 @app.get("/get_liquidity_quote")
-async def get_liquidity_quote(pool_id: str, tick_lower: int, tick_upper: int,
-                              liquidity: Optional[str] = None, amount0: Optional[str] = None,
-                              amount1: Optional[str] = None):
+async def get_liquidity_quote(
+    pool_id: str,
+    tick_lower: int,
+    tick_upper: int,
+    liquidity: Optional[str] = None,
+    amount0: Optional[str] = None,
+    amount1: Optional[str] = None,
+):
     """What adding liquidity to a range costs: pass ``liquidity`` for its exact deposit, or
     ``amount0`` / ``amount1`` for the most liquidity they buy at the current price. Ticks are
     multiples of the pool's tick spacing; the result's ``liquidity`` is ADD_LIQUIDITY's
     ``amount``."""
     from qrdx.exchange import ExchangeStateManager, views
+
     try:
-        found = views.liquidity_quote(ExchangeStateManager.get_instance(), pool_id, tick_lower,
-                                      tick_upper, liquidity, amount0, amount1)
+        found = views.liquidity_quote(
+            ExchangeStateManager.get_instance(),
+            pool_id,
+            tick_lower,
+            tick_upper,
+            liquidity,
+            amount0,
+            amount1,
+        )
     except (ValueError, ArithmeticError) as e:
-        return {'ok': False, 'error': str(e)}
+        return {"ok": False, "error": str(e)}
     if found is None:
-        return {'ok': False, 'error': f'pool {pool_id} not found'}
-    return {'ok': True, 'result': found}
+        return {"ok": False, "error": f"pool {pool_id} not found"}
+    return {"ok": True, "result": found}
 
 
 @app.get("/get_lp_positions")
@@ -5155,25 +6068,40 @@ async def get_lp_positions(address: str):
     """An address's liquidity positions, every pool: range, liquidity, whether it is in range,
     and what removing it would pay right now (principal + uncollected fees)."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.positions(ExchangeStateManager.get_instance(), address)}
+
+    return {"ok": True, "result": views.positions(ExchangeStateManager.get_instance(), address)}
 
 
 @app.get("/get_swap_quote")
-async def get_swap_quote(token_in: str, token_out: str, amount_in: str, sender: str = "",
-                         pool_id: Optional[str] = None, venue: str = "auto"):
+async def get_swap_quote(
+    token_in: str,
+    token_out: str,
+    amount_in: str,
+    sender: str = "",
+    pool_id: Optional[str] = None,
+    venue: str = "auto",
+):
     """The exact fill a SWAP would get right now — the router's own quote across the pair's
     pools and its order book (``venue`` auto | amm | clob, ``pool_id`` pins a pool). Pass
     ``sender`` so the quote stops where self-trade prevention would. Set the swap's
     ``min_amount_out`` from ``amount_out`` less your slippage tolerance."""
     from qrdx.exchange import ExchangeStateManager, views
+
     try:
-        found = views.quote(ExchangeStateManager.get_instance(), token_in, token_out, amount_in,
-                            sender, pool_id, venue)
+        found = views.quote(
+            ExchangeStateManager.get_instance(),
+            token_in,
+            token_out,
+            amount_in,
+            sender,
+            pool_id,
+            venue,
+        )
     except (ValueError, ArithmeticError) as e:
-        return {'ok': False, 'error': str(e)}
+        return {"ok": False, "error": str(e)}
     if found is None:
-        return {'ok': False, 'error': 'no liquidity for this swap'}
-    return {'ok': True, 'result': found}
+        return {"ok": False, "error": "no liquidity for this swap"}
+    return {"ok": True, "result": found}
 
 
 @app.get("/get_spot_orderbook")
@@ -5181,62 +6109,76 @@ async def get_spot_orderbook(pair: str, depth: int = Query(default=20, ge=1, le=
     """A spot pair's order book (``tokenA:tokenB`` by address, either order): aggregated price
     levels in quote per base, best first."""
     from qrdx.exchange import ExchangeStateManager, views
+
     book = views.spot_order_book(ExchangeStateManager.get_instance(), pair, depth)
     if book is None:
-        return {'ok': False, 'error': f'no order book for {pair}'}
-    return {'ok': True, 'result': book}
+        return {"ok": False, "error": f"no order book for {pair}"}
+    return {"ok": True, "result": book}
 
 
 @app.get("/get_nft_collections")
 async def get_nft_collections():
     """Every native NFT collection: metadata, size, royalties, authorities."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.nft_collections(ExchangeStateManager.get_instance())}
+
+    return {"ok": True, "result": views.nft_collections(ExchangeStateManager.get_instance())}
 
 
 @app.get("/get_nft_collection")
 async def get_nft_collection(collection: str):
     from qrdx.exchange import ExchangeStateManager, views
+
     found = views.nft_collection(ExchangeStateManager.get_instance(), collection)
     if found is None:
-        return {'ok': False, 'error': f'collection {collection} not found'}
-    return {'ok': True, 'result': found}
+        return {"ok": False, "error": f"collection {collection} not found"}
+    return {"ok": True, "result": found}
 
 
 @app.get("/get_nft")
 async def get_nft(collection: str, token_id: str):
     """One NFT: its owner, metadata uri, name, approval, and its collection's royalties."""
     from qrdx.exchange import ExchangeStateManager, views
+
     found = views.nft(ExchangeStateManager.get_instance(), collection, token_id)
     if found is None:
-        return {'ok': False, 'error': f'NFT {collection} #{token_id} not found'}
-    return {'ok': True, 'result': found}
+        return {"ok": False, "error": f"NFT {collection} #{token_id} not found"}
+    return {"ok": True, "result": found}
 
 
 @app.get("/get_nfts")
-async def get_nfts(owner: str, collection: Optional[str] = None,
-                   limit: int = Query(default=500, ge=1, le=5000)):
+async def get_nfts(
+    owner: str, collection: Optional[str] = None, limit: int = Query(default=500, ge=1, le=5000)
+):
     """An owner's NFTs (its 0x or 0xPQ address), every collection or one."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.nfts_of(ExchangeStateManager.get_instance(), owner,
-                                                collection, limit)}
+
+    return {
+        "ok": True,
+        "result": views.nfts_of(ExchangeStateManager.get_instance(), owner, collection, limit),
+    }
 
 
 @app.get("/get_spot_orders")
 async def get_spot_orders(address: str):
     """An address's resting spot orders, every pair."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.spot_open_orders(ExchangeStateManager.get_instance(), address)}
+
+    return {
+        "ok": True,
+        "result": views.spot_open_orders(ExchangeStateManager.get_instance(), address),
+    }
 
 
 # ── market data: one shape for spot pairs and perps markets (docs/PERPS_API.md §8) ──
+
 
 @app.get("/get_markets")
 async def get_markets(kind: Optional[str] = None):
     """Every market's ticker — spot pairs (order book and/or AMM pools) and perps markets:
     top of book, last price, 24h open/high/low/change/volume. ``kind`` = spot | perp."""
     from qrdx.exchange import ExchangeStateManager, views
-    return {'ok': True, 'result': views.market_tickers(ExchangeStateManager.get_instance(), kind)}
+
+    return {"ok": True, "result": views.market_tickers(ExchangeStateManager.get_instance(), kind)}
 
 
 @app.get("/get_ticker")
@@ -5244,50 +6186,63 @@ async def get_ticker(market: str):
     """One market's ticker. ``market`` is a spot pair ``base:quote`` (addresses, unique
     symbols or QRDX, either order) or a perps market id."""
     from qrdx.exchange import ExchangeStateManager, views
+
     found = views.market_ticker(ExchangeStateManager.get_instance(), market)
     if found is None:
-        return {'ok': False, 'error': f'no market {market}'}
-    return {'ok': True, 'result': found}
+        return {"ok": False, "error": f"no market {market}"}
+    return {"ok": True, "result": found}
 
 
 @app.get("/get_orderbook")
-async def get_orderbook(market: str, depth: int = Query(default=50, ge=1, le=1000),
-                        level: int = Query(default=2, ge=2, le=3)):
+async def get_orderbook(
+    market: str,
+    depth: int = Query(default=50, ge=1, le=1000),
+    level: int = Query(default=2, ge=2, le=3),
+):
     """A market's order book: level 2 = price levels with running base/quote totals, level 3 =
     every resting order per level in time priority; plus best bid/ask, spread (and in bps),
     mid, last price, the block height it reflects and, for a spot pair, its AMM pools."""
     from qrdx.exchange import ExchangeStateManager, views
+
     found = views.market_book(ExchangeStateManager.get_instance(), market, depth, level)
     if found is None:
-        return {'ok': False, 'error': f'no market {market}'}
-    return {'ok': True, 'result': found}
+        return {"ok": False, "error": f"no market {market}"}
+    return {"ok": True, "result": found}
 
 
 @app.get("/get_trades")
-async def get_trades(market: str, limit: int = Query(default=100, ge=1, le=1000),
-                     since: Optional[int] = None):
+async def get_trades(
+    market: str, limit: int = Query(default=100, ge=1, le=1000), since: Optional[int] = None
+):
     """A market's recent trades, oldest first — order-book fills, AMM swaps, perps fills — with
     the taker's side and the transaction. ``since`` (a trade ``seq``) returns only newer ones."""
     from qrdx.exchange import ExchangeStateManager, views
+
     found = views.market_trades(ExchangeStateManager.get_instance(), market, limit, since)
     if found is None:
-        return {'ok': False, 'error': f'no market {market}'}
-    return {'ok': True, 'result': found}
+        return {"ok": False, "error": f"no market {market}"}
+    return {"ok": True, "result": found}
 
 
 @app.get("/get_candles")
-async def get_candles(market: str, interval: str = "1m",
-                      limit: int = Query(default=200, ge=1, le=1500), end: Optional[float] = None):
+async def get_candles(
+    market: str,
+    interval: str = "1m",
+    limit: int = Query(default=200, ge=1, le=1500),
+    end: Optional[float] = None,
+):
     """OHLCV candles by block time (1m 5m 15m 1h 4h 1d)."""
     from qrdx.exchange import ExchangeStateManager, views
+
     try:
-        found = views.market_candles(ExchangeStateManager.get_instance(), market, interval,
-                                     limit, end)
+        found = views.market_candles(
+            ExchangeStateManager.get_instance(), market, interval, limit, end
+        )
     except ValueError as e:
-        return {'ok': False, 'error': str(e)}
+        return {"ok": False, "error": str(e)}
     if found is None:
-        return {'ok': False, 'error': f'no market {market}'}
-    return {'ok': True, 'result': found}
+        return {"ok": False, "error": f"no market {market}"}
+    return {"ok": True, "result": found}
 
 
 @app.get("/get_perp_market")
@@ -5299,13 +6254,14 @@ async def get_perp_market(market_id: str):
     """
     try:
         from qrdx.exchange import ExchangeStateManager, views
+
         found = views.market(ExchangeStateManager.get_instance(), market_id)
         if found is None:
-            return {'ok': False, 'error': f'market {market_id} not found'}
-        return {'ok': True, 'result': found}
+            return {"ok": False, "error": f"market {market_id} not found"}
+        return {"ok": True, "result": found}
     except Exception as e:
         logger.error(f"get_perp_market error: {e}")
-        return {'ok': False, 'error': str(e)}
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/get_unified_state_root")
@@ -5323,25 +6279,31 @@ async def get_unified_state_root():
     treatment. See docs/EXCHANGE_PRODUCTION_READINESS.md.
     """
     try:
-        from qrdx.exchange import ExchangeStateManager
         from qrdx.crypto.hashing import unified_state_root
-        utxo_root = await db.get_unspent_outputs_hash()
-        account_root = await db.get_account_state_root()
+        from qrdx.exchange import ExchangeStateManager
+
+        # The tip's state, under the rule of the tip's height.
+        tip = max(0, (await db.get_next_block_id()) - 1)
+        utxo_root = await db.get_unspent_outputs_hash(tip)
+        account_root = await db.get_account_state_root(tip)
         exchange_root = ExchangeStateManager.get_instance().compute_state_root()
-        token_root = await db.get_token_balances_root()
+        token_root = await db.get_token_balances_root(tip)
         root = unified_state_root(utxo_root, account_root, exchange_root, token_root)
-        return {'ok': True, 'result': {
-            'unified_state_root': root,
-            'utxo_root': utxo_root,
-            'account_root': account_root,
-            'exchange_root': exchange_root,
-            'token_root': token_root,
-            'token_root_bound': True,
-            'enforced': False,
-        }}
+        return {
+            "ok": True,
+            "result": {
+                "unified_state_root": root,
+                "utxo_root": utxo_root,
+                "account_root": account_root,
+                "exchange_root": exchange_root,
+                "token_root": token_root,
+                "token_root_bound": True,
+                "enforced": False,
+            },
+        }
     except Exception as e:
         logger.error(f"get_unified_state_root error: {e}")
-        return {'ok': False, 'error': str(e)}
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/get_randao_mix")
@@ -5357,16 +6319,20 @@ async def get_randao_mix():
     """
     try:
         from ..validator.randao import compute_randao_mix
+
         tip = (await db.get_next_block_id()) - 1
         mix = await compute_randao_mix(db, tip)
-        return {'ok': True, 'result': {
-            'randao_mix': mix.hex(),
-            'height': tip,
-            'drives_selection': False,
-        }}
+        return {
+            "ok": True,
+            "result": {
+                "randao_mix": mix.hex(),
+                "height": tip,
+                "drives_selection": False,
+            },
+        }
     except Exception as e:
         logger.error(f"get_randao_mix error: {e}")
-        return {'ok': False, 'error': str(e)}
+        return {"ok": False, "error": str(e)}
 
 
 @app.post("/push_block")
@@ -5377,8 +6343,8 @@ async def push_block(
     body: dict = Body(...),
 ):
     """Unauthenticated endpoint for miners with heavy validation"""
-    
-    block_content = body.get('block_content')
+
+    block_content = body.get("block_content")
     if not block_content:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Missing block_content.")
 
@@ -5387,69 +6353,80 @@ async def push_block(
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Block content too large.")
 
     block_identifier = sha256(block_content.encode())
-    
+
     # Use time-based cache
     if await security.block_cache.contains(block_identifier):
-        return {'ok': False, 'error': 'Block recently seen'}
-    
+        return {"ok": False, "error": "Block recently seen"}
+
     # Check sync state
     if security.sync_state_manager.is_syncing:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={'ok': False, 'error': 'Node is busy synchronizing, please try again later.'}
+            content={"ok": False, "error": "Node is busy synchronizing, please try again later."},
         )
 
     # Block processing lock prevents race conditions
     async with block_processing_lock:
-        txs_data = body.get('txs', [])
-        block_no = body.get('id') or body.get('block_no')
+        txs_data = body.get("txs", [])
+        block_no = body.get("id") or body.get("block_no")
 
         if not all([txs_data is not None, block_no is not None]):
-             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Missing block data.")
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Missing block data.")
 
         # Validate block height
         if not await security.input_validator.validate_block_height(block_no, db, max_ahead=1):
-            return {'ok': False, 'error': 'Invalid block height'}
+            return {"ok": False, "error": "Invalid block height"}
 
         next_block_id = await db.get_next_block_id()
-        
+
         # Only accept blocks that build directly on our current chain tip
         if next_block_id != block_no:
-            return {'ok': False, 'error': f'Invalid block height. Expected {next_block_id}, got {block_no}. This may be a stale block.'}
-        
+            return {
+                "ok": False,
+                "error": f"Invalid block height. Expected {next_block_id}, got {block_no}. This may be a stale block.",
+            }
+
         await security.block_cache.put(block_identifier, True)
 
         final_transactions = []
         tx_hashes_to_find = []
         if isinstance(txs_data, str):
-            txs_data = txs_data.split(',') if txs_data else []
+            txs_data = txs_data.split(",") if txs_data else []
         for tx_hex in txs_data:
             if isinstance(tx_hex, str) and len(tx_hex) == 64:
                 tx_hashes_to_find.append(tx_hex)
             else:
                 is_valid, error_msg = security.input_validator.validate_transaction_data(tx_hex)
                 if not is_valid:
-                    raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, f"Transaction data within block is invalid: {error_msg}")
+                    raise HTTPException(
+                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        f"Transaction data within block is invalid: {error_msg}",
+                    )
                 final_transactions.append(await Transaction.from_hex(tx_hex))
 
         if tx_hashes_to_find:
             db_results = await db.get_pending_transactions_by_hash(tx_hashes_to_find)
             if len(db_results) < len(tx_hashes_to_find):
-                return {'ok': False, 'error': 'One or more transaction hashes not found in pending pool.'}
+                return {
+                    "ok": False,
+                    "error": "One or more transaction hashes not found in pending pool.",
+                }
 
             tx_map = {tx.hash(): tx for tx in db_results}
             ordered_txs = [tx_map.get(tx_hash) for tx_hash in tx_hashes_to_find]
             final_transactions.extend(ordered_txs)
-        
-        if not await create_block(block_content, final_transactions):
-            return {'ok': False, 'error': 'Block failed validation.'}
 
-        miner_ip = request.client.host
-        logger.info(f"Accepted block {block_no} from miner at {miner_ip}. Propagating to network...")
-        
+        if not await create_block(block_content, final_transactions):
+            return {"ok": False, "error": "Block failed validation."}
+
+        miner_ip = request.client.host if request.client else "unknown"
+        logger.info(
+            f"Accepted block {block_no} from miner at {miner_ip}. Propagating to network..."
+        )
+
         # Propagate to all peers
-        background_tasks.add_task(propagate, 'submit_block', body, ignore_node_id=None, db=db) 
-        return {'ok': True, 'result': f'Block {block_no} accepted.'}
+        background_tasks.add_task(propagate, "submit_block", body, ignore_node_id=None, db=db)
+        return {"ok": True, "result": f"Block {block_no} accepted."}
 
 
 @app.post("/submit_block")
@@ -5458,92 +6435,90 @@ async def submit_block(
     request: Request,
     background_tasks: BackgroundTasks,
     body: dict = Body(...),
-    verified_sender: str = Depends(get_verified_sender)
+    verified_sender: str = Depends(get_verified_sender),
 ):
     if not verified_sender:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Signed request required.")
 
-    block_content = body.get('block_content')
+    block_content = body.get("block_content")
     if not block_content:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Missing block_content.")
 
     # Validate block content size
     if len(block_content) > MAX_BLOCK_CONTENT_SIZE:
         await security.reputation_manager.record_violation(
-            verified_sender, 'oversized_block', severity=3
+            verified_sender, "oversized_block", severity=3
         )
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Block content too large.")
 
     block_identifier = sha256(block_content.encode())
-    
+
     # Use time-based cache
     if await security.block_cache.contains(block_identifier):
-        return {'ok': False, 'error': 'Block recently seen'}
-    
+        return {"ok": False, "error": "Block recently seen"}
+
     # Check sync state
     if security.sync_state_manager.is_syncing:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={'ok': False, 'error': 'Node is busy synchronizing, please try again later.'}
+            content={"ok": False, "error": "Node is busy synchronizing, please try again later."},
         )
 
     async with block_processing_lock:
-        block_no = body.get('id') or body.get('block_no')
+        block_no = body.get("id") or body.get("block_no")
         if block_no is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Missing block ID.")
-        
+
         # Validate block height
         if not await security.input_validator.validate_block_height(block_no, db):
             await security.reputation_manager.record_violation(
-                verified_sender, 'invalid_block_height', severity=4
+                verified_sender, "invalid_block_height", severity=4
             )
-            return {'ok': False, 'error': 'Invalid block height'}
-        
+            return {"ok": False, "error": "Invalid block height"}
+
         next_block_id = await db.get_next_block_id()
         if next_block_id > block_no:
-            return {'ok': False, 'error': 'Too old block'}
-        
+            return {"ok": False, "error": "Too old block"}
+
         if next_block_id < block_no:
             # Check if peer is already syncing
             if await security.peer_sync_tracker.is_syncing(verified_sender):
-                return {'ok': False, 'error': 'Already syncing to this peer'}
-                
+                return {"ok": False, "error": "Already syncing to this peer"}
+
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={
-                    'ok': False, 
-                    'error': 'sync_required',
-                    'result': {
-                        'next_block_expected': next_block_id
-                    }
-                }
+                    "ok": False,
+                    "error": "sync_required",
+                    "result": {"next_block_expected": next_block_id},
+                },
             )
-        
+
         await security.block_cache.put(block_identifier, True)
-        
+
         # --- PoS fast-path: if the body includes a validator_address & block_hash,
         # this is a PoS block produced by a validator.  Store it directly. ---
-        block_hash = body.get('block_hash')
-        validator_address = body.get('validator_address')
+        block_hash = body.get("block_hash")
+        validator_address = body.get("validator_address")
         if block_hash and validator_address:
             # Security: validate block_hash is well-formed hex
             if not security.input_validator.validate_hex(block_hash, min_length=16, max_length=128):
                 await security.reputation_manager.record_violation(
-                    verified_sender, 'malformed_block_hash', severity=5
+                    verified_sender, "malformed_block_hash", severity=5
                 )
-                return {'ok': False, 'error': 'Invalid block hash format'}
+                return {"ok": False, "error": "Invalid block hash format"}
 
             # Security: block_no must be exactly the next expected height
             if block_no != next_block_id:
-                return {'ok': False, 'error': 'Block height does not match expected next block'}
+                return {"ok": False, "error": "Block height does not match expected next block"}
 
             # Security: verify the claimed validator is registered
             validator_info = await db.get_validator_info(validator_address)
             if not validator_info:
                 await security.reputation_manager.record_violation(
-                    verified_sender, 'unknown_validator', severity=6
+                    verified_sender, "unknown_validator", severity=6
                 )
-                return {'ok': False, 'error': 'Validator address not registered'}
+                return {"ok": False, "error": "Validator address not registered"}
 
             # Security: authenticate the proposer (pubkey↔address binding +
             # Dilithium signature over the signed header). Registration alone does
@@ -5551,133 +6526,160 @@ async def submit_block(
             ok_prop, prop_err = verify_pos_block_proposer(block_content, validator_address)
             if not ok_prop:
                 await security.reputation_manager.record_violation(
-                    verified_sender, 'invalid_proposer_signature', severity=8
+                    verified_sender, "invalid_proposer_signature", severity=8
                 )
-                return {'ok': False, 'error': f'Proposer authentication failed: {prop_err}'}
+                return {"ok": False, "error": f"Proposer authentication failed: {prop_err}"}
 
             # Security: proposer must be eligible for the block's slot. Observe-first.
             ok_elig, elig_err = await verify_proposer_eligibility(
-                db, block_content, enforce=_ENFORCE_PROPOSER_ELIGIBILITY,
+                db,
+                block_content,
+                enforce=_ENFORCE_PROPOSER_ELIGIBILITY,
             )
             if not ok_elig:
                 await security.reputation_manager.record_violation(
-                    verified_sender, 'ineligible_proposer', severity=8
+                    verified_sender, "ineligible_proposer", severity=8
                 )
-                return {'ok': False, 'error': f'Proposer ineligible: {elig_err}'}
+                return {"ok": False, "error": f"Proposer ineligible: {elig_err}"}
 
             # Parent-hash continuity (observe-first): also instrument the REST
             # submit_block path — a fork block entering here (which has no parent
             # check beyond height) is a candidate entry point for the genesis-era
             # broken-linkage divergence seen with no reorg. Observe = log only.
             ok_par, par_err = await _check_parent_continuity(
-                block_no, block_content, enforce=_ENFORCE_PARENT_CONTINUITY,
+                block_no,
+                block_content,
+                enforce=_ENFORCE_PARENT_CONTINUITY,
             )
             if not ok_par:
-                return {'ok': False, 'error': f'Parent discontinuity: {par_err}'}
+                return {"ok": False, "error": f"Parent discontinuity: {par_err}"}
 
-            # D3: if the block carries an exchange section, securely validate +
-            # replay it (verify signatures, re-execute, match declared root)
-            # BEFORE storing. Reject the block on any mismatch — local exchange
-            # state is left untouched by a rejected block.
-            ex_section = body.get('exchange_transactions')
-            if ex_section:
-                try:
-                    # Phase E: route through the importer hook so the collateral
-                    # flush (margin debit → account_state) runs on this REST
-                    # live-broadcast path too, deterministically with proposer/sync.
-                    from ..validator.block_verification import epoch_from_block
-                    ok, verr = await _apply_exchange_section_on_import(
-                        block_no, float(body.get('timestamp', 0) or 0),
-                        ex_section, body.get('exchange_state_root'),
-                        block_epoch=epoch_from_block(body),
-                    )
-                except Exception as e:
-                    ok, verr = False, f"exchange validation error: {e}"
-                if not ok:
-                    await security.reputation_manager.record_violation(
-                        verified_sender, 'invalid_exchange_section', severity=6
-                    )
-                    return {'ok': False, 'error': f'Invalid exchange section: {verr}'}
-            else:
-                # No exchange transactions — the exchange still ticks (mark prices, ...).
-                _exchange_tick_on_import(block_no, body.get('timestamp', 0) or 0)
+            ok_votes, votes_err = await _verify_chain_rules(block_content, block_no)
+            if not ok_votes:
+                return {"ok": False, "error": f"Chain rules: {votes_err}"}
 
-            # E-D3b: validate + replay the EVM section (execute-on-mine) before
-            # storing; reject on account_state_root mismatch.
-            evm_section = body.get('evm_transactions')
-            if evm_section:
-                ok_evm, verr_evm = await _apply_evm_section_on_import(
-                    block_no, block_hash, int(body.get('timestamp', 0) or 0),
-                    evm_section, body.get('account_state_root'),
-                )
-                if not ok_evm:
-                    await security.reputation_manager.record_violation(
-                        verified_sender, 'invalid_evm_section', severity=6
-                    )
-                    await _restore_after_rejected_block(block_no, f"EVM section: {verr_evm}")
-                    return {'ok': False, 'error': f'Invalid EVM section: {verr_evm}'}
+            # Everything the block changes from here is recorded in the undo journal under its
+            # height (a checkpoint first if it opens an epoch) — what makes a later reorg cheap.
+            from ..derived_state_rebuild import before_block
+            from ..validator.block_verification import epoch_from_block as _block_epoch
 
-            # Stake withdrawals — same point as the proposer: after EVM, before E-D4.
-            from ..validator.block_verification import epoch_from_block as _efb
-            await _apply_block_withdrawals_on_import(block_no, _efb(body))
-
-            # E-D4: verify the recomputed unified state root against the signed root.
-            ok_root, root_err = await _verify_unified_state_root(block_content)
-            if not ok_root:
-                await security.reputation_manager.record_violation(
-                    verified_sender, 'invalid_state_root', severity=8
-                )
-                await _restore_after_rejected_block(block_no, f"E-D4: {root_err}")
-                return {'ok': False, 'error': f'Invalid state root: {root_err}'}
-
-            try:
-                await db.add_block(
-                    block_hash=block_hash,
-                    block_height=block_no,
-                    block_content=block_content or '',
-                    validator_address=validator_address,
-                    timestamp=body.get('timestamp', 0),
-                )
-                # D2.2b: persist the (now-validated) exchange section for durability.
+            async with await before_block(db, block_no, _block_epoch(body)):
+                # D3: if the block carries an exchange section, securely validate +
+                # replay it (verify signatures, re-execute, match declared root)
+                # BEFORE storing. Reject the block on any mismatch — local exchange
+                # state is left untouched by a rejected block.
+                ex_section = body.get("exchange_transactions")
                 if ex_section:
                     try:
-                        await db.add_block_exchange_txs(block_hash, ex_section)
+                        # Phase E: route through the importer hook so the collateral
+                        # flush (margin debit → account_state) runs on this REST
+                        # live-broadcast path too, deterministically with proposer/sync.
+                        from ..validator.block_verification import epoch_from_block
+
+                        ok, verr = await _apply_exchange_section_on_import(
+                            block_no,
+                            float(body.get("timestamp", 0) or 0),
+                            ex_section,
+                            body.get("exchange_state_root"),
+                            block_epoch=epoch_from_block(body),
+                        )
                     except Exception as e:
-                        logger.warning(f"Failed to store exchange section for block {block_no}: {e}")
-                # E-D3b: persist the (now-validated) EVM section for durability/rebuild.
+                        ok, verr = False, f"exchange validation error: {e}"
+                    if not ok:
+                        await security.reputation_manager.record_violation(
+                            verified_sender, "invalid_exchange_section", severity=6
+                        )
+                        return {"ok": False, "error": f"Invalid exchange section: {verr}"}
+                else:
+                    # No exchange transactions — the exchange still ticks (mark prices, ...).
+                    _exchange_tick_on_import(block_no, body.get("timestamp", 0) or 0)
+
+                # E-D3b: validate + replay the EVM section (execute-on-mine) before
+                # storing; reject on account_state_root mismatch.
+                evm_section = body.get("evm_transactions")
                 if evm_section:
-                    try:
-                        await db.add_block_evm_txs(block_hash, evm_section)
-                    except Exception as e:
-                        logger.warning(f"Failed to store EVM section for block {block_no}: {e}")
-                # Finality (observe): record attestation votes + recompute.
+                    ok_evm, verr_evm = await _apply_evm_section_on_import(
+                        block_no,
+                        block_hash,
+                        int(body.get("timestamp", 0) or 0),
+                        evm_section,
+                        body.get("account_state_root"),
+                    )
+                    if not ok_evm:
+                        await security.reputation_manager.record_violation(
+                            verified_sender, "invalid_evm_section", severity=6
+                        )
+                        await _restore_after_rejected_block(block_no, f"EVM section: {verr_evm}")
+                        return {"ok": False, "error": f"Invalid EVM section: {verr_evm}"}
+
+                # Stake withdrawals — same point as the proposer: after EVM, before E-D4.
+                from ..validator.block_verification import epoch_from_block as _efb
+
+                await _apply_block_withdrawals_on_import(block_no, _efb(body))
+
+                # E-D4: verify the recomputed unified state root against the signed root.
+                ok_root, root_err = await _verify_unified_state_root(block_content)
+                if not ok_root:
+                    await security.reputation_manager.record_violation(
+                        verified_sender, "invalid_state_root", severity=8
+                    )
+                    await _restore_after_rejected_block(block_no, f"E-D4: {root_err}")
+                    return {"ok": False, "error": f"Invalid state root: {root_err}"}
+
                 try:
-                    from ..validator.finality import record_finality_from_block
-                    await record_finality_from_block(db, block_content)
+                    await db.add_block(
+                        block_hash=block_hash,
+                        block_height=block_no,
+                        block_content=block_content or "",
+                        validator_address=validator_address,
+                        timestamp=body.get("timestamp", 0),
+                    )
+                    # D2.2b: persist the (now-validated) exchange section for durability.
+                    if ex_section:
+                        try:
+                            await db.add_block_exchange_txs(block_hash, ex_section)
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to store exchange section for block {block_no}: {e}"
+                            )
+                    # E-D3b: persist the (now-validated) EVM section for durability/rebuild.
+                    if evm_section:
+                        try:
+                            await db.add_block_evm_txs(block_hash, evm_section)
+                        except Exception as e:
+                            logger.warning(f"Failed to store EVM section for block {block_no}: {e}")
+                    # Finality (observe): record attestation votes + recompute.
+                    try:
+                        from ..validator.finality import record_finality_from_block
+
+                        await record_finality_from_block(db, block_content)
+                    except Exception as e:
+                        logger.debug(f"finality record skipped for block {block_no}: {e}")
+                    await security.reputation_manager.record_good_behavior(
+                        verified_sender, points=5
+                    )
+                    logger.info(
+                        f"Accepted PoS block {block_no} from {verified_sender}. Propagating..."
+                    )
+                    background_tasks.add_task(
+                        propagate, "submit_block", body, ignore_node_id=verified_sender, db=db
+                    )
+                    # Immediate follow-up: check if we're still behind and need more blocks
+                    background_tasks.add_task(_follow_up_sync, verified_sender)
+                    return {"ok": True, "result": f"Block {block_no} accepted."}
                 except Exception as e:
-                    logger.debug(f"finality record skipped for block {block_no}: {e}")
-                await security.reputation_manager.record_good_behavior(verified_sender, points=5)
-                logger.info(f"Accepted PoS block {block_no} from {verified_sender}. Propagating...")
-                background_tasks.add_task(
-                    propagate, 'submit_block', body,
-                    ignore_node_id=verified_sender, db=db
-                )
-                # Immediate follow-up: check if we're still behind and need more blocks
-                background_tasks.add_task(_follow_up_sync, verified_sender)
-                return {'ok': True, 'result': f'Block {block_no} accepted.'}
-            except Exception as e:
-                logger.error(f"Failed to store PoS block {block_no}: {e}")
-                return {'ok': False, 'error': 'Failed to store block'}
+                    logger.error(f"Failed to store PoS block {block_no}: {e}")
+                    return {"ok": False, "error": "Failed to store block"}
 
         # --- Legacy PoW path ---
         # Process transactions with validation
-        txs_data = body.get('txs', [])
+        txs_data = body.get("txs", [])
         final_transactions = []
         tx_hashes_to_find = []
-        
+
         if isinstance(txs_data, str):
-            txs_data = txs_data.split(',') if txs_data else []
-            
+            txs_data = txs_data.split(",") if txs_data else []
+
         for tx_hex in txs_data:
             if isinstance(tx_hex, str) and len(tx_hex) == 64 and VALID_HEX_PATTERN.match(tx_hex):
                 tx_hashes_to_find.append(tx_hex)
@@ -5685,46 +6687,43 @@ async def submit_block(
                 is_valid, error_msg = security.input_validator.validate_transaction_data(tx_hex)
                 if not is_valid:
                     await security.reputation_manager.record_violation(
-                        verified_sender, 'invalid_block_transaction', severity=5
+                        verified_sender, "invalid_block_transaction", severity=5
                     )
-                    return {'ok': False, 'error': f'Invalid transaction in block: {error_msg}'}
-                    
+                    return {"ok": False, "error": f"Invalid transaction in block: {error_msg}"}
+
                 final_transactions.append(await Transaction.from_hex(tx_hex))
-                
+
         if tx_hashes_to_find:
             db_results = await db.get_pending_transactions_by_hash(tx_hashes_to_find)
             if len(db_results) < len(tx_hashes_to_find):
-                return {'ok': False, 'error': 'Transaction hash not found.'}
-                
+                return {"ok": False, "error": "Transaction hash not found."}
+
             tx_map = {tx.hash(): tx for tx in db_results}
             ordered_txs = [tx_map.get(tx_hash) for tx_hash in tx_hashes_to_find]
             final_transactions.extend(ordered_txs)
-        
+
         if not await create_block(block_content, final_transactions):
             await security.reputation_manager.record_violation(
-                verified_sender, 'invalid_block', severity=7
+                verified_sender, "invalid_block", severity=7
             )
-            return {'ok': False, 'error': 'Block failed validation.'}
+            return {"ok": False, "error": "Block failed validation."}
 
         # Record successful block
         await security.reputation_manager.record_good_behavior(verified_sender, points=5)
-        
+
         logger.info(f"Accepted block {block_no} from {verified_sender}. Propagating to network...")
         background_tasks.add_task(
-            propagate, 'submit_block', body, 
-            ignore_node_id=verified_sender, db=db
+            propagate, "submit_block", body, ignore_node_id=verified_sender, db=db
         )
         # Immediate follow-up: check if we're still behind and need more blocks
         background_tasks.add_task(_follow_up_sync, verified_sender)
-        return {'ok': True, 'result': f'Block {block_no} accepted.'}
-        
+        return {"ok": True, "result": f"Block {block_no} accepted."}
+
 
 @app.post("/submit_blocks")
 @limiter.limit("30/minute")
 async def submit_blocks(
-    request: Request,
-    body: list = Body(...),
-    verified_sender: str = Depends(get_verified_sender)
+    request: Request, body: list = Body(...), verified_sender: str = Depends(get_verified_sender)
 ):
     if not verified_sender:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Signed request required.")
@@ -5734,70 +6733,87 @@ async def submit_blocks(
 
     if len(body) > MAX_BLOCKS_PER_SUBMISSION:
         await security.reputation_manager.record_violation(
-            verified_sender, 'too_many_blocks', severity=3
+            verified_sender, "too_many_blocks", severity=3
         )
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Request limit exceeded. You can only submit up to {MAX_BLOCKS_PER_SUBMISSION} blocks at a time."
+            detail=f"Request limit exceeded. You can only submit up to {MAX_BLOCKS_PER_SUBMISSION} blocks at a time.",
         )
-    
+
     try:
         async with security.sync_state_manager.acquire_sync():
             async with block_processing_lock:
-                blocks_to_process = sorted(body, key=lambda x: x['id'])
-                
+                blocks_to_process = sorted(body, key=lambda x: x["id"])
+
                 # Verify continuity
                 for i in range(1, len(blocks_to_process)):
-                    if blocks_to_process[i]['id'] != blocks_to_process[i-1]['id'] + 1:
+                    if blocks_to_process[i]["id"] != blocks_to_process[i - 1]["id"] + 1:
                         await security.reputation_manager.record_violation(
-                            verified_sender, 'non_continuous_blocks', severity=4
+                            verified_sender, "non_continuous_blocks", severity=4
                         )
-                        return {'ok': False, 'error': 'Block sequence must be continuous'}
-                
+                        return {"ok": False, "error": "Block sequence must be continuous"}
+
                 next_block_id = await db.get_next_block_id()
-                if blocks_to_process[0]['id'] != next_block_id:
-                    return {'ok': False, 'error': f'Block sequence out of order. Expected {next_block_id}, got {blocks_to_process[0]["id"]}.'}
+                if blocks_to_process[0]["id"] != next_block_id:
+                    return {
+                        "ok": False,
+                        "error": f'Block sequence out of order. Expected {next_block_id}, got {blocks_to_process[0]["id"]}.',
+                    }
 
                 for block_payload in blocks_to_process:
-                    block_no = block_payload.get('id')
-                    
+                    block_no = block_payload.get("id")
+
                     current_expected_id = await db.get_next_block_id()
                     if current_expected_id != block_no:
-                        return {'ok': False, 'error': f'Block sequence desynchronized during batch. Expected {current_expected_id}, got {block_no}.'}
-                    
-                    block_content = block_payload.get('block_content')
-                    txs_data = block_payload.get('txs', [])
+                        return {
+                            "ok": False,
+                            "error": f"Block sequence desynchronized during batch. Expected {current_expected_id}, got {block_no}.",
+                        }
+
+                    block_content = block_payload.get("block_content")
+                    txs_data = block_payload.get("txs", [])
 
                     if not block_content:
-                        return {'ok': False, 'error': f'Invalid block data for block {block_no}: missing content.'}
+                        return {
+                            "ok": False,
+                            "error": f"Invalid block data for block {block_no}: missing content.",
+                        }
 
                     # Validate block content size
                     if len(block_content) > MAX_BLOCK_CONTENT_SIZE:
                         await security.reputation_manager.record_violation(
-                            verified_sender, 'oversized_bulk_block', severity=3
+                            verified_sender, "oversized_bulk_block", severity=3
                         )
-                        return {'ok': False, 'error': f'Block {block_no} content too large.'}
+                        return {"ok": False, "error": f"Block {block_no} content too large."}
 
                     block_identifier = sha256(block_content.encode())
                     if await security.block_cache.contains(block_identifier):
                         continue
-                    
+
                     final_transactions = []
                     for tx_hex in txs_data:
-                        is_valid, error_msg = security.input_validator.validate_transaction_data(tx_hex)
+                        is_valid, error_msg = security.input_validator.validate_transaction_data(
+                            tx_hex
+                        )
                         if not is_valid:
                             await security.reputation_manager.record_violation(
-                                verified_sender, 'invalid_bulk_transaction', severity=5
+                                verified_sender, "invalid_bulk_transaction", severity=5
                             )
-                            return {'ok': False, 'error': f'Block {block_no} contains an invalid transaction: {error_msg}'}
+                            return {
+                                "ok": False,
+                                "error": f"Block {block_no} contains an invalid transaction: {error_msg}",
+                            }
                         final_transactions.append(await Transaction.from_hex(tx_hex))
-                    
+
                     if not await create_block(block_content, final_transactions):
                         await security.reputation_manager.record_violation(
-                            verified_sender, 'invalid_bulk_block', severity=7
+                            verified_sender, "invalid_bulk_block", severity=7
                         )
-                        return {'ok': False, 'error': f'Block {block_no} failed validation. Halting.'}
-                    
+                        return {
+                            "ok": False,
+                            "error": f"Block {block_no} failed validation. Halting.",
+                        }
+
                     await security.block_cache.put(block_identifier, True)
                     logger.info(f"Accepted block {block_no} from {verified_sender} via bulk sync.")
 
@@ -5806,15 +6822,17 @@ async def submit_blocks(
                     verified_sender, points=len(blocks_to_process) * 2
                 )
 
-                return {'ok': True, 'result': f'Successfully processed {len(blocks_to_process)} blocks.'}
-        
+                return {
+                    "ok": True,
+                    "result": f"Successfully processed {len(blocks_to_process)} blocks.",
+                }
+
     except HTTPException:
         raise
     except Exception as e:
-        await security.security_monitor.log_event('bulk_sync_error', {
-            'peer_id': verified_sender,
-            'error': str(e)
-        })
+        await security.security_monitor.log_event(
+            "bulk_sync_error", {"peer_id": verified_sender, "error": str(e)}
+        )
         raise
 
 
@@ -5822,9 +6840,9 @@ async def submit_blocks(
 async def get_peers(verified_sender: str = Depends(get_verified_sender)):
     if not verified_sender:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Signed request required.")
-    
+
     peers_list = [
-        {'node_id': peer_id, **peer_data} 
+        {"node_id": peer_id, **peer_data}
         for peer_id, peer_data in NodesManager.peers.items()
         # Only share peers that haven't been banned
         if not await security.reputation_manager.is_banned(peer_id)
@@ -5832,128 +6850,24 @@ async def get_peers(verified_sender: str = Depends(get_verified_sender)):
     return {"ok": True, "result": {"peers": peers_list}}
 
 
-@app.get("/handshake/challenge")
-@limiter.limit("30/minute")
-async def handshake_challenge(request: Request):
-    """
-    Provides a challenge and also advertises this node's current chain state.
-    """
-    challenge = await security.handshake_manager.create_challenge()
-    
-    # Get our current chain state to send to the peer.
-    height = await db.get_next_block_id() - 1
-    last_block = await db.get_block_by_id(height) if height > -1 else None
-    
-    # Handle different database implementations (PostgreSQL uses 'hash', SQLite uses 'block_hash')
-    last_hash = None
-    if last_block:
-        last_hash = last_block.get('hash') or last_block.get('block_hash')
-    
-    return {
-        "ok": True, 
-        "result": {
-            "challenge": challenge,
-            "node_id": get_node_id(),
-            "pubkey": get_public_key_hex(),
-            "is_public": NodesManager.self_is_public,
-            "url": DENARO_SELF_URL,
-            "height": height,
-            "last_hash": last_hash,
-            "network": await _local_network_identity(),
-        }
-    }
-
-
-@app.post("/handshake/response")
-@limiter.limit("30/minute")
-async def handshake_response(
-    request: Request,
-    body: dict = Body(...),
-    verified_sender: str = Depends(get_verified_sender)
-):
-    """
-    Verifies a handshake response and uses the peer's advertised chain state to
-    negotiate a sync. This is the server-side of the handshake negotiation.
-    """
-    if not verified_sender:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Signed request required.")
-
-    # --- Read data from request ---
-    challenge = body.get('challenge')
-    try:
-        peer_height = int(request.headers.get('x-denaro-height', -1))
-    except (ValueError, TypeError):
-        peer_height = -1
-    peer_hash = request.headers.get('x-denaro-last_hash')
-
-    if not challenge:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Missing challenge.")
-
-    # --- Verify challenge ---
-    if not await security.handshake_manager.verify_and_consume_challenge(challenge):
-        await security.reputation_manager.record_violation(verified_sender, 'invalid_handshake', severity=6)
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid or expired challenge.")
-
-    # Another network, or an incompatible fork history: refuse before negotiating any sync.
-    if not await _drop_if_incompatible(verified_sender, body.get('network'), "REST handshake"):
-        return JSONResponse(status_code=status.HTTP_409_CONFLICT,
-                            content={'ok': False, 'error': 'network_mismatch'})
-    
-    logger.info(f"Received handshake from {verified_sender} (Height: {peer_height})")
-
-    # --- Compare Chain States and Determine Action ---
-    local_height = await db.get_next_block_id() - 1
-    
-    if peer_height > local_height:
-        # CASE 1: We are behind.
-        # We must ask the connecting peer (who has the longer chain) to PUSH blocks to us.
-        # This is critical for NAT traversal (e.g., an empty public node learning from a private node).
-        logger.info(f"Our chain is behind. Requesting peer {verified_sender} to PUSH-sync to us.")
-        return JSONResponse(
-            status_code=200, # A successful response that contains instructions
-            content={
-                'ok': True,
-                'result': 'sync_requested', # Special status telling the client to initiate a push
-                'detail': {
-                    'start_block': local_height + 1,
-                    'target_block': peer_height + 1
-                }
-            }
-        )
-        
-    elif local_height > peer_height:
-        # CASE 2: The connecting peer is behind.
-        # We tell them they need to sync, and it's their responsibility to act.
-        # We respond with a 409 Conflict to signal a state mismatch they need to resolve.
-        logger.info(f"Our chain is longer. Informing peer {verified_sender} a sync is required.")
-        return JSONResponse(
-            status_code=status.HTTP_409_CONFLICT,
-            content={
-                'ok': False, 
-                'error': 'sync_required',
-                'result': {'next_block_expected': peer_height + 1}
-            }
-        )
-    
-    # CASE 3: Heights are equal. We assume they are in sync.
-    # (A more advanced implementation could compare hashes here to detect forks).
-    logger.info(f"Handshake complete for peer {verified_sender}. Chains appear to be in sync.")
-    return {"ok": True, "result": "Handshake successful."}
+# The handshake is JSON-RPC only (p2p_handshakeChallenge / p2p_handshakeResponse): mutual,
+# with signed calls and a signed identity proof. The REST pair it replaced took a peer's
+# identity on its word, and is gone rather than left as a weaker second way in.
 
 
 @app.get("/sync_blockchain")
 @limiter.limit("10/minute")
-async def sync(request: Request, node_id: str = None): 
+async def sync(request: Request, node_id: Optional[str] = None):
     """Initiates a blockchain synchronization process"""
     if security.sync_state_manager.is_syncing:
-        return {'ok': False, 'error': 'Node is already syncing'}
-    
+        return {"ok": False, "error": "Node is already syncing"}
+
     background_tasks = BackgroundTasks()
     background_tasks.add_task(_sync_blockchain, node_id=node_id)
-    
+
     return JSONResponse(
-        content={'ok': True, 'result': 'Synchronization process has been initiated.'},
-        background=background_tasks
+        content={"ok": True, "result": "Synchronization process has been initiated."},
+        background=background_tasks,
     )
 
 
@@ -5978,13 +6892,15 @@ async def get_mining_info(
     # Recompute difficulty/tip
     Manager.difficulty = None
     difficulty, last_block = await get_difficulty()
-    
-    next_block_height = (last_block['id'] + 1) if last_block else 0
+
+    next_block_height = (last_block["id"] + 1) if last_block else 0
 
     # Guard mempool size (same as before)
     pending_count = await db.get_pending_transaction_count()
     if pending_count > MAX_MEMPOOL_SIZE:
-        logger.warning(f"Mempool size ({pending_count}) exceeds limit of ({MAX_MEMPOOL_SIZE}). Triggering cleanup.")
+        logger.warning(
+            f"Mempool size ({pending_count}) exceeds limit of ({MAX_MEMPOOL_SIZE}). Triggering cleanup."
+        )
         await clear_pending_transactions([])
 
     # === Load ALL mempool transactions by hash, then hydrate ===
@@ -6023,22 +6939,29 @@ async def get_mining_info(
     if not candidate_hashes:
         merkle_root = get_transactions_merkle_tree([], next_block_height)
         result = {
-            'ok': True,
-            'result': {
-                'difficulty': difficulty,
-                'last_block': last_block,
-                'pending_transactions': [],
-                'pending_transactions_hashes': [],
-                'merkle_root': merkle_root,
-            }
+            "ok": True,
+            "result": {
+                "difficulty": difficulty,
+                "last_block": last_block,
+                "pending_transactions": [],
+                "pending_transactions_hashes": [],
+                "merkle_root": merkle_root,
+            },
         }
-        return Response(content=json.dumps(result, indent=4, cls=CustomJSONEncoder), media_type="application/json") if pretty else result
+        return (
+            Response(
+                content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
+                media_type="application/json",
+            )
+            if pretty
+            else result
+        )
 
     # Debug info per tx
     debug_rows = {}  # h -> dict
 
     # Memoize chain prev-tx lookups
-    chain_tx_cache = {}
+    chain_tx_cache: Dict[str, Any] = {}
 
     async def chain_tx(prev_hash: str):
         if prev_hash in chain_tx_cache:
@@ -6048,29 +6971,29 @@ async def get_mining_info(
         return data
 
     # Dependency graph
-    deps = {h: set() for h in candidate_hashes}   # child -> set(parent hashes in mempool)
-    children = defaultdict(set)                   # parent -> set(children)
-    prevouts = {}                                 # h -> set("txhash:index")
-    invalid = set()                               # bad references / failed verify
+    deps: Dict[str, Set[str]] = {h: set() for h in candidate_hashes}  # child -> parents in mempool
+    children = defaultdict(set)  # parent -> set(children)
+    prevouts = {}  # h -> set("txhash:index")
+    invalid = set()  # bad references / failed verify
 
     # First pass: validate inputs, build deps, record prevouts
     for h in candidate_hashes:
         tx = tx_by_hash[h]
         info = {
-            'hash': h,
-            'selected': False,
-            'reason': None,
-            'deps': [],
-            'prevouts': [],
-            'indegree_initial': None,
-            'indegree_final': None,
-            'parents_not_selected': [],
+            "hash": h,
+            "selected": False,
+            "reason": None,
+            "deps": [],
+            "prevouts": [],
+            "indegree_initial": None,
+            "indegree_final": None,
+            "parents_not_selected": [],
         }
 
         # Record prevouts for in-block double-spend checks
-        my_prevouts = set(f"{inp.tx_hash}:{inp.index}" for inp in tx.inputs)
+        my_prevouts = {f"{inp.tx_hash}:{inp.index}" for inp in tx.inputs}
         prevouts[h] = my_prevouts
-        info['prevouts'] = list(my_prevouts)
+        info["prevouts"] = list(my_prevouts)
 
         try:
             ok = True
@@ -6086,13 +7009,15 @@ async def get_mining_info(
                 src = await chain_tx(p)
                 if src is None:
                     logger.debug(f"Tx {h[:10]} references unknown prev tx {p[:10]}")
-                    info['reason'] = f"invalid_input_unknown_parent:{p}"
+                    info["reason"] = f"invalid_input_unknown_parent:{p}"
                     ok = False
                     break
 
-                if 'outputs' in src and inp.index >= len(src['outputs']):
-                    logger.debug(f"Tx {h[:10]} references out-of-range output {inp.index} in {p[:10]}")
-                    info['reason'] = f"invalid_input_out_of_range:{p}:{inp.index}"
+                if "outputs" in src and inp.index >= len(src["outputs"]):
+                    logger.debug(
+                        f"Tx {h[:10]} references out-of-range output {inp.index} in {p[:10]}"
+                    )
+                    info["reason"] = f"invalid_input_out_of_range:{p}:{inp.index}"
                     ok = False
                     break
 
@@ -6104,19 +7029,19 @@ async def get_mining_info(
             # Full signature/script verification
             if not await tx.verify():
                 logger.debug(f"Tx {h[:10]} failed verification")
-                info['reason'] = "verify_failed"
+                info["reason"] = "verify_failed"
                 invalid.add(h)
                 debug_rows[h] = info
                 continue
 
         except Exception as e:
             logger.debug(f"Tx {h[:10]} verification error: {e}")
-            info['reason'] = f"verify_exception:{e}"
+            info["reason"] = f"verify_exception:{e}"
             invalid.add(h)
             debug_rows[h] = info
             continue
 
-        info['deps'] = list(deps[h])
+        info["deps"] = list(deps[h])
         debug_rows[h] = info
 
     # Build children edges (ignore invalid parents)
@@ -6133,7 +7058,7 @@ async def get_mining_info(
         if h in invalid:
             continue
         indegree[h] = sum(1 for p in deps[h] if p not in invalid)
-        debug_rows[h]['indegree_initial'] = indegree[h]
+        debug_rows[h]["indegree_initial"] = indegree[h]
 
     # Queue of zero-dep txs in stable order (DB order)
     zero_dep = [h for h, d in indegree.items() if d == 0]
@@ -6143,7 +7068,7 @@ async def get_mining_info(
     # Selection loop
     selected = []
     selected_hashes = set()
-    spent_prevouts = set()
+    spent_prevouts: Set[str] = set()
     total_size = 0
     size_hard_stop = False
 
@@ -6164,7 +7089,7 @@ async def get_mining_info(
         # In-block double-spend check
         if not prevouts[h].isdisjoint(spent_prevouts):
             if debug:
-                debug_rows[h]['reason'] = "double_spend_conflict_in_block"
+                debug_rows[h]["reason"] = "double_spend_conflict_in_block"
             continue
 
         # Accept tx
@@ -6172,7 +7097,7 @@ async def get_mining_info(
         selected_hashes.add(h)
         spent_prevouts.update(prevouts[h])
         total_size += len(tx_hex)
-        debug_rows[h]['selected'] = True
+        debug_rows[h]["selected"] = True
 
         # Relax children indegrees
         for c in children.get(h, ()):
@@ -6183,17 +7108,17 @@ async def get_mining_info(
 
     # Annotate non-selected reasons
     for h, d in indegree.items():
-        debug_rows[h]['indegree_final'] = d
-        if not debug_rows[h]['selected'] and h not in invalid and debug_rows[h]['reason'] is None:
+        debug_rows[h]["indegree_final"] = d
+        if not debug_rows[h]["selected"] and h not in invalid and debug_rows[h]["reason"] is None:
             if d > 0:
                 blocked_by = [p for p in deps[h] if p not in invalid and p not in selected_hashes]
-                debug_rows[h]['reason'] = "blocked_by_unselected_parents"
-                debug_rows[h]['parents_not_selected'] = blocked_by
+                debug_rows[h]["reason"] = "blocked_by_unselected_parents"
+                debug_rows[h]["parents_not_selected"] = blocked_by
             else:
                 if size_hard_stop:
-                    debug_rows[h]['reason'] = "size_limit_reached"
+                    debug_rows[h]["reason"] = "size_limit_reached"
                 else:
-                    debug_rows[h]['reason'] = "skipped_for_conflict_or_unknown"
+                    debug_rows[h]["reason"] = "skipped_for_conflict_or_unknown"
 
     # Purge invalids
     if invalid:
@@ -6209,7 +7134,7 @@ async def get_mining_info(
     selected_hex = [tx.hex() for tx in selected]
     selected_hashes_list = [tx.hash() for tx in selected]
     merkle_root = get_transactions_merkle_tree(selected_hashes_list, next_block_height)
-    
+
     # Periodic cleanup (unchanged)
     if LAST_PENDING_TRANSACTIONS_CLEAN[0] < timestamp() - 600:
         logger.debug("Clearing old pending transactions")
@@ -6223,58 +7148,65 @@ async def get_mining_info(
             pass
 
     payload = {
-        'ok': True,
-        'result': {
-            'difficulty': difficulty,
-            'last_block': last_block,
-            'pending_transactions': selected_hex,
-            'pending_transactions_hashes': selected_hashes_list,
-            'merkle_root': merkle_root,
-        }
+        "ok": True,
+        "result": {
+            "difficulty": difficulty,
+            "last_block": last_block,
+            "pending_transactions": selected_hex,
+            "pending_transactions_hashes": selected_hashes_list,
+            "merkle_root": merkle_root,
+        },
     }
 
     if debug:
         dbg = []
         for h, row in debug_rows.items():
-            dbg.append({
-                'hash': h,
-                'selected': row['selected'],
-                'reason': row['reason'],
-                'deps': row['deps'],
-                'prevouts': row['prevouts'],
-                'indegree_initial': row['indegree_initial'],
-                'indegree_final': row['indegree_final'],
-                'parents_not_selected': row['parents_not_selected'],
-            })
-        payload['debug'] = dbg
+            dbg.append(
+                {
+                    "hash": h,
+                    "selected": row["selected"],
+                    "reason": row["reason"],
+                    "deps": row["deps"],
+                    "prevouts": row["prevouts"],
+                    "indegree_initial": row["indegree_initial"],
+                    "indegree_final": row["indegree_final"],
+                    "parents_not_selected": row["parents_not_selected"],
+                }
+            )
+        payload["debug"] = dbg
 
-    return Response(content=json.dumps(payload, indent=4, cls=CustomJSONEncoder), media_type="application/json") if pretty else payload
-
+    return (
+        Response(
+            content=json.dumps(payload, indent=4, cls=CustomJSONEncoder),
+            media_type="application/json",
+        )
+        if pretty
+        else payload
+    )
 
 
 @app.get("/get_address_info")
 @limiter.limit("8/second")
 async def get_address_info(
-    request: Request, 
-    address: str, 
-    transactions_count_limit: int = Query(default=5, le=50), 
-    page: int = Query(default=1, ge=1), 
-    show_pending: bool = False, 
-    verify: bool = False, 
-    pretty: bool = False
+    request: Request,
+    address: str,
+    transactions_count_limit: int = Query(default=5, le=50),
+    page: int = Query(default=1, ge=1),
+    show_pending: bool = False,
+    verify: bool = False,
+    pretty: bool = False,
 ):
     # Validate address format. Protocol holders (pool reserves, order-book escrow, the perps
     # clearinghouse) are readable here even though no transaction can name them.
     from qrdx.crypto.account_id import is_synthetic_holder
+
     if not (security.input_validator.validate_address(address) or is_synthetic_holder(address)):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid address format")
 
     # Check query cost
     offset = (page - 1) * transactions_count_limit
-    await security.query_calculator.check_and_update_cost(
-        address, offset, transactions_count_limit
-    )
-    
+    await security.query_calculator.check_and_update_cost(address, offset, transactions_count_limit)
+
     outputs = await db.get_spendable_outputs(address)
     # Headline balance comes from the canonical reader (account_state first, UTXO
     # fallback) — in the unified ledger genesis + exchange-settled funds live in
@@ -6283,39 +7215,54 @@ async def get_address_info(
     # lists the UTXO entries available for legacy-style spends.
     balance = await db.get_address_balance(address)
 
-    transactions = await db.get_address_transactions(
-        address, limit=transactions_count_limit, 
-        offset=offset, check_signatures=True
-    ) if transactions_count_limit > 0 else []
+    transactions = (
+        await db.get_address_transactions(
+            address, limit=transactions_count_limit, offset=offset, check_signatures=True
+        )
+        if transactions_count_limit > 0
+        else []
+    )
 
-    result = {'ok': True, 'result': {
-        'balance': "{:f}".format(balance),
-        'spendable_outputs': [
-            {'amount': "{:f}".format(output.amount), 
-             'tx_hash': output.tx_hash, 
-             'index': output.index} 
-            for output in outputs
-        ],
-        'transactions': [
-            await db.get_nice_transaction(tx.hash(), address if verify else None) 
-            for tx in transactions
-        ],
-        'pending_transactions': [
-            await db.get_nice_transaction(tx.hash(), address if verify else None) 
-            for tx in await db.get_address_pending_transactions(address, True)
-        ] if show_pending else None,
-        'pending_spent_outputs': await db.get_address_pending_spent_outputs(address) if show_pending else None
-    }}
-    
+    result = {
+        "ok": True,
+        "result": {
+            "balance": "{:f}".format(balance),
+            "spendable_outputs": [
+                {
+                    "amount": "{:f}".format(output.amount),
+                    "tx_hash": output.tx_hash,
+                    "index": output.index,
+                }
+                for output in outputs
+            ],
+            "transactions": [
+                await db.get_nice_transaction(tx.hash(), address if verify else None)
+                for tx in transactions
+            ],
+            "pending_transactions": (
+                [
+                    await db.get_nice_transaction(tx.hash(), address if verify else None)
+                    for tx in await db.get_address_pending_transactions(address, True)
+                ]
+                if show_pending
+                else None
+            ),
+            "pending_spent_outputs": (
+                await db.get_address_pending_spent_outputs(address) if show_pending else None
+            ),
+        },
+    }
+
     if pretty:
         return Response(
-            content=json.dumps(result, indent=4, cls=CustomJSONEncoder), 
-            media_type="application/json"
+            content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
+            media_type="application/json",
         )
     return result
 
 
 # ── transaction history (qrdx/tx_index.py) ───────────────────────────────
+
 
 def _history_kinds(kinds: Optional[str]):
     return [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
@@ -6323,9 +7270,13 @@ def _history_kinds(kinds: Optional[str]):
 
 @app.get("/get_address_history")
 @limiter.limit("8/second")
-async def get_address_history(request: Request, address: str,
-                              limit: int = Query(default=50, ge=1, le=500),
-                              cursor: Optional[str] = None, kinds: Optional[str] = None):
+async def get_address_history(
+    request: Request,
+    address: str,
+    limit: int = Query(default=50, ge=1, le=500),
+    cursor: Optional[str] = None,
+    kinds: Optional[str] = None,
+):
     """Everything an address did or received — legacy transfers, exchange operations (token
     moves, swaps, orders and the fills of its resting orders, pools, perps, staking), EVM
     transactions and the token transfers they emitted — newest first, with each transaction's
@@ -6333,25 +7284,39 @@ async def get_address_history(request: Request, address: str,
     history. Page with ``cursor`` (the previous page's ``next_cursor``); ``kinds`` filters
     (comma-separated: genesis, transfer, coinbase, exchange, evm)."""
     from qrdx import tx_index
+
     try:
-        return {'ok': True, 'result': await tx_index.history(
-            db, address, limit=limit, cursor=cursor, kinds=_history_kinds(kinds))}
+        return {
+            "ok": True,
+            "result": await tx_index.history(
+                db, address, limit=limit, cursor=cursor, kinds=_history_kinds(kinds)
+            ),
+        }
     except ValueError as e:
-        return {'ok': False, 'error': str(e)}
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/get_latest_transactions")
 @limiter.limit("8/second")
-async def get_latest_transactions(request: Request, limit: int = Query(default=50, ge=1, le=500),
-                                  cursor: Optional[str] = None, kinds: Optional[str] = None):
+async def get_latest_transactions(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=500),
+    cursor: Optional[str] = None,
+    kinds: Optional[str] = None,
+):
     """The chain's latest transactions of every kind, newest first (paged like
     ``/get_address_history``)."""
     from qrdx import tx_index
+
     try:
-        return {'ok': True, 'result': await tx_index.recent(
-            db, limit=limit, cursor=cursor, kinds=_history_kinds(kinds))}
+        return {
+            "ok": True,
+            "result": await tx_index.recent(
+                db, limit=limit, cursor=cursor, kinds=_history_kinds(kinds)
+            ),
+        }
     except ValueError as e:
-        return {'ok': False, 'error': str(e)}
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/get_indexed_transaction")
@@ -6359,10 +7324,11 @@ async def get_indexed_transaction(tx_hash: str):
     """One indexed transaction of any kind — its block, status, fee, summary and every
     account it touched with their roles."""
     from qrdx import tx_index
+
     found = await tx_index.lookup(db, tx_hash)
     if found is None:
-        return {'ok': False, 'error': f'transaction {tx_hash} not indexed'}
-    return {'ok': True, 'result': found}
+        return {"ok": False, "error": f"transaction {tx_hash} not indexed"}
+    return {"ok": True, "result": found}
 
 
 @app.get("/get_nodes")
@@ -6371,26 +7337,45 @@ async def get_nodes(pretty: bool = False):
     # Redact private peer URLs unless QRDX_SELF_URL is also private
     all_peers = []
     for p in NodesManager.get_recent_nodes()[:100]:
-        if await security.reputation_manager.is_banned(p['node_id']):
+        if await security.reputation_manager.is_banned(p["node_id"]):
             continue
-        all_peers.append({
-            'node_id': p['node_id'],
-            'is_public': p.get('is_public', False),
-            'url': p.get('url', ''),
-            'reputation_score': await security.reputation_manager.get_score(p['node_id'])
-        })
-    result = {'ok': True, 'result': all_peers}
-    return Response(content=json.dumps(result, indent=4, cls=CustomJSONEncoder), media_type="application/json") if pretty else result
+        all_peers.append(
+            {
+                "node_id": p["node_id"],
+                "is_public": p.get("is_public", False),
+                "url": p.get("url", ""),
+                "reputation_score": await security.reputation_manager.get_score(p["node_id"]),
+            }
+        )
+    result = {"ok": True, "result": all_peers}
+    return (
+        Response(
+            content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
+            media_type="application/json",
+        )
+        if pretty
+        else result
+    )
 
 
 @app.get("/get_pending_transactions")
 async def get_pending_transactions(pretty: bool = False):
-    result = {'ok': True, 'result': [tx.hex() for tx in await db.get_pending_transactions_limit(1024)]}
-    return Response(content=json.dumps(result, indent=4, cls=CustomJSONEncoder), media_type="application/json") if pretty else result
+    result = {
+        "ok": True,
+        "result": [tx.hex() for tx in await db.get_pending_transactions_limit(1024)],
+    }
+    return (
+        Response(
+            content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
+            media_type="application/json",
+        )
+        if pretty
+        else result
+    )
 
 
 @app.get("/get_validators")
-async def get_validators(status: str = None, pretty: bool = False):
+async def get_validators(status: Optional[str] = None, pretty: bool = False):
     """
     Return the PoS validator set from the validators table.
 
@@ -6403,17 +7388,21 @@ async def get_validators(status: str = None, pretty: bool = False):
     except Exception as e:
         logger.error(f"get_validators error: {e}")
         validators = []
-    result = {'ok': True, 'result': validators, 'validators': validators}
-    return Response(content=json.dumps(result, indent=4, cls=CustomJSONEncoder), media_type="application/json") if pretty else result
+    result = {"ok": True, "result": validators, "validators": validators}
+    return (
+        Response(
+            content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
+            media_type="application/json",
+        )
+        if pretty
+        else result
+    )
 
 
 @app.get("/get_address_tokens")
 @limiter.limit("8/second")
 async def get_address_tokens(
-    request: Request,
-    address: str,
-    token_type: str = Query(default=None),
-    pretty: bool = False
+    request: Request, address: str, token_type: str = Query(default=None), pretty: bool = False
 ):
     """
     Get all QRC-20, QRC-721, and QRC-1155 tokens owned by an address
@@ -6421,27 +7410,33 @@ async def get_address_tokens(
     # Validate address format
     if not security.input_validator.validate_address(address):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid address format")
-    
+
     # Normalize address to checksummed format
     try:
         from eth_utils import to_checksum_address
-        normalized_address = to_checksum_address(address) if address.startswith('0x') and len(address) == 42 else address
+
+        normalized_address = (
+            to_checksum_address(address)
+            if address.startswith("0x") and len(address) == 42
+            else address
+        )
     except (ImportError, ValueError):
         normalized_address = address
-    
+
     # ERC20 Transfer event signature: Transfer(address,address,uint256)
     transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-    
+
     try:
-        if hasattr(db, 'pool'):
+        if hasattr(db, "pool"):
             # PostgreSQL implementation
             async with db.pool.acquire() as conn:
                 # Format address as 32-byte hex for topic matching
                 address_topic = "0x" + normalized_address.lower().replace("0x", "").zfill(64)
-                
+
                 # Get all tokens received by this address
-                tokens = await conn.fetch("""
-                    SELECT DISTINCT 
+                tokens = await conn.fetch(
+                    """
+                    SELECT DISTINCT
                         cl.contract_address,
                         cm.name,
                         cm.symbol,
@@ -6451,97 +7446,106 @@ async def get_address_tokens(
                     WHERE cl.topic0 = $1
                       AND cl.topic2 = $2
                       AND cl.removed = false
-                """, transfer_topic, address_topic)
-                
+                """,
+                    transfer_topic,
+                    address_topic,
+                )
+
                 result_tokens = []
                 for token in tokens:
                     # Get transfer count for this token
-                    balance_info = await conn.fetchrow("""
+                    balance_info = await conn.fetchrow(
+                        """
                         SELECT COUNT(*) as received
                         FROM contract_logs
                         WHERE contract_address = $1
                           AND topic0 = $2
                           AND topic2 = $3
                           AND removed = false
-                    """, token['contract_address'], transfer_topic, address_topic)
-                    
-                    if balance_info and balance_info['received'] > 0:
-                        result_tokens.append({
-                            'contract_address': token['contract_address'],
-                            'name': token['name'],
-                            'symbol': token['symbol'],
-                            'verified': token['verified'],
-                            'type': 'QRC-20',
-                            'transfer_count': int(balance_info['received'])
-                        })
+                    """,
+                        token["contract_address"],
+                        transfer_topic,
+                        address_topic,
+                    )
+
+                    if balance_info and balance_info["received"] > 0:
+                        result_tokens.append(
+                            {
+                                "contract_address": token["contract_address"],
+                                "name": token["name"],
+                                "symbol": token["symbol"],
+                                "verified": token["verified"],
+                                "type": "QRC-20",
+                                "transfer_count": int(balance_info["received"]),
+                            }
+                        )
         else:
             # SQLite implementation
             tokens = await db.get_address_tokens(normalized_address, transfer_topic)
             result_tokens = [
                 {
-                    'contract_address': token['contract_address'],
-                    'name': token['name'],
-                    'symbol': token['symbol'],
-                    'verified': bool(token['verified']),
-                    'type': 'QRC-20',
-                    'transfer_count': token['transfer_count']
+                    "contract_address": token["contract_address"],
+                    "name": token["name"],
+                    "symbol": token["symbol"],
+                    "verified": bool(token["verified"]),
+                    "type": "QRC-20",
+                    "transfer_count": token["transfer_count"],
                 }
                 for token in tokens
             ]
-        
+
         result = {
-            'ok': True,
-            'result': {
-                'address': normalized_address,
-                'tokens': result_tokens,
-                'total_tokens': len(result_tokens)
-            }
+            "ok": True,
+            "result": {
+                "address": normalized_address,
+                "tokens": result_tokens,
+                "total_tokens": len(result_tokens),
+            },
         }
-    
+
     except Exception as e:
         logger.error(f"Error fetching address tokens: {e}")
-        result = {
-            'ok': False,
-            'error': 'Error fetching token information'
-        }
-    
+        result = {"ok": False, "error": "Error fetching token information"}
+
     if pretty:
         return Response(
             content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
-            media_type="application/json"
+            media_type="application/json",
         )
     return result
 
 
 @app.get("/get_token_info")
 @limiter.limit("8/second")
-async def get_token_info(
-    request: Request,
-    token_address: str,
-    pretty: bool = False
-):
+async def get_token_info(request: Request, token_address: str, pretty: bool = False):
     """
     Get detailed information about a specific token contract
     """
     # Validate address format
     if not security.input_validator.validate_address(token_address):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid token address format")
-    
+
     try:
         from eth_utils import to_checksum_address
-        normalized_address = to_checksum_address(token_address) if token_address.startswith('0x') and len(token_address) == 42 else token_address
+
+        normalized_address = (
+            to_checksum_address(token_address)
+            if token_address.startswith("0x") and len(token_address) == 42
+            else token_address
+        )
     except (ImportError, ValueError):
         normalized_address = token_address
-    
+
     transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-    
+
     try:
-        if hasattr(db, 'pool'):
+        if hasattr(db, "pool"):
             # PostgreSQL implementation
             async with db.pool.acquire() as conn:
                 # Get contract metadata
-                metadata = await conn.fetchrow("""
-                    SELECT 
+                metadata = await conn.fetchrow(
+                    """
+                    SELECT
                         cm.*,
                         ac.balance,
                         ac.created_at,
@@ -6552,66 +7556,76 @@ async def get_token_info(
                     LEFT JOIN account_state ac ON cm.contract_address = ac.address
                     LEFT JOIN contract_code cc ON ac.code_hash = cc.code_hash
                     WHERE cm.contract_address = $1
-                """, normalized_address)
-                
+                """,
+                    normalized_address,
+                )
+
                 if not metadata:
-                    result = {'ok': False, 'error': 'Token contract not found'}
+                    result = {"ok": False, "error": "Token contract not found"}
                 else:
                     # Get transfer count
-                    transfer_count = await conn.fetchval("""
+                    transfer_count = await conn.fetchval(
+                        """
                         SELECT COUNT(*) FROM contract_logs
                         WHERE contract_address = $1 AND topic0 = $2 AND removed = false
-                    """, normalized_address, transfer_topic)
-                    
+                    """,
+                        normalized_address,
+                        transfer_topic,
+                    )
+
                     # Get holder count
-                    holder_count = await conn.fetchval("""
+                    holder_count = await conn.fetchval(
+                        """
                         SELECT COUNT(DISTINCT topic2) FROM contract_logs
                         WHERE contract_address = $1 AND topic0 = $2 AND removed = false
-                    """, normalized_address, transfer_topic)
-                    
+                    """,
+                        normalized_address,
+                        transfer_topic,
+                    )
+
                     result = {
-                        'ok': True,
-                        'result': {
-                            'contract_address': normalized_address,
-                            'name': metadata['name'],
-                            'symbol': metadata['symbol'],
-                            'verified': metadata['verified'],
-                            'compiler_version': metadata['compiler_version'],
-                            'deployer': metadata.get('deployer'),
-                            'deployed_at': metadata.get('deployed_at'),
-                            'total_transfers': transfer_count,
-                            'total_holders': holder_count,
-                            'abi': metadata['abi'] if metadata['verified'] else None
-                        }
+                        "ok": True,
+                        "result": {
+                            "contract_address": normalized_address,
+                            "name": metadata["name"],
+                            "symbol": metadata["symbol"],
+                            "verified": metadata["verified"],
+                            "compiler_version": metadata["compiler_version"],
+                            "deployer": metadata.get("deployer"),
+                            "deployed_at": metadata.get("deployed_at"),
+                            "total_transfers": transfer_count,
+                            "total_holders": holder_count,
+                            "abi": metadata["abi"] if metadata["verified"] else None,
+                        },
                     }
         else:
             # SQLite implementation
             token_info = await db.get_token_info(normalized_address, transfer_topic)
-            
+
             if not token_info:
-                result = {'ok': False, 'error': 'Token contract not found'}
+                result = {"ok": False, "error": "Token contract not found"}
             else:
                 result = {
-                    'ok': True,
-                    'result': {
-                        'contract_address': normalized_address,
-                        'name': token_info.get('name'),
-                        'symbol': token_info.get('symbol'),
-                        'verified': bool(token_info.get('verified', False)),
-                        'total_transfers': token_info.get('total_transfers', 0),
-                        'total_holders': token_info.get('total_holders', 0),
-                        'abi': token_info.get('abi') if token_info.get('verified') else None
-                    }
+                    "ok": True,
+                    "result": {
+                        "contract_address": normalized_address,
+                        "name": token_info.get("name"),
+                        "symbol": token_info.get("symbol"),
+                        "verified": bool(token_info.get("verified", False)),
+                        "total_transfers": token_info.get("total_transfers", 0),
+                        "total_holders": token_info.get("total_holders", 0),
+                        "abi": token_info.get("abi") if token_info.get("verified") else None,
+                    },
                 }
-    
+
     except Exception as e:
         logger.error(f"Error fetching token info: {e}")
-        result = {'ok': False, 'error': 'Error fetching token information'}
-    
+        result = {"ok": False, "error": "Error fetching token information"}
+
     if pretty:
         return Response(
             content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
-            media_type="application/json"
+            media_type="application/json",
         )
     return result
 
@@ -6623,7 +7637,7 @@ async def get_top_addresses(
     limit: int = Query(default=100, le=1000),
     offset: int = Query(default=0, ge=0),
     order_by: str = Query(default="balance"),  # balance, transactions, tokens
-    pretty: bool = False
+    pretty: bool = False,
 ):
     """
     Get top addresses by balance or activity
@@ -6631,21 +7645,23 @@ async def get_top_addresses(
     # Validate order_by parameter
     valid_orders = ["balance", "transactions", "tokens"]
     if order_by not in valid_orders:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid order_by. Must be one of: {valid_orders}")
-    
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, f"Invalid order_by. Must be one of: {valid_orders}"
+        )
+
     try:
-        if hasattr(db, 'pool'):
+        if hasattr(db, "pool"):
             # PostgreSQL implementation
             async with db.pool.acquire() as conn:
                 if order_by == "balance":
                     # Get top addresses by balance (sum of unspent outputs)
                     query = """
-                        SELECT 
+                        SELECT
                             address,
                             SUM(amount) as balance,
                             COUNT(*) as output_count
                         FROM (
-                            SELECT 
+                            SELECT
                                 uo.address,
                                 CAST(COALESCE(t.outputs_amounts[uo.index + 1], 0) AS NUMERIC) / 1000000.0 as amount
                             FROM unspent_outputs uo
@@ -6657,20 +7673,20 @@ async def get_top_addresses(
                         LIMIT $1 OFFSET $2
                     """
                     addresses = await conn.fetch(query, limit, offset)
-                    
+
                     result_addresses = [
                         {
-                            'address': addr['address'],
-                            'balance': "{:f}".format(addr['balance']),
-                            'output_count': addr['output_count']
+                            "address": addr["address"],
+                            "balance": "{:f}".format(addr["balance"]),
+                            "output_count": addr["output_count"],
                         }
                         for addr in addresses
                     ]
-                
+
                 elif order_by == "transactions":
                     # Get most active addresses by transaction count
                     query = """
-                        SELECT 
+                        SELECT
                             address,
                             COUNT(*) as tx_count
                         FROM (
@@ -6684,20 +7700,19 @@ async def get_top_addresses(
                         LIMIT $1 OFFSET $2
                     """
                     addresses = await conn.fetch(query, limit, offset)
-                    
+
                     result_addresses = [
-                        {
-                            'address': addr['address'],
-                            'transaction_count': addr['tx_count']
-                        }
+                        {"address": addr["address"], "transaction_count": addr["tx_count"]}
                         for addr in addresses
                     ]
-                
+
                 else:  # tokens
                     # Get addresses with most token holdings
-                    transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                    transfer_topic = (
+                        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                    )
                     query = """
-                        SELECT 
+                        SELECT
                             topic2 as address_topic,
                             COUNT(DISTINCT contract_address) as token_count,
                             COUNT(*) as transfer_count
@@ -6708,12 +7723,12 @@ async def get_top_addresses(
                         LIMIT $2 OFFSET $3
                     """
                     addresses = await conn.fetch(query, transfer_topic, limit, offset)
-                    
+
                     result_addresses = [
                         {
-                            'address': addr['address_topic'],
-                            'token_count': addr['token_count'],
-                            'transfer_count': addr['transfer_count']
+                            "address": addr["address_topic"],
+                            "token_count": addr["token_count"],
+                            "transfer_count": addr["transfer_count"],
                         }
                         for addr in addresses
                     ]
@@ -6723,50 +7738,49 @@ async def get_top_addresses(
                 addresses = await db.get_top_addresses_by_balance(limit, offset)
                 result_addresses = [
                     {
-                        'address': addr['address'],
-                        'balance': str(addr['balance']),
-                        'output_count': addr.get('output_count', 0)
+                        "address": addr["address"],
+                        "balance": str(addr["balance"]),
+                        "output_count": addr.get("output_count", 0),
                     }
                     for addr in addresses
                 ]
             elif order_by == "transactions":
                 addresses = await db.get_top_addresses_by_transactions(limit, offset)
                 result_addresses = [
-                    {
-                        'address': addr['address'],
-                        'transaction_count': addr['tx_count']
-                    }
+                    {"address": addr["address"], "transaction_count": addr["tx_count"]}
                     for addr in addresses
                 ]
             else:  # tokens
-                transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                transfer_topic = (
+                    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                )
                 addresses = await db.get_top_addresses_by_tokens(limit, offset, transfer_topic)
                 result_addresses = [
                     {
-                        'address': addr['address'],
-                        'token_count': addr['token_count'],
-                        'transfer_count': addr.get('transfer_count', 0)
+                        "address": addr["address"],
+                        "token_count": addr["token_count"],
+                        "transfer_count": addr.get("transfer_count", 0),
                     }
                     for addr in addresses
                 ]
-        
+
         result = {
-            'ok': True,
-            'result': {
-                'addresses': result_addresses,
-                'count': len(result_addresses),
-                'order_by': order_by
-            }
+            "ok": True,
+            "result": {
+                "addresses": result_addresses,
+                "count": len(result_addresses),
+                "order_by": order_by,
+            },
         }
-    
+
     except Exception as e:
         logger.error(f"Error fetching top addresses: {e}")
-        result = {'ok': False, 'error': 'Error fetching address rankings'}
-    
+        result = {"ok": False, "error": "Error fetching address rankings"}
+
     if pretty:
         return Response(
             content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
-            media_type="application/json"
+            media_type="application/json",
         )
     return result
 
@@ -6778,18 +7792,18 @@ async def get_recent_transactions(
     limit: int = Query(default=50, le=500),
     offset: int = Query(default=0, ge=0),
     include_contract_txs: bool = Query(default=True),
-    pretty: bool = False
+    pretty: bool = False,
 ):
     """
     Get most recent transactions across the chain
     """
     try:
-        if hasattr(db, 'pool'):
+        if hasattr(db, "pool"):
             # PostgreSQL implementation
             async with db.pool.acquire() as conn:
                 # Get recent regular transactions
                 txs_query = """
-                SELECT 
+                SELECT
                     t.tx_hash,
                     t.block_hash,
                     b.id as block_number,
@@ -6801,24 +7815,26 @@ async def get_recent_transactions(
                 ORDER BY b.id DESC
                 LIMIT $1 OFFSET $2
             """
-            
+
             recent_txs = await conn.fetch(txs_query, limit, offset)
-            
+
             result_txs = []
             for tx in recent_txs:
-                result_txs.append({
-                    'tx_hash': tx['tx_hash'],
-                    'block_number': tx['block_number'],
-                    'timestamp': tx['timestamp'].isoformat() if tx['timestamp'] else None,
-                    'fees': "{:f}".format(tx['fees']) if tx['fees'] else "0",
-                    'output_count': tx['output_count'],
-                    'type': 'regular'
-                })
-            
+                result_txs.append(
+                    {
+                        "tx_hash": tx["tx_hash"],
+                        "block_number": tx["block_number"],
+                        "timestamp": tx["timestamp"].isoformat() if tx["timestamp"] else None,
+                        "fees": "{:f}".format(tx["fees"]) if tx["fees"] else "0",
+                        "output_count": tx["output_count"],
+                        "type": "regular",
+                    }
+                )
+
             # Get recent contract transactions if requested
             if include_contract_txs:
                 contract_txs_query = """
-                    SELECT 
+                    SELECT
                         ct.tx_hash,
                         ct.block_number,
                         ct.from_address,
@@ -6832,76 +7848,74 @@ async def get_recent_transactions(
                     ORDER BY ct.block_number DESC
                     LIMIT $1 OFFSET $2
                 """
-                
+
                 contract_txs = await conn.fetch(contract_txs_query, min(limit, 100), 0)
-                
+
                 for tx in contract_txs:
-                    result_txs.append({
-                        'tx_hash': tx['tx_hash'],
-                        'block_number': tx['block_number'],
-                        'timestamp': tx['timestamp'].isoformat() if tx['timestamp'] else None,
-                        'from': tx['from_address'],
-                        'to': tx['to_address'],
-                        'value': tx['value'],
-                        'gas_used': tx['gas_used'],
-                        'status': 'success' if tx['status'] == 1 else 'failed',
-                        'type': 'contract'
-                    })
-                
+                    result_txs.append(
+                        {
+                            "tx_hash": tx["tx_hash"],
+                            "block_number": tx["block_number"],
+                            "timestamp": tx["timestamp"].isoformat() if tx["timestamp"] else None,
+                            "from": tx["from_address"],
+                            "to": tx["to_address"],
+                            "value": tx["value"],
+                            "gas_used": tx["gas_used"],
+                            "status": "success" if tx["status"] == 1 else "failed",
+                            "type": "contract",
+                        }
+                    )
+
                 # Sort all transactions by block number
-                result_txs.sort(key=lambda x: x['block_number'], reverse=True)
+                result_txs.sort(key=lambda x: x["block_number"], reverse=True)
                 result_txs = result_txs[:limit]
         else:
             # SQLite implementation
-            transactions = await db.get_recent_transactions_with_blocks(limit)
+            transactions = await db.get_recent_transactions_with_blocks(limit, offset)
             result_txs = [
                 {
-                    'tx_hash': tx['tx_hash'],
-                    'block_number': tx.get('height', 0),
-                    'block_hash': tx.get('block_hash', ''),
-                    'timestamp': tx.get('timestamp', ''),
-                    'fees': str(tx.get('fee', 0)),
-                    'output_count': tx.get('output_count', 0),
-                    'type': 'regular'
+                    "tx_hash": tx["tx_hash"],
+                    "block_number": tx.get("height", 0),
+                    "block_hash": tx.get("block_hash", ""),
+                    "timestamp": tx.get("timestamp", ""),
+                    "fees": str(tx.get("fee", 0)),
+                    "output_count": tx.get("output_count", 0),
+                    "type": "regular",
                 }
                 for tx in transactions
             ]
-            
+
             if include_contract_txs:
-                contract_txs = await db.get_recent_contract_transactions(min(limit, 100))
+                contract_txs = await db.get_recent_contract_transactions(min(limit, 100), offset)
                 for ctx in contract_txs:
-                    result_txs.append({
-                        'tx_hash': ctx['tx_hash'],
-                        'block_number': ctx.get('height', 0),
-                        'timestamp': ctx.get('timestamp', ''),
-                        'from': ctx['sender'],
-                        'to': ctx['contract_address'],
-                        'value': str(ctx['value']),
-                        'gas_used': ctx['gas_used'],
-                        'status': ctx['status'],
-                        'type': 'contract'
-                    })
-                
+                    result_txs.append(
+                        {
+                            "tx_hash": ctx["tx_hash"],
+                            "block_number": ctx.get("height", 0),
+                            "timestamp": ctx.get("timestamp", ""),
+                            "from": ctx["sender"],
+                            "to": ctx["contract_address"],
+                            "value": str(ctx["value"]),
+                            "gas_used": ctx["gas_used"],
+                            "status": ctx["status"],
+                            "type": "contract",
+                        }
+                    )
+
                 # Sort all by timestamp and limit
-                result_txs.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+                result_txs.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
                 result_txs = result_txs[:limit]
-            
-            result = {
-                'ok': True,
-                'result': {
-                    'transactions': result_txs,
-                    'count': len(result_txs)
-                }
-            }
-    
+
+            result = {"ok": True, "result": {"transactions": result_txs, "count": len(result_txs)}}
+
     except Exception as e:
         logger.error(f"Error fetching recent transactions: {e}")
-        result = {'ok': False, 'error': 'Error fetching recent transactions'}
-    
+        result = {"ok": False, "error": "Error fetching recent transactions"}
+
     if pretty:
         return Response(
             content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
-            media_type="application/json"
+            media_type="application/json",
         )
     return result
 
@@ -6913,18 +7927,18 @@ async def get_recent_blocks(
     limit: int = Query(default=50, le=500),
     offset: int = Query(default=0, ge=0),
     include_validator_info: bool = Query(default=True),
-    pretty: bool = False
+    pretty: bool = False,
 ):
     """
     Get most recent blocks with validator information
     """
     try:
-        if hasattr(db, 'pool'):
+        if hasattr(db, "pool"):
             # PostgreSQL implementation
             async with db.pool.acquire() as conn:
                 # Get recent blocks with validator information
                 blocks_query = """
-                SELECT 
+                SELECT
                     b.id,
                     b.hash,
                     b.address,
@@ -6939,90 +7953,89 @@ async def get_recent_blocks(
                 ORDER BY b.id DESC
                 LIMIT $1 OFFSET $2
             """
-            
+
             recent_blocks = await conn.fetch(blocks_query, limit, offset)
-            
+
             result_blocks = []
             for block in recent_blocks:
                 block_data = {
-                    'block_number': block['id'],
-                    'block_hash': block['hash'],
-                    'timestamp': block['timestamp'].isoformat() if block['timestamp'] else None,
-                    'reward': "{:f}".format(block['reward']) if block['reward'] else "0",
-                    'tx_count': block['tx_count']
+                    "block_number": block["id"],
+                    "block_hash": block["hash"],
+                    "timestamp": block["timestamp"].isoformat() if block["timestamp"] else None,
+                    "reward": "{:f}".format(block["reward"]) if block["reward"] else "0",
+                    "tx_count": block["tx_count"],
                 }
-                
+
                 # Add PoS-specific data if available
-                if block['slot'] is not None:
-                    block_data.update({
-                        'slot': block['slot'],
-                        'epoch': block['epoch'],
-                        'proposer': block['proposer_address'],
-                        'attestations': block['attestations_included']
-                    })
-                    
+                if block["slot"] is not None:
+                    block_data.update(
+                        {
+                            "slot": block["slot"],
+                            "epoch": block["epoch"],
+                            "proposer": block["proposer_address"],
+                            "attestations": block["attestations_included"],
+                        }
+                    )
+
                     # Get validator info if requested
-                    if include_validator_info and block['proposer_address']:
-                        validator = await conn.fetchrow("""
+                    if include_validator_info and block["proposer_address"]:
+                        validator = await conn.fetchrow(
+                            """
                             SELECT address, stake, effective_stake, status
                             FROM validators
                             WHERE address = $1
-                        """, block['proposer_address'])
-                        
+                        """,
+                            block["proposer_address"],
+                        )
+
                         if validator:
-                            block_data['validator'] = {
-                                'address': validator['address'],
-                                'stake': str(validator['stake']),
-                                'effective_stake': str(validator['effective_stake']),
-                                'status': validator['status']
+                            block_data["validator"] = {
+                                "address": validator["address"],
+                                "stake": str(validator["stake"]),
+                                "effective_stake": str(validator["effective_stake"]),
+                                "status": validator["status"],
                             }
                 else:
                     # Legacy PoW block
-                    block_data['miner'] = block['address']
-                
+                    block_data["miner"] = block["address"]
+
                 result_blocks.append(block_data)
         else:
             # SQLite implementation
-            recent_blocks = await db.get_recent_blocks_with_validators(limit)
+            recent_blocks = await db.get_recent_blocks_with_validators(limit, offset)
             result_blocks = []
-            
+
             for block in recent_blocks:
                 block_data = {
-                    'block_number': block.get('block_height', 0),
-                    'block_hash': block.get('block_hash', ''),
-                    'timestamp': block.get('timestamp', ''),
-                    'tx_count': block.get('tx_count', 0)
+                    "block_number": block.get("block_height", 0),
+                    "block_hash": block.get("block_hash", ""),
+                    "timestamp": block.get("timestamp", ""),
+                    "tx_count": block.get("tx_count", 0),
                 }
-                
+
                 if include_validator_info:
-                    validator_info = await db.get_validator_info(block.get('validator'))
+                    validator_info = await db.get_validator_info(block.get("validator"))
                     if validator_info:
-                        block_data['validator'] = {
-                            'address': validator_info['address'],
-                            'stake': str(validator_info.get('stake', 0)),
-                            'status': validator_info.get('status', 'unknown')
+                        block_data["validator"] = {
+                            "address": validator_info["address"],
+                            "stake": str(validator_info.get("stake", 0)),
+                            "status": validator_info.get("status", "unknown"),
                         }
                 else:
-                    block_data['validator'] = block.get('validator')
-                
+                    block_data["validator"] = block.get("validator")
+
                 result_blocks.append(block_data)
-            
-            result = {
-                'ok': True,
-                'result': {
-                    'blocks': result_blocks,
-                    'count': len(result_blocks)
-                }
-            }
-    
+
+            result = {"ok": True, "result": {"blocks": result_blocks, "count": len(result_blocks)}}
+
     except Exception as e:
         logger.error(f"Error fetching recent blocks: {e}")
-        result = {'ok': False, 'error': 'Error fetching recent blocks'}
-    
+        result = {"ok": False, "error": "Error fetching recent blocks"}
+
     if pretty:
         return Response(
             content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
-            media_type="application/json"
+            media_type="application/json",
         )
     return result
 
@@ -7037,7 +8050,7 @@ async def get_attestations(
     block_hash: str = Query(default=None),
     limit: int = Query(default=100, le=1000),
     offset: int = Query(default=0, ge=0),
-    pretty: bool = False
+    pretty: bool = False,
 ):
     """
     Get attestations by slot, epoch, validator, or block
@@ -7045,43 +8058,45 @@ async def get_attestations(
     # Validate inputs if provided
     if validator_address and not security.input_validator.validate_address(validator_address):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid validator address format")
-    
-    if block_hash and not security.input_validator.validate_hex(block_hash, min_length=64, max_length=64):
+
+    if block_hash and not security.input_validator.validate_hex(
+        block_hash, min_length=64, max_length=64
+    ):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid block hash format")
-    
+
     try:
-        if hasattr(db, 'pool'):
+        if hasattr(db, "pool"):
             # PostgreSQL implementation
             # Build query based on provided filters
             filters = []
-            params = []
+            params: List[Any] = []
             param_count = 0
-            
+
             if slot is not None:
                 param_count += 1
                 filters.append(f"slot = ${param_count}")
                 params.append(slot)
-            
+
             if epoch is not None:
                 param_count += 1
                 filters.append(f"epoch = ${param_count}")
                 params.append(epoch)
-            
+
             if validator_address:
                 param_count += 1
                 filters.append(f"validator_address = ${param_count}")
                 params.append(validator_address)
-            
+
             if block_hash:
                 param_count += 1
                 filters.append(f"block_hash = ${param_count}")
                 params.append(block_hash)
-            
+
             async with db.pool.acquire() as conn:
                 where_clause = " AND ".join(filters) if filters else "1=1"
-                
+
                 attestations_query = f"""
-                    SELECT 
+                    SELECT
                         a.id,
                         a.slot,
                         a.epoch,
@@ -7102,153 +8117,192 @@ async def get_attestations(
                     ORDER BY a.slot DESC, a.validator_index ASC
                     LIMIT ${param_count + 1} OFFSET ${param_count + 2}
                 """
-                
+
                 params.extend([limit, offset])
                 attestations = await conn.fetch(attestations_query, *params)
-                
+
                 result_attestations = []
                 for att in attestations:
-                    result_attestations.append({
-                        'id': att['id'],
-                        'slot': att['slot'],
-                        'epoch': att['epoch'],
-                        'block_hash': att['block_hash'],
-                        'validator': {
-                            'address': att['validator_address'],
-                            'index': att['validator_index'],
-                            'stake': str(att['stake']) if att['stake'] else None,
-                            'effective_stake': str(att['effective_stake']) if att['effective_stake'] else None,
-                            'status': att['validator_status']
-                        },
-                        'checkpoint': {
-                            'source_epoch': att['source_epoch'],
-                            'target_epoch': att['target_epoch']
-                        },
-                        'inclusion': {
-                            'block_hash': att['included_in_block'],
-                            'slot': att['inclusion_slot']
-                        } if att['included_in_block'] else None,
-                        'created_at': att['created_at'].isoformat() if att['created_at'] else None
-                    })
+                    result_attestations.append(
+                        {
+                            "id": att["id"],
+                            "slot": att["slot"],
+                            "epoch": att["epoch"],
+                            "block_hash": att["block_hash"],
+                            "validator": {
+                                "address": att["validator_address"],
+                                "index": att["validator_index"],
+                                "stake": str(att["stake"]) if att["stake"] else None,
+                                "effective_stake": (
+                                    str(att["effective_stake"]) if att["effective_stake"] else None
+                                ),
+                                "status": att["validator_status"],
+                            },
+                            "checkpoint": {
+                                "source_epoch": att["source_epoch"],
+                                "target_epoch": att["target_epoch"],
+                            },
+                            "inclusion": (
+                                {
+                                    "block_hash": att["included_in_block"],
+                                    "slot": att["inclusion_slot"],
+                                }
+                                if att["included_in_block"]
+                                else None
+                            ),
+                            "created_at": (
+                                att["created_at"].isoformat() if att["created_at"] else None
+                            ),
+                        }
+                    )
         else:
             # SQLite implementation
-            filters = {
-                'slot': slot,
-                'epoch': epoch,
-                'validator_address': validator_address,
-                'block_hash': block_hash
+            sqlite_filters = {
+                "slot": slot,
+                "epoch": epoch,
+                "validator_address": validator_address,
+                "block_hash": block_hash,
             }
-            attestations = await db.get_attestations_filtered(filters, limit, offset)
-            
+            attestations = await db.get_attestations_filtered(sqlite_filters, limit, offset)
+
             result_attestations = []
             for att in attestations:
-                result_attestations.append({
-                    'id': att.get('id'),
-                    'slot': att.get('slot'),
-                    'epoch': att.get('epoch'),
-                    'block_hash': att.get('block_hash'),
-                    'validator': {
-                        'address': att.get('validator_address'),
-                        'index': att.get('validator_index'),
-                        'stake': str(att.get('stake', 0)),
-                        'status': att.get('validator_status')
-                    },
-                    'checkpoint': {
-                        'source_epoch': att.get('source_epoch'),
-                        'target_epoch': att.get('target_epoch')
-                    },
-                    'inclusion': {
-                        'block_hash': att.get('included_in_block'),
-                        'slot': att.get('inclusion_slot')
-                    } if att.get('included_in_block') else None
-                })
-            
-            result = {
-                'ok': True,
-                'result': {
-                    'attestations': result_attestations,
-                    'count': len(result_attestations),
-                    'filters': {
-                        'slot': slot,
-                        'epoch': epoch,
-                        'validator': validator_address,
-                        'block_hash': block_hash
+                result_attestations.append(
+                    {
+                        "id": att.get("id"),
+                        "slot": att.get("slot"),
+                        "epoch": att.get("epoch"),
+                        "block_hash": att.get("block_hash"),
+                        "validator": {
+                            "address": att.get("validator_address"),
+                            "index": att.get("validator_index"),
+                            "stake": str(att.get("stake", 0)),
+                            "status": att.get("validator_status"),
+                        },
+                        "checkpoint": {
+                            "source_epoch": att.get("source_epoch"),
+                            "target_epoch": att.get("target_epoch"),
+                        },
+                        "inclusion": (
+                            {
+                                "block_hash": att.get("included_in_block"),
+                                "slot": att.get("inclusion_slot"),
+                            }
+                            if att.get("included_in_block")
+                            else None
+                        ),
                     }
-                }
+                )
+
+            result = {
+                "ok": True,
+                "result": {
+                    "attestations": result_attestations,
+                    "count": len(result_attestations),
+                    "filters": {
+                        "slot": slot,
+                        "epoch": epoch,
+                        "validator": validator_address,
+                        "block_hash": block_hash,
+                    },
+                },
             }
-    
+
     except Exception as e:
         logger.error(f"Error fetching attestations: {e}")
-        result = {'ok': False, 'error': 'Error fetching attestations'}
-    
+        result = {"ok": False, "error": "Error fetching attestations"}
+
     if pretty:
         return Response(
             content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
-            media_type="application/json"
+            media_type="application/json",
         )
     return result
 
 
 @app.get("/get_transaction")
 @limiter.limit("8/second")
-async def get_transaction(request: Request, tx_hash: str, verify: bool = False, pretty: bool = False):
+async def get_transaction(
+    request: Request, tx_hash: str, verify: bool = False, pretty: bool = False
+):
     # Validate transaction hash format
     if not security.input_validator.validate_hex(tx_hash, min_length=64, max_length=64):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid transaction hash format")
-        
+
     tx = await db.get_nice_transaction(tx_hash)
     if tx is None:
-        result = {'ok': False, 'error': 'Not found'}
+        result = {"ok": False, "error": "Not found"}
     else:
-        result = {'ok': True, 'result': tx}
-    return Response(content=json.dumps(result, indent=4, cls=CustomJSONEncoder), media_type="application/json") if pretty else result
+        result = {"ok": True, "result": tx}
+    return (
+        Response(
+            content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
+            media_type="application/json",
+        )
+        if pretty
+        else result
+    )
 
 
 @app.get("/get_block")
 @limiter.limit("8/second")
-async def get_block(request: Request, block: str, full_transactions: bool = False, pretty: bool = False):
+async def get_block(
+    request: Request, block: str, full_transactions: bool = False, pretty: bool = False
+):
     # Validate block parameter
     block_info = None
-    block_hash = None
+    block_hash = ""
 
     # Validate block parameter
     if block.isdecimal():
         block_id = int(block)
         if not await security.input_validator.validate_block_height(block_id, db, max_ahead=0):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid block height")
-        
+
         block_info = await db.get_block_by_id(block_id)
         if block_info:
-            block_hash = block_info['hash']
+            block_hash = block_info["hash"]
 
     else:
         if not security.input_validator.validate_hex(block, min_length=64, max_length=64):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid block hash format")
-        
+
         block_hash = block
         block_info = await db.get_block(block_hash)
-        
+
     if block_info:
-        result = {'ok': True, 'result': {
-            'block': block_info,
-            'transactions': await db.get_block_transactions(block_hash, hex_only=True) if not full_transactions else None,
-            'full_transactions': await db.get_block_nice_transactions(block_hash) if full_transactions else None
-        }}
+        result = {
+            "ok": True,
+            "result": {
+                "block": block_info,
+                "transactions": (
+                    await db.get_block_transactions(block_hash, hex_only=True)
+                    if not full_transactions
+                    else None
+                ),
+                "full_transactions": (
+                    await db.get_block_nice_transactions(block_hash) if full_transactions else None
+                ),
+            },
+        }
     else:
-        result = {'ok': False, 'error': 'Not found'}
-    
+        result = {"ok": False, "error": "Not found"}
+
     if pretty:
-        return Response(content=json.dumps(result, indent=4, cls=CustomJSONEncoder), media_type="application/json")
+        return Response(
+            content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
+            media_type="application/json",
+        )
     return result
 
 
 @app.get("/get_blocks")
 @limiter.limit("4/second")
 async def get_blocks(
-    request: Request, 
-    offset: int = Query(default=..., ge=0), 
-    limit: int = Query(default=..., le=512), 
-    pretty: bool = False
+    request: Request,
+    offset: int = Query(default=..., ge=0),
+    limit: int = Query(default=..., le=512),
+    pretty: bool = False,
 ):
     # Use QueryCostCalculator to prevent abuse of pagination
     client_ip = get_remote_address(request)
@@ -7260,7 +8314,7 @@ async def get_blocks(
     # syncing peers can reconstruct the chain.
     structured_blocks = []
     for block in blocks:
-        block_hash = block.get('hash') or block.get('block_hash')
+        block_hash = block.get("hash") or block.get("block_hash")
         txs = await db.get_block_transactions(block_hash, hex_only=True) if block_hash else []
         # Attach protocol sections so a syncing node reconstructs exchange + EVM/
         # account state (E-D3b); trust-replayed on the consume side.
@@ -7268,24 +8322,24 @@ async def get_blocks(
             try:
                 ex_section = await db.get_block_exchange_txs(block_hash)
                 if ex_section:
-                    block['exchange_transactions'] = ex_section
+                    block["exchange_transactions"] = ex_section
             except Exception:
                 pass
             try:
                 evm_section = await db.get_block_evm_txs(block_hash)
                 if evm_section:
-                    block['evm_transactions'] = evm_section
+                    block["evm_transactions"] = evm_section
             except Exception:
                 pass
-        structured_blocks.append({
-            'block': block,
-            'transactions': txs or []
-        })
+        structured_blocks.append({"block": block, "transactions": txs or []})
 
-    result = {'ok': True, 'result': structured_blocks}
-    
+    result = {"ok": True, "result": structured_blocks}
+
     if pretty:
-        return Response(content=json.dumps(result, indent=4, cls=CustomJSONEncoder), media_type="application/json")
+        return Response(
+            content=json.dumps(result, indent=4, cls=CustomJSONEncoder),
+            media_type="application/json",
+        )
     return result
 
 
@@ -7299,35 +8353,33 @@ async def get_status():
 
         # Create a base response object that always includes the node's ID.
         response_data = {
-            'height': height,
-            'last_block_hash': None,
-            'node_id': self_node_id # This is the key addition
+            "height": height,
+            "last_block_hash": None,
+            "node_id": self_node_id,  # This is the key addition
         }
-        
+
         if height >= 0:
             last_block = await db.get_block_by_id(height)
             if last_block:
                 # If a block exists, add its hash to the response.
-                response_data['last_block_hash'] = last_block['hash']
+                response_data["last_block_hash"] = last_block["hash"]
             else:
                 # This handles a rare edge case where the DB might be inconsistent.
                 # We report height as -1 to signal a non-ready state.
-                response_data['height'] = -1
+                response_data["height"] = -1
 
-        return {'ok': True, 'result': response_data}
-        
+        return {"ok": True, "result": response_data}
+
     except Exception as e:
         logger.error(f"Error in /get_status: {e}")
-        await security.security_monitor.log_event('get_status_error', {'error': str(e)})
-        return {'ok': False, 'error': 'Internal server error'}
+        await security.security_monitor.log_event("get_status_error", {"error": str(e)})
+        return {"ok": False, "error": "Internal server error"}
 
 
 @app.post("/check_reachability")
 @limiter.limit("2/minute")
 async def check_reachability(
-    request: Request,
-    body: dict = Body(...),
-    verified_sender: str = Depends(get_verified_sender)
+    request: Request, body: dict = Body(...), verified_sender: str = Depends(get_verified_sender)
 ):
     """
     A SECURED endpoint for a peer to ask us to check if they are reachable at a given URL.
@@ -7336,7 +8388,7 @@ async def check_reachability(
     if not verified_sender:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Signed request required.")
 
-    url_to_check = body.get('url_to_check')
+    url_to_check = body.get("url_to_check")
     if not url_to_check:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Body must contain 'url_to_check'.")
 
@@ -7374,7 +8426,7 @@ async def get_mempool_hashes(verified_sender: str = Depends(get_verified_sender)
     """
     if not verified_sender:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Signed request required.")
-    
+
     hashes = await db.get_all_pending_transaction_hashes()
     return {"ok": True, "result": hashes}
 
@@ -7382,40 +8434,40 @@ async def get_mempool_hashes(verified_sender: str = Depends(get_verified_sender)
 @app.post("/get_transactions_by_hash")
 @limiter.limit("20/minute")
 async def get_transactions_by_hash(
-    request: Request,
-    body: dict = Body(...),
-    verified_sender: str = Depends(get_verified_sender)
+    request: Request, body: dict = Body(...), verified_sender: str = Depends(get_verified_sender)
 ):
     """
     Accepts a list of transaction hashes and returns the full transaction data.
     """
     if not verified_sender:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Signed request required.")
-    
-    hashes_to_find = body.get('hashes')
+
+    hashes_to_find = body.get("hashes")
     if not isinstance(hashes_to_find, list):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Body must contain a 'hashes' list.")
-    
+
     if len(hashes_to_find) > MAX_TX_FETCH_LIMIT:
         await security.reputation_manager.record_violation(
-            verified_sender, 'tx_fetch_limit_exceeded', severity=2
+            verified_sender, "tx_fetch_limit_exceeded", severity=2
         )
         raise HTTPException(
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, 
-            f"Request limit exceeded. Maximum {MAX_TX_FETCH_LIMIT} transactions per request."
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            f"Request limit exceeded. Maximum {MAX_TX_FETCH_LIMIT} transactions per request.",
         )
 
     # Validate all hashes using the secure validator
     for hash_str in hashes_to_find:
         if not security.input_validator.validate_hex(hash_str, min_length=64, max_length=64):
             await security.reputation_manager.record_violation(
-                verified_sender, 'invalid_tx_hash_format', severity=3
+                verified_sender, "invalid_tx_hash_format", severity=3
             )
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid transaction hash format for hash: {hash_str}")
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, f"Invalid transaction hash format for hash: {hash_str}"
+            )
 
     found_txs = await db.get_pending_transactions_by_hash(hashes_to_find)
     tx_hex_list = [tx.hex() for tx in found_txs]
-    
+
     return {"ok": True, "result": tx_hex_list}
 
 
@@ -7428,4 +8480,3 @@ class CustomJSONEncoder(json.JSONEncoder):
             # Format datetime to a standard ISO string
             return o.isoformat()
         return super().default(o)
-

@@ -13,9 +13,10 @@
 
 > **October 2026:** the table below is the original snapshot. Since then signature
 > verification, mempool admission, proposer inclusion, import replay with root validation,
-> real-balance settlement (Phase E) and the single block path (Phase C) are all done. Still
-> open: **fees are tallied but never charged** (E1), and the circuit-breaker hooks are
-> constructed but never invoked on the swap path (F1). **Perps were rebuilt** on a zero-sum,
+> real-balance settlement (Phase E) and the single block path (Phase C) are all done. Fees
+> are charged and burned (E1; KNOWN_ISSUES "Exchange operations were free"). The
+> circuit-breaker hooks, which were constructed but never invoked on the swap path, were
+> removed (F1): a trader bounds the price with `min_amount_out`. **Perps were rebuilt** on a zero-sum,
 > order-book-matched clearinghouse (docs/PERPS_CLEARINGHOUSE.md): mark price, liquidations
 > with a backstop vault and auto-deleveraging, funding, settlement in a USD stablecoin, and a
 > validator price oracle. The old engine traded against nobody and minted or burned QRDX on
@@ -275,7 +276,9 @@ node rebuilt from chain history reconstructs identical account/exchange state.
   updates (`build_oracle_update_tx`).
 
 **Phase F — Hardening.**
-- F1. Per-market circuit breakers / price-band checks on order placement.
+- F1. ~~Per-market circuit breakers / price-band checks on order placement.~~ Removed
+  (October 2026): the breaker was never on the swap path. Slippage bounds
+  (`min_amount_out`) protect the trader.
 - F2. Oracle manipulation resistance (TWAP windows, staleness already present).
 - F3. Rate limits + mempool DoS protection for exchange ops.
 - F4. ✅ **done (this change).** Adversarial property/fuzz suite for the exchange

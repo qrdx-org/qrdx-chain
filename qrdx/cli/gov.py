@@ -15,6 +15,7 @@ are exchange transactions signed with the wallet's post-quantum key.
     qrdx-wallet gov veto holder.json 3 50000
     qrdx-wallet gov execute any.json 3
 """
+
 from __future__ import annotations
 
 import json
@@ -31,14 +32,20 @@ memo_option = click.option("--memo", default="", help="Why (stored with the prop
 
 def _show(p) -> None:
     click.echo(f"#{p['id']}  {p['status'].upper():9}  {p['action']}  {json.dumps(p['params'])}")
-    click.echo(f"    by {p['proposer']}  created {p['created_at']}  voting until {p['voting_ends']}")
+    click.echo(
+        f"    by {p['proposer']}  created {p['created_at']}  voting until {p['voting_ends']}"
+    )
     total = Decimal(p["total_weight"])
     if total:
-        click.echo(f"    yes {p['yes']} / no {p['no']} of {p['total_weight']} stake "
-                   f"(needs {p['threshold_bps'] / 100:.2f}%)")
+        click.echo(
+            f"    yes {p['yes']} / no {p['no']} of {p['total_weight']} stake "
+            f"(needs {p['threshold_bps'] / 100:.2f}%)"
+        )
     if p.get("timelock_ends") is not None:
-        click.echo(f"    passed {p['passed_at']}: vetoable until {p['timelock_ends']}, "
-                   f"executable until {p['execute_by']}; vetoes {p['veto_total']} QRDX")
+        click.echo(
+            f"    passed {p['passed_at']}: vetoable until {p['timelock_ends']}, "
+            f"executable until {p['execute_by']}; vetoes {p['veto_total']} QRDX"
+        )
     if p.get("memo"):
         click.echo(f"    memo: {p['memo']}")
 
@@ -63,15 +70,20 @@ def status_cmd(node, as_json):
     click.echo(f"  sunset at block {m['sunset_height']}; frozen at {m['frozen_at']}")
     for f in s["scheduled_forks"]:
         a = f["approval"]
-        state = (f"approved at {a['approved_at']}" if a["approved"]
-                 else f"needs approval by block {a['approve_by']}")
+        state = (
+            f"approved at {a['approved_at']}"
+            if a["approved"]
+            else f"needs approval by block {a['approve_by']}"
+        )
         click.echo(f"fork {f['name']} @ {f['height']} ({', '.join(f['features'])}): {state}")
     for k, v in s["params"].items():
         click.echo(f"  {k} = {v}")
 
 
 @gov.command("list")
-@click.option("--status", default=None, help="open, voting, passed, rejected, vetoed, executed, expired")
+@click.option(
+    "--status", default=None, help="open, voting, passed, rejected, vetoed, executed, expired"
+)
 @click.option("--limit", default=20, show_default=True)
 @node_option
 @json_option
@@ -111,10 +123,22 @@ def show_cmd(proposal_id, node, as_json):
 @yes_option
 def propose_spend_cmd(wallet_file, system_wallet, to, amount, memo, node, wait, yes):
     """Propose moving AMOUNT QRDX from SYSTEM_WALLET to TO (validators only)."""
-    _send(node, wallet_file, "GOV_PROPOSE",
-          {"action": "system_spend", "wallet": system_wallet, "to": to,
-           "amount": str(Decimal(amount)), "memo": memo},
-          f"Propose: spend {amount} QRDX from {system_wallet} to {to}", wait, yes, group="gov")
+    _send(
+        node,
+        wallet_file,
+        "GOV_PROPOSE",
+        {
+            "action": "system_spend",
+            "wallet": system_wallet,
+            "to": to,
+            "amount": str(Decimal(amount)),
+            "memo": memo,
+        },
+        f"Propose: spend {amount} QRDX from {system_wallet} to {to}",
+        wait,
+        yes,
+        group="gov",
+    )
 
 
 @gov.command("propose-freeze")
@@ -125,8 +149,16 @@ def propose_spend_cmd(wallet_file, system_wallet, to, amount, memo, node, wait, 
 @yes_option
 def propose_freeze_cmd(wallet_file, memo, node, wait, yes):
     """Propose ending the master controller's authority over the system wallets now."""
-    _send(node, wallet_file, "GOV_PROPOSE", {"action": "freeze_master", "memo": memo},
-          "Propose: freeze the master controller", wait, yes, group="gov")
+    _send(
+        node,
+        wallet_file,
+        "GOV_PROPOSE",
+        {"action": "freeze_master", "memo": memo},
+        "Propose: freeze the master controller",
+        wait,
+        yes,
+        group="gov",
+    )
 
 
 @gov.command("propose-fork")
@@ -141,10 +173,17 @@ def propose_fork_cmd(wallet_file, fork, memo, node, wait, yes):
     params = rpc(node, "governance_getForkApprovalParams", [fork])
     approve_by = params.pop("approve_by")
     params["memo"] = memo
-    _send(node, wallet_file, "GOV_PROPOSE", params,
-          f"Propose: approve fork {fork} at height {params['height']} "
-          f"(definition {params['definition_hash'][:16]}…; must execute by block {approve_by})",
-          wait, yes, group="gov")
+    _send(
+        node,
+        wallet_file,
+        "GOV_PROPOSE",
+        params,
+        f"Propose: approve fork {fork} at height {params['height']} "
+        f"(definition {params['definition_hash'][:16]}…; must execute by block {approve_by})",
+        wait,
+        yes,
+        group="gov",
+    )
 
 
 @gov.command("vote")
@@ -156,8 +195,16 @@ def propose_fork_cmd(wallet_file, fork, memo, node, wait, yes):
 @yes_option
 def vote_cmd(wallet_file, proposal_id, choice, node, wait, yes):
     """Vote on a proposal (validators in its stake snapshot; votes are final)."""
-    _send(node, wallet_file, "GOV_VOTE", {"proposal_id": proposal_id, "support": choice == "yes"},
-          f"Vote {choice} on proposal #{proposal_id}", wait, yes, group="gov")
+    _send(
+        node,
+        wallet_file,
+        "GOV_VOTE",
+        {"proposal_id": proposal_id, "support": choice == "yes"},
+        f"Vote {choice} on proposal #{proposal_id}",
+        wait,
+        yes,
+        group="gov",
+    )
 
 
 @gov.command("veto")
@@ -170,8 +217,16 @@ def vote_cmd(wallet_file, proposal_id, choice, node, wait, yes):
 def veto_cmd(wallet_file, proposal_id, amount, node, wait, yes):
     """Lock AMOUNT QRDX against a passed proposal during its timelock. It comes back when the
     proposal is vetoed, executed or expires."""
-    _send(node, wallet_file, "GOV_VETO", {"proposal_id": proposal_id, "amount": str(Decimal(amount))},
-          f"Veto proposal #{proposal_id}, locking {amount} QRDX", wait, yes, group="gov")
+    _send(
+        node,
+        wallet_file,
+        "GOV_VETO",
+        {"proposal_id": proposal_id, "amount": str(Decimal(amount))},
+        f"Veto proposal #{proposal_id}, locking {amount} QRDX",
+        wait,
+        yes,
+        group="gov",
+    )
 
 
 @gov.command("execute")
@@ -182,5 +237,13 @@ def veto_cmd(wallet_file, proposal_id, amount, node, wait, yes):
 @yes_option
 def execute_cmd(wallet_file, proposal_id, node, wait, yes):
     """Execute a passed proposal whose timelock has ended (anyone may)."""
-    _send(node, wallet_file, "GOV_EXECUTE", {"proposal_id": proposal_id},
-          f"Execute proposal #{proposal_id}", wait, yes, group="gov")
+    _send(
+        node,
+        wallet_file,
+        "GOV_EXECUTE",
+        {"proposal_id": proposal_id},
+        f"Execute proposal #{proposal_id}",
+        wait,
+        yes,
+        group="gov",
+    )

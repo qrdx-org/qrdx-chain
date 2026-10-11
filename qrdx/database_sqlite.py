@@ -4,10 +4,14 @@ SQLite Database Adapter for QRDX Testnet
 This is a simplified SQLite adapter for local testnet development.
 For production, use the full PostgreSQL database.py implementation.
 """
-import aiosqlite
+
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from decimal import Decimal
+from typing import Any, Dict, Optional
+
+import aiosqlite
+
 from .logger import get_logger
 
 logger = get_logger(__name__)
@@ -32,36 +36,51 @@ _BLOCK_COLS = (
 class DatabaseSQLite:
     """Simplified SQLite database for testnet"""
 
-    instance = None
-    credentials = {}
+    instance: Optional["DatabaseSQLite"] = None
+    credentials: Dict[str, Any] = {}
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self.connection: Optional[aiosqlite.Connection] = None
+        # Opened by create() — the only way an instance is made — before any use.
+        self.connection: aiosqlite.Connection = None  # type: ignore[assignment]
         self.is_indexed = False
-        
+
     @staticmethod
     async def create(db_path: str, **kwargs):
         """Create and initialize SQLite database"""
         self = DatabaseSQLite(db_path)
-        
+
         # Ensure directory exists
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        
+
         # Open connection
         self.connection = await aiosqlite.connect(db_path)
         self.connection.row_factory = aiosqlite.Row
-        
+
         # Enable WAL mode for better concurrency
         await self.connection.execute("PRAGMA journal_mode=WAL")
         await self.connection.execute("PRAGMA synchronous=NORMAL")
-        
+
         # Initialize schema
         await self._init_schema()
-        
+        # Incremental state commitments: triggers that fold every state-row change into the
+        # domain roots (qrdx/state_commitment.py).
+        from . import state_commitment, undo_journal
+
+        await state_commitment.install(self.connection)
+        # Per-block undo journal for reorgs (qrdx/undo_journal.py). A database without one
+        # covers no block until the next full rebuild resets it.
+        await undo_journal.install(self.connection)
+        cur = await self.connection.execute(
+            "SELECT value FROM chain_metadata WHERE key = 'undo_floor'"
+        )
+        if await cur.fetchone() is None:
+            await undo_journal.set_floor(self, max(0, await self.get_next_block_id() - 1))
+            await self.connection.commit()
+
         # Set singleton instance (matching Database pattern for manager.py etc.)
         DatabaseSQLite.instance = self
-        
+
         logger.info(f"SQLite database initialized: {db_path}")
         return self
 
@@ -71,7 +90,7 @@ class DatabaseSQLite:
         if DatabaseSQLite.instance is None:
             raise RuntimeError("DatabaseSQLite not initialized — call create() first")
         return DatabaseSQLite.instance
-        
+
     async def _init_schema(self):
         """Initialize database schema"""
         schema = """
@@ -88,7 +107,7 @@ class DatabaseSQLite:
             content TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        
+
         CREATE TABLE IF NOT EXISTS transactions (
             tx_hash TEXT PRIMARY KEY,
             tx_hex TEXT NOT NULL,
@@ -100,7 +119,7 @@ class DatabaseSQLite:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (block_hash) REFERENCES blocks(block_hash)
         );
-        
+
         CREATE TABLE IF NOT EXISTS pending_transactions (
             tx_hash TEXT PRIMARY KEY,
             tx_hex TEXT NOT NULL,
@@ -109,7 +128,7 @@ class DatabaseSQLite:
             time_received TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             propagation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        
+
         CREATE TABLE IF NOT EXISTS unspent_outputs (
             tx_hash TEXT NOT NULL,
             output_index INTEGER NOT NULL,
@@ -118,19 +137,19 @@ class DatabaseSQLite:
             PRIMARY KEY (tx_hash, output_index),
             FOREIGN KEY (tx_hash) REFERENCES transactions(tx_hash)
         );
-        
+
         CREATE TABLE IF NOT EXISTS pending_spent_outputs (
             tx_hash TEXT NOT NULL,
             output_index INTEGER NOT NULL,
             FOREIGN KEY (tx_hash) REFERENCES transactions(tx_hash) ON DELETE CASCADE
         );
-        
+
         CREATE TABLE IF NOT EXISTS peers (
             node_url TEXT PRIMARY KEY,
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             reputation INTEGER DEFAULT 0
         );
-        
+
         CREATE TABLE IF NOT EXISTS validator_states (
             epoch INTEGER PRIMARY KEY,
             validator_address TEXT NOT NULL,
@@ -138,7 +157,7 @@ class DatabaseSQLite:
             active BOOLEAN DEFAULT 1,
             last_attestation INTEGER
         );
-        
+
         CREATE TABLE IF NOT EXISTS validator_stakes (
             validator_address TEXT PRIMARY KEY,
             stake INTEGER NOT NULL,
@@ -152,7 +171,7 @@ class DatabaseSQLite:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        
+
         CREATE TABLE IF NOT EXISTS stake_deposits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             validator_address TEXT NOT NULL,
@@ -163,7 +182,7 @@ class DatabaseSQLite:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (validator_address) REFERENCES validator_stakes(validator_address)
         );
-        
+
         CREATE TABLE IF NOT EXISTS stake_withdrawals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             validator_address TEXT NOT NULL,
@@ -175,7 +194,7 @@ class DatabaseSQLite:
             completed_at TIMESTAMP,
             FOREIGN KEY (validator_address) REFERENCES validator_stakes(validator_address)
         );
-        
+
         -- Contract tracking tables
         CREATE TABLE IF NOT EXISTS account_state (
             address TEXT PRIMARY KEY,
@@ -187,7 +206,7 @@ class DatabaseSQLite:
             updated_at INTEGER NOT NULL,
             is_contract BOOLEAN NOT NULL DEFAULT 0
         );
-        
+
         CREATE TABLE IF NOT EXISTS contract_metadata (
             contract_address TEXT PRIMARY KEY,
             name TEXT,
@@ -199,7 +218,7 @@ class DatabaseSQLite:
             verified_at INTEGER,
             FOREIGN KEY (contract_address) REFERENCES account_state(address)
         );
-        
+
         CREATE TABLE IF NOT EXISTS contract_code (
             code_hash TEXT PRIMARY KEY,
             bytecode BLOB NOT NULL,
@@ -207,7 +226,7 @@ class DatabaseSQLite:
             deployer TEXT NOT NULL,
             size INTEGER NOT NULL
         );
-        
+
         CREATE TABLE IF NOT EXISTS contract_storage (
             contract_address TEXT NOT NULL,
             storage_key TEXT NOT NULL,
@@ -215,7 +234,7 @@ class DatabaseSQLite:
             block_number INTEGER NOT NULL,
             PRIMARY KEY (contract_address, storage_key)
         );
-        
+
         CREATE TABLE IF NOT EXISTS contract_transactions (
             tx_hash TEXT PRIMARY KEY,
             block_number INTEGER NOT NULL,
@@ -233,7 +252,7 @@ class DatabaseSQLite:
             error_message TEXT,
             created_at INTEGER NOT NULL
         );
-        
+
         CREATE TABLE IF NOT EXISTS contract_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tx_hash TEXT NOT NULL,
@@ -249,7 +268,7 @@ class DatabaseSQLite:
             UNIQUE(tx_hash, log_index),
             FOREIGN KEY (tx_hash) REFERENCES contract_transactions(tx_hash)
         );
-        
+
         CREATE TABLE IF NOT EXISTS attestations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             slot INTEGER NOT NULL,
@@ -265,7 +284,7 @@ class DatabaseSQLite:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(slot, validator_address)
         );
-        
+
         CREATE TABLE IF NOT EXISTS epochs (
             epoch INTEGER PRIMARY KEY,
             start_slot INTEGER NOT NULL,
@@ -282,7 +301,7 @@ class DatabaseSQLite:
             finalized_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        
+
         CREATE TABLE IF NOT EXISTS validators (
             address TEXT PRIMARY KEY,
             public_key TEXT NOT NULL,
@@ -297,7 +316,7 @@ class DatabaseSQLite:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        
+
         -- Append-only log of every consensus STAKE_DEPOSIT, keyed to the block that
         -- carried it. This exists to make a deposit-created registration REORG-SAFE:
         -- the `validators` table is not reconstructed on reorg
@@ -352,7 +371,7 @@ class DatabaseSQLite:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (validator_address) REFERENCES validators(address)
         );
-        
+
         CREATE TABLE IF NOT EXISTS system_wallets (
             address TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -365,7 +384,7 @@ class DatabaseSQLite:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        
+
         CREATE TABLE IF NOT EXISTS block_exchange_transactions (
             block_hash TEXT NOT NULL,
             tx_index INTEGER NOT NULL,
@@ -498,6 +517,7 @@ class DatabaseSQLite:
         CREATE INDEX IF NOT EXISTS idx_block_exchange_txs ON block_exchange_transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_block_evm_txs ON block_evm_transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_attestation_votes_target ON attestation_votes(target_epoch);
+        CREATE INDEX IF NOT EXISTS idx_attestation_votes_block ON attestation_votes(block_hash);
         CREATE INDEX IF NOT EXISTS idx_transactions_block ON transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_unspent_address ON unspent_outputs(address);
         CREATE INDEX IF NOT EXISTS idx_validator_epoch ON validator_states(epoch);
@@ -530,7 +550,7 @@ class DatabaseSQLite:
         CREATE INDEX IF NOT EXISTS idx_validators_status ON validators(status);
         CREATE INDEX IF NOT EXISTS idx_stakes_validator ON stakes(validator_address);
         """
-        
+
         await self.connection.executescript(schema)
         await self.connection.commit()
 
@@ -544,6 +564,11 @@ class DatabaseSQLite:
             "ALTER TABLE attestation_votes ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE attestation_votes ADD COLUMN validator_index INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE attestation_votes ADD COLUMN signature TEXT NOT NULL DEFAULT ''",
+            # The FFG vote's checkpoint roots (qrdx/validator/ffg.py): signed, so a retained
+            # vote rebuilds into the exact attestation — and two copies of one vote compare
+            # equal (without them, seeing an honest vote twice looked like a double vote).
+            "ALTER TABLE attestation_votes ADD COLUMN source_root TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE attestation_votes ADD COLUMN target_root TEXT NOT NULL DEFAULT ''",
         ]
         for stmt in _migrations:
             try:
@@ -558,31 +583,30 @@ class DatabaseSQLite:
         await self.connection.execute("DELETE FROM pending_spent_outputs")
         await self.connection.commit()
         logger.info("Pending transactions cleared")
-        
+
     async def close(self):
         """Close database connection"""
         if self.connection:
             await self.connection.close()
             logger.info(f"SQLite database closed: {self.db_path}")
-    
+
     # Compatibility methods for existing code
-    
+
     async def add_pending_transaction(self, transaction, verify: bool = True):
         """Add pending transaction to the mempool table."""
         try:
-            import json
             tx_hex = transaction.hex() if isinstance(transaction, bytes) else str(transaction)
             await self.connection.execute(
                 "INSERT OR IGNORE INTO pending_transactions (tx_hash, tx_data, added_at) "
                 "VALUES (?, ?, datetime('now'))",
-                (getattr(transaction, 'hash', tx_hex[:64]), tx_hex),
+                (getattr(transaction, "hash", tx_hex[:64]), tx_hex),
             )
             await self.connection.commit()
             return True
         except Exception as e:
             logger.warning("add_pending_transaction: %s", e)
             return True
-        
+
     async def get_latest_block(self):
         """Get the latest block from the database."""
         cursor = await self.connection.execute(
@@ -590,51 +614,66 @@ class DatabaseSQLite:
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
-        
+
     async def get_block_height(self):
         """Get current block height"""
-        cursor = await self.connection.execute(
-            "SELECT MAX(block_height) as height FROM blocks"
-        )
+        cursor = await self.connection.execute("SELECT MAX(block_height) as height FROM blocks")
         row = await cursor.fetchone()
-        return row['height'] if row and row['height'] is not None else -1
-    
+        return row["height"] if row and row["height"] is not None else -1
+
     async def get_next_block_id(self):
         """Get next block ID"""
         height = await self.get_block_height()
         return height + 1
-        
-    async def add_block(self, block_id_or_kw=None, block_hash=None,
-                        block_content=None, address=None, random_value=None,
-                        difficulty=None, reward=None, timestamp=None, **kwargs):
+
+    async def add_block(
+        self,
+        block_id_or_kw=None,
+        block_hash=None,
+        block_content=None,
+        address=None,
+        random_value=None,
+        difficulty=None,
+        reward=None,
+        timestamp=None,
+        **kwargs,
+    ):
         """Add block to database.
-        
+
         Accepts both positional args (matching the PostgreSQL API used by
         manager.py's create_block) and keyword args (used by genesis_init
         and node_integration).
         """
         # Merge positional & keyword sources so every caller works.
-        _id = (block_id_or_kw if block_id_or_kw is not None
-               else kwargs.get('block_id', kwargs.get('block_height', 0)))
-        _hash = (block_hash or kwargs.get('block_hash', ''))
-        _content = (block_content if block_content is not None
-                    else kwargs.get('content', ''))
-        _addr = (address or kwargs.get('validator_address', ''))
-        _ts = (timestamp if timestamp is not None
-               else kwargs.get('timestamp', datetime.now(timezone.utc)))
-        
+        _id = (
+            block_id_or_kw
+            if block_id_or_kw is not None
+            else kwargs.get("block_id", kwargs.get("block_height", 0))
+        )
+        _hash = block_hash or kwargs.get("block_hash", "")
+        _content = block_content if block_content is not None else kwargs.get("content", "")
+        _addr = address or kwargs.get("validator_address", "")
+        _ts = (
+            timestamp
+            if timestamp is not None
+            else kwargs.get("timestamp", datetime.now(timezone.utc))
+        )
+
         # Insert block
-        await self.connection.execute("""
+        await self.connection.execute(
+            """
             INSERT INTO blocks (block_hash, block_height, validator_address, content, timestamp)
             VALUES (?, ?, ?, ?, ?)
-        """, (_hash, _id, _addr, _content, _ts))
+        """,
+            (_hash, _id, _addr, _content, _ts),
+        )
         await self.connection.commit()
         logger.info(f"Block {_id} added: {_hash[:16]}...")
         return True
-    
+
     async def add_transaction(self, transaction_or_kw=None, block_hash_arg=None, **kwargs):
         """Add transaction to database.
-        
+
         Supports both:
           - Positional: add_transaction(Transaction, block_hash_str)
           - Keyword: add_transaction(tx_hash=..., tx_hex=..., block_hash=...)
@@ -644,18 +683,21 @@ class DatabaseSQLite:
             tx = transaction_or_kw
             tx_hash = tx.hash()
             tx_hex = tx.hex()
-            block_hash = block_hash_arg or ''
+            block_hash = block_hash_arg or ""
         else:
             # Keyword call
             kw = transaction_or_kw if isinstance(transaction_or_kw, dict) else kwargs
-            tx_hash = kw.get('tx_hash', kwargs.get('tx_hash', ''))
-            tx_hex = kw.get('tx_hex', kwargs.get('tx_hex', ''))
-            block_hash = kw.get('block_hash', kwargs.get('block_hash', block_hash_arg or ''))
-        
-        await self.connection.execute("""
+            tx_hash = kw.get("tx_hash", kwargs.get("tx_hash", ""))
+            tx_hex = kw.get("tx_hex", kwargs.get("tx_hex", ""))
+            block_hash = kw.get("block_hash", kwargs.get("block_hash", block_hash_arg or ""))
+
+        await self.connection.execute(
+            """
             INSERT OR IGNORE INTO transactions (tx_hash, tx_hex, block_hash)
             VALUES (?, ?, ?)
-        """, (tx_hash, tx_hex, block_hash))
+        """,
+            (tx_hash, tx_hex, block_hash),
+        )
         await self.connection.commit()
         return True
 
@@ -668,20 +710,22 @@ class DatabaseSQLite:
         """Create UTXO entries for all outputs of the given transactions."""
         for tx in transactions:
             for idx, output in enumerate(tx.outputs):
-                await self.connection.execute("""
+                await self.connection.execute(
+                    """
                     INSERT OR IGNORE INTO unspent_outputs (tx_hash, output_index, address, amount)
                     VALUES (?, ?, ?, ?)
-                """, (tx.hash(), idx, output.address, output.amount))
+                """,
+                    (tx.hash(), idx, output.address, output.amount),
+                )
         await self.connection.commit()
 
     async def remove_pending_transactions_by_hash(self, hashes: list):
         """Remove specific pending transactions by hash."""
         if not hashes:
             return
-        placeholders = ','.join('?' for _ in hashes)
+        placeholders = ",".join("?" for _ in hashes)
         await self.connection.execute(
-            f"DELETE FROM pending_transactions WHERE tx_hash IN ({placeholders})",
-            hashes
+            f"DELETE FROM pending_transactions WHERE tx_hash IN ({placeholders})", hashes
         )
         await self.connection.commit()
 
@@ -691,7 +735,7 @@ class DatabaseSQLite:
             for tx_input in tx.inputs:
                 await self.connection.execute(
                     "DELETE FROM unspent_outputs WHERE tx_hash = ? AND output_index = ?",
-                    (tx_input.tx_hash, tx_input.index)
+                    (tx_input.tx_hash, tx_input.index),
                 )
         await self.connection.commit()
 
@@ -701,7 +745,7 @@ class DatabaseSQLite:
             for tx_input in tx.inputs:
                 await self.connection.execute(
                     "DELETE FROM pending_spent_outputs WHERE tx_hash = ? AND index_spent = ?",
-                    (tx_input.tx_hash, tx_input.index)
+                    (tx_input.tx_hash, tx_input.index),
                 )
         await self.connection.commit()
 
@@ -710,14 +754,12 @@ class DatabaseSQLite:
         # Get the block hash first
         block = await self.get_block_by_id(block_id)
         if block:
-            block_hash = block.get('hash') or block.get('block_hash')
+            block_hash = block.get("hash") or block.get("block_hash")
             if block_hash:
                 await self.connection.execute(
                     "DELETE FROM transactions WHERE block_hash = ?", (block_hash,)
                 )
-            await self.connection.execute(
-                "DELETE FROM blocks WHERE block_height = ?", (block_id,)
-            )
+            await self.connection.execute("DELETE FROM blocks WHERE block_height = ?", (block_id,))
             await self.connection.commit()
 
     async def get_unspent_outputs(self, inputs):
@@ -726,7 +768,7 @@ class DatabaseSQLite:
         for tx_hash, idx in inputs:
             cursor = await self.connection.execute(
                 "SELECT tx_hash, output_index FROM unspent_outputs WHERE tx_hash = ? AND output_index = ?",
-                (tx_hash, idx)
+                (tx_hash, idx),
             )
             row = await cursor.fetchone()
             if row:
@@ -746,32 +788,34 @@ class DatabaseSQLite:
         """Remove pending transactions matching patterns."""
         for pattern in patterns:
             await self.connection.execute(
-                "DELETE FROM pending_transactions WHERE tx_hex LIKE ?",
-                (f'%{pattern}%',)
+                "DELETE FROM pending_transactions WHERE tx_hex LIKE ?", (f"%{pattern}%",)
             )
         await self.connection.commit()
-    
+
     async def add_unspent_output(self, **kwargs):
         """Add unspent output to database"""
-        tx_hash = kwargs.get('tx_hash', '')
-        output_index = kwargs.get('index', kwargs.get('output_index', 0))
-        address = kwargs.get('address', '')
-        amount = kwargs.get('amount', 0)
-        
-        await self.connection.execute("""
+        tx_hash = kwargs.get("tx_hash", "")
+        output_index = kwargs.get("index", kwargs.get("output_index", 0))
+        address = kwargs.get("address", "")
+        amount = kwargs.get("amount", 0)
+
+        await self.connection.execute(
+            """
             INSERT INTO unspent_outputs (tx_hash, output_index, address, amount)
             VALUES (?, ?, ?, ?)
-        """, (tx_hash, output_index, address, amount))
+        """,
+            (tx_hash, output_index, address, amount),
+        )
         await self.connection.commit()
         return True
-    
+
     async def execute(self, query: str, *args):
         """Execute raw SQL query"""
         await self.connection.execute(query, args)
         await self.connection.commit()
-    
+
     # Additional methods required by node endpoints
-    
+
     async def get_need_propagate_transactions(self):
         """Get transactions that need propagation (not propagated in the last 30s)."""
         cursor = await self.connection.execute("""
@@ -782,23 +826,40 @@ class DatabaseSQLite:
             LIMIT 200
         """)
         rows = await cursor.fetchall()
-        return [{'tx_hash': row[0], 'tx_hex': row[1]} for row in rows]
-    
+        return [{"tx_hash": row[0], "tx_hex": row[1]} for row in rows]
+
     async def update_pending_transactions_propagation_time(self, tx_hashes: list):
         """Update propagation time for transactions so they are not re-propagated."""
         if not tx_hashes:
             return
-        placeholders = ','.join('?' for _ in tx_hashes)
+        placeholders = ",".join("?" for _ in tx_hashes)
         await self.connection.execute(
             f"UPDATE pending_transactions SET propagation_time = datetime('now') "
             f"WHERE tx_hash IN ({placeholders})",
             tx_hashes,
         )
         await self.connection.commit()
-    
-    async def get_unspent_outputs_hash(self):
-        """Get deterministic hash of unspent outputs for state root computation."""
+
+    async def _incremental_root(self, domain: str, height: Optional[int]) -> Optional[str]:
+        """The domain's incremental root when the chain spec makes it the rule at ``height``
+        (None: the next block's height), else None — the caller then hashes every row."""
+        from . import state_commitment
+
+        if height is None:
+            height = await self.get_next_block_id()
+        if not state_commitment.active(height):
+            return None
+        return await state_commitment.root(self.connection, domain)
+
+    async def get_unspent_outputs_hash(self, height: Optional[int] = None):
+        """Get deterministic hash of unspent outputs for state root computation, under the
+        rule of the block at ``height`` (see ``_incremental_root``)."""
         import hashlib
+
+        incremental = await self._incremental_root("utxo", height)
+        if incremental is not None:
+            return incremental
+
         cursor = await self.connection.execute("""
             SELECT tx_hash, output_index, address, amount
             FROM unspent_outputs
@@ -811,15 +872,20 @@ class DatabaseSQLite:
         for row in rows:
             hasher.update(f"{row[0]}:{row[1]}:{row[2]}:{row[3]}".encode())
         return hasher.hexdigest()
-    
-    async def get_account_state_root(self) -> str:
-        """
-        Deterministic BLAKE3-512 root of the account/EVM state (Whitepaper §3.6).
 
-        Hashes every account_state row in a canonical order (by address) over its
-        consensus-relevant fields. Empty state → all-zero root. This is the
-        account-domain component of the unified block state root (Phase D4).
+    async def get_account_state_root(self, height: Optional[int] = None) -> str:
         """
+        Deterministic BLAKE3-512 root of the account/EVM state (Whitepaper §3.6), under the
+        rule of the block at ``height`` (None: the next block).
+
+        With ``incremental_state_root`` in force: one hash of the domain's LtHash accumulator
+        (qrdx/state_commitment.py). Before it: every account_state row in a canonical order
+        (by address) over its consensus-relevant fields. Empty state → all-zero root either
+        way. This is the account-domain component of the unified block state root (Phase D4).
+        """
+        incremental = await self._incremental_root("account", height)
+        if incremental is not None:
+            return incremental
         cursor = await self.connection.execute("""
             SELECT address, balance, nonce, code_hash, storage_root
             FROM account_state
@@ -837,6 +903,7 @@ class DatabaseSQLite:
         if not rows and not storage:
             return "0" * 128  # BLAKE3-512 width
         import blake3
+
         hasher = blake3.blake3()
         for r in rows:
             addr, balance, nonce, code_hash, storage_root = r[0], r[1], r[2], r[3], r[4]
@@ -864,8 +931,11 @@ class DatabaseSQLite:
         never rebuilt). Clearing it makes the replay re-sync exactly as the original
         run did. Best-effort: the sync tables only exist once EVM has initialized.
         """
-        await self.connection.execute("DELETE FROM account_state")
-        await self.connection.execute("DELETE FROM contract_storage")
+        from . import state_commitment
+
+        async with state_commitment.suspended(self.connection, "account"):
+            await self.connection.execute("DELETE FROM account_state")
+            await self.connection.execute("DELETE FROM contract_storage")
         # The EVM's receipts and logs index (rewritten as the replay re-executes each section,
         # so an orphaned block's receipts do not survive).
         for tbl in ("contract_logs", "contract_transactions"):
@@ -890,8 +960,10 @@ class DatabaseSQLite:
         Does NOT commit — the caller commits atomically with the rest of the block.
         """
         from decimal import Decimal
+
         from .crypto.account_id import to_account_id
-        wei_delta = int(Decimal(str(qrdx_delta)) * Decimal(10 ** 18))
+
+        wei_delta = int(Decimal(str(qrdx_delta)) * Decimal(10**18))
         if wei_delta == 0:
             return False
         # Canonical key: a PQ sender's delta lands on the same row the EVM uses.
@@ -934,15 +1006,17 @@ class DatabaseSQLite:
         """
         import json as _json
         from decimal import Decimal as _D
+
         from .crypto.account_id import to_account_id
-        cur = await self.connection.execute(
-            "SELECT block_hash FROM blocks WHERE block_height = 0")
+
+        cur = await self.connection.execute("SELECT block_hash FROM blocks WHERE block_height = 0")
         row = await cur.fetchone()
         if not row:
             return 0
         genesis_hash = row[0]
         cur = await self.connection.execute(
-            "SELECT tx_hex FROM transactions WHERE block_hash = ?", (genesis_hash,))
+            "SELECT tx_hex FROM transactions WHERE block_hash = ?", (genesis_hash,)
+        )
         seeded = 0
         for (tx_hex,) in await cur.fetchall():
             try:
@@ -950,10 +1024,11 @@ class DatabaseSQLite:
             except Exception:
                 continue
             # Prefunded accounts and system wallets: both are genesis balances in account_state.
-            if d.get("type") not in ("genesis_allocation", "genesis_system_wallet") \
-                    or not d.get("recipient"):
+            if d.get("type") not in ("genesis_allocation", "genesis_system_wallet") or not d.get(
+                "recipient"
+            ):
                 continue
-            wei = int(_D(str(d["amount"])) * _D(10 ** 18))
+            wei = int(_D(str(d["amount"])) * _D(10**18))
             await self.connection.execute(
                 "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, is_contract) "
                 "VALUES (?, ?, 0, 0, 0, 0) "
@@ -963,7 +1038,9 @@ class DatabaseSQLite:
             seeded += 1
         return seeded
 
-    async def apply_token_balance_delta(self, token_address: str, holder_address: str, delta) -> bool:
+    async def apply_token_balance_delta(
+        self, token_address: str, holder_address: str, delta
+    ) -> bool:
         """
         Phase E (spot): apply a token-balance delta (negative = debit) to the
         ``token_balances`` ledger. Balances are stored as Decimal-string token
@@ -978,7 +1055,9 @@ class DatabaseSQLite:
         it is logged as critical, and supply stays exactly conserved.
         """
         from decimal import Decimal
+
         from .crypto.account_id import to_account_id
+
         d = Decimal(str(delta))
         if d == 0:
             return False
@@ -994,8 +1073,14 @@ class DatabaseSQLite:
         cur_bal = Decimal(row[0]) if row and row[0] is not None else Decimal("0")
         new_bal = cur_bal + d
         if new_bal < 0:
-            logger.critical("[TOKEN-OVERDRAFT] %s of token %s debited %s with %s: balance %s",
-                            holder_address, token_address, -d, cur_bal, new_bal)
+            logger.critical(
+                "[TOKEN-OVERDRAFT] %s of token %s debited %s with %s: balance %s",
+                holder_address,
+                token_address,
+                -d,
+                cur_bal,
+                new_bal,
+            )
         await self.connection.execute(
             """INSERT INTO token_balances (token_address, holder_address, balance, updated_at)
                VALUES (?, ?, ?, ?)
@@ -1020,9 +1105,16 @@ class DatabaseSQLite:
                  name = excluded.name, symbol = excluded.symbol, decimals = excluded.decimals,
                  total_supply = excluded.total_supply, owner_address = excluded.owner_address,
                  updated_at = excluded.updated_at""",
-            (op["token_address"], op["name"], op["symbol"], int(op.get("decimals", 18)),
-             str(op["total_supply"]), owner, int(op.get("created_height", 0) or 0),
-             int(op.get("created_height", 0) or 0)),
+            (
+                op["token_address"],
+                op["name"],
+                op["symbol"],
+                int(op.get("decimals", 18)),
+                str(op["total_supply"]),
+                owner,
+                int(op.get("created_height", 0) or 0),
+                int(op.get("created_height", 0) or 0),
+            ),
         )
         return True
 
@@ -1033,7 +1125,9 @@ class DatabaseSQLite:
         canonical account id the ledger is keyed by.
         """
         from decimal import Decimal
+
         from .crypto.account_id import to_account_id
+
         try:
             holder_address = to_account_id(holder_address)
         except ValueError:
@@ -1045,10 +1139,12 @@ class DatabaseSQLite:
         row = await cur.fetchone()
         return Decimal(row[0]) if row and row[0] is not None else Decimal("0")
 
-    async def get_token_balances_root(self) -> str:
+    async def get_token_balances_root(self, height: Optional[int] = None) -> str:
         """
         Deterministic BLAKE3-512 root of the QRC-20 token ledger (Whitepaper §3.6),
-        the token-domain component of the unified block state root (Phase E spot).
+        the token-domain component of the unified block state root (Phase E spot). Under
+        ``incremental_state_root`` (at ``height``; None: the next block) it is one hash of the
+        domain's LtHash accumulator; before it, the sequential hash below.
 
         Hashes every non-zero ``token_balances`` row in canonical order
         (token_address, holder_address) over (token, holder, balance). Zero-value
@@ -1056,6 +1152,9 @@ class DatabaseSQLite:
         Empty ledger → all-zero root. Determinism comes from identical replay of
         the same token deltas on every node (same as ``get_account_state_root``).
         """
+        incremental = await self._incremental_root("token", height)
+        if incremental is not None:
+            return incremental
         cursor = await self.connection.execute("""
             SELECT token_address, holder_address, balance
             FROM token_balances
@@ -1063,7 +1162,9 @@ class DatabaseSQLite:
         """)
         rows = await cursor.fetchall()
         from decimal import Decimal
+
         import blake3
+
         hasher = blake3.blake3()
         any_row = False
         for r in rows:
@@ -1082,7 +1183,10 @@ class DatabaseSQLite:
     async def clear_token_balances(self) -> None:
         """Clear the token ledger (Phase E spot reorg rebuild). Replayed exchange
         sections re-apply the canonical token deltas afterwards. Commits."""
-        await self.connection.execute("DELETE FROM token_balances")
+        from . import state_commitment
+
+        async with state_commitment.suspended(self.connection, "token"):
+            await self.connection.execute("DELETE FROM token_balances")
         # The registry mirror too: a token deployed on an orphaned branch must not survive
         # the replay (which re-mirrors every canonical deploy).
         await self.connection.execute("DELETE FROM token_registry")
@@ -1093,43 +1197,75 @@ class DatabaseSQLite:
         cursor = await self.connection.execute("SELECT COUNT(*) FROM pending_transactions")
         row = await cursor.fetchone()
         return row[0] if row else 0
-    
+
     async def get_all_pending_transaction_hashes(self):
         """Get all pending transaction hashes"""
         cursor = await self.connection.execute("SELECT tx_hash FROM pending_transactions")
         rows = await cursor.fetchall()
         return [row[0] for row in rows]
-    
+
     # Contract tracking methods
-    
-    async def add_contract_log(self, tx_hash: str, block_number: int, log_index: int, 
-                               contract_address: str, topic0: str = None, topic1: str = None,
-                               topic2: str = None, topic3: str = None, data: bytes = None):
+
+    async def add_contract_log(
+        self,
+        tx_hash: str,
+        block_number: int,
+        log_index: int,
+        contract_address: str,
+        topic0: Optional[str] = None,
+        topic1: Optional[str] = None,
+        topic2: Optional[str] = None,
+        topic3: Optional[str] = None,
+        data: Optional[bytes] = None,
+    ):
         """Add contract event log"""
-        await self.connection.execute("""
-            INSERT INTO contract_logs 
+        await self.connection.execute(
+            """
+            INSERT INTO contract_logs
             (tx_hash, block_number, log_index, contract_address, topic0, topic1, topic2, topic3, data, removed)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-        """, (tx_hash, block_number, log_index, contract_address, topic0, topic1, topic2, topic3, data))
+        """,
+            (
+                tx_hash,
+                block_number,
+                log_index,
+                contract_address,
+                topic0,
+                topic1,
+                topic2,
+                topic3,
+                data,
+            ),
+        )
         await self.connection.commit()
-    
-    async def add_contract_metadata(self, contract_address: str, name: str = None, 
-                                   symbol: str = None, verified: bool = False, abi: str = None):
+
+    async def add_contract_metadata(
+        self,
+        contract_address: str,
+        name: Optional[str] = None,
+        symbol: Optional[str] = None,
+        verified: bool = False,
+        abi: Optional[str] = None,
+    ):
         """Add or update contract metadata"""
-        await self.connection.execute("""
-            INSERT OR REPLACE INTO contract_metadata 
+        await self.connection.execute(
+            """
+            INSERT OR REPLACE INTO contract_metadata
             (contract_address, name, symbol, verified, abi)
             VALUES (?, ?, ?, ?, ?)
-        """, (contract_address, name, symbol, verified, abi))
+        """,
+            (contract_address, name, symbol, verified, abi),
+        )
         await self.connection.commit()
-    
+
     async def get_address_tokens(self, address: str, transfer_topic: str):
         """Get tokens owned by address from Transfer events"""
         # Normalize address to 64-char hex (32 bytes)
         address_topic = "0x" + address.lower().replace("0x", "").zfill(64)
-        
-        cursor = await self.connection.execute("""
-            SELECT DISTINCT 
+
+        cursor = await self.connection.execute(
+            """
+            SELECT DISTINCT
                 cl.contract_address,
                 cm.name,
                 cm.symbol,
@@ -1141,47 +1277,59 @@ class DatabaseSQLite:
               AND cl.topic2 = ?
               AND cl.removed = 0
             GROUP BY cl.contract_address, cm.name, cm.symbol, cm.verified
-        """, (transfer_topic, address_topic))
-        
+        """,
+            (transfer_topic, address_topic),
+        )
+
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def get_token_info(self, token_address: str, transfer_topic: str):
         """Get token contract information"""
         # Get metadata
-        cursor = await self.connection.execute("""
+        cursor = await self.connection.execute(
+            """
             SELECT * FROM contract_metadata WHERE contract_address = ?
-        """, (token_address,))
+        """,
+            (token_address,),
+        )
         metadata = await cursor.fetchone()
-        
+
         if not metadata:
             return None
-        
+
         # Get transfer count
-        cursor = await self.connection.execute("""
+        cursor = await self.connection.execute(
+            """
             SELECT COUNT(*) as count FROM contract_logs
             WHERE contract_address = ? AND topic0 = ? AND removed = 0
-        """, (token_address, transfer_topic))
+        """,
+            (token_address, transfer_topic),
+        )
         transfer_row = await cursor.fetchone()
         transfer_count = transfer_row[0] if transfer_row else 0
-        
+
         # Get unique holders (distinct topic2 recipients)
-        cursor = await self.connection.execute("""
+        cursor = await self.connection.execute(
+            """
             SELECT COUNT(DISTINCT topic2) as count FROM contract_logs
             WHERE contract_address = ? AND topic0 = ? AND removed = 0
-        """, (token_address, transfer_topic))
+        """,
+            (token_address, transfer_topic),
+        )
         holder_row = await cursor.fetchone()
         holder_count = holder_row[0] if holder_row else 0
-        
+
         result = dict(metadata)
-        result['total_transfers'] = transfer_count
-        result['total_holders'] = holder_count
+        result["total_transfers"] = transfer_count
+        result["total_holders"] = holder_count
         return result
-    
+
     async def get_top_addresses_by_balance(self, limit: int, offset: int):
         """Get top addresses by balance (sum of unspent outputs)"""
-        cursor = await self.connection.execute("""
-            SELECT 
+        cursor = await self.connection.execute(
+            """
+            SELECT
                 address,
                 SUM(amount) as balance,
                 COUNT(*) as output_count
@@ -1190,16 +1338,19 @@ class DatabaseSQLite:
             GROUP BY address
             ORDER BY balance DESC
             LIMIT ? OFFSET ?
-        """, (limit, offset))
-        
+        """,
+            (limit, offset),
+        )
+
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def get_top_addresses_by_transactions(self, limit: int, offset: int):
         """Get most active addresses by transaction count"""
         # SQLite doesn't have UNNEST, so we need a different approach
         # This is a simplified version - for full implementation, we'd need to parse the arrays
-        cursor = await self.connection.execute("""
+        cursor = await self.connection.execute(
+            """
             SELECT DISTINCT
                 address,
                 COUNT(*) as tx_count
@@ -1208,15 +1359,18 @@ class DatabaseSQLite:
             GROUP BY address
             ORDER BY tx_count DESC
             LIMIT ? OFFSET ?
-        """, (limit, offset))
-        
+        """,
+            (limit, offset),
+        )
+
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def get_top_addresses_by_tokens(self, limit: int, offset: int, transfer_topic: str):
         """Get addresses with most token holdings"""
-        cursor = await self.connection.execute("""
-            SELECT 
+        cursor = await self.connection.execute(
+            """
+            SELECT
                 topic2 as address_topic,
                 COUNT(DISTINCT contract_address) as token_count,
                 COUNT(*) as transfer_count
@@ -1225,15 +1379,18 @@ class DatabaseSQLite:
             GROUP BY topic2
             ORDER BY token_count DESC
             LIMIT ? OFFSET ?
-        """, (transfer_topic, limit, offset))
-        
+        """,
+            (transfer_topic, limit, offset),
+        )
+
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def get_recent_transactions_with_blocks(self, limit: int, offset: int):
         """Get recent transactions with block info"""
-        cursor = await self.connection.execute("""
-            SELECT 
+        cursor = await self.connection.execute(
+            """
+            SELECT
                 t.tx_hash,
                 t.block_hash,
                 b.block_height as block_number,
@@ -1243,15 +1400,18 @@ class DatabaseSQLite:
             JOIN blocks b ON t.block_hash = b.block_hash
             ORDER BY b.block_height DESC
             LIMIT ? OFFSET ?
-        """, (limit, offset))
-        
+        """,
+            (limit, offset),
+        )
+
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def get_recent_contract_transactions(self, limit: int, offset: int):
         """Get recent contract transactions"""
-        cursor = await self.connection.execute("""
-            SELECT 
+        cursor = await self.connection.execute(
+            """
+            SELECT
                 ct.tx_hash,
                 ct.block_number,
                 ct.from_address,
@@ -1264,15 +1424,18 @@ class DatabaseSQLite:
             LEFT JOIN blocks b ON b.block_height = ct.block_number
             ORDER BY ct.block_number DESC
             LIMIT ? OFFSET ?
-        """, (limit, offset))
-        
+        """,
+            (limit, offset),
+        )
+
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def get_recent_blocks_with_validators(self, limit: int, offset: int):
         """Get recent blocks with validator information"""
-        cursor = await self.connection.execute("""
-            SELECT 
+        cursor = await self.connection.execute(
+            """
+            SELECT
                 b.block_height as id,
                 b.block_hash as hash,
                 b.validator_address as address,
@@ -1286,18 +1449,23 @@ class DatabaseSQLite:
             FROM blocks b
             ORDER BY b.block_height DESC
             LIMIT ? OFFSET ?
-        """, (limit, offset))
-        
+        """,
+            (limit, offset),
+        )
+
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def get_validator_info(self, validator_address: str):
         """Get validator information"""
-        cursor = await self.connection.execute("""
+        cursor = await self.connection.execute(
+            """
             SELECT address, stake, effective_stake, status
             FROM validators
             WHERE address = ?
-        """, (validator_address,))
+        """,
+            (validator_address,),
+        )
 
         row = await cursor.fetchone()
         return dict(row) if row else None
@@ -1314,6 +1482,7 @@ class DatabaseSQLite:
         if not items:
             return
         import json
+
         for idx, item in enumerate(items):
             await self.connection.execute(
                 "INSERT OR IGNORE INTO block_exchange_transactions "
@@ -1325,6 +1494,7 @@ class DatabaseSQLite:
     async def get_block_exchange_txs(self, block_hash: str) -> list:
         """Return a block's exchange-transaction section in canonical order."""
         import json
+
         cursor = await self.connection.execute(
             "SELECT tx_data FROM block_exchange_transactions "
             "WHERE block_hash = ? ORDER BY tx_index ASC",
@@ -1361,10 +1531,19 @@ class DatabaseSQLite:
 
     # ── Finality: attestation votes (link 2) ────────────────────────────
 
-    async def record_attestation_vote(self, validator_address: str, target_epoch: int,
-                                      source_epoch: int, slot: int, block_hash: str,
-                                      epoch: int = 0, validator_index: int = 0,
-                                      signature: str = "") -> None:
+    async def record_attestation_vote(
+        self,
+        validator_address: str,
+        target_epoch: int,
+        source_epoch: int,
+        slot: int,
+        block_hash: str,
+        epoch: int = 0,
+        validator_index: int = 0,
+        signature: str = "",
+        source_root: str = "",
+        target_root: str = "",
+    ) -> None:
         """
         Record a validator's attestation vote for a target epoch (one per
         validator per target — later/duplicate votes for the same target are
@@ -1378,10 +1557,20 @@ class DatabaseSQLite:
         await self.connection.execute(
             "INSERT OR IGNORE INTO attestation_votes "
             "(validator_address, target_epoch, source_epoch, slot, block_hash, "
-            "epoch, validator_index, signature) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (validator_address, int(target_epoch), int(source_epoch), int(slot), block_hash,
-             int(epoch), int(validator_index), str(signature)),
+            "epoch, validator_index, signature, source_root, target_root) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                validator_address,
+                int(target_epoch),
+                int(source_epoch),
+                int(slot),
+                block_hash,
+                int(epoch),
+                int(validator_index),
+                str(signature),
+                str(source_root or ""),
+                str(target_root or ""),
+            ),
         )
         await self.connection.commit()
 
@@ -1391,21 +1580,34 @@ class DatabaseSQLite:
         with a retained ``signature`` are returned (pre-retention rows can't form a proof).
         Bounded by ``limit`` — surround votes span a small epoch window in practice."""
         cur = await self.connection.execute(
-            "SELECT slot, epoch, block_hash, validator_index, signature, source_epoch, target_epoch "
+            "SELECT slot, epoch, block_hash, validator_index, signature, source_epoch, target_epoch, "
+            "source_root, target_root "
             "FROM attestation_votes WHERE validator_address = ? AND signature != '' "
             "ORDER BY target_epoch DESC LIMIT ?",
-            (validator_address, int(limit)))
+            (validator_address, int(limit)),
+        )
         rows = await cur.fetchall()
         return [
-            {"slot": s, "epoch": e, "block_hash": bh, "validator_address": validator_address,
-             "validator_index": vi, "signature": sig, "source_epoch": se, "target_epoch": te}
-            for (s, e, bh, vi, sig, se, te) in rows
+            {
+                "slot": s,
+                "epoch": e,
+                "block_hash": bh,
+                "validator_address": validator_address,
+                "validator_index": vi,
+                "signature": sig,
+                "source_epoch": se,
+                "target_epoch": te,
+                "source_root": sr,
+                "target_root": tr,
+            }
+            for (s, e, bh, vi, sig, se, te, sr, tr) in rows
         ]
 
     # ── Slashing evidence (consensus security) ──────────────────────────
 
-    async def record_slashing_event(self, validator_address: str, condition: str,
-                                    slot: int, epoch: int, evidence: str) -> bool:
+    async def record_slashing_event(
+        self, validator_address: str, condition: str, slot: int, epoch: int, evidence: str
+    ) -> bool:
         """Persist a detected slashable offence (idempotent on
         (validator, slot, condition)). Returns True if it was NEW. Commits."""
         cur = await self.connection.execute(
@@ -1416,19 +1618,31 @@ class DatabaseSQLite:
         await self.connection.commit()
         return bool(cur.rowcount)
 
-    async def get_slashing_events(self, validator_address: str = None) -> list:
+    async def get_slashing_events(self, validator_address: Optional[str] = None) -> list:
         """Return recorded slashing evidence rows (optionally for one validator)."""
         if validator_address:
             cur = await self.connection.execute(
                 "SELECT validator_address, condition, slot, epoch, evidence, processed "
-                "FROM slashing_events WHERE validator_address = ? ORDER BY slot", (validator_address,))
+                "FROM slashing_events WHERE validator_address = ? ORDER BY slot",
+                (validator_address,),
+            )
         else:
             cur = await self.connection.execute(
                 "SELECT validator_address, condition, slot, epoch, evidence, processed "
-                "FROM slashing_events ORDER BY slot")
+                "FROM slashing_events ORDER BY slot"
+            )
         rows = await cur.fetchall()
-        return [{"validator_address": r[0], "condition": r[1], "slot": r[2],
-                 "epoch": r[3], "evidence": r[4], "processed": bool(r[5])} for r in rows]
+        return [
+            {
+                "validator_address": r[0],
+                "condition": r[1],
+                "slot": r[2],
+                "epoch": r[3],
+                "evidence": r[4],
+                "processed": bool(r[5]),
+            }
+            for r in rows
+        ]
 
     async def get_unprocessed_slashing_events(self, up_to_epoch: int) -> list:
         """Unprocessed slashing evidence whose offence epoch is at or below
@@ -1437,10 +1651,13 @@ class DatabaseSQLite:
         cur = await self.connection.execute(
             "SELECT validator_address, condition, slot, epoch FROM slashing_events "
             "WHERE processed = 0 AND epoch <= ? ORDER BY validator_address, slot",
-            (int(up_to_epoch),))
+            (int(up_to_epoch),),
+        )
         rows = await cur.fetchall()
-        return [{"validator_address": r[0], "condition": r[1], "slot": r[2], "epoch": r[3]}
-                for r in rows]
+        return [
+            {"validator_address": r[0], "condition": r[1], "slot": r[2], "epoch": r[3]}
+            for r in rows
+        ]
 
     async def get_pending_slashing_evidence(self, limit: int = 16) -> list:
         """The full self-validating PROOFS for unprocessed slashing events, for a proposer to
@@ -1449,9 +1666,12 @@ class DatabaseSQLite:
         keeps riding blocks until the finalized-epoch penalty marks it processed (deduped by
         every importer via INSERT OR IGNORE)."""
         import json as _json
+
         cur = await self.connection.execute(
             "SELECT evidence FROM slashing_events WHERE processed = 0 "
-            "ORDER BY validator_address, slot LIMIT ?", (int(limit),))
+            "ORDER BY validator_address, slot LIMIT ?",
+            (int(limit),),
+        )
         out = []
         for (ev_json,) in await cur.fetchall():
             try:
@@ -1474,8 +1694,10 @@ class DatabaseSQLite:
         node given the same evidence. ``enforce=False`` previews without writing. No
         commit. Returns {address, penalty, new_stake, applied}."""
         from decimal import Decimal
+
         c = await self.connection.execute(
-            "SELECT effective_stake, total_slashed FROM validators WHERE address = ?", (address,))
+            "SELECT effective_stake, total_slashed FROM validators WHERE address = ?", (address,)
+        )
         row = await c.fetchone()
         if not row:
             return {"address": address, "penalty": "0", "new_stake": None, "applied": False}
@@ -1489,16 +1711,22 @@ class DatabaseSQLite:
             await self.connection.execute(
                 "UPDATE validators SET effective_stake = ?, total_slashed = ?, "
                 "slashed = 1, status = 'slashed', updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                (str(new_stake), str(new_slashed), address))
-        return {"address": address, "penalty": str(pen), "new_stake": str(new_stake),
-                "applied": bool(enforce)}
+                (str(new_stake), str(new_slashed), address),
+            )
+        return {
+            "address": address,
+            "penalty": str(pen),
+            "new_stake": str(new_stake),
+            "applied": bool(enforce),
+        }
 
     async def mark_slashing_events_processed(self, address: str, up_to_epoch: int) -> None:
         """Mark a validator's slashing evidence (offence epoch ≤ up_to_epoch) processed,
         so the penalty is applied exactly once. No commit."""
         await self.connection.execute(
             "UPDATE slashing_events SET processed = 1 WHERE validator_address = ? AND epoch <= ?",
-            (address, int(up_to_epoch)))
+            (address, int(up_to_epoch)),
+        )
 
     async def get_epoch_attesters(self, target_epoch: int) -> list:
         """Return the validator addresses that have voted for ``target_epoch``."""
@@ -1509,8 +1737,9 @@ class DatabaseSQLite:
         rows = await cursor.fetchall()
         return [r[0] for r in rows]
 
-    async def set_epoch_finality(self, epoch: int, start_slot: int, end_slot: int,
-                                 justified: bool, finalized: bool) -> None:
+    async def set_epoch_finality(
+        self, epoch: int, start_slot: int, end_slot: int, justified: bool, finalized: bool
+    ) -> None:
         """
         Persist an epoch's justified/finalized status (SQLite). The existing
         epoch-processing writer is PostgreSQL-only, so this is the SQLite path the
@@ -1524,12 +1753,17 @@ class DatabaseSQLite:
             "  finalized = excluded.finalized, "
             "  finalized_at = CASE WHEN excluded.finalized THEN CURRENT_TIMESTAMP "
             "                      ELSE epochs.finalized_at END",
-            (int(epoch), int(start_slot), int(end_slot), 1 if justified else 0,
-             1 if finalized else 0),
+            (
+                int(epoch),
+                int(start_slot),
+                int(end_slot),
+                1 if justified else 0,
+                1 if finalized else 0,
+            ),
         )
         await self.connection.commit()
 
-    async def get_validators(self, status: str = None):
+    async def get_validators(self, status: Optional[str] = None):
         """
         Return the validator set, ordered by effective stake (descending).
 
@@ -1540,13 +1774,16 @@ class DatabaseSQLite:
             List of validator dicts.
         """
         if status:
-            cursor = await self.connection.execute("""
+            cursor = await self.connection.execute(
+                """
                 SELECT address, public_key, stake, effective_stake,
                        status, activation_epoch, exit_epoch, slashed
                 FROM validators
                 WHERE status = ?
                 ORDER BY CAST(effective_stake AS REAL) DESC
-            """, (status,))
+            """,
+                (status,),
+            )
         else:
             cursor = await self.connection.execute("""
                 SELECT address, public_key, stake, effective_stake,
@@ -1559,7 +1796,7 @@ class DatabaseSQLite:
         validators = []
         for row in rows:
             entry = dict(row)
-            entry['slashed'] = bool(entry.get('slashed'))
+            entry["slashed"] = bool(entry.get("slashed"))
             validators.append(entry)
         return validators
 
@@ -1578,16 +1815,21 @@ class DatabaseSQLite:
         if not rows:
             return "0" * 64
         import hashlib
+
         h = hashlib.sha256()
         for r in rows:
-            h.update(
-                f"{r[0]}:{r[1]}:{r[2]}:{r[3]}:{r[4]}:{int(bool(r[5]))}:{r[6]}:{r[7]}".encode()
-            )
+            h.update(f"{r[0]}:{r[1]}:{r[2]}:{r[3]}:{r[4]}:{int(bool(r[5]))}:{r[6]}:{r[7]}".encode())
         return h.hexdigest()
 
     async def apply_epoch_validator_updates(
-        self, rewards: dict, penalties: dict, activated: list, exited: list,
-        activation_epoch: int, max_effective_balance, enforce: bool = False,
+        self,
+        rewards: dict,
+        penalties: dict,
+        activated: list,
+        exited: list,
+        activation_epoch: int,
+        max_effective_balance,
+        enforce: bool = False,
     ) -> dict:
         """
         Validator-lifecycle unification (SQLite port of the PostgreSQL
@@ -1606,12 +1848,14 @@ class DatabaseSQLite:
         caller commits atomically at the epoch boundary. Returns a summary dict.
         """
         from decimal import Decimal
+
         max_bal = Decimal(str(max_effective_balance)) if max_effective_balance is not None else None
 
         async def _cur(addr):
             c = await self.connection.execute(
                 "SELECT effective_stake, total_rewards, total_slashed FROM validators WHERE address = ?",
-                (addr,))
+                (addr,),
+            )
             return await c.fetchone()
 
         preview = {}
@@ -1632,7 +1876,8 @@ class DatabaseSQLite:
                 await self.connection.execute(
                     "UPDATE validators SET effective_stake = ?, total_rewards = ?, "
                     "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                    (str(new_stake), str(new_rewards), addr))
+                    (str(new_stake), str(new_rewards), addr),
+                )
         # Penalties
         for addr, amt in (penalties or {}).items():
             amt = Decimal(str(amt))
@@ -1650,19 +1895,22 @@ class DatabaseSQLite:
                 await self.connection.execute(
                     "UPDATE validators SET effective_stake = ?, total_slashed = ?, "
                     "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                    (str(new_stake), str(new_slashed), addr))
+                    (str(new_stake), str(new_slashed), addr),
+                )
         # Activations
         if enforce:
-            for addr in (activated or []):
+            for addr in activated or []:
                 await self.connection.execute(
                     "UPDATE validators SET status = 'active', activation_epoch = ?, "
                     "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                    (int(activation_epoch), addr))
-            for addr in (exited or []):
+                    (int(activation_epoch), addr),
+                )
+            for addr in exited or []:
                 await self.connection.execute(
                     "UPDATE validators SET status = 'exited', exit_epoch = COALESCE(exit_epoch, ?), "
                     "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                    (int(activation_epoch), addr))
+                    (int(activation_epoch), addr),
+                )
         return {
             "rewarded": len([a for a, v in (rewards or {}).items() if Decimal(str(v)) > 0]),
             "penalized": len([a for a, v in (penalties or {}).items() if Decimal(str(v)) > 0]),
@@ -1679,7 +1927,9 @@ class DatabaseSQLite:
         validators to the same epoch. Returns the count scheduled. No commit."""
         cur = await self.connection.execute(
             "UPDATE validators SET activation_epoch = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE status = 'pending' AND activation_epoch IS NULL", (int(activation_epoch),))
+            "WHERE status = 'pending' AND activation_epoch IS NULL",
+            (int(activation_epoch),),
+        )
         return cur.rowcount if cur.rowcount is not None else 0
 
     async def schedule_pending_exits(self, exit_epoch: int) -> int:
@@ -1687,7 +1937,9 @@ class DatabaseSQLite:
         (exit_epoch IS NULL). Deterministic (epoch-loop driven). No commit."""
         cur = await self.connection.execute(
             "UPDATE validators SET exit_epoch = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE status = 'exiting' AND exit_epoch IS NULL", (int(exit_epoch),))
+            "WHERE status = 'exiting' AND exit_epoch IS NULL",
+            (int(exit_epoch),),
+        )
         return cur.rowcount if cur.rowcount is not None else 0
 
     async def mark_validator_exiting(self, address: str, exit_epoch=None) -> bool:
@@ -1710,12 +1962,19 @@ class DatabaseSQLite:
             "UPDATE validators SET status = 'exiting', "
             "exit_epoch = COALESCE(?, exit_epoch), updated_at = CURRENT_TIMESTAMP "
             "WHERE address = ? AND status IN ('active', 'pending')",
-            (int(exit_epoch) if exit_epoch is not None else None, address))
+            (int(exit_epoch) if exit_epoch is not None else None, address),
+        )
         return bool(cur.rowcount)
 
-    async def register_pending_validator(self, address: str, public_key: str, stake,
-                                          activation_epoch=None, block_height=None,
-                                          block_hash=None) -> bool:
+    async def register_pending_validator(
+        self,
+        address: str,
+        public_key: str,
+        stake,
+        activation_epoch=None,
+        block_height=None,
+        block_hash=None,
+    ) -> bool:
         """
         Validator-lifecycle Phase 3 (staking deposit / join): insert a PENDING
         validator into the consensus ``validators`` table, scheduled to activate at
@@ -1731,9 +1990,11 @@ class DatabaseSQLite:
         registration un-reversible, so every consensus path passes them.
         """
         from decimal import Decimal
+
         s = str(Decimal(str(stake)))
         cur = await self.connection.execute(
-            "SELECT stake, effective_stake FROM validators WHERE address = ?", (address,))
+            "SELECT stake, effective_stake FROM validators WHERE address = ?", (address,)
+        )
         row = await cur.fetchone()
         created_new = row is None
 
@@ -1743,21 +2004,28 @@ class DatabaseSQLite:
             await self.connection.execute(
                 "UPDATE validators SET stake = ?, effective_stake = ?, public_key = ?, "
                 "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                (new_stake, new_eff, public_key, address))
+                (new_stake, new_eff, public_key, address),
+            )
         else:
             await self.connection.execute(
                 "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
                 "activation_epoch) VALUES (?, ?, ?, ?, 'pending', ?)",
-                (address, public_key, s, s,
-                 int(activation_epoch) if activation_epoch is not None else None))
+                (
+                    address,
+                    public_key,
+                    s,
+                    s,
+                    int(activation_epoch) if activation_epoch is not None else None,
+                ),
+            )
 
         if block_height is not None:
             await self.connection.execute(
                 "INSERT INTO validator_deposits "
                 "(block_height, block_hash, address, public_key, stake, created_new) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (int(block_height), block_hash, address, public_key, s,
-                 1 if created_new else 0))
+                (int(block_height), block_hash, address, public_key, s, 1 if created_new else 0),
+            )
 
         return created_new
 
@@ -1794,8 +2062,9 @@ class DatabaseSQLite:
         cur = await self.connection.execute(
             "SELECT id, address, stake, created_new FROM validator_deposits "
             "WHERE block_height > ? ORDER BY block_height DESC, id DESC",
-            (int(tip_height),))
-        rows = await cur.fetchall()
+            (int(tip_height),),
+        )
+        rows = list(await cur.fetchall())
         if not rows:
             return {"reversed": 0, "removed": 0, "reduced": 0}
 
@@ -1803,12 +2072,13 @@ class DatabaseSQLite:
         for dep_id, address, stake, created_new in rows:
             if created_new:
                 await self.connection.execute(
-                    "DELETE FROM validators WHERE address = ?", (address,))
+                    "DELETE FROM validators WHERE address = ?", (address,)
+                )
                 removed += 1
             else:
                 cur2 = await self.connection.execute(
-                    "SELECT stake, effective_stake FROM validators WHERE address = ?",
-                    (address,))
+                    "SELECT stake, effective_stake FROM validators WHERE address = ?", (address,)
+                )
                 v = await cur2.fetchone()
                 if v:
                     back = Decimal(str(stake))
@@ -1821,10 +2091,10 @@ class DatabaseSQLite:
                     await self.connection.execute(
                         "UPDATE validators SET stake = ?, effective_stake = ?, "
                         "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                        (str(new_stake), str(new_eff), address))
+                        (str(new_stake), str(new_eff), address),
+                    )
                     reduced += 1
-            await self.connection.execute(
-                "DELETE FROM validator_deposits WHERE id = ?", (dep_id,))
+            await self.connection.execute("DELETE FROM validator_deposits WHERE id = ?", (dep_id,))
 
         return {"reversed": len(rows), "removed": removed, "reduced": reduced}
 
@@ -1840,11 +2110,13 @@ class DatabaseSQLite:
         Genesis is defined by this passed-in set (from the genesis config/snapshot), NOT by a
         table heuristic — a deposited validator can also sit at activation_epoch 0 mid-reorg."""
         from decimal import Decimal
+
         addrs = [v["address"] for v in genesis_validators]
         if addrs:
             ph = ",".join("?" * len(addrs))
             await self.connection.execute(
-                f"DELETE FROM validators WHERE address NOT IN ({ph})", addrs)
+                f"DELETE FROM validators WHERE address NOT IN ({ph})", addrs
+            )
         else:
             await self.connection.execute("DELETE FROM validators")
         for v in genesis_validators:
@@ -1858,20 +2130,52 @@ class DatabaseSQLite:
                 "effective_stake=excluded.effective_stake, status='active', "
                 "activation_epoch=0, exit_epoch=NULL, slashed=0, "
                 "total_slashed='0', total_rewards='0', updated_at=CURRENT_TIMESTAMP",
-                (v["address"], v["public_key"], s, s))
+                (v["address"], v["public_key"], s, s),
+            )
         return len(genesis_validators)
 
     async def get_genesis_validators(self) -> list:
         """The GENESIS validator set as [{address, public_key, stake}] for the reconstruction
-        reset. Genesis validators are uniquely identified by ``activation_epoch = 0`` — a
-        DEPOSITED validator always gets ``block_epoch + ACTIVATION_DELAY_EPOCHS`` (≥ 4 > 0), so
-        it can never collide. Their ``stake`` column stays at the genesis base (register_pending
-        tops up only deposited rows; epoch updates touch effective_stake, not stake), so it is the
-        correct base to reset to. Canonical address order for determinism."""
+        reset, in canonical address order.
+
+        Read from the immutable record genesis initialisation writes (chain_metadata
+        'genesis_validators'). It used to be read from the live table (``activation_epoch = 0``
+        rows) on every reset — but ``register_pending_validator`` tops up ANY existing row, so
+        a genesis validator that added stake had that deposit baked into its "genesis" base and
+        re-applied on top at every rebuild: its stake grew each finalized epoch, by a different
+        amount on each node. A database from before the record existed derives the set from
+        the table once and records it."""
+        import json
+
+        cur = await self.connection.execute(
+            "SELECT value FROM chain_metadata WHERE key = 'genesis_validators'"
+        )
+        row = await cur.fetchone()
+        if row:
+            return json.loads(row[0])
         cur = await self.connection.execute(
             "SELECT address, public_key, stake FROM validators WHERE activation_epoch = 0 "
-            "ORDER BY address ASC")
-        return [{"address": r[0], "public_key": r[1], "stake": r[2]} for r in await cur.fetchall()]
+            "ORDER BY address ASC"
+        )
+        base = [{"address": r[0], "public_key": r[1], "stake": r[2]} for r in await cur.fetchall()]
+        await self.record_genesis_validators(base)
+        return base
+
+    async def record_genesis_validators(self, validators: list) -> None:
+        """Record the genesis validator set once (see get_genesis_validators). Never overwrites."""
+        import json
+
+        base = sorted(
+            (
+                {"address": v["address"], "public_key": v["public_key"], "stake": str(v["stake"])}
+                for v in validators
+            ),
+            key=lambda v: v["address"],
+        )
+        await self.connection.execute(
+            "INSERT OR IGNORE INTO chain_metadata (key, value) VALUES ('genesis_validators', ?)",
+            (json.dumps(base, sort_keys=True),),
+        )
 
     async def get_validators_to_activate(self, current_epoch: int) -> list:
         """Pending validators whose scheduled activation_epoch has arrived
@@ -1879,7 +2183,9 @@ class DatabaseSQLite:
         cur = await self.connection.execute(
             "SELECT address FROM validators WHERE status = 'pending' "
             "AND activation_epoch IS NOT NULL AND activation_epoch <= ? "
-            "ORDER BY address ASC", (int(current_epoch),))
+            "ORDER BY address ASC",
+            (int(current_epoch),),
+        )
         return [r[0] for r in await cur.fetchall()]
 
     async def get_validators_to_exit(self, current_epoch: int) -> list:
@@ -1888,35 +2194,37 @@ class DatabaseSQLite:
         cur = await self.connection.execute(
             "SELECT address FROM validators WHERE status = 'exiting' "
             "AND exit_epoch IS NOT NULL AND exit_epoch <= ? "
-            "ORDER BY address ASC", (int(current_epoch),))
+            "ORDER BY address ASC",
+            (int(current_epoch),),
+        )
         return [r[0] for r in await cur.fetchall()]
 
     async def get_attestations_filtered(self, filters: dict, limit: int, offset: int):
         """Get attestations with filters"""
         where_clauses = []
         params = []
-        
-        if 'slot' in filters and filters['slot'] is not None:
+
+        if "slot" in filters and filters["slot"] is not None:
             where_clauses.append("slot = ?")
-            params.append(filters['slot'])
-        
-        if 'epoch' in filters and filters['epoch'] is not None:
+            params.append(filters["slot"])
+
+        if "epoch" in filters and filters["epoch"] is not None:
             where_clauses.append("epoch = ?")
-            params.append(filters['epoch'])
-        
-        if 'validator_address' in filters and filters['validator_address']:
+            params.append(filters["epoch"])
+
+        if "validator_address" in filters and filters["validator_address"]:
             where_clauses.append("validator_address = ?")
-            params.append(filters['validator_address'])
-        
-        if 'block_hash' in filters and filters['block_hash']:
+            params.append(filters["validator_address"])
+
+        if "block_hash" in filters and filters["block_hash"]:
             where_clauses.append("block_hash = ?")
-            params.append(filters['block_hash'])
-        
+            params.append(filters["block_hash"])
+
         where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
         params.extend([limit, offset])
-        
+
         query = f"""
-            SELECT 
+            SELECT
                 a.id,
                 a.slot,
                 a.epoch,
@@ -1937,66 +2245,80 @@ class DatabaseSQLite:
             ORDER BY a.slot DESC, a.validator_index ASC
             LIMIT ? OFFSET ?
         """
-        
+
         cursor = await self.connection.execute(query, tuple(params))
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def get_pending_transactions_by_hash(self, hashes: list):
         """Get pending transactions by hash"""
         if not hashes:
             return []
-        placeholders = ','.join('?' * len(hashes))
+        placeholders = ",".join("?" * len(hashes))
         cursor = await self.connection.execute(
-            f"SELECT * FROM pending_transactions WHERE tx_hash IN ({placeholders})",
-            hashes
+            f"SELECT * FROM pending_transactions WHERE tx_hash IN ({placeholders})", hashes
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def get_block_by_id(self, block_id: int):
         """Get block by ID"""
         cursor = await self.connection.execute(
-            f"SELECT {_BLOCK_COLS} FROM blocks WHERE block_height = ?",
-            (block_id,)
+            f"SELECT {_BLOCK_COLS} FROM blocks WHERE block_height = ?", (block_id,)
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
-    
+
+    async def get_block_header(self, block_id: int) -> Optional[Dict[str, Any]]:
+        """A block's row without its body (``content`` is ~45 KB of signatures): for callers
+        that need only the hash, parent, proposer or timestamp. Same keys as get_block_by_id
+        otherwise."""
+        cursor = await self.connection.execute(
+            "SELECT block_hash, block_hash AS hash, block_height, block_height AS id, "
+            "prev_block_hash, timestamp, validator_address, validator_address AS address "
+            "FROM blocks WHERE block_height = ?",
+            (block_id,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_block_hashes(self, start: int, end: int) -> Dict[int, str]:
+        """{height: block hash} for start..end inclusive, in one query and without bodies."""
+        cursor = await self.connection.execute(
+            "SELECT block_height, block_hash FROM blocks WHERE block_height BETWEEN ? AND ?",
+            (int(start), int(end)),
+        )
+        return {int(h): bh for h, bh in await cursor.fetchall()}
+
     async def get_block(self, block_hash: str):
         """Get block by hash"""
         cursor = await self.connection.execute(
-            f"SELECT {_BLOCK_COLS} FROM blocks WHERE block_hash = ?",
-            (block_hash,)
+            f"SELECT {_BLOCK_COLS} FROM blocks WHERE block_hash = ?", (block_hash,)
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
-    
+
     async def get_last_block(self):
         """Get latest block"""
         return await self.get_latest_block()
-    
+
     async def get_block_transactions(self, block_hash: str, hex_only: bool = False):
         """Get transactions in a block"""
         cursor = await self.connection.execute(
-            "SELECT tx_hex FROM transactions WHERE block_hash = ?",
-            (block_hash,)
+            "SELECT tx_hex FROM transactions WHERE block_hash = ?", (block_hash,)
         )
         rows = await cursor.fetchall()
         if hex_only:
             return [row[0] for row in rows]
         return rows
-    
+
     async def get_block_nice_transactions(self, block_hash: str):
         """Get formatted transactions in a block"""
         return await self.get_block_transactions(block_hash, hex_only=True)
-    
+
     async def remove_blocks(self, start_id: int):
         """Remove blocks starting from ID (rollback / reorg)."""
-        await self.connection.execute(
-            "DELETE FROM blocks WHERE block_height >= ?",
-            (start_id,)
-        )
+        await self.connection.execute("DELETE FROM blocks WHERE block_height >= ?", (start_id,))
         # Drop exchange/EVM sections for blocks no longer on the canonical chain
         # so no stale protocol-level state lingers after a reorg rollback.
         await self.connection.execute(
@@ -2010,9 +2332,11 @@ class DatabaseSQLite:
         # The removed blocks' EVM receipts and indexed transactions are no longer canonical:
         # a re-applied block writes its own (an orphaned transaction must not keep a receipt).
         await self.connection.execute(
-            "DELETE FROM contract_logs WHERE block_number >= ?", (start_id,))
+            "DELETE FROM contract_logs WHERE block_number >= ?", (start_id,)
+        )
         await self.connection.execute(
-            "DELETE FROM contract_transactions WHERE block_number >= ?", (start_id,))
+            "DELETE FROM contract_transactions WHERE block_number >= ?", (start_id,)
+        )
         await self._tx_index_cut(start_id)
         await self.connection.commit()
 
@@ -2021,7 +2345,8 @@ class DatabaseSQLite:
     async def _tx_index_cut(self, height: int) -> None:
         for table in ("tx_participants", "tx_index", "tx_index_blocks"):
             await self.connection.execute(
-                f"DELETE FROM {table} WHERE block_height >= ?", (int(height),))
+                f"DELETE FROM {table} WHERE block_height >= ?", (int(height),)
+            )
 
     async def tx_index_cut(self, height: int) -> None:
         """Forget every indexed block at or above ``height``."""
@@ -2032,7 +2357,9 @@ class DatabaseSQLite:
         """``[(height, block_hash)]`` of the indexed blocks at or above ``height``."""
         cursor = await self.connection.execute(
             "SELECT block_height, block_hash FROM tx_index_blocks WHERE block_height >= ? "
-            "ORDER BY block_height", (int(height),))
+            "ORDER BY block_height",
+            (int(height),),
+        )
         return [(int(r[0]), r[1]) for r in await cursor.fetchall()]
 
     async def tx_index_head(self) -> int:
@@ -2041,39 +2368,82 @@ class DatabaseSQLite:
         row = await cursor.fetchone()
         return -1 if row is None or row[0] is None else int(row[0])
 
-    async def tx_index_write_block(self, height: int, block_hash: str, rows: list,
-                                   participants: list) -> None:
+    async def tx_index_write_block(
+        self, height: int, block_hash: str, rows: list, participants: list
+    ) -> None:
         """Replace a height's indexed transactions. ``rows``: dicts with the tx_index columns;
         ``participants``: ``(account, position, roles)``."""
         await self._tx_index_cut_one(height)
-        cols = ("block_height", "position", "tx_hash", "block_hash", "timestamp", "kind", "op",
-                "sender", "target", "asset", "amount", "status", "fee", "error", "detail")
+        cols = (
+            "block_height",
+            "position",
+            "tx_hash",
+            "block_hash",
+            "timestamp",
+            "kind",
+            "op",
+            "sender",
+            "target",
+            "asset",
+            "amount",
+            "status",
+            "fee",
+            "error",
+            "detail",
+        )
         await self.connection.executemany(
             f"INSERT INTO tx_index ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
-            [tuple([int(height), r["position"], r["tx_hash"], block_hash]
-                   + [r.get(c) for c in cols[4:]]) for r in rows])
+            [
+                tuple(
+                    [int(height), r["position"], r["tx_hash"], block_hash]
+                    + [r.get(c) for c in cols[4:]]
+                )
+                for r in rows
+            ],
+        )
         await self.connection.executemany(
             "INSERT OR REPLACE INTO tx_participants (account, block_height, position, roles) "
-            "VALUES (?, ?, ?, ?)", [(a, int(height), pos, roles) for a, pos, roles in participants])
+            "VALUES (?, ?, ?, ?)",
+            [(a, int(height), pos, roles) for a, pos, roles in participants],
+        )
         await self.connection.execute(
             "INSERT OR REPLACE INTO tx_index_blocks (block_height, block_hash) VALUES (?, ?)",
-            (int(height), block_hash))
+            (int(height), block_hash),
+        )
         await self.connection.commit()
 
     async def _tx_index_cut_one(self, height: int) -> None:
         for table in ("tx_participants", "tx_index", "tx_index_blocks"):
             await self.connection.execute(
-                f"DELETE FROM {table} WHERE block_height = ?", (int(height),))
+                f"DELETE FROM {table} WHERE block_height = ?", (int(height),)
+            )
 
-    _TX_INDEX_COLS = ("i.block_height, i.position, i.tx_hash, i.block_hash, i.timestamp, i.kind, "
-                      "i.op, i.sender, i.target, i.asset, i.amount, i.status, i.fee, i.error, "
-                      "i.detail")
+    _TX_INDEX_COLS = (
+        "i.block_height, i.position, i.tx_hash, i.block_hash, i.timestamp, i.kind, "
+        "i.op, i.sender, i.target, i.asset, i.amount, i.status, i.fee, i.error, "
+        "i.detail"
+    )
 
     @staticmethod
     def _tx_index_row(row) -> dict:
-        keys = ("block_height", "position", "tx_hash", "block_hash", "timestamp", "kind", "op",
-                "sender", "target", "asset", "amount", "status", "fee", "error", "detail")
-        out = dict(zip(keys, tuple(row)[:len(keys)]))
+        keys = (
+            "block_height",
+            "position",
+            "tx_hash",
+            "block_hash",
+            "timestamp",
+            "kind",
+            "op",
+            "sender",
+            "target",
+            "asset",
+            "amount",
+            "status",
+            "fee",
+            "error",
+            "detail",
+        )
+        out = dict(zip(keys, tuple(row)[: len(keys)], strict=False))
         if len(tuple(row)) > len(keys):
             out["roles"] = tuple(row)[len(keys)]
         return out
@@ -2083,16 +2453,19 @@ class DatabaseSQLite:
         sql, args = "", []
         if before is not None:
             h, pos = before
-            sql += (f" AND ({alias}.block_height < ? OR ({alias}.block_height = ? "
-                    f"AND {alias}.position < ?))")
+            sql += (
+                f" AND ({alias}.block_height < ? OR ({alias}.block_height = ? "
+                f"AND {alias}.position < ?))"
+            )
             args += [int(h), int(h), int(pos)]
         if kinds:
             sql += f" AND i.kind IN ({', '.join('?' * len(kinds))})"
             args += list(kinds)
         return sql, args
 
-    async def get_account_history(self, account: str, limit: int = 50, before=None,
-                                  kinds=None) -> list:
+    async def get_account_history(
+        self, account: str, limit: int = 50, before=None, kinds=None
+    ) -> list:
         """An account's indexed transactions, newest first; ``before`` = (height, position)
         continues a previous page."""
         where, args = self._tx_index_filters(before, kinds, alias="p")
@@ -2101,7 +2474,8 @@ class DatabaseSQLite:
             f"JOIN tx_index i ON i.block_height = p.block_height AND i.position = p.position "
             f"WHERE p.account = ?{where} "
             f"ORDER BY p.block_height DESC, p.position DESC LIMIT ?",
-            [account] + args + [int(limit)])
+            [account] + args + [int(limit)],
+        )
         return [self._tx_index_row(r) for r in await cursor.fetchall()]
 
     async def get_indexed_transactions(self, limit: int = 50, before=None, kinds=None) -> list:
@@ -2109,7 +2483,9 @@ class DatabaseSQLite:
         where, args = self._tx_index_filters(before, kinds)
         cursor = await self.connection.execute(
             f"SELECT {self._TX_INDEX_COLS} FROM tx_index i WHERE 1 = 1{where} "
-            f"ORDER BY i.block_height DESC, i.position DESC LIMIT ?", args + [int(limit)])
+            f"ORDER BY i.block_height DESC, i.position DESC LIMIT ?",
+            args + [int(limit)],
+        )
         return [self._tx_index_row(r) for r in await cursor.fetchall()]
 
     async def get_indexed_transaction(self, tx_hash: str) -> list:
@@ -2117,72 +2493,75 @@ class DatabaseSQLite:
         h = str(tx_hash).lower()
         cursor = await self.connection.execute(
             f"SELECT {self._TX_INDEX_COLS} FROM tx_index i WHERE i.tx_hash IN (?, ?)",
-            (h.removeprefix("0x"), "0x" + h.removeprefix("0x")))
+            (h.removeprefix("0x"), "0x" + h.removeprefix("0x")),
+        )
         out = []
         for r in await cursor.fetchall():
             row = self._tx_index_row(r)
             parts = await self.connection.execute(
                 "SELECT account, roles FROM tx_participants WHERE block_height = ? AND "
-                "position = ? ORDER BY account", (row["block_height"], row["position"]))
-            row["accounts"] = {a: roles for a, roles in await parts.fetchall()}
+                "position = ? ORDER BY account",
+                (row["block_height"], row["position"]),
+            )
+            row["accounts"] = {part[0]: part[1] for part in await parts.fetchall()}
             out.append(row)
         return out
-    
+
     async def get_pending_transactions_limit(self, limit: int):
         """Get limited pending transactions"""
         cursor = await self.connection.execute(
-            f"SELECT tx_hex FROM pending_transactions LIMIT ?",
-            (limit,)
+            "SELECT tx_hex FROM pending_transactions LIMIT ?", (limit,)
         )
         rows = await cursor.fetchall()
         return [row[0] for row in rows]
-    
-    async def get_nice_transaction(self, tx_hash: str, address: str = None):
+
+    async def get_nice_transaction(self, tx_hash: str, address: Optional[str] = None):
         """Get formatted transaction"""
         cursor = await self.connection.execute(
-            "SELECT * FROM transactions WHERE tx_hash = ?",
-            (tx_hash,)
+            "SELECT * FROM transactions WHERE tx_hash = ?", (tx_hash,)
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
-    
+
     async def remove_pending_transaction(self, tx_hash: str):
         """Remove pending transaction"""
         await self.connection.execute(
-            "DELETE FROM pending_transactions WHERE tx_hash = ?",
-            (tx_hash,)
+            "DELETE FROM pending_transactions WHERE tx_hash = ?", (tx_hash,)
         )
         await self.connection.commit()
-    
+
     async def get_blocks(self, offset: int, limit: int):
         """Get blocks starting from a given height, ascending.
-        
+
         'offset' is treated as a starting block_height (inclusive) so
         that the sync protocol can request ``get_blocks(start_height, count)``.
         """
         cursor = await self.connection.execute(
             f"SELECT {_BLOCK_COLS} FROM blocks WHERE block_height >= ? ORDER BY block_height ASC LIMIT ?",
-            (offset, limit)
+            (offset, limit),
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def get_spendable_outputs(self, address: str):
         """Get spendable outputs for address"""
-        cursor = await self.connection.execute("""
-            SELECT tx_hash, output_index, amount 
-            FROM unspent_outputs 
+        cursor = await self.connection.execute(
+            """
+            SELECT tx_hash, output_index, amount
+            FROM unspent_outputs
             WHERE address = ?
-        """, (address,))
-        
+        """,
+            (address,),
+        )
+
         rows = await cursor.fetchall()
         outputs = []
-        
+
         for tx_hash, output_index, amount in rows:
             # Convert tx_hash bytes to hex if needed
             if isinstance(tx_hash, bytes):
                 tx_hash = tx_hash.hex()
-            
+
             # Create a simple object with the required attributes
             class Output:
                 def __init__(self, address, amount, tx_hash, index):
@@ -2190,12 +2569,12 @@ class DatabaseSQLite:
                     self.amount = amount / 1000000  # Convert from microQRDX to QRDX
                     self.tx_hash = tx_hash
                     self.index = index
-            
+
             outputs.append(Output(address, amount, tx_hash, output_index))
-        
+
         return outputs
 
-    async def get_address_balance(self, address: str, check_pending_txs: bool = False) -> 'Decimal':
+    async def get_address_balance(self, address: str, check_pending_txs: bool = False) -> "Decimal":
         """Get total balance for an address.
 
         Accepts ANY address form — ``0x…``, ``0xPQ…``, ``0xPQMS…``, legacy — and
@@ -2209,6 +2588,7 @@ class DatabaseSQLite:
         Returns balance in QRDX (not micro-QRDX, not wei).
         """
         from decimal import Decimal
+
         from .crypto.account_id import to_account_id
 
         try:
@@ -2248,57 +2628,71 @@ class DatabaseSQLite:
 
         return Decimal(0)
 
-    async def get_address_transactions(self, address: str, limit: int = 100, offset: int = 0, check_signatures: bool = False):
+    async def get_address_transactions(
+        self, address: str, limit: int = 100, offset: int = 0, check_signatures: bool = False
+    ):
         """Get transactions for address from the transactions table."""
-        cursor = await self.connection.execute("""
+        cursor = await self.connection.execute(
+            """
             SELECT tx_hash, tx_hex, block_hash, inputs_addresses,
                    outputs_addresses, outputs_amounts, fees, created_at
             FROM transactions
             WHERE inputs_addresses LIKE ? OR outputs_addresses LIKE ?
             ORDER BY created_at DESC
             LIMIT ? OFFSET ?
-        """, (f'%{address}%', f'%{address}%', limit, offset))
+        """,
+            (f"%{address}%", f"%{address}%", limit, offset),
+        )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def get_address_pending_transactions(self, address: str, hex_only: bool = False):
         """Get pending transactions for address from the mempool."""
-        cursor = await self.connection.execute("""
+        cursor = await self.connection.execute(
+            """
             SELECT tx_hash, tx_hex, inputs_addresses, fees, time_received
             FROM pending_transactions
             WHERE inputs_addresses LIKE ?
             ORDER BY time_received DESC
-        """, (f'%{address}%',))
+        """,
+            (f"%{address}%",),
+        )
         rows = await cursor.fetchall()
         if hex_only:
             return [row[1] for row in rows]
         return [dict(row) for row in rows]
-    
+
     async def get_address_pending_spent_outputs(self, address: str):
         """Get pending spent outputs for address."""
-        cursor = await self.connection.execute("""
+        cursor = await self.connection.execute(
+            """
             SELECT pso.tx_hash, pso.output_index
             FROM pending_spent_outputs pso
             JOIN unspent_outputs uo ON pso.tx_hash = uo.tx_hash AND pso.output_index = uo.output_index
             WHERE uo.address = ?
-        """, (address,))
+        """,
+            (address,),
+        )
         rows = await cursor.fetchall()
         return [(row[0], row[1]) for row in rows]
-    
+
     async def add_peer(self, peer_url: str):
         """Add or update peer"""
-        await self.connection.execute("""
+        await self.connection.execute(
+            """
             INSERT OR REPLACE INTO peers (node_url, last_seen, reputation)
             VALUES (?, CURRENT_TIMESTAMP, COALESCE((SELECT reputation FROM peers WHERE node_url = ?), 0))
-        """, (peer_url, peer_url))
+        """,
+            (peer_url, peer_url),
+        )
         await self.connection.commit()
         return True
-    
+
     async def get_peers(self, limit: int = 100):
         """Get list of peers"""
         cursor = await self.connection.execute(
             "SELECT node_url, reputation, last_seen FROM peers ORDER BY reputation DESC, last_seen DESC LIMIT ?",
-            (limit,)
+            (limit,),
         )
         rows = await cursor.fetchall()
-        return [{'url': row[0], 'reputation': row[1], 'last_seen': row[2]} for row in rows]
+        return [{"url": row[0], "reputation": row[1], "last_seen": row[2]} for row in rows]

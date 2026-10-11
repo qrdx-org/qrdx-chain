@@ -9,41 +9,43 @@ from typing import List, Optional
 @dataclass
 class DiscoveryConfig:
     """Discovery protocol configuration."""
-    
+
     # Enable discovery
     enabled: bool = True
-    
+
     # Bootstrap nodes (@-schema, qnode://, or http:// URIs)
     bootnodes: List[str] = field(default_factory=list)
-    
+
     # Enable DNS-based seed discovery
     dns_enabled: bool = True
-    
+
     # DNS seed domains (queried for signed TXT records)
-    dns_seeds: List[str] = field(default_factory=lambda: [
-        "seeds.qrdx.org",
-        "seeds2.qrdx.org",
-        "dnsseed.qrdxvalidators.org",
-    ])
-    
+    dns_seeds: List[str] = field(
+        default_factory=lambda: [
+            "seeds.qrdx.org",
+            "seeds2.qrdx.org",
+            "dnsseed.qrdxvalidators.org",
+        ]
+    )
+
     # Require Dilithium signatures on DNS seed records
     dns_require_signatures: bool = True
-    
+
     # Kademlia k-bucket size (contacts per bucket)
     bucket_size: int = 20
-    
+
     # Number of k-buckets (160 for 160-bit BLAKE3 node IDs)
     num_buckets: int = 160
-    
+
     # Discovery refresh interval (seconds)
     refresh_interval: int = 60
-    
+
     # Node lookup concurrency (Kademlia α parameter)
     lookup_concurrency: int = 3
-    
+
     # Persist routing table to disk for self-sustaining operation
     persist_routing_table: bool = True
-    
+
     # Routing table persistence directory
     routing_table_path: str = "data/"
 
@@ -51,19 +53,19 @@ class DiscoveryConfig:
 @dataclass
 class SecurityConfig:
     """P2P security configuration."""
-    
+
     # Enable post-quantum cryptography
     post_quantum_enabled: bool = True
-    
+
     # Post-quantum KEM algorithm
     pq_kem_algorithm: str = "Kyber768"
-    
+
     # Post-quantum signature algorithm
     pq_sig_algorithm: str = "Dilithium3"
-    
+
     # Require PQ-capable peers (reject others)
     pq_required: bool = True
-    
+
     # Connection timeout (seconds)
     handshake_timeout: float = 10.0
 
@@ -71,46 +73,46 @@ class SecurityConfig:
 @dataclass
 class P2PConfig:
     """P2P networking configuration."""
-    
+
     # Enable P2P networking
     enabled: bool = True
-    
+
     # Listen address
     listen_addr: str = "0.0.0.0"
-    
+
     # TCP port for RLPx connections
     listen_port: int = 30303
-    
+
     # UDP port for discovery
     discovery_port: int = 30303
-    
+
     # Maximum peers
     max_peers: int = 50
-    
+
     # Maximum pending connections
     max_pending_peers: int = 25
-    
+
     # Private key file path (optional, generated if not set)
     private_key_path: Optional[str] = None
-    
+
     # Node name (for status messages)
     node_name: str = "QRDX/v3.0.0"
-    
+
     # Chain ID
     chain_id: int = 1
-    
+
     # Discovery configuration
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
-    
+
     # Security configuration
     security: SecurityConfig = field(default_factory=SecurityConfig)
-    
+
     @classmethod
     def from_dict(cls, config: dict) -> "P2PConfig":
         """Create from dictionary."""
         discovery_dict = config.pop("discovery", {})
         security_dict = config.pop("security", {})
-        
+
         return cls(
             **config,
             discovery=DiscoveryConfig(**discovery_dict),

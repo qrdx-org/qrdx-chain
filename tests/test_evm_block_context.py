@@ -13,6 +13,8 @@ next block's EVM flush, so any RPC client could push off-chain effects into a no
 account_state and replay them at will.
 """
 import inspect
+
+from source_text import source_of
 from unittest.mock import MagicMock
 
 import pytest
@@ -51,7 +53,7 @@ def test_contracts_read_the_block_context(opcode, context, expected):
 
 def test_every_consensus_execution_passes_its_block():
     from qrdx.node import main as node_main
-    src = inspect.getsource(node_main._execute_evm_raw_tx)
+    src = source_of(node_main._execute_evm_raw_tx)
     assert "block_number=int(block_height or 1)" in src
     assert "timestamp=_evm_block_timestamp(block_timestamp)" in src
 
@@ -68,7 +70,7 @@ def test_block_timestamps_map_to_evm_seconds(value, expected):
 
 def test_eth_call_uses_the_latest_block():
     from qrdx.node import main as node_main
-    src = inspect.getsource(node_main.startup)
+    src = source_of(node_main.startup)
     call = src[src.index("evm_executor.call("):]
     call = call[:call.index("), preload=")]
     assert "block_number=max(tip, 1)" in call and "timestamp=_evm_block_timestamp(" in call
@@ -77,9 +79,9 @@ def test_eth_call_uses_the_latest_block():
 def test_there_is_one_write_path():
     """main.py must not register eth_sendTransaction: EthModule's refusal must stand."""
     from qrdx.node import main as node_main
-    src = inspect.getsource(node_main.startup)
+    src = source_of(node_main.startup)
     assert "register_method('eth_sendTransaction'" not in src
     assert "async def eth_sendTransaction_handler" not in src
     from qrdx.rpc.modules.eth import EthModule
-    refusal = inspect.getsource(EthModule.sendTransaction)
+    refusal = source_of(EthModule.sendTransaction)
     assert "eth_sendRawTransaction" in refusal and "not supported" in refusal

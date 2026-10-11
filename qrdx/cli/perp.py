@@ -13,6 +13,7 @@ to every node, so any node will do. ``--wait`` polls the receipt until a block i
     qrdx-wallet perp cancel wallet.json BTC-USD-PERP 3f9a…
     qrdx-wallet perp withdraw wallet.json all
 """
+
 from __future__ import annotations
 
 import json
@@ -24,54 +25,82 @@ from typing import Any, Dict, Optional
 import click
 
 DEFAULT_NODE = "http://localhost:3007"
-node_option = click.option("--node", "-n", default=DEFAULT_NODE, show_default=True,
-                           help="Node URL (its JSON-RPC endpoint is <node>/rpc)")
+node_option = click.option(
+    "--node",
+    "-n",
+    default=DEFAULT_NODE,
+    show_default=True,
+    help="Node URL (its JSON-RPC endpoint is <node>/rpc)",
+)
 json_option = click.option("--json", "as_json", is_flag=True, help="Print raw JSON")
 
 
 def rpc(node: str, method: str, params: Any = None, timeout: float = 20.0) -> Any:
     import httpx
+
     try:
-        resp = httpx.post(f"{node.rstrip('/')}/rpc", timeout=timeout,
-                          json={"jsonrpc": "2.0", "method": method, "params": params or [], "id": 1})
+        resp = httpx.post(
+            f"{node.rstrip('/')}/rpc",
+            timeout=timeout,
+            json={"jsonrpc": "2.0", "method": method, "params": params or [], "id": 1},
+        )
     except Exception as e:
-        raise click.ClickException(f"cannot reach {node}: {e}")
+        raise click.ClickException(f"cannot reach {node}: {e}") from e
     if resp.status_code != 200:
         raise click.ClickException(f"{method} failed (HTTP {resp.status_code})")
     body = resp.json()
     if body.get("error"):
         err = body["error"]
-        raise click.ClickException(f"{method}: {err.get('message', err) if isinstance(err, dict) else err}")
+        raise click.ClickException(
+            f"{method}: {err.get('message', err) if isinstance(err, dict) else err}"
+        )
     return body.get("result")
 
 
 def _signer(wallet_file: str):
     """The wallet's post-quantum key — exchange transactions are signed with Dilithium."""
     from qrdx.wallet_v2 import PQWallet, UnifiedWallet, WalletDecryptionError, load_wallet
+
     from .wallet import get_password
+
     password = get_password(prompt="Enter wallet password: ")
     try:
         wallet = load_wallet(Path(wallet_file), password)
-    except WalletDecryptionError:
-        raise click.ClickException("Invalid password")
+    except WalletDecryptionError as exc:
+        raise click.ClickException("Invalid password") from exc
     except Exception as e:
-        raise click.ClickException(f"Failed to load wallet: {e}")
+        raise click.ClickException(f"Failed to load wallet: {e}") from e
     if isinstance(wallet, UnifiedWallet):
         wallet = wallet.pq
     if not isinstance(wallet, PQWallet):
         raise click.ClickException(
             "Exchange transactions (perps, spot, tokens) are signed with Dilithium: use a "
-            "post-quantum (0xPQ) wallet. Create one with: qrdx-wallet create --type pq")
+            "post-quantum (0xPQ) wallet. Create one with: qrdx-wallet create --type pq"
+        )
     return wallet
 
 
-def build_tx(signer, op_name: str, params: Dict[str, Any], nonce: int,
-             gas_price: Optional[int] = None, chain_id: Optional[int] = None):
+def build_tx(
+    signer,
+    op_name: str,
+    params: Dict[str, Any],
+    nonce: int,
+    gas_price: Optional[int] = None,
+    chain_id: Optional[int] = None,
+):
     from qrdx.exchange import ExchangeOpType, ExchangeTransaction
-    price = {} if gas_price is None else {"gas_price": int(gas_price)}   # wei per gas
-    chain = {} if chain_id is None else {"chain_id": int(chain_id)}
-    tx = ExchangeTransaction(op_type=ExchangeOpType[op_name], sender=signer.address, nonce=nonce,
-                             params=params, gas_limit=1_000_000, **price, **chain)
+
+    price: Dict[str, Any] = {} if gas_price is None else {"gas_price": int(gas_price)}  # wei/gas
+    chain: Dict[str, Any] = {} if chain_id is None else {"chain_id": int(chain_id)}
+    tx = ExchangeTransaction(
+        op_type=ExchangeOpType[op_name],
+        sender=signer.address,
+        nonce=nonce,
+        params=params,
+        gas_limit=1_000_000,
+        **price,
+        **chain,
+    )
     tx.public_key = signer.public_key
     tx.signature = signer.sign(tx.signing_bytes())
     return tx
@@ -84,9 +113,11 @@ def _chain_id(node: str) -> int:
     status = rpc(node, "p2p_getStatus") or {}
     try:
         return int(status["network"]["chain_id"])
-    except (KeyError, TypeError, ValueError):
-        raise click.ClickException(f"{node} did not report its network's chain id "
-                                   f"(p2p_getStatus); refusing to guess which chain to sign for")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise click.ClickException(
+            f"{node} did not report its network's chain id "
+            f"(p2p_getStatus); refusing to guess which chain to sign for"
+        ) from exc
 
 
 def _gas_price(node: str) -> Optional[int]:
@@ -98,8 +129,16 @@ def _gas_price(node: str) -> Optional[int]:
         return None
 
 
-def _send(node: str, wallet_file: str, op_name: str, params: Any, summary: str,
-          wait: bool, yes: bool, group: str = "perp") -> Optional[Dict[str, Any]]:
+def _send(
+    node: str,
+    wallet_file: str,
+    op_name: str,
+    params: Any,
+    summary: str,
+    wait: bool,
+    yes: bool,
+    group: str = "perp",
+) -> Optional[Dict[str, Any]]:
     """Sign and submit one exchange transaction. ``params`` may be a function of the signer
     (for parameters that name the wallet itself)."""
     signer = _signer(wallet_file)
@@ -110,8 +149,9 @@ def _send(node: str, wallet_file: str, op_name: str, params: Any, summary: str,
         click.echo("Cancelled.")
         return None
     nonce = int(rpc(node, "exchange_getNonce", [signer.address]))
-    tx = build_tx(signer, op_name, params, nonce, gas_price=_gas_price(node),
-                  chain_id=_chain_id(node))
+    tx = build_tx(
+        signer, op_name, params, nonce, gas_price=_gas_price(node), chain_id=_chain_id(node)
+    )
     tx_hash = rpc(node, "exchange_sendTransaction", [tx.to_dict()])
     click.echo(click.style("✓ Submitted", fg="green") + f"  tx {tx_hash}  (nonce {nonce})")
     if not wait:
@@ -128,19 +168,34 @@ def _send(node: str, wallet_file: str, op_name: str, params: Any, summary: str,
 
 
 def _print_receipt(r: Dict[str, Any]) -> None:
-    status = (click.style("✓ executed", fg="green") if r.get("success")
-              else click.style("✗ failed", fg="red"))
+    status = (
+        click.style("✓ executed", fg="green")
+        if r.get("success")
+        else click.style("✗ failed", fg="red")
+    )
     click.echo(f"{status} in block {r.get('block_height')}: {r.get('op')}")
     if r.get("error"):
         click.echo(f"  error: {r['error']}")
     data = r.get("data") or {}
     if data.get("order_id"):
-        click.echo(f"  order {data['order_id']}  "
-                   f"{'resting' if data.get('resting') else 'not resting'}")
+        click.echo(
+            f"  order {data['order_id']}  " f"{'resting' if data.get('resting') else 'not resting'}"
+        )
     for f in data.get("fills", []):
         click.echo(f"  filled {f['amount']} @ {f['price']}")
-    for key in ("collateral", "shares", "value", "token_address", "amount", "total_supply",
-                "allowance_left", "new_authority", "frozen", "position_id", "amount_out"):
+    for key in (
+        "collateral",
+        "shares",
+        "value",
+        "token_address",
+        "amount",
+        "total_supply",
+        "allowance_left",
+        "new_authority",
+        "frozen",
+        "position_id",
+        "amount_out",
+    ):
         if key in data:
             click.echo(f"  {key}: {data[key]}")
 
@@ -151,6 +206,7 @@ def perp():
 
 
 # ── reads ──────────────────────────────────────────────────────────────────
+
 
 @perp.command("markets")
 @node_option
@@ -164,10 +220,12 @@ def markets_cmd(node: str, as_json: bool):
     if not rows:
         click.echo("No perp markets yet.")
     for m in rows:
-        click.echo(click.style(m["market_id"], bold=True) +
-                   f"  oracle {m['oracle_price']}  mark {m['mark_price']}  "
-                   f"last {m['last_trade_price']}  OI {m['open_interest']}  "
-                   f"bid {m['best_bid']} / ask {m['best_ask']}  funding {m['funding_rate']}")
+        click.echo(
+            click.style(m["market_id"], bold=True)
+            + f"  oracle {m['oracle_price']}  mark {m['mark_price']}  "
+            f"last {m['last_trade_price']}  OI {m['open_interest']}  "
+            f"bid {m['best_bid']} / ask {m['best_ask']}  funding {m['funding_rate']}"
+        )
 
 
 @perp.command("book")
@@ -199,18 +257,26 @@ def account_cmd(address: str, node: str, as_json: bool):
         click.echo(json.dumps(a, indent=2))
         return
     click.echo(click.style(address, bold=True))
-    click.echo(f"  collateral {a['collateral']}   withdrawable {a['withdrawable']}   "
-               f"equity {a['equity']}")
-    click.echo(f"  maintenance {a['maintenance_margin']}   initial {a['initial_margin']}   "
-               f"exchange nonce {a['exchange_nonce']}")
+    click.echo(
+        f"  collateral {a['collateral']}   withdrawable {a['withdrawable']}   "
+        f"equity {a['equity']}"
+    )
+    click.echo(
+        f"  maintenance {a['maintenance_margin']}   initial {a['initial_margin']}   "
+        f"exchange nonce {a['exchange_nonce']}"
+    )
     for mid, p in a["positions"].items():
         mode = "isolated" if p["isolated"] else "cross"
-        click.echo(f"  {mid}: {p['size']} @ {p['entry_price']}  mark {p['mark_price']}  "
-                   f"uPnL {p['unrealized_pnl']}  liq {p['liquidation_price']}  ({mode} "
-                   f"{p['leverage']}x)")
+        click.echo(
+            f"  {mid}: {p['size']} @ {p['entry_price']}  mark {p['mark_price']}  "
+            f"uPnL {p['unrealized_pnl']}  liq {p['liquidation_price']}  ({mode} "
+            f"{p['leverage']}x)"
+        )
     for o in a["orders"]:
-        click.echo(f"  order {o['order_id']}: {o['side']} {o['remaining']}/{o['size']} "
-                   f"{o['market_id']} @ {o['price']}{'  reduce-only' if o['reduce_only'] else ''}")
+        click.echo(
+            f"  order {o['order_id']}: {o['side']} {o['remaining']}/{o['size']} "
+            f"{o['market_id']} @ {o['price']}{'  reduce-only' if o['reduce_only'] else ''}"
+        )
     if Decimal(a.get("vault_shares", "0")) > 0:
         click.echo(f"  vault shares {a['vault_shares']} (unlock {a['vault_unlock_time']})")
 
@@ -244,8 +310,15 @@ yes_option = click.option("--yes", "-y", is_flag=True, help="Do not ask for conf
 @yes_option
 def deposit_cmd(wallet_file, amount, node, wait, yes):
     """Move collateral (the stablecoin) from the wallet into the perps clearinghouse."""
-    _send(node, wallet_file, "PERP_DEPOSIT", {"amount": str(Decimal(amount))},
-          f"Deposit {amount} perps collateral", wait, yes)
+    _send(
+        node,
+        wallet_file,
+        "PERP_DEPOSIT",
+        {"amount": str(Decimal(amount))},
+        f"Deposit {amount} perps collateral",
+        wait,
+        yes,
+    )
 
 
 @perp.command("withdraw")
@@ -261,8 +334,15 @@ def withdraw_cmd(wallet_file, amount, node, wait, yes):
         amount = rpc(node, "perp_getAccount", [signer.address])["withdrawable"]
         if Decimal(amount) <= 0:
             raise click.ClickException("Nothing is withdrawable.")
-    _send(node, wallet_file, "PERP_WITHDRAW", {"amount": str(Decimal(amount))},
-          f"Withdraw {amount} perps collateral", wait, yes)
+    _send(
+        node,
+        wallet_file,
+        "PERP_WITHDRAW",
+        {"amount": str(Decimal(amount))},
+        f"Withdraw {amount} perps collateral",
+        wait,
+        yes,
+    )
 
 
 @perp.command("leverage")
@@ -276,9 +356,15 @@ def withdraw_cmd(wallet_file, amount, node, wait, yes):
 def leverage_cmd(wallet_file, market_id, leverage, isolated, node, wait, yes):
     """Set leverage and margin mode for a market."""
     mode = "isolated" if isolated else "cross"
-    _send(node, wallet_file, "PERP_SET_LEVERAGE",
-          {"market_id": market_id, "leverage": str(Decimal(leverage)), "mode": mode},
-          f"Set {market_id} to {leverage}x {mode}", wait, yes)
+    _send(
+        node,
+        wallet_file,
+        "PERP_SET_LEVERAGE",
+        {"market_id": market_id, "leverage": str(Decimal(leverage)), "mode": mode},
+        f"Set {market_id} to {leverage}x {mode}",
+        wait,
+        yes,
+    )
 
 
 @perp.command("order")
@@ -294,15 +380,26 @@ def leverage_cmd(wallet_file, market_id, leverage, isolated, node, wait, yes):
 @yes_option
 def order_cmd(wallet_file, market_id, side, size, price, reduce_only, ioc, node, wait, yes):
     """Place a limit order. A "market" order is --ioc at an aggressive price."""
-    params = {"market_id": market_id, "side": side, "size": str(Decimal(size)),
-              "price": str(Decimal(price))}
+    params = {
+        "market_id": market_id,
+        "side": side,
+        "size": str(Decimal(size)),
+        "price": str(Decimal(price)),
+    }
     if reduce_only:
         params["reduce_only"] = True
     if ioc:
         params["tif"] = "ioc"
     flags = "".join((" reduce-only" if reduce_only else "", " IOC" if ioc else ""))
-    _send(node, wallet_file, "PERP_ORDER", params,
-          f"{side.upper()} {size} {market_id} @ {price}{flags}", wait, yes)
+    _send(
+        node,
+        wallet_file,
+        "PERP_ORDER",
+        params,
+        f"{side.upper()} {size} {market_id} @ {price}{flags}",
+        wait,
+        yes,
+    )
 
 
 @perp.command("cancel")
@@ -314,8 +411,15 @@ def order_cmd(wallet_file, market_id, side, size, price, reduce_only, ioc, node,
 @yes_option
 def cancel_cmd(wallet_file, market_id, order_id, node, wait, yes):
     """Cancel a resting order (its id is the first 16 characters of the order's tx hash)."""
-    _send(node, wallet_file, "PERP_CANCEL", {"market_id": market_id, "order_id": order_id},
-          f"Cancel order {order_id} on {market_id}", wait, yes)
+    _send(
+        node,
+        wallet_file,
+        "PERP_CANCEL",
+        {"market_id": market_id, "order_id": order_id},
+        f"Cancel order {order_id} on {market_id}",
+        wait,
+        yes,
+    )
 
 
 @perp.command("vault-deposit")
@@ -326,8 +430,15 @@ def cancel_cmd(wallet_file, market_id, order_id, node, wait, yes):
 @yes_option
 def vault_deposit_cmd(wallet_file, amount, node, wait, yes):
     """Put free collateral into the liquidation backstop vault for shares (locked a while)."""
-    _send(node, wallet_file, "VAULT_DEPOSIT", {"amount": str(Decimal(amount))},
-          f"Deposit {amount} into the backstop vault", wait, yes)
+    _send(
+        node,
+        wallet_file,
+        "VAULT_DEPOSIT",
+        {"amount": str(Decimal(amount))},
+        f"Deposit {amount} into the backstop vault",
+        wait,
+        yes,
+    )
 
 
 @perp.command("vault-withdraw")
@@ -338,8 +449,15 @@ def vault_deposit_cmd(wallet_file, amount, node, wait, yes):
 @yes_option
 def vault_withdraw_cmd(wallet_file, shares, node, wait, yes):
     """Redeem vault shares at the vault's current value."""
-    _send(node, wallet_file, "VAULT_WITHDRAW", {"shares": str(Decimal(shares))},
-          f"Redeem {shares} vault shares", wait, yes)
+    _send(
+        node,
+        wallet_file,
+        "VAULT_WITHDRAW",
+        {"shares": str(Decimal(shares))},
+        f"Redeem {shares} vault shares",
+        wait,
+        yes,
+    )
 
 
 @perp.command("create-market")
@@ -354,5 +472,4 @@ def create_market_cmd(wallet_file, base, max_leverage, node, wait, yes):
     params = {"base_token": base}
     if max_leverage:
         params["max_leverage"] = str(Decimal(max_leverage))
-    _send(node, wallet_file, "CREATE_MARKET", params, f"Create the {base} perp market",
-          wait, yes)
+    _send(node, wallet_file, "CREATE_MARKET", params, f"Create the {base} perp market", wait, yes)

@@ -9,73 +9,94 @@ This module provides cryptographic primitives for the QRDX blockchain:
 - Address derivation for both wallet types
 """
 
-from .keys import PrivateKey, PublicKey, generate_keypair, Signature
-from .signing import (
-    sign_transaction,
-    sign_message,
-    recover_public_key,
-    verify_signature,
-    sign_message_hash,
+from .account_id import (
+    ACCOUNT_ID_DOMAIN,
+    ACCOUNT_ID_LENGTH,
+    is_account_id,
+    same_account,
+    to_account_id,
+    to_account_id_bytes,
 )
-from .hashing import keccak256, sha256, keccak256_hex, sha256_hex
 from .address import (
-    public_key_to_address,
-    is_valid_address,
-    to_checksum_address,
-    to_pq_checksum_address,
-    normalize_address,
+    AddressType,
+    get_address_type,
     is_checksum_address,
     is_pq_address,
     is_traditional_address,
-    get_address_type,
-    AddressType,
+    is_valid_address,
+    normalize_address,
+    public_key_to_address,
+    to_checksum_address,
+    to_pq_checksum_address,
 )
-from .account_id import (
-    to_account_id,
-    to_account_id_bytes,
-    is_account_id,
-    same_account,
-    ACCOUNT_ID_DOMAIN,
-    ACCOUNT_ID_LENGTH,
+from .encoding import encode_transaction, rlp_decode, rlp_encode
+from .hashing import keccak256, keccak256_hex, sha256, sha256_hex
+from .keys import PrivateKey, PublicKey, Signature, generate_keypair
+from .signing import (
+    recover_public_key,
+    sign_message,
+    sign_message_hash,
+    sign_transaction,
+    verify_signature,
 )
-from .encoding import rlp_encode, rlp_decode, encode_transaction
+
 
 # Post-quantum cryptography - lazy loaded
 # Import directly from qrdx.crypto.pq when needed
 def __getattr__(name):
     """Lazy loading for PQ crypto to avoid liboqs dependency issues at import."""
     pq_sig_names = {
-        'PQPrivateKey', 'PQPublicKey', 'PQSignature',
-        'PQCryptoError', 'PQSignatureError',
-        'pq_generate_keypair', 'pq_sign', 'pq_verify',
+        "PQPrivateKey",
+        "PQPublicKey",
+        "PQSignature",
+        "PQCryptoError",
+        "PQSignatureError",
+        "pq_generate_keypair",
+        "pq_sign",
+        "pq_verify",
     }
     pq_kem_names = {
-        'KEMPrivateKey', 'KEMPublicKey', 'KEMError',
-        'kyber_generate_keypair', 'kyber_encapsulate', 'kyber_decapsulate',
+        "KEMPrivateKey",
+        "KEMPublicKey",
+        "KEMError",
+        "kyber_generate_keypair",
+        "kyber_encapsulate",
+        "kyber_decapsulate",
     }
     # Threshold Dilithium / multisig names
     threshold_names = {
-        'ThresholdConfig', 'MultisigKeySet', 'PartialSignature', 'MultisigSignature',
-        'derive_multisig_address', 'create_multisig_keyset', 'generate_multisig_keyset',
-        'create_partial_signature', 'aggregate_partial_signatures',
-        'verify_multisig', 'is_multisig_address',
+        "ThresholdConfig",
+        "MultisigKeySet",
+        "PartialSignature",
+        "MultisigSignature",
+        "derive_multisig_address",
+        "create_multisig_keyset",
+        "generate_multisig_keyset",
+        "create_partial_signature",
+        "aggregate_partial_signatures",
+        "verify_multisig",
+        "is_multisig_address",
     }
     if name in pq_sig_names:
         from . import pq
-        if name == 'pq_generate_keypair':
+
+        if name == "pq_generate_keypair":
             return pq.generate_keypair
-        elif name == 'pq_sign':
+        elif name == "pq_sign":
             return pq.sign
-        elif name == 'pq_verify':
+        elif name == "pq_verify":
             return pq.verify
         return getattr(pq, name)
     if name in pq_kem_names:
         from . import pq
+
         return getattr(pq, name)
     if name in threshold_names:
         from . import threshold_dilithium
+
         return getattr(threshold_dilithium, name)
     raise AttributeError(f"module 'qrdx.crypto' has no attribute {name!r}")
+
 
 __all__ = [
     # Traditional Keys (secp256k1)
@@ -144,4 +165,3 @@ __all__ = [
     "verify_multisig",
     "is_multisig_address",
 ]
-

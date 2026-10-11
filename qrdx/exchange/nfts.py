@@ -20,20 +20,30 @@ backed by this registry (qrdx/contracts/nft_evm.py).
 The registry is exchange state: replayed from the chain on every path and committed in the
 exchange state root (``state_hash``), contributing nothing until the first collection exists.
 """
+
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .commitment import Section, committed
 from .tokens import (
-    MAX_NAME_LENGTH, MAX_URI_LENGTH, TokenError, _bps, _flag, _name, _symbol, _uri, account,
-    optional_address, same,
+    MAX_NAME_LENGTH,
+    TokenError,
+    _bps,
+    _flag,
+    _name,
+    _symbol,
+    _uri,
+    account,
+    optional_address,
+    same,
 )
 
-MAX_TOKEN_ID = 2 ** 256 - 1
-MAX_OPERATORS_PER_OWNER = 64       # setApprovalForAll grants, across collections
+MAX_TOKEN_ID = 2**256 - 1
+MAX_OPERATORS_PER_OWNER = 64  # setApprovalForAll grants, across collections
 
 
 class NftError(TokenError):
@@ -43,8 +53,8 @@ class NftError(TokenError):
 def token_id(value: Any) -> int:
     try:
         i = int(str(value), 0) if isinstance(value, str) else int(value)
-    except (TypeError, ValueError):
-        raise NftError(f"token id must be an integer, got {value!r}")
+    except (TypeError, ValueError) as exc:
+        raise NftError(f"token id must be an integer, got {value!r}") from exc
     if not 0 <= i <= MAX_TOKEN_ID:
         raise NftError("token id must be a uint256")
     return i
@@ -52,16 +62,22 @@ def token_id(value: Any) -> int:
 
 @dataclass
 class Nft:
-    owner: str                        # as given; compared by account id
+    owner: str  # as given; compared by account id
     uri: str = ""
     name: str = ""
     minted_height: int = 0
-    approved: Optional[str] = None    # one account approved for this NFT (ERC-721 getApproved)
+    approved: Optional[str] = None  # one account approved for this NFT (ERC-721 getApproved)
 
     def summary(self, collection: str, token_id_: int) -> Dict[str, Any]:
-        return {"collection": collection, "token_id": str(token_id_), "owner": self.owner,
-                "uri": self.uri, "name": self.name, "approved": self.approved,
-                "minted_height": self.minted_height}
+        return {
+            "collection": collection,
+            "token_id": str(token_id_),
+            "owner": self.owner,
+            "uri": self.uri,
+            "name": self.name,
+            "approved": self.approved,
+            "minted_height": self.minted_height,
+        }
 
 
 @dataclass
@@ -71,14 +87,14 @@ class Collection:
     symbol: str
     creator: str
     uri: str = ""
-    max_supply: Optional[int] = None          # None = unlimited
-    royalty_bps: int = 0                      # for marketplaces (ERC-2981 / Metaplex)
+    max_supply: Optional[int] = None  # None = unlimited
+    royalty_bps: int = 0  # for marketplaces (ERC-2981 / Metaplex)
     royalty_recipient: Optional[str] = None
-    update_authority: Optional[str] = None    # None = metadata frozen for good
-    mint_authority: Optional[str] = None      # None = no more members, ever
+    update_authority: Optional[str] = None  # None = metadata frozen for good
+    mint_authority: Optional[str] = None  # None = no more members, ever
     non_transferable: bool = False
     created_height: int = 0
-    minted: int = 0                           # ever minted (burned ones included)
+    minted: int = 0  # ever minted (burned ones included)
     burned: int = 0
     next_id: int = 1
 
@@ -87,32 +103,67 @@ class Collection:
         return self.minted - self.burned
 
     def summary(self) -> Dict[str, Any]:
-        return {"collection": self.address, "name": self.name, "symbol": self.symbol,
-                "uri": self.uri, "creator": self.creator,
-                "max_supply": self.max_supply, "supply": self.supply, "minted": self.minted,
-                "burned": self.burned, "royalty_bps": self.royalty_bps,
-                "royalty_recipient": self.royalty_recipient,
-                "update_authority": self.update_authority, "mint_authority": self.mint_authority,
-                "non_transferable": self.non_transferable,
-                "created_height": self.created_height}
+        return {
+            "collection": self.address,
+            "name": self.name,
+            "symbol": self.symbol,
+            "uri": self.uri,
+            "creator": self.creator,
+            "max_supply": self.max_supply,
+            "supply": self.supply,
+            "minted": self.minted,
+            "burned": self.burned,
+            "royalty_bps": self.royalty_bps,
+            "royalty_recipient": self.royalty_recipient,
+            "update_authority": self.update_authority,
+            "mint_authority": self.mint_authority,
+            "non_transferable": self.non_transferable,
+            "created_height": self.created_height,
+        }
 
     def canonical(self) -> List[Any]:
-        return [self.name, self.symbol, self.creator, self.uri, self.max_supply,
-                self.royalty_bps, self.royalty_recipient, self.update_authority,
-                self.mint_authority, self.non_transferable, self.created_height, self.minted,
-                self.burned, self.next_id]
+        return [
+            self.name,
+            self.symbol,
+            self.creator,
+            self.uri,
+            self.max_supply,
+            self.royalty_bps,
+            self.royalty_recipient,
+            self.update_authority,
+            self.mint_authority,
+            self.non_transferable,
+            self.created_height,
+            self.minted,
+            self.burned,
+            self.next_id,
+        ]
+
+
+def _encode_collection(_address: str, c: "Collection") -> Any:
+    return c.canonical()
+
+
+def _encode_nft(_key: Tuple[str, int], n: "Nft") -> Any:
+    return [n.owner, n.uri, n.name, n.minted_height, n.approved]
 
 
 class NftRegistry:
     """Collections, their NFTs, approvals and operators. Every method either changes the state
     completely or raises ``NftError`` having changed nothing."""
 
+    # Committed entry by entry (qrdx/exchange/commitment.py).
+    collections = committed("nfts.collections", _encode_collection)
+    items = committed("nfts.items", _encode_nft)
+    operators = committed("nfts.operators", kind="set")
+
     def __init__(self) -> None:
-        self.collections: Dict[str, Collection] = {}
-        self.items: Dict[Tuple[str, int], Nft] = {}
-        self.operators: Set[Tuple[str, str, str]] = set()      # (collection, owner, operator)
+        # (committed collections: see the class attributes above)
+        self.collections = {}  # address → Collection
+        self.items = {}  # (collection, id) → Nft
+        self.operators = set()  # (collection, owner, operator)
         # derived indexes (rebuilt with the state, never hashed)
-        self.by_owner: Dict[str, Set[Tuple[str, int]]] = {}    # owner id → its NFTs
+        self.by_owner: Dict[str, Set[Tuple[str, int]]] = {}  # owner id → its NFTs
         self.operator_counts: Dict[str, int] = {}
 
     # ── lookup ──────────────────────────────────────────────────────────
@@ -155,8 +206,11 @@ class NftRegistry:
         n = self.find(collection, tid)
         if n is None:
             return False
-        return (same(n.owner, who) or (n.approved is not None and same(n.approved, who))
-                or self.is_operator(collection, n.owner, who))
+        return (
+            same(n.owner, who)
+            or (n.approved is not None and same(n.approved, who))
+            or self.is_operator(collection, n.owner, who)
+        )
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
@@ -165,36 +219,59 @@ class NftRegistry:
         if address in self.collections:
             raise NftError(f"collection {address} already exists")
         account(creator)
-        cap = params.get("max_supply")
-        if cap in (None, ""):
+        raw_cap = params.get("max_supply")
+        cap: Optional[int]
+        if raw_cap is None or raw_cap == "":
             cap = None
         else:
             try:
-                cap = int(cap)
-            except (TypeError, ValueError):
-                raise NftError("max_supply must be an integer")
+                cap = int(raw_cap)
+            except (TypeError, ValueError) as exc:
+                raise NftError("max_supply must be an integer") from exc
             if cap < 1:
                 raise NftError("max_supply must be at least 1")
         c = Collection(
-            address=address, name=_name(params.get("name", "")),
-            symbol=_symbol(params.get("symbol", "")), creator=str(creator),
-            uri=_uri(params.get("uri")), max_supply=cap,
+            address=address,
+            name=_name(params.get("name", "")),
+            symbol=_symbol(params.get("symbol", "")),
+            creator=str(creator),
+            uri=_uri(params.get("uri")),
+            max_supply=cap,
             royalty_bps=_bps(params.get("royalty_bps", 0)),
-            royalty_recipient=(optional_address(params["royalty_recipient"])
-                               if "royalty_recipient" in params else str(creator)),
-            update_authority=(optional_address(params["update_authority"])
-                              if "update_authority" in params else str(creator)),
-            mint_authority=(optional_address(params["mint_authority"])
-                            if "mint_authority" in params else str(creator)),
+            royalty_recipient=(
+                optional_address(params["royalty_recipient"])
+                if "royalty_recipient" in params
+                else str(creator)
+            ),
+            update_authority=(
+                optional_address(params["update_authority"])
+                if "update_authority" in params
+                else str(creator)
+            ),
+            mint_authority=(
+                optional_address(params["mint_authority"])
+                if "mint_authority" in params
+                else str(creator)
+            ),
             non_transferable=_flag(params.get("non_transferable", False)),
-            created_height=int(height))
+            created_height=int(height),
+        )
         if c.royalty_bps and c.royalty_recipient is None:
             raise NftError("royalties need a recipient")
         self.collections[address] = c
         return c
 
-    def mint(self, collection: str, sender: str, to: str, height: int, *, uri: Any = "",
-             name: Any = "", tid: Any = None) -> int:
+    def mint(
+        self,
+        collection: str,
+        sender: str,
+        to: str,
+        height: int,
+        *,
+        uri: Any = "",
+        name: Any = "",
+        tid: Any = None,
+    ) -> int:
         c = self.require(collection)
         if c.mint_authority is None:
             raise NftError(f"{c.symbol} has no mint authority: it is complete")
@@ -259,8 +336,9 @@ class NftRegistry:
         key = (c.address, o, op)
         if approved and key not in self.operators:
             if self.operator_counts.get(o, 0) >= MAX_OPERATORS_PER_OWNER:
-                raise NftError(f"an account may approve at most {MAX_OPERATORS_PER_OWNER} "
-                               "NFT operators")
+                raise NftError(
+                    f"an account may approve at most {MAX_OPERATORS_PER_OWNER} " "NFT operators"
+                )
             self.operators.add(key)
             self.operator_counts[o] = self.operator_counts.get(o, 0) + 1
         elif not approved and key in self.operators:
@@ -302,19 +380,29 @@ class NftRegistry:
             uri = _uri(params["uri"]) if "uri" in params else n.uri
             name = str(params.get("name", n.name) or "").strip()
             if len(name) > MAX_NAME_LENGTH or not name.isprintable():
-                raise NftError(f"an NFT's name must be at most {MAX_NAME_LENGTH} printable "
-                               "characters")
+                raise NftError(
+                    f"an NFT's name must be at most {MAX_NAME_LENGTH} printable " "characters"
+                )
             n.uri, n.name = uri, name
             return n.summary(c.address, token_id(params["token_id"]))
         name = _name(params["name"]) if params.get("name") not in (None, "") else c.name
         symbol = _symbol(params["symbol"]) if params.get("symbol") not in (None, "") else c.symbol
         uri = _uri(params["uri"]) if "uri" in params else c.uri
         bps = _bps(params["royalty_bps"]) if "royalty_bps" in params else c.royalty_bps
-        recipient = (optional_address(params["royalty_recipient"])
-                     if "royalty_recipient" in params else c.royalty_recipient)
+        recipient = (
+            optional_address(params["royalty_recipient"])
+            if "royalty_recipient" in params
+            else c.royalty_recipient
+        )
         if bps and recipient is None:
             raise NftError("royalties need a recipient")
-        c.name, c.symbol, c.uri, c.royalty_bps, c.royalty_recipient = name, symbol, uri, bps, recipient
+        c.name, c.symbol, c.uri, c.royalty_bps, c.royalty_recipient = (
+            name,
+            symbol,
+            uri,
+            bps,
+            recipient,
+        )
         return c.summary()
 
     def set_authority(self, collection: str, sender: str, kind: str, new: Any) -> Optional[str]:
@@ -337,11 +425,28 @@ class NftRegistry:
     def canonical(self) -> Dict[str, Any]:
         return {
             "collections": {a: c.canonical() for a, c in sorted(self.collections.items())},
-            "items": [[c, str(i), n.owner, n.uri, n.name, n.minted_height, n.approved]
-                      for (c, i), n in sorted(self.items.items())],
+            "items": [
+                [c, str(i), n.owner, n.uri, n.name, n.minted_height, n.approved]
+                for (c, i), n in sorted(self.items.items())
+            ],
             "operators": [list(k) for k in sorted(self.operators)],
         }
 
     def state_hash(self) -> bytes:
         blob = json.dumps(self.canonical(), sort_keys=True, separators=(",", ":"))
         return hashlib.blake2b(blob.encode(), digest_size=32).digest()
+
+    def commitment(self) -> bytes:
+        """The incremental commitment (``incremental_state_root``)."""
+        return (
+            Section("nfts")
+            .raw(self.collections.commitment())
+            .raw(self.items.commitment())
+            .raw(self.operators.commitment())
+            .digest()
+        )
+
+    def verify_commitment(self) -> None:
+        self.collections.verify()
+        self.items.verify()
+        self.operators.verify()

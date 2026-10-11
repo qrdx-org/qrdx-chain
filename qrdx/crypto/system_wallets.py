@@ -16,14 +16,15 @@ These wallets provide decentralized system functionality with secure,
 quantum-resistant control via a designated controller wallet.
 """
 
-import hashlib
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, List, Optional, Union
 from enum import Enum
+from typing import TYPE_CHECKING, Dict, List, Optional
 
-from .hashing import sha256
 from ..logger import get_logger
+
+if TYPE_CHECKING:
+    from .threshold_dilithium import MultisigKeySet, MultisigSignature
 
 logger = get_logger(__name__)
 
@@ -35,6 +36,7 @@ SYSTEM_WALLET_MAX = 0x00000000000000000000000000000000000000FF
 
 class SystemWalletType(Enum):
     """Types of system wallets."""
+
     GARBAGE_COLLECTOR = "garbage_collector"
     COMMUNITY_GRANTS = "community_grants"
     DEVELOPER_FUND = "developer_fund"
@@ -51,7 +53,7 @@ class SystemWalletType(Enum):
 class SystemWallet:
     """
     Represents a system-owned wallet.
-    
+
     Attributes:
         address: The 0x0000...000X address
         name: Human-readable name
@@ -61,6 +63,7 @@ class SystemWallet:
         is_burner: If True, funds sent here are permanently burned
         category: Categorization (system, treasury, defi, distribution, security)
     """
+
     address: str
     name: str
     description: str
@@ -68,12 +71,12 @@ class SystemWallet:
     genesis_balance: Decimal
     is_burner: bool = False
     category: str = "system"
-    
+
     def __post_init__(self):
         """Validate system wallet configuration."""
         if not self.address.startswith("0x"):
             raise ValueError(f"System wallet address must start with 0x: {self.address}")
-        
+
         # Validate address is in system range
         addr_int = int(self.address, 16)
         if not (SYSTEM_WALLET_MIN <= addr_int <= SYSTEM_WALLET_MAX):
@@ -81,11 +84,11 @@ class SystemWallet:
                 f"System wallet address {self.address} outside valid range "
                 f"0x{'0'*39}1 - 0x{'0'*38}FF"
             )
-        
+
         # Validate genesis balance
         if self.genesis_balance < 0:
             raise ValueError(f"Genesis balance cannot be negative: {self.genesis_balance}")
-    
+
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
         return {
@@ -129,7 +132,9 @@ class SystemWalletManager:
         from .threshold_dilithium import is_multisig_address
 
         # Accept PQ addresses or multisig addresses as controller
-        valid = is_valid_address(controller_pq_address) or is_multisig_address(controller_pq_address)
+        valid = is_valid_address(controller_pq_address) or is_multisig_address(
+            controller_pq_address
+        )
         if not valid:
             raise ValueError(f"Invalid controller address: {controller_pq_address}")
 
@@ -144,16 +149,16 @@ class SystemWalletManager:
         self._system_wallets: Dict[str, SystemWallet] = {}
 
         # Per-wallet multisig keysets (optional overrides)
-        self._wallet_multisigs: Dict[str, 'MultisigKeySet'] = {}
+        self._wallet_multisigs: Dict[str, "MultisigKeySet"] = {}
 
         # Global multisig keyset (optional — replaces single-key controller)
-        self._global_multisig: Optional['MultisigKeySet'] = None
+        self._global_multisig: Optional["MultisigKeySet"] = None
 
         logger.info(f"System wallet manager initialized with controller: {controller_pq_address}")
 
     # ── Multisig Configuration ──────────────────────────────────────
 
-    def set_global_multisig(self, keyset: 'MultisigKeySet') -> None:
+    def set_global_multisig(self, keyset: "MultisigKeySet") -> None:
         """
         Upgrade the global controller to a multisig keyset.
 
@@ -165,11 +170,9 @@ class SystemWalletManager:
         """
         self._global_multisig = keyset
         self.controller_address = keyset.address
-        logger.info(
-            f"Global multisig set: {keyset.config} at {keyset.address}"
-        )
+        logger.info(f"Global multisig set: {keyset.config} at {keyset.address}")
 
-    def set_wallet_multisig(self, wallet_address: str, keyset: 'MultisigKeySet') -> None:
+    def set_wallet_multisig(self, wallet_address: str, keyset: "MultisigKeySet") -> None:
         """
         Assign a per-wallet multisig keyset.
 
@@ -188,7 +191,7 @@ class SystemWalletManager:
             f"{keyset.config} at {keyset.address}"
         )
 
-    def get_wallet_multisig(self, wallet_address: str) -> Optional['MultisigKeySet']:
+    def get_wallet_multisig(self, wallet_address: str) -> Optional["MultisigKeySet"]:
         """Get the effective multisig keyset for a wallet (per-wallet or global)."""
         return self._wallet_multisigs.get(wallet_address, self._global_multisig)
 
@@ -262,7 +265,7 @@ class SystemWalletManager:
         self,
         system_wallet_address: str,
         message: bytes,
-        multisig_signature: 'MultisigSignature',
+        multisig_signature: "MultisigSignature",
     ) -> tuple[bool, str]:
         """
         Verify a multisig threshold signature for a system wallet spend.
@@ -350,7 +353,7 @@ class SystemWalletManager:
 
     def get_total_genesis_balance(self) -> Decimal:
         """Calculate total balance across all system wallets."""
-        return sum(w.genesis_balance for w in self._system_wallets.values())
+        return sum((w.genesis_balance for w in self._system_wallets.values()), Decimal("0"))
 
     def export_genesis_allocations(self) -> Dict[str, tuple[Decimal, str]]:
         """
@@ -368,16 +371,16 @@ class SystemWalletManager:
 def is_system_wallet_address(address: str) -> bool:
     """
     Check if an address is in the system wallet range.
-    
+
     Args:
         address: Address to check
-        
+
     Returns:
         True if address is in system wallet range (0x0000...0001 - 0x0000...00FF)
     """
     if not address.startswith("0x"):
         return False
-    
+
     try:
         addr_int = int(address, 16)
         return SYSTEM_WALLET_MIN <= addr_int <= SYSTEM_WALLET_MAX
@@ -388,26 +391,26 @@ def is_system_wallet_address(address: str) -> bool:
 def is_address_off_curve(address: str) -> bool:
     """
     Check if an address is off-curve (not derivable from a private key).
-    
+
     For system wallets, we define off-curve as:
     - Addresses in the reserved system range (0x0000...0001 - 0x0000...00FF)
     - Addresses that cannot be generated from secp256k1 or Dilithium keys
-    
+
     Args:
         address: Address to check
-        
+
     Returns:
         True if address is off-curve
     """
     # System wallet addresses are off-curve by definition
     if is_system_wallet_address(address):
         return True
-    
+
     # Check for other reserved ranges (precompiles, etc.)
     # Reserved: 0x0000...0100 - 0x0000...0FFF for future use
     if not address.startswith("0x"):
         return False
-    
+
     try:
         addr_int = int(address, 16)
         # Extended reserved range for future system contracts
@@ -421,16 +424,16 @@ def is_address_off_curve(address: str) -> bool:
 def generate_system_wallet_address(index: int) -> str:
     """
     Generate a system wallet address from an index.
-    
+
     Args:
         index: Index in range [1, 255]
-        
+
     Returns:
         System wallet address (e.g., "0x0000000000000000000000000000000000000001")
     """
     if not (1 <= index <= 255):
         raise ValueError(f"System wallet index must be 1-255, got {index}")
-    
+
     # Create address with leading zeros
     return f"0x{index:040x}"
 
@@ -438,7 +441,7 @@ def generate_system_wallet_address(index: int) -> str:
 def create_default_system_wallets() -> List[SystemWallet]:
     """
     Create the default set of system wallets.
-    
+
     Returns:
         List of SystemWallet instances
     """
@@ -530,21 +533,21 @@ def create_default_system_wallets() -> List[SystemWallet]:
 def initialize_system_wallets(controller_pq_address: str) -> SystemWalletManager:
     """
     Initialize system wallet manager with default wallets.
-    
+
     Args:
         controller_pq_address: PQ address that will control all system wallets
-        
+
     Returns:
         Configured SystemWalletManager instance
     """
     manager = SystemWalletManager(controller_pq_address)
-    
+
     # Register all default system wallets
     for wallet in create_default_system_wallets():
         manager.register_system_wallet(wallet)
-    
+
     total = manager.get_total_genesis_balance()
     logger.info(f"Initialized {len(manager.get_all_wallets())} system wallets")
     logger.info(f"Total system wallet allocation: {total} QRDX")
-    
+
     return manager

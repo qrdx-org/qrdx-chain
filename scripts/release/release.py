@@ -16,6 +16,7 @@ when verifying it) and ``docker`` (image checks and rebuilds).
                       [--cosign-bundle release-manifest.json.cosign.bundle] [--artifacts DIR] \
                       [--check-image] [--rebuild]
     release.py download --tag v2.0.1 --dest DIR   a release's files from GitHub (no gh needed)
+    release.py add-signer --principal alice@qrdx.org --key ~/.ssh/id_ed25519_sk.pub
 
 Trust model. A release is genuine when (1) at least ``maintainer_threshold`` of the maintainers
 in release/allowed_signers signed its manifest, (2) the manifest was signed by the release
@@ -225,6 +226,48 @@ def lint_allowed_signers(text: str, namespace: str = "qrdx-release") -> List[str
             problems.append(f"release/allowed_signers line {n}: its key cannot sign in "
                             f"{', '.join(missing)} (needs namespaces=\"{TAG_NAMESPACE},{namespace}\")")
     return problems
+
+
+_KEY_TYPES = ("ssh-ed25519", "sk-ssh-ed25519@openssh.com", "ecdsa-sha2-nistp256",
+              "sk-ecdsa-sha2-nistp256@openssh.com", "ssh-rsa")
+_PRINCIPAL = re.compile(r"[A-Za-z0-9._+@-]{3,128}")
+
+
+def signer_line(principal: str, public_key: str, namespace: str = "qrdx-release") -> str:
+    """The allowed_signers line for one maintainer key — both namespaces a release needs."""
+    if not _PRINCIPAL.fullmatch(principal):
+        raise ReleaseError(f"not a usable principal (e.g. an email address): {principal!r}")
+    fields = public_key.strip().split()
+    if len(fields) < 2 or fields[0] not in _KEY_TYPES:
+        raise ReleaseError(f"not an OpenSSH public key of a supported type ({', '.join(_KEY_TYPES)})")
+    if fields[0] == "ssh-rsa":
+        raise ReleaseError("use an Ed25519 key (preferably a hardware-backed ed25519-sk key), not RSA")
+    with tempfile.NamedTemporaryFile("w", suffix=".pub", delete=False) as fh:
+        fh.write(f"{fields[0]} {fields[1]}\n")
+    try:
+        if run(["ssh-keygen", "-l", "-f", fh.name], check=False).returncode != 0:
+            raise ReleaseError("ssh-keygen does not accept that public key")
+    finally:
+        os.unlink(fh.name)
+    return f'{principal} namespaces="{TAG_NAMESPACE},{namespace}" {fields[0]} {fields[1]}'
+
+
+def add_signer(signers: Path, principal: str, public_key: str, namespace: str = "qrdx-release") -> str:
+    """Append a maintainer to ``signers``, refusing a principal or key that is already listed."""
+    line = signer_line(principal, public_key, namespace)
+    existing = signers.read_text() if signers.exists() else ""
+    for n, old in enumerate(existing.splitlines(), 1):
+        if old.strip().startswith("#") or not old.strip():
+            continue
+        if old.split()[0] == principal:
+            raise ReleaseError(f"{principal} is already listed (line {n}); remove that line to rotate a key")
+        if line.split()[-1] in old.split():
+            raise ReleaseError(f"that key is already listed (line {n})")
+    signers.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n") + line + "\n")
+    problems = lint_allowed_signers(signers.read_text(), namespace)
+    if problems:
+        raise ReleaseError("; ".join(problems))
+    return line
 
 
 # ── export & source tarball ──────────────────────────────────────────────────────────────
@@ -614,6 +657,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = sub.add_parser("preflight", help="refuse a release that is not clean and consistent")
     p.add_argument("--ref", required=True)
 
+    p = sub.add_parser("add-signer", help="list a maintainer's SSH public key (both namespaces)")
+    p.add_argument("--principal", required=True, help="who the key belongs to, e.g. an email")
+    p.add_argument("--key", required=True, type=Path, help="the public key file (.pub)")
+    p.add_argument("--allowed-signers", type=Path, default=DEFAULT_SIGNERS)
+    p.add_argument("--policy", type=Path, default=DEFAULT_POLICY)
+
     p = sub.add_parser("version", help="the version a ref builds as (vX.Y.Z or dev-<commit>)")
     p.add_argument("--ref", default="HEAD")
 
@@ -667,6 +716,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not problems:
                 print(f"✓ {a.ref} ({resolve(a.ref)[:12]}) can be released as {version_of(a.ref)}")
             return 1 if problems else 0
+        if a.cmd == "add-signer":
+            line = add_signer(a.allowed_signers, a.principal, a.key.read_text(),
+                              load_policy(a.policy)["signing_namespace"])
+            print(f"added to {a.allowed_signers}:\n  {line}")
+            fp = run(["ssh-keygen", "-l", "-f", str(a.key)]).stdout.decode().strip()
+            print(f"fingerprint (publish it out of band): {fp}")
+            return 0
         if a.cmd == "version":
             print(version_of(a.ref))
             return 0

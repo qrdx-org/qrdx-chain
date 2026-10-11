@@ -4,7 +4,7 @@ S03 — Block Production & Consensus
 Verifies:
   - Blocks are being produced (height advances)
   - All nodes agree on blocks (height consistency)
-  - Block production rate is reasonable for 2s slots
+  - Block production rate is reasonable for the slot (250 ms standard)
   - Consensus state is accessible
 """
 
@@ -61,10 +61,17 @@ class S03BlockProduction(Scenario):
             blocks_produced = max_after - max_before
             self.check_gte(blocks_produced, 1, f"Blocks produced in 6s ({blocks_produced})")
 
-            # Check block rate is reasonable (0.25-1.0 blocks/sec for 2s slots)
+            # Check block rate is reasonable: at most one block per slot (with a little slack
+            # for the measurement window's edges).
             if blocks_produced > 0:
+                from qrdx.constants import SLOT_DURATION
+
                 rate = blocks_produced / 6.0
-                self.check(rate <= 2.0, f"Block rate reasonable ({rate:.2f} blk/s)")
+                ceiling = 1.0 / SLOT_DURATION + 0.5
+                self.check(
+                    rate <= ceiling,
+                    f"Block rate reasonable ({rate:.2f} blk/s, at most {ceiling:.2f} per slot clock)",
+                )
 
             # Store max height for dependent scenarios
             self.ctx.artifacts["max_height_after_s03"] = max_after

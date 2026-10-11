@@ -28,7 +28,7 @@ from integration_tests.config import (
     PROJECT_ROOT, TESTNET_DIR, WALLETS_DIR, DATABASES_DIR, CONFIGS_DIR,
     LOGS_DIR, DATA_DIR, GENESIS_FILE,
     CHAIN_ID, NETWORK_NAME, BASE_NODE_PORT, NUM_NODES, NUM_VALIDATORS,
-    SLOT_DURATION, SLOTS_PER_EPOCH,
+    SLOT_DURATION_MS, SLOTS_PER_EPOCH,
     NODE_STARTUP_TIMEOUT, PEER_DISCOVERY_TIMEOUT,
     build_node_specs, NodeSpec, WALLET_ROSTER,
 )
@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 def _inherited_env() -> dict:
     """This process's environment minus everything a chain spec governs. A node takes its
     network's consensus parameters from the genesis file and refuses to start if its environment
-    tries to change them — so a harness knob set on this process (QRDX_SLOT_DURATION,
+    tries to change them — so a harness knob set on this process (QRDX_SLOT_DURATION_MS,
     QRDX_ENFORCE_RANDAO, ...) must reach the genesis spec, never a node."""
     from qrdx import chain_spec as cs
     governed = {p.env for p in cs.PARAMS.values()} | set(cs.CONSENSUS_ENV_SWITCHES) | {

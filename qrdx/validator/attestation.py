@@ -7,27 +7,34 @@ Attestations are signed votes from validators for a specific block.
 
 import asyncio
 import hashlib
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Dict, List, Optional, Set, Tuple
-from collections import defaultdict
 
-from ..logger import get_logger
 from ..crypto.pq import PQPublicKey, PQSignature, verify as pq_verify
-from .types import Validator, ValidatorError
+from ..logger import get_logger
+from .types import Validator
 
 logger = get_logger(__name__)
+
+
+def _root_bytes(root: str) -> bytes:
+    """A checkpoint root as signed: its bytes, length-prefixed (a root is a block hash in hex;
+    an empty root signs as zero length, so it can never collide with a real one)."""
+    raw = bytes.fromhex(root) if root else b""
+    return len(raw).to_bytes(2, "little") + raw
 
 
 @dataclass
 class Attestation:
     """
     Validator attestation for block finality.
-    
+
     An attestation is a signed vote from a validator confirming
     that they have validated a block at a specific slot.
-    
+
     Attributes:
         slot: Slot number being attested to
         epoch: Epoch containing the slot
@@ -37,7 +44,17 @@ class Attestation:
         signature: Dilithium signature of the attestation data
         source_epoch: Source checkpoint epoch
         target_epoch: Target checkpoint epoch
+        source_root: Hash of the source checkpoint's block (the voter's latest justified
+            checkpoint)
+        target_root: Hash of the target checkpoint's block (the last block before the target
+            epoch's first slot, on the voter's chain)
+
+    The (source, target) pair is a Casper FFG vote (qrdx/validator/ffg.py): a validator signs one
+    per epoch, and finality counts a vote only for the checkpoints on the counting node's own
+    chain — so two branches can both finalize only if a third of the stake signs conflicting
+    votes, which is slashable.
     """
+
     slot: int
     epoch: int
     block_hash: str
@@ -46,34 +63,45 @@ class Attestation:
     signature: bytes
     source_epoch: int = 0
     target_epoch: int = 0
+    source_root: str = ""
+    target_root: str = ""
     included_in_block: Optional[int] = None
     created_at: datetime = field(default_factory=datetime.utcnow)
-    
+
     @property
     def signing_root(self) -> bytes:
         """
         Compute the signing root for this attestation.
-        
+
         This is what gets signed by the validator.
         """
         from ..chain_spec import signing_domain
+
         data = (
-            signing_domain("attestation") +       # bound to this network (no cross-network replay)
-            self.slot.to_bytes(8, 'little') +
-            self.epoch.to_bytes(8, 'little') +
-            bytes.fromhex(self.block_hash) +
-            self.source_epoch.to_bytes(8, 'little') +
-            self.target_epoch.to_bytes(8, 'little')
+            signing_domain("attestation")  # bound to this network (no cross-network replay)
+            + self.slot.to_bytes(8, "little")
+            + self.epoch.to_bytes(8, "little")
+            + bytes.fromhex(self.block_hash)
+            + self.source_epoch.to_bytes(8, "little")
+            + self.target_epoch.to_bytes(8, "little")
+            + _root_bytes(self.source_root)
+            + _root_bytes(self.target_root)
         )
         return hashlib.sha256(data).digest()
-    
+
+    @property
+    def ffg(self) -> Tuple[int, str, int, str]:
+        """The Casper FFG vote this attestation casts: (source epoch, source root, target
+        epoch, target root)."""
+        return (self.source_epoch, self.source_root, self.target_epoch, self.target_root)
+
     def verify(self, public_key: bytes) -> bool:
         """
         Verify the attestation signature.
-        
+
         Args:
             public_key: Validator's Dilithium public key
-            
+
         Returns:
             True if signature is valid
         """
@@ -84,38 +112,46 @@ class Attestation:
         except Exception as e:
             logger.warning(f"Attestation verification failed: {e}")
             return False
-    
+
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
         return {
-            'slot': self.slot,
-            'epoch': self.epoch,
-            'block_hash': self.block_hash,
-            'validator_address': self.validator_address,
-            'validator_index': self.validator_index,
-            'signature': self.signature.hex(),
-            'source_epoch': self.source_epoch,
-            'target_epoch': self.target_epoch,
-            'included_in_block': self.included_in_block,
-            'created_at': self.created_at.isoformat(),
+            "slot": self.slot,
+            "epoch": self.epoch,
+            "block_hash": self.block_hash,
+            "validator_address": self.validator_address,
+            "validator_index": self.validator_index,
+            "signature": self.signature.hex(),
+            "source_epoch": self.source_epoch,
+            "target_epoch": self.target_epoch,
+            "source_root": self.source_root,
+            "target_root": self.target_root,
+            "included_in_block": self.included_in_block,
+            "created_at": self.created_at.isoformat(),
         }
-    
+
     @classmethod
-    def from_dict(cls, data: dict) -> 'Attestation':
+    def from_dict(cls, data: dict) -> "Attestation":
         """Create from dictionary."""
         return cls(
-            slot=data['slot'],
-            epoch=data['epoch'],
-            block_hash=data['block_hash'],
-            validator_address=data['validator_address'],
-            validator_index=data['validator_index'],
-            signature=bytes.fromhex(data['signature']),
-            source_epoch=data.get('source_epoch', 0),
-            target_epoch=data.get('target_epoch', 0),
-            included_in_block=data.get('included_in_block'),
-            created_at=datetime.fromisoformat(data['created_at']) if 'created_at' in data else datetime.utcnow(),
+            slot=data["slot"],
+            epoch=data["epoch"],
+            block_hash=data["block_hash"],
+            validator_address=data["validator_address"],
+            validator_index=data["validator_index"],
+            signature=bytes.fromhex(data["signature"]),
+            source_epoch=data.get("source_epoch", 0),
+            target_epoch=data.get("target_epoch", 0),
+            source_root=str(data.get("source_root") or ""),
+            target_root=str(data.get("target_root") or ""),
+            included_in_block=data.get("included_in_block"),
+            created_at=(
+                datetime.fromisoformat(data["created_at"])
+                if "created_at" in data
+                else datetime.utcnow()
+            ),
         )
-    
+
     @classmethod
     def create(
         cls,
@@ -125,11 +161,13 @@ class Attestation:
         validator: Validator,
         private_key,  # PQPrivateKey
         source_epoch: int = 0,
-        target_epoch: int = 0
-    ) -> 'Attestation':
+        target_epoch: int = 0,
+        source_root: str = "",
+        target_root: str = "",
+    ) -> "Attestation":
         """
         Create a new signed attestation.
-        
+
         Args:
             slot: Slot number
             epoch: Epoch number
@@ -138,7 +176,7 @@ class Attestation:
             private_key: Validator's Dilithium private key
             source_epoch: Source checkpoint epoch
             target_epoch: Target checkpoint epoch
-            
+
         Returns:
             Signed attestation
         """
@@ -149,22 +187,24 @@ class Attestation:
             block_hash=block_hash,
             validator_address=validator.address,
             validator_index=validator.index or 0,
-            signature=b'',  # Will be set below
+            signature=b"",  # Will be set below
             source_epoch=source_epoch,
             target_epoch=target_epoch,
+            source_root=source_root,
+            target_root=target_root,
         )
-        
+
         # Sign the attestation
         signature = private_key.sign(attestation.signing_root)
         attestation.signature = signature.to_bytes()
-        
+
         return attestation
 
 
 class AttestationPool:
     """
     Pool for collecting and managing attestations.
-    
+
     Responsibilities:
     - Collect attestations from validators
     - Verify attestation signatures
@@ -172,49 +212,47 @@ class AttestationPool:
     - Select attestations for block inclusion
     - Detect slashable attestations
     """
-    
+
     def __init__(self, max_attestations_per_slot: int = 128):
         """
         Initialize attestation pool.
-        
+
         Args:
             max_attestations_per_slot: Maximum attestations to track per slot
         """
         self.max_per_slot = max_attestations_per_slot
-        
+
         # Attestations indexed by (slot, block_hash)
         self._attestations: Dict[Tuple[int, str], List[Attestation]] = defaultdict(list)
-        
+
         # Track which validators have attested to which slots
         self._validator_slots: Dict[str, Set[int]] = defaultdict(set)
-        
+
         # Public keys for signature verification
         self._public_keys: Dict[str, bytes] = {}
-        
+
         self._lock = asyncio.Lock()
-    
+
     def register_validator(self, address: str, public_key: bytes):
         """
         Register a validator's public key for verification.
-        
+
         Args:
             address: Validator address
             public_key: Dilithium public key
         """
         self._public_keys[address] = public_key
-    
+
     async def add_attestation(
-        self, 
-        attestation: Attestation,
-        verify_signature: bool = True
+        self, attestation: Attestation, verify_signature: bool = True
     ) -> bool:
         """
         Add an attestation to the pool.
-        
+
         Args:
             attestation: Attestation to add
             verify_signature: Whether to verify signature
-            
+
         Returns:
             True if attestation was added
         """
@@ -223,8 +261,7 @@ class AttestationPool:
             if attestation.slot in self._validator_slots[attestation.validator_address]:
                 # Duplicate attestation - could be slashable if different block
                 existing = await self._get_validator_attestation(
-                    attestation.validator_address,
-                    attestation.slot
+                    attestation.validator_address, attestation.slot
                 )
                 if existing and existing.block_hash != attestation.block_hash:
                     logger.warning(
@@ -233,68 +270,62 @@ class AttestationPool:
                     )
                     # This is slashable evidence!
                     return False
-                
+
                 # Same attestation, ignore
                 return False
-            
+
             # Verify signature if requested
             if verify_signature:
                 public_key = self._public_keys.get(attestation.validator_address)
                 if not public_key:
-                    logger.warning(
-                        f"Unknown validator: {attestation.validator_address}"
-                    )
+                    logger.warning(f"Unknown validator: {attestation.validator_address}")
                     return False
-                
+
                 if not attestation.verify(public_key):
                     logger.warning(
                         f"Invalid attestation signature: {attestation.validator_address}"
                     )
                     return False
-            
+
             # Add to pool
             key = (attestation.slot, attestation.block_hash)
-            
+
             if len(self._attestations[key]) >= self.max_per_slot:
                 logger.debug(f"Attestation pool full for slot {attestation.slot}")
                 return False
-            
+
             self._attestations[key].append(attestation)
             self._validator_slots[attestation.validator_address].add(attestation.slot)
-            
+
             logger.debug(
                 f"Added attestation: slot={attestation.slot}, "
                 f"validator={attestation.validator_address[:16]}..."
             )
-            
+
             return True
-    
-    async def get_attestations_for_block(
-        self,
-        slot: int,
-        block_hash: str
-    ) -> List[Attestation]:
+
+    async def get_attestations_for_block(self, slot: int, block_hash: str) -> List[Attestation]:
         """
         Get all attestations for a specific block.
-        
+
         Args:
             slot: Slot number
             block_hash: Block hash
-            
+
         Returns:
             List of attestations
         """
         async with self._lock:
             key = (slot, block_hash)
             return self._attestations.get(key, []).copy()
-    
+
     async def get_attestations_for_slot(self, slot: int) -> List[Attestation]:
         """
         Get all attestations for a slot (any block).
-        
+
         Args:
             slot: Slot number
-            
+
         Returns:
             List of attestations
         """
@@ -304,100 +335,90 @@ class AttestationPool:
                 if s == slot:
                     result.extend(attestations)
             return result
-    
-    async def get_attestation_count(
-        self,
-        slot: int,
-        block_hash: str
-    ) -> int:
+
+    async def get_attestation_count(self, slot: int, block_hash: str) -> int:
         """
         Get number of attestations for a block.
-        
+
         Args:
             slot: Slot number
             block_hash: Block hash
-            
+
         Returns:
             Number of attestations
         """
         attestations = await self.get_attestations_for_block(slot, block_hash)
         return len(attestations)
-    
+
     async def get_attestation_stake(
-        self,
-        slot: int,
-        block_hash: str,
-        validators: List[Validator]
+        self, slot: int, block_hash: str, validators: List[Validator]
     ) -> Decimal:
         """
         Get total stake behind attestations for a block.
-        
+
         Args:
             slot: Slot number
             block_hash: Block hash
             validators: Validator list for stake lookup
-            
+
         Returns:
             Total attesting stake
         """
         attestations = await self.get_attestations_for_block(slot, block_hash)
-        
+
         # Build address -> stake mapping
         stake_map = {v.address: v.effective_stake for v in validators}
-        
+
         total_stake = Decimal("0")
         for attestation in attestations:
             stake = stake_map.get(attestation.validator_address, Decimal("0"))
             total_stake += stake
-        
+
         return total_stake
-    
+
     async def has_supermajority(
         self,
         slot: int,
         block_hash: str,
         validators: List[Validator],
-        threshold: Decimal = Decimal("0.667")
+        threshold: Decimal = Decimal("0.667"),
     ) -> bool:
         """
         Check if block has supermajority (2/3+) attestations.
-        
+
         Args:
             slot: Slot number
             block_hash: Block hash
             validators: Validator list
             threshold: Required stake fraction (default 2/3)
-            
+
         Returns:
             True if supermajority achieved
         """
         attesting_stake = await self.get_attestation_stake(slot, block_hash, validators)
         total_stake = sum(v.effective_stake for v in validators)
-        
+
         if total_stake == 0:
             return False
-        
+
         ratio = attesting_stake / total_stake
         return ratio >= threshold
-    
+
     async def select_attestations_for_inclusion(
-        self,
-        current_slot: int,
-        max_attestations: int,
-        max_inclusion_distance: int = 32
+        self, current_slot: int, max_attestations: int, max_inclusion_distance: int = 32
     ) -> List[Attestation]:
         """
         Select attestations to include in a block.
-        
+
         Prioritizes:
         1. Older attestations (closer to inclusion deadline)
         2. Unique validators
-        
+
         Args:
             current_slot: Current slot number
             max_attestations: Maximum attestations to include
             max_inclusion_distance: Maximum slots since attestation
-            
+
         Returns:
             List of attestations to include
         """
@@ -405,25 +426,44 @@ class AttestationPool:
             # Collect eligible attestations
             eligible = []
             min_slot = current_slot - max_inclusion_distance
-            
-            for (slot, block_hash), attestations in self._attestations.items():
+
+            for (slot, _block_hash), attestations in self._attestations.items():
                 if slot >= min_slot and slot < current_slot:
                     for attestation in attestations:
                         if attestation.included_in_block is None:
                             eligible.append(attestation)
-            
+
             # Sort by slot (older first) and then by validator index
             eligible.sort(key=lambda a: (a.slot, a.validator_index))
-            
+
             # Select up to max_attestations
             selected = eligible[:max_attestations]
-            
+
             return selected
-    
+
+    async def votes(self, min_target_epoch: int) -> List[Attestation]:
+        """Every pooled attestation whose target is ``min_target_epoch`` or later — the
+        candidates a proposer filters against its chain (ffg.votes_to_include). Older ones can
+        no longer be included and are dropped here, which keeps the pool bounded."""
+        async with self._lock:
+            out: List[Attestation] = []
+            for key in list(self._attestations):
+                keep = [a for a in self._attestations[key] if a.target_epoch >= min_target_epoch]
+                if keep:
+                    self._attestations[key] = keep
+                    out.extend(keep)
+                else:
+                    del self._attestations[key]
+            self._validator_slots = defaultdict(set)
+            for (slot, _bh), atts in self._attestations.items():
+                for att in atts:
+                    self._validator_slots[att.validator_address].add(slot)
+            return out
+
     async def mark_included(self, attestations: List[Attestation], block_number: int):
         """
         Mark attestations as included in a block.
-        
+
         Args:
             attestations: Attestations that were included
             block_number: Block that included them
@@ -431,11 +471,9 @@ class AttestationPool:
         async with self._lock:
             for attestation in attestations:
                 attestation.included_in_block = block_number
-    
+
     async def _get_validator_attestation(
-        self,
-        validator_address: str,
-        slot: int
+        self, validator_address: str, slot: int
     ) -> Optional[Attestation]:
         """Get a validator's attestation for a specific slot."""
         for (s, _), attestations in self._attestations.items():
@@ -444,89 +482,79 @@ class AttestationPool:
                     if attestation.validator_address == validator_address:
                         return attestation
         return None
-    
+
     async def prune_old_attestations(self, current_slot: int, keep_slots: int = 1000):
         """
         Remove old attestations to free memory.
-        
+
         Args:
             current_slot: Current slot
             keep_slots: Number of slots to keep
         """
         async with self._lock:
             min_slot = current_slot - keep_slots
-            
+
             # Find keys to remove
-            to_remove = [
-                key for key in self._attestations.keys()
-                if key[0] < min_slot
-            ]
-            
+            to_remove = [key for key in self._attestations.keys() if key[0] < min_slot]
+
             for key in to_remove:
                 del self._attestations[key]
-            
+
             # Clean up validator slot tracking
             for address in list(self._validator_slots.keys()):
                 self._validator_slots[address] = {
-                    s for s in self._validator_slots[address]
-                    if s >= min_slot
+                    s for s in self._validator_slots[address] if s >= min_slot
                 }
                 if not self._validator_slots[address]:
                     del self._validator_slots[address]
-            
-            logger.debug(
-                f"Pruned attestations: removed {len(to_remove)} slot entries"
-            )
-    
+
+            logger.debug(f"Pruned attestations: removed {len(to_remove)} slot entries")
+
     async def get_statistics(self) -> dict:
         """Get pool statistics."""
         async with self._lock:
-            total_attestations = sum(
-                len(atts) for atts in self._attestations.values()
-            )
-            
+            total_attestations = sum(len(atts) for atts in self._attestations.values())
+
             return {
-                'total_attestations': total_attestations,
-                'slots_tracked': len(set(k[0] for k in self._attestations.keys())),
-                'validators_seen': len(self._validator_slots),
-                'registered_validators': len(self._public_keys),
+                "total_attestations": total_attestations,
+                "slots_tracked": len({k[0] for k in self._attestations.keys()}),
+                "validators_seen": len(self._validator_slots),
+                "registered_validators": len(self._public_keys),
             }
 
 
 class AttestationAggregator:
     """
     Groups attestations for efficient block inclusion.
-    
+
     Dilithium (ML-DSA-65) does not support BLS-style signature
     aggregation. Each attestation retains its individual Dilithium
     signature and must be verified independently. This is a fundamental
     property of lattice-based PQ signatures, not a stub.
-    
+
     Grouping by (slot, block_hash, source_epoch, target_epoch)
     enables the block proposer to include a compact set of attestation
     bundles rather than an unsorted list.
     """
-    
+
     @staticmethod
-    def aggregate_attestations(
-        attestations: List[Attestation]
-    ) -> List[Attestation]:
+    def aggregate_attestations(attestations: List[Attestation]) -> List[Attestation]:
         """
         Group attestations by target and return in bundle order.
-        
+
         Since Dilithium does not support aggregation, each attestation
         keeps its own signature. This method groups by common target
         and returns them in deterministic order for block inclusion.
-        
+
         Args:
             attestations: List of attestations
-            
+
         Returns:
             Attestations sorted by group for inclusion
         """
         # Group by (slot, block_hash, source_epoch, target_epoch)
         groups: Dict[Tuple, List[Attestation]] = defaultdict(list)
-        
+
         for attestation in attestations:
             key = (
                 attestation.slot,
@@ -535,7 +563,7 @@ class AttestationAggregator:
                 attestation.target_epoch,
             )
             groups[key].append(attestation)
-        
+
         # Return grouped attestations in deterministic key order
         result = []
         for key in sorted(groups.keys()):
@@ -543,5 +571,5 @@ class AttestationAggregator:
             # Within each group, sort by validator index for determinism
             group.sort(key=lambda a: a.validator_index)
             result.extend(group)
-        
+
         return result

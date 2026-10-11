@@ -29,7 +29,7 @@ Every feature is tracked through **six gates** in order. A feature **cannot** ad
 - **File:** `ref/ref_private_key` (value `83844...18925`)
 - **Risk:** Anyone with repo access can impersonate the node identity
 - [x] Implemented — `.gitignore` updated with `*.priv`, `*.key`, `*.pem`, `*private_key*`, `*secret_key*`, `*.keystore` patterns
-- [x] Verified — `.pre-commit-config.yaml` includes `gitleaks` secret-scanning hook; `.gitleaks.toml` has QRDX-specific rules for Dilithium/Kyber secret keys
+- [x] Verified — no key material is tracked (`TestDockerSecurity.test_no_private_key_in_tracked_files`); release images are built from a clean commit export, so untracked keys cannot reach them
 - [x] Security Tested — `TestDockerSecurity.test_no_private_key_in_tracked_files` + `test_no_hardcoded_credentials_in_config` in `test_security_adversarial.py`
 - [x] Consensus / Decentralized — Each node generates its own key at first boot; no shared keys
 - [x] No Stubs — Key generation uses real entropy (`os.urandom`), not deterministic seeds
@@ -59,8 +59,7 @@ Every feature is tracked through **six gates** in order. A feature **cannot** ad
 - **Files:** `config.example.toml`, `setup.sh`, `docker/docker-compose.yml`
 - **Risk:** Default `qrdx`/`qrdx` credentials in production
 - [x] Implemented — config.example.toml uses `${QRDX_DB_USER}` / `${QRDX_DB_PASSWORD}` placeholders; setup.sh reads from env vars
-- [x] Verified — `.pre-commit-config.yaml` gitleaks hook blocks literal credentials; `TestDockerSecurity.test_no_hardcoded_credentials_in_config` asserts no plaintext passwords
-- [x] Security Tested — `.gitleaks.toml` custom rules for API keys, RPC tokens, mnemonics
+- [x] Verified — `TestDockerSecurity.test_no_hardcoded_credentials_in_config` asserts no plaintext passwords
 - [x] Consensus / Decentralized — Each node operator provisions own DB; no shared credentials
 - [x] No Stubs — No hardcoded fallback passwords in any code path
 - [ ] Production Ready — Deployment guide requires credential provisioning as step 1
@@ -367,7 +366,7 @@ Every feature is tracked through **six gates** in order. A feature **cannot** ad
 - **Status:** ✅ Implemented & Verified — `qrdx/exchange/router.py`
 - [x] Implemented — UnifiedRouter: best-execution across AMM + CLOB; FillSource enum (AMM/CLOB/HYBRID); atomic settlement; fee distribution
 - [x] Verified — Test: AMM-only fill; CLOB-only fill; no-liquidity error; fee split in result; oracle update on trade
-- [x] Security Tested — `TestRouterSecurity` (3 tests): deadline enforcement, paused rejection, zero-amount rejection; `TestHooksSecurity.test_hook_circuit_breaker`
+- [x] Security Tested — `TestRouterSecurity` (3 tests): deadline enforcement, paused rejection, zero-amount rejection
 - [x] Consensus / Decentralized — Router selects best venue deterministically; atomic same-block finality
 
 ### 5.7 Perpetual Contracts (Extension)

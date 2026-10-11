@@ -83,10 +83,10 @@ PQ_TX_TYPE = 0x51
 # --- Gas -------------------------------------------------------------------
 # The envelope carries ~5.3KB of key + signature material. It MUST be priced or
 # it is a cheap way to make every node do a lot of work for 21000 gas.
-PQ_TX_BASE_GAS = 21_000          # same floor as a legacy tx
-PQ_TX_VERIFY_GAS = 40_000        # ML-DSA-65 verification (~10x an ecrecover)
-PQ_TX_CREATE_GAS = 32_000        # EIP-2 contract-creation surcharge
-_GAS_PER_ENVELOPE_BYTE = 16      # Istanbul non-zero calldata rate
+PQ_TX_BASE_GAS = 21_000  # same floor as a legacy tx
+PQ_TX_VERIFY_GAS = 40_000  # ML-DSA-65 verification (~10x an ecrecover)
+PQ_TX_CREATE_GAS = 32_000  # EIP-2 contract-creation surcharge
+_GAS_PER_ENVELOPE_BYTE = 16  # Istanbul non-zero calldata rate
 _GAS_TXDATA_ZERO = 4
 _GAS_TXDATA_NONZERO = 16
 
@@ -121,12 +121,12 @@ class PQTransaction:
     nonce: int
     gas_price: int
     gas_limit: int
-    to: Optional[bytes]        # 20-byte account id, or None for contract creation
-    value: int                 # wei
+    to: Optional[bytes]  # 20-byte account id, or None for contract creation
+    value: int  # wei
     data: bytes
-    on_behalf_of: Optional[bytes] = None   # delegated source (system wallets); 20 bytes
-    public_key: bytes = b""    # 1952-byte ML-DSA-65 public key
-    signature: bytes = b""     # 3309-byte ML-DSA-65 signature
+    on_behalf_of: Optional[bytes] = None  # delegated source (system wallets); 20 bytes
+    public_key: bytes = b""  # 1952-byte ML-DSA-65 public key
+    signature: bytes = b""  # 3309-byte ML-DSA-65 signature
 
     # -- Field encoding -----------------------------------------------------
 
@@ -163,6 +163,7 @@ class PQTransaction:
     def pq_address(self) -> str:
         """The human-facing ``0xPQ…`` address of the signing key."""
         from ..crypto.pq.dilithium import PQPublicKey
+
         return PQPublicKey.from_bytes(self.public_key).to_address()
 
     def sender(self) -> str:
@@ -209,9 +210,7 @@ class PQTransaction:
             from ..crypto.pq.dilithium import PQPublicKey, PQSignature, verify as pq_verify
 
             pub = PQPublicKey.from_bytes(self.public_key)
-            return pq_verify(
-                pub, self.signing_hash(), PQSignature.from_bytes(self.signature)
-            )
+            return pq_verify(pub, self.signing_hash(), PQSignature.from_bytes(self.signature))
         except Exception:
             return False
 
@@ -228,12 +227,14 @@ class PQTransaction:
     # -- Gas ----------------------------------------------------------------
 
     def intrinsic_gas(self) -> int:
-        return intrinsic_gas_pq(self.data, self.public_key, self.signature,
-                               is_create=self.to is None)
+        return intrinsic_gas_pq(
+            self.data, self.public_key, self.signature, is_create=self.to is None
+        )
 
 
-def intrinsic_gas_pq(data: bytes, public_key: bytes, signature: bytes,
-                     is_create: bool = False) -> int:
+def intrinsic_gas_pq(
+    data: bytes, public_key: bytes, signature: bytes, is_create: bool = False
+) -> int:
     """
     Minimum gas a PQ transaction must supply before execution begins.
 
@@ -283,8 +284,18 @@ def decode_pq_tx(raw: bytes) -> PQTransaction:
     if len(fields) != 10:
         raise InvalidPQTransaction(f"expected 10 RLP fields, got {len(fields)}")
 
-    (chain_id, nonce, gas_price, gas_limit, to, value, data, on_behalf_of,
-     public_key, signature) = fields
+    (
+        chain_id,
+        nonce,
+        gas_price,
+        gas_limit,
+        to,
+        value,
+        data,
+        on_behalf_of,
+        public_key,
+        signature,
+    ) = fields
 
     if to and len(to) != 20:
         raise InvalidPQTransaction(

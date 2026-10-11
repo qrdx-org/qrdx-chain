@@ -33,6 +33,7 @@ REST / JSON-RPC views' (qrdx/exchange/views.py). This is a display feed: a readi
 block mid-application, so wallets confirm with ``/get_exchange_receipt`` and re-read state over
 REST or RPC after reconnecting.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -50,7 +51,7 @@ class PerpStreamPublisher:
         self.hub = hub
         self.book_depth = book_depth
         self.markets: Dict[str, Dict[str, Any]] = {}
-        self.books: Dict[str, Dict[str, Any]] = {}
+        self.books: Dict[str, Optional[Dict[str, Any]]] = {}
         self.accounts: Dict[str, Dict[str, Any]] = {}
         self.pools: Dict[str, Dict[str, Any]] = {}
         self.tokens: Dict[str, Dict[str, Any]] = {}
@@ -74,33 +75,53 @@ class PerpStreamPublisher:
             self.journal_id, self.last_seq = id(journal), journal.seq
         elif journal.seq > self.last_seq:
             for ev in journal.query(since=self.last_seq, limit=1000):
-                hub.publish_nowait({"type": "perp_event", "channel": "perp_events",
-                                    "key": ev.get("market"), "event": ev})
+                hub.publish_nowait(
+                    {
+                        "type": "perp_event",
+                        "channel": "perp_events",
+                        "key": ev.get("market"),
+                        "event": ev,
+                    }
+                )
             self.last_seq = journal.seq
 
         for summary in views.markets(mgr):
             mid = summary["market_id"]
             if self.markets.get(mid) != summary:
                 self.markets[mid] = summary
-                hub.publish_nowait({"type": "perp_market", "channel": "perp_markets",
-                                    "key": mid, "market": summary})
+                hub.publish_nowait(
+                    {
+                        "type": "perp_market",
+                        "channel": "perp_markets",
+                        "key": mid,
+                        "market": summary,
+                    }
+                )
             if hub.wants("perp_book", mid):
                 book = views.order_book(mgr, mid, self.book_depth)
                 if self.books.get(mid) != book:
                     self.books[mid] = book
-                    hub.publish_nowait({"type": "perp_book", "channel": "perp_book",
-                                        "key": mid, "book": book})
+                    hub.publish_nowait(
+                        {"type": "perp_book", "channel": "perp_book", "key": mid, "book": book}
+                    )
             else:
                 self.books.pop(mid, None)
 
         watched = hub.keys("perp_account")
         for address in watched:
-            snap = {k: v for k, v in views.account(mgr, address).items()
-                    if k not in ACCOUNT_STREAM_OMIT}
+            snap = {
+                k: v for k, v in views.account(mgr, address).items() if k not in ACCOUNT_STREAM_OMIT
+            }
             if self.accounts.get(address) != snap:
                 self.accounts[address] = snap
-                hub.publish_nowait({"type": "perp_account", "channel": "perp_account",
-                                    "key": address, "account": snap})
+                hub.publish_nowait(
+                    {
+                        "type": "perp_account",
+                        "channel": "perp_account",
+                        "key": address,
+                        "account": snap,
+                    }
+                )
         for address in list(self.accounts):
             if address not in watched:
                 del self.accounts[address]
@@ -111,27 +132,40 @@ class PerpStreamPublisher:
     def _step_market(self, mgr) -> None:
         hub = self.hub
         md = mgr.journal.market
-        if id(md) != self.trades_id:                 # a rebuilt manager: resume from its head
+        if id(md) != self.trades_id:  # a rebuilt manager: resume from its head
             self.trades_id, self.trade_seq = id(md), md.seq
         elif md.seq > self.trade_seq:
             if hub.wants("trades") or hub.keys("trades"):
                 for trade in md.since(self.trade_seq):
-                    hub.publish_nowait({"type": "trade", "channel": "trades",
-                                        "key": trade["market"], "trade": trade})
+                    hub.publish_nowait(
+                        {
+                            "type": "trade",
+                            "channel": "trades",
+                            "key": trade["market"],
+                            "trade": trade,
+                        }
+                    )
             self.trade_seq = md.seq
         if hub.wants("tickers") or hub.keys("tickers"):
             for ticker in views.market_tickers(mgr):
                 if self._changed(self.tickers, ticker["market"], ticker):
-                    hub.publish_nowait({"type": "ticker", "channel": "tickers",
-                                        "key": ticker["market"], "ticker": ticker})
+                    hub.publish_nowait(
+                        {
+                            "type": "ticker",
+                            "channel": "tickers",
+                            "key": ticker["market"],
+                            "ticker": ticker,
+                        }
+                    )
         else:
             self.tickers.clear()
         markets = hub.keys("orderbook")
         for market in markets:
             book = views.market_book(mgr, market, self.book_depth)
             if book is not None and self._changed(self.market_books, market, book):
-                hub.publish_nowait({"type": "orderbook", "channel": "orderbook",
-                                    "key": market, "book": book})
+                hub.publish_nowait(
+                    {"type": "orderbook", "channel": "orderbook", "key": market, "book": book}
+                )
         for market in list(self.market_books):
             if market not in markets:
                 del self.market_books[market]
@@ -147,23 +181,36 @@ class PerpStreamPublisher:
         if hub.wants("spot_pools") or hub.keys("spot_pools"):
             for summary in views.pools(mgr):
                 if self._changed(self.pools, summary["pool_id"], summary):
-                    hub.publish_nowait({"type": "spot_pool", "channel": "spot_pools",
-                                        "key": summary["pool_id"], "pool": summary})
+                    hub.publish_nowait(
+                        {
+                            "type": "spot_pool",
+                            "channel": "spot_pools",
+                            "key": summary["pool_id"],
+                            "pool": summary,
+                        }
+                    )
         else:
             self.pools.clear()
         if hub.wants("tokens") or hub.keys("tokens"):
             for token in views.tokens(mgr):
                 if self._changed(self.tokens, token["token_address"], token):
-                    hub.publish_nowait({"type": "token", "channel": "tokens",
-                                        "key": token["token_address"], "token": token})
+                    hub.publish_nowait(
+                        {
+                            "type": "token",
+                            "channel": "tokens",
+                            "key": token["token_address"],
+                            "token": token,
+                        }
+                    )
         else:
             self.tokens.clear()
         pairs = hub.keys("spot_book")
         for pair in pairs:
             book = views.spot_order_book(mgr, pair, self.book_depth)
             if book is not None and self._changed(self.spot_books, pair, book):
-                hub.publish_nowait({"type": "spot_book", "channel": "spot_book",
-                                    "key": pair, "book": book})
+                hub.publish_nowait(
+                    {"type": "spot_book", "channel": "spot_book", "key": pair, "book": book}
+                )
         for pair in list(self.spot_books):
             if pair not in pairs:
                 del self.spot_books[pair]
@@ -171,24 +218,38 @@ class PerpStreamPublisher:
         for address in watched:
             snap = spot_account(mgr, address)
             if self._changed(self.spot_accounts, address, snap):
-                hub.publish_nowait({"type": "spot_account", "channel": "spot_account",
-                                    "key": address, "account": snap})
+                hub.publish_nowait(
+                    {
+                        "type": "spot_account",
+                        "channel": "spot_account",
+                        "key": address,
+                        "account": snap,
+                    }
+                )
         for address in list(self.spot_accounts):
             if address not in watched:
                 del self.spot_accounts[address]
 
 
 def spot_account(mgr, address: str) -> Dict[str, Any]:
-    return {"positions": views.positions(mgr, address),
-            "orders": views.spot_open_orders(mgr, address)}
+    return {
+        "positions": views.positions(mgr, address),
+        "orders": views.spot_open_orders(mgr, address),
+    }
 
 
 # Perps came first; the publisher now covers spot and tokens too.
 ExchangeStreamPublisher = PerpStreamPublisher
 
 
-async def perp_stream_poller(hub, *, get_manager: Callable[[], Any], interval: float = 1.0,
-                             book_depth: int = 20, _max_iterations: Optional[int] = None) -> None:
+async def perp_stream_poller(
+    hub,
+    *,
+    get_manager: Callable[[], Any],
+    interval: float = 1.0,
+    book_depth: int = 20,
+    _max_iterations: Optional[int] = None,
+) -> None:
     publisher = PerpStreamPublisher(hub, book_depth)
     iterations = 0
     while True:
@@ -216,49 +277,120 @@ def initial_snapshots(mgr, channels, book_depth: int = 20):
         if base == "perp_markets":
             for summary in views.markets(mgr):
                 if not key or summary["market_id"] == key:
-                    out.append({"type": "perp_market", "channel": "perp_markets",
-                                "key": summary["market_id"], "market": summary, "snapshot": True})
+                    out.append(
+                        {
+                            "type": "perp_market",
+                            "channel": "perp_markets",
+                            "key": summary["market_id"],
+                            "market": summary,
+                            "snapshot": True,
+                        }
+                    )
         elif base == "perp_book" and key:
             book = views.order_book(mgr, key, book_depth)
             if book is not None:
-                out.append({"type": "perp_book", "channel": "perp_book", "key": key,
-                            "book": book, "snapshot": True})
+                out.append(
+                    {
+                        "type": "perp_book",
+                        "channel": "perp_book",
+                        "key": key,
+                        "book": book,
+                        "snapshot": True,
+                    }
+                )
         elif base == "perp_account" and key:
-            snap = {k: v for k, v in views.account(mgr, key).items()
-                    if k not in ACCOUNT_STREAM_OMIT}
-            out.append({"type": "perp_account", "channel": "perp_account", "key": key,
-                        "account": snap, "snapshot": True})
+            snap = {
+                k: v for k, v in views.account(mgr, key).items() if k not in ACCOUNT_STREAM_OMIT
+            }
+            out.append(
+                {
+                    "type": "perp_account",
+                    "channel": "perp_account",
+                    "key": key,
+                    "account": snap,
+                    "snapshot": True,
+                }
+            )
         elif base == "spot_pools":
             for summary in views.pools(mgr):
                 if not key or summary["pool_id"] == key:
-                    out.append({"type": "spot_pool", "channel": "spot_pools",
-                                "key": summary["pool_id"], "pool": summary, "snapshot": True})
+                    out.append(
+                        {
+                            "type": "spot_pool",
+                            "channel": "spot_pools",
+                            "key": summary["pool_id"],
+                            "pool": summary,
+                            "snapshot": True,
+                        }
+                    )
         elif base == "tokens":
             for token in views.tokens(mgr):
                 if not key or token["token_address"] == key.lower():
-                    out.append({"type": "token", "channel": "tokens",
-                                "key": token["token_address"], "token": token, "snapshot": True})
+                    out.append(
+                        {
+                            "type": "token",
+                            "channel": "tokens",
+                            "key": token["token_address"],
+                            "token": token,
+                            "snapshot": True,
+                        }
+                    )
         elif base == "spot_book" and key:
             book = views.spot_order_book(mgr, key, book_depth)
             if book is not None:
-                out.append({"type": "spot_book", "channel": "spot_book", "key": book["pair"],
-                            "book": book, "snapshot": True})
+                out.append(
+                    {
+                        "type": "spot_book",
+                        "channel": "spot_book",
+                        "key": book["pair"],
+                        "book": book,
+                        "snapshot": True,
+                    }
+                )
         elif base == "spot_account" and key:
-            out.append({"type": "spot_account", "channel": "spot_account", "key": key,
-                        "account": spot_account(mgr, key), "snapshot": True})
+            out.append(
+                {
+                    "type": "spot_account",
+                    "channel": "spot_account",
+                    "key": key,
+                    "account": spot_account(mgr, key),
+                    "snapshot": True,
+                }
+            )
         elif base == "orderbook" and key:
             book = views.market_book(mgr, key, book_depth)
             if book is not None:
-                out.append({"type": "orderbook", "channel": "orderbook", "key": key,
-                            "book": book, "snapshot": True})
+                out.append(
+                    {
+                        "type": "orderbook",
+                        "channel": "orderbook",
+                        "key": key,
+                        "book": book,
+                        "snapshot": True,
+                    }
+                )
         elif base == "tickers":
             for ticker in views.market_tickers(mgr):
                 if not key or ticker["market"] == key:
-                    out.append({"type": "ticker", "channel": "tickers", "key": ticker["market"],
-                                "ticker": ticker, "snapshot": True})
+                    out.append(
+                        {
+                            "type": "ticker",
+                            "channel": "tickers",
+                            "key": ticker["market"],
+                            "ticker": ticker,
+                            "snapshot": True,
+                        }
+                    )
         elif base == "trades":
             found = views.market_trades(mgr, key, 100) if key else None
             if found is not None:
-                out.append({"type": "trades", "channel": "trades", "key": found["market"],
-                            "trades": found["trades"], "snapshot": True})
+                out.append(
+                    {
+                        "type": "trades",
+                        "channel": "trades",
+                        "key": found["market"],
+                        "trades": found["trades"],
+                        "snapshot": True,
+                    }
+                )
     return out

@@ -12,14 +12,13 @@ from decimal import Decimal
 from enum import IntEnum
 from typing import Any, Dict, List, Optional
 
-from ..logger import get_logger
 from ..constants import (
     GOVERNANCE_APPROVAL_THRESHOLD,
-    GOVERNANCE_MIN_DISCUSSION_DAYS,
     GOVERNANCE_PROPOSAL_DEPOSIT,
     GOVERNANCE_SUPERMAJORITY_THRESHOLD,
     GOVERNANCE_VOTING_PERIOD_DAYS,
 )
+from ..logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -27,6 +26,7 @@ logger = get_logger(__name__)
 # ══════════════════════════════════════════════════════════════════════
 #  EXCEPTIONS
 # ══════════════════════════════════════════════════════════════════════
+
 
 class GovernanceError(Exception):
     """Base governance exception."""
@@ -44,52 +44,60 @@ class ProposalLifecycleError(GovernanceError):
 #  ENUMS
 # ══════════════════════════════════════════════════════════════════════
 
+
 class ProposalType(IntEnum):
     """Category of governance proposal (§13.1)."""
-    PARAMETER_CHANGE = 1      # Fee / limit adjustments
-    PROTOCOL_UPGRADE = 2      # Hard/soft fork upgrade
-    TREASURY_SPEND = 3        # Allocate treasury funds
+
+    PARAMETER_CHANGE = 1  # Fee / limit adjustments
+    PROTOCOL_UPGRADE = 2  # Hard/soft fork upgrade
+    TREASURY_SPEND = 3  # Allocate treasury funds
     VALIDATOR_MANAGEMENT = 4  # Validator set changes
-    CONTRACT_UPGRADE = 5      # Smart-contract upgrade
-    ECOSYSTEM_GRANT = 6       # Ecosystem grant / partnership
-    ORACLE_CONFIG = 7         # Oracle adapter / threshold config
-    EMERGENCY = 8             # Emergency action (uses guardian veto path)
+    CONTRACT_UPGRADE = 5  # Smart-contract upgrade
+    ECOSYSTEM_GRANT = 6  # Ecosystem grant / partnership
+    ORACLE_CONFIG = 7  # Oracle adapter / threshold config
+    EMERGENCY = 8  # Emergency action (uses guardian veto path)
 
 
 class ProposalStatus(IntEnum):
     """Lifecycle stage (§13.2)."""
-    DRAFT = 0           # Created but not yet submitted
-    DISCUSSION = 1      # Open for community discussion
-    TEMPERATURE = 2     # Informal temperature-check vote
-    ACTIVE = 3          # Formal on-chain voting in progress
-    PASSED = 4          # Voting concluded — met quorum & approval
-    DEFEATED = 5        # Voting concluded — failed
-    QUEUED = 6          # In timelock queue awaiting execution
-    EXECUTED = 7        # Successfully executed on-chain
-    CANCELLED = 8       # Cancelled by proposer or guardian veto
-    EXPIRED = 9         # Voting period elapsed without quorum
+
+    DRAFT = 0  # Created but not yet submitted
+    DISCUSSION = 1  # Open for community discussion
+    TEMPERATURE = 2  # Informal temperature-check vote
+    ACTIVE = 3  # Formal on-chain voting in progress
+    PASSED = 4  # Voting concluded — met quorum & approval
+    DEFEATED = 5  # Voting concluded — failed
+    QUEUED = 6  # In timelock queue awaiting execution
+    EXECUTED = 7  # Successfully executed on-chain
+    CANCELLED = 8  # Cancelled by proposer or guardian veto
+    EXPIRED = 9  # Voting period elapsed without quorum
 
 
 # Valid forward transitions
 _VALID_TRANSITIONS: Dict[ProposalStatus, set] = {
-    ProposalStatus.DRAFT:       {ProposalStatus.DISCUSSION, ProposalStatus.CANCELLED},
-    ProposalStatus.DISCUSSION:  {ProposalStatus.TEMPERATURE, ProposalStatus.CANCELLED},
+    ProposalStatus.DRAFT: {ProposalStatus.DISCUSSION, ProposalStatus.CANCELLED},
+    ProposalStatus.DISCUSSION: {ProposalStatus.TEMPERATURE, ProposalStatus.CANCELLED},
     ProposalStatus.TEMPERATURE: {ProposalStatus.ACTIVE, ProposalStatus.CANCELLED},
-    ProposalStatus.ACTIVE:      {ProposalStatus.PASSED, ProposalStatus.DEFEATED,
-                                  ProposalStatus.EXPIRED, ProposalStatus.CANCELLED},
-    ProposalStatus.PASSED:      {ProposalStatus.QUEUED, ProposalStatus.CANCELLED},
-    ProposalStatus.QUEUED:      {ProposalStatus.EXECUTED, ProposalStatus.CANCELLED},
+    ProposalStatus.ACTIVE: {
+        ProposalStatus.PASSED,
+        ProposalStatus.DEFEATED,
+        ProposalStatus.EXPIRED,
+        ProposalStatus.CANCELLED,
+    },
+    ProposalStatus.PASSED: {ProposalStatus.QUEUED, ProposalStatus.CANCELLED},
+    ProposalStatus.QUEUED: {ProposalStatus.EXECUTED, ProposalStatus.CANCELLED},
     # Terminal states — no further transitions
-    ProposalStatus.DEFEATED:    set(),
-    ProposalStatus.EXECUTED:    set(),
-    ProposalStatus.CANCELLED:   set(),
-    ProposalStatus.EXPIRED:     set(),
+    ProposalStatus.DEFEATED: set(),
+    ProposalStatus.EXECUTED: set(),
+    ProposalStatus.CANCELLED: set(),
+    ProposalStatus.EXPIRED: set(),
 }
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  PROPOSAL
 # ══════════════════════════════════════════════════════════════════════
+
 
 @dataclass
 class Proposal:
@@ -110,6 +118,7 @@ class Proposal:
         voting_end:       Timestamp when voting closes
         execution_eta:    Timestamp when timelock expires (earliest execution)
     """
+
     id: int
     title: str
     description: str
@@ -180,12 +189,14 @@ class Proposal:
     # ── State transitions ─────────────────────────────────────────────
 
     def _record_transition(self, new_status: ProposalStatus, reason: str):
-        self._history.append({
-            "from": self.status.name if self._history else "INIT",
-            "to": new_status.name,
-            "reason": reason,
-            "timestamp": time.time(),
-        })
+        self._history.append(
+            {
+                "from": self.status.name if self._history else "INIT",
+                "to": new_status.name,
+                "reason": reason,
+                "timestamp": time.time(),
+            }
+        )
 
     def transition_to(self, new_status: ProposalStatus, reason: str = ""):
         """
@@ -203,8 +214,7 @@ class Proposal:
         self._record_transition(new_status, reason)
         self.status = new_status
         logger.info(
-            f"Proposal #{self.id} ({self.title}): "
-            f"{old.name} → {new_status.name} | {reason}"
+            f"Proposal #{self.id} ({self.title}): " f"{old.name} → {new_status.name} | {reason}"
         )
 
     def submit_for_discussion(self):

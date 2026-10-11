@@ -8,29 +8,30 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import List, Optional, Dict, Tuple
 from enum import Enum
+from typing import Dict, List, Optional
 
 from ..logger import get_logger
-from .types import Validator, ValidatorStatus, ValidatorError, InsufficientStakeError
-from .config import ValidatorConfig, POS_CONSTANTS
+from .config import ValidatorConfig
+from .types import InsufficientStakeError, ValidatorError
 
 logger = get_logger(__name__)
 
 
 class WithdrawalStatus(Enum):
     """Status of stake withdrawal request."""
-    PENDING = "pending"         # In unbonding queue
-    READY = "ready"             # Unbonding complete, ready to withdraw
-    COMPLETED = "completed"     # Withdrawal executed
-    CANCELLED = "cancelled"     # Withdrawal cancelled
+
+    PENDING = "pending"  # In unbonding queue
+    READY = "ready"  # Unbonding complete, ready to withdraw
+    COMPLETED = "completed"  # Withdrawal executed
+    CANCELLED = "cancelled"  # Withdrawal cancelled
 
 
 @dataclass
 class StakeDeposit:
     """
     Record of a stake deposit.
-    
+
     Attributes:
         validator_address: Validator's PQ address
         amount: Amount deposited
@@ -39,21 +40,22 @@ class StakeDeposit:
         epoch: Epoch of deposit
         created_at: Timestamp
     """
+
     validator_address: str
     amount: Decimal
     tx_hash: str
     block_number: int
     epoch: int
     created_at: datetime = field(default_factory=datetime.utcnow)
-    
+
     def to_dict(self) -> dict:
         return {
-            'validator_address': self.validator_address,
-            'amount': str(self.amount),
-            'tx_hash': self.tx_hash,
-            'block_number': self.block_number,
-            'epoch': self.epoch,
-            'created_at': self.created_at.isoformat(),
+            "validator_address": self.validator_address,
+            "amount": str(self.amount),
+            "tx_hash": self.tx_hash,
+            "block_number": self.block_number,
+            "epoch": self.epoch,
+            "created_at": self.created_at.isoformat(),
         }
 
 
@@ -61,7 +63,7 @@ class StakeDeposit:
 class StakeWithdrawal:
     """
     Record of a stake withdrawal request.
-    
+
     Attributes:
         id: Unique withdrawal ID
         validator_address: Validator's PQ address
@@ -72,6 +74,7 @@ class StakeWithdrawal:
         tx_hash: Transaction hash when completed
         created_at: Request timestamp
     """
+
     id: int
     validator_address: str
     amount: Decimal
@@ -80,29 +83,29 @@ class StakeWithdrawal:
     status: WithdrawalStatus = WithdrawalStatus.PENDING
     tx_hash: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.utcnow)
-    
+
     @property
     def is_ready(self) -> bool:
         """Check if withdrawal can be executed."""
         return self.status == WithdrawalStatus.READY
-    
+
     def to_dict(self) -> dict:
         return {
-            'id': self.id,
-            'validator_address': self.validator_address,
-            'amount': str(self.amount),
-            'request_epoch': self.request_epoch,
-            'completion_epoch': self.completion_epoch,
-            'status': self.status.value,
-            'tx_hash': self.tx_hash,
-            'created_at': self.created_at.isoformat(),
+            "id": self.id,
+            "validator_address": self.validator_address,
+            "amount": str(self.amount),
+            "request_epoch": self.request_epoch,
+            "completion_epoch": self.completion_epoch,
+            "status": self.status.value,
+            "tx_hash": self.tx_hash,
+            "created_at": self.created_at.isoformat(),
         }
 
 
 class StakeManager:
     """
     Manages stake deposits and withdrawals for validators.
-    
+
     Responsibilities:
     - Process stake deposits
     - Handle withdrawal requests and unbonding
@@ -110,11 +113,11 @@ class StakeManager:
     - Calculate validator rewards
     - Process delegation (future feature)
     """
-    
-    def __init__(self, config: ValidatorConfig = None, database=None):
+
+    def __init__(self, config: Optional[ValidatorConfig] = None, database=None):
         """
         Initialize stake manager.
-        
+
         Args:
             config: Validator configuration
             database: Database instance for persistence
@@ -122,13 +125,13 @@ class StakeManager:
         self.config = config or ValidatorConfig()
         self.database = database
         self._lock = asyncio.Lock()
-        
+
         # In-memory cache (backed by database)
         self._stakes: Dict[str, Decimal] = {}
         self._pending_withdrawals: Dict[str, List[StakeWithdrawal]] = {}
         self._deposits: List[StakeDeposit] = []
         self._withdrawal_counter = 0
-    
+
     async def load_from_database(self):
         """
         Load all validator stakes, pending withdrawals, and deposit history
@@ -139,7 +142,7 @@ class StakeManager:
         if not self.database or not self.database.connection:
             logger.warning("No database connection available for stake loading")
             return
-        
+
         try:
             async with self._lock:
                 # -- 1. Load stakes -----------------------------------------
@@ -147,12 +150,12 @@ class StakeManager:
                     "SELECT validator_address, stake FROM validator_stakes"
                 )
                 rows = await cursor.fetchall()
-                
+
                 for row in rows:
                     validator_address = row[0]
                     stake = Decimal(str(row[1])) / Decimal("100000000")
                     self._stakes[validator_address] = stake
-                    
+
                 logger.info(f"Loaded {len(self._stakes)} validator stakes from database")
 
                 # -- 2. Load pending withdrawals ----------------------------
@@ -191,9 +194,7 @@ class StakeManager:
                     max_id = max(max_id, row[0])
                 self._withdrawal_counter = max_id
 
-                pending_count = sum(
-                    len(ws) for ws in self._pending_withdrawals.values()
-                )
+                pending_count = sum(len(ws) for ws in self._pending_withdrawals.values())
                 logger.info(
                     f"Loaded {pending_count} pending withdrawals from database "
                     f"(counter={self._withdrawal_counter})"
@@ -220,18 +221,18 @@ class StakeManager:
 
         except Exception as e:
             logger.error(f"Failed to load stakes from database: {e}")
-    
+
     # =========================================================================
     # STAKE QUERIES
     # =========================================================================
-    
+
     async def get_stake(self, validator_address: str) -> Decimal:
         """
         Get total stake for a validator.
-        
+
         Args:
             validator_address: Validator's PQ address
-            
+
         Returns:
             Total stake amount
         """
@@ -239,70 +240,67 @@ class StakeManager:
             # Query database via unified SQLite backend
             row = await self._query_stake(self.database, validator_address)
             if row:
-                return Decimal(str(row['stake']))
-            
+                return Decimal(str(row["stake"]))
+
             # Fallback to cache
             return self._stakes.get(validator_address, Decimal("0"))
-    
+
     async def get_effective_stake(self, validator_address: str) -> Decimal:
         """
         Get effective stake (total stake minus pending withdrawals).
-        
+
         Args:
             validator_address: Validator's PQ address
-            
+
         Returns:
             Effective stake available for validation
         """
         total_stake = await self.get_stake(validator_address)
         pending_withdrawals = await self.get_pending_withdrawal_amount(validator_address)
-        
+
         effective = total_stake - pending_withdrawals
         return max(Decimal("0"), effective)
-    
+
     async def get_pending_withdrawal_amount(self, validator_address: str) -> Decimal:
         """
         Get total amount in pending withdrawals.
-        
+
         Args:
             validator_address: Validator's PQ address
-            
+
         Returns:
             Total pending withdrawal amount
         """
         withdrawals = self._pending_withdrawals.get(validator_address, [])
         return sum(
-            w.amount for w in withdrawals 
-            if w.status == WithdrawalStatus.PENDING
+            (w.amount for w in withdrawals if w.status == WithdrawalStatus.PENDING), Decimal("0")
         )
-    
-    async def get_pending_withdrawals(
-        self, 
-        validator_address: str
-    ) -> List[StakeWithdrawal]:
+
+    async def get_pending_withdrawals(self, validator_address: str) -> List[StakeWithdrawal]:
         """
         Get pending withdrawal requests for a validator.
-        
+
         Args:
             validator_address: Validator's PQ address
-            
+
         Returns:
             List of pending withdrawals
         """
         return [
-            w for w in self._pending_withdrawals.get(validator_address, [])
+            w
+            for w in self._pending_withdrawals.get(validator_address, [])
             if w.status == WithdrawalStatus.PENDING
         ]
-    
+
     async def get_total_staked(self) -> Decimal:
         """
         Get total stake across all validators.
-        
+
         Returns:
             Total network stake
         """
         from .. import Database
-        
+
         database = Database.instance
         if database:
             async with database.pool.acquire() as conn:
@@ -311,48 +309,43 @@ class StakeManager:
                     "WHERE status IN ('active', 'exiting')"
                 )
                 if row:
-                    return Decimal(str(row['total']))
-        
-        return sum(self._stakes.values())
-    
+                    return Decimal(str(row["total"]))
+
+        return sum(self._stakes.values(), Decimal("0"))
+
     # =========================================================================
     # STAKE OPERATIONS
     # =========================================================================
-    
+
     async def deposit(
-        self,
-        validator_address: str,
-        amount: Decimal,
-        tx_hash: str,
-        block_number: int,
-        epoch: int
+        self, validator_address: str, amount: Decimal, tx_hash: str, block_number: int, epoch: int
     ) -> StakeDeposit:
         """
         Process a stake deposit.
-        
+
         Args:
             validator_address: Validator's PQ address
             amount: Amount to deposit
             tx_hash: Deposit transaction hash
             block_number: Block containing deposit
             epoch: Current epoch
-            
+
         Returns:
             StakeDeposit record
-            
+
         Raises:
             ValidatorError: If deposit fails
         """
         if amount <= 0:
             raise ValidatorError("Deposit amount must be positive")
-        
+
         # SECURITY: Prevent unrealistic stake amounts (overflow protection)
         MAX_SAFE_STAKE = Decimal("92233720368")  # ~92B QRDX (max int64 / 1e8)
         if amount > MAX_SAFE_STAKE:
             raise ValidatorError(
                 f"Deposit amount {amount} QRDX exceeds maximum safe value {MAX_SAFE_STAKE} QRDX"
             )
-        
+
         async with self._lock:
             # Create deposit record
             deposit = StakeDeposit(
@@ -362,75 +355,66 @@ class StakeManager:
                 block_number=block_number,
                 epoch=epoch,
             )
-            
+
             # Update stake
             current_stake = self._stakes.get(validator_address, Decimal("0"))
             new_stake = current_stake + amount
-            
+
             # SECURITY: Additional overflow check on total stake
             if new_stake > MAX_SAFE_STAKE:
                 raise ValidatorError(
                     f"Total stake {new_stake} QRDX would exceed maximum safe value {MAX_SAFE_STAKE} QRDX"
                 )
-            
+
             self._stakes[validator_address] = new_stake
-            
+
             # Persist to database
             await self._save_deposit(deposit, new_stake)
-            
+
             self._deposits.append(deposit)
-            
+
             logger.info(
                 f"Stake deposit: {validator_address} deposited {amount} QRDX "
                 f"(total: {new_stake} QRDX)"
             )
-            
+
             return deposit
-    
+
     async def request_withdrawal(
-        self,
-        validator_address: str,
-        amount: Decimal,
-        current_epoch: int
+        self, validator_address: str, amount: Decimal, current_epoch: int
     ) -> StakeWithdrawal:
         """
         Request stake withdrawal (starts unbonding).
-        
+
         Args:
             validator_address: Validator's PQ address
             amount: Amount to withdraw
             current_epoch: Current epoch
-            
+
         Returns:
             StakeWithdrawal record
-            
+
         Raises:
             InsufficientStakeError: If withdrawal would leave insufficient stake
         """
         effective_stake = await self.get_effective_stake(validator_address)
         min_stake = self.config.staking.min_validator_stake
-        
+
         # Check if withdrawal would leave sufficient stake
         remaining = effective_stake - amount
         if remaining < min_stake and remaining > 0:
-            raise InsufficientStakeError(
-                required=min_stake,
-                actual=remaining
-            )
-        
+            raise InsufficientStakeError(required=min_stake, actual=remaining)
+
         if amount > effective_stake:
-            raise InsufficientStakeError(
-                required=amount,
-                actual=effective_stake
-            )
-        
+            raise InsufficientStakeError(required=amount, actual=effective_stake)
+
         async with self._lock:
             self._withdrawal_counter += 1
-            
+
             # Calculate completion epoch (after unbonding period)
             unbonding_epochs = self.config.staking.unbonding_epochs
             completion_epoch = current_epoch + unbonding_epochs
-            
+
             withdrawal = StakeWithdrawal(
                 id=self._withdrawal_counter,
                 validator_address=validator_address,
@@ -439,64 +423,61 @@ class StakeManager:
                 completion_epoch=completion_epoch,
                 status=WithdrawalStatus.PENDING,
             )
-            
+
             # Add to pending withdrawals
             if validator_address not in self._pending_withdrawals:
                 self._pending_withdrawals[validator_address] = []
             self._pending_withdrawals[validator_address].append(withdrawal)
-            
+
             # Persist to database
             await self._save_withdrawal(withdrawal)
-            
+
             logger.info(
                 f"Withdrawal requested: {validator_address} requested {amount} QRDX "
                 f"(completion: epoch {completion_epoch})"
             )
-            
+
             return withdrawal
-    
+
     async def process_unbonding(self, current_epoch: int) -> List[StakeWithdrawal]:
         """
         Process unbonding queue - mark ready withdrawals.
-        
+
         Args:
             current_epoch: Current epoch
-            
+
         Returns:
             List of withdrawals that became ready
         """
         ready_withdrawals = []
-        
+
         async with self._lock:
             for address, withdrawals in self._pending_withdrawals.items():
                 for withdrawal in withdrawals:
-                    if (withdrawal.status == WithdrawalStatus.PENDING and 
-                        current_epoch >= withdrawal.completion_epoch):
+                    if (
+                        withdrawal.status == WithdrawalStatus.PENDING
+                        and current_epoch >= withdrawal.completion_epoch
+                    ):
                         withdrawal.status = WithdrawalStatus.READY
                         ready_withdrawals.append(withdrawal)
-                        
+
                         logger.info(
-                            f"Withdrawal ready: {address} can withdraw "
-                            f"{withdrawal.amount} QRDX"
+                            f"Withdrawal ready: {address} can withdraw " f"{withdrawal.amount} QRDX"
                         )
-        
+
         return ready_withdrawals
-    
-    async def complete_withdrawal(
-        self,
-        withdrawal_id: int,
-        tx_hash: str
-    ) -> bool:
+
+    async def complete_withdrawal(self, withdrawal_id: int, tx_hash: str) -> bool:
         """
         Complete a ready withdrawal.
-        
+
         Args:
             withdrawal_id: Withdrawal ID
             tx_hash: Transaction hash of withdrawal execution
-            
+
         Returns:
             True if successful
-            
+
         Raises:
             ValidatorError: If withdrawal cannot be completed
             InsufficientStakeError: If withdrawal would violate minimum stake
@@ -506,51 +487,49 @@ class StakeManager:
                 for withdrawal in withdrawals:
                     if withdrawal.id == withdrawal_id:
                         if withdrawal.status != WithdrawalStatus.READY:
-                            raise ValidatorError(
-                                f"Withdrawal {withdrawal_id} is not ready"
-                            )
-                        
+                            raise ValidatorError(f"Withdrawal {withdrawal_id} is not ready")
+
                         # SECURITY: Check if deducting would violate minimum stake
                         current_stake = self._stakes.get(address, Decimal("0"))
                         remaining_stake = current_stake - withdrawal.amount
                         min_stake = self.config.staking.min_validator_stake
-                        
+
                         # Allow complete exit (stake to 0) but not partial below minimum
                         if remaining_stake > 0 and remaining_stake < min_stake:
                             raise InsufficientStakeError(
                                 required=min_stake,
                                 actual=remaining_stake,
                                 message=f"Withdrawal would leave {remaining_stake} QRDX, minimum is {min_stake} QRDX. "
-                                       f"Either withdraw all stake (exit validator) or keep at least minimum."
+                                f"Either withdraw all stake (exit validator) or keep at least minimum.",
                             )
-                        
+
                         # Deduct from stake
                         self._stakes[address] = remaining_stake
-                        
+
                         # Update withdrawal
                         withdrawal.status = WithdrawalStatus.COMPLETED
                         withdrawal.tx_hash = tx_hash
-                        
+
                         # Persist to database
                         await self._update_withdrawal(withdrawal)
                         await self._update_stake(address, self._stakes[address])
-                        
+
                         logger.info(
                             f"Withdrawal completed: {address} withdrew "
                             f"{withdrawal.amount} QRDX (remaining: {remaining_stake} QRDX, tx: {tx_hash})"
                         )
-                        
+
                         return True
-            
+
             raise ValidatorError(f"Withdrawal {withdrawal_id} not found")
-    
+
     async def cancel_withdrawal(self, withdrawal_id: int) -> bool:
         """
         Cancel a pending withdrawal.
-        
+
         Args:
             withdrawal_id: Withdrawal ID
-            
+
         Returns:
             True if successful
         """
@@ -559,89 +538,79 @@ class StakeManager:
                 for withdrawal in withdrawals:
                     if withdrawal.id == withdrawal_id:
                         if withdrawal.status != WithdrawalStatus.PENDING:
-                            raise ValidatorError(
-                                f"Can only cancel pending withdrawals"
-                            )
-                        
+                            raise ValidatorError("Can only cancel pending withdrawals")
+
                         withdrawal.status = WithdrawalStatus.CANCELLED
                         await self._update_withdrawal(withdrawal)
-                        
+
                         logger.info(
                             f"Withdrawal cancelled: {address} cancelled "
                             f"{withdrawal.amount} QRDX withdrawal"
                         )
-                        
+
                         return True
-            
+
             raise ValidatorError(f"Withdrawal {withdrawal_id} not found")
-    
+
     # =========================================================================
     # SLASHING
     # =========================================================================
-    
+
     async def slash(
         self,
         validator_address: str,
         percentage: Decimal,
         reason: str,
-        evidence: str = None
+        evidence: Optional[str] = None,
     ) -> Decimal:
         """
         Slash validator stake.
-        
+
         Args:
             validator_address: Validator's PQ address
             percentage: Percentage of stake to slash (0.0 - 1.0)
             reason: Slashing reason
             evidence: Evidence data (optional)
-            
+
         Returns:
             Amount slashed
         """
         if percentage < 0 or percentage > 1:
             raise ValueError("Slash percentage must be between 0 and 1")
-        
+
         current_stake = await self.get_stake(validator_address)
         slash_amount = current_stake * percentage
-        
+
         async with self._lock:
             # Deduct slash amount
             new_stake = current_stake - slash_amount
             self._stakes[validator_address] = new_stake
-            
+
             # Also cancel any pending withdrawals if slashing is severe
             if percentage >= Decimal("0.5"):
                 await self._cancel_all_withdrawals(validator_address)
-            
+
             # Persist to database
-            await self._save_slashing(
-                validator_address, 
-                slash_amount, 
-                reason, 
-                evidence
-            )
+            await self._save_slashing(validator_address, slash_amount, reason, evidence)
             await self._update_stake(validator_address, new_stake)
-            
+
             logger.warning(
                 f"Validator slashed: {validator_address} lost {slash_amount} QRDX "
                 f"({percentage * 100}%) for {reason}"
             )
-            
+
             return slash_amount
-    
+
     # =========================================================================
     # REWARDS
     # =========================================================================
-    
+
     async def add_reward(
-        self,
-        validator_address: str,
-        amount: Decimal,
-        source: str = "block_reward"
+        self, validator_address: str, amount: Decimal, source: str = "block_reward"
     ) -> None:
         """
         Add reward to validator stake.
-        
+
         Args:
             validator_address: Validator's PQ address
             amount: Reward amount
@@ -649,27 +618,23 @@ class StakeManager:
         """
         if amount <= 0:
             return
-        
+
         async with self._lock:
             current_stake = self._stakes.get(validator_address, Decimal("0"))
-            
+
             if self.config.staking.auto_restake_rewards:
                 # Add to stake
                 self._stakes[validator_address] = current_stake + amount
                 await self._update_stake(validator_address, self._stakes[validator_address])
-                logger.debug(
-                    f"Reward restaked: {validator_address} +{amount} QRDX ({source})"
-                )
+                logger.debug(f"Reward restaked: {validator_address} +{amount} QRDX ({source})")
             else:
                 # Track reward separately (future: withdrawable rewards)
-                logger.debug(
-                    f"Reward earned: {validator_address} +{amount} QRDX ({source})"
-                )
-    
+                logger.debug(f"Reward earned: {validator_address} +{amount} QRDX ({source})")
+
     # =========================================================================
     # HELPER METHODS
     # =========================================================================
-    
+
     async def _query_stake(self, database, validator_address: str):
         """Query stake from database (SQLite compatible)."""
         if not self.database or not self.database.connection:
@@ -677,146 +642,174 @@ class StakeManager:
         try:
             cursor = await self.database.connection.execute(
                 "SELECT stake FROM validator_stakes WHERE validator_address = ?",
-                (validator_address,)
+                (validator_address,),
             )
             row = await cursor.fetchone()
             if row:
-                return {'stake': Decimal(str(row[0])) / Decimal("100000000")}
+                return {"stake": Decimal(str(row[0])) / Decimal("100000000")}
             return None
         except Exception:
             return None
-    
+
     async def _save_deposit(self, deposit: StakeDeposit, new_stake: Decimal):
         """Save deposit to database (SQLite compatible)."""
         if not self.database or not self.database.connection:
             logger.warning("No database connection for saving deposit")
             return
-        
+
         try:
             # Convert to satoshis for storage
             stake_satoshis = int(new_stake * Decimal("100000000"))
             amount_satoshis = int(deposit.amount * Decimal("100000000"))
-            
+
             # Update or insert validator stake
-            await self.database.connection.execute("""
+            await self.database.connection.execute(
+                """
                 INSERT INTO validator_stakes (
                     validator_address, stake, effective_stake, status,
                     activation_epoch, updated_at
                 )
                 VALUES (?, ?, ?, 'PENDING', ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(validator_address) DO UPDATE SET 
+                ON CONFLICT(validator_address) DO UPDATE SET
                     stake = stake + ?,
                     effective_stake = effective_stake + ?,
                     updated_at = CURRENT_TIMESTAMP
-            """, (
-                deposit.validator_address, stake_satoshis, stake_satoshis,
-                deposit.epoch, amount_satoshis, amount_satoshis
-            ))
-            
+            """,
+                (
+                    deposit.validator_address,
+                    stake_satoshis,
+                    stake_satoshis,
+                    deposit.epoch,
+                    amount_satoshis,
+                    amount_satoshis,
+                ),
+            )
+
             # Record deposit
-            await self.database.connection.execute("""
-                INSERT INTO stake_deposits 
+            await self.database.connection.execute(
+                """
+                INSERT INTO stake_deposits
                 (validator_address, amount, tx_hash, block_number, epoch, created_at)
                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, (
-                deposit.validator_address, amount_satoshis,
-                deposit.tx_hash, deposit.block_number, deposit.epoch
-            ))
-            
+            """,
+                (
+                    deposit.validator_address,
+                    amount_satoshis,
+                    deposit.tx_hash,
+                    deposit.block_number,
+                    deposit.epoch,
+                ),
+            )
+
             await self.database.connection.commit()
             logger.info(f"Saved deposit for {deposit.validator_address}: {deposit.amount} QRDX")
         except Exception as e:
             logger.error(f"Failed to save deposit: {e}")
-    
+
     async def _save_withdrawal(self, withdrawal: StakeWithdrawal):
         """Save withdrawal request to database (SQLite compatible)."""
         if not self.database or not self.database.connection:
             logger.warning("No database connection for saving withdrawal")
             return
-        
+
         try:
             amount_satoshis = int(withdrawal.amount * Decimal("100000000"))
-            
-            await self.database.connection.execute("""
-                INSERT INTO stake_withdrawals 
+
+            await self.database.connection.execute(
+                """
+                INSERT INTO stake_withdrawals
                 (validator_address, amount, request_epoch, completion_epoch, status, created_at)
                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, (
-                withdrawal.validator_address, amount_satoshis,
-                withdrawal.request_epoch, withdrawal.completion_epoch,
-                withdrawal.status.value
-            ))
-            
+            """,
+                (
+                    withdrawal.validator_address,
+                    amount_satoshis,
+                    withdrawal.request_epoch,
+                    withdrawal.completion_epoch,
+                    withdrawal.status.value,
+                ),
+            )
+
             await self.database.connection.commit()
-            logger.info(f"Saved withdrawal request for {withdrawal.validator_address}: {withdrawal.amount} QRDX")
+            logger.info(
+                f"Saved withdrawal request for {withdrawal.validator_address}: {withdrawal.amount} QRDX"
+            )
         except Exception as e:
             logger.error(f"Failed to save withdrawal: {e}")
-    
+
     async def _update_withdrawal(self, withdrawal: StakeWithdrawal):
         """Update withdrawal in database (SQLite compatible)."""
         if not self.database or not self.database.connection:
             logger.warning("No database connection for updating withdrawal")
             return
-        
+
         try:
-            await self.database.connection.execute("""
-                UPDATE stake_withdrawals 
+            await self.database.connection.execute(
+                """
+                UPDATE stake_withdrawals
                 SET status = ?, completed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
-            """, (withdrawal.status.value, withdrawal.id))
+            """,
+                (withdrawal.status.value, withdrawal.id),
+            )
             await self.database.connection.commit()
         except Exception as e:
             logger.error(f"Failed to update withdrawal: {e}")
-    
+
     async def _update_stake(self, validator_address: str, new_stake: Decimal):
         """Update validator stake in database (SQLite compatible)."""
         if not self.database or not self.database.connection:
             logger.warning("No database connection for updating stake")
             return
-        
+
         try:
             stake_satoshis = int(new_stake * Decimal("100000000"))
-            await self.database.connection.execute("""
-                UPDATE validator_stakes 
+            await self.database.connection.execute(
+                """
+                UPDATE validator_stakes
                 SET stake = ?, effective_stake = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE validator_address = ?
-            """, (stake_satoshis, stake_satoshis, validator_address))
+            """,
+                (stake_satoshis, stake_satoshis, validator_address),
+            )
             await self.database.connection.commit()
         except Exception as e:
             logger.error(f"Failed to update stake: {e}")
-    
+
     async def _save_slashing(
-        self, 
-        validator_address: str, 
-        amount: Decimal,
-        reason: str,
-        evidence: str = None
+        self, validator_address: str, amount: Decimal, reason: str, evidence: Optional[str] = None
     ):
         """Save slashing event to database (SQLite compatible)."""
         if not self.database or not self.database.connection:
             logger.warning("No database connection for saving slashing")
             return
-        
+
         try:
             amount_satoshis = int(amount * Decimal("100000000"))
-            await self.database.connection.execute("""
-                INSERT INTO stake_withdrawals 
+            await self.database.connection.execute(
+                """
+                INSERT INTO stake_withdrawals
                 (validator_address, amount, request_epoch, status, created_at)
                 VALUES (?, ?, 0, 'completed', CURRENT_TIMESTAMP)
-            """, (validator_address, amount_satoshis))
-            
+            """,
+                (validator_address, amount_satoshis),
+            )
+
             # Mark validator as slashed
-            await self.database.connection.execute("""
-                UPDATE validator_stakes 
+            await self.database.connection.execute(
+                """
+                UPDATE validator_stakes
                 SET slashed = 1, updated_at = CURRENT_TIMESTAMP
                 WHERE validator_address = ?
-            """, (validator_address,))
-            
+            """,
+                (validator_address,),
+            )
+
             await self.database.connection.commit()
             logger.info(f"Saved slashing for {validator_address}: {amount} QRDX ({reason})")
         except Exception as e:
             logger.error(f"Failed to save slashing: {e}")
-    
+
     async def _cancel_all_withdrawals(self, validator_address: str):
         """Cancel all pending withdrawals for a validator."""
         withdrawals = self._pending_withdrawals.get(validator_address, [])

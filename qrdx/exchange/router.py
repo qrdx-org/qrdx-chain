@@ -26,14 +26,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from dataclasses import dataclass, field
-from decimal import ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from dataclasses import dataclass
+from decimal import ROUND_DOWN, Decimal
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from qrdx.exchange.amm import (
     AMOUNT_QUANTUM,
-    ConcentratedLiquidityPool,
     FEE_CREATOR_SHARE,
     FEE_LP_SHARE,
     FEE_TREASURY_SHARE,
@@ -41,10 +40,16 @@ from qrdx.exchange.amm import (
     PoolManager,
     SwapPlan,
 )
-from qrdx.exchange.orderbook import (
-    MIN_ORDER_SIZE, Order, OrderBook, OrderSide, OrderType, Trade, _pinned,
-)
 from qrdx.exchange.oracle import TWAPOracle
+from qrdx.exchange.orderbook import (
+    MIN_ORDER_SIZE,
+    Order,
+    OrderBook,
+    OrderSide,
+    OrderType,
+    Trade,
+    _pinned,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +60,14 @@ DEFAULT_DEADLINE_SECONDS = 120
 
 class FillSource(str, Enum):
     AMM = "amm"
-    CLOB = "clob"       # central limit order book
-    HYBRID = "hybrid"   # reserved
+    CLOB = "clob"  # central limit order book
+    HYBRID = "hybrid"  # reserved
 
 
 @dataclass
 class FillResult:
     """Result of a routed trade execution."""
+
     source: FillSource
     amount_in: Decimal
     amount_out: Decimal
@@ -70,8 +76,8 @@ class FillResult:
     fee_creator: Decimal
     fee_treasury: Decimal
     fee_validator: Decimal
-    price: Decimal               # effective execution price (input per unit of output)
-    trades: List[Trade]          # order book fills (if any)
+    price: Decimal  # effective execution price (input per unit of output)
+    trades: List[Trade]  # order book fills (if any)
     pool_id: Optional[str] = None
     order: Optional[Order] = None
 
@@ -79,22 +85,35 @@ class FillResult:
 @dataclass
 class Route:
     """An exactly-quoted way to fill a swap."""
+
     source: FillSource
     token_in: str
     token_out: str
-    amount_in: Decimal           # input it will consume (≤ requested; the rest stays with the trader)
+    amount_in: Decimal  # input it will consume (≤ requested; the rest stays with the trader)
     amount_out: Decimal
     fee_total: Decimal
     pool_id: Optional[str] = None
     plan: Optional[SwapPlan] = None
-    pair: Optional[str] = None   # order book key
+    pair: Optional[str] = None  # order book key
     side: Optional[OrderSide] = None
-    size: Decimal = ZERO         # base units
+    size: Decimal = ZERO  # base units
     limit_price: Decimal = ZERO
 
     @property
     def price(self) -> Decimal:
         return self.amount_in / self.amount_out if self.amount_out > 0 else ZERO
+
+    def amm(self) -> Tuple[str, SwapPlan]:
+        """(pool id, plan) — set on every AMM route."""
+        if self.pool_id is None or self.plan is None:
+            raise ValueError("not an AMM route")
+        return self.pool_id, self.plan
+
+    def clob(self) -> Tuple[str, OrderSide]:
+        """(order-book pair, side) — set on every order-book route."""
+        if self.pair is None or self.side is None:
+            raise ValueError("not an order-book route")
+        return self.pair, self.side
 
 
 class UnifiedRouter:
@@ -147,11 +166,15 @@ class UnifiedRouter:
 
     # -- Quoting (read-only, exact) -----------------------------------------
 
-    def amm_routes(self, token_in: str, token_out: str, amount_in: Decimal,
-                   pool_id: Optional[str] = None) -> List[Route]:
+    def amm_routes(
+        self, token_in: str, token_out: str, amount_in: Decimal, pool_id: Optional[str] = None
+    ) -> List[Route]:
         routes = []
-        pools = ([self.pool_manager.get_pool(pool_id)] if pool_id
-                 else self.pool_manager.get_pools_for_pair(token_in, token_out))
+        pools = (
+            [self.pool_manager.get_pool(pool_id)]
+            if pool_id
+            else self.pool_manager.get_pools_for_pair(token_in, token_out)
+        )
         for pool in sorted((p for p in pools if p is not None), key=lambda p: p.state.id):
             if {pool.state.token0, pool.state.token1} != {token_in, token_out}:
                 continue
@@ -159,13 +182,24 @@ class UnifiedRouter:
                 plan = pool.quote(amount_in, zero_for_one=(token_in == pool.state.token0))
             except ValueError:
                 continue
-            routes.append(Route(FillSource.AMM, token_in, token_out, plan.amount_in,
-                                plan.amount_out, plan.fee, pool_id=pool.state.id, plan=plan))
+            routes.append(
+                Route(
+                    FillSource.AMM,
+                    token_in,
+                    token_out,
+                    plan.amount_in,
+                    plan.amount_out,
+                    plan.fee,
+                    pool_id=pool.state.id,
+                    plan=plan,
+                )
+            )
         return routes
 
     @_pinned
-    def clob_route(self, token_in: str, token_out: str, amount_in: Decimal,
-                   sender: str = "") -> Optional[Route]:
+    def clob_route(
+        self, token_in: str, token_out: str, amount_in: Decimal, sender: str = ""
+    ) -> Optional[Route]:
         """Walk the book exactly as matching will. None if it cannot fill anything."""
         pair = self._pair_key(token_in, token_out)
         book = self._order_books.get(pair)
@@ -183,15 +217,16 @@ class UnifiedRouter:
             for order in levels[price].orders:
                 if not order.is_active:
                     continue
-                if order.owner == sender:          # self-trade prevention stops the taker here
+                if order.owner == sender:  # self-trade prevention stops the taker here
                     done = True
                     break
                 if selling:
                     take = min(order.remaining, amount_in - size)
                     out += take * price
                 else:
-                    affordable = ((amount_in - spent) / price).quantize(AMOUNT_QUANTUM,
-                                                                        rounding=ROUND_DOWN)
+                    affordable = ((amount_in - spent) / price).quantize(
+                        AMOUNT_QUANTUM, rounding=ROUND_DOWN
+                    )
                     take = min(order.remaining, affordable)
                     spent += take * price
                     out += take
@@ -208,11 +243,28 @@ class UnifiedRouter:
         if size < MIN_ORDER_SIZE or out <= 0:
             return None
         used = size if selling else spent
-        return Route(FillSource.CLOB, token_in, token_out, used, out, ZERO, pair=pair,
-                     side=side, size=size, limit_price=limit)
+        return Route(
+            FillSource.CLOB,
+            token_in,
+            token_out,
+            used,
+            out,
+            ZERO,
+            pair=pair,
+            side=side,
+            size=size,
+            limit_price=limit,
+        )
 
-    def best_route(self, token_in: str, token_out: str, amount_in: Decimal, sender: str = "",
-                   pool_id: Optional[str] = None, venue: str = "auto") -> Optional[Route]:
+    def best_route(
+        self,
+        token_in: str,
+        token_out: str,
+        amount_in: Decimal,
+        sender: str = "",
+        pool_id: Optional[str] = None,
+        venue: str = "auto",
+    ) -> Optional[Route]:
         """The route giving the most output (ties: the AMM, then the lowest pool id)."""
         amount_in = Decimal(str(amount_in))
         candidates: List[Route] = []
@@ -224,21 +276,29 @@ class UnifiedRouter:
                 candidates.append(r)
         if not candidates:
             return None
-        return max(candidates, key=lambda r: (r.amount_out, r.source == FillSource.AMM,
-                                              [-ord(c) for c in (r.pool_id or "")]))
+        return max(
+            candidates,
+            key=lambda r: (
+                r.amount_out,
+                r.source == FillSource.AMM,
+                [-ord(c) for c in (r.pool_id or "")],
+            ),
+        )
 
     # Back-compat quoting helpers ----------------------------------------------
 
-    def quote_amm(self, token_in: str, token_out: str, amount_in: Decimal
-                  ) -> Optional[Tuple[Decimal, Decimal, str]]:
+    def quote_amm(
+        self, token_in: str, token_out: str, amount_in: Decimal
+    ) -> Optional[Tuple[Decimal, Decimal, str]]:
         routes = self.amm_routes(token_in, token_out, Decimal(str(amount_in)))
         if not routes:
             return None
         best = max(routes, key=lambda r: r.amount_out)
-        return best.amount_out, best.fee_total, best.pool_id
+        return best.amount_out, best.fee_total, best.amm()[0]
 
-    def quote_clob(self, token_in: str, token_out: str, amount_in: Decimal
-                   ) -> Optional[Tuple[Decimal, Decimal]]:
+    def quote_clob(
+        self, token_in: str, token_out: str, amount_in: Decimal
+    ) -> Optional[Tuple[Decimal, Decimal]]:
         r = self.clob_route(token_in, token_out, Decimal(str(amount_in)))
         return None if r is None else (r.amount_out, r.fee_total)
 
@@ -250,29 +310,52 @@ class UnifiedRouter:
         if self._paused:
             raise ValueError("Router is paused — emergency mode")
         if route.source == FillSource.AMM:
-            pool = self.pool_manager.get_pool(route.pool_id)
+            pool_id, plan = route.amm()
+            pool = self.pool_manager.get_pool(pool_id)
             if pool is None:
-                raise ValueError(f"Pool {route.pool_id} not found")
-            pool.apply(route.plan, now)
-            fees = self._fee_parts(route.plan.fee, route.plan.protocol_fee)
-            return FillResult(source=FillSource.AMM, amount_in=route.amount_in,
-                              amount_out=route.amount_out, fee_total=route.fee_total, **fees,
-                              price=route.price, trades=[], pool_id=route.pool_id)
-        book = self._order_books[route.pair]
+                raise ValueError(f"Pool {pool_id} not found")
+            pool.apply(plan, now)
+            fees = self._fee_parts(plan.fee, plan.protocol_fee)
+            return FillResult(
+                source=FillSource.AMM,
+                amount_in=route.amount_in,
+                amount_out=route.amount_out,
+                fee_total=route.fee_total,
+                **fees,
+                price=route.price,
+                trades=[],
+                pool_id=route.pool_id,
+            )
+        pair, side = route.clob()
+        book = self._order_books[pair]
         self._clob_sequence += 1
-        order = Order(id=self._deterministic_clob_order_id(sender, self._clob_sequence),
-                      owner=sender, side=route.side, order_type=OrderType.LIMIT,
-                      price=route.limit_price, amount=route.size, nonce=0, timestamp=0.0)
+        order = Order(
+            id=self._deterministic_clob_order_id(sender, self._clob_sequence),
+            owner=sender,
+            side=side,
+            order_type=OrderType.LIMIT,
+            price=route.limit_price,
+            amount=route.size,
+            nonce=0,
+            timestamp=0.0,
+        )
         trades = book.place_order(order, protocol=True)
         if order.is_active:
-            book.cancel_order(order.id, caller=sender)          # immediate-or-cancel
+            book.cancel_order(order.id, caller=sender)  # immediate-or-cancel
         filled = sum((t.amount for t in trades), ZERO)
         if filled != route.size:
             raise ValueError(f"order book fill {filled} differs from its quote {route.size}")
         fees = self._fee_parts(ZERO, ZERO)
-        return FillResult(source=FillSource.CLOB, amount_in=route.amount_in,
-                          amount_out=route.amount_out, fee_total=ZERO, **fees,
-                          price=route.price, trades=trades, order=order)
+        return FillResult(
+            source=FillSource.CLOB,
+            amount_in=route.amount_in,
+            amount_out=route.amount_out,
+            fee_total=ZERO,
+            **fees,
+            price=route.price,
+            trades=trades,
+            order=order,
+        )
 
     def execute(
         self,
@@ -305,20 +388,26 @@ class UnifiedRouter:
     # -- Helpers ------------------------------------------------------------
 
     @staticmethod
-    def _fee_parts(total: Decimal, protocol: Decimal) -> Dict[str, Decimal]:
+    def _fee_parts(total: Decimal, protocol: Decimal) -> Dict[str, Any]:
         """The fee as the pool splits it (§7.6): LPs' share, and the protocol's divided between
         creator, treasury and validators in proportion 15 : 10 : 5."""
         lp = total - protocol
         protocol_shares = FEE_CREATOR_SHARE + FEE_TREASURY_SHARE + FEE_VALIDATOR_SHARE
         if protocol > 0:
             creator = (protocol * FEE_CREATOR_SHARE / protocol_shares).quantize(
-                Decimal("1e-18"), rounding=ROUND_DOWN)
+                Decimal("1e-18"), rounding=ROUND_DOWN
+            )
             treasury = (protocol * FEE_TREASURY_SHARE / protocol_shares).quantize(
-                Decimal("1e-18"), rounding=ROUND_DOWN)
+                Decimal("1e-18"), rounding=ROUND_DOWN
+            )
         else:
             creator = treasury = ZERO
-        return {"fee_lp": lp, "fee_creator": creator, "fee_treasury": treasury,
-                "fee_validator": protocol - creator - treasury}
+        return {
+            "fee_lp": lp,
+            "fee_creator": creator,
+            "fee_treasury": treasury,
+            "fee_validator": protocol - creator - treasury,
+        }
 
     @staticmethod
     def _split_fees(total: Decimal) -> Dict[str, Decimal]:
@@ -327,8 +416,12 @@ class UnifiedRouter:
         creator = (total * FEE_CREATOR_SHARE).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
         treasury = (total * FEE_TREASURY_SHARE).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
         validator = total - lp - creator - treasury
-        return {"fee_lp": lp, "fee_creator": creator, "fee_treasury": treasury,
-                "fee_validator": validator}
+        return {
+            "fee_lp": lp,
+            "fee_creator": creator,
+            "fee_treasury": treasury,
+            "fee_validator": validator,
+        }
 
     @staticmethod
     def _pair_key(token_a: str, token_b: str) -> str:

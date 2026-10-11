@@ -7,6 +7,12 @@ Provides:
   - TimelockQueue / TimelockEntry / GovernanceExecutor (execution.py)
 """
 
+from .execution import (
+    GovernanceExecutor,
+    TimelockEntry,
+    TimelockQueue,
+    TimelockStatus,
+)
 from .proposals import (
     GovernanceError,
     InvalidProposalError,
@@ -21,12 +27,6 @@ from .voting import (
     VoteRecord,
     VotingEngine,
     VotingResult,
-)
-from .execution import (
-    GovernanceExecutor,
-    TimelockEntry,
-    TimelockQueue,
-    TimelockStatus,
 )
 
 __all__ = [

@@ -1,18 +1,21 @@
 from decimal import Decimal
 
-from ..constants import ENDIAN, SMALLEST, CURVE
-from ..helpers import byte_length, string_to_point, string_to_bytes
+from ..constants import CURVE, ENDIAN, SMALLEST
+from ..helpers import byte_length, string_to_bytes, string_to_point
 
 
 class TransactionOutput:
     def __init__(self, address: str, amount: Decimal):
         from fastecdsa.point import Point
+
         if isinstance(address, Point):
-            raise Exception('TransactionOutput does not accept Point anymore. Pass the address string instead')
+            raise Exception(
+                "TransactionOutput does not accept Point anymore. Pass the address string instead"
+            )
         self.address = address
         self.address_bytes = string_to_bytes(address)
         self.public_key = string_to_point(address)
-        assert (amount * SMALLEST) % 1 == 0.0, 'too many decimal digits'
+        assert (amount * SMALLEST) % 1 == 0.0, "too many decimal digits"
         self.amount = amount
 
     def tobytes(self):
@@ -26,7 +29,6 @@ class TransactionOutput:
     @property
     def as_dict(self):
         res = vars(self).copy()
-        if 'public_key' in res: del res['public_key']
+        if "public_key" in res:
+            del res["public_key"]
         return res
-
-

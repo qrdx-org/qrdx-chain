@@ -19,7 +19,6 @@
 .mypy_cache
 .ruff_cache
 .pre-commit-config.yaml
-.gitleaks.toml
 
 # --- Local runtime state (never belongs in an image) ---
 data/

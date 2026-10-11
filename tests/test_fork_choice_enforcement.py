@@ -45,17 +45,20 @@ def test_both_gates_are_on_by_default():
 
 
 def test_reconciliation_enforce_path_is_not_a_stub():
-    """It was literally 'intentionally not wired yet' — flipping the flag did nothing."""
+    """It was literally 'intentionally not wired yet' — flipping the flag did nothing. The pass
+    now runs the fork-choice resolver, which fetches and scores the peer's branch BEFORE it
+    rolls anything back, and applies it after."""
     import inspect
-    src = inspect.getsource(node_main.fork_choice_reconcile_pass)
-    assert "intentionally not wired yet" not in src
-    assert "handle_reorganization(" in src, "enforce path must roll back to the ancestor"
-    assert "get_blocks(" in src, (
-        "enforce path must then FETCH the canonical chain — handle_reorganization alone "
-        "only rolls back, leaving the node short")
+    src = inspect.getsource(node_main.resolve_fork_with_peer)
+    assert "intentionally not wired yet" not in inspect.getsource(
+        node_main.fork_choice_reconcile_pass)
+    assert src.index("get_blocks(") < src.index("ffg.prefer(") < src.index("_rollback_to(")
+    assert src.index("_rollback_to(") < src.index("_apply_branch(branch")
+    # ... all under one hold of the block-processing lock (tests/test_fork_resolution.py)
+    assert "async with _adopting_peer_chain(), block_processing_lock:" in src
     assert "remote_height <= local_height" not in src, (
-        "must not reuse _sync_blockchain's longest-chain gate: equal-height reconciliation "
-        "is exactly the case that gate declines")
+        "must not reuse _sync_blockchain's longest-chain gate: equal-height forks are "
+        "exactly the case that gate declines")
 
 
 async def _db_with_block(height, block_hash):

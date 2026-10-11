@@ -8,7 +8,7 @@ It adds the necessary tables for validators, attestations, epochs, and slashing.
 Usage:
     python -m qrdx.migrations.migrate_to_pos --database-url postgresql://user:pass@host/db
 
-IMPORTANT: 
+IMPORTANT:
 - Always backup your database before running migrations
 - This migration is one-way (no automatic rollback)
 - Run during a maintenance window when no blocks are being produced
@@ -20,7 +20,6 @@ import sys
 from datetime import datetime
 
 import asyncpg
-
 
 MIGRATION_VERSION = "2.0.0-pos"
 MIGRATION_DATE = "2025-01-01"
@@ -34,7 +33,7 @@ MIGRATION_SQL = """
 -- =============================================================================
 
 -- Record migration start
-INSERT INTO migrations (version, description, started_at) 
+INSERT INTO migrations (version, description, started_at)
 VALUES ('2.0.0-pos', 'Proof-of-Stake consensus migration', NOW())
 ON CONFLICT (version) DO NOTHING;
 
@@ -105,24 +104,24 @@ CREATE TABLE IF NOT EXISTS validators (
     id SERIAL PRIMARY KEY,
     address VARCHAR(128) UNIQUE NOT NULL,
     public_key TEXT NOT NULL,
-    
+
     stake NUMERIC(20, 6) NOT NULL DEFAULT 0,
     effective_stake NUMERIC(20, 6) NOT NULL DEFAULT 0,
-    
+
     status validator_status NOT NULL DEFAULT 'pending',
     activation_epoch INTEGER,
     exit_epoch INTEGER,
     withdrawable_epoch INTEGER,
     slashed BOOLEAN NOT NULL DEFAULT FALSE,
-    
+
     blocks_proposed INTEGER NOT NULL DEFAULT 0,
     blocks_missed INTEGER NOT NULL DEFAULT 0,
     attestations_made INTEGER NOT NULL DEFAULT 0,
     attestations_missed INTEGER NOT NULL DEFAULT 0,
-    
+
     total_rewards NUMERIC(20, 6) NOT NULL DEFAULT 0,
     total_slashed NUMERIC(20, 6) NOT NULL DEFAULT 0,
-    
+
     graffiti VARCHAR(32),
     created_at TIMESTAMP(0) NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP(0) NOT NULL DEFAULT NOW()
@@ -140,14 +139,14 @@ CREATE TABLE IF NOT EXISTS stakes (
     validator_address VARCHAR(128) NOT NULL REFERENCES validators(address),
     amount NUMERIC(20, 6) NOT NULL,
     deposit_epoch INTEGER NOT NULL,
-    
+
     withdrawal_requested_epoch INTEGER,
     withdrawal_completed_epoch INTEGER,
     withdrawable_at TIMESTAMP(0),
-    
+
     deposit_tx_hash CHAR(64),
     withdrawal_tx_hash CHAR(64),
-    
+
     created_at TIMESTAMP(0) NOT NULL DEFAULT NOW()
 );
 
@@ -160,22 +159,22 @@ CREATE INDEX IF NOT EXISTS stakes_deposit_epoch_idx ON stakes (deposit_epoch);
 
 CREATE TABLE IF NOT EXISTS epochs (
     epoch INTEGER PRIMARY KEY,
-    
+
     start_slot BIGINT NOT NULL,
     end_slot BIGINT NOT NULL,
-    
+
     active_validators INTEGER NOT NULL DEFAULT 0,
     total_stake NUMERIC(24, 6) NOT NULL DEFAULT 0,
-    
+
     finalized BOOLEAN NOT NULL DEFAULT FALSE,
     justified BOOLEAN NOT NULL DEFAULT FALSE,
     finality_root CHAR(64),
-    
+
     randao_mix TEXT,
-    
+
     total_rewards NUMERIC(20, 6) NOT NULL DEFAULT 0,
     total_penalties NUMERIC(20, 6) NOT NULL DEFAULT 0,
-    
+
     started_at TIMESTAMP(0),
     finalized_at TIMESTAMP(0),
     created_at TIMESTAMP(0) NOT NULL DEFAULT NOW()
@@ -187,23 +186,23 @@ CREATE TABLE IF NOT EXISTS epochs (
 
 CREATE TABLE IF NOT EXISTS attestations (
     id SERIAL PRIMARY KEY,
-    
+
     slot BIGINT NOT NULL,
     epoch INTEGER NOT NULL,
     block_hash CHAR(64) NOT NULL,
-    
+
     validator_address VARCHAR(128) NOT NULL,
     validator_index INTEGER NOT NULL,
     signature TEXT NOT NULL,
-    
+
     source_epoch INTEGER NOT NULL,
     target_epoch INTEGER NOT NULL,
-    
+
     included_in_block CHAR(64),
     inclusion_slot BIGINT,
-    
+
     created_at TIMESTAMP(0) NOT NULL DEFAULT NOW(),
-    
+
     UNIQUE (slot, validator_address)
 );
 
@@ -219,25 +218,25 @@ CREATE INDEX IF NOT EXISTS attestations_inclusion_idx ON attestations (included_
 
 CREATE TABLE IF NOT EXISTS slashing_events (
     id SERIAL PRIMARY KEY,
-    
+
     validator_address VARCHAR(128) NOT NULL REFERENCES validators(address),
-    
+
     condition slashing_condition NOT NULL,
     slot BIGINT NOT NULL,
     epoch INTEGER NOT NULL,
-    
+
     evidence_type VARCHAR(64),
     evidence_data TEXT,
-    
+
     penalty_amount NUMERIC(20, 6) NOT NULL,
     penalty_percentage NUMERIC(5, 2) NOT NULL,
-    
+
     reporter_address VARCHAR(128),
     reporter_reward NUMERIC(20, 6),
-    
+
     executed BOOLEAN NOT NULL DEFAULT FALSE,
     executed_at TIMESTAMP(0),
-    
+
     created_at TIMESTAMP(0) NOT NULL DEFAULT NOW()
 );
 
@@ -251,12 +250,12 @@ CREATE INDEX IF NOT EXISTS slashing_epoch_idx ON slashing_events (epoch);
 CREATE TABLE IF NOT EXISTS slashing_protection (
     id SERIAL PRIMARY KEY,
     validator_address VARCHAR(128) NOT NULL,
-    
+
     signed_blocks JSONB NOT NULL DEFAULT '[]',
     signed_attestations JSONB NOT NULL DEFAULT '[]',
-    
+
     updated_at TIMESTAMP(0) NOT NULL DEFAULT NOW(),
-    
+
     UNIQUE (validator_address)
 );
 
@@ -268,11 +267,11 @@ CREATE TABLE IF NOT EXISTS proposer_duties (
     slot BIGINT PRIMARY KEY,
     epoch INTEGER NOT NULL,
     validator_address VARCHAR(128) NOT NULL,
-    
+
     proposed BOOLEAN NOT NULL DEFAULT FALSE,
     proposed_block_hash CHAR(64),
     missed BOOLEAN NOT NULL DEFAULT FALSE,
-    
+
     created_at TIMESTAMP(0) NOT NULL DEFAULT NOW()
 );
 
@@ -287,19 +286,19 @@ CREATE TABLE IF NOT EXISTS validator_rewards (
     id SERIAL PRIMARY KEY,
     validator_address VARCHAR(128) NOT NULL REFERENCES validators(address),
     epoch INTEGER NOT NULL,
-    
+
     proposal_reward NUMERIC(14, 6) NOT NULL DEFAULT 0,
     attestation_reward NUMERIC(14, 6) NOT NULL DEFAULT 0,
     sync_reward NUMERIC(14, 6) NOT NULL DEFAULT 0,
-    
+
     missed_proposal_penalty NUMERIC(14, 6) NOT NULL DEFAULT 0,
     missed_attestation_penalty NUMERIC(14, 6) NOT NULL DEFAULT 0,
     inactivity_penalty NUMERIC(14, 6) NOT NULL DEFAULT 0,
-    
+
     net_reward NUMERIC(14, 6) NOT NULL DEFAULT 0,
-    
+
     created_at TIMESTAMP(0) NOT NULL DEFAULT NOW(),
-    
+
     UNIQUE (validator_address, epoch)
 );
 
@@ -313,18 +312,18 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     id SERIAL PRIMARY KEY,
     epoch INTEGER NOT NULL,
     root CHAR(64) NOT NULL,
-    
+
     justified BOOLEAN NOT NULL DEFAULT FALSE,
     justified_at TIMESTAMP(0),
-    
+
     finalized BOOLEAN NOT NULL DEFAULT FALSE,
     finalized_at TIMESTAMP(0),
-    
+
     total_stake_voted NUMERIC(24, 6) NOT NULL DEFAULT 0,
     attestation_count INTEGER NOT NULL DEFAULT 0,
-    
+
     created_at TIMESTAMP(0) NOT NULL DEFAULT NOW(),
-    
+
     UNIQUE (epoch, root)
 );
 
@@ -344,8 +343,8 @@ CREATE TABLE IF NOT EXISTS migrations (
 );
 
 -- Mark migration as complete
-UPDATE migrations 
-SET completed_at = NOW(), success = TRUE 
+UPDATE migrations
+SET completed_at = NOW(), success = TRUE
 WHERE version = '2.0.0-pos';
 
 -- =============================================================================
@@ -353,11 +352,11 @@ WHERE version = '2.0.0-pos';
 -- =============================================================================
 
 -- This query should return all new tables
-SELECT table_name 
-FROM information_schema.tables 
-WHERE table_schema = 'public' 
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = 'public'
 AND table_name IN (
-    'validators', 'stakes', 'epochs', 'attestations', 
+    'validators', 'stakes', 'epochs', 'attestations',
     'slashing_events', 'slashing_protection', 'proposer_duties',
     'validator_rewards', 'checkpoints', 'migrations'
 );
@@ -367,11 +366,11 @@ AND table_name IN (
 async def run_migration(database_url: str, dry_run: bool = False) -> bool:
     """
     Run the PoS database migration.
-    
+
     Args:
         database_url: PostgreSQL connection URL
         dry_run: If True, only validate without applying changes
-        
+
     Returns:
         True if migration successful
     """
@@ -380,25 +379,24 @@ async def run_migration(database_url: str, dry_run: bool = False) -> bool:
     print(f"Started at: {datetime.now().isoformat()}")
     print(f"Database: {database_url.split('@')[-1] if '@' in database_url else database_url}")
     print()
-    
+
     try:
         # Connect to database
         conn = await asyncpg.connect(database_url)
         print("✓ Connected to database")
-        
+
         # Check if migration already applied
         try:
             result = await conn.fetchrow(
-                "SELECT * FROM migrations WHERE version = $1",
-                MIGRATION_VERSION
+                "SELECT * FROM migrations WHERE version = $1", MIGRATION_VERSION
             )
-            if result and result['success']:
+            if result and result["success"]:
                 print(f"✓ Migration {MIGRATION_VERSION} already applied")
                 await conn.close()
                 return True
         except asyncpg.UndefinedTableError:
             pass  # migrations table doesn't exist yet
-        
+
         if dry_run:
             print("\n[DRY RUN] Would execute the following changes:")
             print("-" * 40)
@@ -414,41 +412,41 @@ async def run_migration(database_url: str, dry_run: bool = False) -> bool:
         else:
             print("\nApplying migration...")
             print("-" * 40)
-            
+
             # Run migration in transaction
             async with conn.transaction():
                 await conn.execute(MIGRATION_SQL)
-            
+
             print("✓ Migration SQL executed")
-            
+
             # Verify tables created
             tables = await conn.fetch("""
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public' 
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
                 AND table_name IN (
-                    'validators', 'stakes', 'epochs', 'attestations', 
+                    'validators', 'stakes', 'epochs', 'attestations',
                     'slashing_events', 'slashing_protection', 'proposer_duties',
                     'validator_rewards', 'checkpoints', 'migrations'
                 )
             """)
-            
+
             print(f"✓ Created {len(tables)} tables:")
             for t in tables:
                 print(f"  - {t['table_name']}")
-            
+
             # Verify blocks table updated
             columns = await conn.fetch("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'blocks' 
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'blocks'
                 AND column_name IN ('slot', 'epoch', 'proposer_address')
             """)
-            
+
             print(f"✓ Updated blocks table with {len(columns)} new columns")
-        
+
         await conn.close()
-        
+
         print()
         print("=" * 60)
         if dry_run:
@@ -456,9 +454,9 @@ async def run_migration(database_url: str, dry_run: bool = False) -> bool:
         else:
             print(f"Migration {MIGRATION_VERSION} completed successfully!")
         print(f"Completed at: {datetime.now().isoformat()}")
-        
+
         return True
-        
+
     except Exception as e:
         print(f"\n✗ Migration failed: {e}")
         return False
@@ -473,29 +471,29 @@ def main():
 Examples:
   # Run migration
   python -m qrdx.migrations.migrate_to_pos --database-url postgresql://qrdx:qrdx@localhost/qrdx
-  
+
   # Dry run (validate only)
   python -m qrdx.migrations.migrate_to_pos --database-url postgresql://qrdx:qrdx@localhost/qrdx --dry-run
-        """
+        """,
     )
-    
+
     parser.add_argument(
         "--database-url",
         required=True,
         help="PostgreSQL connection URL",
     )
-    
+
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate migration without applying changes",
     )
-    
+
     args = parser.parse_args()
-    
+
     # Run migration
     success = asyncio.run(run_migration(args.database_url, args.dry_run))
-    
+
     sys.exit(0 if success else 1)
 
 

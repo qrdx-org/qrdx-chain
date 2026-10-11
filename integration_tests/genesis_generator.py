@@ -15,7 +15,7 @@ from typing import Dict, List
 from integration_tests.config import (
     CHAIN_ID, NETWORK_NAME, GENESIS_FILE,
     VALIDATOR_STAKE, WALLET_ROSTER,
-    CONTRACT_TEST_BALANCE, SLOT_DURATION, SLOTS_PER_EPOCH, STABLECOIN_SYMBOL,
+    CONTRACT_TEST_BALANCE, SLOT_DURATION_MS, SLOTS_PER_EPOCH, STABLECOIN_SYMBOL,
 )
 from integration_tests.wallet_factory import generate_all_wallets, get_wallet_address, get_wallet_public_key_hex
 
@@ -39,16 +39,25 @@ def testnet_chain_spec(wallets: Dict[str, dict]):
     consensus parameters from here — the genesis file — never from its environment.
 
     Harness knobs, read from THIS process's environment (never passed to a node):
-      QRDX_SLOT_DURATION / QRDX_SLOTS_PER_EPOCH   slot clock (the RANDAO larger-slot config)
+      QRDX_SLOT_DURATION_MS / QRDX_SLOTS_PER_EPOCH   slot clock (milliseconds per slot)
       QRDX_ENFORCE_RANDAO=1                       RANDAO selection from genesis
       QRDX_TESTNET_RANDAO_FORK_HEIGHT=N           RANDAO selection switched on by a fork at
                                                   height N — a live protocol upgrade
+      QRDX_LEGACY_STATE_ROOT=1                    sequential state roots (no
+                                                  incremental_state_root)
     """
     from qrdx import chain_spec as cs
 
     reporter = wallets.get("Oracle Reporter", {}).get("address", "")
+    slot_ms = int(os.environ.get("QRDX_SLOT_DURATION_MS") or SLOT_DURATION_MS)
+
+    def blocks(seconds):
+        """A duration in blocks at this slot: scenarios wait on wall-clock time, so a timelock
+        or voting period lasts as long whatever the slot."""
+        return max(1, round(seconds * 1000 / slot_ms))
+
     params = {
-        "SLOT_DURATION": int(os.environ.get("QRDX_SLOT_DURATION") or SLOT_DURATION),
+        "SLOT_DURATION_MS": slot_ms,
         "SLOTS_PER_EPOCH": int(os.environ.get("QRDX_SLOTS_PER_EPOCH") or SLOTS_PER_EPOCH),
         # A 3-validator set is below the production minimum.
         "MIN_VALIDATORS": 1,
@@ -56,7 +65,7 @@ def testnet_chain_spec(wallets: Dict[str, dict]):
         # deposit→active→exit→exited round-trip within a short soak.
         "ACTIVATION_DELAY_EPOCHS": 1,
         "UNBONDING_PERIOD_EPOCHS": 2,
-        # Withdrawability delay after exit (production 256): long enough to cover the finality
+        # Withdrawability delay after exit (standard 2,048): long enough to cover the finality
         # lag, short enough that a soak sees the principal come back.
         "WITHDRAWAL_DELAY_EPOCHS": 4,
         # Prices come from the validators' votes (docs/PERPS_CLEARINGHOUSE.md §8); no trusted
@@ -72,16 +81,27 @@ def testnet_chain_spec(wallets: Dict[str, dict]):
         # fixed in advance by the issuer's first nonce.
         "PERP_COLLATERAL_TOKEN": stablecoin_address(wallets),
         "PERP_QUOTE": "USD",
-        # Governance on testnet time (production: a week of voting, a 2-day timelock, a
-        # 256-block fork-approval lead). The veto threshold is small enough for a test holder
-        # to reach (S22); the approval threshold stays 2/3, so all three validators must vote.
-        "GOV_VOTING_PERIOD_BLOCKS": 60,
-        "GOV_TIMELOCK_BLOCKS": 8,
-        "GOV_EXECUTION_WINDOW_BLOCKS": 200,
+        # Governance on testnet time (standard: a week of voting, a 2-day timelock, a
+        # 256-block fork-approval lead): 2 minutes of voting, a 16 s timelock, ~13 minutes to
+        # execute. The veto threshold is small enough for a test holder to reach (S22); the
+        # approval threshold stays 2/3, so all three validators must vote.
+        "GOV_VOTING_PERIOD_BLOCKS": blocks(120),
+        "GOV_TIMELOCK_BLOCKS": blocks(16),
+        "GOV_EXECUTION_WINDOW_BLOCKS": blocks(800),
         "GOV_VETO_THRESHOLD_QRDX": 500,
-        "GOV_FORK_APPROVAL_LEAD_BLOCKS": 5,
+        "GOV_FORK_APPROVAL_LEAD_BLOCKS": blocks(10),
     }
-    features, forks = [], []
+    # The testnet runs this release's default rules; QRDX_LEGACY_STATE_ROOT=1 runs the
+    # sequential state roots instead (A/B).
+    features = [
+        f
+        for f in cs.GENESIS_DEFAULT_FEATURES
+        if not (
+            f == "incremental_state_root"
+            and os.environ.get("QRDX_LEGACY_STATE_ROOT", "").lower() in _TRUTHY
+        )
+    ]
+    forks = []
     fork_height = os.environ.get("QRDX_TESTNET_RANDAO_FORK_HEIGHT", "").strip()
     if fork_height:
         forks.append({"name": "randao", "height": int(fork_height), "features": ["randao_selection"]})

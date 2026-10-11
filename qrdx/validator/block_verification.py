@@ -87,17 +87,31 @@ def eligible_proposers_for_slot(
     node agrees; ``k=1`` reproduces the single-primary check."""
     from .selection import ValidatorSelector
     from .types import Validator, ValidatorStatus
+
     vals = [
-        Validator(address=addr, public_key=b"", stake=stake, effective_stake=stake,
-                  status=ValidatorStatus.ACTIVE, activation_epoch=0)
+        Validator(
+            address=addr,
+            public_key=b"",
+            stake=stake,
+            effective_stake=stake,
+            status=ValidatorStatus.ACTIVE,
+            activation_epoch=0,
+        )
         for addr, stake in validators
     ]
     return [v.address for v in ValidatorSelector().proposer_ranking(slot, vals, randao_mix, k)]
 
+
 # Header fields the proposer signs (see manager.PoSBlock.signing_root).
 _SIGNING_FIELDS = (
-    "number", "parent_hash", "state_root", "transactions_root",
-    "timestamp", "slot", "epoch", "randao_reveal",
+    "number",
+    "parent_hash",
+    "state_root",
+    "transactions_root",
+    "timestamp",
+    "slot",
+    "epoch",
+    "randao_reveal",
 )
 
 
@@ -122,12 +136,12 @@ def is_double_sign(block_content_a: Any, block_content_b: Any) -> bool:
         b = _parse_block_content(block_content_b)
     except Exception:
         return False
-    pa, pb = a.get('proposer_address'), b.get('proposer_address')
+    pa, pb = a.get("proposer_address"), b.get("proposer_address")
     if not pa or pa != pb:
         return False
-    if a.get('slot') is None or a.get('slot') != b.get('slot'):
+    if a.get("slot") is None or a.get("slot") != b.get("slot"):
         return False
-    return (a.get('hash') or a.get('block_hash')) != (b.get('hash') or b.get('block_hash'))
+    return (a.get("hash") or a.get("block_hash")) != (b.get("hash") or b.get("block_hash"))
 
 
 def epoch_from_block(block_like: Dict[str, Any]) -> Optional[int]:
@@ -161,6 +175,7 @@ def epoch_from_block(block_like: Dict[str, Any]) -> Optional[int]:
                 return int(content["epoch"])
             if content.get("slot") is not None:
                 from ..constants import SLOTS_PER_EPOCH
+
                 return int(content["slot"]) // SLOTS_PER_EPOCH
         except Exception:
             pass
@@ -168,6 +183,7 @@ def epoch_from_block(block_like: Dict[str, Any]) -> Optional[int]:
     if block_like.get("slot") is not None:
         try:
             from ..constants import SLOTS_PER_EPOCH
+
             return int(block_like["slot"]) // SLOTS_PER_EPOCH
         except (TypeError, ValueError):
             pass
@@ -180,15 +196,16 @@ def reconstruct_signing_root(bc: Dict[str, Any]) -> bytes:
     The domain makes a header signed on another network fail verification here — including as
     DOUBLE_SIGN evidence."""
     from ..chain_spec import signing_domain
+
     data = signing_domain("block") + (
-        int(bc["number"]).to_bytes(8, "little") +
-        bytes.fromhex(bc["parent_hash"]) +
-        bytes.fromhex(bc["state_root"]) +
-        bytes.fromhex(bc["transactions_root"]) +
-        int(bc["timestamp"]).to_bytes(8, "little") +
-        int(bc["slot"]).to_bytes(8, "little") +
-        int(bc["epoch"]).to_bytes(8, "little") +
-        bytes.fromhex(bc["randao_reveal"])
+        int(bc["number"]).to_bytes(8, "little")
+        + bytes.fromhex(bc["parent_hash"])
+        + bytes.fromhex(bc["state_root"])
+        + bytes.fromhex(bc["transactions_root"])
+        + int(bc["timestamp"]).to_bytes(8, "little")
+        + int(bc["slot"]).to_bytes(8, "little")
+        + int(bc["epoch"]).to_bytes(8, "little")
+        + bytes.fromhex(bc["randao_reveal"])
     )
     return hashlib.sha256(data).digest()
 
@@ -233,7 +250,8 @@ async def verify_proposer_eligibility(
         validators = [
             (r["address"], Decimal(str(r.get("effective_stake") or r.get("stake") or 0)))
             for r in rows
-            if r.get("address") and str(r.get("status", "active")).upper() in ("ACTIVE", "PENDING", "EXITING")
+            if r.get("address")
+            and str(r.get("status", "active")).upper() in ("ACTIVE", "PENDING", "EXITING")
         ]
     except Exception as e:
         logger.debug("eligibility: could not load validator set: %s", e)
@@ -248,6 +266,7 @@ async def verify_proposer_eligibility(
     # Whether RANDAO selection applies is decided by the block's own HEIGHT (chain-spec feature
     # randao_selection), never by this node's tip.
     from .randao import randao_selection_active, selection_mix_for_slot
+
     randao_enforced = randao_selection_active(height)
     mix = PROPOSER_RANDAO_MIX
     if randao_enforced:
@@ -261,14 +280,27 @@ async def verify_proposer_eligibility(
         # Accept ANY of the slot's top-K eligible proposers (primary or a backup) — the
         # liveness set, so a slow/offline primary that a backup covered still verifies.
         from .randao import RANDAO_PROPOSER_ELIGIBLE_K
-        eligible = set(eligible_proposers_for_slot(slot, validators, mix, RANDAO_PROPOSER_ELIGIBLE_K))
+
+        eligible = set(
+            eligible_proposers_for_slot(slot, validators, mix, RANDAO_PROPOSER_ELIGIBLE_K)
+        )
         ok = (not eligible) or (proposer in eligible)
-        msg = (f"proposer {str(proposer)[:20]}... not in eligible set for slot {slot}") if not ok else ""
+        msg = (
+            (f"proposer {str(proposer)[:20]}... not in eligible set for slot {slot}")
+            if not ok
+            else ""
+        )
     else:
         expected = expected_proposer_for_slot(slot, validators, mix)
         ok = not (expected and expected != proposer)
-        msg = (f"proposer {str(proposer)[:20]}... not eligible for slot {slot} "
-               f"(expected {expected[:20]}...)") if not ok else ""
+        msg = (
+            (
+                f"proposer {str(proposer)[:20]}... not eligible for slot {slot} "
+                f"(expected {str(expected)[:20]}...)"
+            )
+            if not ok
+            else ""
+        )
 
     if not ok:
         if enforce:
@@ -313,6 +345,7 @@ def verify_pos_block_proposer(
     # 1. Identity binding: pubkey must derive to the claimed validator address.
     try:
         from ..crypto.pq.dilithium import PQPublicKey
+
         derived = PQPublicKey.from_bytes(pubkey).to_address()
     except Exception as e:
         return False, f"could not derive address from proposer pubkey: {e}"
@@ -329,10 +362,44 @@ def verify_pos_block_proposer(
         return False, f"could not reconstruct signing root: {e}"
     try:
         from ..crypto.pq import PQPublicKey as PK, PQSignature, verify as pq_verify
+
         ok = pq_verify(PK.from_bytes(pubkey), signing_root, PQSignature.from_bytes(sig))
     except Exception as e:
         return False, f"signature verification error: {e}"
     if not ok:
         return False, "invalid proposer Dilithium signature"
 
+    return True, ""
+
+
+# How far ahead of this node's clock a block's slot may be: about a second (clock skew between
+# honest nodes), and at least one slot.
+def _future_tolerance_slots() -> int:
+    from ..constants import SLOT_DURATION
+
+    return max(1, int(1.0 // float(SLOT_DURATION)) + 1)
+
+
+async def verify_slot_progression(
+    db: Any, block_content: Any, height: int, current_slot: Optional[int]
+) -> Tuple[bool, str]:
+    """A block's slot must be later than its parent's, and not ahead of this node's clock by
+    more than ``_future_tolerance_slots``. Eligibility binds a proposer to a slot; without the
+    first rule one eligible proposer could fill any number of heights from that slot, and
+    without the second it could sign blocks for slots it will be eligible in later. Checked by
+    every import path (the parent is the local tip) and respected by the proposer. A block from
+    the future is refused, not kept: fork choice fetches it again once its slot has come."""
+    from .. import chain_index
+
+    try:
+        bc = _parse_block_content(block_content)
+        slot = int(bc["slot"])
+    except Exception:
+        return False, "block has no readable slot"
+    if height >= 1:
+        parent = await chain_index.slot_at(db, height - 1)
+        if parent is not None and slot <= parent:
+            return False, f"slot {slot} is not after its parent's ({parent})"
+    if current_slot is not None and slot > current_slot + _future_tolerance_slots():
+        return False, f"slot {slot} is ahead of the clock (now {current_slot})"
     return True, ""

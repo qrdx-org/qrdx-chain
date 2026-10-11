@@ -223,9 +223,10 @@ mechanism = "pos"
 
 
 [consensus.pos]
-# PoS parameters (should match network consensus)
-slot_duration = 2          # seconds per slot
-slots_per_epoch = 32       # slots per epoch (64 seconds)
+# PoS parameters, for reference only: every node takes them from its network's genesis chain
+# spec (SLOT_DURATION_MS, SLOTS_PER_EPOCH in qrdx/chain_spec.py).
+slot_duration = 0.25       # seconds per slot (the standard 250 ms)
+slots_per_epoch = 32       # slots per epoch (8 seconds)
 attestation_threshold = 0.667  # 2/3+ for finality
 
 
@@ -257,8 +258,9 @@ min_stake = 100000
 # Maximum effective stake per validator (excess doesn't increase rewards)
 max_effective_stake = 1000000
 
-# Number of epochs for unbonding period (~7 days)
-unbonding_epochs = 5040
+# Number of epochs for unbonding period (~3.7 days of 8 s epochs; the chain spec's
+# UNBONDING_PERIOD_EPOCHS is what consensus uses)
+unbonding_epochs = 40320
 
 
 [validator.attestation]
@@ -268,8 +270,8 @@ max_attestations_per_block = 128
 # Maximum slot distance for attestation inclusion
 max_inclusion_distance = 32
 
-# Seconds into slot to wait before aggregating attestations
-aggregation_delay = 1.0
+# Seconds into slot to wait before aggregating attestations (half the standard slot)
+aggregation_delay = 0.125
 
 
 [validator.slashing_protection]

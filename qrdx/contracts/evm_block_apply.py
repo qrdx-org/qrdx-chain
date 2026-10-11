@@ -93,11 +93,11 @@ async def produce_block_evm_section(
 
     # Fresh reads: other writers (the exchange, withdrawals) changed the database directly.
     state_manager.reset_cache()
-    section = EvmSection()                 # this section's native token moves, pending
+    section = EvmSection()  # this section's native token moves, pending
     token = CURRENT_SECTION.set(section)
     block_snap = await state_manager.snapshot()
     try:
-        for i, raw in enumerate(raw_txs):
+        for _i, raw in enumerate(raw_txs):
             res = await execute_tx(raw, block_height, block_hash, block_timestamp)
             if res is None or res.get("tx_hash") is None:
                 await state_manager.revert(block_snap)
@@ -109,7 +109,7 @@ async def produce_block_evm_section(
         CURRENT_SECTION.reset(token)
 
     await state_manager.commit(block_height, flush_only=True)
-    root = await db.get_account_state_root()
+    root = await db.get_account_state_root(block_height)
     await db.connection.commit()
     state_manager._dirty_accounts.clear()
     state_manager._dirty_storage.clear()
@@ -185,13 +185,23 @@ async def rebuild_account_state_from_chain(
             continue
         ts = int(block.get("timestamp", 0) or 0)
         root, _included = await produce_block_evm_section(
-            height, block_hash, ts, section, db, state_manager, execute_tx,
+            height,
+            block_hash,
+            ts,
+            section,
+            db,
+            state_manager,
+            execute_tx,
         )
         if root is not None:
             applied += 1
-    root = await db.get_account_state_root()
-    logger.info("[reorg-diag] rebuild_account_state: tip=%d evm_sections_applied=%d acct_root=%s",
-                tip, applied, root[:16])
+    root = await db.get_account_state_root(tip)
+    logger.info(
+        "[reorg-diag] rebuild_account_state: tip=%d evm_sections_applied=%d acct_root=%s",
+        tip,
+        applied,
+        root[:16],
+    )
     return root
 
 
@@ -273,9 +283,9 @@ async def apply_block_evm_section(
 
     # 4. Flush-read-decide on a single connection (no competing commit here).
     await state_manager.commit(block_height, flush_only=True)
-    computed_root = await db.get_account_state_root()
+    computed_root = await db.get_account_state_root(block_height)
     if computed_root != declared_state_root:
-        await db.connection.rollback()      # discard the flushed (uncommitted) rows
+        await db.connection.rollback()  # discard the flushed (uncommitted) rows
         await state_manager.revert(block_snap)  # discard cache + created accounts
         return False, (
             f"account_state_root mismatch at block {block_height}: "

@@ -9,10 +9,9 @@ Namespace: ``bridge``  (methods are ``bridge_getDoomsdayStatus``, etc.)
 
 import json
 import logging
-from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
-from ..server import RPCModule, rpc_method, rpc_admin_method, RPCError, RPCErrorCode
+from ..server import RPCError, RPCErrorCode, RPCModule, rpc_admin_method, rpc_method
 
 logger = logging.getLogger(__name__)
 
@@ -72,17 +71,14 @@ class BridgeModule(RPCModule):
                 logger.warning(f"Failed to fetch canary balance: {exc}")
 
         from ...constants import DOOMSDAY_CANARY_BOUNTY
+
         expected = DOOMSDAY_CANARY_BOUNTY
 
         return {
             "canary_address": status["canary_address"],
             "expected_balance": str(expected),
             "live_balance": str(live_balance) if live_balance is not None else None,
-            "is_safe": (
-                live_balance >= expected
-                if live_balance is not None
-                else None
-            ),
+            "is_safe": (live_balance >= expected if live_balance is not None else None),
             "doomsday_active": status["doomsday_active"],
         }
 
@@ -150,7 +146,7 @@ class BridgeModule(RPCModule):
             raise RPCError(
                 RPCErrorCode.INVALID_PARAMS,
                 f"Malformed attestation: {exc}",
-            )
+            ) from exc
 
         triggered = doomsday.submit_canary_attestation(attestation)
 
@@ -187,8 +183,8 @@ class BridgeModule(RPCModule):
 
         try:
             message = bytes.fromhex(message_hex)
-        except ValueError:
-            raise RPCError(RPCErrorCode.INVALID_PARAMS, "Invalid message hex")
+        except ValueError as exc:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, "Invalid message hex") from exc
 
         triggered = doomsday.trigger_by_canary_signature(
             message=message,

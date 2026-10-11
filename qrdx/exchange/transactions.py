@@ -35,22 +35,24 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import dataclass, field, asdict
-from decimal import Decimal, ROUND_HALF_UP
+from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import IntEnum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 ZERO = Decimal("0")
 
 
 def _min_gas_price() -> int:
     from .. import constants
+
     return constants.EXCHANGE_MIN_GAS_PRICE_WEI
 
 
 def _network_chain_id() -> int:
     """The chain id of this process's network (its chain spec)."""
     from .. import chain_spec
+
     return chain_spec.active().chain_id
 
 
@@ -59,6 +61,7 @@ _SIGNING_TAG = b"QRDX-EXCHANGE-TX-v1\x00"
 
 def _wei_per_qrdx() -> Decimal:
     from .. import constants
+
     return Decimal(constants.WEI_PER_QRDX)
 
 
@@ -66,8 +69,10 @@ def _wei_per_qrdx() -> Decimal:
 # Exchange Operation Types
 # ---------------------------------------------------------------------------
 
+
 class ExchangeOpType(IntEnum):
     """All exchange operation types.  Values are consensus-critical."""
+
     CREATE_POOL = 1
     ADD_LIQUIDITY = 2
     REMOVE_LIQUIDITY = 3
@@ -92,44 +97,45 @@ class ExchangeOpType(IntEnum):
     PERP_SET_LEVERAGE = 20
     PERP_ORDER = 21
     PERP_CANCEL = 22
-    VAULT_DEPOSIT = 23     # perps backstop vault: collateral in, shares at NAV
-    VAULT_WITHDRAW = 24    # shares out at NAV, after the lockup
-    ORACLE_VOTE = 25       # a validator's USD prices for perp markets
+    VAULT_DEPOSIT = 23  # perps backstop vault: collateral in, shares at NAV
+    VAULT_WITHDRAW = 24  # shares out at NAV, after the lockup
+    ORACLE_VOTE = 25  # a validator's USD prices for perp markets
     # The native token standard (qrdx/exchange/tokens.py): authorities, supply, allowances.
-    TOKEN_MINT = 26            # the mint authority mints new supply
-    TOKEN_BURN = 27            # a holder burns its own balance
-    TOKEN_APPROVE = 28         # set a spender's allowance (0 revokes)
-    TOKEN_TRANSFER_FROM = 29   # a spender moves an owner's tokens within its allowance
-    TOKEN_SET_AUTHORITY = 30   # hand over or renounce the mint / freeze authority
-    TOKEN_FREEZE = 31          # the freeze authority freezes an account's balance
-    TOKEN_THAW = 32            # … and thaws it
+    TOKEN_MINT = 26  # the mint authority mints new supply
+    TOKEN_BURN = 27  # a holder burns its own balance
+    TOKEN_APPROVE = 28  # set a spender's allowance (0 revokes)
+    TOKEN_TRANSFER_FROM = 29  # a spender moves an owner's tokens within its allowance
+    TOKEN_SET_AUTHORITY = 30  # hand over or renounce the mint / freeze authority
+    TOKEN_FREEZE = 31  # the freeze authority freezes an account's balance
+    TOKEN_THAW = 32  # … and thaws it
     # Token-2022-style extensions and ERC-777 operators (docs/NATIVE_TOKENS.md §7).
-    TOKEN_UPDATE_METADATA = 33     # the metadata authority edits name, symbol, uri, fields
-    TOKEN_SET_TRANSFER_FEE = 34    # the fee authority sets a new rate (applies later)
-    TOKEN_WITHDRAW_FEES = 35       # the withdraw authority collects withheld transfer fees
-    TOKEN_PAUSE = 36               # the pause authority stops transfers, mints and burns
-    TOKEN_RESUME = 37              # … and lets them run again
+    TOKEN_UPDATE_METADATA = 33  # the metadata authority edits name, symbol, uri, fields
+    TOKEN_SET_TRANSFER_FEE = 34  # the fee authority sets a new rate (applies later)
+    TOKEN_WITHDRAW_FEES = 35  # the withdraw authority collects withheld transfer fees
+    TOKEN_PAUSE = 36  # the pause authority stops transfers, mints and burns
+    TOKEN_RESUME = 37  # … and lets them run again
     TOKEN_AUTHORIZE_OPERATOR = 38  # a holder lets an operator move its balance
-    TOKEN_REVOKE_OPERATOR = 39     # … and stops it (a default operator too)
+    TOKEN_REVOKE_OPERATOR = 39  # … and stops it (a default operator too)
     # Native NFTs (qrdx/exchange/nfts.py): collections of supply-1 tokens.
-    NFT_CREATE_COLLECTION = 40     # a collection: metadata, royalties, update + mint authorities
-    NFT_MINT = 41                  # the mint authority adds an NFT to the collection
-    NFT_TRANSFER = 42              # the owner (or its approved account / operator) moves one
-    NFT_BURN = 43                  # … or burns it
-    NFT_APPROVE = 44               # the owner approves one account for one NFT
+    NFT_CREATE_COLLECTION = 40  # a collection: metadata, royalties, update + mint authorities
+    NFT_MINT = 41  # the mint authority adds an NFT to the collection
+    NFT_TRANSFER = 42  # the owner (or its approved account / operator) moves one
+    NFT_BURN = 43  # … or burns it
+    NFT_APPROVE = 44  # the owner approves one account for one NFT
     NFT_SET_APPROVAL_FOR_ALL = 45  # the owner approves an operator for all its NFTs in a collection
-    NFT_UPDATE = 46                # the update authority edits the collection's or an NFT's metadata
-    NFT_SET_AUTHORITY = 47         # hand over or renounce the update / mint authority
+    NFT_UPDATE = 46  # the update authority edits the collection's or an NFT's metadata
+    NFT_SET_AUTHORITY = 47  # hand over or renounce the update / mint authority
     # On-chain governance (qrdx/exchange/governance.py, docs/GOVERNANCE.md).
-    GOV_PROPOSE = 48               # a validator proposes: system_spend, freeze_master, approve_fork
-    GOV_VOTE = 49                  # a validator votes, weighted by its committee stake
-    GOV_VETO = 50                  # a holder locks QRDX against a passed proposal (timelock only)
-    GOV_EXECUTE = 51               # anyone executes a proposal whose timelock has ended
+    GOV_PROPOSE = 48  # a validator proposes: system_spend, freeze_master, approve_fork
+    GOV_VOTE = 49  # a validator votes, weighted by its committee stake
+    GOV_VETO = 50  # a holder locks QRDX against a passed proposal (timelock only)
+    GOV_EXECUTE = 51  # anyone executes a proposal whose timelock has ended
 
 
 # ---------------------------------------------------------------------------
 # Exchange Transaction
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class ExchangeTransaction:
@@ -138,15 +144,16 @@ class ExchangeTransaction:
 
     Fields are consensus-critical — changing any field changes the tx hash.
     """
+
     op_type: ExchangeOpType
-    sender: str                         # PQ address of the signer
-    nonce: int                          # per-sender monotonic nonce
-    params: Dict[str, Any]              # operation-specific parameters
-    gas_limit: int = 100_000            # max gas for this operation
-    gas_price: int = field(default_factory=_min_gas_price)   # WEI per gas (1 QRDX = 10^18 wei)
-    timestamp: float = 0.0             # submission timestamp
-    signature: bytes = b""              # Dilithium signature
-    public_key: bytes = b""             # Dilithium public key
+    sender: str  # PQ address of the signer
+    nonce: int  # per-sender monotonic nonce
+    params: Dict[str, Any]  # operation-specific parameters
+    gas_limit: int = 100_000  # max gas for this operation
+    gas_price: int = field(default_factory=_min_gas_price)  # WEI per gas (1 QRDX = 10^18 wei)
+    timestamp: float = 0.0  # submission timestamp
+    signature: bytes = b""  # Dilithium signature
+    public_key: bytes = b""  # Dilithium public key
     # The network this transaction is for (EIP-155's role): signed, part of the hash, and
     # checked against the verifying node's chain id — a transaction signed for another network
     # never verifies here. Defaults to this process's network.
@@ -166,7 +173,7 @@ class ExchangeTransaction:
                 self.chain_id = int(str(self.chain_id))
             except ValueError:
                 raise ValueError(f"chain_id must be an integer, got {self.chain_id!r}") from None
-        if not 0 <= self.chain_id < 2 ** 63:
+        if not 0 <= self.chain_id < 2**63:
             raise ValueError(f"chain_id out of range: {self.chain_id}")
         # Wei are whole: hold the price as an int, so it hashes and signs as "1000000000"
         # however the caller wrote it. A fractional price is left as given and refused by
@@ -188,9 +195,7 @@ class ExchangeTransaction:
     def _canonical_bytes(self) -> bytes:
         """Canonical byte representation for hashing and signing."""
         # Deterministic JSON serialization of params
-        params_json = json.dumps(
-            self.params, sort_keys=True, default=str
-        ).encode("utf-8")
+        params_json = json.dumps(self.params, sort_keys=True, default=str).encode("utf-8")
         parts = [
             _SIGNING_TAG,
             int(self.chain_id).to_bytes(8, "big"),
@@ -254,11 +259,15 @@ class ExchangeTransaction:
         """Why this transaction is not for this network ("" if it is)."""
         expected = _network_chain_id()
         if not self.chain_id:
-            return (f"exchange transaction is not bound to a chain id; sign it for chain id "
-                    f"{expected}")
+            return (
+                f"exchange transaction is not bound to a chain id; sign it for chain id "
+                f"{expected}"
+            )
         if self.chain_id != expected:
-            return (f"exchange transaction is signed for chain id {self.chain_id}, but this "
-                    f"network's chain id is {expected}")
+            return (
+                f"exchange transaction is signed for chain id {self.chain_id}, but this "
+                f"network's chain id is {expected}"
+            )
         return ""
 
     # -- Serialization ------------------------------------------------------
@@ -466,7 +475,11 @@ class ExchangeTransaction:
             for key in ("name", "symbol"):
                 if key not in p:
                     raise ValueError(f"TOKEN_DEPLOY missing param: {key}")
-            if "total_supply" not in p and "initial_supply" not in p and not p.get("mint_authority"):
+            if (
+                "total_supply" not in p
+                and "initial_supply" not in p
+                and not p.get("mint_authority")
+            ):
                 raise ValueError("TOKEN_DEPLOY needs an initial supply or a mint authority")
 
         elif op in (ExchangeOpType.TOKEN_MINT, ExchangeOpType.TOKEN_BURN):
@@ -489,8 +502,9 @@ class ExchangeTransaction:
                 if key not in p:
                     raise ValueError(f"TOKEN_SET_AUTHORITY missing param: {key}")
             if "new_authority" not in p:
-                raise ValueError("TOKEN_SET_AUTHORITY missing param: new_authority "
-                                 "(empty to renounce)")
+                raise ValueError(
+                    "TOKEN_SET_AUTHORITY missing param: new_authority " "(empty to renounce)"
+                )
 
         elif op in (ExchangeOpType.TOKEN_FREEZE, ExchangeOpType.TOKEN_THAW):
             for key in ("token_address", "account"):
@@ -506,16 +520,20 @@ class ExchangeTransaction:
             if "token_address" not in p:
                 raise ValueError("TOKEN_UPDATE_METADATA missing param: token_address")
             if not any(k in p for k in ("name", "symbol", "uri", "fields")):
-                raise ValueError("TOKEN_UPDATE_METADATA changes nothing: give name, symbol, "
-                                 "uri or fields")
+                raise ValueError(
+                    "TOKEN_UPDATE_METADATA changes nothing: give name, symbol, " "uri or fields"
+                )
 
         elif op == ExchangeOpType.TOKEN_SET_TRANSFER_FEE:
             for key in ("token_address", "transfer_fee_bps"):
                 if key not in p:
                     raise ValueError(f"TOKEN_SET_TRANSFER_FEE missing param: {key}")
 
-        elif op in (ExchangeOpType.TOKEN_WITHDRAW_FEES, ExchangeOpType.TOKEN_PAUSE,
-                    ExchangeOpType.TOKEN_RESUME):
+        elif op in (
+            ExchangeOpType.TOKEN_WITHDRAW_FEES,
+            ExchangeOpType.TOKEN_PAUSE,
+            ExchangeOpType.TOKEN_RESUME,
+        ):
             if "token_address" not in p:
                 raise ValueError(f"{op.name} missing param: token_address")
 
@@ -548,8 +566,10 @@ class ExchangeTransaction:
         return True
 
     def __repr__(self) -> str:
-        return (f"ExchangeTransaction(op={self.op_type.name}, sender={self.sender[:16]}..., "
-                f"nonce={self.nonce}, hash={self.tx_hash()[:12]}...)")
+        return (
+            f"ExchangeTransaction(op={self.op_type.name}, sender={self.sender[:16]}..., "
+            f"nonce={self.nonce}, hash={self.tx_hash()[:12]}...)"
+        )
 
 
 # ---------------------------------------------------------------------------

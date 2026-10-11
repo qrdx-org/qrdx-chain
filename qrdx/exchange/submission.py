@@ -13,12 +13,12 @@ next can include it. Echoes stop at the first node that already holds the transa
 contain Python's JSON rendering of the params, which is easy to get subtly wrong elsewhere, so
 the node returns the exact bytes (and the resulting transaction hash) for the fields given.
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from decimal import Decimal
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional, Tuple
 
 from .transactions import ExchangeOpType, ExchangeTransaction
@@ -61,8 +61,9 @@ def signing_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     unsigned = {k: v for k, v in dict(fields).items() if k not in ("signature", "public_key")}
     unsigned.setdefault("gas_limit", 100_000)
     from .. import chain_spec, constants
-    unsigned.setdefault("chain_id", chain_spec.active().chain_id)   # sign for this network
-    unsigned.setdefault("gas_price", str(constants.EXCHANGE_MIN_GAS_PRICE_WEI))   # wei per gas
+
+    unsigned.setdefault("chain_id", chain_spec.active().chain_id)  # sign for this network
+    unsigned.setdefault("gas_price", str(constants.EXCHANGE_MIN_GAS_PRICE_WEI))  # wei per gas
     tx = parse_exchange_tx(unsigned)
     body = tx.to_dict()
     for key in ("signature", "public_key", "timestamp", "tx_hash"):
@@ -73,9 +74,12 @@ def signing_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
 class ExchangeSubmitter:
     """Admit to the local exchange mempool and gossip what is new."""
 
-    def __init__(self, get_mempool: Callable[[], Any],
-                 get_peer_urls: Callable[[], Iterable[str]],
-                 forward: Callable[[str, Dict[str, Any]], Awaitable[Any]]):
+    def __init__(
+        self,
+        get_mempool: Callable[[], Any],
+        get_peer_urls: Callable[[], Iterable[str]],
+        forward: Callable[[str, Dict[str, Any]], Awaitable[Any]],
+    ):
         self._get_mempool = get_mempool
         self._get_peer_urls = get_peer_urls
         self._forward = forward

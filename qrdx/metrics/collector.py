@@ -20,16 +20,17 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
+from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Metric primitives
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Counter:
     """Monotonically increasing counter."""
+
     name: str
     help: str = ""
     _value: float = 0.0
@@ -57,6 +58,7 @@ class Counter:
 @dataclass
 class Gauge:
     """Gauge that can go up and down."""
+
     name: str
     help: str = ""
     _value: float = 0.0
@@ -89,13 +91,24 @@ class Gauge:
 
 # Default histogram buckets (latency in seconds)
 DEFAULT_BUCKETS: Tuple[float, ...] = (
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
 )
 
 
 @dataclass
 class Histogram:
     """Histogram with configurable buckets."""
+
     name: str
     help: str = ""
     buckets: Tuple[float, ...] = DEFAULT_BUCKETS
@@ -106,7 +119,7 @@ class Histogram:
 
     def __post_init__(self):
         if not self._bucket_counts:
-            self._bucket_counts = {b: 0 for b in self.buckets}
+            self._bucket_counts = dict.fromkeys(self.buckets, 0)
             self._bucket_counts[math.inf] = 0  # +Inf bucket
 
     def observe(self, value: float) -> None:
@@ -149,6 +162,7 @@ class Histogram:
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
+
 
 class MetricsRegistry:
     """
@@ -196,6 +210,7 @@ class MetricsRegistry:
 # ---------------------------------------------------------------------------
 # Node-level collector — pre-registers standard QRDX metrics
 # ---------------------------------------------------------------------------
+
 
 class MetricsCollector:
     """

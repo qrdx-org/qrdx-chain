@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from ..logger import get_logger
 
@@ -30,16 +30,18 @@ logger = get_logger(__name__)
 #  CHAIN IDENTIFIERS
 # ══════════════════════════════════════════════════════════════════════
 
+
 class ChainId(IntEnum):
     """
     Identifiers for external chains supported by the bridge.
     Matches Whitepaper §10.1 chain adapter framework.
     """
-    QRDX     = 0     # QRDX native (self-referential)
+
+    QRDX = 0  # QRDX native (self-referential)
     ETHEREUM = 1
-    BITCOIN  = 2
-    SOLANA   = 3
-    COSMOS   = 4
+    BITCOIN = 2
+    SOLANA = 3
+    COSMOS = 4
 
 
 # Human-readable names
@@ -56,6 +58,7 @@ CHAIN_NAMES: Dict[int, str] = {
 #  BLOCK HEIGHT RECORD  (Whitepaper §8.4 / §10)
 # ══════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class BlockHeightRecord:
     """
@@ -70,6 +73,7 @@ class BlockHeightRecord:
         timestamp: When this record was created (unix seconds)
         attested: Whether the record has been attested by validator quorum
     """
+
     chain_id: ChainId
     block_height: int
     block_hash: str
@@ -90,7 +94,7 @@ class BlockHeightRecord:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'BlockHeightRecord':
+    def from_dict(cls, d: Dict[str, Any]) -> "BlockHeightRecord":
         return cls(
             chain_id=ChainId(d["chain_id"]),
             block_height=d["block_height"],
@@ -104,20 +108,23 @@ class BlockHeightRecord:
 #  BRIDGE RECORD  (Whitepaper §8.4)
 # ══════════════════════════════════════════════════════════════════════
 
+
 class BridgeOperationType(IntEnum):
     """Type of bridge operation."""
-    SHIELD   = 1   # Classical → Quantum-resistant
-    UNSHIELD = 2   # Quantum-resistant → Classical
+
+    SHIELD = 1  # Classical → Quantum-resistant
+    UNSHIELD = 2  # Quantum-resistant → Classical
 
 
 class BridgeStatus(IntEnum):
     """Processing status of a bridge record."""
-    PENDING     = 0  # Awaiting confirmations
-    CONFIRMING  = 1  # Confirmation period in progress
-    ATTESTED    = 2  # Validator quorum attested
-    EXECUTED    = 3  # Mint/unlock completed
-    FAILED      = 4  # Bridge operation failed
-    FRAUD       = 5  # Fraud proof submitted, operation reverted
+
+    PENDING = 0  # Awaiting confirmations
+    CONFIRMING = 1  # Confirmation period in progress
+    ATTESTED = 2  # Validator quorum attested
+    EXECUTED = 3  # Mint/unlock completed
+    FAILED = 4  # Bridge operation failed
+    FRAUD = 5  # Fraud proof submitted, operation reverted
 
 
 @dataclass
@@ -144,6 +151,7 @@ class BridgeRecord:
         confirmations_required: Source chain confirmations needed
         confirmations_received: Confirmations seen so far
     """
+
     record_id: str
     source_chain_id: ChainId
     dest_chain_id: ChainId
@@ -171,9 +179,9 @@ class BridgeRecord:
     def _compute_id(self) -> str:
         """Derive deterministic record ID from source tx."""
         data = (
-            int(self.source_chain_id).to_bytes(4, 'big') +
-            self.source_tx_hash.encode('utf-8') +
-            str(self.amount).encode('utf-8')
+            int(self.source_chain_id).to_bytes(4, "big")
+            + self.source_tx_hash.encode("utf-8")
+            + str(self.amount).encode("utf-8")
         )
         return hashlib.sha256(data).hexdigest()
 
@@ -217,7 +225,7 @@ class BridgeRecord:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'BridgeRecord':
+    def from_dict(cls, d: Dict[str, Any]) -> "BridgeRecord":
         return cls(
             record_id=d["record_id"],
             source_chain_id=ChainId(d["source_chain_id"]),
@@ -241,6 +249,7 @@ class BridgeRecord:
 #  VALIDATOR PROOF  (Whitepaper §10.3)
 # ══════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class ValidatorProof:
     """
@@ -256,6 +265,7 @@ class ValidatorProof:
         nonce: Replay-protection nonce
         threshold: Minimum signatures required (2/3+1)
     """
+
     message_hash: str
     signatures: List[str]
     signers: List[str]
@@ -286,7 +296,7 @@ class ValidatorProof:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'ValidatorProof':
+    def from_dict(cls, d: Dict[str, Any]) -> "ValidatorProof":
         return cls(
             message_hash=d["message_hash"],
             signatures=d["signatures"],
@@ -299,6 +309,7 @@ class ValidatorProof:
 # ══════════════════════════════════════════════════════════════════════
 #  ORACLE ATTESTATION  (Whitepaper §10.2)
 # ══════════════════════════════════════════════════════════════════════
+
 
 @dataclass
 class OracleAttestation:
@@ -317,6 +328,7 @@ class OracleAttestation:
         timestamp: When the attestation was created
         signature: Dilithium signature over the attestation contents
     """
+
     validator_address: str
     chain_id: ChainId
     block_height: int
@@ -328,12 +340,12 @@ class OracleAttestation:
     def attestation_hash(self) -> str:
         """Compute hash of attestation contents for signing."""
         data = (
-            self.validator_address.encode('utf-8') +
-            int(self.chain_id).to_bytes(4, 'big') +
-            self.block_height.to_bytes(8, 'big') +
-            bytes.fromhex(self.block_hash.replace("0x", "")) +
-            bytes.fromhex(self.state_root.replace("0x", "")) +
-            self.timestamp.to_bytes(8, 'big')
+            self.validator_address.encode("utf-8")
+            + int(self.chain_id).to_bytes(4, "big")
+            + self.block_height.to_bytes(8, "big")
+            + bytes.fromhex(self.block_hash.replace("0x", ""))
+            + bytes.fromhex(self.state_root.replace("0x", ""))
+            + self.timestamp.to_bytes(8, "big")
         )
         return hashlib.sha256(data).hexdigest()
 
@@ -349,7 +361,7 @@ class OracleAttestation:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'OracleAttestation':
+    def from_dict(cls, d: Dict[str, Any]) -> "OracleAttestation":
         return cls(
             validator_address=d["validator_address"],
             chain_id=ChainId(d["chain_id"]),
@@ -365,13 +377,15 @@ class OracleAttestation:
 #  EXECUTION CONDITION  (Whitepaper §3.8)
 # ══════════════════════════════════════════════════════════════════════
 
+
 class ConditionType(IntEnum):
     """Execution condition types for OracleTransactions."""
-    IMMEDIATE             = 0x00  # Execute immediately
-    AFTER_BLOCK_HEIGHT    = 0x01  # After external chain reaches block N
+
+    IMMEDIATE = 0x00  # Execute immediately
+    AFTER_BLOCK_HEIGHT = 0x01  # After external chain reaches block N
     AFTER_ORACLE_CONFIRMS = 0x02  # After another oracle tx is confirmed
-    PRICE_THRESHOLD       = 0x03  # When price crosses threshold
-    BALANCE_THRESHOLD     = 0x04  # When balance exceeds/drops below threshold
+    PRICE_THRESHOLD = 0x03  # When price crosses threshold
+    BALANCE_THRESHOLD = 0x04  # When balance exceeds/drops below threshold
 
 
 @dataclass
@@ -385,12 +399,13 @@ class ExecutionCondition:
         value: Numeric threshold or target
         reference: Hash reference (e.g., oracle tx hash, price feed)
     """
+
     condition_type: ConditionType
     chain_id: ChainId = ChainId.QRDX
     value: int = 0
     reference: str = ""
 
-    def is_met(self, current_block_heights: Dict[ChainId, int] = None) -> bool:
+    def is_met(self, current_block_heights: Optional[Dict[ChainId, int]] = None) -> bool:
         """
         Evaluate whether this condition is satisfied.
 
@@ -420,7 +435,7 @@ class ExecutionCondition:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'ExecutionCondition':
+    def from_dict(cls, d: Dict[str, Any]) -> "ExecutionCondition":
         return cls(
             condition_type=ConditionType(d["condition_type"]),
             chain_id=ChainId(d.get("chain_id", 0)),
@@ -433,24 +448,27 @@ class ExecutionCondition:
 #  ORACLE TRANSACTION  (Whitepaper §3.8)
 # ══════════════════════════════════════════════════════════════════════
 
+
 class OracleTxType(IntEnum):
     """Sub-transaction type discriminants."""
+
     ETHEREUM = 0x01
-    BITCOIN  = 0x02
-    SOLANA   = 0x03
-    COSMOS   = 0x04
-    GENERIC  = 0xFF
+    BITCOIN = 0x02
+    SOLANA = 0x03
+    COSMOS = 0x04
+    GENERIC = 0xFF
 
 
 class OracleTxStatus(IntEnum):
     """Lifecycle status of an OracleTransaction."""
-    SUBMITTED  = 0   # In QRDX mempool
-    PENDING    = 1   # Included in QRDX block, awaiting conditions
-    BROADCAST  = 2   # Submitted to external chain
-    CONFIRMING = 3   # Awaiting external chain confirmations
-    CONFIRMED  = 4   # Oracle quorum attested external confirmation
-    FAILED     = 5   # Execution failed
-    EXPIRED    = 6   # Deadline passed
+
+    SUBMITTED = 0  # In QRDX mempool
+    PENDING = 1  # Included in QRDX block, awaiting conditions
+    BROADCAST = 2  # Submitted to external chain
+    CONFIRMING = 3  # Awaiting external chain confirmations
+    CONFIRMED = 4  # Oracle quorum attested external confirmation
+    FAILED = 5  # Execution failed
+    EXPIRED = 6  # Deadline passed
 
 
 @dataclass
@@ -483,6 +501,7 @@ class OracleTransaction:
         tx_hash: QRDX-side transaction hash
         created_at: Creation timestamp
     """
+
     nonce: int
     sender: str
     target_chain_id: ChainId
@@ -508,12 +527,12 @@ class OracleTransaction:
     def compute_hash(self) -> str:
         """Compute deterministic transaction hash."""
         data = (
-            self.nonce.to_bytes(8, 'big') +
-            self.sender.encode('utf-8') +
-            int(self.target_chain_id).to_bytes(4, 'big') +
-            int(self.tx_type).to_bytes(1, 'big') +
-            bytes.fromhex(self.inner_transaction) +
-            self.deadline.to_bytes(8, 'big')
+            self.nonce.to_bytes(8, "big")
+            + self.sender.encode("utf-8")
+            + int(self.target_chain_id).to_bytes(4, "big")
+            + int(self.tx_type).to_bytes(1, "big")
+            + bytes.fromhex(self.inner_transaction)
+            + self.deadline.to_bytes(8, "big")
         )
         return hashlib.sha256(data).hexdigest()
 
@@ -526,9 +545,13 @@ class OracleTransaction:
 
     @property
     def is_complete(self) -> bool:
-        return self.status in (OracleTxStatus.CONFIRMED, OracleTxStatus.FAILED, OracleTxStatus.EXPIRED)
+        return self.status in (
+            OracleTxStatus.CONFIRMED,
+            OracleTxStatus.FAILED,
+            OracleTxStatus.EXPIRED,
+        )
 
-    def conditions_met(self, block_heights: Dict[ChainId, int] = None) -> bool:
+    def conditions_met(self, block_heights: Optional[Dict[ChainId, int]] = None) -> bool:
         """Check if all execution conditions are satisfied."""
         if not self.conditions:
             return True
@@ -554,10 +577,8 @@ class OracleTransaction:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'OracleTransaction':
-        conditions = [
-            ExecutionCondition.from_dict(c) for c in d.get("conditions", [])
-        ]
+    def from_dict(cls, d: Dict[str, Any]) -> "OracleTransaction":
+        conditions = [ExecutionCondition.from_dict(c) for c in d.get("conditions", [])]
         return cls(
             nonce=d["nonce"],
             sender=d["sender"],
@@ -581,6 +602,7 @@ class OracleTransaction:
 #  TOKEN CONFIG  (Whitepaper §10.3)
 # ══════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class BridgeTokenConfig:
     """
@@ -597,6 +619,7 @@ class BridgeTokenConfig:
         max_amount: Maximum bridge amount per operation
         confirmations_required: Source chain confirmations needed
     """
+
     symbol: str
     shielded_symbol: str
     source_chain_id: ChainId

@@ -158,8 +158,7 @@ def test_every_path_ticks_blocks_without_exchange_transactions():
     assert main_src.count("_exchange_tick_on_import(") >= 3      # def + sync + REST
     assert "run_exchange_tick(" in inspect.getsource(p2p)
     assert "run_exchange_tick(next_height" in inspect.getsource(NI.ValidatorNode._block_production_loop)
-    assert "run_exchange_tick(height" in inspect.getsource(
-        derived_state_rebuild.rebuild_derived_state_interleaved)
+    assert "run_exchange_tick(height" in inspect.getsource(derived_state_rebuild._replay)
     assert "run_exchange_tick(height" in inspect.getsource(BP.rebuild_exchange_state_from_chain)
     assert "mgr.clearinghouse.tick(" in inspect.getsource(BP._execute_block_boundary_duties)
 

@@ -33,14 +33,21 @@ class S20NativeTokens(Scenario):
         from qrdx.crypto.pq.dilithium import PQPrivateKey
         from qrdx.exchange import ExchangeTransaction
         key = PQPrivateKey.from_hex(wallet["private_key"], wallet["public_key"])
-        nonce = (await self._get(target, "/get_exchange_nonce", address=wallet["address"])
-                 or {}).get("nonce", 0)
-        tx = ExchangeTransaction(chain_id=CHAIN_ID, op_type=op, sender=wallet["address"], nonce=int(nonce),
-                                 params=params, gas_limit=2_000_000, gas_price=10**9)
-        tx.public_key = key.public_key.to_bytes()
-        tx.signature = key.sign(tx.signing_bytes()).to_bytes()
-        async with NodeRPCClient(target) as c:
-            r = await c._post("/submit_exchange_tx", json_data={"tx_hex": tx.to_hex()})
+        # A nonce read just after a reorg can be one too low (the orphaned transaction is re-queued
+        # and included again): re-read it and resend, as a wallet does.
+        for _attempt in range(4):
+            nonce = (await self._get(target, "/get_exchange_nonce", address=wallet["address"])
+                     or {}).get("nonce", 0)
+            tx = ExchangeTransaction(chain_id=CHAIN_ID, op_type=op, sender=wallet["address"], nonce=int(nonce),
+                                     params=params, gas_limit=2_000_000, gas_price=10**9)
+            tx.public_key = key.public_key.to_bytes()
+            tx.signature = key.sign(tx.signing_bytes()).to_bytes()
+            async with NodeRPCClient(target) as c:
+                r = await c._post("/submit_exchange_tx", json_data={"tx_hex": tx.to_hex()})
+            error = str((r or {}).get("error", ""))
+            if (r and r.get("ok")) or not ("nonce too low" in error or "already queued" in error):
+                break
+            await asyncio.sleep(1)
         if not (r and r.get("ok")):
             self.check(False, f"{label}: admitted ({r})")
             return None

@@ -8,6 +8,7 @@ Verifies:
     - Verify governance parameter updates
 """
 
+import os
 import time
 from decimal import Decimal
 
@@ -23,7 +24,10 @@ class S08Governance(Scenario):
     depends_on = ["s07_validators"]
 
     async def execute(self) -> None:
-        db_path = self.ctx.db_paths[0]
+        # The governance persistence library gets its own database file. Writing into a running
+        # node's database from another connection made the node's own writes fail with
+        # "database is locked" for ~18 s (it lost a perp balance delta and forked off).
+        db_path = os.path.join(os.path.dirname(self.ctx.db_paths[0]), "governance_lib.db")
         wallets = self.ctx.wallets
         user0 = wallets.get("Test User 0")
 

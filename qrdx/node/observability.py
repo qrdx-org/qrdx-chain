@@ -13,14 +13,14 @@ Design goals:
 Pure + framework-agnostic (no FastAPI import here) so the core is unit-testable; main.py wires the
 endpoints and the poller's data getters.
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
 import time
 from collections import defaultdict
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Set, Union
-
+from typing import AbstractSet, Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Set, Union
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pub/sub event hub
@@ -30,12 +30,24 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Set,
 # receives every event on it, one to "<channel>:<key>" only that key's. A client that never
 # subscribes receives DEFAULT_CHANNELS — the block feed, exactly as before channels existed.
 DEFAULT_CHANNELS = frozenset({"blocks"})
-STREAM_CHANNELS = frozenset({"blocks", "perp_markets", "perp_book", "perp_events", "perp_account",
-                             "spot_pools", "spot_book", "spot_account", "tokens",
-                             "orderbook", "trades", "tickers"})
+STREAM_CHANNELS = frozenset(
+    {
+        "blocks",
+        "perp_markets",
+        "perp_book",
+        "perp_events",
+        "perp_account",
+        "spot_pools",
+        "spot_book",
+        "spot_account",
+        "tokens",
+        "orderbook",
+        "trades",
+        "tickers",
+    }
+)
 # Channels that only make sense for one market / pair / address.
-KEYED_CHANNELS = frozenset({"perp_book", "perp_account", "spot_book", "spot_account",
-                            "orderbook"})
+KEYED_CHANNELS = frozenset({"perp_book", "perp_account", "spot_book", "spot_account", "orderbook"})
 # Channels keyed by a market: a spot pair "a:b" (either order) or a perps market id.
 MARKET_CHANNELS = frozenset({"spot_book", "orderbook", "trades", "tickers"})
 MAX_CHANNELS_PER_CLIENT = 64
@@ -49,7 +61,7 @@ def valid_channel(name: Any) -> bool:
     if base not in STREAM_CHANNELS:
         return False
     if base in KEYED_CHANNELS and not key:
-        return False                     # a book / account stream is per market or address
+        return False  # a book / account stream is per market or address
     return all(c.isalnum() or c in "-_:." for c in key)
 
 
@@ -62,7 +74,7 @@ def canonical_channel(name: str) -> str:
         a, b = (_asset_key(x) for x in key.split(":"))
         return f"{base}:{min(a, b)}:{max(a, b)}"
     if base == "tokens" and key:
-        return f"{base}:{key.lower()}"       # token addresses are lowercase
+        return f"{base}:{key.lower()}"  # token addresses are lowercase
     return name
 
 
@@ -73,7 +85,7 @@ def _asset_key(asset: str) -> str:
     return asset.lower() if asset.lower().startswith("0x") else asset
 
 
-def event_matches(channels: Set[str], event: Dict[str, Any]) -> bool:
+def event_matches(channels: AbstractSet[str], event: Dict[str, Any]) -> bool:
     channel = event.get("channel", "blocks")
     if channel in channels:
         return True
@@ -93,7 +105,7 @@ class EventHub:
     def __init__(self, max_queue: int = 256):
         self._max_queue = max_queue
         self._subs: Set[asyncio.Queue] = set()
-        self._channels: Dict[asyncio.Queue, Set[str]] = {}
+        self._channels: Dict[asyncio.Queue, AbstractSet[str]] = {}
         self._dropped = 0
 
     def subscribe(self, channels: Optional[Set[str]] = None) -> asyncio.Queue:
@@ -122,8 +134,12 @@ class EventHub:
     def keys(self, channel: str) -> Set[str]:
         """Every key subscribed to on ``channel`` ("perp_account:0xPQ…" → "0xPQ…")."""
         prefix = channel + ":"
-        return {c[len(prefix):] for chans in self._channels.values() for c in chans
-                if c.startswith(prefix)}
+        return {
+            c[len(prefix) :]
+            for chans in self._channels.values()
+            for c in chans
+            if c.startswith(prefix)
+        }
 
     @property
     def subscriber_count(self) -> int:
@@ -138,7 +154,7 @@ class EventHub:
             q.put_nowait(event)
         except asyncio.QueueFull:
             try:
-                q.get_nowait()          # drop oldest
+                q.get_nowait()  # drop oldest
                 self._dropped += 1
                 q.put_nowait(event)
             except Exception:
@@ -218,8 +234,8 @@ class Metrics:
     cardinality bounded (method names, event kinds) — never user-supplied unbounded strings."""
 
     def __init__(self):
-        self._counters: Dict[tuple, float] = defaultdict(float)   # (name, labelkey) -> value
-        self._gauges: Dict[tuple, float] = {}                     # (name, labelkey) -> value
+        self._counters: Dict[tuple, float] = defaultdict(float)  # (name, labelkey) -> value
+        self._gauges: Dict[tuple, float] = {}  # (name, labelkey) -> value
         self._help: Dict[str, str] = {}
 
     @staticmethod
@@ -305,7 +321,7 @@ async def chain_event_poller(
     get_slashing_count: Optional[_MaybeAsync] = None,
     get_mempool_depth: Optional[_MaybeAsync] = None,
     interval: float = 1.0,
-    _max_iterations: Optional[int] = None,   # test hook
+    _max_iterations: Optional[int] = None,  # test hook
 ) -> None:
     """Poll chain tip + finality (+ peer count) and publish deltas to ``hub`` while updating
     ``metrics``. Reads only — never touches the import path. A new-tip transition emits a ``block``
@@ -337,7 +353,9 @@ async def chain_event_poller(
                 # healthy chain keeps this small + bounded; a growing lag = finality falling behind
                 # (the key production alert). -1 finalized (pre-finality) → lag 0 (not yet meaningful).
                 max_ep = int(fin.get("max_epoch", -1))
-                metrics.set("qrdx_finality_lag_epochs", max(0, max_ep - fin_ep) if fin_ep >= 0 else 0)
+                metrics.set(
+                    "qrdx_finality_lag_epochs", max(0, max_ep - fin_ep) if fin_ep >= 0 else 0
+                )
             if get_slashing_count is not None:
                 metrics.set("qrdx_slashing_events", int(await _maybe_await(get_slashing_count())))
             if get_mempool_depth is not None:
@@ -348,10 +366,15 @@ async def chain_event_poller(
                 # far doesn't flood subscribers).
                 start = last_height + 1 if last_height >= 0 else tip
                 for h in range(max(start, tip - 63), tip + 1):
-                    await hub.publish({
-                        "type": "block", "channel": "blocks", "height": h, "ts": time.time(),
-                        "finalized_epoch": int(fin.get("finalized_epoch", -1)) if fin else None,
-                    })
+                    await hub.publish(
+                        {
+                            "type": "block",
+                            "channel": "blocks",
+                            "height": h,
+                            "ts": time.time(),
+                            "finalized_epoch": int(fin.get("finalized_epoch", -1)) if fin else None,
+                        }
+                    )
                     metrics.inc("qrdx_blocks_streamed_total")
                 last_height = tip
         except asyncio.CancelledError:
@@ -401,9 +424,13 @@ def sse_frame(event: Dict[str, Any]) -> str:
     return f"data: {json.dumps(event, default=str)}\n\n"
 
 
-async def sse_stream(hub: EventHub, *, keepalive: float = 15.0,
-                     channels: Optional[Set[str]] = None,
-                     initial: Optional[list] = None) -> AsyncIterator[str]:
+async def sse_stream(
+    hub: EventHub,
+    *,
+    keepalive: float = 15.0,
+    channels: Optional[Set[str]] = None,
+    initial: Optional[list] = None,
+) -> AsyncIterator[str]:
     """Yield SSE frames from the hub for ``channels`` (None: the default block feed) — first any
     ``initial`` snapshot events — with periodic keepalive comments so idle proxies don't cut the
     connection. Always unsubscribes on exit."""

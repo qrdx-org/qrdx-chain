@@ -16,14 +16,13 @@ Connection management:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, Optional, Set
 
 from .server import RPCError, RPCErrorCode, RPCResponse, RPCServer
 
@@ -34,8 +33,10 @@ logger = logging.getLogger(__name__)
 # Subscription types
 # ---------------------------------------------------------------------------
 
+
 class SubscriptionType(str, Enum):
     """Supported subscription channels."""
+
     NEW_HEADS = "newHeads"
     NEW_PENDING_TRANSACTIONS = "newPendingTransactions"
     LOGS = "logs"
@@ -45,9 +46,11 @@ class SubscriptionType(str, Enum):
 # Data models
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Subscription:
     """A single subscription held by a connection."""
+
     id: str
     sub_type: SubscriptionType
     filter_params: Optional[Dict[str, Any]] = None
@@ -57,6 +60,7 @@ class Subscription:
 @dataclass
 class WSConnection:
     """Tracks one WebSocket client connection."""
+
     id: str
     subscriptions: Dict[str, Subscription] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
@@ -73,6 +77,7 @@ class WSConnection:
 # ---------------------------------------------------------------------------
 # WebSocket subscription manager
 # ---------------------------------------------------------------------------
+
 
 class WebSocketManager:
     """
@@ -126,7 +131,7 @@ class WebSocketManager:
         if len(self._connections) >= self.max_connections:
             raise RPCError(
                 RPCErrorCode.LIMIT_EXCEEDED,
-                f"Max WebSocket connections reached ({self.max_connections})"
+                f"Max WebSocket connections reached ({self.max_connections})",
             )
 
         conn_id = uuid.uuid4().hex[:16]
@@ -184,18 +189,18 @@ class WebSocketManager:
         # Validate type
         try:
             st = SubscriptionType(sub_type)
-        except ValueError:
+        except ValueError as exc:
             raise RPCError(
                 RPCErrorCode.INVALID_PARAMS,
                 f"Unknown subscription type: {sub_type}. "
-                f"Valid: {[t.value for t in SubscriptionType]}"
-            )
+                f"Valid: {[t.value for t in SubscriptionType]}",
+            ) from exc
 
         # Check limit
         if conn.subscription_count >= self.max_subscriptions_per_conn:
             raise RPCError(
                 RPCErrorCode.LIMIT_EXCEEDED,
-                f"Max subscriptions per connection reached ({self.max_subscriptions_per_conn})"
+                f"Max subscriptions per connection reached ({self.max_subscriptions_per_conn})",
             )
 
         sub_id = uuid.uuid4().hex[:16]
@@ -206,7 +211,9 @@ class WebSocketManager:
 
         logger.debug(
             "WS subscribe: conn=%s type=%s sub=%s",
-            conn_id, sub_type, sub_id,
+            conn_id,
+            sub_type,
+            sub_id,
         )
         return sub_id
 
@@ -390,37 +397,45 @@ class WebSocketManager:
                 sub_type = params[0] if params else ""
                 filter_params = params[1] if len(params) > 1 else None
                 sub_id = self.subscribe(conn_id, sub_type, filter_params)
-                return json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": sub_id,
-                })
+                return json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": sub_id,
+                    }
+                )
             except RPCError as e:
-                return json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": e.to_dict(),
-                })
+                return json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": e.to_dict(),
+                    }
+                )
 
         # --- eth_unsubscribe ---
         if method == "eth_unsubscribe":
             sub_id = params[0] if params else ""
             ok = self.unsubscribe(conn_id, sub_id)
-            return json.dumps({
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": ok,
-            })
+            return json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": ok,
+                }
+            )
 
         # --- everything else → RPCServer ---
         if self.rpc_server:
             return await self.rpc_server.handle_request(parsed)
 
-        return json.dumps({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": RPCError(RPCErrorCode.INTERNAL_ERROR, "No RPC server").to_dict(),
-        })
+        return json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": RPCError(RPCErrorCode.INTERNAL_ERROR, "No RPC server").to_dict(),
+            }
+        )
 
     # -- Diagnostics --------------------------------------------------------
 
@@ -440,7 +455,5 @@ class WebSocketManager:
             "total_connections_served": self.total_connections_served,
             "total_subscriptions_created": self.total_subscriptions_created,
             "total_events_dispatched": self.total_events_dispatched,
-            "subscriptions_by_type": {
-                st.value: len(subs) for st, subs in self._type_index.items()
-            },
+            "subscriptions_by_type": {st.value: len(subs) for st, subs in self._type_index.items()},
         }

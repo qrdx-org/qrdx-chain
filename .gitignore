@@ -40,3 +40,5 @@ wallet/
 validator_wallet.json
 slashing_protection.db
 data/
+# Legacy denaro-coin VM checkout (not part of QRDX; was an undeclared submodule that broke fresh clones)
+dvm/

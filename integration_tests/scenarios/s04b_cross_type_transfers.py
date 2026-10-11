@@ -28,7 +28,7 @@ from integration_tests.tx_sender import TransactionSender
 
 from qrdx.crypto.account_id import to_account_id
 
-# Confirmation slack: 2s slots, so a few slots plus import time.
+# Confirmation slack: a few slots plus import time.
 _SETTLE_SECONDS = 8
 
 

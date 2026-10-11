@@ -1,40 +1,48 @@
 # denaro/node/nodes_manager.py
 
-import os
+import asyncio
+import ipaddress
 import json
+import os
+import socket
 import time
 from os.path import dirname, exists
 from random import sample
-from typing import Optional, List, Any, Dict
-
-import asyncio
-import ipaddress
-import socket
-from urllib.parse import urlparse, urlencode
+from typing import Any, Callable, List, Optional
+from urllib.parse import urlencode, urlparse
 
 import httpx
 
 from ..constants import (
-    ACTIVE_NODES_DELTA, MAX_PEERS_COUNT, DENARO_SELF_URL, BOOTSTRAP_NODES,
-    LOG_INCLUDE_REQUEST_CONTENT, LOG_INCLUDE_RESPONSE_CONTENT, LOG_MAX_PATH_LENGTH,
-    CONNECTION_TIMEOUT
+    ACTIVE_NODES_DELTA,
+    BOOTSTRAP_NODES,
+    DENARO_SELF_URL,
+    LOG_INCLUDE_REQUEST_CONTENT,
+    LOG_INCLUDE_RESPONSE_CONTENT,
+    LOG_MAX_PATH_LENGTH,
+    MAX_PEERS_COUNT,
 )
-
-from .identity import get_node_id, get_public_key_hex, sign_message, get_canonical_json_bytes
 from ..logger import get_logger
+from .identity import get_canonical_json_bytes, get_node_id, get_public_key_hex, sign_message
 
 logger = get_logger(__name__)
 
 # --- Constants ---
-path = dirname(os.path.realpath(__file__)) + '/nodes.json'
+path = dirname(os.path.realpath(__file__)) + "/nodes.json"
+# A peer's last_seen changes on every request it makes; the peer store on disk only needs it
+# for a restart, measured against a 7-day window (ACTIVE_NODES_DELTA).
+LAST_SEEN_PERSIST_INTERVAL = 60
+
 
 class NodesManager:
     db_path = path
-    self_id: str = None
-    peers: dict = None
+    # Both loaded by init() before use.
+    self_id: str = None  # type: ignore[assignment]
+    peers: dict = None  # type: ignore[assignment]
     self_is_public: bool = False
     bootstrap_nodes: List[str] = BOOTSTRAP_NODES
     _bootstrap_complete: bool = False
+    _last_sync: float = 0.0
 
     # The self-contained httpx.AsyncClient has been REMOVED from this class.
     # It will now be passed in from the main application.
@@ -43,88 +51,89 @@ class NodesManager:
     def init(self_node_id: str, bootstrap_nodes: Optional[List[str]] = None):
         """
         Initializes the manager, loading peers from the JSON file.
-        
+
         Args:
             self_node_id: This node's unique identifier
             bootstrap_nodes: Optional list of bootstrap node URLs to use
         """
         NodesManager.self_id = self_node_id
         NodesManager._bootstrap_complete = False
-        
+
         # Set custom bootstrap nodes if provided
         if bootstrap_nodes:
             NodesManager.bootstrap_nodes = bootstrap_nodes
-        
+
         if not exists(NodesManager.db_path):
             NodesManager.purge_peers()
         else:
-            with open(NodesManager.db_path, 'r') as f:
+            with open(NodesManager.db_path, "r") as f:
                 data = json.load(f)
-                NodesManager.peers = data.get('peers', {})
+                NodesManager.peers = data.get("peers", {})
 
     @staticmethod
     def purge_peers():
         """Clears the peer list and resets the JSON file."""
         NodesManager.peers = {}
         NodesManager.sync()
-    
+
     @staticmethod
     def sync():
         """Saves the current peer list to the JSON file."""
-        with open(NodesManager.db_path, 'w') as f:
-            json.dump({'peers': NodesManager.peers}, f, indent=4)
+        with open(NodesManager.db_path, "w") as f:
+            json.dump({"peers": NodesManager.peers}, f, indent=4)
+        NodesManager._last_sync = time.monotonic()
 
     @staticmethod
     async def bootstrap_from_nodes(
         client: httpx.AsyncClient,
-        handshake_func: callable,
+        handshake_func: Callable[..., Any],
     ) -> int:
         """
         Bootstrap from configured bootstrap nodes.
-        
+
         Attempts to connect to each bootstrap node and perform handshakes
         to discover initial peers.
-        
+
         Args:
             client: HTTP client for making requests
             handshake_func: Async function to perform handshake with a peer URL
-            
+
         Returns:
             Number of successful bootstrap connections
         """
         if NodesManager._bootstrap_complete:
             logger.debug("Bootstrap already completed, skipping")
             return 0
-        
+
         successful = 0
         failed_nodes = []
-        
+
         logger.info(f"Starting bootstrap from {len(NodesManager.bootstrap_nodes)} nodes...")
-        
+
         for node_url in NodesManager.bootstrap_nodes:
-            node_url = node_url.strip().rstrip('/')
+            node_url = node_url.strip().rstrip("/")
             if not node_url:
                 continue
-                
+
             try:
                 logger.info(f"Attempting bootstrap handshake with {node_url}")
                 await handshake_func(node_url)
                 successful += 1
                 logger.info(f"Successfully bootstrapped from {node_url}")
-                
+
             except httpx.RequestError as e:
                 logger.warning(f"Bootstrap node {node_url} unreachable: {e}")
                 failed_nodes.append(node_url)
-                
+
             except Exception as e:
                 logger.error(f"Error bootstrapping from {node_url}: {e}")
                 failed_nodes.append(node_url)
-            
+
             # Small delay between bootstrap attempts
             await asyncio.sleep(0.5)
-        
+
         NodesManager._bootstrap_complete = True
-        
+
         if successful == 0:
             logger.warning(
                 f"Failed to bootstrap from any node. "
@@ -135,50 +144,48 @@ class NodesManager:
                 f"Bootstrap complete: {successful}/{len(NodesManager.bootstrap_nodes)} nodes, "
                 f"{len(NodesManager.peers)} peers discovered"
             )
-        
+
         return successful
 
     @staticmethod
     def get_bootstrap_nodes() -> List[str]:
         """Get the list of configured bootstrap nodes."""
         return NodesManager.bootstrap_nodes.copy()
-    
+
     @staticmethod
     def set_bootstrap_nodes(nodes: List[str]):
         """
         Set the list of bootstrap nodes.
-        
+
         Args:
             nodes: List of bootstrap node URLs
         """
-        NodesManager.bootstrap_nodes = [
-            n.strip().rstrip('/') for n in nodes if n.strip()
-        ]
+        NodesManager.bootstrap_nodes = [n.strip().rstrip("/") for n in nodes if n.strip()]
         logger.info(f"Updated bootstrap nodes: {NodesManager.bootstrap_nodes}")
-    
+
     @staticmethod
     def add_bootstrap_node(url: str) -> bool:
         """
         Add a bootstrap node to the list.
-        
+
         Args:
             url: Bootstrap node URL
-            
+
         Returns:
             True if added, False if already exists
         """
-        url = url.strip().rstrip('/')
+        url = url.strip().rstrip("/")
         if url in NodesManager.bootstrap_nodes:
             return False
         NodesManager.bootstrap_nodes.append(url)
         logger.info(f"Added bootstrap node: {url}")
         return True
-    
+
     @staticmethod
     def is_bootstrap_complete() -> bool:
         """Check if initial bootstrap has completed."""
         return NodesManager._bootstrap_complete
-    
+
     @staticmethod
     def reset_bootstrap():
         """Reset bootstrap state to allow re-bootstrapping."""
@@ -186,38 +193,45 @@ class NodesManager:
         logger.info("Bootstrap state reset")
 
     @staticmethod
-    async def request(client: httpx.AsyncClient, url: str, method: str = 'GET', signed: bool = False, node_id: Optional[str] = None, **kwargs):
+    async def request(
+        client: httpx.AsyncClient,
+        url: str,
+        method: str = "GET",
+        signed: bool = False,
+        node_id: Optional[str] = None,
+        **kwargs,
+    ):
         """
         A wrapper for making async HTTP requests.
         It now re-raises RequestError so the caller can handle unreachability,
         while gracefully handling other response errors.
         """
         start_time = time.time()
-        
+
         # Build the URL with params for logging
         log_url = url
-        if 'params' in kwargs and kwargs['params']:
-            params_str = urlencode(kwargs['params'], doseq=True)
-            separator = '&' if '?' in url else '?'
+        if "params" in kwargs and kwargs["params"]:
+            params_str = urlencode(kwargs["params"], doseq=True)
+            separator = "&" if "?" in url else "?"
             log_url = f"{url}{separator}{params_str}"
-        
+
         # Truncate very long URLs to prevent log spam
         if len(log_url) > LOG_MAX_PATH_LENGTH:
             log_url = log_url[:LOG_MAX_PATH_LENGTH] + "...[TRUNCATED]"
-        
+
         signed_marker = " [SIGNED]" if signed else ""
-        
+
         # Log request body if present and has content
         body = None
         if LOG_INCLUDE_REQUEST_CONTENT:
-            for body_key in ('content', 'content_body', 'data', 'json'):
+            for body_key in ("content", "content_body", "data", "json"):
                 if body_key not in kwargs:
                     continue
-                
+
                 value = kwargs[body_key]
                 if value is None:
                     continue
-                
+
                 # Normalize value: parse JSON strings once, keep other types as-is
                 parsed_value = None
                 if isinstance(value, str):
@@ -232,11 +246,11 @@ class NodesManager:
                     parsed_value = value
                 else:
                     parsed_value = value
-                
+
                 # Skip empty collections
                 if isinstance(parsed_value, (dict, list)) and len(parsed_value) == 0:
                     continue
-                
+
                 # Format the body nicely
                 if isinstance(parsed_value, (dict, list)):
                     body = json.dumps(parsed_value, indent=2)
@@ -244,22 +258,22 @@ class NodesManager:
                     body = parsed_value
                 else:
                     body = str(parsed_value)
-                
-                body = f"\n\nOutgoing Request:\n\"{body}\"\n"
+
+                body = f'\n\nOutgoing Request:\n"{body}"\n'
                 break
-            
+
         logger.info(f"--> \"{method} {log_url} HTTP/1.1\"{signed_marker}{body if body else ''}")
-        
+
         try:
             response = await client.request(method, url, **kwargs)
             process_time = time.time() - start_time
             status_code = response.status_code
-            
+
             # Prevents 409 from being treated as an error
             # It's a hint from the peer that we are out of sync
             if response.status_code != 409:
                 response.raise_for_status()
-            
+
             # Extract and format response body if present
             response_body = None
             if LOG_INCLUDE_RESPONSE_CONTENT:
@@ -281,28 +295,36 @@ class NodesManager:
                 except Exception:
                     # Silently fail response body extraction
                     response_body = None
-            
-            response_body_log = f"\n\nIncoming Response:\n\"{response_body}\"\n" if response_body else ""
-            logger.info(f"<-- \"{method} {log_url} HTTP/1.1\" {status_code}⁢ ({process_time:.3f}s){response_body_log}")
+
+            response_body_log = (
+                f'\n\nIncoming Response:\n"{response_body}"\n' if response_body else ""
+            )
+            logger.info(
+                f'<-- "{method} {log_url} HTTP/1.1" {status_code}⁢ ({process_time:.3f}s){response_body_log}'
+            )
             return response.json()
-        
+
         except httpx.RequestError as e:
             process_time = time.time() - start_time
-            logger.warning(f"<-- \"{method} {log_url} HTTP/1.1\" NETWORK_ERROR ({process_time:.3f}s)")
+            logger.warning(f'<-- "{method} {log_url} HTTP/1.1" NETWORK_ERROR ({process_time:.3f}s)')
             raise e
 
         except (json.JSONDecodeError, httpx.HTTPStatusError) as e:
             process_time = time.time() - start_time
-            status_code = getattr(e, 'response', None)
-            status_code = status_code.status_code if status_code else ''
-            logger.warning(f"<-- \"{method} {log_url} HTTP/1.1\" {status_code}⁢ ERROR ({process_time:.3f}s): {e}")
+            failed_response = getattr(e, "response", None)
+            failed_status = failed_response.status_code if failed_response else ""
+            logger.warning(
+                f'<-- "{method} {log_url} HTTP/1.1" {failed_status}⁢ ERROR ({process_time:.3f}s): {e}'
+            )
             return None
 
     @staticmethod
-    def add_or_update_peer(node_id: str, pubkey: str, url: str | None, is_public: bool, at_schema: str = ''):
+    def add_or_update_peer(
+        node_id: str, pubkey: str, url: str | None, is_public: bool, at_schema: str = ""
+    ):
         """
         Adds a new peer or updates an existing one's information.
-        
+
         Args:
             node_id: Peer's node ID (qx…)
             pubkey: Peer's Dilithium public key (hex)
@@ -312,63 +334,62 @@ class NodesManager:
         """
         if node_id == NodesManager.self_id:
             return False
-    
+
         is_new = node_id not in NodesManager.peers
         if is_new and len(NodesManager.peers) >= MAX_PEERS_COUNT:
             logger.warning(f"Peer limit reached ({MAX_PEERS_COUNT}), new peer will not be added.")
             return False
-    
-        url_to_store = url.strip('/') if url else None
-        
+
+        url_to_store = url.strip("/") if url else None
+
         NodesManager.peers[node_id] = {
-            'pubkey': pubkey,
-            'url': url_to_store,
-            'at_schema': at_schema,
-            'last_seen': int(time.time()),
-            'is_public': is_public
+            "pubkey": pubkey,
+            "url": url_to_store,
+            "at_schema": at_schema,
+            "last_seen": int(time.time()),
+            "is_public": is_public,
         }
         NodesManager.sync()
         return is_new
-    
+
     @staticmethod
     def update_peer_last_seen(node_id: str):
         """
-        Updates the 'last_seen' timestamp for an active peer.
+        Updates the 'last_seen' timestamp for an active peer. In memory at once; on disk at
+        most every LAST_SEEN_PERSIST_INTERVAL seconds — it is called for every signed request,
+        and rewriting the peer store each time was a third of a node's event-loop time.
         """
         peer = NodesManager.peers.get(node_id)
         if peer:
-            peer['last_seen'] = int(time.time())
-            NodesManager.sync()
-    
+            peer["last_seen"] = int(time.time())
+            if time.monotonic() - NodesManager._last_sync >= LAST_SEEN_PERSIST_INTERVAL:
+                NodesManager.sync()
+
     @staticmethod
-    def get_peer(node_id: str) -> dict:
+    def get_peer(node_id: str) -> Optional[dict]:
         """Retrieves a peer's data by their NodeID."""
         return NodesManager.peers.get(node_id)
-        
+
     @staticmethod
     def get_all_peers() -> list[dict]:
         """Returns a list of all peers, with NodeID included in each dict."""
         return [
-            {'node_id': node_id, **peer_data}
-            for node_id, peer_data in NodesManager.peers.items()
+            {"node_id": node_id, **peer_data} for node_id, peer_data in NodesManager.peers.items()
         ]
-    
+
     @staticmethod
-    def get_recent_nodes() -> list[dict]: # Return the full peer object
+    def get_recent_nodes() -> list[dict]:  # Return the full peer object
         """
         Gets a list of recently active peers.
         """
         now = int(time.time())
         all_peers = NodesManager.get_all_peers()
 
-        active_peers = [
-            peer for peer in all_peers
-            if peer['last_seen'] > now - ACTIVE_NODES_DELTA
-        ]
-        
-        active_peers.sort(key=lambda p: p['last_seen'], reverse=True)
+        active_peers = [peer for peer in all_peers if peer["last_seen"] > now - ACTIVE_NODES_DELTA]
+
+        active_peers.sort(key=lambda p: p["last_seen"], reverse=True)
         return active_peers
-    
+
     @staticmethod
     def get_propagate_peers(limit: int = 10) -> list[dict]:
         """
@@ -378,10 +399,11 @@ class NodesManager:
         all_peers_with_id = NodesManager.get_all_peers()
 
         active_and_connectable_peers = [
-            peer for peer in all_peers_with_id
-            if peer['last_seen'] > now - ACTIVE_NODES_DELTA and peer.get('url')
+            peer
+            for peer in all_peers_with_id
+            if peer["last_seen"] > now - ACTIVE_NODES_DELTA and peer.get("url")
         ]
-        
+
         if len(active_and_connectable_peers) <= limit:
             return active_and_connectable_peers
         return sample(active_and_connectable_peers, k=limit)
@@ -399,16 +421,17 @@ class NodesManager:
             NodesManager.sync()
             return True
         return False
-    
+
     @staticmethod
     def find_peer_by_url(url: str) -> Optional[str]:
         """Finds a peer's node_id by their URL."""
         if not url:
             return None
         for node_id, peer_data in NodesManager.peers.items():
-            if peer_data.get('url') == url:
+            if peer_data.get("url") == url:
                 return node_id
         return None
+
 
 class NodeInterface:
     """
@@ -426,7 +449,7 @@ class NodeInterface:
     network_identity_provider = None
 
     def __init__(self, url: str, client: httpx.AsyncClient, db):
-        self.url = url.strip('/')
+        self.url = url.strip("/")
         self.client = client
         self.db = db
 
@@ -457,30 +480,28 @@ class NodeInterface:
             payload["params"] = params
 
         rpc_url = f"{self.url}/rpc"
+        # Signed by this node, over these exact bytes: the receiver attributes the call to us
+        # and refuses a peer-only method (a block, a transaction, a handshake) without it.
+        body = json.dumps(payload, separators=(",", ":"))
+        headers = {"Content-Type": "application/json"}
+        try:
+            headers.update(await self._identity_headers(body))
+        except RuntimeError:
+            pass  # no node identity in this process (a tool, not a node): the call goes unsigned
         start_time = time.time()
         try:
-            response = await self.client.post(
-                rpc_url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
+            response = await self.client.post(rpc_url, content=body, headers=headers)
             elapsed = time.time() - start_time
-            logger.debug(
-                f"RPC {method} → {self.url} [{response.status_code}] ({elapsed:.3f}s)"
-            )
+            logger.debug(f"RPC {method} → {self.url} [{response.status_code}] ({elapsed:.3f}s)")
             response.raise_for_status()
             return response.json()
         except httpx.RequestError as exc:
             elapsed = time.time() - start_time
-            logger.warning(
-                f"RPC {method} → {self.url} NETWORK_ERROR ({elapsed:.3f}s)"
-            )
+            logger.warning(f"RPC {method} → {self.url} NETWORK_ERROR ({elapsed:.3f}s)")
             raise exc
         except (json.JSONDecodeError, httpx.HTTPStatusError) as exc:
             elapsed = time.time() - start_time
-            logger.warning(
-                f"RPC {method} → {self.url} ERROR ({elapsed:.3f}s): {exc}"
-            )
+            logger.warning(f"RPC {method} → {self.url} ERROR ({elapsed:.3f}s): {exc}")
             return None
 
     def _unwrap(self, rpc_resp: Optional[dict]) -> Optional[dict]:
@@ -510,48 +531,20 @@ class NodeInterface:
     #  Handshake helpers  (still uses REST for the signed exchange)
     # -----------------------------------------------------------------
 
-    async def _signed_request(self, path: str, data: dict = {}, method: str = 'POST', signed_headers_data: dict = None) -> Optional[Any]:
+    async def _signed_request(
+        self,
+        path: str,
+        data: Optional[dict] = None,
+        method: str = "POST",
+        signed_headers_data: Optional[dict] = None,
+    ) -> Optional[Any]:
         """
         Creates and sends a cryptographically signed REST request.
         Kept for the handshake flow which needs Dilithium-signed auth.
         """
-        current_time = int(time.time())
-        nonce = os.urandom(16).hex()
-
-        body_str = json.dumps(data)
-
-        payload_to_sign = {
-            "body": body_str,
-            "timestamp": current_time,
-            "nonce": nonce
-        }
-        # Name our genesis block (signed, as x-denaro-genesis): the receiver adds an unknown
-        # caller as a peer only if it is on the same chain.
-        if NodeInterface.network_identity_provider is not None:
-            try:
-                ident = await NodeInterface.network_identity_provider()
-                signed_headers_data = {**(signed_headers_data or {}),
-                                       "genesis": ident["genesis_hash"]}
-            except Exception:
-                pass
-        if signed_headers_data:
-            payload_to_sign.update(signed_headers_data)
-
-        canonical_bytes_to_sign = get_canonical_json_bytes(payload_to_sign)
-        signature = sign_message(canonical_bytes_to_sign)
-
-        headers = {
-            'x-node-id': get_node_id(),
-            'x-public-key': get_public_key_hex(),
-            'x-signature': signature,
-            'x-timestamp': str(current_time),
-            'x-nonce': nonce,
-            'Content-Type': 'application/json'
-        }
-
-        if signed_headers_data:
-            for key, value in signed_headers_data.items():
-                headers[f'x-denaro-{key}'] = str(value)
+        body_str = json.dumps(data if data is not None else {})
+        headers = {"Content-Type": "application/json"}
+        headers.update(await self._identity_headers(body_str, signed_headers_data))
 
         should_advertise = False
         if DENARO_SELF_URL:
@@ -561,19 +554,60 @@ class NodeInterface:
                 should_advertise = True
 
         if should_advertise:
-            headers['x-peer-url'] = DENARO_SELF_URL
+            headers["x-peer-url"] = DENARO_SELF_URL
 
-        full_url = f'{self.url}/{path}'
-        result = await NodesManager.request(self.client, full_url, method=method, content=body_str, headers=headers, signed=True)
+        full_url = f"{self.url}/{path}"
+        result = await NodesManager.request(
+            self.client, full_url, method=method, content=body_str, headers=headers, signed=True
+        )
         return result
+
+    async def _identity_headers(
+        self, body: str, signed_headers_data: Optional[dict] = None
+    ) -> dict:
+        """Headers that sign ``body`` (the exact bytes sent) as this node: its id, public key,
+        a Dilithium signature over {body, timestamp, nonce, x-denaro-* values} and that
+        timestamp and nonce (the receiver refuses stale or replayed ones). Raises RuntimeError
+        when this process has no node identity."""
+        current_time = int(time.time())
+        nonce = os.urandom(16).hex()
+        payload_to_sign: dict = {"body": body, "timestamp": current_time, "nonce": nonce}
+        # Name our genesis block (signed, as x-denaro-genesis): the receiver adds an unknown
+        # caller as a peer only if it is on the same chain.
+        if NodeInterface.network_identity_provider is not None:
+            try:
+                ident = await NodeInterface.network_identity_provider()
+                signed_headers_data = {
+                    **(signed_headers_data or {}),
+                    "genesis": ident["genesis_hash"],
+                }
+            except Exception:
+                pass
+        if signed_headers_data:
+            payload_to_sign.update(signed_headers_data)
+
+        signature = sign_message(get_canonical_json_bytes(payload_to_sign))
+        headers = {
+            "x-node-id": get_node_id(),
+            "x-public-key": get_public_key_hex(),
+            "x-signature": signature,
+            "x-timestamp": str(current_time),
+            "x-nonce": nonce,
+        }
+        for key, value in (signed_headers_data or {}).items():
+            headers[f"x-denaro-{key}"] = str(value)
+        return headers
 
     async def is_url_local(self, url: str) -> bool:
         """Resolves a URL's hostname and returns True if the IP is private/local."""
         try:
             parsed_url = urlparse(url)
             hostname = parsed_url.hostname
-            if not hostname: return False
-            addr_info = await asyncio.get_event_loop().getaddrinfo(hostname, None, family=socket.AF_INET)
+            if not hostname:
+                return False
+            addr_info = await asyncio.get_event_loop().getaddrinfo(
+                hostname, None, family=socket.AF_INET
+            )
             ip_str = addr_info[0][4][0]
             ip_obj = ipaddress.ip_address(ip_str)
             return ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
@@ -590,13 +624,13 @@ class NodeInterface:
 
     async def push_attestation(self, attestation: dict):
         # Tag the sender so the receiver excludes us from its re-gossip.
-        att = {**attestation, '_sender_node_id': get_node_id()}
+        att = {**attestation, "_sender_node_id": get_node_id()}
         resp = await self._rpc_call("p2p_pushAttestation", [att])
         return self._unwrap(resp)
 
     async def submit_block(self, block_data: dict):
         # Tag the sender so the receiver can do a follow-up sync
-        block_data_with_sender = {**block_data, '_sender_node_id': get_node_id()}
+        block_data_with_sender = {**block_data, "_sender_node_id": get_node_id()}
         resp = await self._rpc_call("p2p_submitBlock", [block_data_with_sender])
         return self._unwrap(resp)
 
@@ -612,6 +646,10 @@ class NodeInterface:
         resp = await self._rpc_call("p2p_getBlocks", [offset, limit])
         return self._unwrap(resp)
 
+    async def get_block_hashes(self, start: int, end: int):
+        resp = await self._rpc_call("p2p_getBlockHashes", [start, end])
+        return self._unwrap(resp)
+
     async def get_status(self):
         resp = await self._rpc_call("p2p_getStatus")
         # Wrap in the {ok, result} envelope callers expect
@@ -625,9 +663,10 @@ class NodeInterface:
         resp = await self._rpc_call("p2p_getPeers")
         return self._unwrap(resp)
 
-    async def handshake_challenge(self):
-        """Initiates a handshake — uses RPC instead of REST."""
-        resp = await self._rpc_call("p2p_handshakeChallenge")
+    async def handshake_challenge(self, client_nonce: str):
+        """Initiates a handshake — uses RPC instead of REST. ``client_nonce`` is what the peer
+        must sign to prove its identity (rpc.modules.p2p.verify_handshake_proof)."""
+        resp = await self._rpc_call("p2p_handshakeChallenge", [client_nonce])
         return self._unwrap(resp)
 
     async def handshake_response(self, challenge: str):
@@ -638,9 +677,10 @@ class NodeInterface:
         current_height = await self.db.get_next_block_id() - 1
         last_block_hash = None
         if current_height > -1:
-            last_block = await self.db.get_block_by_id(current_height)
+            read = getattr(self.db, "get_block_header", None) or self.db.get_block_by_id
+            last_block = await read(current_height)
             if last_block:
-                last_block_hash = last_block.get('hash') or last_block.get('block_hash')
+                last_block_hash = last_block.get("hash") or last_block.get("block_hash")
 
         network = None
         if NodeInterface.network_identity_provider is not None:
@@ -653,10 +693,10 @@ class NodeInterface:
 
     async def check_peer_reachability(self, url_to_check: str) -> bool:
         """Still uses signed REST — reachability checks need auth."""
-        payload = {'url_to_check': url_to_check}
-        resp = await self._signed_request('check_reachability', data=payload)
-        if resp and resp.get('ok'):
-            return resp.get('result', {}).get('reachable', False)
+        payload = {"url_to_check": url_to_check}
+        resp = await self._signed_request("check_reachability", data=payload)
+        if resp and resp.get("ok"):
+            return resp.get("result", {}).get("reachable", False)
         return False
 
     async def get_mempool_hashes(self) -> Optional[dict]:
@@ -666,4 +706,3 @@ class NodeInterface:
     async def get_transactions_by_hash(self, hashes: List[str]) -> Optional[dict]:
         resp = await self._rpc_call("p2p_getTransactionsByHash", [hashes])
         return self._unwrap(resp)
-

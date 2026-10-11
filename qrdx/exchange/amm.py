@@ -36,11 +36,19 @@ import hashlib
 import logging
 from dataclasses import dataclass, field
 from decimal import (
-    ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, ROUND_HALF_UP, Context, Decimal,
-    getcontext, localcontext,
+    ROUND_CEILING,
+    ROUND_FLOOR,
+    ROUND_HALF_EVEN,
+    ROUND_HALF_UP,
+    Context,
+    Decimal,
+    getcontext,
+    localcontext,
 )
 from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple
+
+from .commitment import CommitmentMismatch, Section, as_committed_dict, tracked
 
 # Q96 arithmetic requires high precision. (Kept for modules that relied on importing this one to
 # raise the process-wide default; this module's own arithmetic runs in the pinned contexts below.)
@@ -50,11 +58,11 @@ logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
-Q96 = Decimal(2 ** 96)
+Q96 = Decimal(2**96)
 MIN_TICK = -887272
 MAX_TICK = 887272
 TICK_BASE = Decimal("1.0001")
-AMOUNT_QUANTUM = Decimal("1e-18")        # token amounts: 18 decimals
+AMOUNT_QUANTUM = Decimal("1e-18")  # token amounts: 18 decimals
 MAX_OBSERVATIONS = 64
 
 _PREC = 78
@@ -68,6 +76,7 @@ def _pinned(method):
     def wrapper(*args, **kwargs):
         with localcontext(_CTX):
             return method(*args, **kwargs)
+
     return wrapper
 
 
@@ -75,12 +84,14 @@ def _pinned(method):
 # Enums
 # ---------------------------------------------------------------------------
 
+
 class FeeTier(IntEnum):
     """Fee tiers in pips (1e-6), Whitepaper §7.6."""
-    ULTRA_LOW = 100      # 0.01 %
-    LOW = 500            # 0.05 %
-    MEDIUM = 3000        # 0.30 %
-    HIGH = 10000         # 1.00 %
+
+    ULTRA_LOW = 100  # 0.01 %
+    LOW = 500  # 0.05 %
+    MEDIUM = 3000  # 0.30 %
+    HIGH = 10000  # 1.00 %
 
     @property
     def rate(self) -> Decimal:
@@ -96,9 +107,10 @@ _TICK_SPACINGS = {100: 1, 500: 10, 3000: 60, 10000: 200}
 
 class PoolType(IntEnum):
     """Pool creation types with different stake requirements (§7.3)."""
-    STANDARD = 0       # 10 000 QRDX staked
-    BOOTSTRAP = 1      # 25 000 QRDX staked (30-day incentive)
-    SUBSIDIZED = 2     # 5 000 QRDX burned (permanent, community-owned)
+
+    STANDARD = 0  # 10 000 QRDX staked
+    BOOTSTRAP = 1  # 25 000 QRDX staked (30-day incentive)
+    SUBSIDIZED = 2  # 5 000 QRDX burned (permanent, community-owned)
     INSTITUTIONAL = 3  # 100 000 QRDX staked (higher depth, lower fees)
 
 
@@ -123,11 +135,12 @@ MIN_INITIAL_LIQUIDITY = Decimal("1000")
 # Deterministic tick math
 # ---------------------------------------------------------------------------
 
+
 @functools.lru_cache(maxsize=1 << 16)
 def _sqrt_ratio(tick: int) -> Decimal:
     """√(1.0001^tick), plain (not Q96)."""
     with localcontext(_CTX):
-        return (TICK_BASE ** tick).sqrt()
+        return (TICK_BASE**tick).sqrt()
 
 
 @functools.lru_cache(maxsize=1)
@@ -221,8 +234,9 @@ def amount1_delta(s_a: Decimal, s_b: Decimal, liquidity: Decimal, round_up: bool
     return _q_up(value) if round_up else _q_down(value)
 
 
-def _next_sqrt_from_input(s: Decimal, liquidity: Decimal, amount: Decimal,
-                          zero_for_one: bool) -> Decimal:
+def _next_sqrt_from_input(
+    s: Decimal, liquidity: Decimal, amount: Decimal, zero_for_one: bool
+) -> Decimal:
     """The √price after adding ``amount`` of the input token, rounded so the pool keeps the
     better side: up when token0 comes in (price falls), down when token1 comes in."""
     if zero_for_one:
@@ -236,8 +250,14 @@ def _next_sqrt_from_input(s: Decimal, liquidity: Decimal, amount: Decimal,
         return s + amount / liquidity
 
 
-def _swap_step(s: Decimal, s_target: Decimal, liquidity: Decimal, remaining: Decimal,
-               fee_rate: Decimal, zero_for_one: bool) -> Tuple[Decimal, Decimal, Decimal, Decimal]:
+def _swap_step(
+    s: Decimal,
+    s_target: Decimal,
+    liquidity: Decimal,
+    remaining: Decimal,
+    fee_rate: Decimal,
+    zero_for_one: bool,
+) -> Tuple[Decimal, Decimal, Decimal, Decimal]:
     """One exact-input step toward ``s_target``: (√price after, input, output, fee)."""
     with localcontext(_DOWN):
         remaining_less_fee = _q_down(remaining * (ONE - fee_rate))
@@ -257,7 +277,7 @@ def _swap_step(s: Decimal, s_target: Decimal, liquidity: Decimal, remaining: Dec
         amount_in = amount1_delta(s, s_next, liquidity, round_up=True)
         amount_out = amount0_delta(s, s_next, liquidity, round_up=False)
     if not reached:
-        fee = remaining - amount_in              # the input left over is all fee
+        fee = remaining - amount_in  # the input left over is all fee
     elif amount_in > 0:
         with localcontext(_UP):
             fee = _q_up(amount_in * fee_rate / (ONE - fee_rate))
@@ -270,9 +290,11 @@ def _swap_step(s: Decimal, s_target: Decimal, liquidity: Decimal, remaining: Dec
 # Data models
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class TickInfo:
     """Liquidity info at a single tick boundary."""
+
     tick: int
     liquidity_net: Decimal = ZERO
     liquidity_gross: Decimal = ZERO
@@ -284,6 +306,7 @@ class TickInfo:
 @dataclass
 class Position:
     """A concentrated-liquidity position."""
+
     id: str
     owner: str
     pool_id: str
@@ -292,7 +315,7 @@ class Position:
     liquidity: Decimal = ZERO
     fee_growth_inside_0_last: Decimal = ZERO
     fee_growth_inside_1_last: Decimal = ZERO
-    tokens_owed_0: Decimal = ZERO            # fees earned, not yet paid out
+    tokens_owed_0: Decimal = ZERO  # fees earned, not yet paid out
     tokens_owed_1: Decimal = ZERO
     created_at: float = 0.0
 
@@ -304,6 +327,7 @@ class Position:
 @dataclass
 class Observation:
     """Tick-cumulative observation (block time, Σ tick·dt)."""
+
     time: int
     tick_cumulative: int
 
@@ -314,6 +338,7 @@ class PoolState:
     State of a concentrated-liquidity pool. token0 < token1 (canonical ordering);
     ``sqrt_price`` is √(token1 per token0) in Q96.
     """
+
     id: str
     token0: str
     token1: str
@@ -327,7 +352,7 @@ class PoolState:
 
     sqrt_price: Decimal = ZERO
     tick: int = 0
-    liquidity: Decimal = ZERO                # active (in-range) liquidity
+    liquidity: Decimal = ZERO  # active (in-range) liquidity
 
     # Fee growth per unit of liquidity, LP share only (§7.6)
     fee_growth_global_0: Decimal = ZERO
@@ -345,23 +370,52 @@ class PoolState:
     total_volume_1: Decimal = ZERO
     created_at: float = 0.0
 
+    def __post_init__(self) -> None:
+        # Committed entry by entry (qrdx/exchange/commitment.py): a swap re-digests the ticks
+        # it crosses, a mint or burn its position — not every position of the pool.
+        self.ticks = as_committed_dict(self.ticks, "pool.ticks", _encode_tick)
+        self.positions = as_committed_dict(self.positions, "pool.positions", _encode_position)
+
     @property
     def price(self) -> Decimal:
         return sqrt_price_to_price(self.sqrt_price)
 
 
+def _encode_tick(_tick: int, i: "TickInfo") -> Any:
+    return [
+        str(i.liquidity_net),
+        str(i.liquidity_gross),
+        str(i.fee_growth_outside_0),
+        str(i.fee_growth_outside_1),
+    ]
+
+
+def _encode_position(_pid: str, p: "Position") -> Any:
+    return [
+        p.owner,
+        p.tick_lower,
+        p.tick_upper,
+        str(p.liquidity),
+        str(p.fee_growth_inside_0_last),
+        str(p.fee_growth_inside_1_last),
+        str(p.tokens_owed_0),
+        str(p.tokens_owed_1),
+    ]
+
+
 @dataclass
 class SwapPlan:
     """A simulated exact-input swap — what ``apply`` will do, to the last unit."""
+
     zero_for_one: bool
-    amount_in: Decimal                       # input consumed, fee included
+    amount_in: Decimal  # input consumed, fee included
     amount_out: Decimal
-    fee: Decimal                             # total fee (LP + protocol)
+    fee: Decimal  # total fee (LP + protocol)
     protocol_fee: Decimal
-    sqrt_price: Decimal                      # Q96, after
+    sqrt_price: Decimal  # Q96, after
     tick: int
     liquidity: Decimal
-    fee_growth_global: Decimal               # the input token's, after
+    fee_growth_global: Decimal  # the input token's, after
     crossings: List[Tuple[int, Decimal, Decimal]] = field(default_factory=list)  # tick, fg0, fg1
 
     @property
@@ -374,6 +428,7 @@ class SwapPlan:
 # Concentrated Liquidity Pool
 # ---------------------------------------------------------------------------
 
+
 class ConcentratedLiquidityPool:
     """One pool: swaps (quote → apply), liquidity (mint / burn), fees, oracle."""
 
@@ -382,22 +437,31 @@ class ConcentratedLiquidityPool:
         self._paused: bool = False
         self._pos_sequence: int = 0  # deterministic position ID counter
         self._tick_index: List[int] = sorted(t for t, i in state.ticks.items() if i.initialized)
+        # Commitment cache: the digest as of _digest_version; every mutating entry point bumps
+        # _version (qrdx/exchange/commitment.py).
+        self._version: int = 0
+        self._digest: Optional[bytes] = None
+        self._digest_version: int = -1
 
     # -- Atomicity ------------------------------------------------------------
 
     def snapshot(self) -> Any:
         import copy
+
         return copy.deepcopy((self.state, self._tick_index, self._pos_sequence, self._paused))
 
     def restore(self, snap: Any) -> None:
         self.state, self._tick_index, self._pos_sequence, self._paused = snap
+        self._version += 1
 
     # -- Emergency controls -------------------------------------------------
 
     def pause(self) -> None:
+        self._version += 1
         self._paused = True
 
     def unpause(self) -> None:
+        self._version += 1
         self._paused = False
 
     @property
@@ -474,8 +538,14 @@ class ConcentratedLiquidityPool:
         position = self.state.positions[position_id]
         _, _, fees0, fees1 = self._pending_fees(position)
         principal0, principal1 = self.amounts_for_liquidity(
-            position.tick_lower, position.tick_upper, position.liquidity, round_up=False)
-        return principal0, principal1, position.tokens_owed_0 + fees0, position.tokens_owed_1 + fees1
+            position.tick_lower, position.tick_upper, position.liquidity, round_up=False
+        )
+        return (
+            principal0,
+            principal1,
+            position.tokens_owed_0 + fees0,
+            position.tokens_owed_1 + fees1,
+        )
 
     # -- Oracle -------------------------------------------------------------
 
@@ -491,10 +561,13 @@ class ConcentratedLiquidityPool:
         last = obs[-1]
         if now <= last.time:
             return
-        obs.append(Observation(time=now, tick_cumulative=last.tick_cumulative
-                               + self.state.tick * (now - last.time)))
+        obs.append(
+            Observation(
+                time=now, tick_cumulative=last.tick_cumulative + self.state.tick * (now - last.time)
+            )
+        )
         if len(obs) > MAX_OBSERVATIONS:
-            del obs[:len(obs) - MAX_OBSERVATIONS]
+            del obs[: len(obs) - MAX_OBSERVATIONS]
 
     def _cumulative_at(self, when: int) -> Optional[int]:
         """Σ tick·dt up to block time ``when``. Between two observations the tick was constant
@@ -552,13 +625,14 @@ class ConcentratedLiquidityPool:
         while remaining > 0:
             nxt = self._next_tick(cursor, zero_for_one)
             boundary = nxt is None
-            target_tick = (MIN_TICK if zero_for_one else MAX_TICK) if boundary else nxt
+            target_tick = nxt if nxt is not None else (MIN_TICK if zero_for_one else MAX_TICK)
             s_target = _sqrt_ratio(target_tick)
             if (zero_for_one and s_target >= s) or (not zero_for_one and s_target <= s):
                 if boundary:
                     raise ValueError("Insufficient liquidity for this swap")
             s_next, step_in, step_out, step_fee = _swap_step(
-                s, s_target, liquidity, remaining, fee_rate, zero_for_one)
+                s, s_target, liquidity, remaining, fee_rate, zero_for_one
+            )
             remaining -= step_in + step_fee
             out += step_out
             fee_total += step_fee
@@ -571,7 +645,7 @@ class ConcentratedLiquidityPool:
                 protocol += step_fee
             s = s_next
             if s_next == s_target:
-                if boundary:
+                if nxt is None:  # the boundary
                     if remaining > 0:
                         raise ValueError("Insufficient liquidity for this swap")
                     tick = target_tick
@@ -589,13 +663,23 @@ class ConcentratedLiquidityPool:
                 break
         if out <= 0:
             raise ValueError("Swap too small: no output")
-        return SwapPlan(zero_for_one=zero_for_one, amount_in=amount_in, amount_out=out,
-                        fee=fee_total, protocol_fee=protocol, sqrt_price=s * Q96, tick=tick,
-                        liquidity=liquidity, fee_growth_global=fg, crossings=crossings)
+        return SwapPlan(
+            zero_for_one=zero_for_one,
+            amount_in=amount_in,
+            amount_out=out,
+            fee=fee_total,
+            protocol_fee=protocol,
+            sqrt_price=s * Q96,
+            tick=tick,
+            liquidity=liquidity,
+            fee_growth_global=fg,
+            crossings=crossings,
+        )
 
     @_pinned
     def apply(self, plan: SwapPlan, now: Optional[int] = None) -> SwapPlan:
         """Execute a plan from ``quote`` on the current (unchanged) state."""
+        self._version += 1
         st = self.state
         self.observe_block(now)
         for tick, fg0, fg1 in plan.crossings:
@@ -613,8 +697,13 @@ class ConcentratedLiquidityPool:
         st.sqrt_price, st.tick, st.liquidity = plan.sqrt_price, plan.tick, plan.liquidity
         return plan
 
-    def swap(self, amount_in: Decimal, zero_for_one: bool, min_amount_out: Decimal = ZERO,
-             now: Optional[int] = None) -> Tuple[Decimal, Decimal]:
+    def swap(
+        self,
+        amount_in: Decimal,
+        zero_for_one: bool,
+        min_amount_out: Decimal = ZERO,
+        now: Optional[int] = None,
+    ) -> Tuple[Decimal, Decimal]:
         """Quote, check slippage, apply. Returns (amount_out, fee). Raises — changing
         nothing — if the output would be below ``min_amount_out``."""
         plan = self.quote(amount_in, zero_for_one)
@@ -632,8 +721,11 @@ class ConcentratedLiquidityPool:
             return ONE
         before = (self.state.sqrt_price / Q96) ** 2
         after = (plan.sqrt_price / Q96) ** 2
-        return (abs(after - before) / before).quantize(Decimal("0.00000001"),
-                                                       rounding=ROUND_HALF_UP) if before > 0 else ZERO
+        return (
+            (abs(after - before) / before).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+            if before > 0
+            else ZERO
+        )
 
     # -- Liquidity ----------------------------------------------------------
 
@@ -647,8 +739,9 @@ class ConcentratedLiquidityPool:
             raise ValueError(f"Ticks must be multiples of tick_spacing ({spacing})")
 
     @_pinned
-    def amounts_for_liquidity(self, tick_lower: int, tick_upper: int, liquidity: Decimal,
-                              round_up: bool) -> Tuple[Decimal, Decimal]:
+    def amounts_for_liquidity(
+        self, tick_lower: int, tick_upper: int, liquidity: Decimal, round_up: bool
+    ) -> Tuple[Decimal, Decimal]:
         """token0 / token1 that ``liquidity`` in the range is worth at the current price —
         rounded up for a deposit, down for a withdrawal."""
         st = self.state
@@ -656,35 +749,48 @@ class ConcentratedLiquidityPool:
         if st.tick < tick_lower:
             return amount0_delta(s_l, s_u, liquidity, round_up), ZERO
         if st.tick < tick_upper:
-            return (amount0_delta(s, s_u, liquidity, round_up),
-                    amount1_delta(s_l, s, liquidity, round_up))
+            return (
+                amount0_delta(s, s_u, liquidity, round_up),
+                amount1_delta(s_l, s, liquidity, round_up),
+            )
         return ZERO, amount1_delta(s_l, s_u, liquidity, round_up)
 
     @_pinned
-    def liquidity_for_amounts(self, tick_lower: int, tick_upper: int,
-                              amount0: Optional[Decimal], amount1: Optional[Decimal]) -> Decimal:
+    def liquidity_for_amounts(
+        self,
+        tick_lower: int,
+        tick_upper: int,
+        amount0: Optional[Decimal],
+        amount1: Optional[Decimal],
+    ) -> Decimal:
         """The most liquidity in the range that ``amount0`` / ``amount1`` can pay for at the
         current price (None = unlimited) — the deposit ``amounts_for_liquidity(..., round_up=
         True)`` charges for it never exceeds them. Read-only."""
         self._check_range(tick_lower, tick_upper)
         st = self.state
         s, s_l, s_u = st.sqrt_price / Q96, _sqrt_ratio(tick_lower), _sqrt_ratio(tick_upper)
-        lo, hi = (s_l, s_u) if st.tick < tick_lower else ((s, s_u) if st.tick < tick_upper
-                                                            else (s_l, s_l))
+        lo, hi = (
+            (s_l, s_u)
+            if st.tick < tick_lower
+            else ((s, s_u) if st.tick < tick_upper else (s_l, s_l))
+        )
         candidates = []
         with localcontext(_DOWN):
-            if amount0 is not None and hi > lo:          # the token0 side of the range
+            if amount0 is not None and hi > lo:  # the token0 side of the range
                 candidates.append(Decimal(amount0) * lo * hi / (hi - lo))
-            lo1, hi1 = (s_l, s_l) if st.tick < tick_lower else ((s_l, s) if st.tick < tick_upper
-                                                                 else (s_l, s_u))
-            if amount1 is not None and hi1 > lo1:        # the token1 side
+            lo1, hi1 = (
+                (s_l, s_l)
+                if st.tick < tick_lower
+                else ((s_l, s) if st.tick < tick_upper else (s_l, s_u))
+            )
+            if amount1 is not None and hi1 > lo1:  # the token1 side
                 candidates.append(Decimal(amount1) / (hi1 - lo1))
         if not candidates:
             raise ValueError("amounts give no liquidity in this range at the current price")
         liquidity = min(candidates).quantize(AMOUNT_QUANTUM, rounding=ROUND_FLOOR)
         limit0 = Decimal(amount0) if amount0 is not None else None
         limit1 = Decimal(amount1) if amount1 is not None else None
-        for _ in range(64):              # the deposit rounds up: step under it if it overshoots
+        for _ in range(64):  # the deposit rounds up: step under it if it overshoots
             if liquidity <= 0:
                 break
             cost0, cost1 = self.amounts_for_liquidity(tick_lower, tick_upper, liquidity, True)
@@ -694,10 +800,17 @@ class ConcentratedLiquidityPool:
         return ZERO
 
     @_pinned
-    def add_liquidity(self, owner: str, tick_lower: int, tick_upper: int, amount: Decimal,
-                      now: Optional[int] = None) -> Position:
+    def add_liquidity(
+        self,
+        owner: str,
+        tick_lower: int,
+        tick_upper: int,
+        amount: Decimal,
+        now: Optional[int] = None,
+    ) -> Position:
         """Mint ``amount`` of liquidity in [tick_lower, tick_upper) for ``owner``. The tokens
         it costs are ``amounts_for_liquidity(..., round_up=True)``, computed beforehand."""
+        self._version += 1
         if self._paused:
             raise ValueError("Pool is paused — emergency mode")
         self._check_range(tick_lower, tick_upper)
@@ -707,26 +820,39 @@ class ConcentratedLiquidityPool:
         st = self.state
         self.observe_block(now)
         self._pos_sequence += 1
-        position_id = self._deterministic_position_id(owner, tick_lower, tick_upper,
-                                                      self._pos_sequence)
+        position_id = self._deterministic_position_id(
+            owner, tick_lower, tick_upper, self._pos_sequence
+        )
         self._update_tick(tick_lower, amount, upper=False)
         self._update_tick(tick_upper, amount, upper=True)
         inside0, inside1 = self._fee_growth_inside(tick_lower, tick_upper)
-        position = Position(id=position_id, owner=owner, pool_id=st.id, tick_lower=tick_lower,
-                            tick_upper=tick_upper, liquidity=amount,
-                            fee_growth_inside_0_last=inside0, fee_growth_inside_1_last=inside1)
+        position = Position(
+            id=position_id,
+            owner=owner,
+            pool_id=st.id,
+            tick_lower=tick_lower,
+            tick_upper=tick_upper,
+            liquidity=amount,
+            fee_growth_inside_0_last=inside0,
+            fee_growth_inside_1_last=inside1,
+        )
         if tick_lower <= st.tick < tick_upper:
             st.liquidity += amount
         st.positions[position_id] = position
         return position
 
     @_pinned
-    def remove_liquidity(self, position_id: str, amount: Optional[Decimal] = None,
-                         owner: Optional[str] = None,
-                         now: Optional[int] = None) -> Tuple[Decimal, Decimal]:
+    def remove_liquidity(
+        self,
+        position_id: str,
+        amount: Optional[Decimal] = None,
+        owner: Optional[str] = None,
+        now: Optional[int] = None,
+    ) -> Tuple[Decimal, Decimal]:
         """Burn ``amount`` (default: all) of a position's liquidity and collect its fees.
         Returns the tokens it releases: principal at the current price (rounded down) plus
         every fee the position has earned. With ``owner`` given, only the owner may."""
+        self._version += 1
         position = self.state.positions.get(position_id)
         if position is None:
             raise ValueError(f"Position {position_id} not found")
@@ -739,7 +865,8 @@ class ConcentratedLiquidityPool:
         self.observe_block(now)
         self._accrue(position)
         principal0, principal1 = self.amounts_for_liquidity(
-            position.tick_lower, position.tick_upper, remove, round_up=False)
+            position.tick_lower, position.tick_upper, remove, round_up=False
+        )
         if remove > 0:
             if position.tick_lower <= st.tick < position.tick_upper:
                 st.liquidity -= remove
@@ -764,27 +891,86 @@ class ConcentratedLiquidityPool:
     def state_digest(self) -> bytes:
         """Every consensus-relevant field of the pool, hashed in a canonical order."""
         st = self.state
-        parts = [st.id, st.token0, st.token1, str(int(st.fee_tier)), str(st.sqrt_price),
-                 str(st.tick), str(st.liquidity), str(st.fee_growth_global_0),
-                 str(st.fee_growth_global_1), str(st.protocol_fees_0), str(st.protocol_fees_1)]
+        parts = [
+            st.id,
+            st.token0,
+            st.token1,
+            str(int(st.fee_tier)),
+            str(st.sqrt_price),
+            str(st.tick),
+            str(st.liquidity),
+            str(st.fee_growth_global_0),
+            str(st.fee_growth_global_1),
+            str(st.protocol_fees_0),
+            str(st.protocol_fees_1),
+        ]
         for t in sorted(st.ticks):
             i = st.ticks[t]
-            parts.append(f"t{t}:{i.liquidity_net}:{i.liquidity_gross}:{i.fee_growth_outside_0}:"
-                         f"{i.fee_growth_outside_1}")
+            parts.append(
+                f"t{t}:{i.liquidity_net}:{i.liquidity_gross}:{i.fee_growth_outside_0}:"
+                f"{i.fee_growth_outside_1}"
+            )
         for pid in sorted(st.positions):
             p = st.positions[pid]
-            parts.append(f"p{pid}:{p.owner}:{p.tick_lower}:{p.tick_upper}:{p.liquidity}:"
-                         f"{p.fee_growth_inside_0_last}:{p.fee_growth_inside_1_last}:"
-                         f"{p.tokens_owed_0}:{p.tokens_owed_1}")
+            parts.append(
+                f"p{pid}:{p.owner}:{p.tick_lower}:{p.tick_upper}:{p.liquidity}:"
+                f"{p.fee_growth_inside_0_last}:{p.fee_growth_inside_1_last}:"
+                f"{p.tokens_owed_0}:{p.tokens_owed_1}"
+            )
         for o in st.observations:
             parts.append(f"o{o.time}:{o.tick_cumulative}")
         parts.append(f"seq{self._pos_sequence}")
         return hashlib.blake2b("|".join(parts).encode(), digest_size=32).digest()
 
+    def _incremental_digest(self) -> bytes:
+        st = self.state
+        return (
+            Section("pool")
+            .value(
+                [
+                    st.id,
+                    st.token0,
+                    st.token1,
+                    int(st.fee_tier),
+                    int(st.pool_type),
+                    st.creator,
+                    str(st.stake_amount),
+                    str(st.sqrt_price),
+                    st.tick,
+                    str(st.liquidity),
+                    str(st.fee_growth_global_0),
+                    str(st.fee_growth_global_1),
+                    str(st.protocol_fees_0),
+                    str(st.protocol_fees_1),
+                    self._pos_sequence,
+                    [[o.time, o.tick_cumulative] for o in st.observations],
+                ]
+            )
+            .raw(tracked(st.ticks).commitment())
+            .raw(tracked(st.positions).commitment())
+            .digest()
+        )
+
+    def cached_digest(self) -> bytes:
+        """The pool's incremental digest (``incremental_state_root``), recomputed only after an
+        entry point that may have changed the pool; then it costs the pool's own fields plus
+        the ticks and positions touched, not all of them."""
+        if self._digest is None or self._digest_version != self._version:
+            self._digest = self._incremental_digest()
+            self._digest_version = self._version
+        return self._digest
+
+    def verify_digest(self) -> None:
+        tracked(self.state.ticks).verify()
+        tracked(self.state.positions).verify()
+        if self.cached_digest() != self._incremental_digest():
+            raise CommitmentMismatch(f"pool {self.state.id}: cached digest is stale")
+
 
 # ---------------------------------------------------------------------------
 # Pool Manager  (registry)
 # ---------------------------------------------------------------------------
+
 
 class PoolManager:
     """All AMM pools: permissionless creation (with stake), lookup by id or pair."""
@@ -822,8 +1008,10 @@ class PoolManager:
         required = POOL_STAKE_REQUIREMENTS[pool_type]
         if stake_amount < required:
             verb = "burning" if pool_type == PoolType.SUBSIDIZED else "staking"
-            raise ValueError(f"{PoolType(pool_type).name} pool requires {verb} {required} QRDX "
-                             f"(got {stake_amount})")
+            raise ValueError(
+                f"{PoolType(pool_type).name} pool requires {verb} {required} QRDX "
+                f"(got {stake_amount})"
+            )
         initial_sqrt_price = Decimal(str(initial_sqrt_price))
         if 0 < initial_sqrt_price < MIN_SQRT_RATIO:
             # Below the smallest Q96 value there is: a plain √price (callers wrote √30000 as
@@ -836,15 +1024,27 @@ class PoolManager:
         self._pool_sequence += 1
         pool_id = self._deterministic_pool_id(token0, token1, fee_tier, self._pool_sequence)
         state = PoolState(
-            id=pool_id, token0=token0, token1=token1, fee_tier=fee_tier, pool_type=pool_type,
-            creator=creator, stake_amount=stake_amount, sqrt_price=initial_sqrt_price,
+            id=pool_id,
+            token0=token0,
+            token1=token1,
+            fee_tier=fee_tier,
+            pool_type=pool_type,
+            creator=creator,
+            stake_amount=stake_amount,
+            sqrt_price=initial_sqrt_price,
             tick=sqrt_price_to_tick(initial_sqrt_price),
         )
         pool = ConcentratedLiquidityPool(state)
         self._pools[pool_id] = pool
         self._pair_index.setdefault(pair_key, []).append(pool_id)
-        logger.info("Pool %s created: %s/%s fee=%s type=%s", pool_id, token0, token1, fee_tier,
-                    pool_type.name)
+        logger.info(
+            "Pool %s created: %s/%s fee=%s type=%s",
+            pool_id,
+            token0,
+            token1,
+            fee_tier,
+            pool_type.name,
+        )
         return pool
 
     def remove_pool(self, pool_id: str) -> Optional[ConcentratedLiquidityPool]:

@@ -29,11 +29,21 @@ Doomsday Protocol (§8.5):
 import hashlib
 import json
 import time
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
+from ..constants import (
+    BRIDGE_FEE_BPS,
+    DOOMSDAY_CANARY_ADDRESS,
+    DOOMSDAY_CANARY_BOUNTY,
+    FRAUD_PROOF_WINDOW_SECONDS,
+    HIGH_VALUE_THRESHOLD_USD,
+    ORACLE_ATTESTATION_QUORUM_DENOMINATOR,
+    ORACLE_ATTESTATION_QUORUM_NUMERATOR,
+)
+from ..crypto.hashing import keccak256
+from ..logger import get_logger
 from .types import (
     BridgeOperationType,
     BridgeRecord,
@@ -42,17 +52,6 @@ from .types import (
     ChainId,
     ValidatorProof,
 )
-from ..constants import (
-    BRIDGE_FEE_BPS,
-    DOOMSDAY_CANARY_ADDRESS,
-    DOOMSDAY_CANARY_BOUNTY,
-    FRAUD_PROOF_WINDOW_SECONDS,
-    HIGH_VALUE_THRESHOLD_USD,
-    ORACLE_ATTESTATION_QUORUM_NUMERATOR,
-    ORACLE_ATTESTATION_QUORUM_DENOMINATOR,
-)
-from ..crypto.hashing import keccak256
-from ..logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -120,6 +119,7 @@ DEFAULT_TOKEN_CONFIGS = {
 #  DOOMSDAY BRIDGE INTERFACE  (for notification callbacks)
 # ══════════════════════════════════════════════════════════════════════
 
+
 @runtime_checkable
 class DoomsdayAware(Protocol):
     """
@@ -138,6 +138,7 @@ class DoomsdayAware(Protocol):
 #  DOOMSDAY ATTESTATION  (validator vote for canary drain)
 # ══════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class DoomsdayAttestation:
     """
@@ -153,6 +154,7 @@ class DoomsdayAttestation:
         timestamp: When the attestation was created
         signature: Dilithium signature over the attestation contents
     """
+
     validator_address: str
     canary_address: str
     observed_balance: Decimal
@@ -202,6 +204,7 @@ class DoomsdayAttestation:
 #  DOOMSDAY PROOF  (aggregated quorum proof)
 # ══════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class DoomsdayProof:
     """
@@ -228,6 +231,7 @@ class DoomsdayProof:
         trigger_block_height: Block height when trigger was initiated
         verification_hash: SHA-256 of the full proof for on-chain recording
     """
+
     attestations: List[DoomsdayAttestation] = field(default_factory=list)
     canary_signature: str = ""
     canary_signed_message: str = ""
@@ -264,9 +268,7 @@ class DoomsdayProof:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "DoomsdayProof":
         return cls(
-            attestations=[
-                DoomsdayAttestation.from_dict(a) for a in d.get("attestations", [])
-            ],
+            attestations=[DoomsdayAttestation.from_dict(a) for a in d.get("attestations", [])],
             canary_signature=d.get("canary_signature", ""),
             canary_signed_message=d.get("canary_signed_message", ""),
             trigger_block_height=d.get("trigger_block_height", 0),
@@ -277,6 +279,7 @@ class DoomsdayProof:
 # ══════════════════════════════════════════════════════════════════════
 #  STATE PERSISTENCE INTERFACE
 # ══════════════════════════════════════════════════════════════════════
+
 
 @runtime_checkable
 class DoomsdayStateStore(Protocol):
@@ -316,6 +319,7 @@ class InMemoryDoomsdayStateStore:
 # ══════════════════════════════════════════════════════════════════════
 #  DOOMSDAY PROTOCOL  (Whitepaper §8.5)
 # ══════════════════════════════════════════════════════════════════════
+
 
 class DoomsdayProtocol:
     """
@@ -394,9 +398,7 @@ class DoomsdayProtocol:
         self._registered_bridge_ids: set = set()
 
         # ── persistence ──
-        self._state_store: DoomsdayStateStore = (
-            state_store or InMemoryDoomsdayStateStore()
-        )
+        self._state_store: DoomsdayStateStore = state_store or InMemoryDoomsdayStateStore()
 
         # ── ECDSA verification for Path A ──
         self._verify_ecdsa_fn = verify_ecdsa_fn
@@ -524,9 +526,7 @@ class DoomsdayProtocol:
 
         # Reject duplicate from same validator
         if attestation.validator_address in self._attesting_validators:
-            logger.debug(
-                f"Duplicate attestation from {attestation.validator_address[:16]}..."
-            )
+            logger.debug(f"Duplicate attestation from {attestation.validator_address[:16]}...")
             return False
 
         # Accept attestation
@@ -710,8 +710,7 @@ class DoomsdayProtocol:
         self._registered_bridge_ids.discard(bridge_id)
         # Remove from list (linear scan — small list in practice)
         self._registered_bridges = [
-            b for i, b in enumerate(self._registered_bridges)
-            if str(id(b)) != bridge_id
+            b for i, b in enumerate(self._registered_bridges) if str(id(b)) != bridge_id
         ]
         return True
 
@@ -886,9 +885,7 @@ class DoomsdayProtocol:
         self._bounty_paid = state.get("bounty_paid", False)
 
         if self._doomsday_active:
-            logger.warning(
-                "Doomsday state RESTORED from store — shield operations remain BLOCKED"
-            )
+            logger.warning("Doomsday state RESTORED from store — shield operations remain BLOCKED")
 
     def __setattr__(self, name: str, value: Any) -> None:
         """
@@ -913,6 +910,7 @@ class DoomsdayProtocol:
 # ══════════════════════════════════════════════════════════════════════
 #  BRIDGE MINTER  (Whitepaper §10.3)
 # ══════════════════════════════════════════════════════════════════════
+
 
 class BridgeMinter:
     """
@@ -977,14 +975,16 @@ class BridgeMinter:
         self.total_minted.setdefault(shielded, Decimal(0))
         self.total_minted[shielded] += amount
 
-        self._mint_records.append({
-            "type": "mint",
-            "token": shielded,
-            "amount": str(amount),
-            "recipient": recipient,
-            "bridge_record_id": bridge_record_id,
-            "timestamp": int(time.time()),
-        })
+        self._mint_records.append(
+            {
+                "type": "mint",
+                "token": shielded,
+                "amount": str(amount),
+                "recipient": recipient,
+                "bridge_record_id": bridge_record_id,
+                "timestamp": int(time.time()),
+            }
+        )
 
         logger.info(f"Minted {amount} {shielded} to {recipient[:16]}...")
         return True
@@ -1018,22 +1018,22 @@ class BridgeMinter:
         outstanding = minted - burned
 
         if amount > outstanding:
-            logger.error(
-                f"Cannot burn {amount} {shielded}: only {outstanding} outstanding"
-            )
+            logger.error(f"Cannot burn {amount} {shielded}: only {outstanding} outstanding")
             return False
 
         self.total_burned.setdefault(shielded, Decimal(0))
         self.total_burned[shielded] += amount
 
-        self._mint_records.append({
-            "type": "burn",
-            "token": shielded,
-            "amount": str(amount),
-            "burner": burner,
-            "bridge_record_id": bridge_record_id,
-            "timestamp": int(time.time()),
-        })
+        self._mint_records.append(
+            {
+                "type": "burn",
+                "token": shielded,
+                "amount": str(amount),
+                "burner": burner,
+                "bridge_record_id": bridge_record_id,
+                "timestamp": int(time.time()),
+            }
+        )
 
         logger.info(f"Burned {amount} {shielded} from {burner[:16]}...")
         return True
@@ -1049,10 +1049,7 @@ class BridgeMinter:
         return {
             "total_minted": {k: str(v) for k, v in self.total_minted.items()},
             "total_burned": {k: str(v) for k, v in self.total_burned.items()},
-            "outstanding": {
-                sym: str(self.get_outstanding(sym))
-                for sym in self.total_minted
-            },
+            "outstanding": {sym: str(self.get_outstanding(sym)) for sym in self.total_minted},
             "registered_tokens": list(self.token_configs.keys()),
         }
 
@@ -1060,6 +1057,7 @@ class BridgeMinter:
 # ══════════════════════════════════════════════════════════════════════
 #  SHIELDING MANAGER  (Whitepaper §8.1 – §8.3)
 # ══════════════════════════════════════════════════════════════════════
+
 
 class ShieldingManager:
     """
@@ -1105,9 +1103,9 @@ class ShieldingManager:
         # Fail any PENDING/CONFIRMING shield records immediately
         failed_count = 0
         for record in self._records.values():
-            if (
-                record.operation == BridgeOperationType.SHIELD
-                and record.status in (BridgeStatus.PENDING, BridgeStatus.CONFIRMING)
+            if record.operation == BridgeOperationType.SHIELD and record.status in (
+                BridgeStatus.PENDING,
+                BridgeStatus.CONFIRMING,
             ):
                 record.status = BridgeStatus.FAILED
                 failed_count += 1
@@ -1295,9 +1293,7 @@ class ShieldingManager:
         )
 
         # Burn tokens
-        success = self.minter.burn(
-            token_symbol, amount, qrdx_address, record.record_id
-        )
+        success = self.minter.burn(token_symbol, amount, qrdx_address, record.record_id)
         if not success:
             return None
 
@@ -1319,7 +1315,7 @@ class ShieldingManager:
     def _is_high_value(self, amount: Decimal, token_symbol: str) -> bool:
         """
         Check if amount exceeds the high-value threshold for fraud proof window.
-        
+
         Uses per-token thresholds derived from the bridge token configuration
         to ensure denomination-aware comparison. The thresholds are conservative
         estimates based on the token's expected value range.
@@ -1327,10 +1323,10 @@ class ShieldingManager:
         # Per-token high-value thresholds (amount of token ≈ $100K USD)
         # These are updated via governance proposals as prices change.
         HIGH_VALUE_THRESHOLDS: Dict[str, Decimal] = {
-            "ETH": Decimal("30"),        # ~$100K at $3,300/ETH
-            "BTC": Decimal("1"),         # ~$100K at $100K/BTC
-            "SOL": Decimal("500"),       # ~$100K at $200/SOL
-            "USDC": Decimal("100000"),   # $100K
+            "ETH": Decimal("30"),  # ~$100K at $3,300/ETH
+            "BTC": Decimal("1"),  # ~$100K at $100K/BTC
+            "SOL": Decimal("500"),  # ~$100K at $200/SOL
+            "USDC": Decimal("100000"),  # $100K
             "QRDX": HIGH_VALUE_THRESHOLD_USD,  # Direct comparison for native token
         }
         threshold = HIGH_VALUE_THRESHOLDS.get(token_symbol, HIGH_VALUE_THRESHOLD_USD)
@@ -1409,14 +1405,12 @@ class ShieldingManager:
         return self._records.get(record_id)
 
     def get_records_by_address(self, qrdx_address: str) -> List[BridgeRecord]:
-        return [
-            r for r in self._records.values()
-            if r.qrdx_address == qrdx_address
-        ]
+        return [r for r in self._records.values() if r.qrdx_address == qrdx_address]
 
     def get_pending_records(self) -> List[BridgeRecord]:
         return [
-            r for r in self._records.values()
+            r
+            for r in self._records.values()
             if r.status in (BridgeStatus.PENDING, BridgeStatus.CONFIRMING)
         ]
 
@@ -1426,8 +1420,7 @@ class ShieldingManager:
             "pending": len(self.get_pending_records()),
             "doomsday": self.doomsday.get_status(),
             "minter": self.minter.get_stats(),
-            "fraud_windows_active": len([
-                rid for rid, exp in self._fraud_windows.items()
-                if int(time.time()) < exp
-            ]),
+            "fraud_windows_active": len(
+                [rid for rid, exp in self._fraud_windows.items() if int(time.time()) < exp]
+            ),
         }

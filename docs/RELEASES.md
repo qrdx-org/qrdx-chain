@@ -149,11 +149,21 @@ the diff, and run `scripts/release/test-image.sh` on an image built with it.
 
 ### One-time setup
 
-1. **Keys.** Each maintainer adds one line to `release/allowed_signers`:
+1. **Keys.** Each maintainer adds one line to `release/allowed_signers`, with the tool that
+   writes it in the required form and refuses malformed, duplicate or RSA keys:
+
+   ```sh
+   ssh-keygen -t ed25519-sk -C alice@qrdx.org          # hardware-backed; or -t ed25519
+   python3 scripts/release/release.py add-signer --principal alice@qrdx.org --key ~/.ssh/id_ed25519_sk.pub
+   ```
+
+   It adds a line like:
 
    ```
    alice@qrdx.org namespaces="git,qrdx-release" sk-ssh-ed25519@openssh.com AAAA…
    ```
+
+   It also prints the key's fingerprint, to publish out of band.
 
    Both namespaces are required:
    - `git` covers the release tag, which the workflow checks with `git verify-tag`;

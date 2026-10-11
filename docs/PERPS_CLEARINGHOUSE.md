@@ -87,7 +87,7 @@ mark; skipping it would split nodes (pinned by `tests/test_clearinghouse_mark_pr
 perp prices; we have none yet, so — as Hyperliquid does when that input is missing — the
 30 s EMA of the book median stands in, and the ±5 % band is added on top. On an empty or thin
 book a squeeze moves the mark only as fast as the EMAs let it (a 50 % squeeze moves it ~3 %
-in one 2 s block), never past the band, and it decays within about three minutes once the
+in two seconds), never past the band, and it decays within about three minutes once the
 honest book returns. A deep book is the real defence; a validator-voted external perp price
 (Phase 5) would restore the third input.
 

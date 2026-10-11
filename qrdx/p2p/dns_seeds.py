@@ -21,11 +21,10 @@ with post-quantum signatures.
 """
 
 import asyncio
-import hashlib
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 from ..logger import get_logger
 
@@ -60,13 +59,14 @@ MIN_SEED_OPERATORS = 2
 
 # TXT record regex
 _TXT_RECORD_RE = re.compile(
-    r'v=(?P<version>\w+)\s+nodes=(?P<nodes>[^\s]+)\s+sig=(?P<sig>[a-fA-F0-9]+)\s+pubkey=(?P<pubkey>[a-fA-F0-9]+)'
+    r"v=(?P<version>\w+)\s+nodes=(?P<nodes>[^\s]+)\s+sig=(?P<sig>[a-fA-F0-9]+)\s+pubkey=(?P<pubkey>[a-fA-F0-9]+)"
 )
 
 
 # ---------------------------------------------------------------------------
 # Seed Operator Trust Anchor
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SeedOperator:
@@ -76,9 +76,10 @@ class SeedOperator:
     Each operator has a Dilithium public key used to verify
     the authenticity of DNS TXT records they publish.
     """
+
     domain: str
     public_key_hex: str  # Dilithium public key hex for signature verification
-    organization: str    # Human-readable org name
+    organization: str  # Human-readable org name
     is_active: bool = True
 
     @property
@@ -90,11 +91,13 @@ class SeedOperator:
 # DNSSeedResult
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class DNSSeedResult:
     """Result from querying a single DNS seed."""
+
     domain: str
-    nodes: List[str]          # @-schema addresses
+    nodes: List[str]  # @-schema addresses
     signature_valid: bool
     timestamp: float = field(default_factory=time.time)
     error: Optional[str] = None
@@ -107,6 +110,7 @@ class DNSSeedResult:
 # ---------------------------------------------------------------------------
 # DNSSeedDiscovery
 # ---------------------------------------------------------------------------
+
 
 class DNSSeedDiscovery:
     """
@@ -177,7 +181,10 @@ class DNSSeedDiscovery:
         try:
             # Use asyncio subprocess for non-blocking DNS query
             proc = await asyncio.create_subprocess_exec(
-                'dig', '+short', 'TXT', domain,
+                "dig",
+                "+short",
+                "TXT",
+                domain,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -191,7 +198,7 @@ class DNSSeedDiscovery:
                 return []
 
             records = []
-            for line in stdout.decode().strip().split('\n'):
+            for line in stdout.decode().strip().split("\n"):
                 line = line.strip().strip('"')
                 if line:
                     records.append(line)
@@ -210,11 +217,12 @@ class DNSSeedDiscovery:
     async def _resolve_txt_builtin(self, domain: str) -> List[str]:
         """Fallback TXT resolution using Python's socket/dns modules."""
         try:
-            import socket
             # Python's socket doesn't support TXT records directly
             # Use the subprocess approach with `nslookup` as fallback
             proc = await asyncio.create_subprocess_exec(
-                'nslookup', '-type=TXT', domain,
+                "nslookup",
+                "-type=TXT",
+                domain,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -224,10 +232,10 @@ class DNSSeedDiscovery:
             )
 
             records = []
-            for line in stdout.decode().split('\n'):
-                if 'text =' in line.lower():
+            for line in stdout.decode().split("\n"):
+                if "text =" in line.lower():
                     # Extract the TXT value
-                    txt = line.split('=', 1)[1].strip().strip('"')
+                    txt = line.split("=", 1)[1].strip().strip('"')
                     records.append(txt)
             return records
 
@@ -246,8 +254,8 @@ class DNSSeedDiscovery:
         match = _TXT_RECORD_RE.match(record)
         if not match:
             # Try unsigned format: just a comma-separated list of @-schema nodes
-            if not self._require_signatures and '@' in record:
-                nodes = [n.strip() for n in record.split(',') if '@' in n]
+            if not self._require_signatures and "@" in record:
+                nodes = [n.strip() for n in record.split(",") if "@" in n]
                 if nodes:
                     return DNSSeedResult(
                         domain=domain,
@@ -256,21 +264,19 @@ class DNSSeedDiscovery:
                     )
             return None
 
-        version = match.group('version')
+        version = match.group("version")
         if version != DNS_SEED_VERSION:
             logger.debug(f"Unsupported DNS seed version: {version}")
             return None
 
-        nodes_csv = match.group('nodes')
-        sig_hex = match.group('sig')
-        pubkey_hex = match.group('pubkey')
+        nodes_csv = match.group("nodes")
+        sig_hex = match.group("sig")
+        pubkey_hex = match.group("pubkey")
 
-        nodes = [n.strip() for n in nodes_csv.split(',') if n.strip()]
+        nodes = [n.strip() for n in nodes_csv.split(",") if n.strip()]
 
         # Verify signature
-        sig_valid = self._verify_signature(
-            domain, version, nodes_csv, sig_hex, pubkey_hex
-        )
+        sig_valid = self._verify_signature(domain, version, nodes_csv, sig_hex, pubkey_hex)
 
         if self._require_signatures and not sig_valid:
             logger.warning(
@@ -316,7 +322,7 @@ class DNSSeedDiscovery:
             public_key = bytes.fromhex(pubkey_hex)
 
             # Resolve algorithm name
-            for algo_name in ('ML-DSA-65', 'Dilithium3'):
+            for algo_name in ("ML-DSA-65", "Dilithium3"):
                 try:
                     verifier = oqs.Signature(algo_name)
                     return verifier.verify(message, signature, public_key)
@@ -372,8 +378,7 @@ class DNSSeedDiscovery:
         self._last_query_time = time.time()
 
         logger.info(
-            f"DNS seed discovery: {len(all_nodes)} unique nodes from "
-            f"{len(self._domains)} seeds"
+            f"DNS seed discovery: {len(all_nodes)} unique nodes from " f"{len(self._domains)} seeds"
         )
         return all_nodes
 
@@ -415,16 +420,16 @@ class DNSSeedDiscovery:
     def get_stats(self) -> Dict:
         """Get DNS seed discovery statistics."""
         return {
-            'seed_domains': self._domains,
-            'trusted_operators': len(self._operators),
-            'require_signatures': self._require_signatures,
-            'cached_results': len(self._cache),
-            'last_query_time': self._last_query_time,
-            'cache': {
+            "seed_domains": self._domains,
+            "trusted_operators": len(self._operators),
+            "require_signatures": self._require_signatures,
+            "cached_results": len(self._cache),
+            "last_query_time": self._last_query_time,
+            "cache": {
                 domain: {
-                    'nodes': len(result.nodes),
-                    'signature_valid': result.signature_valid,
-                    'fresh': result.is_fresh,
+                    "nodes": len(result.nodes),
+                    "signature_valid": result.signature_valid,
+                    "fresh": result.is_fresh,
                 }
                 for domain, result in self._cache.items()
             },

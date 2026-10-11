@@ -102,7 +102,7 @@ RANDAO_PROPOSER_ELIGIBLE_K = 2
 # the variance averages out and backups rarely collide. Enable there (or with a slot sized above
 # worst-case block-production time). Kept OFF; K=2 retained (neutral when off).
 # LARGER-SLOT ENABLE ATTEMPT (2026-08-29, two 6s soaks): a slot sized above block-production time
-# (QRDX_SLOT_DURATION=6 → backup wait slot/2 = 3s) SUBSTANTIALLY reduces the K=2 competing-block
+# (QRDX_SLOT_DURATION_MS=6000 → backup wait slot/2 = 3s) SUBSTANTIALLY reduces the K=2 competing-block
 # churn — 0 live-path eligibility rejects (selection stable), state converges (token ledger
 # byte-identical, height spread 0–1), reorgs down (~8 vs ~13), and s07/s08 pass with the new
 # slot-aware height check. Run 1 was FULLY green incl. all perp/token/CLOB convergence scenarios;
@@ -111,7 +111,7 @@ RANDAO_PROPOSER_ELIGIBLE_K = 2
 # confirms the slot-sizing direction, but NOT reliably clean on only 3 validators (backups still
 # occasionally collide). Full reliability needs a production-scale set (variance averages out).
 # ENV-GATED, default OFF (fast 2s dev testnet stays green); enable in production with
-# QRDX_ENFORCE_RANDAO=1 + QRDX_SLOT_DURATION≥6. See docs item 5 / [[randao-fork-choice-status]].
+# QRDX_ENFORCE_RANDAO=1 + QRDX_SLOT_DURATION_MS≥6000. See docs item 5 / [[randao-fork-choice-status]].
 #
 # Scheduling: RANDAO selection is the chain-spec feature ``randao_selection`` — a network turns
 # it on at a fork height (docs/PROTOCOL_UPGRADES.md). QRDX_ENFORCE_RANDAO remains as a
@@ -124,6 +124,7 @@ def randao_reveal_message(slot: int, spec=None) -> bytes:
     """What a proposer signs as its RANDAO reveal for ``slot``: the network's RANDAO signing
     domain, the slot, and a purpose tag. One definition for the proposer and every verifier."""
     from ..chain_spec import signing_domain
+
     return signing_domain("randao", spec) + int(slot).to_bytes(8, "little") + b"RANDAO_REVEAL"
 
 
@@ -137,7 +138,9 @@ def randao_selection_active(height: int) -> bool:
     if ENFORCE_RANDAO_SELECTION:
         return True
     from .. import chain_spec
+
     return chain_spec.is_active("randao_selection", int(height))
+
 
 # Genesis seed for the fold. Equal to the current constant proposer mix, so the
 # accumulated mix at height 0 (no reveals) reproduces today's selection input —
@@ -154,6 +157,7 @@ def _mix_in(mix: bytes, reveal: bytes) -> bytes:
 def _extract_reveal(block: dict) -> Optional[bytes]:
     """The proposer's RANDAO reveal from a stored block, or None if absent/empty."""
     from .block_verification import _parse_block_content
+
     content = block.get("content") or block.get("block_content")
     if not content:
         return None
@@ -178,7 +182,26 @@ async def compute_randao_mix(db: Any, up_to_height: Optional[int] = None) -> byt
 
     Pure function of the canonical chain → identical on every node, reorg-safe.
     Blocks without a reveal (e.g. genesis) are skipped. Returns the 32-byte mix.
+
+    On the node's database this is a lookup in the chain index (qrdx/chain_index.py), which
+    folds each block once; ``compute_randao_mix_by_walk`` — the fold from genesis, kept as
+    the reference — is used for a store without SQL.
     """
+    if up_to_height is None:
+        try:
+            up_to_height = (await db.get_next_block_id()) - 1
+        except Exception:
+            return RANDAO_SEED
+    if getattr(db, "connection", None) is not None:
+        from ..chain_index import randao_mix
+
+        return await randao_mix(db, int(up_to_height))
+    return await compute_randao_mix_by_walk(db, up_to_height)
+
+
+async def compute_randao_mix_by_walk(db: Any, up_to_height: Optional[int] = None) -> bytes:
+    """``compute_randao_mix`` by folding every block from genesis: O(height) block reads and
+    parses per call. The reference the chain index is tested against."""
     if up_to_height is None:
         try:
             up_to_height = (await db.get_next_block_id()) - 1
@@ -225,6 +248,7 @@ async def checkpoint_mix_for_block(db: Any, height: int, lookback: Optional[int]
 async def _block_slot(db: Any, height: int) -> Optional[int]:
     """The slot of the block at ``height`` (parsed from its content), or None."""
     from .block_verification import _parse_block_content
+
     try:
         b = await db.get_block_by_id(height)
     except Exception:
@@ -243,7 +267,11 @@ async def _boundary_height_for_slot(db: Any, boundary_slot: int) -> int:
     """Highest block height whose slot is < ``boundary_slot``. Block slot is strictly
     increasing with height on any single chain (each block is proposed at a later slot
     than its parent), so a binary search over heights is correct and O(log n). Returns -1
-    if no such block."""
+    if no such block. On the node's database: one indexed query (qrdx/chain_index.py)."""
+    if getattr(db, "connection", None) is not None:
+        from ..chain_index import highest_height_before_slot
+
+        return await highest_height_before_slot(db, boundary_slot)
     try:
         tip = (await db.get_next_block_id()) - 1
     except Exception:
@@ -284,8 +312,9 @@ async def epoch_checkpoint_mix(db: Any, epoch: int, lookback_epochs: int = 1) ->
     return await compute_randao_mix(db, h)
 
 
-async def selection_mix_for_slot(db: Any, slot: int,
-                                 lookback_epochs: int = RANDAO_SELECTION_LOOKBACK_EPOCHS) -> bytes:
+async def selection_mix_for_slot(
+    db: Any, slot: int, lookback_epochs: int = RANDAO_SELECTION_LOOKBACK_EPOCHS
+) -> bytes:
     """The proposer-selection mix for a given SLOT = `epoch_checkpoint_mix(epoch(slot))`.
     The SINGLE entry point used by both the proposer (`manager._selection_mix`) and the
     importer (`verify_proposer_eligibility`), so the slot→epoch conversion uses ONE

@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set
 
-from ..logger import get_logger
 from ..constants import (
     GOVERNANCE_APPROVAL_THRESHOLD,
     GOVERNANCE_QUORUM_THRESHOLD,
@@ -24,10 +23,10 @@ from ..constants import (
     GOVERNANCE_VOTE_AGAINST,
     GOVERNANCE_VOTE_FOR,
 )
+from ..logger import get_logger
 from .proposals import (
     GovernanceError,
     Proposal,
-    ProposalStatus,
 )
 
 logger = get_logger(__name__)
@@ -36,6 +35,7 @@ logger = get_logger(__name__)
 # ══════════════════════════════════════════════════════════════════════
 #  EXCEPTIONS
 # ══════════════════════════════════════════════════════════════════════
+
 
 class VotingError(GovernanceError):
     """Base voting error."""
@@ -61,8 +61,10 @@ class VotingClosedError(VotingError):
 #  VOTE DATA
 # ══════════════════════════════════════════════════════════════════════
 
+
 class Vote:
     """Vote type constants matching constants.py."""
+
     FOR = GOVERNANCE_VOTE_FOR
     AGAINST = GOVERNANCE_VOTE_AGAINST
     ABSTAIN = GOVERNANCE_VOTE_ABSTAIN
@@ -85,10 +87,11 @@ class Vote:
 @dataclass(frozen=True)
 class VoteRecord:
     """An individual vote cast by a voter."""
+
     proposal_id: int
     voter: str
-    vote_type: int          # Vote.FOR / AGAINST / ABSTAIN
-    voting_power: Decimal   # Stake-derived weight
+    vote_type: int  # Vote.FOR / AGAINST / ABSTAIN
+    voting_power: Decimal  # Stake-derived weight
     delegated_from: Optional[str] = None  # If voting on behalf of delegator
     timestamp: float = field(default_factory=time.time)
 
@@ -106,6 +109,7 @@ class VoteRecord:
 @dataclass
 class VotingResult:
     """Aggregated tally for a proposal."""
+
     proposal_id: int
     votes_for: Decimal = field(default_factory=lambda: Decimal("0"))
     votes_against: Decimal = field(default_factory=lambda: Decimal("0"))
@@ -162,9 +166,11 @@ class VotingResult:
 #  DELEGATION
 # ══════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class Delegation:
     """Delegation of voting power from delegator → delegate."""
+
     delegator: str
     delegate: str
     amount: Decimal
@@ -182,6 +188,7 @@ class Delegation:
 # ══════════════════════════════════════════════════════════════════════
 #  VOTING ENGINE
 # ══════════════════════════════════════════════════════════════════════
+
 
 class VotingEngine:
     """
@@ -232,8 +239,7 @@ class VotingEngine:
     def get_delegated_power(self, delegate: str) -> Decimal:
         """Total power delegated TO this delegate."""
         return sum(
-            d.amount for d in self._delegations.values()
-            if d.delegate == delegate
+            (d.amount for d in self._delegations.values() if d.delegate == delegate), Decimal("0")
         )
 
     # ── Voting power resolution ───────────────────────────────────────
@@ -283,25 +289,20 @@ class VotingEngine:
         # Proposal must be in ACTIVE status
         if not proposal.is_votable:
             raise VotingClosedError(
-                f"Proposal #{proposal.id} is not votable "
-                f"(status={proposal.status.name})"
+                f"Proposal #{proposal.id} is not votable " f"(status={proposal.status.name})"
             )
 
         # Check voting period
         now = time.time()
         if proposal.voting_end and now > proposal.voting_end:
-            raise VotingClosedError(
-                f"Voting period for proposal #{proposal.id} has ended"
-            )
+            raise VotingClosedError(f"Voting period for proposal #{proposal.id} has ended")
 
         # Prevent double voting
         pid = proposal.id
         if pid not in self._voters:
             self._voters[pid] = set()
         if voter in self._voters[pid]:
-            raise AlreadyVotedError(
-                f"{voter} has already voted on proposal #{pid}"
-            )
+            raise AlreadyVotedError(f"{voter} has already voted on proposal #{pid}")
 
         # Resolve voting power
         power = voting_power if voting_power is not None else self.get_voting_power(voter)
@@ -333,8 +334,7 @@ class VotingEngine:
             result.votes_abstain += power
 
         logger.info(
-            f"Vote: {voter} → {Vote.name(vote_type)} on proposal #{pid} "
-            f"(power={power})"
+            f"Vote: {voter} → {Vote.name(vote_type)} on proposal #{pid} " f"(power={power})"
         )
         return record
 
@@ -394,8 +394,7 @@ class VotingEngine:
         elif result.is_approved:
             proposal.mark_passed()
             logger.info(
-                f"Proposal #{proposal.id}: PASSED "
-                f"(approval={result.approval_rate:.2%})"
+                f"Proposal #{proposal.id}: PASSED " f"(approval={result.approval_rate:.2%})"
             )
         else:
             proposal.mark_defeated(
@@ -403,8 +402,7 @@ class VotingEngine:
                 f"threshold {result.approval_threshold:.0%}"
             )
             logger.info(
-                f"Proposal #{proposal.id}: DEFEATED "
-                f"(approval={result.approval_rate:.2%})"
+                f"Proposal #{proposal.id}: DEFEATED " f"(approval={result.approval_rate:.2%})"
             )
 
         return result
@@ -418,9 +416,7 @@ class VotingEngine:
         return {
             "activeProposals": len(self._results),
             "delegations": len(self._delegations),
-            "results": {
-                pid: r.to_dict() for pid, r in self._results.items()
-            },
+            "results": {pid: r.to_dict() for pid, r in self._results.items()},
         }
 
     def __repr__(self) -> str:

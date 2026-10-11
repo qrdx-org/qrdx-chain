@@ -5,36 +5,38 @@ Configuration classes for validator operations.
 """
 
 import os
+import sys
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Dict
 
-try:
-    import tomli
-except ImportError:
-    import tomllib as tomli
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 
 @dataclass
 class StakingConfig:
     """Staking parameters configuration."""
-    
+
     # Minimum stake to become a validator (100,000 QRDX)
     min_validator_stake: Decimal = Decimal("100000")
-    
+
     # Minimum delegation amount (100 QRDX)
     min_delegation: Decimal = Decimal("100")
-    
-    # Unbonding period in epochs (approximately 7 days with 64s epochs)
-    unbonding_epochs: int = 9450  # ~7 days
-    
+
+    # Unbonding period in epochs (~3.7 days of the standard 8 s epochs, as the chain spec's
+    # UNBONDING_PERIOD_EPOCHS)
+    unbonding_epochs: int = 40_320
+
     # Maximum validators in active set
     max_validators: int = 150
-    
+
     # Auto-restake rewards
     auto_restake_rewards: bool = True
-    
+
     # Target stake amount for this validator
     target_stake: Decimal = Decimal("100000")
 
@@ -42,13 +44,13 @@ class StakingConfig:
 @dataclass
 class SlashingProtectionConfig:
     """Slashing protection configuration."""
-    
+
     # Enable slashing protection database
     enabled: bool = True
-    
+
     # Path to slashing protection database
     db_path: str = "slashing_protection.db"
-    
+
     # Maximum slots to track (for memory efficiency)
     max_tracked_slots: int = 100000
 
@@ -56,13 +58,13 @@ class SlashingProtectionConfig:
 @dataclass
 class AttestationConfig:
     """Attestation configuration."""
-    
+
     # Attestation aggregation delay (seconds)
     aggregation_delay: float = 0.5
-    
+
     # Maximum attestations per block
     max_attestations_per_block: int = 128
-    
+
     # Attestation inclusion distance (slots)
     max_inclusion_distance: int = 32
 
@@ -71,163 +73,163 @@ class AttestationConfig:
 class ValidatorConfig:
     """
     Main validator configuration.
-    
+
     Loaded from config.toml [validator] section.
     """
-    
+
     # Validator enabled/disabled
     enabled: bool = False
-    
+
     # Path to PQ wallet file (REQUIRED if enabled)
     pq_wallet_path: str = ""
-    
+
     # Wallet password (prefer environment variable)
     pq_wallet_password: str = ""
-    
+
     # Validator fee recipient address (for rewards)
     fee_recipient: str = ""
-    
+
     # Staking configuration
     staking: StakingConfig = field(default_factory=StakingConfig)
-    
+
     # Slashing protection configuration
     slashing_protection: SlashingProtectionConfig = field(default_factory=SlashingProtectionConfig)
-    
+
     # Attestation configuration
     attestation: AttestationConfig = field(default_factory=AttestationConfig)
-    
+
     # Graffiti (included in proposed blocks)
     graffiti: str = "QRDX-QR-PoS"
-    
+
     # Network endpoints
     beacon_api_url: str = "http://127.0.0.1:5052"
-    
+
     def __post_init__(self):
         """Post-initialization validation."""
         # Get password from environment if not set
         if not self.pq_wallet_password:
             self.pq_wallet_password = os.environ.get("QRDX_VALIDATOR_PASSWORD", "")
-    
+
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'ValidatorConfig':
+    def from_dict(cls, data: Dict[str, Any]) -> "ValidatorConfig":
         """Create from dictionary."""
         # Parse nested configurations
-        staking_data = data.pop('staking', {})
-        slashing_data = data.pop('slashing_protection', {})
-        attestation_data = data.pop('attestation', {})
-        
+        staking_data = data.pop("staking", {})
+        slashing_data = data.pop("slashing_protection", {})
+        attestation_data = data.pop("attestation", {})
+
         staking = StakingConfig(
-            min_validator_stake=Decimal(str(staking_data.get('min_validator_stake', 100000))),
-            min_delegation=Decimal(str(staking_data.get('min_delegation', 100))),
-            unbonding_epochs=staking_data.get('unbonding_epochs', 9450),
-            max_validators=staking_data.get('max_validators', 150),
-            auto_restake_rewards=staking_data.get('auto_restake_rewards', True),
-            target_stake=Decimal(str(staking_data.get('target_stake', 100000))),
+            min_validator_stake=Decimal(str(staking_data.get("min_validator_stake", 100000))),
+            min_delegation=Decimal(str(staking_data.get("min_delegation", 100))),
+            unbonding_epochs=staking_data.get("unbonding_epochs", 40_320),
+            max_validators=staking_data.get("max_validators", 150),
+            auto_restake_rewards=staking_data.get("auto_restake_rewards", True),
+            target_stake=Decimal(str(staking_data.get("target_stake", 100000))),
         )
-        
+
         slashing_protection = SlashingProtectionConfig(
-            enabled=slashing_data.get('enabled', True),
-            db_path=slashing_data.get('db_path', 'slashing_protection.db'),
-            max_tracked_slots=slashing_data.get('max_tracked_slots', 100000),
+            enabled=slashing_data.get("enabled", True),
+            db_path=slashing_data.get("db_path", "slashing_protection.db"),
+            max_tracked_slots=slashing_data.get("max_tracked_slots", 100000),
         )
-        
+
         attestation = AttestationConfig(
-            aggregation_delay=attestation_data.get('aggregation_delay', 0.5),
-            max_attestations_per_block=attestation_data.get('max_attestations_per_block', 128),
-            max_inclusion_distance=attestation_data.get('max_inclusion_distance', 32),
+            aggregation_delay=attestation_data.get("aggregation_delay", 0.5),
+            max_attestations_per_block=attestation_data.get("max_attestations_per_block", 128),
+            max_inclusion_distance=attestation_data.get("max_inclusion_distance", 32),
         )
-        
+
         return cls(
-            enabled=data.get('enabled', False),
-            pq_wallet_path=data.get('pq_wallet_path', ''),
-            pq_wallet_password=data.get('pq_wallet_password', ''),
-            fee_recipient=data.get('fee_recipient', ''),
+            enabled=data.get("enabled", False),
+            pq_wallet_path=data.get("pq_wallet_path", ""),
+            pq_wallet_password=data.get("pq_wallet_password", ""),
+            fee_recipient=data.get("fee_recipient", ""),
             staking=staking,
             slashing_protection=slashing_protection,
             attestation=attestation,
-            graffiti=data.get('graffiti', 'QRDX-QR-PoS'),
-            beacon_api_url=data.get('beacon_api_url', 'http://127.0.0.1:5052'),
+            graffiti=data.get("graffiti", "QRDX-QR-PoS"),
+            beacon_api_url=data.get("beacon_api_url", "http://127.0.0.1:5052"),
         )
-    
+
     @classmethod
-    def from_file(cls, config_path: str) -> 'ValidatorConfig':
+    def from_file(cls, config_path: str) -> "ValidatorConfig":
         """
         Load configuration from TOML file.
-        
+
         Args:
             config_path: Path to config.toml
-            
+
         Returns:
             ValidatorConfig instance
         """
         path = Path(config_path)
-        
+
         if not path.exists():
             # Return default config if file doesn't exist
             return cls()
-        
-        with open(path, 'rb') as f:
-            config_data = tomli.load(f)
-        
-        validator_data = config_data.get('validator', {})
+
+        with open(path, "rb") as f:
+            config_data = tomllib.load(f)
+
+        validator_data = config_data.get("validator", {})
         return cls.from_dict(validator_data)
-    
+
     def validate(self) -> bool:
         """
         Validate configuration.
-        
+
         Returns:
             True if valid
-            
+
         Raises:
             ValueError: If configuration is invalid
         """
         if not self.enabled:
             return True  # No validation needed if disabled
-        
+
         # Check PQ wallet path
         if not self.pq_wallet_path:
             raise ValueError("pq_wallet_path is required when validator is enabled")
-        
+
         wallet_path = Path(self.pq_wallet_path)
         if not wallet_path.exists():
             raise ValueError(f"PQ wallet file not found: {self.pq_wallet_path}")
-        
+
         # Validate stake requirement
         if self.staking.min_validator_stake <= 0:
             raise ValueError("min_validator_stake must be positive")
-        
+
         # Validate max validators
         if self.staking.max_validators < 1:
             raise ValueError("max_validators must be at least 1")
-        
+
         return True
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
-            'enabled': self.enabled,
-            'pq_wallet_path': self.pq_wallet_path,
-            'fee_recipient': self.fee_recipient,
-            'graffiti': self.graffiti,
-            'beacon_api_url': self.beacon_api_url,
-            'staking': {
-                'min_validator_stake': str(self.staking.min_validator_stake),
-                'min_delegation': str(self.staking.min_delegation),
-                'unbonding_epochs': self.staking.unbonding_epochs,
-                'max_validators': self.staking.max_validators,
-                'auto_restake_rewards': self.staking.auto_restake_rewards,
-                'target_stake': str(self.staking.target_stake),
+            "enabled": self.enabled,
+            "pq_wallet_path": self.pq_wallet_path,
+            "fee_recipient": self.fee_recipient,
+            "graffiti": self.graffiti,
+            "beacon_api_url": self.beacon_api_url,
+            "staking": {
+                "min_validator_stake": str(self.staking.min_validator_stake),
+                "min_delegation": str(self.staking.min_delegation),
+                "unbonding_epochs": self.staking.unbonding_epochs,
+                "max_validators": self.staking.max_validators,
+                "auto_restake_rewards": self.staking.auto_restake_rewards,
+                "target_stake": str(self.staking.target_stake),
             },
-            'slashing_protection': {
-                'enabled': self.slashing_protection.enabled,
-                'db_path': self.slashing_protection.db_path,
-                'max_tracked_slots': self.slashing_protection.max_tracked_slots,
+            "slashing_protection": {
+                "enabled": self.slashing_protection.enabled,
+                "db_path": self.slashing_protection.db_path,
+                "max_tracked_slots": self.slashing_protection.max_tracked_slots,
             },
-            'attestation': {
-                'aggregation_delay': self.attestation.aggregation_delay,
-                'max_attestations_per_block': self.attestation.max_attestations_per_block,
-                'max_inclusion_distance': self.attestation.max_inclusion_distance,
+            "attestation": {
+                "aggregation_delay": self.attestation.aggregation_delay,
+                "max_attestations_per_block": self.attestation.max_attestations_per_block,
+                "max_inclusion_distance": self.attestation.max_inclusion_distance,
             },
         }
 
@@ -245,43 +247,38 @@ class ValidatorConfig:
 # 8-slot terms — read op epochs roughly 4x too early, compressing a deposit's activation and
 # a later exit into the same epoch, where the exit was silently dropped. Production defaults
 # (32) happened to agree, which is why it hid. Never re-hardcode these.
-from ..constants import (
+from ..constants import (  # noqa: E402  (kept beside the explanation above)
+    MIN_VALIDATOR_STAKE as _MIN_VALIDATOR_STAKE,
     SLOT_DURATION as _SLOT_DURATION,
     SLOTS_PER_EPOCH as _SLOTS_PER_EPOCH,
     UNBONDING_PERIOD_EPOCHS as _UNBONDING_PERIOD_EPOCHS,
-    MIN_VALIDATOR_STAKE as _MIN_VALIDATOR_STAKE,
 )
 
 POS_CONSTANTS = {
     # Timing
-    'SLOT_DURATION': _SLOT_DURATION,
-    'SLOTS_PER_EPOCH': _SLOTS_PER_EPOCH,
-
+    "SLOT_DURATION": _SLOT_DURATION,
+    "SLOTS_PER_EPOCH": _SLOTS_PER_EPOCH,
     # Staking
-    'MIN_VALIDATOR_STAKE': _MIN_VALIDATOR_STAKE,
-    'MIN_DELEGATION': Decimal("100"),          # 100 QRDX minimum delegation
-    'MAX_VALIDATORS': 150,                     # Maximum active validators
-    'UNBONDING_PERIOD_EPOCHS': _UNBONDING_PERIOD_EPOCHS,
-    
+    "MIN_VALIDATOR_STAKE": _MIN_VALIDATOR_STAKE,
+    "MIN_DELEGATION": Decimal("100"),  # 100 QRDX minimum delegation
+    "MAX_VALIDATORS": 150,  # Maximum active validators
+    "UNBONDING_PERIOD_EPOCHS": _UNBONDING_PERIOD_EPOCHS,
     # Consensus
-    'ATTESTATION_THRESHOLD': Decimal("0.667"), # 2/3 for finality
-    'MIN_ATTESTATION_INCLUSION_DELAY': 1,      # Minimum slots before attestation included
-    'MAX_ATTESTATION_INCLUSION_DELAY': 32,     # Maximum slots for attestation inclusion
-    
+    "ATTESTATION_THRESHOLD": Decimal("0.667"),  # 2/3 for finality
+    "MIN_ATTESTATION_INCLUSION_DELAY": 1,  # Minimum slots before attestation included
+    "MAX_ATTESTATION_INCLUSION_DELAY": 32,  # Maximum slots for attestation inclusion
     # Rewards (per epoch)
-    'BASE_REWARD_FACTOR': 64,                  # Base reward calculation factor
-    'PROPOSER_REWARD_QUOTIENT': 4,             # Proposer gets 1/4 of attestation rewards
-    
+    "BASE_REWARD_FACTOR": 64,  # Base reward calculation factor
+    "PROPOSER_REWARD_QUOTIENT": 4,  # Proposer gets 1/4 of attestation rewards
     # Slashing
-    'SLASH_DOUBLE_SIGN_PERCENT': Decimal("0.50"),        # 50% stake
-    'SLASH_INVALID_ATTESTATION_PERCENT': Decimal("0.30"), # 30% stake
-    'SLASH_DOWNTIME_PERCENT': Decimal("0.05"),           # 5% stake
-    'SLASH_BRIDGE_FRAUD_PERCENT': Decimal("1.00"),       # 100% stake
-    
+    "SLASH_DOUBLE_SIGN_PERCENT": Decimal("0.50"),  # 50% stake
+    "SLASH_INVALID_ATTESTATION_PERCENT": Decimal("0.30"),  # 30% stake
+    "SLASH_DOWNTIME_PERCENT": Decimal("0.05"),  # 5% stake
+    "SLASH_BRIDGE_FRAUD_PERCENT": Decimal("1.00"),  # 100% stake
     # Misc
-    'MAX_ATTESTATIONS_PER_BLOCK': 128,
-    'GENESIS_EPOCH': 0,
-    'GENESIS_SLOT': 0,
+    "MAX_ATTESTATIONS_PER_BLOCK": 128,
+    "GENESIS_EPOCH": 0,
+    "GENESIS_SLOT": 0,
 }
 
 

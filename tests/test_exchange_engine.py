@@ -1293,7 +1293,7 @@ class TestPackageImports:
         assert TWAPOracle is not None
 
     def test_hooks_imports(self):
-        from qrdx.exchange import HookFlags, HookContext, HookResult, HookRegistry, CircuitBreaker
+        from qrdx.exchange import HookFlags, HookContext, HookResult, HookRegistry
         assert HookRegistry is not None
 
     def test_security_imports(self):
@@ -1338,7 +1338,6 @@ from qrdx.exchange.hooks import (
     HookContext,
     HookResult,
     HookRegistry,
-    CircuitBreaker,
     ExchangeHook,
 )
 
@@ -1879,7 +1878,7 @@ class TestPerpSecurity:
 # ============================================================================
 
 class TestRouterSecurity:
-    """Deadline enforcement, slippage, circuit breaker, pause, read-only quote."""
+    """Deadline enforcement, slippage, pause, read-only quote."""
 
     def _setup_router(self):
         mgr = PoolManager()
@@ -2074,7 +2073,7 @@ class TestOracleSecurity:
 # ============================================================================
 
 class TestHookSystem:
-    """HookFlags, HookContext, HookResult, HookRegistry, CircuitBreaker."""
+    """HookFlags, HookContext, HookResult, HookRegistry."""
 
     # -- HookFlags ----------------------------------------------------------
 
@@ -2243,75 +2242,13 @@ class TestHookSystem:
         assert hook.before_liq_count == 1
         assert hook.after_liq_count == 1
 
-    # -- Circuit Breaker ----------------------------------------------------
 
-    def test_circuit_breaker_manual_trip(self):
-        cb = CircuitBreaker()
-        assert not cb.is_tripped
-        cb.trip("Emergency")
-        assert cb.is_tripped
-        assert "Emergency" in cb.trip_reason
 
-    def test_circuit_breaker_reset(self):
-        cb = CircuitBreaker()
-        cb.trip("Test")
-        cb.reset()
-        assert not cb.is_tripped
 
-    def test_circuit_breaker_blocks_when_tripped(self):
-        cb = CircuitBreaker()
-        cb.trip("Test")
-        result = cb.on_before_swap(HookContext(amount_in=Decimal("1")))
-        assert not result.allow
 
-    def test_circuit_breaker_allows_when_not_tripped(self):
-        cb = CircuitBreaker()
-        result = cb.on_before_swap(HookContext(amount_in=Decimal("1")))
-        assert result.allow
 
-    def test_circuit_breaker_volume_trip(self):
-        cb = CircuitBreaker(max_volume_per_block=Decimal("100"))
-        # First swap within limit
-        r1 = cb.on_before_swap(HookContext(amount_in=Decimal("50")))
-        assert r1.allow
-        # Second swap pushes over limit
-        r2 = cb.on_before_swap(HookContext(amount_in=Decimal("60")))
-        assert not r2.allow
-        assert cb.is_tripped
 
-    def test_circuit_breaker_new_block_resets_volume(self):
-        cb = CircuitBreaker(max_volume_per_block=Decimal("100"))
-        cb.on_before_swap(HookContext(amount_in=Decimal("90")))
-        cb.new_block()
-        # Volume should be reset
-        r = cb.on_before_swap(HookContext(amount_in=Decimal("90")))
-        assert r.allow
 
-    def test_circuit_breaker_price_deviation_trip(self):
-        cb = CircuitBreaker(max_price_deviation=Decimal("0.10"))
-        # First swap establishes baseline price
-        cb.on_after_swap(HookContext(amount_in=Decimal("100"), amount_out=Decimal("100")))
-        # Big price deviation
-        result = cb.on_after_swap(HookContext(amount_in=Decimal("100"), amount_out=Decimal("50")))
-        # Price went from 1.0 to 2.0 → 100% deviation > 10%
-        assert not result.allow
-        assert cb.is_tripped
 
-    def test_circuit_breaker_liquidity_blocked_when_tripped(self):
-        cb = CircuitBreaker()
-        cb.trip("Test")
-        result = cb.on_before_liquidity(HookContext())
-        assert not result.allow
 
-    def test_circuit_breaker_flags(self):
-        cb = CircuitBreaker()
-        assert HookFlags.BEFORE_SWAP in cb.flags
-        assert HookFlags.AFTER_SWAP in cb.flags
 
-    def test_circuit_breaker_integrated_with_registry(self):
-        reg = HookRegistry()
-        cb = CircuitBreaker()
-        reg.register(cb)
-        cb.trip("Emergency")
-        result = reg.run_before_swap(HookContext(amount_in=Decimal("1")))
-        assert not result.allow

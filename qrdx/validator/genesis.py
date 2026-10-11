@@ -14,22 +14,24 @@ This is used to bootstrap a new network.
 import hashlib
 import json
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from ..crypto.system_wallets import SystemWalletManager
 from datetime import datetime, timezone
 
-from ..logger import get_logger
-from ..crypto.hashing import sha256
 from .. import chain_spec as chain_spec_mod
 from ..chain_spec import ChainSpec, ChainSpecError
 from ..constants import (
-    SLOTS_PER_EPOCH,
-    MIN_VALIDATOR_STAKE,
-    MAX_VALIDATORS,
-    GENESIS_SLOT,
     GENESIS_EPOCH,
+    GENESIS_SLOT,
+    MAX_VALIDATORS,
+    MIN_VALIDATOR_STAKE,
+    SLOTS_PER_EPOCH,
 )
+from ..logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -53,6 +55,7 @@ def _wei(amount: Any) -> str:
         raise ValueError(f"genesis amount {amount} has more than 18 decimal places")
     return str(int(value))
 
+
 # Minimum validators to start
 MIN_GENESIS_VALIDATORS = 4
 MIN_GENESIS_ACTIVE_VALIDATORS = 4
@@ -65,6 +68,7 @@ FOUNDATION_ADDRESS = "qrdx_foundation_0x0000000000000000000000000000000000000002
 @dataclass
 class GenesisValidator:
     """A validator in the genesis state."""
+
     address: str
     public_key: str  # Hex-encoded PQ public key
     stake: Decimal
@@ -76,6 +80,7 @@ class GenesisValidator:
 @dataclass
 class GenesisAccount:
     """A pre-funded account in genesis."""
+
     address: str
     balance: Decimal
     label: str = ""
@@ -89,36 +94,37 @@ class GenesisConfig:
     and genesis commits to it. Without one, the creator uses the process's spec when
     ``chain_id`` and ``network_name`` are left unset, and otherwise builds a DEV spec from them
     (with the process's parameters) — tooling that creates a real network passes its spec."""
+
     # Chain identification (taken from chain_spec when one is given; must agree with it)
     chain_id: Optional[int] = None
     network_name: Optional[str] = None
     chain_spec: Optional[ChainSpec] = None
-    
+
     # Timing
     genesis_time: int = 0  # Unix timestamp
     genesis_slot: int = GENESIS_SLOT
     genesis_epoch: int = GENESIS_EPOCH
     slots_per_epoch: int = SLOTS_PER_EPOCH
     seconds_per_slot: int = 2
-    
+
     # Validator parameters
     min_genesis_validators: int = MIN_GENESIS_VALIDATORS
     min_validator_stake: Decimal = MIN_VALIDATOR_STAKE
     max_validators: int = MAX_VALIDATORS
-    
+
     # Initial supply
     initial_supply: Decimal = Decimal("100000000")  # 100M QRDX
-    
+
     # Pre-allocations (address -> balance)
     pre_allocations: Dict[str, Decimal] = field(default_factory=dict)
-    
+
     # Validators
     validators: List[GenesisValidator] = field(default_factory=list)
-    
+
     # System wallets
     system_wallet_controller: Optional[str] = None  # PQ address that controls system wallets
     enable_system_wallets: bool = True
-    
+
     # Extra data
     extra_data: bytes = b""
 
@@ -126,26 +132,27 @@ class GenesisConfig:
 @dataclass
 class GenesisState:
     """Complete genesis state for QR-PoS chain."""
+
     # Metadata
     version: str = GENESIS_VERSION
     chain_id: int = 1
     network_name: str = "qrdx-mainnet"
-    
+
     # Timing
     genesis_time: int = 0
     genesis_slot: int = GENESIS_SLOT
-    
+
     # Roots
     genesis_validators_root: str = ""
     state_root: str = ""
-    
+
     # RANDAO
     randao_seed: str = ""
-    
+
     # Validators
     validators: List[Dict[str, Any]] = field(default_factory=list)
     balances: Dict[str, str] = field(default_factory=dict)
-    
+
     # Fork info
     fork_version: str = GENESIS_FORK_VERSION.hex()
 
@@ -154,11 +161,11 @@ class GenesisState:
 
     # Accounts
     accounts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    
+
     # System wallets
     system_wallets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     system_wallet_controller: str = ""  # PQ address controlling system wallets
-    
+
     # Totals
     total_supply: str = "0"
     total_staked: str = "0"
@@ -168,23 +175,24 @@ class GenesisState:
 @dataclass
 class GenesisBlock:
     """The genesis block."""
+
     # Block header
     slot: int = GENESIS_SLOT
     epoch: int = GENESIS_EPOCH
     proposer_index: int = 0
     parent_root: str = "0" * 64  # All zeros
     state_root: str = ""
-    
+
     # Block body (empty for genesis)
     transactions: List[Dict] = field(default_factory=list)
     attestations: List[Dict] = field(default_factory=list)
-    
+
     # Signature (empty for genesis)
     signature: str = ""
-    
+
     # Block hash
     block_hash: str = ""
-    
+
     # Metadata
     timestamp: int = 0
     extra_data: str = ""
@@ -193,14 +201,14 @@ class GenesisBlock:
 class GenesisCreator:
     """
     Creates genesis state for QR-PoS chain.
-    
+
     Handles:
     - Validator registration and validation
     - Initial balance allocation
     - State root computation
     - Genesis block creation
     """
-    
+
     def __init__(self, config: GenesisConfig):
         self.config = config
         self.spec = self._resolve_spec(config)
@@ -208,8 +216,8 @@ class GenesisCreator:
         config.network_name = self.spec.network
         self._validators: List[GenesisValidator] = list(config.validators)
         self._accounts: Dict[str, GenesisAccount] = {}
-        self._system_wallet_manager = None
-        
+        self._system_wallet_manager: Optional["SystemWalletManager"] = None
+
         # Initialize pre-allocations
         for address, balance in config.pre_allocations.items():
             self._accounts[address] = GenesisAccount(
@@ -217,21 +225,25 @@ class GenesisCreator:
                 balance=balance,
                 label="pre-allocation",
             )
-        
+
         # Initialize system wallets if enabled
         if config.enable_system_wallets and config.system_wallet_controller:
             self._init_system_wallets(config.system_wallet_controller)
-    
+
     @staticmethod
     def _resolve_spec(config: GenesisConfig) -> ChainSpec:
         spec = config.chain_spec
         if spec is not None:
             if config.chain_id is not None and config.chain_id != spec.chain_id:
-                raise ChainSpecError(f"genesis chain_id {config.chain_id} disagrees with its "
-                                     f"chain spec ({spec.chain_id})")
+                raise ChainSpecError(
+                    f"genesis chain_id {config.chain_id} disagrees with its "
+                    f"chain spec ({spec.chain_id})"
+                )
             if config.network_name is not None and config.network_name != spec.network:
-                raise ChainSpecError(f"genesis network {config.network_name!r} disagrees with "
-                                     f"its chain spec ({spec.network!r})")
+                raise ChainSpecError(
+                    f"genesis network {config.network_name!r} disagrees with "
+                    f"its chain spec ({spec.network!r})"
+                )
             return spec
         process = chain_spec_mod.active()
         if config.chain_id is None and config.network_name is None:
@@ -239,21 +251,21 @@ class GenesisCreator:
         return chain_spec_mod.build_spec(
             config.network_name or process.network,
             config.chain_id if config.chain_id is not None else process.chain_id,
-            process.params, dev=True)
+            process.params,
+            dev=True,
+        )
 
     def _init_system_wallets(self, controller_address: str):
         """Initialize system wallets with controller."""
         from ..crypto.system_wallets import initialize_system_wallets
-        
+
         self._system_wallet_manager = initialize_system_wallets(controller_address)
-        logger.info(
-            f"System wallets initialized with controller: {controller_address[:16]}..."
-        )
-    
+        logger.info(f"System wallets initialized with controller: {controller_address[:16]}...")
+
     def get_system_wallet_manager(self):
         """Get system wallet manager."""
         return self._system_wallet_manager
-    
+
     def add_validator(
         self,
         address: str,
@@ -263,42 +275,40 @@ class GenesisCreator:
     ) -> bool:
         """
         Add a genesis validator.
-        
+
         Args:
             address: Validator's address
             public_key: Hex-encoded PQ public key (CRYSTALS-Dilithium)
             stake: Initial stake amount
             withdrawal_address: Address for stake withdrawals
-            
+
         Returns:
             True if validator was added successfully
         """
         # Validate stake
         if stake < self.config.min_validator_stake:
-            logger.error(
-                f"Stake {stake} below minimum {self.config.min_validator_stake}"
-            )
+            logger.error(f"Stake {stake} below minimum {self.config.min_validator_stake}")
             return False
-        
+
         # Check max validators
         if len(self._validators) >= self.config.max_validators:
             logger.error(f"Maximum validators ({self.config.max_validators}) reached")
             return False
-        
+
         # Check for duplicate
         if any(v.address == address for v in self._validators):
             logger.error(f"Validator {address} already exists")
             return False
-        
+
         # Validate public key format (should be hex-encoded Dilithium key)
         try:
             pk_bytes = bytes.fromhex(public_key)
             if len(pk_bytes) < 1000:  # Dilithium public keys are ~1952 bytes
-                logger.warning(f"Public key seems too short for Dilithium")
+                logger.warning("Public key seems too short for Dilithium")
         except ValueError:
-            logger.error(f"Invalid public key format")
+            logger.error("Invalid public key format")
             return False
-        
+
         validator = GenesisValidator(
             address=address,
             public_key=public_key,
@@ -306,10 +316,10 @@ class GenesisCreator:
             withdrawal_address=withdrawal_address or address,
         )
         self._validators.append(validator)
-        
+
         logger.info(f"Added genesis validator: {address[:16]}... stake={stake}")
         return True
-    
+
     def add_account(
         self,
         address: str,
@@ -318,12 +328,12 @@ class GenesisCreator:
     ) -> bool:
         """
         Add a pre-funded account.
-        
+
         Args:
             address: Account address
             balance: Initial balance
             label: Optional description
-            
+
         Returns:
             True if account was added
         """
@@ -336,41 +346,39 @@ class GenesisCreator:
                 balance=balance,
                 label=label,
             )
-        
+
         logger.info(f"Added genesis account: {address[:16]}... balance={balance}")
         return True
-    
+
     def _compute_validators_root(self, validators: List[GenesisValidator]) -> bytes:
         """Compute Merkle root of validator set."""
         if not validators:
             return hashlib.sha256(GENESIS_VALIDATORS_ROOT_PREFIX).digest()
-        
+
         # Hash each validator
         leaves = []
         for v in sorted(validators, key=lambda x: x.address):
             leaf_data = (
-                v.address.encode() +
-                bytes.fromhex(v.public_key)[:32] +  # First 32 bytes of pubkey
-                str(v.stake).encode() +
-                v.withdrawal_address.encode()
+                v.address.encode()
+                + bytes.fromhex(v.public_key)[:32]  # First 32 bytes of pubkey
+                + str(v.stake).encode()
+                + v.withdrawal_address.encode()
             )
             leaves.append(hashlib.sha256(leaf_data).digest())
-        
+
         # Simple Merkle tree (pad to power of 2)
         while len(leaves) & (len(leaves) - 1):
             leaves.append(hashlib.sha256(b"").digest())
-        
+
         while len(leaves) > 1:
             new_leaves = []
             for i in range(0, len(leaves), 2):
                 combined = leaves[i] + leaves[i + 1]
                 new_leaves.append(hashlib.sha256(combined).digest())
             leaves = new_leaves
-        
-        return hashlib.sha256(
-            GENESIS_VALIDATORS_ROOT_PREFIX + leaves[0]
-        ).digest()
-    
+
+        return hashlib.sha256(GENESIS_VALIDATORS_ROOT_PREFIX + leaves[0]).digest()
+
     def _compute_state_root(self, state: GenesisState) -> bytes:
         """The genesis state root: a commitment to everything a genesis node initialises — the
         network's chain spec, every allocation (prefunded accounts, validator stakes, system
@@ -385,15 +393,25 @@ class GenesisCreator:
             "genesis_time": state.genesis_time,
             "validators_root": state.genesis_validators_root,
             "validators": [
-                {"address": v["address"], "public_key": v["public_key"],
-                 "stake_wei": _wei(v["stake"]), "withdrawal_address": v["withdrawal_address"]}
-                for v in sorted(state.validators, key=lambda v: v["address"])],
+                {
+                    "address": v["address"],
+                    "public_key": v["public_key"],
+                    "stake_wei": _wei(v["stake"]),
+                    "withdrawal_address": v["withdrawal_address"],
+                }
+                for v in sorted(state.validators, key=lambda v: v["address"])
+            ],
             "balances_wei": {a: _wei(b) for a, b in state.balances.items()},
             "accounts_wei": {a: _wei(info["balance"]) for a, info in state.accounts.items()},
             "system_wallets": {
-                a: {"balance_wei": _wei(w["balance"]), "type": w.get("type"),
-                    "is_burner": bool(w.get("is_burner")), "category": w.get("category")}
-                for a, w in state.system_wallets.items()},
+                a: {
+                    "balance_wei": _wei(w["balance"]),
+                    "type": w.get("type"),
+                    "is_burner": bool(w.get("is_burner")),
+                    "category": w.get("category"),
+                }
+                for a, w in state.system_wallets.items()
+            },
             "system_wallet_controller": state.system_wallet_controller,
             "total_supply_wei": _wei(state.total_supply),
         }
@@ -405,20 +423,22 @@ class GenesisCreator:
         file must arrive at the same seed (a per-node random seed would make any consumer of it
         diverge). Unpredictability comes later, from the proposers' RANDAO reveals."""
         return hashlib.sha256(
-            GENESIS_RANDAO_PREFIX + bytes.fromhex(self.spec.genesis_hash()) + validators_root
+            GENESIS_RANDAO_PREFIX
+            + bytes.fromhex(self.spec.genesis_hash())
+            + validators_root
             + int(genesis_time).to_bytes(8, "little")
         ).digest()
-    
+
     def create_genesis(
         self,
         genesis_time: Optional[int] = None,
     ) -> Tuple[GenesisState, GenesisBlock]:
         """
         Create the complete genesis state and block.
-        
+
         Args:
             genesis_time: Unix timestamp for genesis (default: now)
-            
+
         Returns:
             Tuple of (GenesisState, GenesisBlock)
         """
@@ -428,15 +448,15 @@ class GenesisCreator:
                 f"Need at least {self.config.min_genesis_validators} validators, "
                 f"got {len(self._validators)}"
             )
-        
+
         # Set genesis time
         if genesis_time is None:
             genesis_time = self.config.genesis_time or int(time.time())
-        
+
         logger.info(f"Creating genesis for {self.config.network_name}")
         logger.info(f"Genesis time: {datetime.fromtimestamp(genesis_time, tz=timezone.utc)}")
         logger.info(f"Validators: {len(self._validators)}")
-        
+
         # Calculate totals
         total_staked = sum(v.stake for v in self._validators)
 
@@ -448,26 +468,28 @@ class GenesisCreator:
             genesis_slot=self.config.genesis_slot,
             chain_spec_hash=self.spec.genesis_hash(),
         )
-        
+
         # Add validators
         for v in sorted(self._validators, key=lambda x: x.address):
-            state.validators.append({
-                "address": v.address,
-                "public_key": v.public_key,
-                "stake": str(v.stake),
-                "withdrawal_address": v.withdrawal_address,
-                "activation_epoch": v.activation_epoch,
-                "exit_epoch": v.exit_epoch,
-            })
+            state.validators.append(
+                {
+                    "address": v.address,
+                    "public_key": v.public_key,
+                    "stake": str(v.stake),
+                    "withdrawal_address": v.withdrawal_address,
+                    "activation_epoch": v.activation_epoch,
+                    "exit_epoch": v.exit_epoch,
+                }
+            )
             state.balances[v.address] = str(v.stake)
-        
+
         # Add accounts
         for a in self._accounts.values():
             state.accounts[a.address] = {
                 "balance": str(a.balance),
                 "label": a.label,
             }
-        
+
         # Add system wallets
         total_system_wallet_balance = Decimal("0")
         if self._system_wallet_manager:
@@ -484,18 +506,18 @@ class GenesisCreator:
                 # Add to balances for consistency
                 state.balances[wallet.address] = str(wallet.genesis_balance)
                 total_system_wallet_balance += wallet.genesis_balance
-            
+
             logger.info(f"Added {len(state.system_wallets)} system wallets")
             logger.info(f"Total system wallet balance: {total_system_wallet_balance}")
-        
+
         # Compute roots
         validators_root = self._compute_validators_root(self._validators)
         state.genesis_validators_root = validators_root.hex()
-        
+
         # Initial RANDAO mix (derived — identical on every node)
         randao_seed = self._generate_randao_seed(validators_root, genesis_time)
         state.randao_seed = randao_seed.hex()
-        
+
         # Set totals
         state.total_supply = str(self.config.initial_supply)
         state.total_staked = str(total_staked)
@@ -503,11 +525,11 @@ class GenesisCreator:
             state.total_system_wallets = str(
                 self._system_wallet_manager.get_total_genesis_balance()
             )
-        
+
         # Compute state root
         state_root = self._compute_state_root(state)
         state.state_root = state_root.hex()
-        
+
         # Create genesis block
         block = GenesisBlock(
             slot=self.config.genesis_slot,
@@ -516,23 +538,23 @@ class GenesisCreator:
             timestamp=genesis_time,
             extra_data=self.config.extra_data.hex() if self.config.extra_data else "",
         )
-        
+
         # Compute block hash
         block_data = (
-            block.slot.to_bytes(8, 'little') +
-            bytes.fromhex(block.parent_root) +
-            bytes.fromhex(block.state_root) +
-            block.timestamp.to_bytes(8, 'little')
+            block.slot.to_bytes(8, "little")
+            + bytes.fromhex(block.parent_root)
+            + bytes.fromhex(block.state_root)
+            + block.timestamp.to_bytes(8, "little")
         )
         block.block_hash = hashlib.sha256(block_data).hexdigest()
-        
+
         logger.info(f"Genesis state root: {state.state_root[:16]}...")
         logger.info(f"Genesis block hash: {block.block_hash[:16]}...")
         logger.info(f"Total staked: {total_staked}")
         logger.info(f"Total supply: {self.config.initial_supply}")
-        
+
         return state, block
-    
+
     def export_genesis(
         self,
         state: GenesisState,
@@ -541,7 +563,7 @@ class GenesisCreator:
     ):
         """
         Export genesis to a JSON file.
-        
+
         Args:
             state: Genesis state
             block: Genesis block
@@ -559,13 +581,14 @@ class GenesisCreator:
                 "chain_id": self.spec.chain_id,
                 "network_name": self.spec.network,
                 "slots_per_epoch": params["SLOTS_PER_EPOCH"],
-                "seconds_per_slot": params["SLOT_DURATION"],
+                "seconds_per_slot": params["SLOT_DURATION_MS"] / 1000,
+                "slot_duration_ms": params["SLOT_DURATION_MS"],
                 "min_validator_stake": str(self.config.min_validator_stake),
                 "max_validators": self.config.max_validators,
             },
         }
 
-        with open(filepath, 'w') as f:
+        with open(filepath, "w") as f:
             json.dump(genesis_data, f, indent=2)
 
         logger.info(f"Genesis exported to {filepath}")
@@ -590,8 +613,10 @@ def create_testnet_genesis(
     """
     if chain_spec is None:
         chain_spec = chain_spec_mod.build_spec(
-            chain_spec_mod.TESTNET_NETWORK_NAME, chain_spec_mod.TESTNET_CHAIN_ID,
-            chain_spec_mod.active().params)
+            chain_spec_mod.TESTNET_NETWORK_NAME,
+            chain_spec_mod.TESTNET_CHAIN_ID,
+            chain_spec_mod.active().params,
+        )
     config = GenesisConfig(
         chain_spec=chain_spec,
         min_genesis_validators=1,  # Lower for testnet
@@ -630,12 +655,15 @@ def create_mainnet_genesis(
         raise ValueError("Genesis time must be in the future")
     if not isinstance(chain_spec, ChainSpec) or chain_spec.dev:
         raise ChainSpecError("mainnet genesis needs a non-dev chain spec")
-    if (chain_spec.chain_id, chain_spec.network) != (chain_spec_mod.MAINNET_CHAIN_ID,
-                                                     chain_spec_mod.MAINNET_NETWORK_NAME):
+    if (chain_spec.chain_id, chain_spec.network) != (
+        chain_spec_mod.MAINNET_CHAIN_ID,
+        chain_spec_mod.MAINNET_NETWORK_NAME,
+    ):
         raise ChainSpecError(
             f"mainnet genesis needs chain id {chain_spec_mod.MAINNET_CHAIN_ID} and network "
             f"{chain_spec_mod.MAINNET_NETWORK_NAME!r}; got {chain_spec.chain_id} / "
-            f"{chain_spec.network!r}")
+            f"{chain_spec.network!r}"
+        )
 
     config = GenesisConfig(
         chain_spec=chain_spec,

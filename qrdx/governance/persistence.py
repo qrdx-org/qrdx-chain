@@ -5,11 +5,12 @@ Stores governance proposals, votes, and execution state.
 No stubs — real SQL operations.
 """
 
-import aiosqlite
-from decimal import Decimal
-from typing import Dict, List, Optional
 import logging
 import time
+from decimal import Decimal
+from typing import List, Optional
+
+import aiosqlite
 
 logger = logging.getLogger(__name__)
 
@@ -96,8 +97,18 @@ class GovernancePersistence:
                 deposit_amount, status, parameter_key, parameter_value,
                 votes_for, votes_against, votes_abstain, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, 'DISCUSSION', ?, ?, '0', '0', '0', ?, ?)""",
-            (proposal_id, proposer_address, title, description, proposal_type,
-             str(deposit_amount), parameter_key, parameter_value, now, now),
+            (
+                proposal_id,
+                proposer_address,
+                title,
+                description,
+                proposal_type,
+                str(deposit_amount),
+                parameter_key,
+                parameter_value,
+                now,
+                now,
+            ),
         )
         await self.connection.commit()
 
@@ -136,7 +147,9 @@ class GovernancePersistence:
         # Remove old vote totals if re-voting
         old = await self._get_vote(proposal_id, voter_address)
         if old:
-            await self._subtract_vote_power(proposal_id, old["vote_type"], Decimal(old["voting_power"]))
+            await self._subtract_vote_power(
+                proposal_id, old["vote_type"], Decimal(old["voting_power"])
+            )
 
         await self.connection.execute(
             """INSERT INTO governance_votes
@@ -144,12 +157,24 @@ class GovernancePersistence:
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(proposal_id, voter_address) DO UPDATE SET
                 vote_type = ?, voting_power = ?, signature = ?, created_at = ?""",
-            (proposal_id, voter_address, vote_type, str(voting_power), signature, now,
-             vote_type, str(voting_power), signature, now),
+            (
+                proposal_id,
+                voter_address,
+                vote_type,
+                str(voting_power),
+                signature,
+                now,
+                vote_type,
+                str(voting_power),
+                signature,
+                now,
+            ),
         )
 
         # Add to totals
-        col = {VOTE_FOR: "votes_for", VOTE_AGAINST: "votes_against", VOTE_ABSTAIN: "votes_abstain"}[vote_type]
+        col = {VOTE_FOR: "votes_for", VOTE_AGAINST: "votes_against", VOTE_ABSTAIN: "votes_abstain"}[
+            vote_type
+        ]
         await self.connection.execute(
             f"""UPDATE governance_proposals
                 SET {col} = CAST(CAST({col} AS DECIMAL) + ? AS TEXT), updated_at = ?
@@ -167,7 +192,9 @@ class GovernancePersistence:
         return dict(row) if row else None
 
     async def _subtract_vote_power(self, proposal_id: str, vote_type: int, power: Decimal) -> None:
-        col = {VOTE_FOR: "votes_for", VOTE_AGAINST: "votes_against", VOTE_ABSTAIN: "votes_abstain"}[vote_type]
+        col = {VOTE_FOR: "votes_for", VOTE_AGAINST: "votes_against", VOTE_ABSTAIN: "votes_abstain"}[
+            vote_type
+        ]
         now = int(time.time())
         await self.connection.execute(
             f"""UPDATE governance_proposals
@@ -176,7 +203,9 @@ class GovernancePersistence:
             (str(power), now, proposal_id),
         )
 
-    async def tally_and_finalize(self, proposal_id: str, quorum: Decimal, approval_threshold: Decimal) -> str:
+    async def tally_and_finalize(
+        self, proposal_id: str, quorum: Decimal, approval_threshold: Decimal
+    ) -> str:
         """
         Tally votes and finalize the proposal.
         Returns new status: 'PASSED', 'REJECTED', or 'QUORUM_NOT_MET'.
@@ -190,11 +219,13 @@ class GovernancePersistence:
         total_abstain = Decimal(proposal["votes_abstain"])
         total_votes = total_for + total_against + total_abstain
 
-        deposit = Decimal(proposal["deposit_amount"])
-
         if total_votes < quorum:
             status = "QUORUM_NOT_MET"
-        elif total_for / (total_for + total_against) >= approval_threshold if (total_for + total_against) > 0 else False:
+        elif (
+            total_for / (total_for + total_against) >= approval_threshold
+            if (total_for + total_against) > 0
+            else False
+        ):
             status = "PASSED"
         else:
             status = "REJECTED"
@@ -222,8 +253,15 @@ class GovernancePersistence:
                    VALUES (?, ?, ?, ?)
                    ON CONFLICT(parameter_key) DO UPDATE SET
                     parameter_value = ?, updated_by_proposal = ?, updated_at = ?""",
-                (proposal["parameter_key"], proposal["parameter_value"], proposal_id, now,
-                 proposal["parameter_value"], proposal_id, now),
+                (
+                    proposal["parameter_key"],
+                    proposal["parameter_value"],
+                    proposal_id,
+                    now,
+                    proposal["parameter_value"],
+                    proposal_id,
+                    now,
+                ),
             )
 
         await self.connection.execute(

@@ -81,3 +81,18 @@ def test_the_block_carries_the_execution_timestamp():
     assert "timestamp" in params
     src = inspect.getsource(ValidatorManager.propose_block)
     assert "timestamp=int(timestamp) if timestamp is not None else int(time.time())" in src
+
+
+def test_the_parent_is_re_checked_under_the_lock_before_any_section_runs():
+    """The height can come back with a different tip: a reorg removes the tip read at the top of
+    the iteration and applies another block at its height. The proposer then read the tip as
+    missing and built on an all-zero parent, which every peer refused (seen in the 250 ms
+    integration run). Under the lock it now re-reads the tip and skips unless it is exactly the
+    parent the block is built on."""
+    lines = _loop_lines()
+    start, end = _locked_region(lines)
+    region = lines[start:end]
+    recheck = next(i for i, l in enumerate(region) if "tip_hash != parent_hash" in l)
+    first_section = next(i for i, l in enumerate(region) if "process_exchange_transactions(" in l)
+    assert recheck < first_section
+    assert any("continue" in l for l in region[recheck + 1:recheck + 6])

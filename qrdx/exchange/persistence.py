@@ -11,12 +11,13 @@ Provides durable storage for the AMM and order book:
 No stubs. All operations are real SQL against the node's SQLite database.
 """
 
-import aiosqlite
-from decimal import Decimal
-from typing import Dict, List, Optional, Tuple
+import hashlib
 import logging
 import time
-import hashlib
+from decimal import Decimal
+from typing import Any, List, Optional
+
+import aiosqlite
 
 logger = logging.getLogger(__name__)
 
@@ -152,10 +153,17 @@ def _make_order_id(pool_id: str, owner: str, nonce: int) -> str:
     return hashlib.blake2b(raw, digest_size=20).hexdigest()
 
 
+def _one(row: Any) -> Any:
+    """The single row an aggregate query (COUNT/SUM) always returns."""
+    if row is None:
+        raise RuntimeError("aggregate query returned no row")
+    return row
+
+
 class ExchangePersistence:
     """
     SQLite persistence for exchange state (AMM + orderbook).
-    
+
     All operations hit the real database — no in-memory fallback.
     """
 
@@ -185,20 +193,30 @@ class ExchangePersistence:
         if pool_id is None:
             pool_id = _make_pool_id(token_a, token_b, fee_tier)
         now = int(time.time())
-        
+
         # Check for duplicate
         existing = await self.get_pool(pool_id)
         if existing:
             raise ValueError(f"Pool already exists: {pool_id} ({token_a}/{token_b} fee={fee_tier})")
-        
+
         await self.connection.execute(
             """INSERT INTO amm_pools
                (pool_id, token_a, token_b, fee_tier, pool_type, sqrt_price, liquidity,
                 tick_current, fee_growth_global_a, fee_growth_global_b,
                 volume_a, volume_b, creator_address, paused, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, '0', ?, '0', '0', '0', '0', ?, 0, ?, ?)""",
-            (pool_id, token_a, token_b, fee_tier, pool_type,
-             str(initial_sqrt_price), initial_tick, creator_address, now, now),
+            (
+                pool_id,
+                token_a,
+                token_b,
+                fee_tier,
+                pool_type,
+                str(initial_sqrt_price),
+                initial_tick,
+                creator_address,
+                now,
+                now,
+            ),
         )
         await self.connection.commit()
         logger.info("Pool created: %s (%s/%s fee=%d)", pool_id, token_a, token_b, fee_tier)
@@ -233,9 +251,7 @@ class ExchangePersistence:
         )
         await self.connection.commit()
 
-    async def update_pool_volume(
-        self, pool_id: str, amount_a: Decimal, amount_b: Decimal
-    ) -> None:
+    async def update_pool_volume(self, pool_id: str, amount_a: Decimal, amount_b: Decimal) -> None:
         """Increment cumulative volume counters."""
         now = int(time.time())
         await self.connection.execute(
@@ -261,7 +277,7 @@ class ExchangePersistence:
         """Add a liquidity position. Returns position_id."""
         position_id = _make_position_id(pool_id, owner_address, tick_lower, tick_upper)
         now = int(time.time())
-        
+
         await self.connection.execute(
             """INSERT INTO amm_positions
                (position_id, pool_id, owner_address, tick_lower, tick_upper, liquidity,
@@ -270,8 +286,18 @@ class ExchangePersistence:
                VALUES (?, ?, ?, ?, ?, ?, '0', '0', '0', '0', ?, ?)
                ON CONFLICT(position_id) DO UPDATE SET
                 liquidity = CAST(CAST(liquidity AS DECIMAL) + ? AS TEXT), updated_at = ?""",
-            (position_id, pool_id, owner_address, tick_lower, tick_upper,
-             str(liquidity), now, now, str(liquidity), now),
+            (
+                position_id,
+                pool_id,
+                owner_address,
+                tick_lower,
+                tick_upper,
+                str(liquidity),
+                now,
+                now,
+                str(liquidity),
+                now,
+            ),
         )
         await self.connection.commit()
         return position_id
@@ -323,12 +349,23 @@ class ExchangePersistence:
                (pool_id, sender_address, token_in, token_out, amount_in, amount_out,
                 fee_amount, sqrt_price_after, tick_after, block_height, tx_hash, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (pool_id, sender_address, token_in, token_out,
-             str(amount_in), str(amount_out), str(fee_amount),
-             str(sqrt_price_after), tick_after, block_height, tx_hash, now),
+            (
+                pool_id,
+                sender_address,
+                token_in,
+                token_out,
+                str(amount_in),
+                str(amount_out),
+                str(fee_amount),
+                str(sqrt_price_after),
+                tick_after,
+                block_height,
+                tx_hash,
+                now,
+            ),
         )
         await self.connection.commit()
-        return cursor.lastrowid
+        return cursor.lastrowid or 0
 
     async def record_fee_distribution(
         self,
@@ -348,8 +385,17 @@ class ExchangePersistence:
                (pool_id, swap_id, total_fee, lp_fee, creator_fee, treasury_fee, validator_fee,
                 block_height, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (pool_id, swap_id, str(total_fee), str(lp_fee), str(creator_fee),
-             str(treasury_fee), str(validator_fee), block_height, now),
+            (
+                pool_id,
+                swap_id,
+                str(total_fee),
+                str(lp_fee),
+                str(creator_fee),
+                str(treasury_fee),
+                str(validator_fee),
+                block_height,
+                now,
+            ),
         )
         await self.connection.commit()
 
@@ -377,14 +423,25 @@ class ExchangePersistence:
         """Place an order on the order book. Returns order_id."""
         order_id = _make_order_id(pool_id, owner_address, nonce)
         now = int(time.time())
-        
+
         await self.connection.execute(
             """INSERT INTO orderbook_orders
                (order_id, pool_id, owner_address, order_type, side, price, quantity,
                 filled_quantity, status, nonce, expires_at, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, '0', 'OPEN', ?, ?, ?, ?)""",
-            (order_id, pool_id, owner_address, order_type, side,
-             str(price), str(quantity), nonce, expires_at, now, now),
+            (
+                order_id,
+                pool_id,
+                owner_address,
+                order_type,
+                side,
+                str(price),
+                str(quantity),
+                nonce,
+                expires_at,
+                now,
+                now,
+            ),
         )
         await self.connection.commit()
         return order_id
@@ -399,11 +456,11 @@ class ExchangePersistence:
         row = await cursor.fetchone()
         if not row:
             raise ValueError(f"Order not found: {order_id}")
-        
+
         total_filled = Decimal(row["filled_quantity"]) + filled_qty
         total_qty = Decimal(row["quantity"])
         status = "FILLED" if total_filled >= total_qty else "PARTIAL"
-        
+
         await self.connection.execute(
             "UPDATE orderbook_orders SET filled_quantity = ?, status = ?, updated_at = ? WHERE order_id = ?",
             (str(total_filled), status, now, order_id),
@@ -438,9 +495,18 @@ class ExchangePersistence:
                (pool_id, maker_order_id, taker_order_id, price, quantity,
                 maker_fee, taker_fee, block_height, tx_hash, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (pool_id, maker_order_id, taker_order_id,
-             str(price), str(quantity), str(maker_fee), str(taker_fee),
-             block_height, tx_hash, now),
+            (
+                pool_id,
+                maker_order_id,
+                taker_order_id,
+                str(price),
+                str(quantity),
+                str(maker_fee),
+                str(taker_fee),
+                block_height,
+                tx_hash,
+                now,
+            ),
         )
         await self.connection.commit()
 
@@ -474,20 +540,20 @@ class ExchangePersistence:
         cursor = await self.connection.execute(
             "SELECT COUNT(*) as count FROM amm_swaps WHERE pool_id = ?", (pool_id,)
         )
-        swap_count = (await cursor.fetchone())["count"]
+        swap_count = _one(await cursor.fetchone())["count"]
 
         # Count positions
         cursor = await self.connection.execute(
             "SELECT COUNT(*) as count FROM amm_positions WHERE pool_id = ?", (pool_id,)
         )
-        position_count = (await cursor.fetchone())["count"]
+        position_count = _one(await cursor.fetchone())["count"]
 
         # Total fees
         cursor = await self.connection.execute(
             "SELECT COALESCE(SUM(CAST(total_fee AS REAL)), 0) as total FROM amm_fee_distributions WHERE pool_id = ?",
             (pool_id,),
         )
-        total_fees = (await cursor.fetchone())["total"]
+        total_fees = _one(await cursor.fetchone())["total"]
 
         return {
             **pool,

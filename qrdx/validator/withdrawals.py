@@ -93,10 +93,12 @@ logger = logging.getLogger(__name__)
 # validator/config.py, epoch_from_block not reading the sync path's `content` key, and a
 # pending validator's exit being silently dropped.
 ENFORCE_VALIDATOR_WITHDRAWALS = os.getenv(
-    "QRDX_ENFORCE_VALIDATOR_WITHDRAWALS", "1").lower() not in ("0", "false", "no")
+    "QRDX_ENFORCE_VALIDATOR_WITHDRAWALS", "1"
+).lower() not in ("0", "false", "no")
 
-Withdrawal = Tuple[str, int, Decimal]   # (address, exit_epoch, amount_qrdx)
-Forfeit = Tuple[str, int]               # (address, exit_epoch)
+Withdrawal = Tuple[str, int, Decimal]  # (address, exit_epoch, amount_qrdx)
+Forfeit = Tuple[str, int]  # (address, exit_epoch)
+
 
 async def ensure_tables(db) -> None:
     """
@@ -115,13 +117,27 @@ async def record_validator_exit(db, address: str, exit_epoch: int, block_height:
     await ensure_tables(db)
     await db.connection.execute(
         "INSERT INTO validator_exits (block_height, address, exit_epoch) VALUES (?, ?, ?)",
-        (int(block_height), address, int(exit_epoch)))
+        (int(block_height), address, int(exit_epoch)),
+    )
 
 
 async def slashed_on_chain(db, address: str, before_height: int) -> bool:
     """
     True if a canonical block below ``before_height`` carries verified slashing evidence
     against ``address``.
+
+    A lookup in the chain index (qrdx/chain_index.py), which verifies each block's evidence
+    once. ``slashed_on_chain_by_scan`` — a text search over every block body below the height —
+    is the reference it is tested against.
+    """
+    from ..chain_index import slashed_before
+
+    return await slashed_before(db, address, int(before_height))
+
+
+async def slashed_on_chain_by_scan(db, address: str, before_height: int) -> bool:
+    """
+    ``slashed_on_chain`` by scanning block bodies (a LIKE over every block below the height).
 
     Reads block bodies, not ``slashing_events``: every node holds the same canonical blocks,
     and each proof self-verifies with no external state (a proposer cannot fabricate one —
@@ -139,8 +155,13 @@ async def slashed_on_chain(db, address: str, before_height: int) -> bool:
         "AND content LIKE '%slashing_evidence%' "
         "AND content NOT LIKE ? AND content NOT LIKE ? "
         "AND content LIKE ? ORDER BY block_height",
-        (int(before_height),
-         "%'slashing_evidence': []%", '%"slashing_evidence": []%', f"%{address}%"))
+        (
+            int(before_height),
+            "%'slashing_evidence': []%",
+            '%"slashing_evidence": []%',
+            f"%{address}%",
+        ),
+    )
     for (content,) in await cur.fetchall():
         try:
             block = _parse_block_content(content)
@@ -153,8 +174,9 @@ async def slashed_on_chain(db, address: str, before_height: int) -> bool:
     return False
 
 
-async def compute_block_withdrawals(db, block_height: int, block_epoch: int
-                                    ) -> Tuple[List[Withdrawal], List[Forfeit]]:
+async def compute_block_withdrawals(
+    db, block_height: int, block_epoch: int
+) -> Tuple[List[Withdrawal], List[Forfeit]]:
     """
     The withdrawals block ``block_height`` must credit, and the exits it must settle as
     forfeited.
@@ -176,7 +198,8 @@ async def compute_block_withdrawals(db, block_height: int, block_epoch: int
         "SELECT address, exit_epoch FROM validator_exits "
         "WHERE block_height < ? AND exit_epoch + ? <= ? "
         "ORDER BY LOWER(address), exit_epoch",
-        (int(block_height), int(WITHDRAWAL_DELAY_EPOCHS), int(block_epoch)))
+        (int(block_height), int(WITHDRAWAL_DELAY_EPOCHS), int(block_epoch)),
+    )
     candidates = await cur.fetchall()
 
     payable: List[Withdrawal] = []
@@ -184,29 +207,31 @@ async def compute_block_withdrawals(db, block_height: int, block_epoch: int
     for address, exit_epoch in candidates:
         cur = await db.connection.execute(
             "SELECT 1 FROM validator_withdrawals "
-            "WHERE LOWER(address) = LOWER(?) AND exit_epoch = ?", (address, exit_epoch))
+            "WHERE LOWER(address) = LOWER(?) AND exit_epoch = ?",
+            (address, exit_epoch),
+        )
         if await cur.fetchone():
-            continue                                   # already settled
+            continue  # already settled
         if any(f[0].lower() == address.lower() and f[1] == int(exit_epoch) for f in forfeited):
             continue
 
         cur = await db.connection.execute(
             "SELECT stake FROM validator_deposits "
             "WHERE LOWER(address) = LOWER(?) AND block_height < ?",
-            (address, int(block_height)))
+            (address, int(block_height)),
+        )
         deposited = sum((Decimal(str(r[0])) for r in await cur.fetchall()), Decimal(0))
 
         cur = await db.connection.execute(
-            "SELECT amount FROM validator_withdrawals WHERE LOWER(address) = LOWER(?)",
-            (address,))
+            "SELECT amount FROM validator_withdrawals WHERE LOWER(address) = LOWER(?)", (address,)
+        )
         withdrawn = sum((Decimal(str(r[0])) for r in await cur.fetchall()), Decimal(0))
         # Withdrawals already queued earlier in THIS list (an address with two exits).
-        withdrawn += sum((w[2] for w in payable if w[0].lower() == address.lower()),
-                         Decimal(0))
+        withdrawn += sum((w[2] for w in payable if w[0].lower() == address.lower()), Decimal(0))
 
         amount = deposited - withdrawn
         if amount <= 0:
-            continue                                   # nothing to pay, so nothing to forfeit
+            continue  # nothing to pay, so nothing to forfeit
         # The whole chain below, not just since the first deposit: a genesis validator has
         # no deposit row but could still have offended before topping up.
         if await slashed_on_chain(db, address, block_height):
@@ -216,8 +241,7 @@ async def compute_block_withdrawals(db, block_height: int, block_epoch: int
     return payable, forfeited
 
 
-async def compute_payable_withdrawals(db, block_height: int,
-                                      block_epoch: int) -> List[Withdrawal]:
+async def compute_payable_withdrawals(db, block_height: int, block_epoch: int) -> List[Withdrawal]:
     """The withdrawals block ``block_height`` must credit (see ``compute_block_withdrawals``)."""
     payable, _forfeited = await compute_block_withdrawals(db, block_height, block_epoch)
     return payable
@@ -234,9 +258,15 @@ async def apply_withdrawals(db, withdrawals: List[Withdrawal], block_height: int
         await db.connection.execute(
             "INSERT INTO validator_withdrawals (address, exit_epoch, amount, block_height) "
             "VALUES (?, ?, ?, ?)",
-            (address, int(exit_epoch), str(amount), int(block_height)))
-        logger.info("[withdrawal] block %d returned %s QRDX of stake to %s (exit epoch %d)",
-                    block_height, amount, str(address)[:24], exit_epoch)
+            (address, int(exit_epoch), str(amount), int(block_height)),
+        )
+        logger.info(
+            "[withdrawal] block %d returned %s QRDX of stake to %s (exit epoch %d)",
+            block_height,
+            amount,
+            str(address)[:24],
+            exit_epoch,
+        )
 
 
 async def record_forfeits(db, forfeited: List[Forfeit], block_height: int) -> None:
@@ -248,9 +278,15 @@ async def record_forfeits(db, forfeited: List[Forfeit], block_height: int) -> No
     for address, exit_epoch in forfeited:
         await db.connection.execute(
             "INSERT INTO validator_withdrawals (address, exit_epoch, amount, block_height) "
-            "VALUES (?, ?, ?, ?)", (address, int(exit_epoch), "0", int(block_height)))
-        logger.warning("[withdrawal] block %d: stake of %s forfeited (slashed; exit epoch %d)",
-                       block_height, str(address)[:24], exit_epoch)
+            "VALUES (?, ?, ?, ?)",
+            (address, int(exit_epoch), "0", int(block_height)),
+        )
+        logger.warning(
+            "[withdrawal] block %d: stake of %s forfeited (slashed; exit epoch %d)",
+            block_height,
+            str(address)[:24],
+            exit_epoch,
+        )
 
 
 async def process_block_withdrawals(db, block_height: int, block_epoch: int) -> int:
@@ -269,9 +305,11 @@ async def undo_withdrawal_logs_above(db, tip_height: int) -> None:
     """Discard exit and withdrawal records carried by orphaned blocks. Does not commit."""
     await ensure_tables(db)
     await db.connection.execute(
-        "DELETE FROM validator_exits WHERE block_height > ?", (int(tip_height),))
+        "DELETE FROM validator_exits WHERE block_height > ?", (int(tip_height),)
+    )
     await db.connection.execute(
-        "DELETE FROM validator_withdrawals WHERE block_height > ?", (int(tip_height),))
+        "DELETE FROM validator_withdrawals WHERE block_height > ?", (int(tip_height),)
+    )
 
 
 async def reapply_withdrawal_ledger(db) -> int:
@@ -285,9 +323,10 @@ async def reapply_withdrawal_ledger(db) -> int:
     """
     await ensure_tables(db)
     cur = await db.connection.execute(
-        "SELECT address, amount FROM validator_withdrawals ORDER BY block_height, address")
+        "SELECT address, amount FROM validator_withdrawals ORDER BY block_height, address"
+    )
     rows = [(a, Decimal(str(v))) for a, v in await cur.fetchall()]
-    rows = [(a, v) for a, v in rows if v != 0]        # forfeits credit nothing
+    rows = [(a, v) for a, v in rows if v != 0]  # forfeits credit nothing
     for address, amount in rows:
         await db.apply_account_balance_delta(address, amount)
     return len(rows)

@@ -26,24 +26,26 @@ logger = get_logger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
+
 # Resolve algorithm name at import time (ML-DSA-65 preferred, Dilithium3 legacy)
 def _resolve_sig_algorithm() -> str:
-    for name in ('ML-DSA-65', 'Dilithium3'):
+    for name in ("ML-DSA-65", "Dilithium3"):
         try:
             oqs.Signature(name)
             return name
         except Exception:
             continue
-    raise RuntimeError('No supported PQ signature algorithm found in liboqs')
+    raise RuntimeError("No supported PQ signature algorithm found in liboqs")
+
 
 PQ_SIG_ALGORITHM = _resolve_sig_algorithm()
-NODE_ID_HEX_LEN = 40          # 20 bytes = 160 bits, expressed as 40 hex chars
-NODE_ID_PREFIX = 'qx'
+NODE_ID_HEX_LEN = 40  # 20 bytes = 160 bits, expressed as 40 hex chars
+NODE_ID_PREFIX = "qx"
 NODE_ID_FULL_LEN = len(NODE_ID_PREFIX) + NODE_ID_HEX_LEN  # 42
 
 # @-schema regex
 _AT_SCHEMA_RE = re.compile(
-    r'^(?P<algo>[a-zA-Z0-9-]+)@(?P<id>qx[a-fA-F0-9]{40,})@(?P<host>[^:]+):(?P<port>\d+)$'
+    r"^(?P<algo>[a-zA-Z0-9-]+)@(?P<id>qx[a-fA-F0-9]{40,})@(?P<host>[^:]+):(?P<port>\d+)$"
 )
 
 # Type alias for 20-byte node ID
@@ -53,6 +55,7 @@ NodeID = bytes  # 20 bytes
 # ---------------------------------------------------------------------------
 # Address
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Address:
@@ -71,7 +74,7 @@ class Address:
         return (self.ip, self.tcp_port)
 
     @property
-    def udp_endpoint(self) -> Tuple[str, int]:
+    def udp_endpoint(self) -> Tuple[str, Optional[int]]:
         return (self.ip, self.udp_port)
 
     def __str__(self) -> str:
@@ -83,6 +86,7 @@ class Address:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def derive_node_id(public_key: bytes) -> NodeID:
     """
@@ -111,8 +115,8 @@ def node_id_to_hex(node_id: NodeID) -> str:
 def hex_to_node_id(hex_str: str) -> NodeID:
     """Convert 'qx'-prefixed or plain hex string to 20-byte node ID."""
     if hex_str.startswith(NODE_ID_PREFIX):
-        hex_str = hex_str[len(NODE_ID_PREFIX):]
-    if hex_str.startswith('0x'):
+        hex_str = hex_str[len(NODE_ID_PREFIX) :]
+    if hex_str.startswith("0x"):
         hex_str = hex_str[2:]
     return bytes.fromhex(hex_str)
 
@@ -120,6 +124,7 @@ def hex_to_node_id(hex_str: str) -> NodeID:
 # ---------------------------------------------------------------------------
 # Node
 # ---------------------------------------------------------------------------
+
 
 class Node:
     """
@@ -158,7 +163,7 @@ class Node:
     # -- Constructors -------------------------------------------------------
 
     @classmethod
-    def from_at_schema(cls, address: str) -> 'Node':
+    def from_at_schema(cls, address: str) -> "Node":
         """
         Parse a node from an @-schema address string.
 
@@ -170,20 +175,20 @@ class Node:
         if not m:
             raise ValueError(f"Invalid @-schema address: {address!r}")
 
-        algo = m.group('algo')
+        algo = m.group("algo")
         # Accept both legacy 'dilithium3' and FIPS 'ml-dsa-65' names
-        accepted = {PQ_SIG_ALGORITHM.lower(), 'dilithium3', 'ml-dsa-65'}
+        accepted = {PQ_SIG_ALGORITHM.lower(), "dilithium3", "ml-dsa-65"}
         if algo.lower() not in accepted:
             raise ValueError(f"Unsupported algorithm in @-schema: {algo}")
 
-        node_id_hex = m.group('id')
-        host = m.group('host')
-        port = int(m.group('port'))
+        node_id_hex = m.group("id")
+        host = m.group("host")
+        port = int(m.group("port"))
 
         # We don't have the public key from the @-schema alone —
         # store the node ID and address. Public key is obtained during handshake.
         node = cls.__new__(cls)
-        node._public_key = None  # Unknown until handshake
+        node._public_key = None  # type: ignore[assignment]  # unknown until handshake
         node._secret_key = None
         node._address = Address(ip=host, tcp_port=port)
         node._node_id = hex_to_node_id(node_id_hex)
@@ -191,7 +196,7 @@ class Node:
         return node
 
     @classmethod
-    def from_http_url(cls, url: str) -> 'Node':
+    def from_http_url(cls, url: str) -> "Node":
         """
         Create a placeholder node from an HTTP(S) URL.
 
@@ -201,19 +206,19 @@ class Node:
         from urllib.parse import urlparse
 
         parsed = urlparse(url)
-        host = parsed.hostname or 'localhost'
+        host = parsed.hostname or "localhost"
         port = parsed.port or 30303
 
         node = cls.__new__(cls)
-        node._public_key = None
+        node._public_key = None  # type: ignore[assignment]  # unknown until handshake
         node._secret_key = None
         node._address = Address(ip=host, tcp_port=port)
-        node._node_id = b'\x00' * 20  # Placeholder — resolved after handshake
-        node._node_id_hex = NODE_ID_PREFIX + '0' * NODE_ID_HEX_LEN
+        node._node_id = b"\x00" * 20  # Placeholder — resolved after handshake
+        node._node_id_hex = NODE_ID_PREFIX + "0" * NODE_ID_HEX_LEN
         return node
 
     @classmethod
-    def generate(cls, address: Optional[Address] = None) -> 'Node':
+    def generate(cls, address: Optional[Address] = None) -> "Node":
         """Generate a new node with a fresh Dilithium3 keypair."""
         signer = oqs.Signature(PQ_SIG_ALGORITHM)
         public_key = signer.generate_keypair()
@@ -221,27 +226,29 @@ class Node:
         return cls(public_key=public_key, address=address, secret_key=secret_key)
 
     @classmethod
-    def load_or_generate(cls, key_path: str, address: Optional[Address] = None) -> 'Node':
+    def load_or_generate(cls, key_path: str, address: Optional[Address] = None) -> "Node":
         """
         Load node from key files on disk, or generate new.
 
         Stores: <key_path> (secret key) and <key_path>.pub (public key).
         """
-        pub_path = key_path + '.pub'
+        pub_path = key_path + ".pub"
         if os.path.exists(key_path) and os.path.exists(pub_path):
-            with open(key_path, 'rb') as f:
+            with open(key_path, "rb") as f:
                 secret_key = f.read()
-            with open(pub_path, 'rb') as f:
+            with open(pub_path, "rb") as f:
                 public_key = f.read()
             return cls(public_key=public_key, address=address, secret_key=secret_key)
 
         node = cls.generate(address=address)
 
-        os.makedirs(os.path.dirname(key_path) or '.', exist_ok=True)
-        with open(key_path, 'wb') as f:
+        os.makedirs(os.path.dirname(key_path) or ".", exist_ok=True)
+        if node._secret_key is None:
+            raise ValueError("a generated node has a secret key")
+        with open(key_path, "wb") as f:
             f.write(node._secret_key)
         os.chmod(key_path, 0o600)
-        with open(pub_path, 'wb') as f:
+        with open(pub_path, "wb") as f:
             f.write(node._public_key)
         os.chmod(pub_path, 0o644)
 
@@ -357,15 +364,15 @@ class Node:
 
     # -- Kademlia XOR distance ---------------------------------------------
 
-    def distance(self, other: 'Node') -> int:
+    def distance(self, other: "Node") -> int:
         """XOR distance to another node (for Kademlia routing)."""
-        return int.from_bytes(self._node_id, 'big') ^ int.from_bytes(other._node_id, 'big')
+        return int.from_bytes(self._node_id, "big") ^ int.from_bytes(other._node_id, "big")
 
     def distance_to(self, node_id: NodeID) -> int:
         """XOR distance to a raw node ID."""
-        return int.from_bytes(self._node_id, 'big') ^ int.from_bytes(node_id, 'big')
+        return int.from_bytes(self._node_id, "big") ^ int.from_bytes(node_id, "big")
 
-    def log_distance(self, other: 'Node') -> int:
+    def log_distance(self, other: "Node") -> int:
         """
         Log2 distance (Kademlia bucket index) to another node.
 

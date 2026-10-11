@@ -132,34 +132,32 @@ funding paid none (caught by S19's funding check). The duplicate is gone and
   only if it falls under maintenance); after a halt spanning several funding intervals, one is
   paid; anyone may create a market (it trades only once validators price it).
 
-## OPEN — Three things block the first release
+## OPEN — The first release needs maintainer keys
 
 **Severity: high (blocks every release).** Signed releases and reproducible builds are in place
-([RELEASES.md](RELEASES.md)), but no release can be cut until these are fixed:
+([RELEASES.md](RELEASES.md)). `release/allowed_signers` is empty on purpose, so nothing
+verifies until maintainers register.
 
-1. **`dvm` is recorded as a submodule that no clone can fetch.** The tree has a gitlink at
-   `dvm` (commit `ddc8868`, the legacy denaro-coin VM, added in `ff83360`) with no
-   `.gitmodules` entry. It works only in checkouts that happen to have a `dvm/` repository.
-   Every fresh clone with submodules fails with "No url found for submodule path 'dvm'",
-   including `actions/checkout` with `submodules: recursive` in the release workflow. Nothing
-   in `qrdx/` uses it. `release.py preflight` now refuses it. **To close:**
-   `git rm --cached dvm`, then add `dvm/` to `.gitignore` (or declare it in `.gitmodules` if it
-   is meant to ship).
-2. **The EVM change the tests ran against is not committed.** `py-evm` has an uncommitted
-   change to `eth/vm/forks/qrdx/precompiles.py` (+41/−635). The test suite and every
-   working-tree image so far ran *with* it. A release built from a tag gets the submodule's
-   recorded commit, *without* it. **To close:** commit it in `py-evm`, push it to
-   `qrdx-org/py-evm`, and commit the new submodule pointer here. A fresh clone must be able to
-   fetch every recorded commit.
-3. **No maintainer keys are registered.** `release/allowed_signers` is empty on purpose, so
-   nothing verifies. **To close:** at least `maintainer_threshold` (2) maintainers add their
-   keys ([RELEASES.md §5](RELEASES.md#5-cutting-a-release-maintainers)), and the GitHub
-   settings listed there are applied: branch protection, a `v*` tag ruleset, and a public GHCR
-   package.
+**To close:**
 
-The full flow (preflight, build from the tag, source tarball, manifest, two maintainer
-signatures, an operator `verify --rebuild` reproducing the image) was rehearsed end to end on a
-scratch clone where items 1 and 2 were fixed.
+1. At least `maintainer_threshold` (2) maintainers add their keys with
+   `scripts/release/release.py add-signer`
+   ([RELEASES.md §5](RELEASES.md#5-cutting-a-release-maintainers)).
+2. Apply the GitHub settings listed there: branch protection, a `v*` tag ruleset, and a public
+   GHCR package.
+
+Two other blockers are resolved, pending your next commit:
+
+- **The `dvm` gitlink.** An undeclared submodule broke every fresh clone. Its removal and the
+  `.gitignore` entry are staged.
+- **The py-evm change.** The change the tests ran against is committed as py-evm `ffe59501` and
+  pushed to `qrdx-org/py-evm` (`denaro`). The new submodule pointer is staged.
+
+A CI simulation (a fresh clone of a commit of the current tree, py-evm fetched from GitHub)
+reproduced the following:
+
+- the image build from the commit;
+- the unit suite inside the image.
 
 ## OPEN — QRDX's chain ids are not registered yet
 
@@ -171,17 +169,6 @@ signed transaction is bound to it, so another chain taking 762 would make keys u
 replayable.
 
 **To close:** submit `eip155-762.json` and `eip155-7620.json` to ethereum-lists/chains.
-
-## OPEN — The peer RPC transport is unauthenticated
-
-**Severity: medium.** Node-to-node calls go over plain JSON-RPC (`NodeInterface._rpc_call`): no
-request signature, and `p2p_handshakeResponse` consumes a challenge without verifying that the
-caller signed it. A peer's node id, URL and advertised chain identity are therefore
-self-declared. The chain-identity check ([PROTOCOL_UPGRADES.md §5](PROTOCOL_UPGRADES.md)) keeps
-honest-but-misconfigured nodes — another network, a missed upgrade — apart, but a malicious peer
-can claim any identity; block validity (proposer signature, eligibility, parent linkage, E-D4)
-remains the real defence. **To close:** sign RPC requests the way the legacy REST path does
-(`get_verified_sender`), and verify the challenge signature in the handshake.
 
 ## OPEN — A second, unused token class remains
 
@@ -199,6 +186,90 @@ it, give native tokens the Doomsday flag and move S05/S06 onto them.
 ---
 
 # Accepted limitations
+
+## OPEN — Historical proposer eligibility cannot be re-checked
+
+**Severity: medium (consensus).** A block's proposer must be the validator selected for its slot
+(`verify_proposer_eligibility`). The selection is computed from the `validators` table as it is
+*now*. That table changes every finalized epoch (rewards, penalties, joins, exits), so a block
+judged long after its slot — during sync, or when fork choice adopts a competing branch — can be
+assigned a different expected proposer than the one it was proposed under. Sync has therefore
+always trust-replayed eligibility, and fork-choice adoption does the same
+(`main._apply_branch`). Proposer signatures, parent continuity, slot progression and FFG votes
+are still enforced on those paths. What is not checked there is whether the signer owned the
+slot.
+
+The risk is bounded but real. A branch of out-of-turn blocks by one validator cannot justify a
+checkpoint, which needs ⅔ of the stake, and fork choice puts the newest justified checkpoint
+first. Between justified checkpoints, though, such a branch could win on height.
+
+**Closing it:** record the selection set per epoch (address and stake, as of the epoch's
+start), derived deterministically from the canonical chain, and check every block, historical
+or live, against the set of its own epoch. The validator reconstruction already keeps
+per-epoch snapshots it could serve from.
+
+## OPEN — Restarts replay derived state from genesis
+
+**Severity: medium (scaling).** Reorgs no longer replay the chain (see "FIXED — A reorg
+replayed derived state from genesis"), but a restart still does. The exchange state lives only
+in memory, and the reorg checkpoints are in-memory copies, so a starting node rebuilds every
+derived domain from genesis (`rebuild_derived_state_interleaved`). That is ~26 µs per block plus
+the blocks that carry transactions: ~2 s at 75,000 blocks, ~9 s per day of 250 ms blocks.
+
+**Closing it:** persist the exchange checkpoint at the finalized height to disk. At startup,
+undo the journal back to it (`undo_journal.rollback_to`), load it, and replay the blocks above.
+The `[RESTART-REBUILD]` equivalence check should keep running periodically against a full
+replay, so a bad checkpoint cannot persist unnoticed.
+
+## OPEN — Two exchange duties still cost O(state) per block
+
+**Severity: medium (scaling; it decides how far sub-second blocks scale).** The state roots no
+longer grow with the state (see "FIXED — State roots were recomputed from all state every
+block"). Two exchange costs still do, and at 250 ms slots they are what a busy node runs out of
+first:
+
+- **The liquidation scan.** `Clearinghouse.tick` runs on every block. It sorts every margin
+  account and computes the equity of each one that has positions. That is about 3 µs per
+  account: 29 ms at 10,000 accounts and 148 ms at 50,000.
+- **The per-block revert snapshot.** A block that carries exchange transactions first
+  deep-copies the whole exchange state (`take_snapshot`), so that a section that fails halfway
+  can be undone. That is about 11 µs per account: 115 ms at 10,000. (A *rejected block* no
+  longer needs it: it is restored through the fast reorg path.)
+
+**Closing them:**
+
+- *Liquidation:* index positions by the mark price at which they fall below maintenance, per
+  market, and check only those the new mark crosses.
+- *Snapshot:* journal the exchange like the database. The commitment tracking
+  (`qrdx/exchange/commitment.py`) already marks every entry a block may change, at the moment it
+  is handed out. Copying an entry the first time it is marked in a block makes the undo cost what
+  the block touched. Pools and books need the same at their version bumps.
+
+The order books and pools are re-digested whole when touched, which is O(that book or pool)
+rather than O(changes). Their size is bounded by market structure, not by the number of users,
+but per-order and per-position digests would remove it.
+
+## OPEN — Sub-second slots make the chain large
+
+**Severity: medium (operations).** A block is about 20 KB. Votes are now cast once per validator
+per epoch (about 0.3 per block on the testnet), not every slot, which removed most of the
+attestations that used to make blocks 45 KB. What remains is mostly Dilithium signatures,
+stored as hex inside the Python-literal body:
+
+| Part | Size |
+|---|---|
+| Proposer signature | 6.6 KB |
+| RANDAO reveal | 6.6 KB |
+| Proposer public key | 3.9 KB |
+| Each vote | ~7 KB |
+
+That is about 0.9 GB a day at 2 s slots and 7 GB a day at 250 ms.
+
+**Closing it:**
+
+- Store signatures as bytes, not hex: half the size.
+- Drop the public key from the body. The chain-derived key registry
+  (`chain_index.validator_public_key`) already supplies every validator's key.
 
 ## ACCEPTED — Oracle reporters are trusted (development override only)
 
@@ -220,15 +291,6 @@ Closing it fully means gating payout on the exit being finalized, which needs a 
 epoch that is a pure function of the chain at each block — the finality view today is a
 node-local table. 256 epochs is Ethereum's figure for the same window, and a stall that
 long is itself a network emergency.
-
-## ACCEPTED — The forfeiture scan reads block bodies linearly
-
-Deciding whether an exiting validator forfeits reads canonical block bodies (the only source
-every node agrees on), once per payout. SQL excludes blocks with empty evidence before
-parsing, so the parsing cost is tiny — but the `LIKE` filter itself still scans stored block
-text, O(chain size) per payout. Negligible at testnet scale; at production scale the fix is a
-per-block evidence index written during block application and trimmed on rollback, like the
-deposit and exit logs.
 
 ## ACCEPTED — Ejected validators claim their principal manually; staking has no CLI
 
@@ -345,6 +407,22 @@ These are not defects, but they are the reason two real bugs survived a green su
 
 | Issue | Where |
 |---|---|
+| A proposer could build on an all-zero parent during a reorg | [below](#fixed-a-proposer-could-build-on-an-all-zero-parent-during-a-reorg) |
+| Fork choice let a branch carrying the votes for a shared checkpoint beat a taller one (a lone validator never rejoined) | [below](#fixed-fork-choice-let-a-branch-carrying-the-votes-for-a-shared-checkpoint-beat-a-taller-one) |
+| A peer that dropped out came back without a URL, so the network stayed split after a validator restart | [below](#fixed-a-peer-that-dropped-out-came-back-without-a-url-and-the-network-stayed-split) |
+| A sync aborted as "fatal", and penalized its peer, over blocks pushed while it ran | [below](#fixed-a-sync-aborted-as-fatal-and-penalized-its-peer-over-blocks-pushed-meanwhile) |
+| The local testnet forked at 250 ms: nodes could not push blocks to each other (one bootstrap peer, staggered start) | [below](#fixed-the-local-testnet-forked-at-250-ms-its-nodes-could-not-push-blocks-to-each-other) |
+| A validator proposed and voted before its first sync (a restarted validator forked the chain) | [below](#fixed-a-validator-proposed-and-voted-before-its-first-sync) |
+| Validator rewards and penalties accrued per epoch, so 8 s epochs would have run them 8 times as fast | [below](#fixed-validator-rewards-and-penalties-accrued-per-epoch-not-per-unit-of-time) |
+| Finality was not bound to a branch: two forks could both finalize (now Casper FFG) | [below](#fixed-finality-was-not-bound-to-a-branch-two-forks-could-both-finalize) |
+| Forks were resolved only every 8 s, under two rules that disagreed | [below](#fixed-forks-were-resolved-only-every-8-s-under-two-rules-that-disagreed) |
+| A reorg replayed derived state from genesis (now an undo journal) | [below](#fixed-a-reorg-replayed-derived-state-from-genesis) |
+| The proposer selected from a validator set frozen at startup | [below](#fixed-the-proposer-selected-from-a-validator-set-frozen-at-startup) |
+| State roots were recomputed from all state every block (now incremental) | [below](#fixed-state-roots-were-recomputed-from-all-state-every-block) |
+| Block time grew with the chain (2 s → 14.5 s on the testnet): consensus helpers re-read history every call | [below](#fixed-block-time-grew-with-the-chain) |
+| A genesis validator's top-up deposit was re-applied at every rebuild (its stake grew each finalized epoch) | [below](#fixed-a-genesis-validators-top-up-was-re-applied-at-every-rebuild) |
+| The peer RPC transport was unauthenticated (any peer could claim any identity) | [below](#fixed-the-peer-rpc-transport-was-unauthenticated) |
+| CI's lint and type checks had never passed, and hid real bugs; shipped dependencies had known vulnerabilities | [below](#fixed-cis-static-checks-had-never-passed-and-hid-real-bugs) |
 | Release images were neither reproducible nor signed, and never ran the tested dependency versions | [below](#fixed-release-images-were-neither-reproducible-nor-signed) |
 | Locally built images could contain the node's private key | [below](#fixed-locally-built-images-could-contain-the-nodes-private-key) |
 | System-wallet balances lived only in the legacy UTXO ledger (a debit through the balance flush was dropped) | [below](#fixed-system-wallet-balances-lived-only-in-the-legacy-utxo-ledger) |
@@ -387,6 +465,496 @@ These are not defects, but they are the reason two real bugs survived a green su
 | Malformed `TOKEN_TRANSFER` recipient burned tokens | same, §1.3(a) |
 
 ---
+
+## FIXED — A proposer could build on an all-zero parent during a reorg
+
+**Severity: medium (liveness).** The proposer read the next height and then the tip block, in two
+steps before taking the block-processing lock. Under the lock it re-checked only the height. A
+reorg in between could remove the tip and apply another block at the same height, so the
+height still matched, but the tip had been read as missing. The block was then built on an
+all-zero parent, stored, and broadcast, and every peer refused it. Seen once in the 250 ms
+integration run.
+
+**Fixed:** under the lock the proposer re-reads the tip, and skips the slot unless it is exactly
+the parent the block is built on. Tests: `tests/test_proposer_production_lock.py`.
+
+## FIXED — Fork choice let a branch carrying the votes for a shared checkpoint beat a taller one
+
+**Severity: high (liveness).** Fork choice first compared each branch's latest justified epoch,
+computed from the votes that branch's own blocks carry. A checkpoint below the fork is in both
+chains, but its votes ride whichever blocks included them. On the 250 ms integration run, one
+validator was briefly cut off and ended on its own branch. That branch carried all three
+validators' votes for epoch 14's checkpoint (height 331, below the fork at 338); the network's
+branch was missing that validator's vote. The lone branch therefore scored "justified 14"
+against "justified 9" and never rejoined the network, 162 blocks taller. With three equal
+validators, justification needs all three votes, so finality stopped.
+
+**Fixed:** a justified checkpoint decides only if it is above the fork, in one chain alone
+(`ffg.prefer(candidate, current, ancestor)`; scores now carry the justified checkpoint's
+height). A checkpoint below the fork is held by both chains and decides nothing, so height does.
+The node then re-includes its orphaned votes on the chain it joins. Replaying the stuck node's
+database with the new rule picks the network's branch. Tests: `tests/test_fork_resolution.py`.
+
+## FIXED — A peer that dropped out came back without a URL, and the network stayed split
+
+**Severity: high (liveness).** A node drops a peer it cannot reach. When the peer came back it
+connected in, and a peer that connects in is recorded without a URL, because a private node
+advertises none. The node could then neither push blocks to it nor resolve a fork with it (the
+resolver fetches from the peer's URL). It never re-learned the URL either: it re-bootstrapped
+only when it had no connectable peer at all. On the 250 ms testnet, a validator restarted for
+10 s ended up on its own branch for good, and finality stopped, because each of the two
+validators voted for its own branch's checkpoint.
+
+**Fixed:**
+
+- A dropped peer's URL, verified by the handshake it was learned in, is remembered (up to 256
+  peers). When that peer next connects in, it is dialled back (`main._dial_back_if_known`, at
+  most every 5 s), which records the URL again. Measured: all three peers restored it within
+  3 s of the restart, and finality resumed.
+- The 30 s discovery pass also re-handshakes any configured bootstrap node that no peer entry
+  reaches.
+
+Tests: `tests/test_peer_dialback.py`.
+
+## FIXED — A sync aborted as "fatal", and penalized its peer, over blocks pushed meanwhile
+
+**Severity: medium (liveness, peer reputation).** At 250 ms slots, blocks pushed by peers keep
+arriving while a sync fetches a batch, so the batch's first blocks were often already here when
+it was applied. The sync tried to apply them again and failed on the height. It then aborted
+with "FATAL ERROR", and recorded a severity-8 violation against the honest peer it was syncing
+from.
+
+**Fixed:** a block the node already holds is skipped. A different block at a height the node
+holds stops the sync without a penalty and hands the decision to fork choice. So does a next
+block whose parent is not the node's tip, which happens when the peer reorgs between the sync's
+check and its batch. Tests: `tests/test_sync_race.py`.
+
+## FIXED — The local testnet forked at 250 ms: its nodes could not push blocks to each other
+
+**Severity: high (testnet liveness).** `scripts/testnet.sh` gave every node node 0 as its only
+bootstrap peer, and started the nodes 5 s apart. A node records a peer that only connects in
+without a URL (a node advertises one only when public), and pushes blocks only to peers with a
+URL. So validator 1's blocks never reached validator 0 by push, and validator 0's reached
+validator 1 over three hops. Each validator then proposed in the other's slots as the backup,
+on its own branch:
+
+- fork choice repaired the split every few seconds, with rollbacks of about 30 blocks;
+- FFG justified almost nothing, because each validator voted for its own branch's checkpoint;
+- a validator that started 9 s after genesis forked off at height 1.
+
+Peer and routing state from earlier runs (`databases/node<i>.p2p`) also survived a restart.
+
+**Fixed (in the script):**
+
+- Every node lists every other node as a bootstrap peer, a full mesh as in the integration
+  harness.
+- All nodes start together, and genesis is set 15 s plus 1 s per node ahead, so the mesh has
+  formed before the first slot.
+- Each start wipes the per-node database and peer state.
+- The slot is a `--slot-ms` option (default 250), written into the genesis chain spec.
+
+Measured with 4 nodes and 2 validators: 120 blocks in 30.0 s (0.250 s per block, no missed
+slots), no fork switches, and every node finalizing together about 12 s behind the tip.
+
+**Still true of the node:** a peer that only connects in is never pushed to. A public network is
+unaffected, because its nodes advertise URLs, but a private node relies on its configured
+bootstrap list.
+
+## FIXED — A validator proposed and voted before its first sync
+
+**Severity: medium (liveness).** A validator started producing as soon as it booted. One that
+joined late, or restarted behind the network, built blocks on its stale tip (seconds of them at
+250 ms). They forked the network until fork choice undid them, and the validator spent its one
+FFG vote of the epoch on a checkpoint of that stale chain.
+
+**Fixed:** the validator node's guard (`main._validator_wait_reason`) holds proposals and votes
+until the post-bootstrap sync check has run, and until any sync it started has finished. With
+no reachable peer there is nothing to wait for, and the wait never exceeds 120 s. A vote held
+back is cast in a later slot of the same epoch. Tests: `tests/test_fork_choice_adoption.py`.
+
+## FIXED — Validator rewards and penalties accrued per epoch, not per unit of time
+
+**Severity: medium (economics).** Each finalized epoch moved every active validator's effective
+stake by 0.01%. At 250 ms slots an epoch is 8 s instead of 64 s, so stake would have moved 8
+times as fast per day. An offline validator would have lost half its stake, and been ejected,
+after about 15 hours instead of 5 days.
+
+**Fixed:** the rate is 0.01% per 64 s of chain time, so each 8 s epoch carries an eighth
+(`epoch_rewards.reward_quotient`, integer arithmetic from the chain spec). The other parameters
+with a duration are sized for 250 ms slots in `chain_spec.PARAMS`:
+
+| Parameter | Standard value | Wall-clock time |
+|---|---|---|
+| Governance voting period | 2,419,200 blocks | 7 days |
+| Governance timelock | 691,200 blocks | 2 days |
+| Governance execution window | 2,419,200 blocks | 7 days |
+| Unbonding period | 40,320 epochs | ~3.7 days |
+| Withdrawal delay | 2,048 epochs | ~4.6 hours |
+| Master-controller sunset | height 800,000 | ~2.3 days |
+
+Activation delay and the fork-approval lead stay depths (4 epochs, 256 blocks). Tests:
+`tests/test_epoch_rewards.py`.
+
+## FIXED — Finality was not bound to a branch: two forks could both finalize
+
+**Severity: critical (safety).** Finality justified epoch *E* once ⅔ of the stake had voted
+for *E*, whichever branch the voted block was on, and validators voted every slot for whatever
+head they saw. A validator that switched forks therefore supported both branches, legitimately.
+When a fork outlived the finality lag, both branches finalized different blocks at the same
+height, and the reorg guard made the split permanent.
+
+At 250 ms slots, within 30 s of an idle run, nodes {0, 1} and {2, 3} had each finalized their
+own branch: 31 refused reorgs and a 47-block spread. At 2 s a network partition of about 30 s
+would have done the same.
+
+**Fixed: Casper FFG** (`qrdx/validator/ffg.py`):
+
+- **Checkpoint-bound votes.** A vote names a source and a target checkpoint (epoch and block
+  hash), both signed. A validator casts one vote per epoch, at a fixed point in it
+  (`vote_slot`). Its signing record (`SigningRecord`, persisted) refuses a second, different
+  vote for one target, or a surrounding one, even across restarts. Both are slashable
+  (`slashing_block.attestation_equivocation`).
+- **Votes validated on import.** A block is accepted only if every carried vote checks out
+  (`verify_block_votes`): the key from the chain-derived registry, a valid signature, and a
+  target that is this chain's checkpoint. Every import path runs the check. The proposer
+  includes only votes valid for, and not already on, its own chain, so a vote that rode an
+  orphaned block is included again.
+- **Justification from canonical votes.** A checkpoint is justified when ⅔ of the voting stake
+  voted for it from a source justified on the same chain. *t−1* is finalized when ⅔ voted the
+  link *t−1 → t* exactly. Every input comes from the chain index, so every node holding the
+  chain computes the same finality. The computation resumes from the stored finalized
+  checkpoint.
+
+Two branches can now finalize conflicting checkpoints only if ⅓ of the stake signs slashable
+votes. A side effect: blocks carry about 0.3 votes instead of one per validator per slot.
+
+**A bug found while building it:** each node's vote store did not keep the new roots, so seeing
+an honest vote a second time (re-included after a reorg) looked like a double vote. All three
+testnet validators were slashed within minutes. The store keeps the roots now, votes without
+roots are never compared, and the detector records only evidence that verifies
+(`tests/test_surround_vote_detection.py`). Tests: `tests/test_finality_compute.py` (14),
+including two branches with honest validators that cannot both finalize.
+
+## FIXED — Forks were resolved only every 8 s, under two rules that disagreed
+
+**Severity: high (liveness).** A node on a losing branch stayed there until a periodic pass,
+about every 8 s. Sync took the longer chain, while the pass took the lower hash at the first
+divergent height, so the two rules could move nodes in opposite directions. Sync and the pass
+also rolled back before fetching the competing branch, so a branch with a bad block left the
+node on a partial chain.
+
+**Fixed:** one fork-choice rule (`ffg.prefer`), Casper FFG's and then the longest chain. A
+chain holding the newest justified checkpoint is never left for one that does not hold it. When
+both chains hold it, because it lies below the fork, the taller chain wins, then the lower tip
+hash. One resolver applies it (`main.resolve_fork_with_peer`):
+
+1. Find the common ancestor in one exchange of block hashes (`p2p_getBlockHashes`). It is never
+   searched for below the finalized checkpoint.
+2. Fetch the peer's branch and score it from its own blocks. A peer's claims are never trusted.
+3. Roll back and apply only if the branch wins. If one of its blocks is refused, restore our
+   own branch. The tip check, rollback, apply and restore all happen under one hold of the
+   block-processing lock. The 250 ms suite caught a block pushed over p2p landing between the
+   rollback and the apply: the branch then no longer fit on the tip, and our own branch could
+   not be restored either. If the chain moved while the branch was being scored, the switch is
+   abandoned, and the next competing block triggers it again.
+
+It runs at once when a peer sends a block that does not extend our tip, and the periodic pass
+stays as a backstop. Tests: `tests/test_fork_resolution.py`.
+
+## FIXED — A reorg replayed derived state from genesis
+
+**Severity: high (scaling).** Every reorg, and every rejected block, rebuilt all derived state by
+replaying the whole chain: ~26 µs a block, about 9 s after one day of 250 ms blocks.
+
+**Fixed:**
+
+- **Undo journal.** SQLite triggers record every change a block makes to the derived tables,
+  under its height (`qrdx/undo_journal.py`).
+- **Exchange checkpoints.** The exchange state is checkpointed when a block opens an epoch.
+- **The fast path** (`derived_state_rebuild.rebuild_to_tip`). A rollback undoes the journal to
+  the newest checkpoint at or below the new tip, restores the exchange from it, and replays only
+  the blocks above. The cost is the changes since that checkpoint plus less than an epoch of
+  blocks, not the chain.
+- **Safety net.** Every block-application path records its writes. A write to those tables
+  outside any block is recorded as unattributed, and while one exists the full rebuild is used
+  instead. The journal is pruned below the finalized checkpoint.
+
+Tests: `tests/test_fast_reorg_rebuild.py` checks that the fast path equals the full rebuild —
+every row, the state commitments and both exchange roots — across successive reorgs onto
+different branches.
+
+## FIXED — A proposer could fill several heights from one slot
+
+**Severity: medium (consensus).** Eligibility bound a proposer to a slot, but nothing compared
+the slot with the chain. One eligible proposer could sign a run of blocks all claiming its slot,
+or claim future slots.
+
+**Fixed:** every import path refuses a block whose slot is not later than its parent's, or that
+is more than about a second ahead of the clock (`verify_slot_progression`). The proposer skips a
+slot that is not after its tip's. Tests: `tests/test_slot_progression.py`.
+
+## FIXED — The proposer selected from a validator set frozen at startup
+
+**Severity: high (liveness).** The proposer's validator set was built once, when the node
+started. Importers check eligibility against the validators table as it is. Every finalized
+epoch changes the table (rewards and penalties move stakes; validators join and exit), so the
+proposer chose from a set its peers no longer used. It proposed in slots they assigned to
+someone else, its blocks were refused, and the chain forked. This was the main cause of
+sub-second instability, and after a validator joined the testnet it split the 2 s network too.
+
+**Fixed:** the set is rebuilt from the table every slot, exactly as importers build it
+(`ValidatorNode._refresh_validator_set`; `tests/test_proposer_validator_set.py`). With this and
+the fixes above, an idle 250 ms testnet ran 482 consecutive slots at exactly 0.250 s: no missed
+slot, no reorg, nodes within one block. Before, the same run had 218 missed slots, a 47-block
+split and 31 finality conflicts.
+
+## FIXED — State roots were recomputed from all state every block
+
+**Severity: high (scaling).** Every block hashed every entry of every state domain, in order.
+The proposer and each importer did this at least twice per block (the EVM section's account
+root, then the unified root):
+
+| Domain | Cost before |
+|---|---|
+| Account/contract-storage root | ~1.4 µs per account: 74 ms at 50,000 |
+| Exchange root | 42 ms at 10,000 perp accounts and nonces; 296 ms at 50,000 |
+| Token root, UTXO hash | likewise |
+
+The exchange root was the worst: one JSON document of every account, order, LP position,
+allowance and nonce.
+
+**Fixed (chain-spec feature `incremental_state_root`, on from genesis for networks this release
+creates):** every domain commits to its state with an LtHash accumulator (`qrdx/crypto/lthash.py`;
+1024 × 16-bit lanes, BLAKE3 output, the construction Solana uses for its accounts). Adding an
+entry adds its vector and removing one subtracts it, so a root costs what changed:
+
+- **Database domains** (`qrdx/state_commitment.py`). SQLite triggers fold every
+  `account_state`, `contract_storage`, `token_balances` and `unspent_outputs` change into the
+  domain's accumulator, inside the writing statement's transaction, so a rollback takes the
+  change with it and no write path can bypass it. Startup recomputes each accumulator from its
+  rows and repairs any that disagree.
+- **Exchange** (`qrdx/exchange/commitment.py`). Keyed collections are `CommittedDict` /
+  `CommittedSet`. Each keeps a 32-byte digest per entry and re-digests only entries that may
+  have changed. That covers clearinghouse accounts and the vault, nonces, tokens, allowances,
+  frozen sets, NFTs, proposals, and pool ticks and positions. Tracking is conservative: a write
+  marks its key, and handing out a mutable value marks it too. Only explicit `peek` reads (the
+  liquidation scan, the invariant sums) leave a value unmarked, so a missed conversion costs
+  time, never correctness. Order books and pools keep a digest that their own mutating entry
+  points invalidate.
+
+After: at 10,000 or at 50,000 accounts, a block that changes nothing costs 0.2 ms of exchange
+root, and one that changes 40 entries about 1 ms. An account-root update plus the root takes
+under 10 ms at 20,000 accounts in a test bound.
+
+**How it is checked:**
+
+- `QRDX_VERIFY_STATE_COMMITMENTS=1` checks every incremental exchange root against a
+  from-scratch recomputation. The test suite runs that way, about 700 checks over real exchange
+  states. It caught one test that edits a book's private fields, which is exactly what it is
+  for.
+- `tests/test_state_commitment.py`: the triggers equal the rows across randomized writes,
+  rollbacks, REPLACE, upserts and clears; roots are independent of write order; startup repair.
+- `tests/test_exchange_commitment.py`: marking rules, copies, order independence, a quiet block
+  re-digests no account, gating by height.
+
+## FIXED — Block time grew with the chain
+
+**Severity: critical.** On test.qrdx.org the block time drifted from 2.0 s at genesis to 14.7 s
+at height 74,600. By then two of every three slots were missed. Only one validator was
+proposing, so this was not competition: every block cost the node more work than the one
+before. Several consensus helpers recomputed their answer from genesis on every call:
+
+| What | How often | Cost per call |
+|---|---|---|
+| RANDAO mix (`compute_randao_mix`) | twice per fork-choice pass (~10 s); per slot and per import once RANDAO selection is on | every block body fetched and parsed |
+| Validator reconstruction | every finalized epoch | two such walks, then every epoch replayed from genesis |
+| `update_finality` | every imported block, and every 2 s | every epoch since genesis re-evaluated and rewritten, one commit each |
+| `finalized_block_height` | every import, every fork-choice pass | every vote ever, plus one query per distinct block |
+| `slashed_on_chain` | per exit payout | `LIKE` over every block body |
+
+A block body is ~60 KB (Dilithium signatures). One walk at 75,000 blocks parses ~4.5 GB with
+`ast.literal_eval`, ~0.6 ms per block, on the event loop. That starved block production.
+
+**Fixed:**
+
+- **Chain index** (`qrdx/chain_index.py`). Each block is parsed once into compact rows: slot,
+  epoch, running RANDAO mix, stake ops, votes, and the offenders its verified slashing proofs
+  convict. It is extended lazily and is reorg-safe: a block's hash commits to its ancestry,
+  so the index is trusted up to the highest height whose hash still matches. Index writes
+  join the current transaction. It is brought up to date at startup, before the validator
+  runs.
+- **Validator reconstruction** resumes from per-epoch snapshots. It restores the latest one,
+  or an earlier one when newly finalized blocks add an attester to an epoch already processed,
+  when slashing evidence for such an epoch was recorded, or when the chain changed below a
+  snapshot. The result equals the full rebuild exactly, checked at every finality step on
+  randomized histories with late votes, late evidence, reorgs and restarts.
+- **Finality** is monotonic, so it is computed only from the latest finalized epoch or height
+  onward, and only changed rows are written.
+- **Slot clock.** The proposer and attester loops slept a fixed slot *after* their work, so
+  each iteration took the slot plus the work: a lone validator's block time was 2 s plus
+  everything above, and grew with it. The loops now wake at slot boundaries computed from the
+  genesis time (attestations at a third of the slot), so work that fits in a slot no longer
+  lengthens it (`tests/test_validator_slot_clock.py`).
+- **Derived-state rebuild** (every reorg and every restart) read every block body and probed
+  both section tables per height to find the few blocks that carry transactions: 0.42 ms per
+  block, ~32 s at 75,000 blocks. It now reads hashes and timestamps in one query and the set
+  of blocks with sections in one more: 0.026 ms per block, ~2 s at 75,000. What is replayed
+  is unchanged. The rebuild is still linear in the chain; see the open entry below.
+- **The transaction indexer held the block-processing lock** while it re-read the last 64
+  blocks in full, about 45 KB of signatures each, every second, only to compare their hashes.
+  That was ~100 ms a second during which the proposer could not build. It now reads the
+  window's hashes in one query (`get_block_hashes`). The parent check on import, the
+  fork-choice window, the attestation loop and the proposer read headers only
+  (`get_block_header`).
+- **Smaller costs.** Every signed peer request rewrote the peer store (`nodes.json`) to record
+  the peer's `last_seen`, a third of an idle node's event-loop time; it is now written at most
+  once a minute (`tests/test_nodes_manager_last_seen.py`). Observe-only RANDAO logging in the
+  fork-choice pass is removed. HTTP access logs moved to DEBUG (two INFO lines per request
+  through the rich console were a measurable share of the event loop).
+
+Steady-state costs at 2,000 and 16,000 blocks: the RANDAO mix 1 ms, selection 2 ms, finality
+2 ms and 1 ms, reconstruction 8 ms per epoch. Each was linear in the chain before. On the
+4-node, 3-validator integration testnet, all 23 scenarios pass, and once they finish every
+block lands exactly one 2 s slot after the last, with no missed slots. The event loop is about
+11% busy. With 1-second slots (`SLOT_DURATION_MS: 1000` in the chain spec, or
+`QRDX_SLOT_DURATION_MS=1000` for the harness) the suite also passes. Blocks then land exactly 1.00 s
+apart at about 8% event-loop load; that is after the peer-store fix, and the 2 s figure was
+measured before it. This run exposed the push-sync defect below. Tests:
+
+- `tests/test_chain_index.py`: every indexed answer equals the original walk, across reorgs
+  and a rollback;
+- `tests/test_validator_reconstruction_incremental.py`.
+
+## FIXED — Push-sync never delivered a PoS block, and stranded the node it targeted
+
+**Severity: high (liveness of joining nodes).** When a node falls behind, a peer that is ahead
+pushes the missing blocks to it (`_push_sync_to_peer` → `p2p_submitBlocks`). Three defects
+combined:
+
+1. The pushed items carried no block hash, proposer or timestamp. `p2p_submitBlocks` routes a
+   block to the PoS import path only when both the hash and the proposer are set, so it handed
+   every pushed block to the legacy PoW parser, which failed on it. A push of a PoS chain never
+   delivered a block.
+2. The pusher counted each refused push as a violation by the receiver (−30). After four, the
+   receiver was banned, and a banned node's handshake is refused.
+3. Peers learned only from their own requests are private and have no URL. A node knowing only
+   such peers never re-bootstrapped: that happened only when the peer list was empty.
+
+Together, a node that started a few blocks behind was pushed to, banned by every validator,
+and left at height 0 with no peer it could pull from. With 2-second slots, a joining node
+usually completed its handshakes before the validators pushed to it, which hid the problem.
+With 1-second slots it lost that race on the first start.
+
+**Fixed:** pushed items carry the hash, proposer and timestamp, and the receiver imports them
+with live enforcement (slot eligibility included), so a push cannot bypass a check that a
+broadcast faces. A refused push is logged, not held against the receiver. A node with no
+connectable peer re-bootstraps from its configured nodes every 30 s.
+`tests/test_push_sync.py` covers each defect and fails on the old code.
+
+## FIXED — A genesis validator's top-up was re-applied at every rebuild
+
+**Severity: high (consensus divergence).** The validator reconstruction reset to a "genesis
+base" it read from the live table (`activation_epoch = 0` rows). `register_pending_validator`
+tops up any existing row, so a genesis validator that deposited more stake had that deposit in
+its base. Every rebuild, one per finalized epoch, applied it again on top. Its stake grew every
+epoch, and by a different amount on each node, depending on how many rebuilds each had run.
+
+**Fixed:** genesis initialisation records the genesis set immutably (`chain_metadata`
+`genesis_validators`), and the reset reads that record. A database from before the record
+existed derives the set once and records it. Found by the incremental-reconstruction
+equivalence test.
+
+## FIXED — The peer RPC transport was unauthenticated
+
+**Severity: medium.** Node-to-node JSON-RPC carried no signature.
+
+- **Handshake.** `p2p_handshakeResponse` consumed a challenge without checking who answered it.
+  The answering node's id and public key were taken on its word, and it was added as a peer.
+- **Signed REST requests.** The node id they claimed (`x-node-id`) was never checked against
+  the key that signed them, so a peer could sign with its own key and claim any node's id.
+- **Pushed blocks.** A block named the node the receiver should follow-up-sync from
+  (`_sender_node_id`).
+
+**Fixed:**
+
+- **Signed calls.** Every call a node makes to a peer is signed with its Dilithium identity
+  over the exact bytes sent, a timestamp and a nonce (`NodeInterface._rpc_call`).
+- **Verified at the endpoint.** `/rpc` (`node/main.py rpc_endpoint`) verifies the signature,
+  the replay and timestamp window, and the ban list. It accepts a node id only if it is the
+  BLAKE3 of the presented key, which also closes the REST gap. A forged, tampered or replayed
+  signature is refused on any call.
+- **Peer-only methods.** Methods marked `@peer_only` are refused without a verified caller:
+  block and block-batch submission, transaction and attestation push, and both handshake steps.
+  The RPC server enforces this itself, so no transport can bypass it. Reads stay open, because
+  what they return is verified by whoever uses it.
+- **The verified caller.** It reaches RPC methods as `rpc_caller`. Follow-up sync uses it,
+  never a node named in the payload.
+- **Mutual handshake.** A challenge can be answered only by the node it was issued to. The
+  answering node proves its identity by signing the caller's fresh nonce together with the
+  challenge and every claim it makes (id, key, URL, network), under a per-network signing
+  domain (`p2p-handshake`). The caller adds a peer only on a valid proof.
+- **REST handshake removed.** The REST pair (`/handshake/challenge`, `/handshake/response`)
+  is gone, rather than left as a weaker second way in.
+
+Tests: `tests/test_peer_rpc_authentication.py`.
+
+## FIXED — CI's static checks had never passed, and hid real bugs
+
+**Severity: high.** The Lint, Type check and Security jobs had failed on every run, and the test
+jobs behind them never ran.
+
+- **Lint.** 4,393 ruff findings; black would have reformatted 150 of 163 files.
+- **Type check.** mypy reported 722 errors, and the job never even installed mypy
+  (`pip install -e .[dev] --no-deps`).
+- **Security.** `gitleaks-action@v2` needed a paid license for organisation repositories (the
+  secret scan has since been removed), and `pip-audit` audited `requirements.txt` (not what ships)
+  and ended in `|| true`.
+
+**Real bugs found while clearing them:**
+
+- **Endpoints that always failed.** `/get_recent_transactions` and `/get_recent_blocks`
+  raised `TypeError` on every SQLite call (missing `offset`).
+- **`InsufficientStakeError` was unreachable.** It was raised with a keyword it did not
+  accept, so callers got `TypeError` instead.
+- **`qrdx_submitBlock`.** Its fallback path would have reported success for a block nothing
+  validated or stored. It now refuses.
+- **The state checkpoint.** It called `bytes.fromhex` on bytes (`TypeError`).
+- **Bridge scanners.** `BridgeRecord` was built without its operation, and the ETH and SOL
+  scanners crashed on undecoded amounts.
+- **Signing.** `ContractTransaction.sign` and `verify_signature` called the signing helpers
+  with the wrong arguments. `transactions/validation.py` called a `PublicKey.from_bytes` that
+  does not exist.
+- **Missing APIs.** `PQWallet.from_seed` called an API that was deliberately removed.
+  `compute_contract_address` imported from the wrong module.
+- **Handshake crashes.** The handshake state machine crashed on out-of-order messages.
+- **Discovery.** A cancelled lookup (`BaseException`) was iterated as a result.
+
+Other fixes:
+
+- **Formatting.** The code base is black/isort formatted, and ruff and isort agree on import
+  grouping.
+- **Exceptions.** Raised exceptions chain their cause (B904).
+- **Dead code.** 259 unused imports were removed, checked against every cross-module import.
+- **mypy.** mypy is clean against the dependency versions the image ships.
+
+CI (`.github/workflows/ci.yml`) now runs as follows:
+
+- **Pinned tools.** It installs every tool from a hashed lock (`release/lint-requirements.lock`)
+  and type-checks against the shipped dependencies.
+- **pip-audit.** It audits `release/requirements.lock`, and a finding fails the build.
+- **Tests.** It runs the unit suite, and the integration suite for pull requests to main,
+  **inside the node image built from the commit**.
+
+The pytest integration wrapper (`tests/test_testnet_integration.py`) could never have passed.
+It ran each scenario through a fresh runner, so every scenario after the first was skipped for
+"unmet dependencies", and it covered only 13 of the 23 scenarios. It now runs the canonical
+suite once and reports each scenario. Inside the image it passed 24/24: the testnet came up
+ready and all 23 scenarios passed.
+
+**The audit found nine vulnerable packages in the lock:** cryptography, urllib3, starlette,
+requests, anyio, idna, pygments, python-dotenv and fastecdsa. All are upgraded. fastecdsa is
+held to the 2.3 line, because 3.0 rejects the `str` messages `transaction_input.py` verifies.
+The unit suite passes inside an image built with the upgraded set.
 
 ## FIXED — Release images were neither reproducible nor signed
 

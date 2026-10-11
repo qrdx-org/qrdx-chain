@@ -32,7 +32,7 @@ Environment
                                 otherwise an id no other EVM network uses (every signed
                                 transaction is bound to it)
   QRDX_NETWORK_NAME             [qrdx-mainnet]
-  QRDX_SLOT_DURATION, ...       any network parameter (qrdx/chain_spec.py PARAMS)
+  QRDX_SLOT_DURATION_MS, ...    any network parameter (qrdx/chain_spec.py PARAMS)
   QRDX_VALIDATOR_ENABLED        must be true — a genesis node has to propose
   QRDX_VALIDATOR_WALLET         [/app/data/validator/validator.json]
 """

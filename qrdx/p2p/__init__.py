@@ -11,46 +11,46 @@ Implements post-quantum peer-to-peer networking with:
 - Encrypted transport via Kyber-derived shared secrets
 """
 
-from .node import (
-    Node,
-    NodeID,
-    Address,
-    derive_node_id,
-    derive_node_id_hex,
-    node_id_to_hex,
-    hex_to_node_id,
-)
 from .config import P2PConfig
-from .handshake import (
-    HandshakeInitiator,
-    HandshakeResponder,
-    HandshakeResult,
-    HelloMessage,
-    HelloAckMessage,
-    AuthMessage,
-    AuthAckMessage,
-    encrypt_message,
-    decrypt_message,
-    derive_channel_keys,
-)
-from .routing import (
-    RoutingTable,
-    KBucket,
-    KBucketEntry,
-    K_BUCKET_SIZE,
-    NUM_BUCKETS,
-    ALPHA,
-)
 from .discovery import (
-    KademliaDiscovery,
-    KademliaProtocol,
     DHTMessage,
     DHTMessageType,
+    KademliaDiscovery,
+    KademliaProtocol,
 )
 from .dns_seeds import (
     DNSSeedDiscovery,
-    SeedOperator,
     DNSSeedResult,
+    SeedOperator,
+)
+from .handshake import (
+    AuthAckMessage,
+    AuthMessage,
+    HandshakeInitiator,
+    HandshakeResponder,
+    HandshakeResult,
+    HelloAckMessage,
+    HelloMessage,
+    decrypt_message,
+    derive_channel_keys,
+    encrypt_message,
+)
+from .node import (
+    Address,
+    Node,
+    NodeID,
+    derive_node_id,
+    derive_node_id_hex,
+    hex_to_node_id,
+    node_id_to_hex,
+)
+from .routing import (
+    ALPHA,
+    K_BUCKET_SIZE,
+    NUM_BUCKETS,
+    KBucket,
+    KBucketEntry,
+    RoutingTable,
 )
 
 __all__ = [

@@ -16,10 +16,18 @@ from qrdx.validator.slashing_block import (
 )
 
 
+def _root(epoch):
+    """A checkpoint root per epoch (one honest chain)."""
+    import hashlib
+
+    return hashlib.sha256(f"checkpoint {epoch}".encode()).hexdigest()
+
+
 def _signed_att(key, slot, epoch, block_hash, source, target, idx=0):
     addr = key.public_key.to_address()
     att = Attestation(slot=slot, epoch=epoch, block_hash=block_hash, validator_address=addr,
-                      validator_index=idx, signature=b"", source_epoch=source, target_epoch=target)
+                      validator_index=idx, signature=b"", source_epoch=source, target_epoch=target,
+                      source_root=_root(source), target_root=_root(target))
     att.signature = key.sign(att.signing_root).to_bytes()
     return att.to_dict()
 
@@ -39,16 +47,18 @@ def test_double_vote_validates():
     assert ok, err
 
 
-def test_honest_per_slot_votes_not_slashable():
-    """REGRESSION: this chain attests PER SLOT, so one honest validator casts many attestations
-    sharing a target epoch but pointing at the advancing head (DIFFERENT slot + block). That MUST
-    NOT be a double vote — else honest validators are slashable and anyone could harvest two of
-    their public per-slot attestations to forge a slash."""
+def test_two_votes_for_one_target_are_a_double_vote():
+    """Casper FFG: a validator casts one vote per target epoch, so two DIFFERENT signed votes for
+    the same target — even at different slots, as per-slot voting used to produce — are a double
+    vote. (Re-sending one vote is not: the data is identical.)"""
     key = PQPrivateKey.generate()
     a = _signed_att(key, slot=8, epoch=1, block_hash="aa" * 32, source=0, target=1)
-    b = _signed_att(key, slot=9, epoch=1, block_hash="bb" * 32, source=0, target=1)  # same target, next slot/head
-    assert attestation_equivocation(a, b) is None
-    ok, err = verify_attestation_evidence({"att_a": a, "att_b": b, "public_key": _pub(key)})
+    b = _signed_att(key, slot=9, epoch=1, block_hash="bb" * 32, source=0, target=1)
+    assert attestation_equivocation(a, b) == "double_vote"
+    ok, err = verify_attestation_evidence(make_attestation_evidence(a, b, _pub(key)))
+    assert ok, err
+    assert attestation_equivocation(a, dict(a)) is None
+    ok, err = verify_attestation_evidence({"att_a": a, "att_b": dict(a), "public_key": _pub(key)})
     assert not ok and "not a double/surround" in err
 
 

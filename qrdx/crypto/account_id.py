@@ -110,8 +110,8 @@ def is_synthetic_holder(value: object) -> bool:
     if not isinstance(value, str):
         return False
     for prefix in SYNTHETIC_HOLDER_PREFIXES:
-        if value[:len(prefix)].upper() == prefix.upper():
-            body = value[len(prefix):]
+        if value[: len(prefix)].upper() == prefix.upper():
+            body = value[len(prefix) :]
             if len(body) != SYNTHETIC_HOLDER_BODY_LENGTH:
                 return False
             try:
@@ -166,9 +166,7 @@ def to_account_id(address: Union[str, bytes, bytearray, memoryview]) -> str:
     if isinstance(address, (bytes, bytearray, memoryview)):
         raw = bytes(address)
         if len(raw) != ACCOUNT_ID_LENGTH:
-            raise ValueError(
-                f"raw account id must be {ACCOUNT_ID_LENGTH} bytes, got {len(raw)}"
-            )
+            raise ValueError(f"raw account id must be {ACCOUNT_ID_LENGTH} bytes, got {len(raw)}")
         return "0x" + raw.hex()
 
     if not isinstance(address, str):
@@ -190,9 +188,7 @@ def to_account_id(address: Union[str, bytes, bytearray, memoryview]) -> str:
     if addr.startswith("0xPQ") or addr.startswith("0xpq"):
         raw_hex = addr[4:]
         if len(raw_hex) != 64:
-            raise ValueError(
-                f"PQ address must be 64 hex chars after 0xPQ, got {len(raw_hex)}"
-            )
+            raise ValueError(f"PQ address must be 64 hex chars after 0xPQ, got {len(raw_hex)}")
         try:
             payload = bytes.fromhex(raw_hex.lower())
         except ValueError as e:
@@ -205,18 +201,18 @@ def to_account_id(address: Union[str, bytes, bytearray, memoryview]) -> str:
     for prefix in SYNTHETIC_HOLDER_PREFIXES:
         # Case-insensitive on the whole prefix (note: uppercasing the address would
         # turn its "0x" into "0X", so compare the slice, not an uppercased address).
-        if addr[:len(prefix)].upper() == prefix.upper():
-            body = addr[len(prefix):].lower()
+        if addr[: len(prefix)].upper() == prefix.upper():
+            body = addr[len(prefix) :].lower()
             if len(body) != SYNTHETIC_HOLDER_BODY_LENGTH:
                 raise ValueError(
                     f"{prefix} holder must have {SYNTHETIC_HOLDER_BODY_LENGTH} hex "
-                    f"chars after the prefix, got {len(body)}: {addr!r}")
+                    f"chars after the prefix, got {len(body)}: {addr!r}"
+                )
             try:
                 bytes.fromhex(body)
             except ValueError as e:
                 raise ValueError(f"malformed {prefix} holder {addr!r}: {e}") from e
-            return _derive(b"internal:" + prefix[2:].encode("ascii"),
-                           body.encode("ascii"))
+            return _derive(b"internal:" + prefix[2:].encode("ascii"), body.encode("ascii"))
 
     if addr.startswith("0x") or addr.startswith("0X"):
         raw_hex = addr[2:]

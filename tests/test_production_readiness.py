@@ -322,7 +322,7 @@ class TestConsensusConfig:
     def test_defaults(self):
         cfg = ConsensusConfig()
         assert cfg.mechanism == "pos"
-        assert cfg.pos.slot_duration == 2
+        assert cfg.pos.slot_duration == 0.25  # the standard 250 ms slot
 
     def test_from_dict(self):
         cfg = ConsensusConfig.from_dict({

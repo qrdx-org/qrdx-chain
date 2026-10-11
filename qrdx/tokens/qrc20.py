@@ -13,10 +13,8 @@ import hashlib
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
-from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..logger import get_logger
 from ..constants import (
     QRC20_DEFAULT_DECIMALS,
     QRC20_DOMAIN_APPROVE,
@@ -24,6 +22,7 @@ from ..constants import (
     QRC20_MAX_BATCH_SIZE,
     QRC20_MAX_SUPPLY,
 )
+from ..logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -31,6 +30,7 @@ logger = get_logger(__name__)
 # ══════════════════════════════════════════════════════════════════════
 #  EXCEPTIONS
 # ══════════════════════════════════════════════════════════════════════
+
 
 class QRC20Error(Exception):
     """Base exception for qRC20 operations."""
@@ -56,9 +56,11 @@ class TokenFrozenError(QRC20Error):
 #  EVENTS
 # ══════════════════════════════════════════════════════════════════════
 
+
 @dataclass(frozen=True)
 class QRC20TransferEvent:
     """Emitted on every successful transfer."""
+
     token_symbol: str
     sender: str
     recipient: str
@@ -81,6 +83,7 @@ class QRC20TransferEvent:
 @dataclass(frozen=True)
 class QRC20ApprovalEvent:
     """Emitted on every successful approve."""
+
     token_symbol: str
     owner: str
     spender: str
@@ -101,6 +104,7 @@ class QRC20ApprovalEvent:
 @dataclass(frozen=True)
 class QRC20BridgeMintEvent:
     """Emitted when bridge mints shielded tokens."""
+
     token_symbol: str
     recipient: str
     amount: Decimal
@@ -123,6 +127,7 @@ class QRC20BridgeMintEvent:
 @dataclass(frozen=True)
 class QRC20BridgeBurnEvent:
     """Emitted when bridge burns shielded tokens (unshield)."""
+
     token_symbol: str
     sender: str
     amount: Decimal
@@ -143,6 +148,7 @@ class QRC20BridgeBurnEvent:
 # ══════════════════════════════════════════════════════════════════════
 #  SIGNATURE HELPER
 # ══════════════════════════════════════════════════════════════════════
+
 
 def _make_transfer_digest(
     token_symbol: str,
@@ -190,6 +196,7 @@ def _proof_hash(digest: bytes) -> str:
 # ══════════════════════════════════════════════════════════════════════
 #  QRC20 TOKEN
 # ══════════════════════════════════════════════════════════════════════
+
 
 class QRC20Token:
     """
@@ -350,9 +357,7 @@ class QRC20Token:
 
         bal = self.balance_of(sender)
         if bal < amount:
-            raise InsufficientBalanceError(
-                f"{sender} balance {bal} < transfer amount {amount}"
-            )
+            raise InsufficientBalanceError(f"{sender} balance {bal} < transfer amount {amount}")
 
         # Verify PQ signature
         nonce = self._nonces.get(sender, 0)
@@ -427,15 +432,11 @@ class QRC20Token:
 
         bal = self.balance_of(sender)
         if bal < amount:
-            raise InsufficientBalanceError(
-                f"{sender} balance {bal} < transfer amount {amount}"
-            )
+            raise InsufficientBalanceError(f"{sender} balance {bal} < transfer amount {amount}")
 
         allow = self.allowance(sender, spender)
         if allow < amount:
-            raise InsufficientAllowanceError(
-                f"Allowance {allow} < transfer amount {amount}"
-            )
+            raise InsufficientAllowanceError(f"Allowance {allow} < transfer amount {amount}")
 
         # Verify spender's PQ signature
         nonce = self._nonces.get(spender, 0)
@@ -474,9 +475,7 @@ class QRC20Token:
         Batch transfer to multiple recipients (gas-optimised pattern §9.1).
         """
         if len(recipients) > QRC20_MAX_BATCH_SIZE:
-            raise QRC20Error(
-                f"Batch size {len(recipients)} exceeds max {QRC20_MAX_BATCH_SIZE}"
-            )
+            raise QRC20Error(f"Batch size {len(recipients)} exceeds max {QRC20_MAX_BATCH_SIZE}")
 
         events = []
         for recipient, amount in recipients:
@@ -554,9 +553,7 @@ class QRC20Token:
 
         bal = self.balance_of(sender)
         if bal < amount:
-            raise InsufficientBalanceError(
-                f"{sender} balance {bal} < burn amount {amount}"
-            )
+            raise InsufficientBalanceError(f"{sender} balance {bal} < burn amount {amount}")
 
         self._balances[sender] = bal - amount
         self._total_supply -= amount
@@ -606,6 +603,7 @@ class QRC20Token:
 # ══════════════════════════════════════════════════════════════════════
 #  QRC20 REGISTRY
 # ══════════════════════════════════════════════════════════════════════
+
 
 class QRC20Registry:
     """

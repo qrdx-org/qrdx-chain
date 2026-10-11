@@ -16,6 +16,7 @@ deterministically — a stake-weighted median, so a minority of wrong feeds cann
 Markets are quoted in USD; a market base with a "q" prefix (qBTC, the bridged asset) is priced
 as its underlying.
 """
+
 from __future__ import annotations
 
 import json
@@ -84,12 +85,12 @@ class FilePriceFeed(PriceFeed):
 
 # Public USD spot endpoints: symbol → (url, how to read the price from the JSON body).
 _EXCHANGES: List[Callable[[str], tuple]] = [
-    lambda s: (f"https://api.coinbase.com/v2/prices/{s}-USD/spot",
-               lambda j: j["data"]["amount"]),
-    lambda s: (f"https://api.kraken.com/0/public/Ticker?pair={s}USD",
-               lambda j: next(iter(j["result"].values()))["c"][0]),
-    lambda s: (f"https://api.binance.com/api/v3/ticker/price?symbol={s}USDT",
-               lambda j: j["price"]),
+    lambda s: (f"https://api.coinbase.com/v2/prices/{s}-USD/spot", lambda j: j["data"]["amount"]),
+    lambda s: (
+        f"https://api.kraken.com/0/public/Ticker?pair={s}USD",
+        lambda j: next(iter(j["result"].values()))["c"][0],
+    ),
+    lambda s: (f"https://api.binance.com/api/v3/ticker/price?symbol={s}USDT", lambda j: j["price"]),
 ]
 
 
@@ -100,7 +101,7 @@ class ExchangePriceFeed(PriceFeed):
 
     def __init__(self, interval: float = 5.0, max_age: float = 30.0, timeout: float = 3.0):
         self.interval, self.max_age, self.timeout = interval, max_age, timeout
-        self._cache: Dict[str, tuple] = {}            # symbol → (price, fetched_at)
+        self._cache: Dict[str, tuple] = {}  # symbol → (price, fetched_at)
         self._wanted: set = set()
         self._lock = threading.Lock()
         threading.Thread(target=self._run, daemon=True, name="oracle-feed").start()
@@ -117,6 +118,7 @@ class ExchangePriceFeed(PriceFeed):
 
     def _run(self):
         import httpx
+
         while True:
             with self._lock:
                 wanted = sorted(self._wanted)
@@ -142,9 +144,9 @@ def feed_from_env(spec: Optional[str] = None) -> Optional[PriceFeed]:
     if not spec:
         return None
     if spec.startswith("file:"):
-        return FilePriceFeed(spec[len("file:"):])
+        return FilePriceFeed(spec[len("file:") :])
     if spec.startswith("static:"):
-        return StaticPriceFeed(spec[len("static:"):])
+        return StaticPriceFeed(spec[len("static:") :])
     if spec == "exchanges":
         return ExchangePriceFeed()
     logger.warning("QRDX_ORACLE_FEED=%r is not a known feed; this validator will not vote", spec)
@@ -154,10 +156,14 @@ def feed_from_env(spec: Optional[str] = None) -> Optional[PriceFeed]:
 def build_vote(wallet, nonce: int, prices: Dict[str, Decimal]):
     """An ORACLE_VOTE exchange transaction signed by the validator's PQ wallet."""
     from ..exchange import ExchangeOpType, ExchangeTransaction
+
     tx = ExchangeTransaction(
-        op_type=ExchangeOpType.ORACLE_VOTE, sender=wallet.address, nonce=nonce,
+        op_type=ExchangeOpType.ORACLE_VOTE,
+        sender=wallet.address,
+        nonce=nonce,
         params={"prices": {b: str(p) for b, p in sorted(prices.items())}},
-        gas_limit=100_000)                      # gas_price: the floor (default)
+        gas_limit=100_000,
+    )  # gas_price: the floor (default)
     tx.public_key = wallet.public_key
     tx.signature = wallet.sign(tx.signing_bytes())
     return tx

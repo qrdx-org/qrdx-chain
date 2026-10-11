@@ -27,32 +27,35 @@ import copy
 import hashlib
 import json
 import logging
-import time
-from dataclasses import asdict
-from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from decimal import ROUND_FLOOR, Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from .amm import (
-    ConcentratedLiquidityPool,
     FEE_CREATOR_SHARE,
     FEE_TREASURY_SHARE,
     FEE_VALIDATOR_SHARE,
+    Q96,
+    ConcentratedLiquidityPool,
     FeeTier,
     PoolManager,
     PoolType,
-    Q96,
 )
-from .hooks import CircuitBreaker, HookContext, HookRegistry
+from .clearinghouse import Clearinghouse, ClearinghouseError
+from .commitment import Section, committed, encode_value, verifying
+from .governance import Governance, GovernanceError, veto_escrow_address
+from .nfts import NftError, NftRegistry, token_id as nft_token_id
 from .oracle import TWAPOracle
 from .orderbook import Order, OrderBook, OrderSide, OrderType, SelfTradeAction, _pinned
-from .clearinghouse import Clearinghouse, ClearinghouseError
-from .perpetual import PerpEngine, PerpSide
+from .perpetual import PerpEngine
 from .router import FillSource, UnifiedRouter
-from .nfts import NftError, NftRegistry, token_id as nft_token_id
-from .governance import Governance, GovernanceError, veto_escrow_address
 from .tokens import (
-    NATIVE_ASSET, TokenError, TokenRegistry, account as token_account, amount as token_amount,
-    canonical_asset, is_native_asset, memo as token_memo,
+    TokenError,
+    TokenRegistry,
+    account as token_account,
+    amount as token_amount,
+    canonical_asset,
+    is_native_asset,
+    memo as token_memo,
 )
 from .transactions import (
     EXCHANGE_GAS_COSTS,
@@ -68,6 +71,7 @@ ZERO = Decimal("0")
 # ---------------------------------------------------------------------------
 # Transaction execution result
 # ---------------------------------------------------------------------------
+
 
 class ExchangeExecResult:
     """Result of executing a single exchange transaction."""
@@ -87,12 +91,13 @@ class ExchangeExecResult:
         self.data = data or {}
         self.error = error
         self.logs = logs or []
-        self.fee = ZERO                  # QRDX paid for gas (burned)
+        self.fee = ZERO  # QRDX paid for gas (burned)
 
 
 # ---------------------------------------------------------------------------
 # Exchange State Manager
 # ---------------------------------------------------------------------------
+
 
 class ExchangeStateManager:
     """
@@ -107,6 +112,9 @@ class ExchangeStateManager:
             result = mgr.process_transaction(tx)
         state_root = mgr.finalize_block()
     """
+
+    # Each sender's next exchange nonce, committed entry by entry (qrdx/exchange/commitment.py).
+    _nonces = committed("exchange.nonces", encode_value, mutable=False)
 
     instance: Optional[ExchangeStateManager] = None
 
@@ -127,6 +135,7 @@ class ExchangeStateManager:
         # Node-local receipts + perps event feed for wallets, the API and streams — NOT
         # consensus state (see journal.py). Recorded at commit, rebuilt with the manager.
         from .journal import ExchangeJournal
+
         self.journal = ExchangeJournal()
         self._block_tick_events: List[Dict[str, Any]] = []
         self.router = UnifiedRouter(pool_manager=self.pool_manager)
@@ -135,18 +144,13 @@ class ExchangeStateManager:
         # sync — decides them identically. They used to read the wall clock.
         self.perp_engine.clock = self._block_clock
         self.router.clock = self._block_clock
-        self.hook_registry = HookRegistry()
-        self.circuit_breaker = CircuitBreaker()
-
-        # Register built-in hooks
-        self.hook_registry.register(self.circuit_breaker)
 
         # Order books: pair_key → OrderBook
         self._order_books: Dict[str, OrderBook] = {}
         # Oracles: pair_key → TWAPOracle
         self._oracles: Dict[str, TWAPOracle] = {}
         # Per-sender nonces for replay protection
-        self._nonces: Dict[str, int] = {}
+        self._nonces = {}  # sender → next nonce (committed: see the class attribute)
 
         # --- Block-level tracking ---
         self._current_block_height: int = 0
@@ -284,17 +288,15 @@ class ExchangeStateManager:
         self._block_fees = ZERO
         self._balance_deltas = {}  # Phase E: reset per-block balance deltas
         self._token_balance_deltas = {}  # Phase E (spot): reset per-block token deltas
-        self.tokens.changed.clear()      # the DB registry mirror is written per block
+        self.tokens.changed.clear()  # the DB registry mirror is written per block
         self._validator_lifecycle_ops = []  # Phase 3: reset per-block staking deposit/exit ops
-        self._block_tick_events = []        # journal: this block's liquidations + funding
+        self._block_tick_events = []  # journal: this block's liquidations + funding
         self._block_journaled = False
 
         # Reset per-block rate limits on all order books; expiry is judged by block time
         for book in self._order_books.values():
             book.new_block(block_timestamp)
 
-        # Reset circuit breaker per-block counters
-        self.circuit_breaker.new_block()
         self.clearinghouse.new_block(block_timestamp)
 
     def finalize_block(self) -> str:
@@ -341,11 +343,16 @@ class ExchangeStateManager:
             self._block_journaled = True
             try:
                 self.journal.record_block(
-                    self._current_block_height, self._current_block_timestamp,
-                    self._block_exchange_txs, self._block_results, self._block_tick_events)
-            except Exception as e:              # the journal must never break a block
-                logger.warning("exchange journal: block %s not recorded: %s",
-                               self._current_block_height, e)
+                    self._current_block_height,
+                    self._current_block_timestamp,
+                    self._block_exchange_txs,
+                    self._block_results,
+                    self._block_tick_events,
+                )
+            except Exception as e:  # the journal must never break a block
+                logger.warning(
+                    "exchange journal: block %s not recorded: %s", self._current_block_height, e
+                )
         self._block_tick_events = []
 
     def record_tick_events(self, events: List[Dict[str, Any]]) -> None:
@@ -380,7 +387,8 @@ class ExchangeStateManager:
         expected_nonce = self._nonces.get(tx.sender, 0)
         if tx.nonce != expected_nonce:
             return ExchangeExecResult(
-                success=False, gas_used=0,
+                success=False,
+                gas_used=0,
                 error=f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}",
             )
 
@@ -388,7 +396,8 @@ class ExchangeStateManager:
         base_gas = EXCHANGE_GAS_COSTS.get(tx.op_type, 100_000)
         if tx.gas_limit < base_gas:
             return ExchangeExecResult(
-                success=False, gas_used=0,
+                success=False,
+                gas_used=0,
                 error=f"Gas limit too low: need {base_gas}, got {tx.gas_limit}",
             )
 
@@ -405,8 +414,10 @@ class ExchangeStateManager:
             avail = self.available_balance(tx.sender)
             if avail is None or avail < reserved:
                 return ExchangeExecResult(
-                    success=False, gas_used=0,
-                    error=f"insufficient QRDX for gas: need {reserved}, available {avail}")
+                    success=False,
+                    gas_used=0,
+                    error=f"insufficient QRDX for gas: need {reserved}, available {avail}",
+                )
             self._record_balance_delta(tx.sender, -reserved)
 
         # 4. Execute the operation
@@ -414,9 +425,7 @@ class ExchangeStateManager:
             result = self._execute_op(tx)
         except Exception as e:
             logger.error("Exchange op %s failed: %s", tx.op_type.name, e)
-            result = ExchangeExecResult(
-                success=False, gas_used=base_gas, error=str(e)
-            )
+            result = ExchangeExecResult(success=False, gas_used=base_gas, error=str(e))
 
         # 5. Consume the nonce once the operation has EXECUTED — success or failure. It used
         #    to advance only on success, so a failing operation could be re-submitted and
@@ -502,9 +511,7 @@ class ExchangeStateManager:
         }
         handler = handlers.get(tx.op_type)
         if handler is None:
-            return ExchangeExecResult(
-                success=False, error=f"Unknown op type: {tx.op_type}"
-            )
+            return ExchangeExecResult(success=False, error=f"Unknown op type: {tx.op_type}")
         return handler(tx)
 
     # =====================================================================
@@ -514,7 +521,11 @@ class ExchangeStateManager:
     def _op_create_pool(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
         fee_tier = FeeTier(int(p["fee_tier"]))
-        pool_type = PoolType[p["pool_type"]] if isinstance(p["pool_type"], str) else PoolType(int(p["pool_type"]))
+        pool_type = (
+            PoolType[p["pool_type"]]
+            if isinstance(p["pool_type"], str)
+            else PoolType(int(p["pool_type"]))
+        )
         if p.get("initial_price") is not None:
             # Plain price, token1 per token0 of the CANONICAL (sorted) pair.
             sqrt_price = Decimal(str(p["initial_price"])).sqrt() * Q96
@@ -532,13 +543,16 @@ class ExchangeStateManager:
             if self.enforce_pool_stake:
                 return ExchangeExecResult(
                     success=False,
-                    error=(f"insufficient balance for pool stake: need {stake}, "
-                           f"available {avail}"),
+                    error=(
+                        f"insufficient balance for pool stake: need {stake}, " f"available {avail}"
+                    ),
                 )
             logger.warning(
                 "[Phase E observe] create_pool by %s: stake %s exceeds available "
                 "balance %s — would REJECT once pool stake is enforced",
-                tx.sender[:20], stake, avail,
+                tx.sender[:20],
+                stake,
+                avail,
             )
 
         for asset in (self.canonical_asset(p["token0"]), self.canonical_asset(p["token1"])):
@@ -548,11 +562,17 @@ class ExchangeStateManager:
                 # on the way in would break their accounting; a soulbound token cannot move.
                 kind = "charges a transfer fee" if t.fee_enabled else "is non-transferable"
                 return ExchangeExecResult(
-                    success=False, error=f"{t.symbol} {kind}: it cannot be pooled or traded")
+                    success=False, error=f"{t.symbol} {kind}: it cannot be pooled or traded"
+                )
         try:
             pool = self.pool_manager.create_pool(
-                self.canonical_asset(p["token0"]), self.canonical_asset(p["token1"]), fee_tier,
-                pool_type, sqrt_price, tx.sender, stake,
+                self.canonical_asset(p["token0"]),
+                self.canonical_asset(p["token1"]),
+                fee_tier,
+                pool_type,
+                sqrt_price,
+                tx.sender,
+                stake,
             )
         except ValueError as e:
             return ExchangeExecResult(success=False, error=str(e))
@@ -603,10 +623,12 @@ class ExchangeStateManager:
         if pool.state.positions:
             return ExchangeExecResult(
                 success=False,
-                error=f"pool still has {len(pool.state.positions)} position(s); remove them first")
+                error=f"pool still has {len(pool.state.positions)} position(s); remove them first",
+            )
 
-        from .amm import PoolType
         from .. import constants
+        from .amm import PoolType
+
         stake = Decimal(str(pool.state.stake_amount or 0))
         pool_type = pool.state.pool_type
         pair_key = f"{pool.state.token0}:{pool.state.token1}"
@@ -615,8 +637,10 @@ class ExchangeStateManager:
         share = FEE_CREATOR_SHARE / (FEE_CREATOR_SHARE + FEE_TREASURY_SHARE + FEE_VALIDATOR_SHARE)
         try:
             with self._atomic(pool):
-                for token, fees in ((pool.state.token0, pool.state.protocol_fees_0),
-                                    (pool.state.token1, pool.state.protocol_fees_1)):
+                for token, fees in (
+                    (pool.state.token0, pool.state.protocol_fees_0),
+                    (pool.state.token1, pool.state.protocol_fees_1),
+                ):
                     to_creator = (fees * share).quantize(Decimal("1e-18"), rounding=ROUND_FLOOR)
                     self._settle_token_move(holder, pool.state.creator, token, to_creator)
                     self._settle_token_move(holder, treasury, token, fees - to_creator)
@@ -642,10 +666,12 @@ class ExchangeStateManager:
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.REMOVE_POOL],
-            data={"pool_id": pool.state.id, "refunded_stake": str(refunded),
-                  "burned_stake": str(stake) if pool_type == PoolType.SUBSIDIZED else "0",
-                  "protocol_fees": [str(pool.state.protocol_fees_0),
-                                    str(pool.state.protocol_fees_1)]},
+            data={
+                "pool_id": pool.state.id,
+                "refunded_stake": str(refunded),
+                "burned_stake": str(stake) if pool_type == PoolType.SUBSIDIZED else "0",
+                "protocol_fees": [str(pool.state.protocol_fees_0), str(pool.state.protocol_fees_1)],
+            },
         )
 
     def _op_add_liquidity(self, tx: ExchangeTransaction) -> ExchangeExecResult:
@@ -656,8 +682,11 @@ class ExchangeStateManager:
         p = tx.params
         pool = self.pool_manager.get_pool(p["pool_id"]) if p.get("pool_id") else None
         if pool is None and p.get("token0") and p.get("token1"):
-            pool = self._find_pool_for_pair(self.canonical_asset(p["token0"]),
-                                            self.canonical_asset(p["token1"]), p.get("fee_tier"))
+            pool = self._find_pool_for_pair(
+                self.canonical_asset(p["token0"]),
+                self.canonical_asset(p["token1"]),
+                p.get("fee_tier"),
+            )
         if pool is None:
             return ExchangeExecResult(success=False, error="Pool not found")
         tick_lower, tick_upper = int(p["tick_lower"]), int(p["tick_upper"])
@@ -675,17 +704,26 @@ class ExchangeStateManager:
                 if av is not None and av < amt:
                     return ExchangeExecResult(
                         success=False,
-                        error=f"insufficient {tok[:10]} for liquidity: need {amt}, available {av}")
+                        error=f"insufficient {tok[:10]} for liquidity: need {amt}, available {av}",
+                    )
         holder = self.pool_holder_address(pool.state.id)
         with self._atomic(pool):
-            position = pool.add_liquidity(tx.sender, tick_lower, tick_upper, liquidity,
-                                          now=int(self._block_clock()))
+            position = pool.add_liquidity(
+                tx.sender, tick_lower, tick_upper, liquidity, now=int(self._block_clock())
+            )
             self._settle_token_move(tx.sender, holder, pool.state.token0, amt0)
             self._settle_token_move(tx.sender, holder, pool.state.token1, amt1)
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ADD_LIQUIDITY],
-            data={"pool_id": pool.state.id, "position_id": position.id,
-                  "liquidity": str(liquidity), "amount0": str(amt0), "amount1": str(amt1)})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ADD_LIQUIDITY],
+            data={
+                "pool_id": pool.state.id,
+                "position_id": position.id,
+                "liquidity": str(liquidity),
+                "amount0": str(amt0),
+                "amount1": str(amt1),
+            },
+        )
 
     def _op_remove_liquidity(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Withdraw ``amount`` of L (default: all) from one of the SENDER's positions: its
@@ -700,7 +738,8 @@ class ExchangeStateManager:
             return ExchangeExecResult(success=False, error=f"Position {p['position_id']} not found")
         if position.owner != tx.sender:
             return ExchangeExecResult(
-                success=False, error="only the position's owner may remove its liquidity")
+                success=False, error="only the position's owner may remove its liquidity"
+            )
         raw = p.get("amount")
         amount = Decimal(str(raw)) if raw not in (None, "", "all") else None
         if amount is not None and amount < 0:
@@ -708,23 +747,31 @@ class ExchangeStateManager:
         holder = self.pool_holder_address(pool.state.id)
         try:
             with self._atomic(pool):
-                out0, out1 = pool.remove_liquidity(position.id, amount, owner=tx.sender,
-                                                   now=int(self._block_clock()))
+                out0, out1 = pool.remove_liquidity(
+                    position.id, amount, owner=tx.sender, now=int(self._block_clock())
+                )
                 self._settle_token_move(holder, tx.sender, pool.state.token0, out0)
                 self._settle_token_move(holder, tx.sender, pool.state.token1, out1)
         except ValueError as e:
             return ExchangeExecResult(success=False, error=str(e))
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.REMOVE_LIQUIDITY],
-            data={"pool_id": pool.state.id, "position_id": position.id,
-                  "amount0": str(out0), "amount1": str(out1),
-                  "removed": str((out0, out1))})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.REMOVE_LIQUIDITY],
+            data={
+                "pool_id": pool.state.id,
+                "position_id": position.id,
+                "amount0": str(out0),
+                "amount1": str(out1),
+                "removed": str((out0, out1)),
+            },
+        )
 
     def _find_pool_for_pair(self, token_a: str, token_b: str, fee_tier=None):
         """A pool for the pair: the one with ``fee_tier`` if given, else — only when the pair
         has exactly one pool — that one. Several pools and no fee tier is ambiguous: None."""
-        pools = sorted(self.pool_manager.get_pools_for_pair(token_a, token_b),
-                       key=lambda p: p.state.id)
+        pools = sorted(
+            self.pool_manager.get_pools_for_pair(token_a, token_b), key=lambda p: p.state.id
+        )
         if fee_tier is not None:
             pools = [p for p in pools if int(p.state.fee_tier) == int(fee_tier)]
         return pools[0] if len(pools) == 1 else None
@@ -736,10 +783,16 @@ class ExchangeStateManager:
         turns the exception into a failed result — and a failed operation must change
         nothing, or a swap that misses its own slippage limit could still move a pool's price
         for free.)"""
-        saved = [(e, e.snapshot() if hasattr(e, "snapshot") else copy.deepcopy(e.__dict__))
-                 for e in engines]
-        ledgers = (dict(self._token_balance_deltas), dict(self._balance_deltas),
-                   dict(self._available_token_balances), dict(self._available_balances))
+        saved = [
+            (e, e.snapshot() if hasattr(e, "snapshot") else copy.deepcopy(e.__dict__))
+            for e in engines
+        ]
+        ledgers = (
+            dict(self._token_balance_deltas),
+            dict(self._balance_deltas),
+            dict(self._available_token_balances),
+            dict(self._available_balances),
+        )
         try:
             yield
         except Exception:
@@ -749,8 +802,12 @@ class ExchangeStateManager:
                 else:
                     engine.__dict__.clear()
                     engine.__dict__.update(snap)
-            (self._token_balance_deltas, self._balance_deltas,
-             self._available_token_balances, self._available_balances) = ledgers
+            (
+                self._token_balance_deltas,
+                self._balance_deltas,
+                self._available_token_balances,
+                self._available_balances,
+            ) = ledgers
             raise
 
     def _op_swap(self, tx: ExchangeTransaction) -> ExchangeExecResult:
@@ -775,34 +832,46 @@ class ExchangeStateManager:
             if self.enforce_spot_settlement:
                 return ExchangeExecResult(
                     success=False,
-                    error=f"insufficient token_in: need {amount_in}, available {avail}")
-            logger.warning("[Phase E observe] swap by %s: amount_in %s exceeds available %s",
-                           tx.sender[:20], amount_in, avail)
+                    error=f"insufficient token_in: need {amount_in}, available {avail}",
+                )
+            logger.warning(
+                "[Phase E observe] swap by %s: amount_in %s exceeds available %s",
+                tx.sender[:20],
+                amount_in,
+                avail,
+            )
 
-        route = self.router.best_route(token_in, token_out, amount_in, tx.sender,
-                                       pool_id=p.get("pool_id"),
-                                       venue=str(p.get("venue", "auto")).lower())
+        route = self.router.best_route(
+            token_in,
+            token_out,
+            amount_in,
+            tx.sender,
+            pool_id=p.get("pool_id"),
+            venue=str(p.get("venue", "auto")).lower(),
+        )
         if route is None:
             return ExchangeExecResult(success=False, error="No liquidity available for this pair")
         if min_out > 0 and route.amount_out < min_out:
             return ExchangeExecResult(
-                success=False,
-                error=f"Slippage exceeded: got {route.amount_out}, minimum {min_out}")
+                success=False, error=f"Slippage exceeded: got {route.amount_out}, minimum {min_out}"
+            )
 
+        engine: Any
         if route.source == FillSource.AMM:
-            engine = self.pool_manager.get_pool(route.pool_id)
+            engine = self.pool_manager.get_pool(route.amm()[0])
         else:
-            engine = self._order_books[route.pair]
+            engine = self._order_books[route.clob()[0]]
         try:
             with self._atomic(engine):
                 result = self.router.apply_route(route, tx.sender, now=int(self._block_clock()))
                 if route.source == FillSource.AMM:
-                    holder = self.pool_holder_address(route.pool_id)
+                    holder = self.pool_holder_address(route.amm()[0])
                     self._settle_token_move(tx.sender, holder, token_in, route.amount_in)
                     self._settle_token_move(holder, tx.sender, token_out, route.amount_out)
                 else:
-                    base, quote = route.pair.split(":", 1)
-                    self._settle_orderbook(result.order, result.trades, base, quote, route.pair)
+                    pair = route.clob()[0]
+                    base, quote = pair.split(":", 1)
+                    self._settle_orderbook(result.order, result.trades, base, quote, pair)
         except ValueError as e:
             return ExchangeExecResult(success=False, error=str(e))
 
@@ -810,7 +879,8 @@ class ExchangeStateManager:
         if route.source == FillSource.AMM:
             fills = [self._amm_fill(route, tx.sender)]
         else:
-            fills = self._clob_fills(route.pair, result.trades, tx.sender, route.side)
+            pair, side = route.clob()
+            fills = self._clob_fills(pair, result.trades, tx.sender, side)
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.SWAP],
@@ -832,25 +902,45 @@ class ExchangeStateManager:
     @staticmethod
     def _clob_fills(pair: str, trades, taker: str, side) -> List[Dict[str, Any]]:
         side = getattr(side, "value", side)
-        return [{"market": pair, "venue": "clob", "trade_id": t.id, "price": str(t.price),
-                 "amount": str(t.amount), "buyer": t.buyer, "seller": t.seller,
-                 "maker": t.seller if t.buyer == taker else t.buyer, "taker": taker,
-                 "side": side} for t in trades]
+        return [
+            {
+                "market": pair,
+                "venue": "clob",
+                "trade_id": t.id,
+                "price": str(t.price),
+                "amount": str(t.amount),
+                "buyer": t.buyer,
+                "seller": t.seller,
+                "maker": t.seller if t.buyer == taker else t.buyer,
+                "taker": taker,
+                "side": side,
+            }
+            for t in trades
+        ]
 
     def _amm_fill(self, route, taker: str) -> Dict[str, Any]:
         pair = self._canonical_pair(f"{route.token_in}:{route.token_out}")
         base = pair.split(":", 1)[0]
         holder = self.pool_holder_address(route.pool_id)
-        if route.token_in == base:          # selling base into the pool
+        if route.token_in == base:  # selling base into the pool
             amount, quote_amount, side = route.amount_in, route.amount_out, "sell"
             buyer, seller = holder, taker
         else:
             amount, quote_amount, side = route.amount_out, route.amount_in, "buy"
             buyer, seller = taker, holder
-        return {"market": pair, "venue": "amm", "pool_id": route.pool_id,
-                "price": str(quote_amount / amount) if amount > 0 else "0",
-                "amount": str(amount), "quote_amount": str(quote_amount), "buyer": buyer,
-                "seller": seller, "maker": holder, "taker": taker, "side": side}
+        return {
+            "market": pair,
+            "venue": "amm",
+            "pool_id": route.pool_id,
+            "price": str(quote_amount / amount) if amount > 0 else "0",
+            "amount": str(amount),
+            "quote_amount": str(quote_amount),
+            "buyer": buyer,
+            "seller": seller,
+            "maker": holder,
+            "taker": taker,
+            "side": side,
+        }
 
     def canonical_asset(self, value) -> str:
         """Spot's name for an asset: "QRDX" for native QRDX, a registered token's canonical
@@ -909,7 +999,8 @@ class ExchangeStateManager:
             if order_type is not OrderType.LIMIT:
                 return ExchangeExecResult(
                     success=False,
-                    error=f"CLOB settlement supports LIMIT orders only (got {order_type.value})")
+                    error=f"CLOB settlement supports LIMIT orders only (got {order_type.value})",
+                )
             need_token = quote if side == OrderSide.BUY else base
             need_amount = (order.amount * order.price) if side == OrderSide.BUY else order.amount
             avail = self.available_token_balance(tx.sender, need_token)
@@ -917,7 +1008,8 @@ class ExchangeStateManager:
                 return ExchangeExecResult(
                     success=False,
                     error=f"insufficient balance for order: need {need_amount} {need_token[:10]}, "
-                          f"available {avail}")
+                    f"available {avail}",
+                )
 
         try:
             with self._atomic(book):
@@ -985,12 +1077,18 @@ class ExchangeStateManager:
                     # remaining base for a SELL — the book's pair is token0:token1).
                     if result is not None and self.enforce_orderbook_settlement:
                         book_pair = getattr(book, "pool_id", "") or ""
-                        rbase, rquote = (book_pair.split(":", 1) + [""])[:2] if ":" in book_pair else (book_pair, "")
+                        rbase, rquote = (
+                            (book_pair.split(":", 1) + [""])[:2]
+                            if ":" in book_pair
+                            else (book_pair, "")
+                        )
                         r = Decimal(str(result.remaining))
                         if r > ZERO:
                             escrow = self.orderbook_escrow_address(book_pair)
                             if result.side == OrderSide.BUY:
-                                self._settle_token_move(escrow, result.owner, rquote, r * Decimal(str(result.price)))
+                                self._settle_token_move(
+                                    escrow, result.owner, rquote, r * Decimal(str(result.price))
+                                )
                             else:
                                 self._settle_token_move(escrow, result.owner, rbase, r)
             except ValueError as e:
@@ -1012,13 +1110,15 @@ class ExchangeStateManager:
         A duplicate market is a non-critical failure, not a block-breaking error.
         """
         from .. import constants
+
         p = tx.params
         base = str(p["base_token"])
         quote = str(p.get("quote_token", constants.PERP_QUOTE))
         try:
             if "max_leverage" in p:
                 market = self.clearinghouse.create_market(
-                    base, quote, max_leverage=Decimal(str(p["max_leverage"])))
+                    base, quote, max_leverage=Decimal(str(p["max_leverage"]))
+                )
             else:
                 market = self.clearinghouse.create_market(base, quote)
         except ClearinghouseError as e:
@@ -1069,16 +1169,19 @@ class ExchangeStateManager:
                 # preload_token_balances). One that was not is a gap in that list: refuse it
                 # rather than let an unchecked debit overdraw the ledger.
                 if self.enforce_spot_settlement:
-                    raise ValueError(f"{frm[:16]}…'s {token[:12]}… balance was not loaded "
-                                     "for this block")
+                    raise ValueError(
+                        f"{frm[:16]}…'s {token[:12]}… balance was not loaded " "for this block"
+                    )
             elif avail < amount:
                 # The protocol's holders (pool reserves, book escrow, the perps clearinghouse)
                 # are always held to it; a trader only once spot settlement is enforced (in
                 # observe mode their overdraft is logged by the flush, not refused).
                 from ..crypto.account_id import is_synthetic_holder
+
                 if self.enforce_spot_settlement or is_synthetic_holder(frm):
-                    raise ValueError(f"{frm[:16]}… cannot cover {amount} of {token[:12]}… "
-                                     f"(holds {avail})")
+                    raise ValueError(
+                        f"{frm[:16]}… cannot cover {amount} of {token[:12]}… " f"(holds {avail})"
+                    )
             if is_native_asset(token):
                 # Native QRDX lives in account_state: the move rides the balance flush.
                 self._record_balance_delta(frm, -amount)
@@ -1098,11 +1201,18 @@ class ExchangeStateManager:
         address = self.derive_token_address(tx.sender, tx.nonce, symbol)
         try:
             token = self.tokens.deploy(
-                address, tx.sender, self._current_block_height,
-                name=p.get("name", ""), symbol=symbol, decimals=p.get("decimals", 18),
+                address,
+                tx.sender,
+                self._current_block_height,
+                name=p.get("name", ""),
+                symbol=symbol,
+                decimals=p.get("decimals", 18),
                 initial_supply=p.get("initial_supply", p.get("total_supply", 0)),
-                max_supply=p.get("max_supply"), mint_authority=p.get("mint_authority"),
-                freeze_authority=p.get("freeze_authority"), extensions=p)
+                max_supply=p.get("max_supply"),
+                mint_authority=p.get("mint_authority"),
+                freeze_authority=p.get("freeze_authority"),
+                extensions=p,
+            )
         except TokenError as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_DEPLOY: {e}")
         if token.supply > 0:
@@ -1110,14 +1220,20 @@ class ExchangeStateManager:
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_DEPLOY],
-            data={"token_address": token.address, "symbol": token.symbol,
-                  "total_supply": str(token.supply), "decimals": token.decimals,
-                  "mint_authority": token.mint_authority,
-                  "freeze_authority": token.freeze_authority,
-                  "extensions": token.extensions()},
+            data={
+                "token_address": token.address,
+                "symbol": token.symbol,
+                "total_supply": str(token.supply),
+                "decimals": token.decimals,
+                "mint_authority": token.mint_authority,
+                "freeze_authority": token.freeze_authority,
+                "extensions": token.extensions(),
+            },
         )
 
-    def _token_move(self, op: str, token: str, frm: str, to: str, value) -> Tuple[Any, Decimal, Decimal]:
+    def _token_move(
+        self, op: str, token: str, frm: str, to: str, value
+    ) -> Tuple[Any, Decimal, Decimal]:
         """Validate a holder-to-holder move of a registered token: the token, the amount, a
         keyable recipient (an unkeyable one would have its credit dropped while the debit
         applied — burning the tokens), the token's transfer rules (paused, non-transferable,
@@ -1131,8 +1247,14 @@ class ExchangeStateManager:
         if avail is not None and avail < v:
             if self.enforce_spot_settlement:
                 raise TokenError(f"insufficient token balance: need {v}, available {avail}")
-            logger.warning("[Phase E observe] %s by %s: amount %s exceeds available %s — would "
-                           "REJECT once spot settlement is enforced", op, frm[:20], v, avail)
+            logger.warning(
+                "[Phase E observe] %s by %s: amount %s exceeds available %s — would "
+                "REJECT once spot settlement is enforced",
+                op,
+                frm[:20],
+                v,
+                avail,
+            )
         return t, v, fee
 
     def _transfer_with_fee(self, frm: str, to: str, t, v: Decimal, fee: Decimal) -> None:
@@ -1149,8 +1271,9 @@ class ExchangeStateManager:
         to = str(p["to"])
         try:
             note = token_memo(p.get("memo"))
-            t, v, fee = self._token_move("token_transfer", str(p["token_address"]), tx.sender,
-                                         to, p["amount"])
+            t, v, fee = self._token_move(
+                "token_transfer", str(p["token_address"]), tx.sender, to, p["amount"]
+            )
             self._transfer_with_fee(tx.sender, to, t, v, fee)
         except (TokenError, ValueError) as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_TRANSFER: {e}")
@@ -1160,7 +1283,8 @@ class ExchangeStateManager:
         if note:
             data["memo"] = note
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER], data=data)
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER], data=data
+        )
 
     def _spend_authority(self, t, owner: str, spender: str, v: Decimal) -> str:
         """How ``spender`` may move ``owner``'s tokens: as the permanent delegate, as an
@@ -1182,23 +1306,25 @@ class ExchangeStateManager:
         owner, to = str(p["from"]), str(p["to"])
         try:
             note = token_memo(p.get("memo"))
-            t, v, fee = self._token_move("token_transfer_from", str(p["token_address"]), owner,
-                                         to, p["amount"])
+            t, v, fee = self._token_move(
+                "token_transfer_from", str(p["token_address"]), owner, to, p["amount"]
+            )
             via = self._spend_authority(t, owner, tx.sender, v)
             self._transfer_with_fee(owner, to, t, v, fee)
         except (TokenError, ValueError) as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_TRANSFER_FROM: {e}")
         data = {"token_address": t.address, "from": owner, "to": to, "amount": str(v), "via": via}
         if via == "allowance":
-            data["allowance_left"] = str(self.tokens.spend_allowance(t.address, owner,
-                                                                     tx.sender, v))
+            data["allowance_left"] = str(
+                self.tokens.spend_allowance(t.address, owner, tx.sender, v)
+            )
         if fee:
             data.update(fee=str(fee), received=str(v - fee))
         if note:
             data["memo"] = note
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER_FROM],
-            data=data)
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER_FROM], data=data
+        )
 
     def _op_token_mint(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """The mint authority mints ``amount`` to ``to`` (default: itself), within any cap."""
@@ -1212,9 +1338,15 @@ class ExchangeStateManager:
             return ExchangeExecResult(success=False, error=f"TOKEN_MINT: {e}")
         self._record_token_delta(to, t.address, v)
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_MINT],
-            data={"token_address": t.address, "to": to, "amount": str(v),
-                  "total_supply": str(t.supply)})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_MINT],
+            data={
+                "token_address": t.address,
+                "to": to,
+                "amount": str(v),
+                "total_supply": str(t.supply),
+            },
+        )
 
     def _op_token_burn(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """A holder burns ``amount`` of its own balance — or, naming ``from``, an operator or
@@ -1231,8 +1363,10 @@ class ExchangeStateManager:
                 elif self.tokens.is_operator(t.address, holder, tx.sender):
                     via = "operator"
                 else:
-                    raise TokenError("only the holder, its operators or the permanent delegate "
-                                     "may burn its balance")
+                    raise TokenError(
+                        "only the holder, its operators or the permanent delegate "
+                        "may burn its balance"
+                    )
             if self.tokens.is_frozen(t.address, holder):
                 raise TokenError("the holder's balance is frozen")
             avail = self.available_token_balance(holder, t.address)
@@ -1246,7 +1380,8 @@ class ExchangeStateManager:
         if via != "holder":
             data.update(**{"from": holder, "via": via})
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_BURN], data=data)
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_BURN], data=data
+        )
 
     def _op_token_approve(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Set ``spender``'s allowance over the sender's tokens to ``amount`` (0 revokes)."""
@@ -1257,8 +1392,10 @@ class ExchangeStateManager:
         except TokenError as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_APPROVE: {e}")
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_APPROVE],
-            data={"token_address": t.address, "spender": str(p["spender"]), "amount": str(v)})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_APPROVE],
+            data={"token_address": t.address, "spender": str(p["spender"]), "amount": str(v)},
+        )
 
     def _op_token_set_authority(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Hand the mint or freeze authority to ``new_authority``, or renounce it (empty) —
@@ -1266,14 +1403,20 @@ class ExchangeStateManager:
         p = tx.params
         try:
             t = self.tokens.require(str(p["token_address"]))
-            new = self.tokens.set_authority(t.address, tx.sender, str(p["authority"]),
-                                            p.get("new_authority"))
+            new = self.tokens.set_authority(
+                t.address, tx.sender, str(p["authority"]), p.get("new_authority")
+            )
         except TokenError as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_SET_AUTHORITY: {e}")
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_SET_AUTHORITY],
-            data={"token_address": t.address, "authority": str(p["authority"]).lower(),
-                  "new_authority": new})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_SET_AUTHORITY],
+            data={
+                "token_address": t.address,
+                "authority": str(p["authority"]).lower(),
+                "new_authority": new,
+            },
+        )
 
     def _op_token_freeze(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """TOKEN_FREEZE / TOKEN_THAW: the freeze authority stops (or lets again) ``account``
@@ -1286,8 +1429,10 @@ class ExchangeStateManager:
         except TokenError as e:
             return ExchangeExecResult(success=False, error=f"{tx.op_type.name}: {e}")
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[tx.op_type],
-            data={"token_address": t.address, "account": str(p["account"]), "frozen": frozen})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[tx.op_type],
+            data={"token_address": t.address, "account": str(p["account"]), "frozen": frozen},
+        )
 
     def _op_token_update_metadata(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """The metadata authority edits the token's name, symbol, uri and extra fields."""
@@ -1297,9 +1442,16 @@ class ExchangeStateManager:
         except (TokenError, KeyError) as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_UPDATE_METADATA: {e}")
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_UPDATE_METADATA],
-            data={"token_address": t.address, "name": t.name, "symbol": t.symbol,
-                  "uri": t.uri, "fields": dict(t.fields)})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_UPDATE_METADATA],
+            data={
+                "token_address": t.address,
+                "name": t.name,
+                "symbol": t.symbol,
+                "uri": t.uri,
+                "fields": dict(t.fields),
+            },
+        )
 
     def _op_token_set_transfer_fee(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """The fee authority sets a new transfer-fee rate and cap, effective
@@ -1307,14 +1459,24 @@ class ExchangeStateManager:
         p = tx.params
         try:
             bps, cap, height = self.tokens.set_transfer_fee(
-                str(p["token_address"]), tx.sender, self._current_block_height,
-                p["transfer_fee_bps"], p.get("max_transfer_fee"))
+                str(p["token_address"]),
+                tx.sender,
+                self._current_block_height,
+                p["transfer_fee_bps"],
+                p.get("max_transfer_fee"),
+            )
         except TokenError as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_SET_TRANSFER_FEE: {e}")
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_SET_TRANSFER_FEE],
-            data={"token_address": str(p["token_address"]).lower(), "transfer_fee_bps": bps,
-                  "max_transfer_fee": None if cap is None else str(cap), "from_height": height})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_SET_TRANSFER_FEE],
+            data={
+                "token_address": str(p["token_address"]).lower(),
+                "transfer_fee_bps": bps,
+                "max_transfer_fee": None if cap is None else str(cap),
+                "from_height": height,
+            },
+        )
 
     def _op_token_withdraw_fees(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """The withdraw authority moves every withheld transfer fee to ``to`` (default: itself)."""
@@ -1331,8 +1493,10 @@ class ExchangeStateManager:
         except (TokenError, ValueError) as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_WITHDRAW_FEES: {e}")
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_WITHDRAW_FEES],
-            data={"token_address": t.address, "to": to, "amount": str(withheld)})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_WITHDRAW_FEES],
+            data={"token_address": t.address, "to": to, "amount": str(withheld)},
+        )
 
     def _op_token_pause(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """TOKEN_PAUSE / TOKEN_RESUME: the pause authority stops (or restarts) every transfer,
@@ -1344,8 +1508,10 @@ class ExchangeStateManager:
         except TokenError as e:
             return ExchangeExecResult(success=False, error=f"{tx.op_type.name}: {e}")
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[tx.op_type],
-            data={"token_address": str(p["token_address"]).lower(), "paused": paused})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[tx.op_type],
+            data={"token_address": str(p["token_address"]).lower(), "paused": paused},
+        )
 
     def _op_token_operator(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """TOKEN_AUTHORIZE_OPERATOR / TOKEN_REVOKE_OPERATOR (ERC-777): the sender lets
@@ -1354,14 +1520,20 @@ class ExchangeStateManager:
         p = tx.params
         authorized = tx.op_type == ExchangeOpType.TOKEN_AUTHORIZE_OPERATOR
         try:
-            self.tokens.set_operator(str(p["token_address"]), tx.sender, str(p["operator"]),
-                                     authorized)
+            self.tokens.set_operator(
+                str(p["token_address"]), tx.sender, str(p["operator"]), authorized
+            )
         except TokenError as e:
             return ExchangeExecResult(success=False, error=f"{tx.op_type.name}: {e}")
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[tx.op_type],
-            data={"token_address": str(p["token_address"]).lower(),
-                  "operator": str(p["operator"]), "authorized": authorized})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[tx.op_type],
+            data={
+                "token_address": str(p["token_address"]).lower(),
+                "operator": str(p["operator"]),
+                "authorized": authorized,
+            },
+        )
 
     # ── native NFTs (qrdx/exchange/nfts.py) ─────────────────────────────
 
@@ -1377,71 +1549,104 @@ class ExchangeStateManager:
             data = fn(tx.params)
         except (NftError, TokenError) as e:
             return ExchangeExecResult(success=False, error=f"{tx.op_type.name}: {e}")
-        return ExchangeExecResult(success=True, gas_used=EXCHANGE_GAS_COSTS[tx.op_type],
-                                  data=data)
+        return ExchangeExecResult(success=True, gas_used=EXCHANGE_GAS_COSTS[tx.op_type], data=data)
 
     def _op_nft_create_collection(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Create an NFT collection: name, symbol, uri, optional size cap, royalties, update and
         mint authorities (both the creator unless given), optionally soulbound."""
+
         def go(p):
             address = self.derive_collection_address(tx.sender, tx.nonce, str(p.get("symbol", "")))
             if self.tokens.get(address) is not None:
                 raise NftError(f"{address} is a token")
             return self.nfts.create(address, tx.sender, self._current_block_height, p).summary()
+
         return self._nft(tx, go)
 
     def _op_nft_mint(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """The collection's mint authority mints the next NFT (or ``token_id``) to ``to``
         (default: itself), with its own uri and name."""
+
         def go(p):
             to = str(p.get("to") or tx.sender)
-            i = self.nfts.mint(str(p["collection"]), tx.sender, to, self._current_block_height,
-                               uri=p.get("uri", ""), name=p.get("name", ""),
-                               tid=p.get("token_id"))
+            i = self.nfts.mint(
+                str(p["collection"]),
+                tx.sender,
+                to,
+                self._current_block_height,
+                uri=p.get("uri", ""),
+                name=p.get("name", ""),
+                tid=p.get("token_id"),
+            )
             return {"collection": str(p["collection"]).lower(), "token_id": str(i), "to": to}
+
         return self._nft(tx, go)
 
     def _op_nft_transfer(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Move an NFT to ``to``: by its owner, its approved account or an operator of the
         owner's (``from`` names the owner when the sender is not it)."""
+
         def go(p):
             note = token_memo(p.get("memo"))
             frm = str(p.get("from") or tx.sender)
             self.nfts.transfer(str(p["collection"]), p["token_id"], tx.sender, frm, str(p["to"]))
-            out = {"collection": str(p["collection"]).lower(),
-                   "token_id": str(nft_token_id(p["token_id"])), "from": frm, "to": str(p["to"])}
+            out = {
+                "collection": str(p["collection"]).lower(),
+                "token_id": str(nft_token_id(p["token_id"])),
+                "from": frm,
+                "to": str(p["to"]),
+            }
             if note:
                 out["memo"] = note
             return out
+
         return self._nft(tx, go)
 
     def _op_nft_burn(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         def go(p):
             owner = self.nfts.item(str(p["collection"]), p["token_id"]).owner
             self.nfts.burn(str(p["collection"]), p["token_id"], tx.sender)
-            return {"collection": str(p["collection"]).lower(),
-                    "token_id": str(nft_token_id(p["token_id"])), "owner": owner}
+            return {
+                "collection": str(p["collection"]).lower(),
+                "token_id": str(nft_token_id(p["token_id"])),
+                "owner": owner,
+            }
+
         return self._nft(tx, go)
 
     def _op_nft_approve(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """The owner (or an operator) approves one account for one NFT ("" clears it)."""
+
         def go(p):
-            spender = self.nfts.approve(str(p["collection"]), p["token_id"], tx.sender,
-                                        p.get("spender"))
-            return {"collection": str(p["collection"]).lower(),
-                    "token_id": str(nft_token_id(p["token_id"])), "spender": spender}
+            spender = self.nfts.approve(
+                str(p["collection"]), p["token_id"], tx.sender, p.get("spender")
+            )
+            return {
+                "collection": str(p["collection"]).lower(),
+                "token_id": str(nft_token_id(p["token_id"])),
+                "spender": spender,
+            }
+
         return self._nft(tx, go)
 
     def _op_nft_set_approval_for_all(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """The sender approves (``approved``, default true) or revokes an operator for all its
         NFTs in the collection."""
+
         def go(p):
             approved = p.get("approved", True)
-            approved = (str(approved).lower() in ("1", "true", "yes")
-                        if isinstance(approved, str) else bool(approved))
+            approved = (
+                str(approved).lower() in ("1", "true", "yes")
+                if isinstance(approved, str)
+                else bool(approved)
+            )
             self.nfts.set_operator(str(p["collection"]), tx.sender, str(p["operator"]), approved)
-            return {"collection": str(p["collection"]).lower(), "operator": str(p["operator"]),
-                    "approved": approved}
+            return {
+                "collection": str(p["collection"]).lower(),
+                "operator": str(p["operator"]),
+                "approved": approved,
+            }
+
         return self._nft(tx, go)
 
     def _op_nft_update(self, tx: ExchangeTransaction) -> ExchangeExecResult:
@@ -1449,17 +1654,25 @@ class ExchangeStateManager:
 
     def _op_nft_set_authority(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         def go(p):
-            new = self.nfts.set_authority(str(p["collection"]), tx.sender, str(p["authority"]),
-                                          p.get("new_authority"))
-            return {"collection": str(p["collection"]).lower(),
-                    "authority": str(p["authority"]).lower(), "new_authority": new}
+            new = self.nfts.set_authority(
+                str(p["collection"]), tx.sender, str(p["authority"]), p.get("new_authority")
+            )
+            return {
+                "collection": str(p["collection"]).lower(),
+                "authority": str(p["authority"]).lower(),
+                "new_authority": new,
+            }
+
         return self._nft(tx, go)
 
     def token_registry_ops(self) -> List[Dict[str, Any]]:
         """The registry rows of the tokens this block deployed or changed (supply,
         authorities), for the DB mirror (``token_registry``)."""
-        return [self.tokens.tokens[a].summary() for a in sorted(self.tokens.changed)
-                if a in self.tokens.tokens]
+        return [
+            self.tokens.tokens[a].summary()
+            for a in sorted(self.tokens.changed)
+            if a in self.tokens.tokens
+        ]
 
     def _op_stake_deposit(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """
@@ -1506,8 +1719,9 @@ class ExchangeStateManager:
             if stake < MIN_VALIDATOR_STAKE:
                 return ExchangeExecResult(
                     success=False,
-                    error=(f"STAKE_DEPOSIT: stake {stake} below minimum "
-                           f"{MIN_VALIDATOR_STAKE} QRDX"),
+                    error=(
+                        f"STAKE_DEPOSIT: stake {stake} below minimum " f"{MIN_VALIDATOR_STAKE} QRDX"
+                    ),
                 )
 
             # (2) Ownership. ``available_balance`` is pre-loaded from account_state by
@@ -1524,8 +1738,10 @@ class ExchangeStateManager:
             if avail < stake:
                 return ExchangeExecResult(
                     success=False,
-                    error=(f"STAKE_DEPOSIT: insufficient balance for stake: need {stake}, "
-                           f"available {avail}"),
+                    error=(
+                        f"STAKE_DEPOSIT: insufficient balance for stake: need {stake}, "
+                        f"available {avail}"
+                    ),
                 )
         else:
             avail = self.available_balance(tx.sender)
@@ -1533,13 +1749,19 @@ class ExchangeStateManager:
                 logger.warning(
                     "[observe] stake_deposit by %s: claimed stake %s exceeds available "
                     "balance %s — would REJECT once validator stake is enforced",
-                    tx.sender[:20], stake, avail,
+                    tx.sender[:20],
+                    stake,
+                    avail,
                 )
 
-        self._validator_lifecycle_ops.append({
-            "type": "deposit", "address": tx.sender,
-            "public_key": str(p["validator_public_key"]), "stake": str(stake),
-        })
+        self._validator_lifecycle_ops.append(
+            {
+                "type": "deposit",
+                "address": tx.sender,
+                "public_key": str(p["validator_public_key"]),
+                "stake": str(stake),
+            }
+        )
         if self.oracle_committee is not None:
             key = tx.sender.lower()
             self.oracle_committee[key] = self.oracle_committee.get(key, ZERO) + stake
@@ -1553,8 +1775,12 @@ class ExchangeStateManager:
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.STAKE_DEPOSIT],
-            data={"validator": tx.sender, "stake": str(stake), "status": "pending",
-                  "staked_debit": str(stake) if self.enforce_validator_stake else "0"},
+            data={
+                "validator": tx.sender,
+                "stake": str(stake),
+                "status": "pending",
+                "staked_debit": str(stake) if self.enforce_validator_stake else "0",
+            },
         )
 
     def _op_stake_exit(self, tx: ExchangeTransaction) -> ExchangeExecResult:
@@ -1596,44 +1822,67 @@ class ExchangeStateManager:
 
     def _op_gov_propose(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """A validator opens a proposal; its committee's stake is snapshotted for the vote."""
+
         def go():
-            p = self.governance.propose(tx.sender, tx.params, self._current_block_height,
-                                        self.oracle_committee)
-            return {"proposal_id": p.id, "action": p.action, "params": p.params,
-                    "voting_ends": p.voting_ends}
+            p = self.governance.propose(
+                tx.sender, tx.params, self._current_block_height, self.oracle_committee
+            )
+            return {
+                "proposal_id": p.id,
+                "action": p.action,
+                "params": p.params,
+                "voting_ends": p.voting_ends,
+            }
+
         return self._gov(tx, go)
 
     def _op_gov_vote(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         def go():
             p = self.governance.vote(tx.sender, tx.params, self._current_block_height)
-            return {"proposal_id": p.id, "status": p.status, "yes": str(p.yes), "no": str(p.no),
-                    "timelock_ends": p.timelock_ends}
+            return {
+                "proposal_id": p.id,
+                "status": p.status,
+                "yes": str(p.yes),
+                "no": str(p.no),
+                "timelock_ends": p.timelock_ends,
+            }
+
         return self._gov(tx, go)
 
     def _op_gov_veto(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """A holder locks QRDX in the veto escrow against a passed proposal. Reaching the veto
         threshold stops the proposal and returns every holder's QRDX."""
+
         def go():
             p, amount, refunds = self.governance.veto(
-                tx.sender, tx.params, self._current_block_height, self.available_balance(tx.sender))
+                tx.sender, tx.params, self._current_block_height, self.available_balance(tx.sender)
+            )
             self._record_balance_delta(tx.sender, -amount)
             self._record_balance_delta(veto_escrow_address(), amount)
             self._release_vetoes(refunds)
-            return {"proposal_id": p.id, "status": p.status, "locked": str(amount),
-                    "veto_total": str(p.veto_total)}
+            return {
+                "proposal_id": p.id,
+                "status": p.status,
+                "locked": str(amount),
+                "veto_total": str(p.veto_total),
+            }
+
         return self._gov(tx, go)
 
     def _op_gov_execute(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Anyone executes a passed proposal once its timelock has ended (or closes an expired
         one). A system_spend reads the wallet's balance pre-loaded for this transaction
         (block_processor.preload_sender_balances)."""
+
         def go():
             p, result, moves, refunds = self.governance.execute(
-                tx.params, self._current_block_height, self.available_balance)
+                tx.params, self._current_block_height, self.available_balance
+            )
             for address, delta in moves:
                 self._record_balance_delta(address, delta)
             self._release_vetoes(refunds)
             return {"proposal_id": p.id, "status": p.status, **result}
+
         return self._gov(tx, go)
 
     # =====================================================================
@@ -1649,28 +1898,34 @@ class ExchangeStateManager:
     def _op_retired_perp(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         return ExchangeExecResult(
             success=False,
-            error=(f"{tx.op_type.name} is retired: it traded against nobody, so it minted and "
-                   f"burned QRDX. Perps trade on the order book — PERP_DEPOSIT, then PERP_ORDER."))
+            error=(
+                f"{tx.op_type.name} is retired: it traded against nobody, so it minted and "
+                f"burned QRDX. Perps trade on the order book — PERP_DEPOSIT, then PERP_ORDER."
+            ),
+        )
 
     @staticmethod
     def perp_collateral_token() -> str:
         """What perps settle in: a QRC-20 token address (production: the bridged USD
         stablecoin), "QRDX" for native QRDX, or "" when none is configured."""
         from .. import constants
+
         return constants.PERP_COLLATERAL_TOKEN
 
     def _op_perp_deposit(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         token = self.perp_collateral_token()
         if not token:
             return ExchangeExecResult(
-                success=False, error="perps have no collateral token configured")
+                success=False, error="perps have no collateral token configured"
+            )
         amount = Decimal(str(tx.params["amount"]))
         native = token.upper() == "QRDX"
         if native:
             avail = self.available_balance(tx.sender)
             if avail is not None and avail < amount and self.enforce_collateral:
                 return ExchangeExecResult(
-                    success=False, error=f"insufficient balance: need {amount}, available {avail}")
+                    success=False, error=f"insufficient balance: need {amount}, available {avail}"
+                )
         else:
             # Always enforced: the token flush is not gated, so admitting an unaffordable
             # deposit would apply the holder's credit while the sender's debit could not land.
@@ -1678,7 +1933,8 @@ class ExchangeStateManager:
             if avail is None or avail < amount:
                 return ExchangeExecResult(
                     success=False,
-                    error=f"insufficient collateral token balance: need {amount}, available {avail}")
+                    error=f"insufficient collateral token balance: need {amount}, available {avail}",
+                )
         try:
             amount = self.clearinghouse.deposit(tx.sender, amount)
         except ClearinghouseError as e:
@@ -1689,14 +1945,17 @@ class ExchangeStateManager:
         else:
             self._settle_token_move(tx.sender, self.perps_holder_address(), token, amount)
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_DEPOSIT],
-            data={"collateral": str(self.clearinghouse.accounts[tx.sender].collateral)})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_DEPOSIT],
+            data={"collateral": str(self.clearinghouse.accounts[tx.sender].collateral)},
+        )
 
     def _op_perp_withdraw(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         token = self.perp_collateral_token()
         if not token:
             return ExchangeExecResult(
-                success=False, error="perps have no collateral token configured")
+                success=False, error="perps have no collateral token configured"
+            )
         try:
             amount = self.clearinghouse.withdraw(tx.sender, Decimal(str(tx.params["amount"])))
         except ClearinghouseError as e:
@@ -1707,33 +1966,45 @@ class ExchangeStateManager:
         else:
             self._settle_token_move(self.perps_holder_address(), tx.sender, token, amount)
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_WITHDRAW],
-            data={"collateral": str(self.clearinghouse.accounts[tx.sender].collateral)})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_WITHDRAW],
+            data={"collateral": str(self.clearinghouse.accounts[tx.sender].collateral)},
+        )
 
     def _op_vault_deposit(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Perp collateral → backstop vault shares at NAV. Internal to the clearinghouse: no
         real balance moves (the vault's collateral is inside the perps holder too)."""
         from .. import constants
+
         seeder = tx.sender.lower() in {a.lower() for a in constants.PERP_VAULT_SEEDERS}
         try:
             shares = self.clearinghouse.vault_deposit(
-                tx.sender, Decimal(str(tx.params["amount"])), self._block_clock(),
-                constants.PERP_VAULT_LOCKUP_SECONDS, protocol=seeder)
+                tx.sender,
+                Decimal(str(tx.params["amount"])),
+                self._block_clock(),
+                constants.PERP_VAULT_LOCKUP_SECONDS,
+                protocol=seeder,
+            )
         except (ClearinghouseError, ValueError) as e:
             return ExchangeExecResult(success=False, error=str(e))
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.VAULT_DEPOSIT],
-            data={"shares": str(shares), "protocol_owned": seeder})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.VAULT_DEPOSIT],
+            data={"shares": str(shares), "protocol_owned": seeder},
+        )
 
     def _op_vault_withdraw(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         try:
             value = self.clearinghouse.vault_withdraw(
-                tx.sender, Decimal(str(tx.params["shares"])), self._block_clock())
+                tx.sender, Decimal(str(tx.params["shares"])), self._block_clock()
+            )
         except (ClearinghouseError, ValueError) as e:
             return ExchangeExecResult(success=False, error=str(e))
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.VAULT_WITHDRAW],
-            data={"value": str(value)})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.VAULT_WITHDRAW],
+            data={"value": str(value)},
+        )
 
     def _op_perp_set_leverage(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
@@ -1741,38 +2012,54 @@ class ExchangeStateManager:
         if mode not in ("cross", "isolated"):
             return ExchangeExecResult(success=False, error=f"unknown margin mode {mode!r}")
         try:
-            self.clearinghouse.set_leverage(tx.sender, str(p["market_id"]),
-                                            Decimal(str(p["leverage"])), mode == "isolated")
+            self.clearinghouse.set_leverage(
+                tx.sender, str(p["market_id"]), Decimal(str(p["leverage"])), mode == "isolated"
+            )
         except ClearinghouseError as e:
             return ExchangeExecResult(success=False, error=str(e))
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_SET_LEVERAGE])
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_SET_LEVERAGE]
+        )
 
     def _op_perp_order(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
         order_id = tx.tx_hash()[:16]
         from .. import constants
+
         m = self.clearinghouse.markets.get(str(p["market_id"]))
-        if (m is not None and not bool(p.get("reduce_only", False)) and m.oracle_time > 0
-                and Decimal(str(self._block_clock())) - m.oracle_time
-                > constants.PERP_ORACLE_STALE_SECONDS):
+        if (
+            m is not None
+            and not bool(p.get("reduce_only", False))
+            and m.oracle_time > 0
+            and Decimal(str(self._block_clock())) - m.oracle_time
+            > constants.PERP_ORACLE_STALE_SECONDS
+        ):
             return ExchangeExecResult(
                 success=False,
-                error=f"the oracle for {m.id} is stale; only reduce-only orders are accepted")
+                error=f"the oracle for {m.id} is stale; only reduce-only orders are accepted",
+            )
         try:
             fills = self.clearinghouse.place_order(
-                tx.sender, str(p["market_id"]), order_id, str(p["side"]),
-                Decimal(str(p["size"])), Decimal(str(p["price"])), tx.nonce,
+                tx.sender,
+                str(p["market_id"]),
+                order_id,
+                str(p["side"]),
+                Decimal(str(p["size"])),
+                Decimal(str(p["price"])),
+                tx.nonce,
                 reduce_only=bool(p.get("reduce_only", False)),
-                ioc=str(p.get("tif", "gtc")).lower() == "ioc")
+                ioc=str(p.get("tif", "gtc")).lower() == "ioc",
+            )
         except (ClearinghouseError, ValueError) as e:
             return ExchangeExecResult(success=False, error=str(e))
         # Not resting after its fills: filled, IOC, or stopped by self-trade prevention
         # (an order that would hit the sender's own resting order is cancelled there).
         resting = order_id in self.clearinghouse.markets[str(p["market_id"])].orders
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_ORDER],
-            data={"order_id": order_id, "fills": fills, "resting": resting})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_ORDER],
+            data={"order_id": order_id, "fills": fills, "resting": resting},
+        )
 
     def _op_perp_cancel(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
@@ -1781,7 +2068,8 @@ class ExchangeStateManager:
         except (ClearinghouseError, ValueError) as e:
             return ExchangeExecResult(success=False, error=str(e))
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_CANCEL])
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_CANCEL]
+        )
 
     def _op_update_oracle(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         p = tx.params
@@ -1791,9 +2079,11 @@ class ExchangeStateManager:
         # authorized reporter may set it (constants.ORACLE_REPORTERS). Unrestricted, any
         # user could move the price their own position closes at.
         from .. import constants
+
         if tx.sender.lower() not in {a.lower() for a in constants.ORACLE_REPORTERS}:
-            return ExchangeExecResult(success=False,
-                                      error="sender is not an authorized oracle reporter")
+            return ExchangeExecResult(
+                success=False, error="sender is not an authorized oracle reporter"
+            )
         if price <= 0:
             return ExchangeExecResult(success=False, error="oracle price must be positive")
 
@@ -1831,7 +2121,9 @@ class ExchangeStateManager:
         if self.oracle_committee is not None:
             return
         try:
-            content = json.loads(genesis_content) if isinstance(genesis_content, str) else genesis_content
+            content = (
+                json.loads(genesis_content) if isinstance(genesis_content, str) else genesis_content
+            )
             members = content.get("validator_set") if isinstance(content, dict) else None
         except Exception:
             members = None
@@ -1849,13 +2141,15 @@ class ExchangeStateManager:
         """A committee member's USD prices, keyed by market base ("BTC" → BTC-USD-PERP). Votes
         only for existing markets; each replaces the voter's previous one for that market."""
         from .. import constants
+
         committee = self.oracle_committee
         if not committee or tx.sender.lower() not in committee:
             return ExchangeExecResult(success=False, error="sender is not in the oracle committee")
         prices = tx.params.get("prices")
         if not isinstance(prices, dict) or not prices or len(prices) > self.MAX_VOTE_PRICES:
             return ExchangeExecResult(
-                success=False, error=f"a vote carries 1 to {self.MAX_VOTE_PRICES} prices")
+                success=False, error=f"a vote carries 1 to {self.MAX_VOTE_PRICES} prices"
+            )
         parsed: Dict[str, Decimal] = {}
         for base in sorted(prices):
             market_id = Clearinghouse.market_id(str(base), constants.PERP_QUOTE)
@@ -1873,8 +2167,10 @@ class ExchangeStateManager:
         for market_id, price in parsed.items():
             self.oracle_votes.setdefault(market_id, {})[voter] = (price, now)
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ORACLE_VOTE],
-            data={"markets": sorted(parsed)})
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ORACLE_VOTE],
+            data={"markets": sorted(parsed)},
+        )
 
     def apply_oracle_votes(self, now) -> None:
         """Each block (before the clearinghouse tick): set every voted market's oracle to the
@@ -1882,6 +2178,7 @@ class ExchangeStateManager:
         committee's stake. Without that the oracle is not refreshed, and goes stale. Votes
         older than the window are dropped, so the state stays small."""
         from .. import constants
+
         committee = self.oracle_committee
         if not committee:
             return
@@ -1889,8 +2186,11 @@ class ExchangeStateManager:
         max_age = Decimal(constants.PERP_ORACLE_VOTE_MAX_AGE)
         total = sum(committee.values(), ZERO)
         for market_id in sorted(self.oracle_votes):
-            votes = {v: pt for v, pt in self.oracle_votes[market_id].items()
-                     if v in committee and now - pt[1] <= max_age}
+            votes = {
+                v: pt
+                for v, pt in self.oracle_votes[market_id].items()
+                if v in committee and now - pt[1] <= max_age
+            }
             self.oracle_votes[market_id] = votes
             if market_id not in self.clearinghouse.markets or not votes:
                 continue
@@ -1899,7 +2199,7 @@ class ExchangeStateManager:
             if weight * 2 <= total:
                 continue
             acc = ZERO
-            for price, w in weighted:            # lower weighted median
+            for price, w in weighted:  # lower weighted median
                 acc += w
                 if acc * 2 >= weight:
                     self.clearinghouse.set_oracle_price(market_id, price, now)
@@ -1909,8 +2209,10 @@ class ExchangeStateManager:
     def oracle_state_hash(self) -> bytes:
         """The live votes. (Not the committee: see block_processor.ensure_oracle_committee —
         it is a function of genesis and the staking ops, which the chain already commits to.)"""
-        votes = {m: {v: [str(p), str(t)] for v, (p, t) in sorted(vs.items())}
-                 for m, vs in sorted(self.oracle_votes.items())}
+        votes = {
+            m: {v: [str(p), str(t)] for v, (p, t) in sorted(vs.items())}
+            for m, vs in sorted(self.oracle_votes.items())
+        }
         blob = json.dumps(votes, sort_keys=True, separators=(",", ":"))
         return hashlib.blake2b(blob.encode(), digest_size=32).digest()
 
@@ -1924,14 +2226,91 @@ class ExchangeStateManager:
         Compute a deterministic hash of the entire exchange state.
 
         This is included in the block header to commit to the exchange
-        state at each block boundary.
+        state at each block boundary — under the rule of the block being processed
+        (``_current_block_height``): the incremental commitment once
+        ``incremental_state_root`` is in force, the full serialization before it.
 
         Returns:
             128-char hex string (BLAKE3-512, Whitepaper §3.6 quantum-resistant
             state root). Internal per-component digests use blake2b as a
             deterministic compression step; the committed root is BLAKE3.
         """
+        from .. import chain_spec
+
+        if chain_spec.is_active("incremental_state_root", self._current_block_height):
+            return self._incremental_state_root()
+        return self._sequential_state_root()
+
+    def _incremental_state_root(self) -> str:
+        """Every section of the sequential root, each from its incremental commitment: the
+        pools and books that changed are re-digested (and within a pool only the ticks and
+        positions touched); accounts, nonces, tokens, NFTs and proposals by the entries that
+        changed. The small parts (each market's own fields, the oracles, the votes) are
+        recomputed. QRDX_VERIFY_STATE_COMMITMENTS=1 checks every part from scratch."""
         import blake3
+
+        from ..crypto.hashing import STATE_ROOT_SIZE
+
+        pools = Section("pools")
+        for pid in sorted(self.pool_manager._pools):
+            pools.value(pid).raw(self.pool_manager._pools[pid].cached_digest())
+        books = Section("books")
+        for pair_key in sorted(self._order_books):
+            books.value(pair_key).raw(self._order_books[pair_key].cached_digest())
+        oracles = Section("oracles")
+        for pair_key in sorted(self._oracles):
+            o = self._oracles[pair_key]
+            oracles.value([pair_key, str(o.latest_price or ZERO), o.observation_count])
+        perps = Section("perp_engine")
+        for market_id in sorted(self.perp_engine._markets):
+            m = self.perp_engine._markets[market_id]
+            perps.value(
+                [
+                    market_id,
+                    str(m.index_price),
+                    str(m.mark_price),
+                    str(m.open_interest_long),
+                    str(m.open_interest_short),
+                    str(m.insurance_fund),
+                ]
+            )
+        hasher = blake3.blake3(b"QRDX-EXCHANGE-ROOT-v2\x00")
+        for part in (
+            pools.digest(),
+            books.digest(),
+            oracles.digest(),
+            perps.digest(),
+            self.clearinghouse.commitment(),
+            self.oracle_state_hash(),
+            self.tokens.commitment(),
+            self.nfts.commitment(),
+            self.governance.commitment(),
+            Section("nonces").raw(self._nonces.commitment()).digest(),
+            self._current_block_height.to_bytes(8, "big"),
+        ):
+            hasher.update(part)
+        if verifying():
+            self.verify_commitments()
+        return hasher.digest(length=STATE_ROOT_SIZE).hex()
+
+    def verify_commitments(self) -> None:
+        """Check every incremental commitment against a from-scratch recomputation (raises
+        ``CommitmentMismatch``): a mutation that bypassed the tracking shows up here."""
+        for pool in self.pool_manager._pools.values():
+            pool.verify_digest()
+        for book in self._order_books.values():
+            book.verify_digest()
+        self.clearinghouse.verify_commitment()
+        self.tokens.verify_commitment()
+        self.nfts.verify_commitment()
+        self.governance.verify_commitment()
+        self._nonces.verify()
+
+    @_pinned
+    def _sequential_state_root(self) -> str:
+        """The exchange root before ``incremental_state_root``: every entry, in order."""
+        import blake3
+
         hasher = blake3.blake3()
 
         # 1. Pool state hashes (sorted by pool ID)
@@ -1963,9 +2342,11 @@ class ExchangeStateManager:
         for market_id in sorted(self.perp_engine._markets.keys()):
             market = self.perp_engine._markets[market_id]
             market_hash = hashlib.blake2b(
-                (f"{market_id}:{market.index_price}:{market.mark_price}:"
-                 f"{market.open_interest_long}:{market.open_interest_short}:"
-                 f"{market.insurance_fund}").encode(),
+                (
+                    f"{market_id}:{market.index_price}:{market.mark_price}:"
+                    f"{market.open_interest_long}:{market.open_interest_short}:"
+                    f"{market.insurance_fund}"
+                ).encode(),
                 digest_size=16,
             ).digest()
             hasher.update(market_hash)
@@ -1978,9 +2359,9 @@ class ExchangeStateManager:
 
         # 4d. Native tokens: registry (supply, authorities), allowances, frozen accounts.
         hasher.update(self.tokens.state_hash())
-        if self.nfts.collections:            # (nothing until the first collection exists)
+        if self.nfts.collections:  # (nothing until the first collection exists)
             hasher.update(self.nfts.state_hash())
-        if self.governance.touched:          # (nothing until the first proposal)
+        if self.governance.touched:  # (nothing until the first proposal)
             hasher.update(self.governance.state_hash())
 
         # 5. Nonce state
@@ -1991,6 +2372,7 @@ class ExchangeStateManager:
         hasher.update(self._current_block_height.to_bytes(8, "big"))
 
         from ..crypto.hashing import STATE_ROOT_SIZE
+
         return hasher.digest(length=STATE_ROOT_SIZE).hex()
 
     # =====================================================================
@@ -2005,10 +2387,17 @@ class ExchangeStateManager:
         and positions), which a field-level snapshot cannot remove. Correctness
         over speed: a rejected block must leave local state byte-identical.
         """
+        self._snapshot = self.capture()
+        return self._snapshot
+
+    def capture(self) -> Dict[str, Any]:
+        """The deep copy ``take_snapshot`` keeps, without making it this block's revert point —
+        for the reorg checkpoints (qrdx/derived_state_rebuild.py). ``_restore_snapshot`` copies
+        out of it again, so one capture can be restored more than once."""
         import copy
 
         snapshot = {
-            "nonces": dict(self._nonces),
+            "nonces": self._nonces.copy(),
             "block_height": self._current_block_height,
             "block_timestamp": self._current_block_timestamp,
             "total_swaps": self._total_swaps,
@@ -2034,7 +2423,6 @@ class ExchangeStateManager:
             "governance": copy.deepcopy(self.governance),
             "router_clob_sequence": self.router._clob_sequence,
         }
-        self._snapshot = snapshot
         return snapshot
 
     def _restore_snapshot(self, snapshot: Dict[str, Any]) -> None:
@@ -2047,7 +2435,7 @@ class ExchangeStateManager:
         """
         import copy
 
-        self._nonces = dict(snapshot["nonces"])
+        self._nonces = snapshot["nonces"].copy()
         self._current_block_height = snapshot["block_height"]
         self._current_block_timestamp = snapshot["block_timestamp"]
         self._total_swaps = snapshot["total_swaps"]

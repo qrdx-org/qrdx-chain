@@ -32,6 +32,7 @@ rest of the exchange. Validity never depends on the node's chain spec — an ``a
 recorded by every node, whatever forks its own spec schedules — so nodes that have and have not
 installed an upgrade keep identical state.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -41,13 +42,21 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .commitment import Section, committed
+
 ZERO = Decimal(0)
 BPS = 10_000
 
 ACTIONS = ("system_spend", "freeze_master", "approve_fork")
 
 VOTING, PASSED, REJECTED, VETOED, EXECUTED, EXPIRED = (
-    "voting", "passed", "rejected", "vetoed", "executed", "expired")
+    "voting",
+    "passed",
+    "rejected",
+    "vetoed",
+    "executed",
+    "expired",
+)
 OPEN_STATUSES = (VOTING, PASSED)
 
 MAX_OPEN_PER_PROPOSER = 4
@@ -65,6 +74,7 @@ def veto_escrow_address() -> str:
 
 def _params():
     from .. import constants
+
     return constants
 
 
@@ -90,8 +100,11 @@ def _fmt(value: Decimal) -> str:
 def _system_wallets() -> Dict[str, str]:
     """Spendable system wallets: lowercase address → name (the burner is not spendable)."""
     c = _params()
-    return {addr.lower(): name for name, addr in c.SYSTEM_WALLET_ADDRESSES.items()
-            if name != "GARBAGE_COLLECTOR"}
+    return {
+        addr.lower(): name
+        for name, addr in c.SYSTEM_WALLET_ADDRESSES.items()
+        if name != "GARBAGE_COLLECTOR"
+    }
 
 
 @dataclass
@@ -118,16 +131,25 @@ class Proposal:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "id": self.id, "proposer": self.proposer, "action": self.action,
-            "params": self.params, "memo": self.memo, "created_at": self.created_at,
+            "id": self.id,
+            "proposer": self.proposer,
+            "action": self.action,
+            "params": self.params,
+            "memo": self.memo,
+            "created_at": self.created_at,
             "voting_ends": self.voting_ends,
             "weights": {a: _fmt(w) for a, w in sorted(self.weights.items())},
             "total_weight": _fmt(self.total_weight),
-            "votes": dict(sorted(self.votes.items())), "yes": _fmt(self.yes), "no": _fmt(self.no),
-            "status": self.status, "passed_at": self.passed_at,
-            "timelock_ends": self.timelock_ends, "execute_by": self.execute_by,
+            "votes": dict(sorted(self.votes.items())),
+            "yes": _fmt(self.yes),
+            "no": _fmt(self.no),
+            "status": self.status,
+            "passed_at": self.passed_at,
+            "timelock_ends": self.timelock_ends,
+            "execute_by": self.execute_by,
             "vetoes": {a: _fmt(v) for a, v in sorted(self.vetoes.items())},
-            "veto_total": _fmt(self.veto_total), "resolved_at": self.resolved_at,
+            "veto_total": _fmt(self.veto_total),
+            "resolved_at": self.resolved_at,
         }
 
 
@@ -140,13 +162,17 @@ class Governance:
     block height it is judged at; balances it needs are passed in by the exchange state
     manager, which also applies the QRDX moves it returns."""
 
+    # Committed entry by entry (qrdx/exchange/commitment.py).
+    proposals = committed("gov.proposals", lambda _pid, p: p.to_dict())
+    fork_approvals = committed("gov.fork_approvals", lambda _key, rec: rec)
+
     def __init__(self) -> None:
-        self.proposals: Dict[int, Proposal] = {}
+        self.proposals = {}  # id → Proposal (committed: see the class attributes)
         self.next_id: int = 1
         # Height of the block whose governance execution froze the master controller.
         self.master_frozen_at: Optional[int] = None
         # "<fork name>:<definition hash>" → approval record (chain_spec.fork_approval reads it).
-        self.fork_approvals: Dict[str, Dict[str, Any]] = {}
+        self.fork_approvals = {}
         # From the genesis block: whether system wallets exist on this chain.
         self.system_wallets_enabled: bool = False
         self.genesis_loaded: bool = False
@@ -157,7 +183,9 @@ class Governance:
         if self.genesis_loaded:
             return
         try:
-            content = json.loads(genesis_content) if isinstance(genesis_content, str) else genesis_content
+            content = (
+                json.loads(genesis_content) if isinstance(genesis_content, str) else genesis_content
+            )
         except ValueError:
             content = None
         if isinstance(content, dict):
@@ -176,9 +204,12 @@ class Governance:
         return p.status
 
     def _open_count(self, height: int, proposer: Optional[str] = None) -> int:
-        return sum(1 for p in self.proposals.values()
-                   if self.effective_status(p, height) in OPEN_STATUSES
-                   and (proposer is None or p.proposer == proposer))
+        return sum(
+            1
+            for p in self.proposals.values()
+            if self.effective_status(p, height) in OPEN_STATUSES
+            and (proposer is None or p.proposer == proposer)
+        )
 
     def get(self, proposal_id: Any) -> Proposal:
         try:
@@ -192,14 +223,23 @@ class Governance:
 
     # ── propose ─────────────────────────────────────────────────────────────────────────
 
-    def propose(self, sender: str, params: Dict[str, Any], height: int,
-                committee: Optional[Dict[str, Decimal]]) -> Proposal:
+    def propose(
+        self,
+        sender: str,
+        params: Dict[str, Any],
+        height: int,
+        committee: Optional[Dict[str, Decimal]],
+    ) -> Proposal:
         c = _params()
         proposer = sender.lower()
         if not committee or proposer not in committee:
-            raise GovernanceError("only a validator (a member of the validator committee) can propose")
+            raise GovernanceError(
+                "only a validator (a member of the validator committee) can propose"
+            )
         if self._open_count(height, proposer) >= MAX_OPEN_PER_PROPOSER:
-            raise GovernanceError(f"a validator may have at most {MAX_OPEN_PER_PROPOSER} open proposals")
+            raise GovernanceError(
+                f"a validator may have at most {MAX_OPEN_PER_PROPOSER} open proposals"
+            )
         if self._open_count(height) >= MAX_OPEN_TOTAL:
             raise GovernanceError(f"at most {MAX_OPEN_TOTAL} proposals may be open at once")
         action = params.get("action")
@@ -213,9 +253,17 @@ class Governance:
         total = sum(weights.values(), ZERO)
         if total <= 0:
             raise GovernanceError("the validator committee has no stake")
-        p = Proposal(id=self.next_id, proposer=proposer, action=action, params=body, memo=memo,
-                     created_at=height, voting_ends=height + c.GOV_VOTING_PERIOD_BLOCKS,
-                     weights=weights, total_weight=total)
+        p = Proposal(
+            id=self.next_id,
+            proposer=proposer,
+            action=action,
+            params=body,
+            memo=memo,
+            created_at=height,
+            voting_ends=height + c.GOV_VOTING_PERIOD_BLOCKS,
+            weights=weights,
+            total_weight=total,
+        )
         self.proposals[p.id] = p
         self.next_id += 1
         return p
@@ -230,6 +278,7 @@ class Governance:
                 raise GovernanceError(f"{params.get('wallet')!r} is not a spendable system wallet")
             to = str(params.get("to", "")).strip()
             from ..crypto.account_id import is_synthetic_holder, to_account_id
+
             try:
                 to_id = to_account_id(to)
             except ValueError as e:
@@ -245,7 +294,9 @@ class Governance:
             if self.master_frozen_at is not None:
                 raise GovernanceError("the master controller is already frozen")
             if height >= c.SYSTEM_WALLET_MASTER_SUNSET_HEIGHT:
-                raise GovernanceError("the master controller's authority has already ended (sunset)")
+                raise GovernanceError(
+                    "the master controller's authority has already ended (sunset)"
+                )
             return {}
         # approve_fork — recorded as given; deliberately NOT checked against this node's spec
         # (see the module docstring).
@@ -253,15 +304,17 @@ class Governance:
         if not _FORK_NAME.match(fork):
             raise GovernanceError(f"invalid fork name {fork!r}")
         try:
-            fork_height = int(params.get("height"))
-        except (TypeError, ValueError):
+            fork_height = int(params["height"])
+        except (KeyError, TypeError, ValueError):
             raise GovernanceError("approve_fork needs the fork's height") from None
         if fork_height <= height:
             raise GovernanceError("the fork's height has already passed")
         digest = str(params.get("definition_hash", "")).lower()
         if not _HEX64.match(digest):
-            raise GovernanceError("approve_fork needs the fork's definition_hash "
-                                  "(chain_spec.ChainSpec.fork_definition_hash)")
+            raise GovernanceError(
+                "approve_fork needs the fork's definition_hash "
+                "(chain_spec.ChainSpec.fork_definition_hash)"
+            )
         return {"fork": fork, "height": fork_height, "definition_hash": digest}
 
     # ── vote ────────────────────────────────────────────────────────────────────────────
@@ -270,9 +323,13 @@ class Governance:
         p = self.get(params.get("proposal_id"))
         voter = sender.lower()
         if self.effective_status(p, height) != VOTING:
-            raise GovernanceError(f"proposal {p.id} is not open for voting ({self.effective_status(p, height)})")
+            raise GovernanceError(
+                f"proposal {p.id} is not open for voting ({self.effective_status(p, height)})"
+            )
         if voter not in p.weights:
-            raise GovernanceError("only the validators in the proposal's committee snapshot can vote")
+            raise GovernanceError(
+                "only the validators in the proposal's committee snapshot can vote"
+            )
         if voter in p.votes:
             raise GovernanceError("already voted (votes are final)")
         support = params.get("support")
@@ -291,20 +348,27 @@ class Governance:
             p.timelock_ends = height + c.GOV_TIMELOCK_BLOCKS
             p.execute_by = p.timelock_ends + c.GOV_EXECUTION_WINDOW_BLOCKS
         elif p.no * BPS > p.total_weight * (BPS - threshold):
-            p.status = REJECTED                    # approval is no longer reachable
+            p.status = REJECTED  # approval is no longer reachable
             p.resolved_at = height
         return p
 
     # ── veto ────────────────────────────────────────────────────────────────────────────
 
-    def veto(self, sender: str, params: Dict[str, Any], height: int,
-             available: Optional[Decimal]) -> Tuple[Proposal, Decimal, Dict[str, Decimal]]:
+    def veto(
+        self, sender: str, params: Dict[str, Any], height: int, available: Optional[Decimal]
+    ) -> Tuple[Proposal, Decimal, Dict[str, Decimal]]:
         """Lock ``amount`` QRDX against a passed proposal. Returns (proposal, amount locked,
         refunds) — refunds are non-empty when this veto crossed the threshold."""
         p = self.get(params.get("proposal_id"))
-        if self.effective_status(p, height) != PASSED or height >= p.timelock_ends:
-            raise GovernanceError(f"proposal {p.id} cannot be vetoed now (vetoes are open during "
-                                  f"its timelock only)")
+        if (
+            self.effective_status(p, height) != PASSED
+            or p.timelock_ends is None
+            or height >= p.timelock_ends
+        ):
+            raise GovernanceError(
+                f"proposal {p.id} cannot be vetoed now (vetoes are open during "
+                f"its timelock only)"
+            )
         try:
             amount = _amount(params.get("amount"))
         except ValueError as e:
@@ -312,7 +376,9 @@ class Governance:
         if available is None:
             raise GovernanceError("sender balance unavailable; cannot lock the veto")
         if available < amount:
-            raise GovernanceError(f"insufficient QRDX to lock: need {amount}, available {available}")
+            raise GovernanceError(
+                f"insufficient QRDX to lock: need {amount}, available {available}"
+            )
         # Keyed by the sender exactly as the transaction names it — the form its locked QRDX
         # was debited under, so the refund lands on the same balance entry.
         holder = sender
@@ -327,9 +393,12 @@ class Governance:
 
     # ── execute ─────────────────────────────────────────────────────────────────────────
 
-    def execute(self, params: Dict[str, Any], height: int,
-                wallet_balance: Callable[[str], Optional[Decimal]]
-                ) -> Tuple[Proposal, Dict[str, Any], List[Tuple[str, Decimal]], Dict[str, Decimal]]:
+    def execute(
+        self,
+        params: Dict[str, Any],
+        height: int,
+        wallet_balance: Callable[[str], Optional[Decimal]],
+    ) -> Tuple[Proposal, Dict[str, Any], List[Tuple[str, Decimal]], Dict[str, Decimal]]:
         """Execute a passed proposal whose timelock has ended, or close an expired one.
         Returns (proposal, result, balance moves [(address, delta)], refunds)."""
         p = self.get(params.get("proposal_id"))
@@ -340,7 +409,7 @@ class Governance:
             return p, {"executed": False, "expired": True}, [], dict(p.vetoes)
         if status != PASSED:
             raise GovernanceError(f"proposal {p.id} is not executable ({status})")
-        if height < p.timelock_ends:
+        if p.timelock_ends is None or height < p.timelock_ends:
             raise GovernanceError(f"proposal {p.id} is timelocked until block {p.timelock_ends}")
 
         moves: List[Tuple[str, Decimal]] = []
@@ -352,7 +421,9 @@ class Governance:
                 raise GovernanceError("system wallet balance unavailable")
             if balance < amount:
                 # Retryable until the execution window closes.
-                raise GovernanceError(f"system wallet holds {balance} QRDX, the proposal spends {amount}")
+                raise GovernanceError(
+                    f"system wallet holds {balance} QRDX, the proposal spends {amount}"
+                )
             moves = [(p.params["wallet"], -amount), (p.params["to"], amount)]
             result.update(wallet=p.params["wallet"], to=p.params["to"], amount=_fmt(amount))
         elif p.action == "freeze_master":
@@ -381,13 +452,31 @@ class Governance:
         return bool(self.proposals or self.fork_approvals or self.master_frozen_at is not None)
 
     def state_hash(self) -> bytes:
-        blob = json.dumps({
-            "next_id": self.next_id,
-            "master_frozen_at": self.master_frozen_at,
-            "fork_approvals": self.fork_approvals,
-            "proposals": [self.proposals[i].to_dict() for i in sorted(self.proposals)],
-        }, sort_keys=True, separators=(",", ":"))
+        blob = json.dumps(
+            {
+                "next_id": self.next_id,
+                "master_frozen_at": self.master_frozen_at,
+                "fork_approvals": self.fork_approvals,
+                "proposals": [self.proposals[i].to_dict() for i in sorted(self.proposals)],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return hashlib.blake2b(b"governance:" + blob.encode(), digest_size=32).digest()
+
+    def commitment(self) -> bytes:
+        """The incremental commitment (``incremental_state_root``)."""
+        return (
+            Section("governance")
+            .value([self.next_id, self.master_frozen_at])
+            .raw(self.proposals.commitment())
+            .raw(self.fork_approvals.commitment())
+            .digest()
+        )
+
+    def verify_commitment(self) -> None:
+        self.proposals.verify()
+        self.fork_approvals.verify()
 
     def view(self, p: Proposal, height: int) -> Dict[str, Any]:
         """A proposal as an API shows it: its stored record plus its status at ``height``."""
@@ -400,6 +489,7 @@ class Governance:
 def _approval_lookup(fork_name: str, definition_hash: str) -> Optional[int]:
     """chain_spec's view of on-chain fork approvals: the live exchange state's."""
     from .state_manager import ExchangeStateManager
+
     inst = ExchangeStateManager.instance
     return inst.governance.fork_approved_at(fork_name, definition_hash) if inst else None
 
@@ -410,20 +500,26 @@ def master_authority(height: int) -> Tuple[bool, str]:
     frozen it (from the block whose exchange section executed the freeze)."""
     c = _params()
     if height >= c.SYSTEM_WALLET_MASTER_SUNSET_HEIGHT:
-        return False, (f"the master controller's authority over system wallets ended at block "
-                       f"{c.SYSTEM_WALLET_MASTER_SUNSET_HEIGHT}; system-wallet funds move only "
-                       f"by governance proposal (system_spend)")
+        return False, (
+            f"the master controller's authority over system wallets ended at block "
+            f"{c.SYSTEM_WALLET_MASTER_SUNSET_HEIGHT}; system-wallet funds move only "
+            f"by governance proposal (system_spend)"
+        )
     from .state_manager import ExchangeStateManager
+
     inst = ExchangeStateManager.instance
     frozen = inst.governance.master_frozen_at if inst else None
     if frozen is not None and height >= frozen:
-        return False, (f"governance froze the master controller at block {frozen}; system-wallet "
-                       f"funds move only by governance proposal (system_spend)")
+        return False, (
+            f"governance froze the master controller at block {frozen}; system-wallet "
+            f"funds move only by governance proposal (system_spend)"
+        )
     return True, ""
 
 
 def _install() -> None:
     from .. import chain_spec
+
     chain_spec.set_approval_lookup(_approval_lookup)
 
 

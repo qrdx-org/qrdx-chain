@@ -13,6 +13,8 @@ rebuild the reorg path uses. Also covered: that rebuild now resets the mempool's
 expectations, whose absence silently lost orphaned EVM transactions on every reorg.
 """
 import inspect
+
+from source_text import source_of
 import os
 import tempfile
 from decimal import Decimal
@@ -28,11 +30,11 @@ from pq_addrs import pq
 # ── Every rejection after state mutation restores ──────────────────────────
 
 def _main_src():
-    return inspect.getsource(node_main)
+    return source_of(node_main)
 
 
 def test_sync_path_restores_on_evm_and_e_d4_rejection():
-    src = inspect.getsource(node_main.process_and_create_block)
+    src = source_of(node_main.process_and_create_block)
     evm = src.index('Rejecting PoS block {block_height}: {verr_evm}')
     ed4 = src.index('Rejecting block {block_height}: E-D4')
     assert "_restore_after_rejected_block(" in src[evm:evm + 300]
@@ -49,7 +51,7 @@ def test_rest_path_restores_on_evm_and_e_d4_rejection():
 
 def test_p2p_path_restores_on_evm_and_e_d4_rejection():
     from qrdx.rpc.modules import p2p
-    src = inspect.getsource(p2p)
+    src = source_of(p2p)
     evm = src.index("return {'ok': False, 'error': f'Invalid EVM section: {verr_evm}'}")
     root = src.index("return {'ok': False, 'error': f'Invalid state root: {root_err}'}")
     assert "_restore_after_rejection(" in src[evm - 200:evm]
@@ -57,14 +59,18 @@ def test_p2p_path_restores_on_evm_and_e_d4_rejection():
 
 
 def test_the_p2p_hook_is_injected():
-    src = _main_src()
-    call = src[src.index("set_node_context("):]
-    call = call[:call.index("\n    )\n")]   # the call's closing paren, not one in a comment
-    assert "restore_after_rejected_block=_restore_after_rejected_block" in call
+    import ast
+    tree = ast.parse(inspect.getsource(node_main))
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and getattr(n.func, "attr", getattr(n.func, "id", None)) == "set_node_context"]
+    assert calls
+    for call in calls:
+        hooks = {k.arg: getattr(k.value, "id", None) for k in call.keywords}
+        assert hooks.get("restore_after_rejected_block") == "_restore_after_rejected_block"
 
 
 def test_restore_uses_the_full_derived_state_rebuild():
-    src = inspect.getsource(node_main._restore_after_rejected_block)
+    src = source_of(node_main._restore_after_rejected_block)
     assert "_rebuild_derived_state_after_rollback()" in src
     assert "rollback()" in src
 
@@ -127,5 +133,5 @@ async def test_the_rebuild_resets_mempool_nonce_expectations():
 
 
 def test_the_rollback_rebuild_resets_nonces():
-    src = inspect.getsource(node_main._rebuild_derived_state_after_rollback)
+    src = source_of(node_main._rebuild_derived_state_after_rollback)
     assert "_reset_evm_pending_nonces()" in src

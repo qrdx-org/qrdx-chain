@@ -24,10 +24,18 @@ from qrdx.validator.attestation_block import BLOCK_ATTESTATIONS_KEY
 from qrdx.validator.slashing_block import verify_attestation_evidence
 
 
+def _root(epoch):
+    """A checkpoint root per epoch (one honest chain)."""
+    import hashlib
+
+    return hashlib.sha256(f"checkpoint {epoch}".encode()).hexdigest()
+
+
 def _signed_att(key, slot, epoch, block_hash, source, target, idx=0):
     att = Attestation(slot=slot, epoch=epoch, block_hash=block_hash,
                       validator_address=key.public_key.to_address(), validator_index=idx,
-                      signature=b"", source_epoch=source, target_epoch=target)
+                      signature=b"", source_epoch=source, target_epoch=target,
+                      source_root=_root(source), target_root=_root(target))
     att.signature = key.sign(att.signing_root).to_bytes()
     return att
 
@@ -75,17 +83,20 @@ async def test_honest_sequential_votes_no_detection():
 
 @pytest.mark.asyncio
 async def test_honest_per_slot_same_target_no_detection():
-    """REGRESSION (the enforce-soak false positive): a validator attesting EVERY slot in an epoch
-    to the advancing head produces many votes sharing a target epoch but with different slots +
-    blocks. Even with enforce ON this must yield ZERO events — else honest churn slashes everyone."""
+    """An honest validator casts ONE vote per epoch (qrdx/validator/ffg.py) and may see it carried
+    by several blocks (re-included after a reorg, or by two proposers): the same signed vote
+    again is never a conflict. (Under the old per-slot voting, a validator signed many votes per
+    target; that is what let a validator switching forks support both branches, and it is now a
+    double vote — see test_surround_vote_evidence.)"""
     key = PQPrivateKey.generate()
     db, path = await _fresh_db_with_validator(key)
     F._ENFORCE_SURROUND_DETECTION = True
     try:
-        # slots 8,9,10 all in epoch 1 (target=1, source=0), each a different head.
-        for slot, bh in ((8, "a1"), (9, "b2"), (10, "c3")):
-            a = _signed_att(key, slot=slot, epoch=1, block_hash=bh * 32, source=0, target=1)
+        a = _signed_att(key, slot=10, epoch=1, block_hash="a1" * 32, source=0, target=1)
+        for _ in range(3):
             await F.record_block_attestations(db, _block([a]))
+        b = _signed_att(key, slot=18, epoch=2, block_hash="b2" * 32, source=1, target=2)
+        await F.record_block_attestations(db, _block([b]))  # the next epoch's vote
         assert await _events(db) == []
     finally:
         F._ENFORCE_SURROUND_DETECTION = True
@@ -155,5 +166,27 @@ async def test_observe_gate_detects_but_does_not_record():
         assert await _events(db) == []  # detected but observe-gated → not recorded
     finally:
         F._ENFORCE_SURROUND_DETECTION = True
+        await db.connection.close()
+        os.remove(path)
+
+
+@pytest.mark.asyncio
+async def test_an_honest_vote_seen_in_two_blocks_is_never_a_slash():
+    """REGRESSION (all three testnet validators were slashed): the node's vote store did not keep
+    a vote's checkpoint roots, so the copy it compared a re-included vote against lacked them,
+    differed, and was flagged as a double vote — and the detector recorded the slash without
+    checking the evidence. The roots are kept now, and evidence must verify before it is
+    recorded."""
+    key = PQPrivateKey.generate()
+    db, path = await _fresh_db_with_validator(key)
+    F._ENFORCE_SURROUND_DETECTION = True
+    try:
+        a = _signed_att(key, slot=10, epoch=1, block_hash="a1" * 32, source=0, target=1)
+        await F.record_block_attestations(db, _block([a]))
+        await db.connection.execute("UPDATE attestation_votes SET source_root = '', "
+                                    "target_root = ''")  # a store that dropped the roots
+        await F.record_block_attestations(db, _block([a]))   # the same vote, another block
+        assert await _events(db) == []
+    finally:
         await db.connection.close()
         os.remove(path)

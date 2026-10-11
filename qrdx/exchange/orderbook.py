@@ -36,9 +36,9 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from decimal import Context, Decimal, ROUND_DOWN, ROUND_HALF_EVEN, ROUND_HALF_UP, localcontext
-from enum import Enum, IntEnum
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Context, Decimal, localcontext
+from enum import Enum
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +48,11 @@ ZERO = Decimal("0")
 # Security limits
 # ---------------------------------------------------------------------------
 
-MAX_ORDERS_PER_ADDRESS = 200           # per book
+MAX_ORDERS_PER_ADDRESS = 200  # per book
 MAX_ORDERS_PER_BLOCK_PER_ADDRESS = 50  # rate limit
-MIN_ORDER_SIZE = Decimal("0.00000001") # 1 sat equivalent
+MIN_ORDER_SIZE = Decimal("0.00000001")  # 1 sat equivalent
 MAX_STOP_ORDERS_PER_ADDRESS = 50
-MAX_RECENT_TRADES = 1000               # display history per book — bounded, never consensus
+MAX_RECENT_TRADES = 1000  # display history per book — bounded, never consensus
 
 # Every book computation runs in this context, whatever the caller's: a result must not depend
 # on the precision of the thread or task that happens to call in.
@@ -64,12 +64,14 @@ def _pinned(method):
     def wrapper(*args, **kwargs):
         with localcontext(_CTX):
             return method(*args, **kwargs)
+
     return wrapper
 
 
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
+
 
 class OrderSide(str, Enum):
     BUY = "buy"
@@ -92,35 +94,38 @@ class OrderStatus(str, Enum):
 
 class SelfTradeAction(str, Enum):
     """What to do when maker and taker are the same address."""
-    REJECT = "reject"              # skip the resting maker order (the taker may then rest
-                                   # ACROSS its own order: a crossed book — not for consensus)
+
+    REJECT = "reject"  # skip the resting maker order (the taker may then rest
+    # ACROSS its own order: a crossed book — not for consensus)
     CANCEL_MAKER = "cancel_maker"  # cancel the resting maker
-    CANCEL_BOTH = "cancel_both"    # cancel both sides
+    CANCEL_BOTH = "cancel_both"  # cancel both sides
     CANCEL_TAKER = "cancel_taker"  # stop matching and cancel the taker's remainder; fills
-                                   # already made stand, resting orders are untouched. The
-                                   # consensus books use this: the book can never cross.
+    # already made stand, resting orders are untouched. The
+    # consensus books use this: the book can never cross.
 
 
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Order:
     """A single order on the book."""
+
     id: str
-    owner: str                  # PQ address
+    owner: str  # PQ address
     side: OrderSide
     order_type: OrderType
-    price: Decimal              # limit price (0 for market)
-    amount: Decimal             # original size
-    filled: Decimal = ZERO      # how much has been filled
+    price: Decimal  # limit price (0 for market)
+    amount: Decimal  # original size
+    filled: Decimal = ZERO  # how much has been filled
     status: OrderStatus = OrderStatus.OPEN
     timestamp: float = field(default_factory=time.time)
     stop_price: Optional[Decimal] = None  # for stop-loss orders
-    signature: bytes = b""      # Dilithium signature
-    nonce: int = 0              # replay protection — must increase per owner
-    expire_time: float = 0.0    # 0 = GTC; else unix timestamp
+    signature: bytes = b""  # Dilithium signature
+    nonce: int = 0  # replay protection — must increase per owner
+    expire_time: float = 0.0  # 0 = GTC; else unix timestamp
 
     @property
     def remaining(self) -> Decimal:
@@ -138,6 +143,7 @@ class Order:
 @dataclass
 class Trade:
     """A completed trade between two orders."""
+
     id: str
     maker_order_id: str
     taker_order_id: str
@@ -148,22 +154,24 @@ class Trade:
     timestamp: float
     buyer: str
     seller: str
-    sequence: int = 0           # deterministic global sequence
+    sequence: int = 0  # deterministic global sequence
 
 
 # ---------------------------------------------------------------------------
 # Price Level
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class PriceLevel:
     """Orders at a single price point, in time-priority order."""
+
     price: Decimal
     orders: List[Order] = field(default_factory=list)
 
     @property
     def total_amount(self) -> Decimal:
-        return sum(o.remaining for o in self.orders if o.is_active)
+        return sum((o.remaining for o in self.orders if o.is_active), ZERO)
 
     def add_order(self, order: Order) -> None:
         self.orders.append(order)
@@ -178,6 +186,7 @@ class PriceLevel:
 # ---------------------------------------------------------------------------
 # Order Book
 # ---------------------------------------------------------------------------
+
 
 class OrderBook:
     """
@@ -201,8 +210,8 @@ class OrderBook:
         self,
         pool_id: str = "",
         max_depth: int = 500,
-        maker_fee_rate: Decimal = Decimal("0.0002"),   # 0.02%
-        taker_fee_rate: Decimal = Decimal("0.0005"),   # 0.05%
+        maker_fee_rate: Decimal = Decimal("0.0002"),  # 0.02%
+        taker_fee_rate: Decimal = Decimal("0.0005"),  # 0.05%
         self_trade_action: SelfTradeAction = SelfTradeAction.REJECT,
         min_order_size: Decimal = MIN_ORDER_SIZE,
         max_orders_per_address: int = MAX_ORDERS_PER_ADDRESS,
@@ -221,8 +230,8 @@ class OrderBook:
         self._orders: Dict[str, Order] = {}
         self._stop_orders: Dict[str, Order] = {}
         self._trades: Deque[Trade] = deque(maxlen=MAX_RECENT_TRADES)
-        self.last_price: Optional[Decimal] = None   # the stop-order trigger (consensus)
-        self._now: Optional[float] = None           # the current block's time
+        self.last_price: Optional[Decimal] = None  # the stop-order trigger (consensus)
+        self._now: Optional[float] = None  # the current block's time
 
         # --- Security state ---
         self._owner_order_count: Dict[str, int] = {}
@@ -235,6 +244,12 @@ class OrderBook:
         # --- Stats ---
         self.total_volume: Decimal = ZERO
         self.total_trades: int = 0
+
+        # --- Commitment cache: state_digest() as of _digest_version; every mutating entry
+        # point bumps _version (qrdx/exchange/commitment.py) ---
+        self._version: int = 0
+        self._digest: Optional[bytes] = None
+        self._digest_version: int = -1
 
     # -- Properties ---------------------------------------------------------
 
@@ -279,11 +294,13 @@ class OrderBook:
 
     def pause(self) -> None:
         """Emergency pause — blocks all new orders."""
+        self._version += 1
         self._paused = True
         logger.warning("Order book %s PAUSED", self.pool_id)
 
     def unpause(self) -> None:
         """Resume trading after emergency pause."""
+        self._version += 1
         self._paused = False
         logger.info("Order book %s resumed", self.pool_id)
 
@@ -308,28 +325,52 @@ class OrderBook:
         self.__dict__.clear()
         self.__dict__.update(state)
         self._trades = deque(trades, maxlen=MAX_RECENT_TRADES)
+        self._version += 1
 
     @_pinned
     def state_digest(self) -> bytes:
         """Every consensus-relevant field: each resting order in priority order (price level,
         then time), each parked stop order, the owners' order nonces, the trade sequence, the
         last trade price and the totals — not the display history or any wall-clock stamp."""
-        parts = [self.pool_id, str(self._trade_sequence), str(self.total_trades),
-                 str(self.total_volume), str(self.last_price)]
+        parts = [
+            self.pool_id,
+            str(self._trade_sequence),
+            str(self.total_trades),
+            str(self.total_volume),
+            str(self.last_price),
+        ]
         for tag, levels, best_first in (("b", self._bids, True), ("a", self._asks, False)):
             for price in sorted(levels, reverse=best_first):
                 parts.append(f"{tag}{price}")
                 for o in levels[price].orders:
-                    parts.append(f"{o.id}:{o.owner}:{o.side.value}:{o.order_type.value}:"
-                                 f"{o.price}:{o.amount}:{o.filled}:{o.status.value}:{o.nonce}:"
-                                 f"{o.expire_time}")
+                    parts.append(
+                        f"{o.id}:{o.owner}:{o.side.value}:{o.order_type.value}:"
+                        f"{o.price}:{o.amount}:{o.filled}:{o.status.value}:{o.nonce}:"
+                        f"{o.expire_time}"
+                    )
         for oid in sorted(self._stop_orders):
             o = self._stop_orders[oid]
-            parts.append(f"s{o.id}:{o.owner}:{o.side.value}:{o.stop_price}:{o.amount}:"
-                         f"{o.filled}:{o.status.value}:{o.nonce}:{o.expire_time}")
+            parts.append(
+                f"s{o.id}:{o.owner}:{o.side.value}:{o.stop_price}:{o.amount}:"
+                f"{o.filled}:{o.status.value}:{o.nonce}:{o.expire_time}"
+            )
         for owner in sorted(self._owner_nonces):
             parts.append(f"n{owner}:{self._owner_nonces[owner]}")
         return hashlib.blake2b("|".join(parts).encode(), digest_size=32).digest()
+
+    def cached_digest(self) -> bytes:
+        """``state_digest()``, recomputed only after an entry point that may have changed the
+        book (place, cancel, expiry, restore, pause)."""
+        if self._digest is None or self._digest_version != self._version:
+            self._digest = self.state_digest()
+            self._digest_version = self._version
+        return self._digest
+
+    def verify_digest(self) -> None:
+        from .commitment import CommitmentMismatch
+
+        if self.cached_digest() != self.state_digest():
+            raise CommitmentMismatch(f"order book {self.pool_id}: cached digest is stale")
 
     # -- Order placement ----------------------------------------------------
 
@@ -350,6 +391,7 @@ class OrderBook:
         Raises:
             ValueError: on invalid order parameters or security violations
         """
+        self._version += 1  # everything below may change the book
         if self._paused:
             raise ValueError("Order book is paused — emergency mode")
 
@@ -384,6 +426,7 @@ class OrderBook:
         Raises:
             ValueError: if caller is not the order owner
         """
+        self._version += 1
         # Check stop orders first
         if order_id in self._stop_orders:
             order = self._stop_orders[order_id]
@@ -394,9 +437,10 @@ class OrderBook:
             self._decrement_owner_count(order.owner, is_stop=True)
             return order
 
-        order = self._orders.get(order_id)
-        if order is None:
+        found = self._orders.get(order_id)
+        if found is None:
             return None
+        order = found
 
         if caller and order.owner != caller:
             raise ValueError("Only order owner can cancel")
@@ -424,7 +468,11 @@ class OrderBook:
         """Match a market order against the book."""
         trades = []
         opposite = self._asks if taker.side == OrderSide.BUY else self._bids
-        prices = sorted(opposite.keys()) if taker.side == OrderSide.BUY else sorted(opposite.keys(), reverse=True)
+        prices = (
+            sorted(opposite.keys())
+            if taker.side == OrderSide.BUY
+            else sorted(opposite.keys(), reverse=True)
+        )
 
         for price in list(prices):
             if taker.remaining <= 0 or taker.status == OrderStatus.CANCELLED:
@@ -436,7 +484,7 @@ class OrderBook:
 
         # Market orders: remaining is discarded (no resting)
         if taker.status == OrderStatus.CANCELLED:
-            pass                                  # self-trade prevention cancelled it
+            pass  # self-trade prevention cancelled it
         elif taker.remaining > 0:
             taker.status = OrderStatus.FILLED if taker.filled > 0 else OrderStatus.CANCELLED
         else:
@@ -477,7 +525,7 @@ class OrderBook:
 
     def _match_at_level(self, taker: Order, level: PriceLevel, price: Decimal) -> List[Trade]:
         """Match taker against all makers at a price level (time priority)."""
-        trades = []
+        trades: List[Trade] = []
         for maker in list(level.orders):
             if taker.remaining <= 0:
                 break
@@ -596,16 +644,12 @@ class OrderBook:
 
         # Enforce max depth
         if order.price not in book and len(book) >= self.max_depth:
-            raise ValueError(
-                f"Order book depth limit reached ({self.max_depth} levels)"
-            )
+            raise ValueError(f"Order book depth limit reached ({self.max_depth} levels)")
 
         # Enforce per-address order limit
         count = self._owner_order_count.get(order.owner, 0)
         if count >= self.max_orders_per_address:
-            raise ValueError(
-                f"Max orders per address reached ({self.max_orders_per_address})"
-            )
+            raise ValueError(f"Max orders per address reached ({self.max_orders_per_address})")
 
         if order.price not in book:
             book[order.price] = PriceLevel(price=order.price)
@@ -622,7 +666,9 @@ class OrderBook:
             raise ValueError(f"Order amount below minimum ({self.min_order_size})")
         if order.order_type == OrderType.LIMIT and order.price <= 0:
             raise ValueError("Limit order price must be positive")
-        if order.order_type == OrderType.STOP_LOSS and (order.stop_price is None or order.stop_price <= 0):
+        if order.order_type == OrderType.STOP_LOSS and (
+            order.stop_price is None or order.stop_price <= 0
+        ):
             raise ValueError("Stop-loss requires positive stop_price")
         if not order.owner:
             raise ValueError("Order must have an owner address")
@@ -640,18 +686,14 @@ class OrderBook:
         if order.nonce > 0:
             last_nonce = self._owner_nonces.get(order.owner, 0)
             if order.nonce <= last_nonce:
-                raise ValueError(
-                    f"Nonce replay: got {order.nonce}, expected > {last_nonce}"
-                )
+                raise ValueError(f"Nonce replay: got {order.nonce}, expected > {last_nonce}")
             self._owner_nonces[order.owner] = order.nonce
 
     def _check_rate_limit(self, owner: str) -> None:
         """Enforce per-block order rate limit."""
         count = self._block_order_count.get(owner, 0)
         if count >= MAX_ORDERS_PER_BLOCK_PER_ADDRESS:
-            raise ValueError(
-                f"Rate limit: max {MAX_ORDERS_PER_BLOCK_PER_ADDRESS} orders per block"
-            )
+            raise ValueError(f"Rate limit: max {MAX_ORDERS_PER_BLOCK_PER_ADDRESS} orders per block")
         self._block_order_count[owner] = count + 1
 
     def _decrement_owner_count(self, owner: str, is_stop: bool = False) -> None:

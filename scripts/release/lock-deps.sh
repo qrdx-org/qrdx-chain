@@ -4,6 +4,7 @@
 #   release/requirements.lock        what the node image installs (requirements-v3.txt + py-evm)
 #   release/build-requirements.lock  build backends for the dependencies that ship only as source
 #   release/test-requirements.lock   test tools, constrained by requirements.lock
+#   release/lint-requirements.lock   CI's lint and type-check tools, constrained by requirements.lock
 #
 #   scripts/release/lock-deps.sh                   re-lock, keeping every current pin that still
 #                                                  satisfies the inputs (the usual case: after
@@ -67,4 +68,5 @@ status=0
 compile requirements.in requirements.lock --no-emit-package qrdx-evm || status=1
 compile build-requirements.in build-requirements.lock || status=1
 compile test-requirements.in test-requirements.lock -c requirements.lock || status=1
+compile lint-requirements.in lint-requirements.lock -c requirements.lock || status=1
 exit "$status"

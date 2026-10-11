@@ -1,204 +1,69 @@
 """
 Pytest wrapper for the QRDX integration testnet.
 
-Runs the full scenario suite as a pytest test, allowing CI integration.
+Runs the canonical scenario suite (``integration_tests.run_scenarios.ALL_SCENARIOS``) once,
+against one live multi-node testnet and in dependency order — exactly what
+``python -m integration_tests.run_scenarios`` does — and reports each scenario as its own test.
 
-Usage:
-    pytest tests/test_testnet_integration.py -v --timeout=300
-    pytest tests/test_testnet_integration.py -v -k "genesis"
+    pytest tests/test_testnet_integration.py -m integration -q
+    pytest tests/test_testnet_integration.py -m integration -k s22
+
+(``-k`` selects which results are reported; the suite always runs whole, because later
+scenarios depend on earlier ones.) The previous wrapper ran every scenario through a fresh
+runner, so each one after the first was skipped for "unmet dependencies", and it covered only
+13 of the scenarios.
 """
 
 import asyncio
-import os
+from typing import Dict, Optional
 
 import pytest
 
-pytestmark = pytest.mark.integration
-
-from integration_tests.config import build_node_specs, DATABASES_DIR
+from integration_tests.config import build_node_specs
 from integration_tests.orchestrator import TestnetOrchestrator
-from integration_tests.scenarios.base import ScenarioContext, ScenarioRunner
+from integration_tests.run_scenarios import ALL_SCENARIOS
+from integration_tests.scenarios.base import ScenarioContext, ScenarioResult, ScenarioRunner
 
-# Import scenarios
-from integration_tests.scenarios.s01_genesis import S01GenesisBootstrap
-from integration_tests.scenarios.s02_peer_mesh import S02PeerMesh
-from integration_tests.scenarios.s03_block_production import S03BlockProduction
-from integration_tests.scenarios.s04_transactions import S04Transactions
-from integration_tests.scenarios.s04b_cross_type_transfers import S04bCrossTypeTransfers
-from integration_tests.scenarios.s05_tokens import S05Tokens
-from integration_tests.scenarios.s06_pools import S06Pools
-from integration_tests.scenarios.s07_validators import S07Validators
-from integration_tests.scenarios.s08_governance import S08Governance
-from integration_tests.scenarios.s09_bridge import S09Bridge
-from integration_tests.scenarios.s10_consistency import S10Consistency
-from integration_tests.scenarios.s11_stress import S11Stress
-from integration_tests.scenarios.s12_exchange_consensus import S12ExchangeConsensus
+# The whole suite runs in the first test's setup and takes several minutes.
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(3600)]
+
+SCENARIO_NAMES = [cls.name for cls in ALL_SCENARIOS]
 
 
-@pytest.fixture(scope="module")
-def event_loop():
-    """Create an event loop for the module."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="module")
-async def testnet(event_loop):
-    """Start the full integration testnet for the test module."""
+async def _run_suite() -> Optional[Dict[str, ScenarioResult]]:
     orch = TestnetOrchestrator(force_regenerate=True)
-    await orch.setup()
-    await orch.start_all_nodes()
-    ready = await orch.wait_network_ready()
-    assert ready, "Testnet failed to reach ready state"
-
-    yield orch
-
-    await orch.stop_all_nodes()
+    try:
+        await orch.setup()
+        await orch.start_all_nodes()
+        if not await orch.wait_network_ready():
+            return None
+        specs = build_node_specs(orch.num_nodes, orch.num_validators)
+        ctx = ScenarioContext(
+            orchestrator=orch,
+            wallets=orch.wallets,
+            node_urls=[p.url for p in orch.node_processes],
+            db_paths=[s.db_path for s in specs],
+        )
+        runner = ScenarioRunner(ctx)
+        runner.register_all(ALL_SCENARIOS)
+        return {r.name: r for r in await runner.run_all(stop_on_failure=False)}
+    finally:
+        await orch.stop_all_nodes()
 
 
 @pytest.fixture(scope="module")
-def scenario_ctx(testnet):
-    """Build a ScenarioContext from the running testnet."""
-    node_specs = build_node_specs(testnet.num_nodes, testnet.num_validators)
-    return ScenarioContext(
-        orchestrator=testnet,
-        wallets=testnet.wallets,
-        node_urls=[p.url for p in testnet.node_processes],
-        db_paths=[s.db_path for s in node_specs],
+def suite_results() -> Optional[Dict[str, ScenarioResult]]:
+    return asyncio.run(_run_suite())
+
+
+def test_the_testnet_reaches_ready_state(suite_results):
+    assert suite_results is not None, "testnet failed to reach ready state"
+
+
+@pytest.mark.parametrize("name", SCENARIO_NAMES)
+def test_scenario(suite_results, name):
+    assert suite_results is not None, "testnet failed to reach ready state"
+    result = suite_results[name]
+    assert result.passed, (
+        f"{name}: {result.error_message} ({result.checks_passed}/{result.checks_total} checks)"
     )
-
-
-# ── Individual Scenario Tests ─────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_s01_genesis_bootstrap(scenario_ctx):
-    """S01: Verify genesis block creation and node bootstrap."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S01GenesisBootstrap)
-    results = await runner.run_all()
-    assert results[0].passed, f"S01 failed: {results[0].error_message}"
-
-
-@pytest.mark.asyncio
-async def test_s02_peer_mesh(scenario_ctx):
-    """S02: Verify P2P network mesh formation."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S02PeerMesh)
-    results = await runner.run_all()
-    assert results[0].passed, f"S02 failed: {results[0].error_message}"
-
-
-@pytest.mark.asyncio
-async def test_s03_block_production(scenario_ctx):
-    """S03: Verify block production and consensus."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S03BlockProduction)
-    results = await runner.run_all()
-    assert results[0].passed, f"S03 failed: {results[0].error_message}"
-
-
-@pytest.mark.asyncio
-async def test_s04_transactions(scenario_ctx):
-    """S04: Verify UTXO transaction lifecycle."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S04Transactions)
-    results = await runner.run_all()
-    assert results[0].passed, f"S04 failed: {results[0].error_message}"
-
-
-@pytest.mark.asyncio
-async def test_s04b_cross_type_transfers(scenario_ctx):
-    """S04b: Verify native transfers between 0x and 0xPQ accounts, both ways."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S04bCrossTypeTransfers)
-    results = await runner.run_all()
-    assert results[0].passed, f"S04b failed: {results[0].error_message}"
-
-
-@pytest.mark.asyncio
-async def test_s05_token_operations(scenario_ctx):
-    """S05: Verify qRC20 token deployment and operations."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S05Tokens)
-    results = await runner.run_all()
-    assert results[0].passed, f"S05 failed: {results[0].error_message}"
-
-
-@pytest.mark.asyncio
-async def test_s06_pool_operations(scenario_ctx):
-    """S06: Verify AMM pool creation, liquidity, and swaps."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S06Pools)
-    results = await runner.run_all()
-    assert results[0].passed, f"S06 failed: {results[0].error_message}"
-
-
-@pytest.mark.asyncio
-async def test_s07_validator_lifecycle(scenario_ctx):
-    """S07: Verify validator registration and epoch processing."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S07Validators)
-    results = await runner.run_all()
-    assert results[0].passed, f"S07 failed: {results[0].error_message}"
-
-
-@pytest.mark.asyncio
-async def test_s08_governance(scenario_ctx):
-    """S08: Verify governance proposal lifecycle."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S08Governance)
-    results = await runner.run_all()
-    assert results[0].passed, f"S08 failed: {results[0].error_message}"
-
-
-@pytest.mark.asyncio
-async def test_s09_bridge_operations(scenario_ctx):
-    """S09: Verify cross-chain bridge operations."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S09Bridge)
-    results = await runner.run_all()
-    assert results[0].passed, f"S09 failed: {results[0].error_message}"
-
-
-@pytest.mark.asyncio
-async def test_s10_multi_node_consistency(scenario_ctx):
-    """S10: Verify state consistency across all nodes."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S10Consistency)
-    results = await runner.run_all()
-    assert results[0].passed, f"S10 failed: {results[0].error_message}"
-
-
-@pytest.mark.asyncio
-async def test_s11_stress(scenario_ctx):
-    """S11: Stress test with rapid transactions."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S11Stress)
-    results = await runner.run_all()
-    assert results[0].passed, f"S11 failed: {results[0].error_message}"
-
-
-@pytest.mark.asyncio
-async def test_s12_exchange_consensus(scenario_ctx):
-    """S12: Exchange tx submit→block→replay→cross-node consistency."""
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register(S12ExchangeConsensus)
-    results = await runner.run_all()
-    assert results[0].passed, f"S12 failed: {results[0].error_message}"
-
-
-# ── Full Suite Test ───────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_full_integration_suite(scenario_ctx):
-    """Run all 11 scenarios in dependency order."""
-    from integration_tests.run_scenarios import ALL_SCENARIOS
-
-    runner = ScenarioRunner(scenario_ctx)
-    runner.register_all(ALL_SCENARIOS)
-    results = await runner.run_all(stop_on_failure=False)
-
-    passed = sum(1 for r in results if r.passed)
-    total = len(results)
-    assert passed == total, f"Integration suite: {passed}/{total} passed"

@@ -9,7 +9,7 @@ A chain spec is the ``chain_spec`` section of a network's genesis file::
       "network": "qrdx-testnet",
       "chain_id": 7620,
       "dev": false,
-      "params":   {"SLOT_DURATION": 2, "SLOTS_PER_EPOCH": 32, ...every network parameter...},
+      "params":   {"SLOT_DURATION_MS": 2000, "SLOTS_PER_EPOCH": 32, ...every network parameter...},
       "features": ["..."],                       # rules active from genesis
       "forks": [                                 # the upgrade schedule, append-only
         {"name": "fork1", "height": 120000, "features": ["randao_selection"]}
@@ -53,20 +53,41 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
-    "SPEC_FORMAT", "PARAMS", "FEATURES", "CONSENSUS_ENV_SWITCHES", "RESERVED_CHAIN_IDS",
-    "ChainSpecError", "ChainSpec", "ForkId",
-    "dev_spec", "load_genesis_file", "resolve_genesis_file", "load_process_spec",
-    "active", "set_active", "use_spec", "is_active",
-    "check_peer_compatibility", "network_identity", "report", "params_from_environment",
-    "SIGNING_PURPOSES", "signing_domain", "set_approval_lookup", "fork_approval",
-    "active_features", "MAINNET_CHAIN_ID", "TESTNET_CHAIN_ID",
+    "SPEC_FORMAT",
+    "PARAMS",
+    "FEATURES",
+    "GENESIS_DEFAULT_FEATURES",
+    "CONSENSUS_ENV_SWITCHES",
+    "RESERVED_CHAIN_IDS",
+    "ChainSpecError",
+    "ChainSpec",
+    "ForkId",
+    "dev_spec",
+    "load_genesis_file",
+    "resolve_genesis_file",
+    "load_process_spec",
+    "active",
+    "set_active",
+    "use_spec",
+    "is_active",
+    "check_peer_compatibility",
+    "network_identity",
+    "report",
+    "params_from_environment",
+    "SIGNING_PURPOSES",
+    "signing_domain",
+    "set_approval_lookup",
+    "fork_approval",
+    "active_features",
+    "MAINNET_CHAIN_ID",
+    "TESTNET_CHAIN_ID",
 ]
 
 SPEC_FORMAT = 1
 
 _GENESIS_HASH_TAG = b"QRDX-CHAIN-SPEC-v1\x00"
 _FORK_ID_TAG = b"QRDX-FORK-ID-v1\x00"
-_FORK_HASH_BYTES = 16          # fork ids are peer filters, not commitments; 128 bits is ample
+_FORK_HASH_BYTES = 16  # fork ids are peer filters, not commitments; 128 bits is ample
 
 
 class ChainSpecError(ValueError):
@@ -76,6 +97,7 @@ class ChainSpecError(ValueError):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Network parameters
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _parse_int(raw: str) -> int:
     return int(raw)
@@ -95,7 +117,8 @@ class Param:
     network may set it from. ``height_aware`` marks a parameter whose every consumer reads it
     through ``ChainSpec.param_at(name, height)``; only such a parameter may be changed by a fork
     (a fork changing one read as a module constant would be silently ignored by that code)."""
-    kind: str                    # "int" | "str" | "list"
+
+    kind: str  # "int" | "str" | "list"
     default: Any
     env: str
     minimum: Optional[int] = None
@@ -108,44 +131,68 @@ class Param:
 # The dev defaults reproduce the values qrdx/constants.py used before the chain spec existed.
 PARAMS: Dict[str, Param] = {
     # Slot clock and epoch length (all nodes MUST agree: epochs drive finality and the
-    # validator lifecycle).
-    "SLOT_DURATION":                 Param("int", 2, "QRDX_SLOT_DURATION", minimum=1),
-    "SLOTS_PER_EPOCH":               Param("int", 32, "QRDX_SLOTS_PER_EPOCH", minimum=1),
-    "MIN_VALIDATORS":                Param("int", 4, "QRDX_MIN_VALIDATORS", minimum=1),
+    # validator lifecycle). The slot is in milliseconds; block timestamps stay in whole seconds,
+    # and consecutive blocks may share one. The standard is 250 ms slots and 32-slot (8 s)
+    # epochs. Parameters below counted in blocks or epochs are sized for that; a spec with
+    # another slot or epoch length must scale them to keep their wall-clock meaning.
+    "SLOT_DURATION_MS": Param("int", 250, "QRDX_SLOT_DURATION_MS", minimum=100),
+    "SLOTS_PER_EPOCH": Param("int", 32, "QRDX_SLOTS_PER_EPOCH", minimum=1),
+    "MIN_VALIDATORS": Param("int", 4, "QRDX_MIN_VALIDATORS", minimum=1),
     # Staking lifecycle.
-    "UNBONDING_PERIOD_EPOCHS":       Param("int", 5040, "QRDX_UNBONDING_PERIOD_EPOCHS", minimum=0),
-    "ACTIVATION_DELAY_EPOCHS":       Param("int", 4, "QRDX_ACTIVATION_DELAY_EPOCHS", minimum=0),
-    "WITHDRAWAL_DELAY_EPOCHS":       Param("int", 256, "QRDX_WITHDRAWAL_DELAY_EPOCHS", minimum=0),
+    # Unbonding ~3.7 days. Activation waits a number of epochs (a finality depth, not a
+    # duration). The withdrawal delay, the window for carrying evidence of an offence before
+    # the principal leaves, is ~4.6 hours.
+    "UNBONDING_PERIOD_EPOCHS": Param("int", 40_320, "QRDX_UNBONDING_PERIOD_EPOCHS", minimum=0),
+    "ACTIVATION_DELAY_EPOCHS": Param("int", 4, "QRDX_ACTIVATION_DELAY_EPOCHS", minimum=0),
+    "WITHDRAWAL_DELAY_EPOCHS": Param("int", 2_048, "QRDX_WITHDRAWAL_DELAY_EPOCHS", minimum=0),
     # Exchange / perps.
-    "ORACLE_REPORTERS":              Param("list", [], "QRDX_ORACLE_REPORTERS"),
-    "PERP_VAULT_LOCKUP_SECONDS":     Param("int", 4 * 24 * 3600, "QRDX_PERP_VAULT_LOCKUP_SECONDS", minimum=0),
-    "PERP_VAULT_SEEDERS":            Param("list", [], "QRDX_PERP_VAULT_SEEDERS"),
-    "PERP_COLLATERAL_TOKEN":         Param("str", "", "QRDX_PERP_COLLATERAL_TOKEN"),
-    "PERP_QUOTE":                    Param("str", "USD", "QRDX_PERP_QUOTE", empty_env_is_default=True),
-    "PERP_ORACLE_VOTE_MAX_AGE":      Param("int", 60, "QRDX_PERP_ORACLE_VOTE_MAX_AGE", minimum=1),
-    "PERP_ORACLE_STALE_SECONDS":     Param("int", 300, "QRDX_PERP_ORACLE_STALE_SECONDS", minimum=1),
-    "PERP_FUNDING_INTERVAL_SECONDS": Param("int", 3600, "QRDX_PERP_FUNDING_INTERVAL_SECONDS", minimum=1),
-    "EXCHANGE_MIN_GAS_PRICE_WEI":    Param("int", 10 ** 9, "QRDX_EXCHANGE_MIN_GAS_PRICE_WEI", minimum=0),
+    "ORACLE_REPORTERS": Param("list", [], "QRDX_ORACLE_REPORTERS"),
+    "PERP_VAULT_LOCKUP_SECONDS": Param(
+        "int", 4 * 24 * 3600, "QRDX_PERP_VAULT_LOCKUP_SECONDS", minimum=0
+    ),
+    "PERP_VAULT_SEEDERS": Param("list", [], "QRDX_PERP_VAULT_SEEDERS"),
+    "PERP_COLLATERAL_TOKEN": Param("str", "", "QRDX_PERP_COLLATERAL_TOKEN"),
+    "PERP_QUOTE": Param("str", "USD", "QRDX_PERP_QUOTE", empty_env_is_default=True),
+    "PERP_ORACLE_VOTE_MAX_AGE": Param("int", 60, "QRDX_PERP_ORACLE_VOTE_MAX_AGE", minimum=1),
+    "PERP_ORACLE_STALE_SECONDS": Param("int", 300, "QRDX_PERP_ORACLE_STALE_SECONDS", minimum=1),
+    "PERP_FUNDING_INTERVAL_SECONDS": Param(
+        "int", 3600, "QRDX_PERP_FUNDING_INTERVAL_SECONDS", minimum=1
+    ),
+    "EXCHANGE_MIN_GAS_PRICE_WEI": Param("int", 10**9, "QRDX_EXCHANGE_MIN_GAS_PRICE_WEI", minimum=0),
     # On-chain governance (qrdx/exchange/governance.py, docs/GOVERNANCE.md). Block counts, not
     # wall time: every node judges a deadline by the height of the block being applied.
-    # Defaults assume 2-second slots: 7 days of voting, a 2-day timelock (the holders' veto
-    # window), 7 days to execute a passed proposal.
-    "GOV_VOTING_PERIOD_BLOCKS":      Param("int", 302_400, "QRDX_GOV_VOTING_PERIOD_BLOCKS", minimum=1),
-    "GOV_TIMELOCK_BLOCKS":           Param("int", 86_400, "QRDX_GOV_TIMELOCK_BLOCKS", minimum=1),
-    "GOV_EXECUTION_WINDOW_BLOCKS":   Param("int", 302_400, "QRDX_GOV_EXECUTION_WINDOW_BLOCKS", minimum=1),
+    # At 250 ms slots (345,600 blocks a day): 7 days of voting, a 2-day timelock (the holders'
+    # veto window), 7 days to execute a passed proposal.
+    "GOV_VOTING_PERIOD_BLOCKS": Param("int", 2_419_200, "QRDX_GOV_VOTING_PERIOD_BLOCKS", minimum=1),
+    "GOV_TIMELOCK_BLOCKS": Param("int", 691_200, "QRDX_GOV_TIMELOCK_BLOCKS", minimum=1),
+    "GOV_EXECUTION_WINDOW_BLOCKS": Param(
+        "int", 2_419_200, "QRDX_GOV_EXECUTION_WINDOW_BLOCKS", minimum=1
+    ),
     # Share of the validator committee's stake (basis points) a proposal needs: 2/3, as finality.
-    "GOV_APPROVAL_THRESHOLD_BPS":    Param("int", 6_667, "QRDX_GOV_APPROVAL_THRESHOLD_BPS", minimum=5_001),
+    "GOV_APPROVAL_THRESHOLD_BPS": Param(
+        "int", 6_667, "QRDX_GOV_APPROVAL_THRESHOLD_BPS", minimum=5_001
+    ),
     # QRDX that holders must lock in vetoes to stop a passed proposal (10% of genesis supply).
-    "GOV_VETO_THRESHOLD_QRDX":       Param("int", 10_000_000, "QRDX_GOV_VETO_THRESHOLD_QRDX", minimum=1),
+    "GOV_VETO_THRESHOLD_QRDX": Param("int", 10_000_000, "QRDX_GOV_VETO_THRESHOLD_QRDX", minimum=1),
     # A fork activates only if its approval executed at least this many blocks before its
-    # height — deeper than any permitted reorg, so no reorg can flip whether it activates.
-    "GOV_FORK_APPROVAL_LEAD_BLOCKS": Param("int", 256, "QRDX_GOV_FORK_APPROVAL_LEAD_BLOCKS", minimum=1),
-    # From this height the genesis master controller can no longer move system-wallet funds;
-    # only executed governance proposals can (validators may also freeze it earlier).
-    "SYSTEM_WALLET_MASTER_SUNSET_HEIGHT": Param("int", 100_000, "QRDX_SYSTEM_WALLET_MASTER_SUNSET_HEIGHT", minimum=1),
+    # height — deeper than any permitted reorg, so no reorg can flip whether it activates. A
+    # depth, not a duration: fork resolution searches 256 blocks back, finality ~3 epochs.
+    "GOV_FORK_APPROVAL_LEAD_BLOCKS": Param(
+        "int", 256, "QRDX_GOV_FORK_APPROVAL_LEAD_BLOCKS", minimum=1
+    ),
+    # From this height (~2.3 days at 250 ms) the genesis master controller can no longer move
+    # system-wallet funds; only executed governance proposals can (validators may also freeze it
+    # earlier).
+    "SYSTEM_WALLET_MASTER_SUNSET_HEIGHT": Param(
+        "int", 800_000, "QRDX_SYSTEM_WALLET_MASTER_SUNSET_HEIGHT", minimum=1
+    ),
 }
 
-_PARSERS: Dict[str, Callable[[str], Any]] = {"int": _parse_int, "str": _parse_str, "list": _parse_list}
+_PARSERS: Dict[str, Callable[[str], Any]] = {
+    "int": _parse_int,
+    "str": _parse_str,
+    "list": _parse_list,
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,8 +207,18 @@ _PARSERS: Dict[str, Callable[[str], Any]] = {"int": _parse_int, "str": _parse_st
 FEATURES: Dict[str, str] = {
     "randao_selection": (
         "Proposer eligibility follows the RANDAO mix of the block's slot "
-        "(qrdx/validator/randao.py) instead of the fixed stake-weighted schedule."),
+        "(qrdx/validator/randao.py) instead of the fixed stake-weighted schedule."
+    ),
+    "incremental_state_root": (
+        "Each state-root domain commits to its state by an LtHash accumulator updated per "
+        "change (qrdx/state_commitment.py, qrdx/exchange/commitment.py) instead of a hash over "
+        "every entry in order: a root costs O(changes) rather than O(state)."
+    ),
 }
+
+# The rules a network created by this release has from genesis unless its spec says otherwise
+# (dev networks, and specs assembled by ``build_spec`` without an explicit feature list).
+GENESIS_DEFAULT_FEATURES: Tuple[str, ...] = ("incremental_state_root",)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,13 +243,24 @@ CONSENSUS_ENV_SWITCHES: Tuple[str, ...] = (
 # register its own id in the public chain registry — but it blocks the defaults this codebase
 # used to ship (1 is Ethereum mainnet; 88888 is assigned to Chiliz Chain).
 RESERVED_CHAIN_IDS: Dict[int, str] = {
-    1: "Ethereum mainnet", 5: "Goerli", 10: "OP Mainnet", 56: "BNB Smart Chain",
-    100: "Gnosis", 137: "Polygon PoS", 250: "Fantom", 1337: "local development",
-    8453: "Base", 17000: "Holesky", 31337: "Hardhat", 42161: "Arbitrum One",
-    43114: "Avalanche C-Chain", 88888: "Chiliz Chain", 11155111: "Sepolia",
+    1: "Ethereum mainnet",
+    5: "Goerli",
+    10: "OP Mainnet",
+    56: "BNB Smart Chain",
+    100: "Gnosis",
+    137: "Polygon PoS",
+    250: "Fantom",
+    1337: "local development",
+    8453: "Base",
+    17000: "Holesky",
+    31337: "Hardhat",
+    42161: "Arbitrum One",
+    43114: "Avalanche C-Chain",
+    88888: "Chiliz Chain",
+    11155111: "Sepolia",
 }
 
-DEV_CHAIN_ID = 88888            # the id every dev node has always reported
+DEV_CHAIN_ID = 88888  # the id every dev node has always reported
 DEV_NETWORK_NAME = "qrdx-dev"
 
 # QRDX's own public networks (both unassigned in the public chain registries, checked
@@ -203,8 +271,10 @@ MAINNET_CHAIN_ID = 762
 MAINNET_NETWORK_NAME = "qrdx-mainnet"
 TESTNET_CHAIN_ID = 7620
 TESTNET_NETWORK_NAME = "qrdx-testnet"
-QRDX_NETWORKS: Dict[int, str] = {MAINNET_CHAIN_ID: MAINNET_NETWORK_NAME,
-                                 TESTNET_CHAIN_ID: TESTNET_NETWORK_NAME}
+QRDX_NETWORKS: Dict[int, str] = {
+    MAINNET_CHAIN_ID: MAINNET_NETWORK_NAME,
+    TESTNET_CHAIN_ID: TESTNET_NETWORK_NAME,
+}
 
 # Published networks pinned by this release: network name -> genesis block hash. A node whose
 # spec names one of these networks must hold exactly that genesis block, so a tampered or stale
@@ -241,12 +311,15 @@ def _check_param_value(name: str, value: Any, where: str) -> Any:
         return value
     if p.kind == "str":
         if not isinstance(value, str) or value != value.strip():
-            raise ChainSpecError(f"{where}: {name} must be a string without surrounding "
-                                 f"whitespace, got {value!r}")
+            raise ChainSpecError(
+                f"{where}: {name} must be a string without surrounding "
+                f"whitespace, got {value!r}"
+            )
         return value
     # list of strings
     if not isinstance(value, list) or not all(
-            isinstance(a, str) and a and a == a.strip() and "," not in a for a in value):
+        isinstance(a, str) and a and a == a.strip() and "," not in a for a in value
+    ):
         raise ChainSpecError(f"{where}: {name} must be a list of non-empty strings, got {value!r}")
     if len(set(value)) != len(value):
         raise ChainSpecError(f"{where}: {name} lists an entry twice")
@@ -262,7 +335,8 @@ def _check_features(features: Any, where: str) -> List[str]:
     if unknown:
         raise ChainSpecError(
             f"{where}: unknown feature(s) {unknown}. This release cannot execute them, so it "
-            f"cannot follow this chain — upgrade the node software.")
+            f"cannot follow this chain — upgrade the node software."
+        )
     return sorted(features)
 
 
@@ -270,6 +344,7 @@ def _check_features(features: Any, where: str) -> List[str]:
 class ForkId:
     """What a node announces to peers: the hash of the fork history it has passed and the
     height of the next fork it knows of (0 if none)."""
+
     hash: str
     next: int
 
@@ -288,7 +363,8 @@ class ChainSpec:
             raise TypeError("build a ChainSpec with ChainSpec.from_dict (it validates)")
         self._data = data
         self._genesis_hash = hashlib.sha256(
-            _GENESIS_HASH_TAG + _canonical(self.genesis_part())).hexdigest()
+            _GENESIS_HASH_TAG + _canonical(self.genesis_part())
+        ).hexdigest()
         # (height, feature-set active from that height), ascending, starting at genesis.
         steps: List[Tuple[int, frozenset]] = [(0, frozenset(data["features"]))]
         acc = set(data["features"])
@@ -316,7 +392,8 @@ class ChainSpec:
         if raw["format"] != SPEC_FORMAT or not _is_int(raw["format"]):
             raise ChainSpecError(
                 f"chain spec format {raw['format']!r} is not supported by this release "
-                f"(supports {SPEC_FORMAT})")
+                f"(supports {SPEC_FORMAT})"
+            )
 
         network = raw["network"]
         if not isinstance(network, str) or not _NETWORK_RE.match(network):
@@ -324,18 +401,22 @@ class ChainSpec:
         if not isinstance(raw["dev"], bool):
             raise ChainSpecError("chain spec: dev must be true or false")
         chain_id = raw["chain_id"]
-        if not _is_int(chain_id) or not (0 < chain_id < 2 ** 63):
-            raise ChainSpecError(f"chain spec: chain_id must be a positive integer, got {chain_id!r}")
+        if not _is_int(chain_id) or not (0 < chain_id < 2**63):
+            raise ChainSpecError(
+                f"chain spec: chain_id must be a positive integer, got {chain_id!r}"
+            )
         if chain_id in QRDX_NETWORKS and (raw["dev"] or network != QRDX_NETWORKS[chain_id]):
             raise ChainSpecError(
                 f"chain spec: chain_id {chain_id} is {QRDX_NETWORKS[chain_id]}'s; only that "
                 f"network's (non-dev) spec may use it — a transaction signed elsewhere for it "
-                f"would be valid there")
+                f"would be valid there"
+            )
         if not raw["dev"] and chain_id in RESERVED_CHAIN_IDS:
             raise ChainSpecError(
                 f"chain spec: chain_id {chain_id} belongs to {RESERVED_CHAIN_IDS[chain_id]}. "
                 f"Transactions signed for one network would be valid on the other; register a "
-                f"unique chain id.")
+                f"unique chain id."
+            )
 
         params = raw["params"]
         if not isinstance(params, Mapping):
@@ -344,8 +425,10 @@ class ChainSpec:
         if extra:
             raise ChainSpecError(f"chain spec: unknown parameter(s) {sorted(extra)}")
         if absent:
-            raise ChainSpecError(f"chain spec: missing parameter(s) {sorted(absent)} — a "
-                                 f"network spec lists every parameter explicitly")
+            raise ChainSpecError(
+                f"chain spec: missing parameter(s) {sorted(absent)} — a "
+                f"network spec lists every parameter explicitly"
+            )
         clean_params = {k: _check_param_value(k, params[k], "chain spec params") for k in PARAMS}
 
         genesis_features = _check_features(raw["features"], "chain spec")
@@ -376,13 +459,16 @@ class ChainSpec:
                 raise ChainSpecError(
                     f"{where} ({name}): height must be an integer above the previous fork's "
                     f"({last_height}); got {height!r}. Rules active from genesis belong in the "
-                    f"top-level features list.")
+                    f"top-level features list."
+                )
             last_height = height
             feats = _check_features(f["features"], f"{where} ({name})")
             reused = seen_features.intersection(feats)
             if reused:
-                raise ChainSpecError(f"{where} ({name}): feature(s) {sorted(reused)} already "
-                                     f"activated earlier — features switch on once")
+                raise ChainSpecError(
+                    f"{where} ({name}): feature(s) {sorted(reused)} already "
+                    f"activated earlier — features switch on once"
+                )
             seen_features.update(feats)
             fork_params = f.get("params", {})
             if not isinstance(fork_params, Mapping):
@@ -393,18 +479,22 @@ class ChainSpec:
                 if not PARAMS[k].height_aware:
                     raise ChainSpecError(
                         f"{where} ({name}): parameter {k} cannot change at a fork — its "
-                        f"consumers read it as a constant fixed at genesis")
+                        f"consumers read it as a constant fixed at genesis"
+                    )
                 _check_param_value(k, v, f"{where} ({name})")
             if not feats and not fork_params:
                 raise ChainSpecError(f"{where} ({name}): a fork must change something")
             approval = f.get("approval", "validators")
             if approval not in FORK_APPROVAL_MODES:
-                raise ChainSpecError(f"{where} ({name}): approval must be one of "
-                                     f"{FORK_APPROVAL_MODES}, got {approval!r}")
+                raise ChainSpecError(
+                    f"{where} ({name}): approval must be one of "
+                    f"{FORK_APPROVAL_MODES}, got {approval!r}"
+                )
             if approval == "none" and not raw["dev"]:
                 raise ChainSpecError(
                     f"{where} ({name}): only a dev network may activate a fork without "
-                    f"validator approval")
+                    f"validator approval"
+                )
             entry: Dict[str, Any] = {"name": name, "height": height, "features": feats}
             if fork_params:
                 entry["params"] = {k: copy.deepcopy(fork_params[k]) for k in sorted(fork_params)}
@@ -412,10 +502,18 @@ class ChainSpec:
                 entry["approval"] = approval
             clean_forks.append(entry)
 
-        return cls({
-            "format": SPEC_FORMAT, "network": network, "chain_id": chain_id, "dev": raw["dev"],
-            "params": clean_params, "features": genesis_features, "forks": clean_forks,
-        }, _CONSTRUCT)
+        return cls(
+            {
+                "format": SPEC_FORMAT,
+                "network": network,
+                "chain_id": chain_id,
+                "dev": raw["dev"],
+                "params": clean_params,
+                "features": genesis_features,
+                "forks": clean_forks,
+            },
+            _CONSTRUCT,
+        )
 
     # ── identity ────────────────────────────────────────────────────────────
 
@@ -456,8 +554,10 @@ class ChainSpec:
     @staticmethod
     def _check_height(height: Any) -> int:
         if not _is_int(height) or height < 0:
-            raise ValueError(f"a block height is required (got {height!r}); rules are decided "
-                             f"by the height of the block being applied, never by the tip")
+            raise ValueError(
+                f"a block height is required (got {height!r}); rules are decided "
+                f"by the height of the block being applied, never by the tip"
+            )
         return height
 
     def scheduled_features_at(self, height: int) -> frozenset:
@@ -522,7 +622,9 @@ class ChainSpec:
 
     def fork_hashes(self, genesis_block_hash: str) -> List[str]:
         """``hashes[i]`` is the fork hash after the first ``i`` forks have passed."""
-        if not isinstance(genesis_block_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", genesis_block_hash):
+        if not isinstance(genesis_block_hash, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{64}", genesis_block_hash
+        ):
             raise ValueError("genesis block hash must be 64 hex characters")
         h = hashlib.sha256(_FORK_ID_TAG + bytes.fromhex(genesis_block_hash)).digest()
         out = [h[:_FORK_HASH_BYTES].hex()]
@@ -550,8 +652,10 @@ class ChainSpec:
 #  Peer compatibility
 # ─────────────────────────────────────────────────────────────────────────────
 
-def network_identity(spec: ChainSpec, genesis_block_hash: str, head: int,
-                     node_version: str) -> Dict[str, Any]:
+
+def network_identity(
+    spec: ChainSpec, genesis_block_hash: str, head: int, node_version: str
+) -> Dict[str, Any]:
     """What a node advertises in its handshake and status."""
     fid = spec.fork_id(genesis_block_hash, max(0, head))
     return {
@@ -565,7 +669,9 @@ def network_identity(spec: ChainSpec, genesis_block_hash: str, head: int,
     }
 
 
-def report(spec: ChainSpec, genesis_block_hash: str, head: int, node_version: str) -> Dict[str, Any]:
+def report(
+    spec: ChainSpec, genesis_block_hash: str, head: int, node_version: str
+) -> Dict[str, Any]:
     """An operator's view of the network and its upgrade schedule (``/chain_spec``,
     ``qrdx_chainSpec``): what is active now, what is scheduled, and when."""
     head = max(0, int(head))
@@ -604,8 +710,9 @@ def report(spec: ChainSpec, genesis_block_hash: str, head: int, node_version: st
     }
 
 
-def check_peer_compatibility(spec: ChainSpec, genesis_block_hash: str, head: int,
-                             remote: Any) -> Tuple[bool, str]:
+def check_peer_compatibility(
+    spec: ChainSpec, genesis_block_hash: str, head: int, remote: Any
+) -> Tuple[bool, str]:
     """
     Decide whether a peer advertising ``remote`` (``network_identity`` output) follows the same
     chain. EIP-2124's rules, with block heights:
@@ -646,15 +753,19 @@ def check_peer_compatibility(spec: ChainSpec, genesis_block_hash: str, head: int
 
     if r_hash == hashes[passed]:
         if r_next and head >= r_next:
-            return False, (f"peer schedules a fork at height {r_next}, which this node has passed "
-                           f"without it — one of the two runs outdated software or spec")
+            return False, (
+                f"peer schedules a fork at height {r_next}, which this node has passed "
+                f"without it — one of the two runs outdated software or spec"
+            )
         return True, ""
     for j in range(passed):
         if r_hash == hashes[j]:
             if r_next == heights[j]:
                 return True, ""
-            return False, (f"peer is behind and does not schedule the fork at height "
-                           f"{heights[j]} that this node has passed — it must upgrade")
+            return False, (
+                f"peer is behind and does not schedule the fork at height "
+                f"{heights[j]} that this node has passed — it must upgrade"
+            )
     for j in range(passed + 1, len(hashes)):
         if r_hash == hashes[j]:
             return True, ""
@@ -665,8 +776,10 @@ def check_peer_compatibility(spec: ChainSpec, genesis_block_hash: str, head: int
 #  Building and loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _env_lookup(env: Optional[Mapping[str, str]], dotenv: Optional[Mapping[str, Optional[str]]],
-                key: str) -> Optional[str]:
+
+def _env_lookup(
+    env: Optional[Mapping[str, str]], dotenv: Optional[Mapping[str, Optional[str]]], key: str
+) -> Optional[str]:
     """Environment first, then the .env file — the precedence qrdx.constants uses."""
     env = os.environ if env is None else env
     v = env.get(key)
@@ -680,8 +793,9 @@ def _env_lookup(env: Optional[Mapping[str, str]], dotenv: Optional[Mapping[str, 
 _DEV_ALLOWED_RESERVED = {DEV_CHAIN_ID, 1337, 31337}
 
 
-def params_from_environment(env: Optional[Mapping[str, str]] = None,
-                            dotenv: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, Any]:
+def params_from_environment(
+    env: Optional[Mapping[str, str]] = None, dotenv: Optional[Mapping[str, Optional[str]]] = None
+) -> Dict[str, Any]:
     """Every network parameter, from its environment variable or its dev default."""
     params: Dict[str, Any] = {}
     for name, p in PARAMS.items():
@@ -696,8 +810,9 @@ def params_from_environment(env: Optional[Mapping[str, str]] = None,
     return params
 
 
-def dev_spec(env: Optional[Mapping[str, str]] = None,
-             dotenv: Optional[Mapping[str, Optional[str]]] = None) -> ChainSpec:
+def dev_spec(
+    env: Optional[Mapping[str, str]] = None, dotenv: Optional[Mapping[str, Optional[str]]] = None
+) -> ChainSpec:
     """The spec of a node started without a genesis file: a development network whose
     parameters come from the environment (falling back to the historical defaults), exactly as
     before chain specs existed. Its genesis hash covers those values, so a dev database refuses
@@ -713,23 +828,34 @@ def dev_spec(env: Optional[Mapping[str, str]] = None,
             f"QRDX_CHAIN_ID={chain_id} is {QRDX_NETWORKS[chain_id]}'s chain id; a node with no "
             f"genesis file runs a dev network, and a dev network on that id would sign "
             f"transactions valid on {QRDX_NETWORKS[chain_id]}. Give the node the network's "
-            f"genesis file (QRDX_GENESIS_FILE).")
+            f"genesis file (QRDX_GENESIS_FILE)."
+        )
     if chain_id in RESERVED_CHAIN_IDS and chain_id not in _DEV_ALLOWED_RESERVED:
         raise ChainSpecError(
             f"QRDX_CHAIN_ID={chain_id} belongs to {RESERVED_CHAIN_IDS[chain_id]}; a node with no "
             f"genesis file runs a dev network, and keys used on both would have every transaction "
             f"replayable. Give the node its network's genesis file (QRDX_GENESIS_FILE), or unset "
-            f"QRDX_CHAIN_ID for a dev network.")
+            f"QRDX_CHAIN_ID for a dev network."
+        )
     network = _env_lookup(env, dotenv, "QRDX_NETWORK_NAME") or DEV_NETWORK_NAME
-    return ChainSpec.from_dict({
-        "format": SPEC_FORMAT, "network": network, "chain_id": chain_id, "dev": True,
-        "params": params, "features": [], "forks": [],
-    })
+    return ChainSpec.from_dict(
+        {
+            "format": SPEC_FORMAT,
+            "network": network,
+            "chain_id": chain_id,
+            "dev": True,
+            "params": params,
+            "features": list(GENESIS_DEFAULT_FEATURES),
+            "forks": [],
+        }
+    )
 
 
-def resolve_genesis_file(env: Optional[Mapping[str, str]] = None,
-                         dotenv: Optional[Mapping[str, Optional[str]]] = None,
-                         database_path: Optional[str] = None) -> Optional[str]:
+def resolve_genesis_file(
+    env: Optional[Mapping[str, str]] = None,
+    dotenv: Optional[Mapping[str, Optional[str]]] = None,
+    database_path: Optional[str] = None,
+) -> Optional[str]:
     """Where this process's genesis file is: ``QRDX_GENESIS_FILE`` if set (it must exist),
     else ``genesis_config.json`` two directories above the database (the testnet layout the
     node has always used), else none."""
@@ -760,13 +886,17 @@ def load_genesis_file(path: str) -> Tuple[Dict[str, Any], ChainSpec]:
         raise ChainSpecError(
             f"genesis file {path} has no chain_spec section. It was produced by a release "
             f"before chain specs; regenerate the network's genesis (a new network) — a node "
-            f"cannot guess the consensus parameters a chain was started with.")
+            f"cannot guess the consensus parameters a chain was started with."
+        )
     spec = ChainSpec.from_dict(data["chain_spec"])
     return data, spec
 
 
-def environment_conflicts(spec: ChainSpec, env: Optional[Mapping[str, str]] = None,
-                          dotenv: Optional[Mapping[str, Optional[str]]] = None) -> List[str]:
+def environment_conflicts(
+    spec: ChainSpec,
+    env: Optional[Mapping[str, str]] = None,
+    dotenv: Optional[Mapping[str, Optional[str]]] = None,
+) -> List[str]:
     """Environment settings that try to change consensus on a non-dev network. Empty for a dev
     network (which takes them from the environment by design)."""
     if spec.dev:
@@ -779,25 +909,35 @@ def environment_conflicts(spec: ChainSpec, env: Optional[Mapping[str, str]] = No
         try:
             value = _PARSERS[p.kind](raw)
         except ValueError:
-            problems.append(f"{p.env}={raw!r} is set, but {spec.network} takes {name} from its "
-                            f"chain spec ({spec.params[name]!r})")
+            problems.append(
+                f"{p.env}={raw!r} is set, but {spec.network} takes {name} from its "
+                f"chain spec ({spec.params[name]!r})"
+            )
             continue
         if value != spec.params[name]:
-            problems.append(f"{p.env}={raw!r} conflicts with the chain spec's {name} = "
-                            f"{spec.params[name]!r}")
+            problems.append(
+                f"{p.env}={raw!r} conflicts with the chain spec's {name} = "
+                f"{spec.params[name]!r}"
+            )
     chain_raw = _env_lookup(env, dotenv, "QRDX_CHAIN_ID")
     if chain_raw and chain_raw.strip() != str(spec.chain_id):
-        problems.append(f"QRDX_CHAIN_ID={chain_raw!r} conflicts with the chain spec's chain_id "
-                        f"{spec.chain_id}")
+        problems.append(
+            f"QRDX_CHAIN_ID={chain_raw!r} conflicts with the chain spec's chain_id "
+            f"{spec.chain_id}"
+        )
     net_raw = _env_lookup(env, dotenv, "QRDX_NETWORK_NAME")
     if net_raw and net_raw.strip() != spec.network:
-        problems.append(f"QRDX_NETWORK_NAME={net_raw!r} conflicts with the chain spec's network "
-                        f"{spec.network!r}")
+        problems.append(
+            f"QRDX_NETWORK_NAME={net_raw!r} conflicts with the chain spec's network "
+            f"{spec.network!r}"
+        )
     for switch in CONSENSUS_ENV_SWITCHES:
         raw = _env_lookup(env, dotenv, switch)
         if raw is not None and raw.strip():
-            problems.append(f"{switch}={raw!r} is a development switch; on {spec.network} the "
-                            f"chain spec alone decides consensus behaviour")
+            problems.append(
+                f"{switch}={raw!r} is a development switch; on {spec.network} the "
+                f"chain spec alone decides consensus behaviour"
+            )
     return problems
 
 
@@ -805,15 +945,18 @@ def environment_conflicts(spec: ChainSpec, env: Optional[Mapping[str, str]] = No
 class ProcessSpec:
     """What ``qrdx.constants`` loads at import: the spec, the genesis file it came from (None for
     the built-in dev spec), and any environment conflicts the node must refuse to start with."""
+
     spec: ChainSpec
     genesis_file: Optional[str]
     genesis_data: Optional[Dict[str, Any]]
     env_conflicts: Tuple[str, ...]
 
 
-def load_process_spec(env: Optional[Mapping[str, str]] = None,
-                      dotenv: Optional[Mapping[str, Optional[str]]] = None,
-                      database_path: Optional[str] = None) -> ProcessSpec:
+def load_process_spec(
+    env: Optional[Mapping[str, str]] = None,
+    dotenv: Optional[Mapping[str, Optional[str]]] = None,
+    database_path: Optional[str] = None,
+) -> ProcessSpec:
     """Resolve and load this process's chain spec. Raises ``ChainSpecError`` if a genesis file
     exists but cannot be used — a node must never fall back to other rules than its network's."""
     path = resolve_genesis_file(env, dotenv, database_path)
@@ -866,14 +1009,20 @@ def use_spec(spec: ChainSpec) -> Iterator[ChainSpec]:
 # one purpose — never verifies as another (Ethereum's compute_domain). Without it, two block
 # headers a validator signed at one slot on a testnet are a valid DOUBLE_SIGN proof on every
 # network where it uses the same key.
-SIGNING_PURPOSES = ("block", "attestation", "randao")
+# p2p-handshake: a node proving its identity to a peer (qrdx.rpc.modules.p2p).
+SIGNING_PURPOSES = ("block", "attestation", "randao", "p2p-handshake")
 _SIGNING_DOMAIN_TAG = b"QRDX-SIGNING-DOMAIN-v1\x00"
 
 
 @functools.lru_cache(maxsize=64)
 def _signing_domain(purpose: str, chain_id: int, spec_hash: str) -> bytes:
-    return hashlib.sha256(_SIGNING_DOMAIN_TAG + purpose.encode() + b"\x00"
-                          + chain_id.to_bytes(8, "big") + bytes.fromhex(spec_hash)).digest()
+    return hashlib.sha256(
+        _SIGNING_DOMAIN_TAG
+        + purpose.encode()
+        + b"\x00"
+        + chain_id.to_bytes(8, "big")
+        + bytes.fromhex(spec_hash)
+    ).digest()
 
 
 def signing_domain(purpose: str, spec: Optional[ChainSpec] = None) -> bytes:
@@ -908,8 +1057,13 @@ def fork_approval(spec: ChainSpec, fork: Mapping[str, Any]) -> Dict[str, Any]:
         approved_at = _APPROVAL_LOOKUP(fork["name"], digest)
     deadline = fork["height"] - lead
     in_time = mode == "none" or (approved_at is not None and approved_at <= deadline)
-    return {"mode": mode, "definition_hash": digest, "approve_by": deadline,
-            "approved_at": approved_at, "approved": in_time}
+    return {
+        "mode": mode,
+        "definition_hash": digest,
+        "approve_by": deadline,
+        "approved_at": approved_at,
+        "approved": in_time,
+    }
 
 
 def is_active(feature: str, height: int) -> bool:
@@ -939,18 +1093,33 @@ def active_features(height: int, spec: Optional[ChainSpec] = None) -> List[str]:
     return sorted(out)
 
 
-def build_spec(network: str, chain_id: int, params: Mapping[str, Any], *,
-               dev: bool = False, features: Sequence[str] = (),
-               forks: Sequence[Mapping[str, Any]] = ()) -> ChainSpec:
+def build_spec(
+    network: str,
+    chain_id: int,
+    params: Mapping[str, Any],
+    *,
+    dev: bool = False,
+    features: Optional[Sequence[str]] = None,
+    forks: Sequence[Mapping[str, Any]] = (),
+) -> ChainSpec:
     """Assemble and validate a spec (genesis tooling). ``params`` may be partial: missing ones
     take the dev defaults, so tooling states only what its network changes — the written spec
-    still lists every parameter."""
+    still lists every parameter. ``features`` defaults to ``GENESIS_DEFAULT_FEATURES``."""
+    if features is None:
+        features = GENESIS_DEFAULT_FEATURES
     full = {k: copy.deepcopy(p.default) for k, p in PARAMS.items()}
     unknown = set(params) - set(PARAMS)
     if unknown:
         raise ChainSpecError(f"unknown parameter(s) {sorted(unknown)}")
     full.update({k: copy.deepcopy(v) for k, v in params.items()})
-    return ChainSpec.from_dict({
-        "format": SPEC_FORMAT, "network": network, "chain_id": chain_id, "dev": dev,
-        "params": full, "features": list(features), "forks": [dict(f) for f in forks],
-    })
+    return ChainSpec.from_dict(
+        {
+            "format": SPEC_FORMAT,
+            "network": network,
+            "chain_id": chain_id,
+            "dev": dev,
+            "params": full,
+            "features": list(features),
+            "forks": [dict(f) for f in forks],
+        }
+    )

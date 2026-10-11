@@ -136,40 +136,48 @@ class S10Consistency(Scenario):
             # tolerance above. Determinism guarantees the trailing node converges to
             # the same balance once it catches up.
             async def _heights_and_balances():
-                out = {}
-                for url in node_urls:
+                """Every node's (height, recipient balance), read concurrently (one at a time,
+                at sub-second slots, no two nodes were ever read at the same height)."""
+                async def one(url):
                     try:
-                        await asyncio.sleep(0.3)
                         async with NodeRPCClient(url) as client:
                             info = await client.get_mining_info()
                             h = (info or {}).get("last_block", {}).get("id", 0)
-                            bal = await client.eth_get_balance(recipient_addr)
-                            out[url] = (h, bal)
+                            return url, (h, await client.eth_get_balance(recipient_addr))
                     except Exception:
-                        pass
-                return out
+                        return url, None
+
+                got = await asyncio.gather(*(one(u) for u in node_urls))
+                return {u: v for u, v in got if v is not None}
+
+            def _agreement(hb):
+                """Nodes at the same height must hold the same balance, and at least two must
+                share a height for that to mean anything. Returns (ok, compared, height)."""
+                by_height = {}
+                for h, bal in hb.values():
+                    by_height.setdefault(h, []).append(bal)
+                shared = [h for h, bals in by_height.items() if len(bals) >= 2]
+                ok = bool(shared) and all(len(set(b)) == 1 for b in by_height.values())
+                top = max(shared) if shared else (max(by_height) if by_height else -1)
+                return ok, len(by_height.get(top, [])), top
 
             hb = {}
-            for _ in range(8):  # ~16s, matches the convergence window above
+            for _ in range(16):
                 hb = await _heights_and_balances()
-                if hb:
-                    max_h = max(h for h, _ in hb.values())
-                    at_tip = {u: b for u, (h, b) in hb.items() if h == max_h}
-                    if len(at_tip) >= 2 and len(set(at_tip.values())) == 1:
-                        break
-                await asyncio.sleep(2)
+                if hb and _agreement(hb)[0]:
+                    break
+                await asyncio.sleep(1)
 
             if hb:
-                max_h = max(h for h, _ in hb.values())
-                at_tip = {u: b for u, (h, b) in hb.items() if h == max_h}
+                ok, n, max_h = _agreement(hb)
                 self._log.info(
-                    "Recipient balances by node (height, wei): %s; comparing %d node(s) at tip height %d",
-                    {u: hb[u] for u in hb}, len(at_tip), max_h,
+                    "Recipient balances by node (height, wei): %s; comparing %d node(s) at "
+                    "height %d", {u: hb[u] for u in hb}, n, max_h,
                 )
                 self.check(
-                    len(at_tip) >= 2 and len(set(at_tip.values())) == 1,
+                    ok,
                     f"Recipient balance consistent across nodes at tip height {max_h} "
-                    f"({len(at_tip)} node(s), unique={len(set(at_tip.values()))})",
+                    f"({n} node(s), unique=1)",
                 )
                 self.check(
                     all(b > 0 for _, b in hb.values()),

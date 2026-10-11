@@ -19,6 +19,7 @@ different hashes → the eligible proposer signed two blocks for its slot (slash
 proposers at adjacent slots (the benign equal-height race) fail the same-proposer check, so they
 can never be smuggled in as a slash.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -94,43 +95,59 @@ def extract_slashing_evidence_from_dict(block: Dict[str, Any]) -> List[Dict[str,
 
 def attestation_equivocation(a: Dict[str, Any], b: Dict[str, Any]) -> Optional[str]:
     """Attestation-slashing relationship between two attestations BY THE SAME validator, or None
-    if they don't conflict:
-      - 'double_vote'   : same SLOT, DIFFERENT block_hash (two heads signed for one slot).
-      - 'surround_vote' : one's (source,target) span STRICTLY surrounds the other's.
+    if they don't conflict — the Casper FFG conditions (qrdx/validator/ffg.py):
 
-    IMPORTANT — the double-vote rule keys on SLOT, not target_epoch. This chain attests PER SLOT
-    (node_integration attests every slot with target_epoch = slot // SLOTS_PER_EPOCH), so ONE
-    honest validator legitimately casts many attestations that share a target epoch but point at
-    the ADVANCING head (different block_hash) across the epoch's slots. Keying double-vote on
-    target_epoch (canonical single-vote-per-epoch Casper) would flag that honest pattern as
-    slashable — and, since attestations ride blocks publicly, would let anyone HARVEST two honest
-    per-slot attestations and forge a slash. An honest validator signs exactly ONE head per slot,
-    so same-slot/different-block is genuine equivocation; different slots never conflict. Honest
-    source/target spans are width-1 (source = target-1), which can never strictly surround another,
-    so surround never fires on honest voting either. (A stricter future option is to make the
-    attester emit one vote per target so the canonical target-keyed rule would apply.)"""
+      - 'double_vote'   : two DIFFERENT votes for the same target epoch.
+      - 'surround_vote' : one's (source, target) span strictly surrounds the other's.
+
+    A validator casts one vote per epoch (``ffg.vote_slot``) and its signing record refuses a
+    second, different one for the same target, so neither fires on honest voting. (The rule used
+    to key double votes on the slot, because validators attested every slot to an advancing
+    head; that per-slot voting is what let a validator switching forks support both branches.)"""
     try:
         sa, ta = int(a["source_epoch"]), int(a["target_epoch"])
         sb, tb = int(b["source_epoch"]), int(b["target_epoch"])
-        sla, slb = int(a["slot"]), int(b["slot"])
     except (KeyError, TypeError, ValueError):
         return None
-    ha, hb = a.get("block_hash"), b.get("block_hash")
-    if sla == slb and ha != hb:
+    if ta == tb and _vote_data(a) != _vote_data(b):
+        # Only FFG votes (both checkpoint roots signed) are compared: a copy missing them is the
+        # same vote seen through a store that dropped fields, not a second vote.
+        if not (a.get("target_root") and b.get("target_root")):
+            return None
         return "double_vote"
     if (sa < sb and ta > tb) or (sb < sa and tb > ta):
         return "surround_vote"
     return None
 
 
-def make_attestation_evidence(att_a: Dict[str, Any], att_b: Dict[str, Any],
-                              public_key_hex: str) -> Dict[str, Any]:
+def _vote_data(att: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Everything an attestation signs, so two signatures over different data never compare
+    equal (re-sending one attestation is not a double vote)."""
+    return tuple(
+        str(att.get(k, ""))
+        for k in (
+            "slot",
+            "epoch",
+            "block_hash",
+            "source_epoch",
+            "source_root",
+            "target_epoch",
+            "target_root",
+        )
+    )
+
+
+def make_attestation_evidence(
+    att_a: Dict[str, Any], att_b: Dict[str, Any], public_key_hex: str
+) -> Dict[str, Any]:
     """Build canonical attestation-equivocation evidence: the two conflicting attestation dicts
     plus the offending validator's public key (attestations carry no pubkey, so — like a
     DOUBLE_SIGN proof's proposer_public_key — the pubkey rides the evidence so importers can
     verify with no external state). Ordered by (target_epoch, block_hash) for determinism."""
-    if (int(att_a.get("target_epoch", 0)), str(att_a.get("block_hash", ""))) > \
-       (int(att_b.get("target_epoch", 0)), str(att_b.get("block_hash", ""))):
+    if (int(att_a.get("target_epoch", 0)), str(att_a.get("block_hash", ""))) > (
+        int(att_b.get("target_epoch", 0)),
+        str(att_b.get("block_hash", "")),
+    ):
         att_a, att_b = att_b, att_a
     # Record under SURROUND_VOTE (the 50% attestation-equivocation SlashingConditions) for BOTH
     # double- and surround-votes — they are the same offence class + penalty; the precise kind is
@@ -153,8 +170,9 @@ def verify_attestation_evidence(evidence: Dict[str, Any]) -> Tuple[bool, str]:
     carried in the evidence, derives to their validator_address) and they form a double/surround
     vote. A malicious proposer cannot fabricate one for an honest validator — it would need that
     validator's signature over two conflicting attestations."""
-    from .attestation import Attestation
     from ..crypto.pq.dilithium import PQPublicKey
+    from .attestation import Attestation
+
     a, b = evidence.get("att_a"), evidence.get("att_b")
     if not isinstance(a, dict) or not isinstance(b, dict):
         return False, "evidence missing att_a/att_b"
@@ -201,6 +219,7 @@ def verified_offence(evidence: Dict[str, Any]) -> Optional[Tuple[str, str, int, 
       key to that address) and the earlier of the two slots.
     """
     from ..constants import SLOTS_PER_EPOCH
+
     if not isinstance(evidence, dict):
         return None
     if str(evidence.get("condition", "double_sign")) in ("surround_vote", "double_vote"):
@@ -241,6 +260,7 @@ async def record_block_slashing_evidence(db, block: Dict[str, Any]) -> int:
     INSERT-OR-IGNORE on (validator, slot, condition), so re-inclusion across blocks is a harmless
     no-op. Best-effort: a bad proof is skipped, never raised. Returns the count newly recorded."""
     import json
+
     evidence_list = extract_slashing_evidence_from_dict(block)
     if not evidence_list:
         return 0

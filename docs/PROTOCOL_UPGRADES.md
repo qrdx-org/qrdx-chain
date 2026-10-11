@@ -60,8 +60,8 @@ The `chain_spec` section of a network's genesis file:
   "network": "qrdx-testnet",
   "chain_id": 7620,
   "dev": false,
-  "params":   { "SLOT_DURATION": 2, "SLOTS_PER_EPOCH": 32, "...": "every parameter" },
-  "features": [],
+  "params":   { "SLOT_DURATION_MS": 250, "SLOTS_PER_EPOCH": 32, "...": "every parameter" },
+  "features": ["incremental_state_root"],
   "forks": [
     { "name": "randao", "height": 120000, "features": ["randao_selection"] }
   ]
@@ -70,10 +70,18 @@ The `chain_spec` section of a network's genesis file:
 
 - **`params`** lists every network parameter (`chain_spec.PARAMS`) explicitly. A missing or
   unknown parameter is an error, because a later release changing a default must not change a
-  running chain. The parameters are the ones networks have always varied: slot length, epoch
-  length, minimum validators, staking delays, oracle reporters and the perps settings, and the
-  exchange gas floor.
-- **`features`** lists rules active from genesis.
+  running chain. The parameters are the ones networks have always varied: slot length (in
+  milliseconds, `SLOT_DURATION_MS`, so a network can run sub-second slots), epoch length,
+  minimum validators, staking delays, oracle reporters and the perps settings, and the exchange
+  gas floor. The standard is 250 ms slots and 32-slot (8 s) epochs. Parameters counted in blocks
+  (`GOV_*_BLOCKS`, `SYSTEM_WALLET_MASTER_SUNSET_HEIGHT`) or epochs (`UNBONDING_PERIOD_EPOCHS`,
+  `WITHDRAWAL_DELAY_EPOCHS`) have defaults sized for that, so they last a set wall-clock time:
+  7 days of governance voting, a 2-day timelock, ~3.7 days of unbonding. A spec with another
+  slot or epoch length must scale them. Validator rewards and penalties are already set per
+  unit of time (`epoch_rewards.reward_quotient`).
+- **`features`** lists rules active from genesis. A spec this release assembles (the dev spec,
+  `build_spec` without a feature list) gets `chain_spec.GENESIS_DEFAULT_FEATURES`:
+  `incremental_state_root`.
 - **`forks`** is the upgrade schedule. It is append-only, heights strictly increase, and each
   feature is switched on exactly once.
 - **`dev`** marks a development network (see §6).
@@ -174,6 +182,13 @@ eligibility (`validator/block_verification.py`, `validator/manager.py`) asks
 `randao.randao_selection_active(height)`. The old `QRDX_ENFORCE_RANDAO` switch survives only
 as a dev-network override.
 
+**`incremental_state_root`** changes how every state-root domain commits to its state: an
+LtHash accumulator updated per change instead of a hash over every entry in order
+(`state_commitment.py` for the account, token and UTXO domains, `exchange/commitment.py` for
+the exchange). Each root getter takes the height of the block it is computed for and branches
+on `is_active("incremental_state_root", height)`, so a network created without it can switch
+to it at a fork. New networks have it from genesis.
+
 ## 5. Peers: fork ids (EIP-2124)
 
 A node advertises its identity in the handshake challenge, the handshake response and
@@ -214,7 +229,7 @@ Implicit peer discovery through signed REST requests now also requires the calle
 
 The environment check (`chain_spec.environment_conflicts`) covers:
 
-- every parameter's variable (`QRDX_SLOT_DURATION`, `QRDX_WITHDRAWAL_DELAY_EPOCHS`, …), plus
+- every parameter's variable (`QRDX_SLOT_DURATION_MS`, `QRDX_WITHDRAWAL_DELAY_EPOCHS`, …), plus
   `QRDX_CHAIN_ID` and `QRDX_NETWORK_NAME`;
 - the development A/B switches in `CONSENSUS_ENV_SWITCHES` (`QRDX_ENFORCE_RANDAO`,
   `QRDX_ENFORCE_FAILED_TX_COSTS`, `QRDX_ENFORCE_PARENT_CONTINUITY`,
@@ -377,6 +392,6 @@ These are breaking changes by design. Every existing network must be **regenerat
 - **The passed-forks record** is written at startup. A fork that passes while the node runs is
   recorded at the next start. In between, tampering is caught by the network (fork ids) rather
   than locally.
-- **The p2p RPC transport is unauthenticated.** The identity check keeps honest but
-  misconfigured nodes apart. It does not stop a malicious peer from claiming an identity.
-  Block validity remains the real defence (see docs/KNOWN_ISSUES.md).
+- **Peer identity** is now authenticated: signed peer calls and a mutual handshake proof
+  (docs/KNOWN_ISSUES.md, "The peer RPC transport was unauthenticated"). Block validity
+  remains the defence against a peer that is who it claims to be and still misbehaves.

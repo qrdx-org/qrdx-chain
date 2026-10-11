@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import List, Optional, Tuple
 
 from rich.console import Console
 from rich.highlighter import RegexHighlighter
@@ -27,14 +27,13 @@ from rich.logging import RichHandler
 from rich.theme import Theme
 
 from .constants import (
-    LOG_LEVEL,
-    LOG_FORMAT,
-    LOG_DATE_FORMAT,
-    LOG_MAX_FILE_SIZE,
     LOG_BACKUP_COUNT,
     LOG_CONSOLE_HIGHLIGHTING,
+    LOG_DATE_FORMAT,
+    LOG_FORMAT,
+    LOG_LEVEL,
+    LOG_MAX_FILE_SIZE,
 )
-
 
 # Define log file location relative to the project root
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -53,10 +52,10 @@ class LogManager:
         _instance (LogManager): The singleton instance.
         _lock (threading.Lock): Thread lock for atomic initialization.
     """
-    
+
     _instance: Optional["LogManager"] = None
     _lock: threading.Lock = threading.Lock()
-    
+    _initialized: bool = False
 
     def __new__(cls) -> "LogManager":
         """Creates or returns the existing singleton instance."""
@@ -67,7 +66,6 @@ class LogManager:
                     cls._instance = super().__new__(cls)
                     cls._instance._initialized = False
         return cls._instance
-    
 
     def __init__(self) -> None:
         """Initializes the LogManager instance."""
@@ -75,7 +73,6 @@ class LogManager:
             return
         self._configured = False
         self._initialized = True
-    
 
     @staticmethod
     def validate_log_format(log_format: str) -> str:
@@ -100,7 +97,7 @@ class LogManager:
             # This regex looks for valid keys inside format specifiers
             format_specifier_pattern = r"\([a-zA-Z_][a-zA-Z0-9_]*\)[a-zA-Z]"
             paren_pattern = re.compile(format_specifier_pattern)
-            
+
             # Ensure every match is preceded by a '%' char
             for match in paren_pattern.finditer(log_format):
                 start_pos = match.start()
@@ -110,8 +107,13 @@ class LogManager:
             # Test formatting against a dummy record to catch runtime errors
             formatter = logging.Formatter(fmt=log_format)
             record = logging.LogRecord(
-                name="test", level=logging.INFO, pathname="", lineno=0,
-                msg="test", args=(), exc_info=None,
+                name="test",
+                level=logging.INFO,
+                pathname="",
+                lineno=0,
+                msg="test",
+                args=(),
+                exc_info=None,
             )
             formatted_output = formatter.format(record)
 
@@ -132,7 +134,6 @@ class LogManager:
             )
             return str(LOG_FORMAT.default())
 
-
     @staticmethod
     def validate_date_format(date_format: str) -> str:
         """
@@ -152,10 +153,10 @@ class LogManager:
         # Regex strictly matches valid strftime directives (e.g., %Y, %m, %d)
         # and standard separators to prevent injection of arbitrary text.
         date_format_pattern = re.compile(
-            rf"^(?=.*%(?!%)(?:[EO])?(?:[-_0^#])*(?:[A-DF-HIM-NPR-VW-Za-hj-lm-npr-uw-z]))"
-            rf"(?:%%|%(?:[EO])?(?:[-_0^#])*(?:[A-DF-HIM-NPR-VW-Za-hj-lm-npr-uw-z])|[0-9 \t:\-\/\.,TZ+])+$"
+            r"^(?=.*%(?!%)(?:[EO])?(?:[-_0^#])*(?:[A-DF-HIM-NPR-VW-Za-hj-lm-npr-uw-z]))"
+            r"(?:%%|%(?:[EO])?(?:[-_0^#])*(?:[A-DF-HIM-NPR-VW-Za-hj-lm-npr-uw-z])|[0-9 \t:\-\/\.,TZ+])+$"
         )
-        
+
         # Fallback to default format on validation failure to ensure logging continuity
         if not date_format_pattern.match(date_format):
             print(
@@ -167,7 +168,6 @@ class LogManager:
 
         return date_format
 
-
     def configure(
         self,
         log_level: Optional[str] = None,
@@ -177,7 +177,7 @@ class LogManager:
     ) -> None:
         """
         Configures the root logger with console and file handlers.
-        
+
         This sets the global logging level, suppresses noisy third-party libraries,
         and attaches formatters.
 
@@ -214,30 +214,33 @@ class LogManager:
             file_formatter.converter = time.gmtime
 
             if console_output:
-                if LOG_CONSOLE_HIGHLIGHTING:
+                # Rich highlighting only for a person at a terminal. A node under Docker, a
+                # process supervisor or the test harness writes to a pipe or a file: there rich
+                # only hard-wraps lines at 80 columns, at a cost a validator measurably felt.
+                if LOG_CONSOLE_HIGHLIGHTING and sys.stdout.isatty():
                     # 'Rich' theme definition for highlighting
                     denaro_theme = Theme(
                         {
-                            "denaro.arrow":           "bold yellow",
-                            "denaro.http_version":    "bold dim",
-                            "denaro.ip":              "cyan",
-                            "denaro.level_critical":  "bold red reverse",
-                            "denaro.level_debug":     "bold dim",
-                            "denaro.level_error":     "bold red",
-                            "denaro.level_info":      "bold green",
-                            "denaro.logger_name":     "magenta",
-                            "denaro.level_warning":   "bold yellow",
-                            "denaro.method":          "bold white",
-                            "qrdx.network_error":   "bold red",
+                            "denaro.arrow": "bold yellow",
+                            "denaro.http_version": "bold dim",
+                            "denaro.ip": "cyan",
+                            "denaro.level_critical": "bold red reverse",
+                            "denaro.level_debug": "bold dim",
+                            "denaro.level_error": "bold red",
+                            "denaro.level_info": "bold green",
+                            "denaro.logger_name": "magenta",
+                            "denaro.level_warning": "bold yellow",
+                            "denaro.method": "bold white",
+                            "qrdx.network_error": "bold red",
                             "denaro.status_critical": "bold red reverse",
-                            "denaro.status_error":    "bold red",
+                            "denaro.status_error": "bold red",
                             "denaro.status_redirect": "bold yellow",
-                            "denaro.status_success":  "bold green",
-                            "denaro.status_sync":     "bold green",
-                            "denaro.tag":             "bold magenta",
-                            "denaro.timestamp":       "bold cyan",
-                            "denaro.url":             "cyan",
-                            "denaro.url_host":        "cyan",
+                            "denaro.status_success": "bold green",
+                            "denaro.status_sync": "bold green",
+                            "denaro.tag": "bold magenta",
+                            "denaro.timestamp": "bold cyan",
+                            "denaro.url": "cyan",
+                            "denaro.url_host": "cyan",
                         }
                     )
 
@@ -268,7 +271,7 @@ class LogManager:
             if file_output:
                 log_file_path = log_file or LOG_FILE_PATH
                 log_file_path.parent.mkdir(parents=True, exist_ok=True)
-                
+
                 # Configures file handler
                 file_handler = logging.handlers.RotatingFileHandler(
                     filename=str(log_file_path),
@@ -282,7 +285,6 @@ class LogManager:
                 root_logger.addHandler(file_handler)
 
             self._configured = True
-
 
     def get_logger(self, name: str) -> logging.Logger:
         """
@@ -298,7 +300,6 @@ class LogManager:
             self.configure()
         return logging.getLogger(name)
 
-
     @property
     def is_configured(self) -> bool:
         """Returns True if the logging system has been successfully configured."""
@@ -310,28 +311,24 @@ class TerminalSafeFormatter(logging.Formatter):
     A formatter class that sanitizes log output.
 
     This formatter acts as a defense against Log Injection attacks (CWE-117)
-    and terminal manipulation by stripping ANSI escape sequences and non-printable 
+    and terminal manipulation by stripping ANSI escape sequences and non-printable
     control characters.
     """
 
     # Matches ANSI CSI sequences (colors, cursor moves) and single ESC chars
-    _ansi_escape_re = re.compile(
-        r"\x1b\[[0-?]*[ -/]*[@-~]"
-        r"|\x1b[@-Z\\-_]"
-    )
+    _ansi_escape_re = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]" r"|\x1b[@-Z\\-_]")
     # Matches control chars (0x00-0x1F) excluding Tab and Newline
     _control_chars_re = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
     _carriage_return_re = re.compile(r"\r")
-
 
     @classmethod
     def sanitize(cls, text: str) -> str:
         """
         Removes potentially dangerous characters from the provided text.
-        
+
         Args:
             text (str): The raw log message.
-            
+
         Returns:
             str: The sanitized message safe for terminal output.
         """
@@ -342,7 +339,6 @@ class TerminalSafeFormatter(logging.Formatter):
         text = cls._control_chars_re.sub("", text)
         return text
 
-
     def format(self, record: logging.LogRecord) -> str:
         return self.sanitize(super().format(record))
 
@@ -351,7 +347,7 @@ class DenaroLogHighlighter(RegexHighlighter):
     """
     Custom Rich Highlighter for API and system logs.
 
-    This class applies regex-based coloring to log messages. To prevent visual 
+    This class applies regex-based coloring to log messages. To prevent visual
     spoofing, it strictly protects URL paths and query strings within quoted
     HTTP request lines from being highlighted.
     """
@@ -369,15 +365,15 @@ class DenaroLogHighlighter(RegexHighlighter):
         r"(?P<level_warning>\bWARNING\b)",
         r"(?P<method>\b(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\b)",
         r"(?P<network_error>NETWORK_ERROR)",
-        r"(?P<status_critical>(?<!\.)\b5\d{2}\b⁢(?!\.))", # 5xx
-        r"(?P<status_error>(?<!\.)\b4\d{2}\b⁢(?!\.))",    # 4xx
+        r"(?P<status_critical>(?<!\.)\b5\d{2}\b⁢(?!\.))",  # 5xx
+        r"(?P<status_error>(?<!\.)\b4\d{2}\b⁢(?!\.))",  # 4xx
         r"(?P<status_sync>(?<!\.)\b409\b⁢(?!\.))",
-        r"(?P<status_redirect>(?<!\.)\b3\d{2}\b⁢(?!\.))", # 3xx
+        r"(?P<status_redirect>(?<!\.)\b3\d{2}\b⁢(?!\.))",  # 3xx
         r"(?P<status_success>(?<!\.)\b2\d{2}\b⁢(?!\.))",  # 2xx
         r"(?P<tag>\[.*?\])",
         r"(?P<timestamp>^(.*?)UTC)",
-        r"(?P<url>https?://\S+)",            # Standalone URLs
-        r"(?P<url_host>https?://[^/\s]+/?)", # Host part only
+        r"(?P<url>https?://\S+)",  # Standalone URLs
+        r"(?P<url_host>https?://[^/\s]+/?)",  # Host part only
     ]
 
     # Greedy matching captures up to the *last* 'HTTP/x.x' to prevent
@@ -387,31 +383,30 @@ class DenaroLogHighlighter(RegexHighlighter):
         re.IGNORECASE,
     )
 
-
     @classmethod
     def _get_protected_segments(cls, s: str) -> List[Tuple[int, int]]:
         """
         Identifies regions in a log string that should NOT be highlighted.
-        
+
         This specifically targets URL paths in quoted request lines to avoid
         coloring user-controlled input.
-        
+
         Args:
             s (str): The plain text log message.
-            
+
         Returns:
             List[Tuple[int, int]]: List of (start, end) indices for protected segments.
         """
         protected = []
         for m in cls._quoted_request_line_re.finditer(s):
             url = m.group(2)
-            url_start = m.start(2) 
-            
-            if url.startswith('http://') or url.startswith('https://'):
+            url_start = m.start(2)
+
+            if url.startswith("http://") or url.startswith("https://"):
                 # For full URLs, allow highlighting of the `scheme://host`,
                 # but protect the path starting from the first slash.
-                scheme_end = url.find('://') + 3
-                first_path_slash = url.find('/', scheme_end)
+                scheme_end = url.find("://") + 3
+                first_path_slash = url.find("/", scheme_end)
                 if first_path_slash != -1:
                     protect_start = url_start + first_path_slash + 1
                     protect_end = url_start + len(url)
@@ -424,12 +419,10 @@ class DenaroLogHighlighter(RegexHighlighter):
                 protected.append((protect_start, protect_end))
         return protected
 
-
     @staticmethod
     def _overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
         """Check if range A intersects with range B."""
         return a_start < b_end and a_end > b_start
-
 
     def highlight(self, text) -> None:
         """
@@ -460,19 +453,20 @@ class DenaroLogHighlighter(RegexHighlighter):
 
 _manager = LogManager()
 
+
 def get_logger(name: str) -> logging.Logger:
     """
     Public accessor of the logging system.
     Delegates to the Singleton LogManager, ensuring configuration is applied.
-    
+
     Args:
         name (str): The name of the module requesting the logger.
-        
+
     Returns:
         logging.Logger: The configured logger instance.
     """
     return _manager.get_logger(name)
 
+
 # Auto-configure on import to ensure immediate availability
 _manager.configure()
-

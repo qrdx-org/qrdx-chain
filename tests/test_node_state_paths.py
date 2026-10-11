@@ -23,8 +23,8 @@ def test_the_state_directory_can_be_named(monkeypatch, tmp_path):
 
 def test_the_peer_store_is_no_longer_inside_the_package():
     import inspect
-    src = inspect.getsource(main)
-    start = src.index("NodesManager.db_path = os.path.join(_p2p_state_dir(), 'nodes.json')")
+    src = inspect.getsource(main).replace("'", '"')   # quote style is the formatter's choice
+    start = src.index('NodesManager.db_path = os.path.join(_p2p_state_dir(), "nodes.json")')
     assert start < src.index("NodesManager.purge_peers()", start - 200)
     assert "persist_dir = _p2p_state_dir()" in src
 

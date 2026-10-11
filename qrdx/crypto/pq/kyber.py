@@ -15,7 +15,7 @@ SECURITY: This module REQUIRES liboqs-python. There is NO fallback mode.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 try:
     import oqs
@@ -30,14 +30,15 @@ except ImportError as e:
 # ML-KEM-768 parameters (formerly Kyber768) — FIPS 203
 ALGORITHM = "ML-KEM-768"
 ALGORITHM_LEGACY = "Kyber768"
-PUBLIC_KEY_SIZE = 1184    # ML-KEM-768 public key size
-PRIVATE_KEY_SIZE = 2400   # ML-KEM-768 private key size
-CIPHERTEXT_SIZE = 1088    # ML-KEM-768 ciphertext size
-SHARED_SECRET_SIZE = 32   # ML-KEM-768 shared secret size
+PUBLIC_KEY_SIZE = 1184  # ML-KEM-768 public key size
+PRIVATE_KEY_SIZE = 2400  # ML-KEM-768 private key size
+CIPHERTEXT_SIZE = 1088  # ML-KEM-768 ciphertext size
+SHARED_SECRET_SIZE = 32  # ML-KEM-768 shared secret size
 
 
 class KEMError(Exception):
     """Key Encapsulation Mechanism error."""
+
     pass
 
 
@@ -50,12 +51,12 @@ def _get_working_algorithm() -> str:
         try:
             oqs.KeyEncapsulation(ALGORITHM_LEGACY)
             return ALGORITHM_LEGACY
-        except Exception:
+        except Exception as exc:
             raise KEMError(
                 f"Neither {ALGORITHM} nor {ALGORITHM_LEGACY} is supported by "
                 f"the installed liboqs. Upgrade liboqs to a version that "
                 f"supports FIPS 203 (ML-KEM-768)."
-            )
+            ) from exc
 
 
 # Validate at import time
@@ -70,6 +71,7 @@ class KEMPublicKey:
     Attributes:
         key_bytes: Raw public key bytes (1184 bytes for ML-KEM-768)
     """
+
     key_bytes: bytes
 
     def __post_init__(self):
@@ -77,17 +79,16 @@ class KEMPublicKey:
             raise TypeError("key_bytes must be bytes")
         if len(self.key_bytes) != PUBLIC_KEY_SIZE:
             raise ValueError(
-                f"KEM public key must be {PUBLIC_KEY_SIZE} bytes, "
-                f"got {len(self.key_bytes)}"
+                f"KEM public key must be {PUBLIC_KEY_SIZE} bytes, " f"got {len(self.key_bytes)}"
             )
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'KEMPublicKey':
+    def from_bytes(cls, data: bytes) -> "KEMPublicKey":
         return cls(key_bytes=data)
 
     @classmethod
-    def from_hex(cls, hex_str: str) -> 'KEMPublicKey':
-        if hex_str.startswith('0x'):
+    def from_hex(cls, hex_str: str) -> "KEMPublicKey":
+        if hex_str.startswith("0x"):
             hex_str = hex_str[2:]
         return cls(key_bytes=bytes.fromhex(hex_str))
 
@@ -124,7 +125,7 @@ class KEMPrivateKey:
         key_bytes: Optional[bytes] = None,
         public_key: Optional[KEMPublicKey] = None,
     ):
-        self._kem = None
+        self._kem: Any = None  # oqs.KeyEncapsulation once created
         self._key_bytes = key_bytes
         self._public_key = public_key
 
@@ -141,7 +142,7 @@ class KEMPrivateKey:
             self._public_key = KEMPublicKey(pub_bytes)
             self._key_bytes = self._kem.export_secret_key()
         except Exception as e:
-            raise KEMError(f"KEM key generation failed: {e}")
+            raise KEMError(f"KEM key generation failed: {e}") from e
 
     def _restore_from_bytes(self, key_bytes: bytes):
         """Restore KEM keypair from private key bytes."""
@@ -151,15 +152,15 @@ class KEMPrivateKey:
                 pub_bytes = self._kem.generate_keypair()
                 self._public_key = KEMPublicKey(pub_bytes)
         except Exception as e:
-            raise KEMError(f"KEM key restoration failed: {e}")
+            raise KEMError(f"KEM key restoration failed: {e}") from e
 
     @classmethod
-    def generate(cls) -> 'KEMPrivateKey':
+    def generate(cls) -> "KEMPrivateKey":
         """Generate a new random KEM keypair."""
         return cls()
 
     @classmethod
-    def from_bytes(cls, data: bytes, public_key: Optional[KEMPublicKey] = None) -> 'KEMPrivateKey':
+    def from_bytes(cls, data: bytes, public_key: Optional[KEMPublicKey] = None) -> "KEMPrivateKey":
         return cls(key_bytes=data, public_key=public_key)
 
     def to_bytes(self) -> bytes:
@@ -201,7 +202,7 @@ class KEMPrivateKey:
             shared_secret = self._kem.decap_secret(ciphertext)
             return shared_secret
         except Exception as e:
-            raise KEMError(f"Decapsulation failed: {e}")
+            raise KEMError(f"Decapsulation failed: {e}") from e
 
     def __repr__(self) -> str:
         return f"KEMPrivateKey(algorithm={_WORKING_ALGORITHM})"
@@ -247,7 +248,7 @@ def kyber_encapsulate(public_key: KEMPublicKey) -> Tuple[bytes, bytes]:
         ciphertext, shared_secret = kem.encap_secret(public_key.to_bytes())
         return ciphertext, shared_secret
     except Exception as e:
-        raise KEMError(f"Encapsulation failed: {e}")
+        raise KEMError(f"Encapsulation failed: {e}") from e
 
 
 def kyber_decapsulate(private_key: KEMPrivateKey, ciphertext: bytes) -> bytes:
@@ -281,13 +282,13 @@ def get_algorithm_info() -> dict:
         details = {}
 
     return {
-        'algorithm': algo,
-        'algorithm_family': 'ML-KEM (Kyber)',
-        'nist_standard': 'FIPS 203',
-        'private_key_size': PRIVATE_KEY_SIZE,
-        'public_key_size': PUBLIC_KEY_SIZE,
-        'ciphertext_size': CIPHERTEXT_SIZE,
-        'shared_secret_size': SHARED_SECRET_SIZE,
-        'liboqs_available': True,
-        'claimed_nist_level': details.get('claimed_nist_level', 3),
+        "algorithm": algo,
+        "algorithm_family": "ML-KEM (Kyber)",
+        "nist_standard": "FIPS 203",
+        "private_key_size": PRIVATE_KEY_SIZE,
+        "public_key_size": PUBLIC_KEY_SIZE,
+        "ciphertext_size": CIPHERTEXT_SIZE,
+        "shared_secret_size": SHARED_SECRET_SIZE,
+        "liboqs_available": True,
+        "claimed_nist_level": details.get("claimed_nist_level", 3),
     }

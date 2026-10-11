@@ -6,7 +6,7 @@
 # Creates a complete local testnet with configurable nodes and validators.
 #
 # Usage:
-#   ./scripts/testnet.sh start [--nodes N] [--validators V]
+#   ./scripts/testnet.sh start [--nodes N] [--validators V] [--slot-ms MS]
 #   ./scripts/testnet.sh stop
 #   ./scripts/testnet.sh status
 #   ./scripts/testnet.sh clean
@@ -34,6 +34,9 @@ DEFAULT_NODES=4
 DEFAULT_VALIDATORS=2
 DEFAULT_BASE_PORT=3007
 DEFAULT_GENESIS_BALANCE=1000000  # 1M QRDX per validator
+DEFAULT_SLOT_MS=250  # the standard slot: 250 ms blocks, 32-slot (8 s) epochs
+SLOT_MS=$DEFAULT_SLOT_MS
+GENESIS_DELAY=20  # seconds from genesis creation to the first slot (set by start)
 
 # Colors for output
 RED='\033[0;31m'
@@ -228,10 +231,13 @@ create_genesis_config() {
         log_info "Validator $i: ${address:0:20}..."
     done
     
-    # Create genesis configuration (suppress liboqs warnings, capture output)
+    # Create genesis configuration (suppress liboqs warnings, capture output). The slot and
+    # the validator minimum go into its chain spec, which every node takes them from.
+    log_info "Slot: ${SLOT_MS} ms; first slot in ${GENESIS_DELAY} s"
     local genesis_output
-    genesis_output=$(OQS_FAULTHANDLER=0 PYTHONWARNINGS=ignore python3 -W ignore 2>/dev/null << EOF
-import sys, os, json, warnings
+    genesis_output=$(QRDX_SLOT_DURATION_MS="${SLOT_MS}" QRDX_MIN_VALIDATORS=1 \
+        OQS_FAULTHANDLER=0 PYTHONWARNINGS=ignore python3 -W ignore 2>/dev/null << EOF
+import sys, os, json, time, warnings
 warnings.filterwarnings('ignore')
 from decimal import Decimal
 sys.path.insert(0, '${PROJECT_DIR}')
@@ -276,8 +282,8 @@ for i, (addr, pubkey) in enumerate(zip(validator_addresses, validator_pubkeys)):
     stake = Decimal("100000")  # 100K QRDX stake
     creator.add_validator(addr, pubkey, stake)
 
-# Create genesis
-state, block = creator.create_genesis()
+# Create genesis, ${GENESIS_DELAY} s ahead: every node is up and meshed before the first slot
+state, block = creator.create_genesis(genesis_time=int(time.time()) + ${GENESIS_DELAY})
 
 # Export
 creator.export_genesis(state, block, '${genesis_file}')
@@ -323,17 +329,16 @@ setup_databases() {
     
     log_step "Setting up SQLite databases"
     
-    # Create database directory
+    # A new genesis: remove every node's old database and peer state (node<i>.p2p holds its
+    # peer list and routing table, which would point at nodes from an earlier run).
     local db_dir="${TESTNET_DIR}/databases"
+    rm -rf "${db_dir}"
     mkdir -p "${db_dir}"
-    
+
     # Create SQLite database for each node
     for i in $(seq 0 $((num_nodes - 1))); do
         local db_file="${db_dir}/node${i}.db"
         log_info "Creating SQLite database: ${db_file}"
-        
-        # Remove existing database for clean restart
-        rm -f "${db_file}"
         
         # Create new empty database file
         touch "${db_file}"
@@ -363,12 +368,15 @@ create_node_config() {
     
     mkdir -p "$node_dir"
     
-    # Determine bootstrap nodes
+    # Every node lists every other node as a bootstrap peer, so they form a full mesh. A peer
+    # that connects in is recorded without a URL, and blocks are pushed only to peers with one:
+    # with node 0 as the only bootstrap, some validators got each other's blocks only over
+    # several hops or not at all, too slow for sub-second slots, and they forked.
     local bootstrap_nodes=""
-    if [ "$is_bootstrap" = false ]; then
-        # Point to the bootstrap node (node 0)
-        bootstrap_nodes="http://127.0.0.1:${DEFAULT_BASE_PORT}"
-    fi
+    for j in $(seq 0 $((total_nodes - 1))); do
+        [ "$j" -eq "$node_id" ] && continue
+        bootstrap_nodes="${bootstrap_nodes:+${bootstrap_nodes},}http://127.0.0.1:$((DEFAULT_BASE_PORT + j))"
+    done
     
     # Create per-node identity directory
     local key_dir="${DATA_DIR}/node${node_id}/keys"
@@ -389,8 +397,8 @@ QRDX_NODE_HOST=127.0.0.1
 QRDX_NODE_PORT=${node_port}
 QRDX_SELF_URL=http://127.0.0.1:${node_port}
 
-# Bootstrap configuration
-QRDX_BOOTSTRAP_NODE=${bootstrap_nodes}
+# Bootstrap configuration (every other node)
+QRDX_BOOTSTRAP_NODE=${bootstrap_nodes%%,*}
 QRDX_BOOTSTRAP_NODES=${bootstrap_nodes}
 
 # Database (SQLite)
@@ -401,6 +409,8 @@ QRDX_NODE_KEY_DIR=${key_dir}
 
 # Testnet validator set override (allow < 4 validators)
 QRDX_MIN_VALIDATORS=1
+
+# Slot clock: ${SLOT_MS} ms, from the chain spec in ${TESTNET_DIR}/genesis_config.json
 
 # RPC
 QRDX_RPC_ENABLED=true
@@ -448,24 +458,28 @@ start_node() {
     mkdir -p "$(dirname "$pid_file")"
     mkdir -p "$(dirname "$log_file")"
     
-    # Source environment
-    set -a
-    source "$config_file"
-    set +a
-    
-    # Start node with env vars and suppressed warnings
-    cd "${PROJECT_DIR}"
-    nohup python3 -W ignore run_node.py > "$log_file" 2>&1 &
+    # Each node runs in a subshell with its own environment: sourcing the config into this
+    # shell would carry one node's settings over to the next.
+    (
+        set -a
+        source "$config_file"
+        set +a
+        cd "${PROJECT_DIR}"
+        exec nohup python3 -W ignore run_node.py > "$log_file" 2>&1
+    ) &
     local pid=$!
-    
+
     echo "$pid" > "$pid_file"
-    
-    log_info "Started node ${node_id} (PID: ${pid}, Port: ${QRDX_NODE_PORT})"
-    
-    # Wait for startup
-    sleep 2
-    
-    # Check if still running
+
+    log_info "Started node ${node_id} (PID: ${pid}, Port: $((DEFAULT_BASE_PORT + node_id)))"
+}
+
+check_node_started() {
+    local node_id=$1
+    local pid
+    pid=$(cat "${TESTNET_DIR}/pids/node${node_id}.pid")
+    local log_file="${LOGS_DIR}/node${node_id}/node.log"
+
     if ! kill -0 "$pid" 2>/dev/null; then
         log_error "Node ${node_id} failed to start. Check logs: ${log_file}"
         tail -5 "$log_file" 2>/dev/null
@@ -537,6 +551,10 @@ cmd_start() {
                 num_validators=$2
                 shift 2
                 ;;
+            --slot-ms)
+                SLOT_MS=$2
+                shift 2
+                ;;
             *)
                 log_error "Unknown option: $1"
                 return 1
@@ -554,10 +572,16 @@ cmd_start() {
         log_error "At least 1 validator required"
         return 1
     fi
+
+    if ! [[ "$SLOT_MS" =~ ^[0-9]+$ ]] || [ "$SLOT_MS" -lt 100 ]; then
+        log_error "--slot-ms must be a whole number of milliseconds, at least 100"
+        return 1
+    fi
     
     log_step "Starting QRDX Local Testnet"
     log_info "Nodes: ${num_nodes}"
     log_info "Validators: ${num_validators}"
+    log_info "Slot: ${SLOT_MS} ms"
     log_info "Bootstrap: node 0"
     echo
     
@@ -585,7 +609,8 @@ cmd_start() {
         log_success "Validator ${i} wallet: ${address}"
     done
     
-    # Create genesis
+    # Create genesis (its first slot after every node has started and meshed)
+    GENESIS_DELAY=$((15 + num_nodes))
     create_genesis_config "$num_validators"
     
     # Setup databases
@@ -612,24 +637,30 @@ cmd_start() {
         create_node_config "$i" "$num_nodes" "$is_bootstrap" "$is_validator" "$validator_id"
     done
     
-    # Start nodes (bootstrap first, then others with staggered delay)
+    # Start every node at once. Each bootstraps from all the others a few seconds after it
+    # starts, so they must all be up by then for the mesh to form; genesis is far enough ahead
+    # that it has formed before the first slot.
     log_step "Starting nodes"
     for i in $(seq 0 $((num_nodes - 1))); do
         start_node "$i"
-        if [ "$i" -eq 0 ]; then
-            # Give bootstrap node extra time to fully initialize
-            sleep 3
-            # Verify bootstrap node is accepting connections
-            if curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${DEFAULT_BASE_PORT}/get_nodes" 2>/dev/null | grep -q '200'; then
-                log_success "Bootstrap node is accepting connections"
-            else
-                log_warn "Bootstrap node may still be initializing..."
-                sleep 2
-            fi
-        else
-            sleep 3  # Stagger non-bootstrap nodes
-        fi
     done
+    sleep 3
+    for i in $(seq 0 $((num_nodes - 1))); do
+        check_node_started "$i" || return 1
+    done
+    log_info "Waiting for the nodes to answer..."
+    local deadline=$((SECONDS + 90))
+    for i in $(seq 0 $((num_nodes - 1))); do
+        local port=$((DEFAULT_BASE_PORT + i))
+        until curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/get_nodes" 2>/dev/null | grep -q '200'; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+                log_warn "Node ${i} is not answering yet: ${LOGS_DIR}/node${i}/node.log"
+                break
+            fi
+            sleep 1
+        done
+    done
+    log_success "Nodes are up"
     
     # Summary
     echo
@@ -640,6 +671,7 @@ cmd_start() {
     echo "  Network:     qrdx-testnet-local"
     echo "  Nodes:       ${num_nodes}"
     echo "  Validators:  ${num_validators}"
+    echo "  Slot:        ${SLOT_MS} ms (32-slot epochs)"
     echo
     log_info "Node Endpoints:"
     for i in $(seq 0 $((num_nodes - 1))); do
@@ -716,7 +748,15 @@ cmd_status() {
     
     local running=0
     local stopped=0
-    
+
+    local genesis_file="${TESTNET_DIR}/genesis_config.json"
+    if [ -f "$genesis_file" ]; then
+        local slot_ms
+        slot_ms=$(python3 -c "import json; print(json.load(open('${genesis_file}'))['chain_spec']['params']['SLOT_DURATION_MS'])" 2>/dev/null || echo "?")
+        log_info "Slot: ${slot_ms} ms"
+        echo
+    fi
+
     for pid_file in "${TESTNET_DIR}/pids"/node*.pid; do
         if [ -f "$pid_file" ]; then
             local node_id=$(basename "$pid_file" .pid | sed 's/node//')
@@ -727,7 +767,12 @@ cmd_status() {
             if kill -0 "$pid" 2>/dev/null; then
                 local health=""
                 if curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/get_nodes" 2>/dev/null | grep -q '200'; then
-                    health="${GREEN}[healthy]${NC}"
+                    local height
+                    height=$(curl -s -X POST -H 'Content-Type: application/json' \
+                        -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+                        "http://127.0.0.1:${port}/rpc" 2>/dev/null \
+                        | python3 -c "import json,sys; print(int(json.load(sys.stdin)['result'], 16))" 2>/dev/null || echo "?")
+                    health="${GREEN}[healthy]${NC} height ${height}"
                 else
                     health="${YELLOW}[starting]${NC}"
                 fi
@@ -809,9 +854,9 @@ ${BOLD}USAGE:${NC}
     $0 <command> [options]
 
 ${BOLD}COMMANDS:${NC}
-    start [--nodes N] [--validators V]
-        Start local testnet with N nodes and V validators
-        Default: ${DEFAULT_NODES} nodes, ${DEFAULT_VALIDATORS} validators
+    start [--nodes N] [--validators V] [--slot-ms MS]
+        Start local testnet with N nodes, V validators and MS-millisecond slots
+        Default: ${DEFAULT_NODES} nodes, ${DEFAULT_VALIDATORS} validators, ${DEFAULT_SLOT_MS} ms slots
 
     stop
         Stop all running testnet nodes
@@ -832,6 +877,9 @@ ${BOLD}EXAMPLES:${NC}
     # Start with custom configuration
     $0 start --nodes 6 --validators 3
 
+    # Slower slots (e.g. on a loaded machine)
+    $0 start --slot-ms 500
+
     # Check status
     $0 status
 
@@ -845,6 +893,7 @@ ${BOLD}CONFIGURATION:${NC}
     Testnet Directory: ${TESTNET_DIR}
     Base Port:         ${DEFAULT_BASE_PORT}
     Genesis Balance:   ${DEFAULT_GENESIS_BALANCE} QRDX per validator
+    Slot:              ${DEFAULT_SLOT_MS} ms (the standard; 32-slot epochs)
 "
 }
 

@@ -5,16 +5,14 @@ Ethereum Virtual Machine execution engine for QRDX blockchain.
 Uses py-evm library for full Ethereum compatibility.
 """
 
-from typing import Optional, Dict, List, Tuple, Any
-from decimal import Decimal
-from dataclasses import dataclass
-from importlib import util as importlib_util
-
 # Prefer an installed `eth` package (the container installs the py-evm QRDX fork
 # as a wheel). Fall back to the in-repo checkout for local development, resolved
 # relative to this file rather than a hardcoded absolute path.
 import os
 import sys
+from dataclasses import dataclass
+from importlib import util as importlib_util
+from typing import Any, Dict, List, Optional
 
 if importlib_util.find_spec("eth") is None:
     _vendored_py_evm = os.path.join(
@@ -24,14 +22,12 @@ if importlib_util.find_spec("eth") is None:
     if os.path.isdir(_vendored_py_evm) and _vendored_py_evm not in sys.path:
         sys.path.insert(0, _vendored_py_evm)
 
-from eth.vm.forks.qrdx import QRDXVM
+from eth.constants import CREATE_CONTRACT_ADDRESS
 from eth.db.atomic import AtomicDB
-from eth.db.backends.memory import MemoryDB
-from eth_typing import Address
-from eth_utils import to_canonical_address, to_checksum_address, keccak
+from eth.vm.forks.qrdx import QRDXVM
 from eth.vm.message import Message
 from eth.vm.transaction_context import BaseTransactionContext
-from eth.constants import CREATE_CONTRACT_ADDRESS
+from eth_utils import to_canonical_address, to_checksum_address
 
 from .state import ContractStateManager
 
@@ -39,6 +35,7 @@ from .state import ContractStateManager
 @dataclass
 class ExecutionResult:
     """Result of contract execution."""
+
     success: bool
     gas_used: int
     gas_remaining: int
@@ -52,53 +49,47 @@ class ExecutionResult:
 class EVMExecutor:
     """
     Execute smart contracts using py-evm.
-    
+
     Provides full Ethereum compatibility with:
     - All EVM opcodes and precompiles
     - Transaction execution
     - State management
     - Gas accounting
     """
-    
+
     def __init__(self, state_manager: ContractStateManager, block_number: int = 0):
         """
         Initialize EVM executor.
-        
+
         Args:
             state_manager: Contract state manager
             block_number: Current block number
         """
         self.state_manager = state_manager
         self.block_number = block_number
-        
+
         # Initialize py-evm database
         self.db = AtomicDB()
-        
+
         # Create VM instance
         self.vm = None
         self._init_vm()
-    
+
     def _init_vm(self):
         """Initialize QRDX VM instance."""
         from eth.chains.base import Chain
-        from eth.chains.mainnet import MAINNET_CHAIN_ID
-        from eth.vm.forks.qrdx import QRDXVM
-        from eth import constants
-        from eth_typing import BlockNumber, Hash32
-        
+        from eth_typing import BlockNumber
+
         # Create minimal chain context
         class QRDXChain(Chain):
-            vm_configuration = (
-                (BlockNumber(0), QRDXVM),
-            )
+            vm_configuration = ((BlockNumber(0), QRDXVM),)
             from ..constants import CHAIN_ID as chain_id  # the network's chain id (chain spec)
-        
+
         # Initialize chain with in-memory database
         self.chain = QRDXChain.configure(
-            __name__='QRDXChain',
-            vm_configuration=((BlockNumber(0), QRDXVM),)
+            __name__="QRDXChain", vm_configuration=((BlockNumber(0), QRDXVM),)
         )(self.db, None)
-    
+
     async def execute_transaction(
         self,
         sender: str,
@@ -111,7 +102,7 @@ class EVMExecutor:
     ) -> ExecutionResult:
         """
         Execute a contract transaction.
-        
+
         Args:
             sender: Sender address
             to: Recipient address (None for contract creation)
@@ -120,7 +111,7 @@ class EVMExecutor:
             gas_limit: Gas limit
             gas_price: Gas price per unit
             nonce: Sender nonce
-            
+
         Returns:
             ExecutionResult with execution details
         """
@@ -128,24 +119,24 @@ class EVMExecutor:
             # Convert addresses
             sender_addr = to_canonical_address(sender)
             to_addr = to_canonical_address(to) if to else CREATE_CONTRACT_ADDRESS
-            
+
             # Check sender balance
             sender_balance = await self.state_manager.get_balance(sender)
             total_cost = value + (gas_limit * gas_price)
-            
+
             if sender_balance < total_cost:
                 return ExecutionResult(
                     success=False,
                     gas_used=0,
                     gas_remaining=gas_limit,
-                    output=b'',
+                    output=b"",
                     logs=[],
-                    error=f"Insufficient balance: {sender_balance} < {total_cost}"
+                    error=f"Insufficient balance: {sender_balance} < {total_cost}",
                 )
-            
+
             # Create execution message
-            is_create = (to is None or to == '' or to_addr == CREATE_CONTRACT_ADDRESS)
-            
+            is_create = to is None or to == "" or to_addr == CREATE_CONTRACT_ADDRESS
+
             if is_create:
                 # Contract creation
                 contract_address = self._compute_contract_address(sender, nonce)
@@ -154,13 +145,13 @@ class EVMExecutor:
                     to=CREATE_CONTRACT_ADDRESS,
                     sender=sender_addr,
                     value=value,
-                    data=b'',
+                    data=b"",
                     code=data,  # Bytecode goes in code field for creation
                     create_address=to_canonical_address(contract_address),
                 )
             else:
-                # Contract call
-                code = await self.state_manager.get_code(to)
+                # Contract call (is_create is false, so `to` is a non-empty address)
+                code = await self.state_manager.get_code(str(to))
                 message = Message(
                     gas=gas_limit,
                     to=to_addr,
@@ -169,20 +160,20 @@ class EVMExecutor:
                     data=data,
                     code=code,
                 )
-            
+
             # Create transaction context
             tx_context = BaseTransactionContext(
                 gas_price=gas_price,
                 origin=sender_addr,
             )
-            
+
             # Get VM state
             vm = self.chain.get_vm()
             state = vm.state
-            
+
             # Sync state from our state manager
             await self._sync_state_to_vm(state)
-            
+
             # Execute computation
             if is_create:
                 computation = state.computation_class.apply_create_message(
@@ -196,47 +187,46 @@ class EVMExecutor:
                     message,
                     tx_context,
                 )
-            
+
             # Extract results
             success = not computation.is_error
             gas_used = gas_limit - computation.get_gas_remaining()
-            
+
             # Extract logs
             logs = []
             for log_entry in computation.get_log_entries():
-                logs.append({
-                    'address': to_checksum_address(log_entry.address),
-                    'topics': [topic.hex() for topic in log_entry.topics],
-                    'data': log_entry.data.hex(),
-                })
-            
+                logs.append(
+                    {
+                        "address": to_checksum_address(log_entry.address),
+                        "topics": [topic.hex() for topic in log_entry.topics],
+                        "data": log_entry.data.hex(),
+                    }
+                )
+
             # Sync state back from VM
             await self._sync_state_from_vm(state)
-            
+
             # Deduct gas cost
             gas_cost = gas_used * gas_price
             new_balance = sender_balance - gas_cost - value
             await self.state_manager.set_balance(sender, new_balance)
-            
+
             # If contract creation, store code
             if is_create and success:
                 deployed_code = computation.output
                 await self.state_manager.set_code(
-                    contract_address,
-                    deployed_code,
-                    self.block_number,
-                    sender
+                    contract_address, deployed_code, self.block_number, sender
                 )
-                
+
                 # Credit contract with sent value
                 if value > 0:
                     await self.state_manager.set_balance(contract_address, value)
-            
+
             # If contract call, update recipient balance
             elif to and value > 0:
                 to_balance = await self.state_manager.get_balance(to)
                 await self.state_manager.set_balance(to, to_balance + value)
-            
+
             return ExecutionResult(
                 success=success,
                 gas_used=gas_used,
@@ -247,17 +237,17 @@ class EVMExecutor:
                 contract_address=contract_address if is_create else None,
                 state_root=state.state_root,
             )
-            
+
         except Exception as e:
             return ExecutionResult(
                 success=False,
                 gas_used=gas_limit,  # Consume all gas on error
                 gas_remaining=0,
-                output=b'',
+                output=b"",
                 logs=[],
                 error=str(e),
             )
-    
+
     async def call_contract(
         self,
         sender: str,
@@ -268,20 +258,20 @@ class EVMExecutor:
     ) -> ExecutionResult:
         """
         Call contract without state changes (eth_call).
-        
+
         Args:
             sender: Caller address
             to: Contract address
             data: Call data
             value: Value to send
             gas_limit: Gas limit
-            
+
         Returns:
             ExecutionResult
         """
         # Take snapshot
         snapshot_id = await self.state_manager.snapshot()
-        
+
         try:
             # Execute call
             result = await self.execute_transaction(
@@ -293,12 +283,12 @@ class EVMExecutor:
                 gas_price=0,  # No gas cost for eth_call
                 nonce=0,
             )
-            
+
             return result
         finally:
             # Always revert state changes
             await self.state_manager.revert(snapshot_id)
-    
+
     async def estimate_gas(
         self,
         sender: str,
@@ -308,26 +298,26 @@ class EVMExecutor:
     ) -> int:
         """
         Estimate gas for transaction.
-        
+
         Args:
             sender: Sender address
             to: Recipient address
             data: Transaction data
             value: Value to send
-            
+
         Returns:
             Estimated gas amount
         """
         # Binary search for gas limit
         low = 21000  # Minimum transaction gas
         high = 10_000_000  # Maximum reasonable gas
-        
+
         snapshot_id = await self.state_manager.snapshot()
-        
+
         try:
             while low < high:
                 mid = (low + high) // 2
-                
+
                 result = await self.execute_transaction(
                     sender=sender,
                     to=to,
@@ -337,26 +327,27 @@ class EVMExecutor:
                     gas_price=0,
                     nonce=0,
                 )
-                
+
                 if result.success:
                     high = mid
                 else:
                     low = mid + 1
-                
+
                 # Revert for next iteration
                 await self.state_manager.revert(snapshot_id)
                 snapshot_id = await self.state_manager.snapshot()
-            
+
             # Add 10% buffer
             return int(low * 1.1)
         finally:
             await self.state_manager.revert(snapshot_id)
-    
+
     def _compute_contract_address(self, sender: str, nonce: int) -> str:
         """Compute contract address for CREATE."""
         from ..crypto.contract import generate_contract_address
+
         return generate_contract_address(sender, nonce)
-    
+
     async def _sync_state_to_vm(self, vm_state) -> None:
         """Sync state manager to VM state."""
         # Sync account balances and nonces
@@ -364,19 +355,19 @@ class EVMExecutor:
             canonical_addr = to_canonical_address(address)
             vm_state.set_balance(canonical_addr, account.balance)
             vm_state.set_nonce(canonical_addr, account.nonce)
-            
+
             # Sync code if contract
             if account.code_hash:
                 code = await self.state_manager.get_code(address)
                 vm_state.set_code(canonical_addr, code)
-        
+
         # Sync storage
         for (address, key), value in self.state_manager._storage_cache.items():
             canonical_addr = to_canonical_address(address)
-            slot = int.from_bytes(key, 'big')
-            value_int = int.from_bytes(value, 'big')
+            slot = int.from_bytes(key, "big")
+            value_int = int.from_bytes(value, "big")
             vm_state.set_storage(canonical_addr, slot, value_int)
-    
+
     async def _sync_state_from_vm(self, vm_state) -> None:
         """Sync VM state back to state manager.
 
@@ -394,7 +385,7 @@ class EVMExecutor:
             touched.add(addr_str)
 
         # 2. All addresses referenced in storage cache
-        for (addr_str, _key) in list(self.state_manager._storage_cache.keys()):
+        for addr_str, _key in list(self.state_manager._storage_cache.keys()):
             touched.add(addr_str)
 
         # Sync each touched account
@@ -416,7 +407,10 @@ class EVMExecutor:
                     existing_code = await self.state_manager.get_code(addr_str)
                     if existing_code != vm_code:
                         await self.state_manager.set_code(
-                            addr_str, vm_code, self.block_number, addr_str,
+                            addr_str,
+                            vm_code,
+                            self.block_number,
+                            addr_str,
                         )
 
                 # Storage – replay cached slots through the VM's final state
@@ -425,9 +419,9 @@ class EVMExecutor:
                 ):
                     if cached_addr != addr_str:
                         continue
-                    slot = int.from_bytes(cached_key, 'big')
+                    slot = int.from_bytes(cached_key, "big")
                     vm_val = vm_state.get_storage(canonical, slot)
-                    new_val = vm_val.to_bytes(32, 'big')
+                    new_val = vm_val.to_bytes(32, "big")
                     await self.state_manager.set_storage(addr_str, cached_key, new_val)
             except Exception:
                 # Account may not exist in VM state (e.g. self-destructed)

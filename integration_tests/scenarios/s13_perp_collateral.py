@@ -82,14 +82,22 @@ class S13PerpCollateral(Scenario):
         object), and wait until that nonce is consumed (the exchange root is no signal: it
         commits to the height, so it moves every block). Returns the tx hash, or None."""
         from qrdx.exchange import ExchangeTransaction
-        acct = await self._account(target, wallet["address"])
-        nonce = acct["exchange_nonce"] if acct else 0
-        tx = ExchangeTransaction(chain_id=CHAIN_ID, op_type=op, sender=wallet["address"], nonce=nonce, params=params,
-                                 gas_limit=2_000_000, gas_price=10**9)
-        tx.public_key = key.public_key.to_bytes()
-        tx.signature = key.sign(tx.signing_bytes()).to_bytes()
-        async with NodeRPCClient(target) as c:
-            r = await c._post("/submit_exchange_tx", json_data={"tx": tx.to_dict()})
+        # A wallet's view of its nonce can lag a reorg: a transaction orphaned with its block is
+        # re-queued and soon included again, so a nonce read in between is one too low. Like a
+        # wallet, re-read it and resend when the node says so.
+        for attempt in range(4):
+            acct = await self._account(target, wallet["address"])
+            nonce = acct["exchange_nonce"] if acct else 0
+            tx = ExchangeTransaction(chain_id=CHAIN_ID, op_type=op, sender=wallet["address"], nonce=nonce, params=params,
+                                     gas_limit=2_000_000, gas_price=10**9)
+            tx.public_key = key.public_key.to_bytes()
+            tx.signature = key.sign(tx.signing_bytes()).to_bytes()
+            async with NodeRPCClient(target) as c:
+                r = await c._post("/submit_exchange_tx", json_data={"tx": tx.to_dict()})
+            error = str((r or {}).get("error", ""))
+            if (r and r.get("ok")) or not ("nonce too low" in error or "already queued" in error):
+                break
+            await asyncio.sleep(1)
         if not self.check(bool(r and r.get("ok")), f"{label}: admitted"):
             self._log.error("%s rejected at admission: %s", label, r)
             return None

@@ -13,6 +13,7 @@ from decimal import Decimal, localcontext
 
 import pytest
 
+from qrdx.exchange.commitment import CommitmentMismatch
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransaction
 from qrdx.exchange import orderbook as OB
 from qrdx.exchange.orderbook import Order, OrderBook, OrderSide, OrderType, SelfTradeAction
@@ -50,7 +51,8 @@ def test_the_digest_commits_owners_sizes_and_time_priority():
     assert d.state_digest() == a.state_digest()
 
 
-def test_the_exchange_root_commits_the_book():
+def test_the_exchange_root_commits_the_book(monkeypatch):
+    monkeypatch.setenv("QRDX_VERIFY_STATE_COMMITMENTS", "1")
     ExchangeStateManager.reset_instance()
     try:
         m = ExchangeStateManager.get_instance()
@@ -59,7 +61,10 @@ def test_the_exchange_root_commits_the_book():
         before = m.compute_state_root()
         book.place_order(_order("1", ALICE, OrderSide.BUY, "1", "5"))
         mid = m.compute_state_root()
-        book._orders["1"].amount = D(6)                    # a node whose order differs
+        book._orders["1"].amount = D(6)                    # a node whose order differs,
+        with pytest.raises(CommitmentMismatch):            # written past the book's entry
+            m.compute_state_root()                         # points: verification notices
+        book._version += 1                                 # what every entry point does
         assert len({before, mid, m.compute_state_root()}) == 3
     finally:
         ExchangeStateManager.reset_instance()

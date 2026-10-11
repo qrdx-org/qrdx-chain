@@ -10,11 +10,12 @@ Provides durable storage for qRC20 token state:
 No stubs. All operations are real SQL against the node's SQLite database.
 """
 
-import aiosqlite
-from decimal import Decimal
-from typing import Dict, List, Optional, Tuple
 import logging
 import time
+from decimal import Decimal
+from typing import Dict, List, Optional
+
+import aiosqlite
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ CREATE INDEX IF NOT EXISTS idx_token_events_block ON token_events(block_height);
 class TokenPersistence:
     """
     SQLite persistence for qRC20 token state.
-    
+
     Every method performs real SQL operations — no in-memory caches,
     no stubs, no fallback to dicts. If the database is unavailable,
     operations raise exceptions.
@@ -126,7 +127,13 @@ class TokenPersistence:
             (token_address, owner_address, str(total_supply), now),
         )
         await self.connection.commit()
-        logger.info("Token registered: %s (%s) supply=%s owner=%s", name, symbol, total_supply, owner_address)
+        logger.info(
+            "Token registered: %s (%s) supply=%s owner=%s",
+            name,
+            symbol,
+            total_supply,
+            owner_address,
+        )
 
     async def get_token(self, token_address: str) -> Optional[dict]:
         """Get token metadata from registry."""
@@ -183,29 +190,35 @@ class TokenPersistence:
     ) -> None:
         """
         Transfer tokens between addresses.
-        
+
         Raises ValueError if sender has insufficient balance.
         This is a REAL balance check against the database — not a stub.
         """
         now = int(time.time())
-        
+
         # Check sender balance
         sender_balance = await self.get_balance(token_address, from_address)
         if sender_balance < amount:
             raise ValueError(
                 f"Insufficient balance: {from_address} has {sender_balance}, needs {amount}"
             )
-        
+
         # Debit sender
         new_sender_balance = sender_balance - amount
         await self.connection.execute(
             """INSERT INTO token_balances (token_address, holder_address, balance, updated_at)
                VALUES (?, ?, ?, ?)
                ON CONFLICT(token_address, holder_address) DO UPDATE SET balance = ?, updated_at = ?""",
-            (token_address, from_address, str(new_sender_balance), now,
-             str(new_sender_balance), now),
+            (
+                token_address,
+                from_address,
+                str(new_sender_balance),
+                now,
+                str(new_sender_balance),
+                now,
+            ),
         )
-        
+
         # Credit receiver
         receiver_balance = await self.get_balance(token_address, to_address)
         new_receiver_balance = receiver_balance + amount
@@ -213,17 +226,23 @@ class TokenPersistence:
             """INSERT INTO token_balances (token_address, holder_address, balance, updated_at)
                VALUES (?, ?, ?, ?)
                ON CONFLICT(token_address, holder_address) DO UPDATE SET balance = ?, updated_at = ?""",
-            (token_address, to_address, str(new_receiver_balance), now,
-             str(new_receiver_balance), now),
+            (
+                token_address,
+                to_address,
+                str(new_receiver_balance),
+                now,
+                str(new_receiver_balance),
+                now,
+            ),
         )
-        
+
         # Log event
         await self.connection.execute(
             """INSERT INTO token_events (token_address, event_type, from_address, to_address, amount, block_height, tx_hash, created_at)
                VALUES (?, 'TRANSFER', ?, ?, ?, ?, ?, ?)""",
             (token_address, from_address, to_address, str(amount), block_height, tx_hash, now),
         )
-        
+
         await self.connection.commit()
 
     # ─────────── Allowances ───────────
@@ -275,7 +294,7 @@ class TokenPersistence:
     ) -> None:
         """
         Transfer using allowance (transferFrom).
-        
+
         Checks both balance AND allowance — real database checks, not stubs.
         """
         # Check allowance
@@ -284,10 +303,10 @@ class TokenPersistence:
             raise ValueError(
                 f"Insufficient allowance: {spender} has {allowance} from {from_address}, needs {amount}"
             )
-        
+
         # Execute transfer
         await self.transfer(token_address, from_address, to_address, amount, block_height, tx_hash)
-        
+
         # Decrease allowance
         new_allowance = allowance - amount
         now = int(time.time())
@@ -310,7 +329,7 @@ class TokenPersistence:
     ) -> None:
         """Mint tokens via bridge (increases supply)."""
         now = int(time.time())
-        
+
         # Credit receiver
         balance = await self.get_balance(token_address, to_address)
         new_balance = balance + amount
@@ -320,14 +339,14 @@ class TokenPersistence:
                ON CONFLICT(token_address, holder_address) DO UPDATE SET balance = ?, updated_at = ?""",
             (token_address, to_address, str(new_balance), now, str(new_balance), now),
         )
-        
+
         # Update total supply
         await self.connection.execute(
             """UPDATE token_registry SET total_supply = CAST(CAST(total_supply AS DECIMAL) + ? AS TEXT), updated_at = ?
                WHERE token_address = ?""",
             (str(amount), now, token_address),
         )
-        
+
         # Log event
         await self.connection.execute(
             """INSERT INTO token_events (token_address, event_type, from_address, to_address, amount, block_height, tx_hash, created_at)
@@ -346,12 +365,14 @@ class TokenPersistence:
     ) -> None:
         """Burn tokens via bridge (decreases supply)."""
         now = int(time.time())
-        
+
         # Check balance
         balance = await self.get_balance(token_address, from_address)
         if balance < amount:
-            raise ValueError(f"Insufficient balance for burn: {from_address} has {balance}, needs {amount}")
-        
+            raise ValueError(
+                f"Insufficient balance for burn: {from_address} has {balance}, needs {amount}"
+            )
+
         # Debit sender
         new_balance = balance - amount
         await self.connection.execute(
@@ -359,15 +380,17 @@ class TokenPersistence:
                WHERE token_address = ? AND holder_address = ?""",
             (str(new_balance), now, token_address, from_address),
         )
-        
+
         # Update total supply
         token = await self.get_token(token_address)
+        if token is None:
+            raise ValueError(f"unknown token {token_address}")
         new_supply = Decimal(token["total_supply"]) - amount
         await self.connection.execute(
             "UPDATE token_registry SET total_supply = ?, updated_at = ? WHERE token_address = ?",
             (str(new_supply), now, token_address),
         )
-        
+
         # Log event
         await self.connection.execute(
             """INSERT INTO token_events (token_address, event_type, from_address, to_address, amount, block_height, tx_hash, created_at)

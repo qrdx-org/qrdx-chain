@@ -20,7 +20,7 @@ DoS caps.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +55,9 @@ def intrinsic_gas_legacy(data: bytes, is_create: bool = False) -> int:
     return gas
 
 
-async def verify_delegated_spend(db, raw_tx_hex: str,
-                                 block_height: Optional[int] = None) -> Tuple[bool, str]:
+async def verify_delegated_spend(
+    db, raw_tx_hex: str, block_height: Optional[int] = None
+) -> Tuple[bool, str]:
     """
     Authorise a delegated spend: may the signer move value out of ``on_behalf_of``?
 
@@ -89,23 +90,23 @@ async def verify_delegated_spend(db, raw_tx_hex: str,
     try:
         raw = decode_hex(raw_tx_hex)
     except Exception:
-        return True, ""          # malformed hex is the parser's business, not ours
+        return True, ""  # malformed hex is the parser's business, not ours
     if not raw or raw[0] != PQ_TX_TYPE:
-        return True, ""          # legacy envelope cannot delegate
+        return True, ""  # legacy envelope cannot delegate
 
     try:
         tx = decode_pq_tx(raw)
     except Exception:
-        return True, ""          # structural failure is the parser's business
+        return True, ""  # structural failure is the parser's business
     if not tx.is_delegated():
         return True, ""
-
 
     source, signer = tx.spend_from(), tx.sender()
     try:
         cur = await db.connection.execute(
             "SELECT controller_address FROM system_wallets WHERE LOWER(address) = LOWER(?)",
-            (source,))
+            (source,),
+        )
         row = await cur.fetchone()
     except Exception as e:
         return False, f"system-wallet registry unreadable ({e})"
@@ -116,7 +117,10 @@ async def verify_delegated_spend(db, raw_tx_hex: str,
         # account id is what the transaction names.
         try:
             from ..crypto.account_id import to_account_id
-            cur = await db.connection.execute("SELECT address, controller_address FROM system_wallets")
+
+            cur = await db.connection.execute(
+                "SELECT address, controller_address FROM system_wallets"
+            )
             row = None
             for addr, controller in await cur.fetchall():
                 try:
@@ -134,18 +138,22 @@ async def verify_delegated_spend(db, raw_tx_hex: str,
     controller = row[0]
     try:
         from ..crypto.account_id import to_account_id
+
         authorised = to_account_id(controller) == signer
     except ValueError:
         authorised = str(controller).lower() == signer.lower()
 
     if not authorised:
-        return False, (f"signer {signer[:20]} is not the controller of {source[:20]} "
-                       f"(controller {str(controller)[:20]})")
+        return False, (
+            f"signer {signer[:20]} is not the controller of {source[:20]} "
+            f"(controller {str(controller)[:20]})"
+        )
 
     # The controller's authority is temporary: it ends at the sunset height, or when
     # governance freezes it (docs/GOVERNANCE.md).
     try:
         from ..exchange.governance import master_authority
+
         if block_height is None:
             block_height = int(await db.get_next_block_id())
         allowed, why = master_authority(int(block_height))
@@ -156,7 +164,7 @@ async def verify_delegated_spend(db, raw_tx_hex: str,
     return True, ""
 
 
-def _parse_pq_raw_tx(raw_tx: bytes) -> Dict[str, object]:
+def _parse_pq_raw_tx(raw_tx: bytes) -> Dict[str, Any]:
     """
     Decode **and authenticate** a type-0x51 post-quantum transaction.
 
@@ -172,15 +180,15 @@ def _parse_pq_raw_tx(raw_tx: bytes) -> Dict[str, object]:
     signature checked explicitly at the same point, or a proposer could smuggle an
     unsigned transaction spending someone else's account.
     """
-    from eth_utils import encode_hex
     from eth_hash.auto import keccak
+    from eth_utils import encode_hex
 
-    from ..transactions.pq_tx import decode_pq_tx, PQ_TX_TYPE
+    from ..transactions.pq_tx import PQ_TX_TYPE, decode_pq_tx
 
     try:
         tx = decode_pq_tx(raw_tx)
     except Exception as e:
-        raise ValueError(f"malformed PQ transaction: {e}")
+        raise ValueError(f"malformed PQ transaction: {e}") from e
 
     if not tx.verify():
         raise ValueError("PQ signature verification failed")
@@ -230,16 +238,20 @@ def _require_chain_id(chain_id) -> None:
     a proposer cannot include what admission would refuse.
     """
     from ..constants import CHAIN_ID
+
     if chain_id is None:
         raise ValueError(
             f"transaction is not bound to a chain id (pre-EIP-155 signature); sign it for "
-            f"chain id {CHAIN_ID}")
+            f"chain id {CHAIN_ID}"
+        )
     if int(chain_id) != CHAIN_ID:
-        raise ValueError(f"transaction is signed for chain id {chain_id}, but this network's "
-                         f"chain id is {CHAIN_ID}")
+        raise ValueError(
+            f"transaction is signed for chain id {chain_id}, but this network's "
+            f"chain id is {CHAIN_ID}"
+        )
 
 
-def parse_eth_raw_tx(raw_tx_hex: str) -> Dict[str, object]:
+def parse_eth_raw_tx(raw_tx_hex: str) -> Dict[str, Any]:
     """
     Decode a signed transaction and establish its sender.
 
@@ -256,17 +268,17 @@ def parse_eth_raw_tx(raw_tx_hex: str) -> Dict[str, object]:
     Raises ValueError on malformed input, an unsupported transaction type, or a
     signature that cannot be recovered / verified.
     """
-    from eth_utils import decode_hex, encode_hex
-    from eth_keys import keys
-    from eth_hash.auto import keccak
     import rlp
+    from eth_hash.auto import keccak
+    from eth_keys import keys
+    from eth_utils import decode_hex, encode_hex
 
     from ..transactions.pq_tx import PQ_TX_TYPE
 
     try:
         raw_tx = decode_hex(raw_tx_hex)
     except Exception as e:
-        raise ValueError(f"malformed hex: {e}")
+        raise ValueError(f"malformed hex: {e}") from e
     if not raw_tx:
         raise ValueError("empty transaction")
 
@@ -282,7 +294,7 @@ def parse_eth_raw_tx(raw_tx_hex: str) -> Dict[str, object]:
     try:
         tx = rlp.decode(raw_tx)
     except Exception as e:
-        raise ValueError(f"malformed RLP: {e}")
+        raise ValueError(f"malformed RLP: {e}") from e
     if len(tx) != 9:
         raise ValueError(f"expected 9 RLP fields, got {len(tx)}")
 
@@ -303,7 +315,9 @@ def parse_eth_raw_tx(raw_tx_hex: str) -> Dict[str, object]:
         chain_id = (v_int - 35) // 2
         recovery_id = v_int - (chain_id * 2 + 35)
         unsigned = [tx[i] for i in range(6)] + [
-            chain_id.to_bytes((chain_id.bit_length() + 7) // 8, "big"), b"", b"",
+            chain_id.to_bytes((chain_id.bit_length() + 7) // 8, "big"),
+            b"",
+            b"",
         ]
     else:  # pre-EIP-155
         chain_id = None
@@ -316,11 +330,13 @@ def parse_eth_raw_tx(raw_tx_hex: str) -> Dict[str, object]:
 
     message_hash = keccak(rlp.encode(unsigned))
     try:
-        sig = keys.Signature(r_int.to_bytes(32, "big") + s_int.to_bytes(32, "big") + bytes([recovery_id]))
+        sig = keys.Signature(
+            r_int.to_bytes(32, "big") + s_int.to_bytes(32, "big") + bytes([recovery_id])
+        )
         pub = sig.recover_public_key_from_msg_hash(message_hash)
         sender = pub.to_canonical_address()
     except Exception as e:
-        raise ValueError(f"signature recovery failed: {e}")
+        raise ValueError(f"signature recovery failed: {e}") from e
 
     return {
         "sender": encode_hex(sender),
@@ -358,7 +374,7 @@ class EVMMempool:
         self.max_nonce_gap = max_nonce_gap
         self._nonce_provider = nonce_provider or _default_nonce_provider
         # tx_hash -> {raw, sender, nonce}
-        self._txs: Dict[str, Dict[str, object]] = {}
+        self._txs: Dict[str, Dict[str, Any]] = {}
         self._by_sender: Dict[str, Set[str]] = {}
 
     # ── Admission ──────────────────────────────────────────────────────
@@ -395,7 +411,11 @@ class EVMMempool:
         if nonce < expected:
             return False, f"nonce too low: {nonce} < expected {expected} (stale/replay)", None
         if nonce > expected + self.max_nonce_gap:
-            return False, f"nonce too far ahead: {nonce} > expected {expected} + gap {self.max_nonce_gap}", None
+            return (
+                False,
+                f"nonce too far ahead: {nonce} > expected {expected} + gap {self.max_nonce_gap}",
+                None,
+            )
         for h in sender_hashes:
             if int(self._txs[h]["nonce"]) == nonce:
                 return False, f"nonce {nonce} already queued for sender", None
@@ -423,8 +443,7 @@ class EVMMempool:
         transaction is rejected as already queued.
         """
         queued = {
-            int(self._txs[h]["nonce"])
-            for h in self._by_sender.get(str(sender).lower(), set())
+            int(self._txs[h]["nonce"]) for h in self._by_sender.get(str(sender).lower(), set())
         }
         nonce = base
         while nonce in queued:

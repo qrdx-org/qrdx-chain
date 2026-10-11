@@ -5,11 +5,12 @@ Stores bridge deposit/withdrawal events and fraud proof windows.
 No stubs — real SQL operations.
 """
 
-import aiosqlite
-from decimal import Decimal
-from typing import List, Optional
 import logging
 import time
+from decimal import Decimal
+from typing import List, Optional
+
+import aiosqlite
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +92,18 @@ class BridgePersistence:
                 token_symbol, amount, status, confirmations, required_confirmations,
                 source_tx_hash, attestation_count, created_at, updated_at)
                VALUES (?, 'DEPOSIT', ?, 'QRDX', ?, ?, ?, ?, 'PENDING', 0, ?, ?, 0, ?, ?)""",
-            (event_id, source_chain, from_address, to_address,
-             token_symbol, str(amount), required_confirmations, source_tx_hash, now, now),
+            (
+                event_id,
+                source_chain,
+                from_address,
+                to_address,
+                token_symbol,
+                str(amount),
+                required_confirmations,
+                source_tx_hash,
+                now,
+                now,
+            ),
         )
         await self.connection.commit()
 
@@ -114,14 +125,21 @@ class BridgePersistence:
                 token_symbol, amount, status, confirmations, required_confirmations,
                 fraud_proof_deadline, attestation_count, created_at, updated_at)
                VALUES (?, 'WITHDRAWAL', 'QRDX', ?, ?, ?, ?, ?, 'PENDING', 0, 0, ?, 0, ?, ?)""",
-            (event_id, dest_chain, from_address, to_address,
-             token_symbol, str(amount), fraud_proof_deadline, now, now),
+            (
+                event_id,
+                dest_chain,
+                from_address,
+                to_address,
+                token_symbol,
+                str(amount),
+                fraud_proof_deadline,
+                now,
+                now,
+            ),
         )
         await self.connection.commit()
 
-    async def add_attestation(
-        self, event_id: str, validator_address: str, signature: str
-    ) -> int:
+    async def add_attestation(self, event_id: str, validator_address: str, signature: str) -> int:
         """Add a validator attestation for a bridge event. Returns new count."""
         now = int(time.time())
         await self.connection.execute(

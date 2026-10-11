@@ -123,7 +123,7 @@ The exchange engine is not a smart contract application deployed on top of the c
 **Key Specifications:**
 - **Protocol Layer**: Layer-0 (cross-chain substrate)
 - **Consensus**: Quantum-Resistant Proof-of-Stake (QR-PoS) with PQ-only validator identity
-- **Block Time**: 2 seconds
+- **Block Time**: 250 ms
 - **Finality**: Sub-second (single slot finality)
 - **Throughput**: 5,000+ TPS (exchange operations included)
 - **Smart Contract VM**: QEVM (Quantum-resistant EVM)
@@ -2705,7 +2705,7 @@ Validators running more chain adapters get a slight selection probability bonus,
 ### 11.4 Block Production
 
 **Timeline:**
-- Slot Duration: 2 seconds
+- Slot Duration: 250 ms
 - Block Proposal: Validator signature (Dilithium)
 - Attestation Period: 1 second
 - Finality: 1 second (after 2/3+ attestations)
@@ -2922,7 +2922,7 @@ All governance actions pass through a timelock contract with quantum-resistant s
 | Pool Creation Stake (Standard) | 10,000 QRDX | Yes |
 | Pool Creation Subsidy (Burned) | 5,000 QRDX | Yes |
 | Validator Set Size | 150 | Yes |
-| Block Time | 2 seconds | Yes (requires upgrade) |
+| Block Time | 250 ms | Yes (requires upgrade) |
 | Proposal Threshold | 10,000,000 QRDX | Yes |
 | Voting Period | 7 days | Yes |
 | Oracle Attestation Threshold | 2/3+1 of adapter validators | Yes |

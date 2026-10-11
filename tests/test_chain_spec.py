@@ -44,7 +44,8 @@ def test_dev_spec_reproduces_the_historical_defaults():
     spec = cs.dev_spec(env={})
     assert spec.dev and spec.chain_id == 88888 and spec.network == "qrdx-dev"
     assert spec.params == {k: p.default for k, p in cs.PARAMS.items()}
-    assert spec.scheduled_features_at(10 ** 9) == frozenset()
+    # A dev network runs the release's genesis defaults, and nothing scheduled beyond them.
+    assert spec.scheduled_features_at(10 ** 9) == frozenset(cs.GENESIS_DEFAULT_FEATURES)
 
 
 def test_dev_spec_takes_parameters_from_the_environment():
@@ -58,7 +59,7 @@ def test_dev_spec_takes_parameters_from_the_environment():
 
 def test_dev_spec_rejects_a_malformed_environment_value():
     with pytest.raises(ChainSpecError):
-        cs.dev_spec(env={"QRDX_SLOT_DURATION": "two"})
+        cs.dev_spec(env={"QRDX_SLOT_DURATION_MS": "two"})
 
 
 @pytest.mark.parametrize("mutate, message", [
@@ -70,11 +71,11 @@ def test_dev_spec_rejects_a_malformed_environment_value():
     (lambda r: r.update(dev="no"), "dev"),
     (lambda r: r.update(chain_id=0), "chain_id"),
     (lambda r: r.update(chain_id=True), "chain_id"),
-    (lambda r: r["params"].pop("SLOT_DURATION"), "missing parameter"),
+    (lambda r: r["params"].pop("SLOT_DURATION_MS"), "missing parameter"),
     (lambda r: r["params"].update(NOT_A_PARAM=1), "unknown parameter"),
-    (lambda r: r["params"].update(SLOT_DURATION=0), ">= 1"),
-    (lambda r: r["params"].update(SLOT_DURATION=True), "integer"),
-    (lambda r: r["params"].update(SLOT_DURATION=2.0), "integer"),
+    (lambda r: r["params"].update(SLOT_DURATION_MS=99), ">= 100"),
+    (lambda r: r["params"].update(SLOT_DURATION_MS=True), "integer"),
+    (lambda r: r["params"].update(SLOT_DURATION_MS=250.0), "integer"),
     (lambda r: r["params"].update(PERP_QUOTE=" USD"), "whitespace"),
     (lambda r: r["params"].update(ORACLE_REPORTERS=["a", "a"]), "twice"),
     (lambda r: r["params"].update(ORACLE_REPORTERS=["a,b"]), "list"),
@@ -177,9 +178,9 @@ def test_a_rule_check_needs_a_real_height_and_a_known_feature():
 
 def test_the_spec_is_immutable_from_outside():
     spec = _spec()
-    spec.params["SLOT_DURATION"] = 99
-    spec.to_dict()["params"]["SLOT_DURATION"] = 99
-    assert spec.params["SLOT_DURATION"] == 2
+    spec.params["SLOT_DURATION_MS"] = 99
+    spec.to_dict()["params"]["SLOT_DURATION_MS"] = 99
+    assert spec.params["SLOT_DURATION_MS"] == 250  # the standard slot, untouched
 
 
 # ── peers (EIP-2124) ────────────────────────────────────────────────────────────────────
@@ -306,7 +307,7 @@ def test_a_process_with_a_genesis_file_takes_its_parameters_from_it(tmp_path):
     """End to end through qrdx.constants, in a subprocess (constants load at import)."""
     import subprocess
     import sys
-    spec = _spec(SLOTS_PER_EPOCH=8, SLOT_DURATION=6, PERP_QUOTE="QRDX")
+    spec = _spec(SLOTS_PER_EPOCH=8, SLOT_DURATION_MS=250, PERP_QUOTE="QRDX")
     (tmp_path / "databases").mkdir()
     (tmp_path / "genesis_config.json").write_text(json.dumps({"chain_spec": spec.to_dict()}))
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -320,7 +321,7 @@ def test_a_process_with_a_genesis_file_takes_its_parameters_from_it(tmp_path):
                          capture_output=True, text=True, timeout=120)
     assert out.returncode == 0, out.stderr[-2000:]
     slots, slot_s, quote, chain_id, network, conflicts = json.loads(out.stdout.strip().splitlines()[-1])
-    assert (slots, slot_s, quote, chain_id, network) == (8, 6, "QRDX", 4242, "qrdx-testnet")
+    assert (slots, slot_s, quote, chain_id, network) == (8, 0.25, "QRDX", 4242, "qrdx-testnet")
     assert len(conflicts) == 1 and "QRDX_SLOTS_PER_EPOCH" in conflicts[0]
 
 

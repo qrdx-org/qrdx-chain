@@ -17,21 +17,24 @@ import hashlib
 import json
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.request import Request, urlopen
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.error import URLError
+from urllib.request import Request, urlopen
 
+from ..constants import DOOMSDAY_CANARY_ADDRESS
+from ..logger import get_logger
 from .types import (
     BlockHeightRecord,
+    BridgeOperationType,
     BridgeRecord,
     ChainId,
     OracleAttestation,
-    ValidatorProof,
 )
-from ..constants import DOOMSDAY_CANARY_ADDRESS
-from ..logger import get_logger
+
+if TYPE_CHECKING:
+    from .shielding import DoomsdayAttestation
 
 logger = get_logger(__name__)
 
@@ -39,6 +42,7 @@ logger = get_logger(__name__)
 # ══════════════════════════════════════════════════════════════════════
 #  PROOF STRUCTURES
 # ══════════════════════════════════════════════════════════════════════
+
 
 @dataclass
 class InclusionProof:
@@ -53,6 +57,7 @@ class InclusionProof:
         proof_data: Chain-specific proof bytes (hex)
         root_hash: Expected Merkle/state root
     """
+
     chain_id: ChainId
     tx_hash: str
     block_hash: str
@@ -74,6 +79,7 @@ class InclusionProof:
 # ══════════════════════════════════════════════════════════════════════
 #  BASE CHAIN ADAPTER  (Abstract)
 # ══════════════════════════════════════════════════════════════════════
+
 
 class BaseChainAdapter(ABC):
     """
@@ -160,12 +166,14 @@ class BaseChainAdapter(ABC):
             )
 
         self._rpc_request_id += 1
-        payload = json.dumps({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-            "id": self._rpc_request_id,
-        }).encode()
+        payload = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+                "id": self._rpc_request_id,
+            }
+        ).encode()
 
         req = Request(
             self.rpc_url,
@@ -177,15 +185,11 @@ class BaseChainAdapter(ABC):
             with urlopen(req, timeout=timeout) as resp:
                 body = json.loads(resp.read().decode())
         except URLError as e:
-            raise ConnectionError(
-                f"{self.name}: RPC call {method} failed: {e}"
-            ) from e
+            raise ConnectionError(f"{self.name}: RPC call {method} failed: {e}") from e
 
         if "error" in body and body["error"]:
             err = body["error"]
-            raise RuntimeError(
-                f"{self.name}: RPC error {err.get('code')}: {err.get('message')}"
-            )
+            raise RuntimeError(f"{self.name}: RPC error {err.get('code')}: {err.get('message')}")
 
         return body.get("result")
 
@@ -307,6 +311,7 @@ class BaseChainAdapter(ABC):
 #  ETHEREUM ADAPTER  (Whitepaper §10.3)
 # ══════════════════════════════════════════════════════════════════════
 
+
 class EthereumAdapter(BaseChainAdapter):
     """
     Ethereum chain adapter implementing Merkle-Patricia proof verification.
@@ -336,19 +341,13 @@ class EthereumAdapter(BaseChainAdapter):
         Raises ConnectionError if no RPC URL is configured.
         """
         try:
-            result = self._json_rpc_call(
-                "eth_getBlockByNumber", ["finalized", False]
-            )
+            result = self._json_rpc_call("eth_getBlockByNumber", ["finalized", False])
             if result is None:
                 # Fallback to "latest" for nodes without finality API
-                result = self._json_rpc_call(
-                    "eth_getBlockByNumber", ["latest", False]
-                )
+                result = self._json_rpc_call("eth_getBlockByNumber", ["latest", False])
         except RuntimeError:
             # Some nodes don't support "finalized" tag
-            result = self._json_rpc_call(
-                "eth_getBlockByNumber", ["latest", False]
-            )
+            result = self._json_rpc_call("eth_getBlockByNumber", ["latest", False])
 
         height = int(result["number"], 16)
         block_hash = result["hash"]
@@ -368,9 +367,7 @@ class EthereumAdapter(BaseChainAdapter):
 
     def get_block_by_height(self, height: int) -> Optional[BlockHeightRecord]:
         hex_height = hex(height)
-        result = self._json_rpc_call(
-            "eth_getBlockByNumber", [hex_height, False]
-        )
+        result = self._json_rpc_call("eth_getBlockByNumber", [hex_height, False])
         if result is None:
             return None
         return BlockHeightRecord(
@@ -382,19 +379,14 @@ class EthereumAdapter(BaseChainAdapter):
 
     def get_transaction(self, tx_hash: str) -> Optional[Dict[str, Any]]:
         """Fetch Ethereum transaction via eth_getTransactionByHash."""
-        result = self._json_rpc_call(
-            "eth_getTransactionByHash", [tx_hash]
-        )
+        result = self._json_rpc_call("eth_getTransactionByHash", [tx_hash])
         if result is None:
             return None
         return {
             "hash": result["hash"],
             "chain_id": int(ChainId.ETHEREUM),
             "block_hash": result.get("blockHash"),
-            "block_number": (
-                int(result["blockNumber"], 16)
-                if result.get("blockNumber") else None
-            ),
+            "block_number": (int(result["blockNumber"], 16) if result.get("blockNumber") else None),
             "from": result.get("from"),
             "to": result.get("to"),
             "value": result.get("value"),
@@ -423,9 +415,7 @@ class EthereumAdapter(BaseChainAdapter):
 
         # Verify the transaction actually exists in the claimed block
         try:
-            receipt = self._json_rpc_call(
-                "eth_getTransactionReceipt", [proof.tx_hash]
-            )
+            receipt = self._json_rpc_call("eth_getTransactionReceipt", [proof.tx_hash])
             if receipt is None:
                 return False
 
@@ -459,39 +449,50 @@ class EthereumAdapter(BaseChainAdapter):
             return []
 
         # keccak256("Lock(address,uint256,bytes32)")
-        lock_topic = "0x" + hashlib.sha256(
-            b"Lock(address,uint256,bytes32)"
-        ).hexdigest()
+        lock_topic = "0x" + hashlib.sha256(b"Lock(address,uint256,bytes32)").hexdigest()
 
         try:
-            logs = self._json_rpc_call("eth_getLogs", [{
-                "fromBlock": hex(from_height),
-                "toBlock": hex(to_height),
-                "address": bridge_contract,
-                "topics": [lock_topic],
-            }])
+            logs = self._json_rpc_call(
+                "eth_getLogs",
+                [
+                    {
+                        "fromBlock": hex(from_height),
+                        "toBlock": hex(to_height),
+                        "address": bridge_contract,
+                        "topics": [lock_topic],
+                    }
+                ],
+            )
         except (ConnectionError, RuntimeError) as e:
             logger.error(f"Failed to fetch lock events: {e}")
             return []
 
         records = []
-        for log_entry in (logs or []):
+        for log_entry in logs or []:
             try:
-                records.append(BridgeRecord(
-                    record_id="",
-                    source_chain_id=ChainId.ETHEREUM,
-                    dest_chain_id=ChainId.QRDX,
-                    block_height=int(log_entry["blockNumber"], 16),
-                    block_hash=log_entry["blockHash"],
-                    source_tx_hash=log_entry["transactionHash"],
-                    amount=Decimal(0),  # Decoded from log data
-                    source_address=log_entry.get("topics", ["", ""])[1] if len(log_entry.get("topics", [])) > 1 else "",
-                    qrdx_address="",  # Decoded from log data
-                    token_symbol="ETH",
-                    confirmations_required=self.confirmations_required,
-                ))
-            except (IndexError, KeyError) as e:
-                logger.warning(f"Malformed lock event log: {e}")
+                records.append(
+                    BridgeRecord(
+                        record_id="",
+                        source_chain_id=ChainId.ETHEREUM,
+                        dest_chain_id=ChainId.QRDX,
+                        block_height=int(log_entry["blockNumber"], 16),
+                        block_hash=log_entry["blockHash"],
+                        source_tx_hash=log_entry["transactionHash"],
+                        amount=Decimal(0),  # Decoded from log data
+                        source_address=(
+                            log_entry.get("topics", ["", ""])[1]
+                            if len(log_entry.get("topics", [])) > 1
+                            else ""
+                        ),
+                        qrdx_address="",  # Decoded from log data
+                        operation=BridgeOperationType.SHIELD,
+                        token_symbol="ETH",
+                        confirmations_required=self.confirmations_required,
+                    )
+                )
+            except (IndexError, KeyError, ValueError) as e:
+                # ValueError: no positive amount (the event's data is not decoded yet).
+                logger.warning(f"Skipping lock event without a usable record: {e}")
         return records
 
     def _get_state_root(self, block: BlockHeightRecord) -> str:
@@ -517,14 +518,12 @@ class EthereumAdapter(BaseChainAdapter):
         """
         address = canary_address or DOOMSDAY_CANARY_ADDRESS
         try:
-            result = self._json_rpc_call(
-                "eth_getBalance", [address, block_tag]
-            )
+            result = self._json_rpc_call("eth_getBalance", [address, block_tag])
             if result is None:
                 return None
             # Result is hex-encoded wei — convert to ether
             wei = int(result, 16)
-            return Decimal(wei) / Decimal(10 ** 18)
+            return Decimal(wei) / Decimal(10**18)
         except (ConnectionError, RuntimeError, ValueError) as exc:
             logger.warning(f"Failed to check canary balance: {exc}")
             return None
@@ -576,6 +575,7 @@ class EthereumAdapter(BaseChainAdapter):
 # ══════════════════════════════════════════════════════════════════════
 #  BITCOIN ADAPTER  (Whitepaper §10.4)
 # ══════════════════════════════════════════════════════════════════════
+
 
 class BitcoinAdapter(BaseChainAdapter):
     """
@@ -632,9 +632,7 @@ class BitcoinAdapter(BaseChainAdapter):
     def get_transaction(self, tx_hash: str) -> Optional[Dict[str, Any]]:
         """Fetch Bitcoin transaction via getrawtransaction (verbose)."""
         try:
-            result = self._json_rpc_call(
-                "getrawtransaction", [tx_hash, True]
-            )
+            result = self._json_rpc_call("getrawtransaction", [tx_hash, True])
             if result is None:
                 return None
             confirmations = result.get("confirmations", 0)
@@ -643,7 +641,9 @@ class BitcoinAdapter(BaseChainAdapter):
                 "chain_id": int(ChainId.BITCOIN),
                 "block_hash": result.get("blockhash"),
                 "confirmations": confirmations,
-                "status": "confirmed" if confirmations >= self.confirmations_required else "pending",
+                "status": (
+                    "confirmed" if confirmations >= self.confirmations_required else "pending"
+                ),
             }
         except (ConnectionError, RuntimeError):
             return None
@@ -669,9 +669,7 @@ class BitcoinAdapter(BaseChainAdapter):
 
         # Verify the proof against the Bitcoin node
         try:
-            verified_txids = self._json_rpc_call(
-                "verifytxoutproof", [proof.proof_data]
-            )
+            verified_txids = self._json_rpc_call("verifytxoutproof", [proof.proof_data])
             return proof.tx_hash in (verified_txids or [])
         except (ConnectionError, RuntimeError) as e:
             logger.warning(f"Bitcoin proof verification failed: {e}")
@@ -701,19 +699,22 @@ class BitcoinAdapter(BaseChainAdapter):
                     for vout in tx.get("vout", []):
                         addrs = vout.get("scriptPubKey", {}).get("addresses", [])
                         if bridge_contract in addrs:
-                            records.append(BridgeRecord(
-                                record_id="",
-                                source_chain_id=ChainId.BITCOIN,
-                                dest_chain_id=ChainId.QRDX,
-                                block_height=height,
-                                block_hash=block_hash,
-                                source_tx_hash=tx["txid"],
-                                amount=Decimal(str(vout["value"])),
-                                source_address="",
-                                qrdx_address="",
-                                token_symbol="BTC",
-                                confirmations_required=self.confirmations_required,
-                            ))
+                            records.append(
+                                BridgeRecord(
+                                    record_id="",
+                                    source_chain_id=ChainId.BITCOIN,
+                                    dest_chain_id=ChainId.QRDX,
+                                    block_height=height,
+                                    block_hash=block_hash,
+                                    source_tx_hash=tx["txid"],
+                                    amount=Decimal(str(vout["value"])),
+                                    source_address="",
+                                    qrdx_address="",
+                                    operation=BridgeOperationType.SHIELD,
+                                    token_symbol="BTC",
+                                    confirmations_required=self.confirmations_required,
+                                )
+                            )
             except (ConnectionError, RuntimeError) as e:
                 logger.error(f"Failed scanning BTC block {height}: {e}")
         return records
@@ -722,6 +723,7 @@ class BitcoinAdapter(BaseChainAdapter):
 # ══════════════════════════════════════════════════════════════════════
 #  SOLANA ADAPTER  (Whitepaper §10.1)
 # ══════════════════════════════════════════════════════════════════════
+
 
 class SolanaAdapter(BaseChainAdapter):
     """
@@ -852,40 +854,50 @@ class SolanaAdapter(BaseChainAdapter):
             return []
 
         try:
-            sigs = self._json_rpc_call("getSignaturesForAddress", [
-                bridge_contract,
-                {"limit": 100, "commitment": "finalized"},
-            ])
+            sigs = self._json_rpc_call(
+                "getSignaturesForAddress",
+                [
+                    bridge_contract,
+                    {"limit": 100, "commitment": "finalized"},
+                ],
+            )
         except (ConnectionError, RuntimeError) as e:
             logger.error(f"Failed to fetch Solana signatures: {e}")
             return []
 
         records = []
-        for sig_info in (sigs or []):
+        for sig_info in sigs or []:
             slot = sig_info.get("slot", 0)
             if slot < from_height or slot > to_height:
                 continue
             if sig_info.get("err") is not None:
                 continue
-            records.append(BridgeRecord(
-                record_id="",
-                source_chain_id=ChainId.SOLANA,
-                dest_chain_id=ChainId.QRDX,
-                block_height=slot,
-                block_hash="",
-                source_tx_hash=sig_info["signature"],
-                amount=Decimal(0),
-                source_address="",
-                qrdx_address="",
-                token_symbol="SOL",
-                confirmations_required=self.confirmations_required,
-            ))
+            try:
+                records.append(
+                    BridgeRecord(
+                        record_id="",
+                        source_chain_id=ChainId.SOLANA,
+                        dest_chain_id=ChainId.QRDX,
+                        block_height=slot,
+                        block_hash="",
+                        source_tx_hash=sig_info["signature"],
+                        amount=Decimal(0),  # not decoded from the transaction yet
+                        source_address="",
+                        qrdx_address="",
+                        operation=BridgeOperationType.SHIELD,
+                        token_symbol="SOL",
+                        confirmations_required=self.confirmations_required,
+                    )
+                )
+            except ValueError as e:
+                logger.warning(f"Skipping Solana lock without a usable record: {e}")
         return records
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  ORACLE CONSENSUS  (Whitepaper §10.2)
 # ══════════════════════════════════════════════════════════════════════
+
 
 class OracleConsensus:
     """
@@ -986,6 +998,7 @@ class OracleConsensus:
 #  BLOCK HEIGHT TRACKER  (Whitepaper §8.4 / Step 7.6)
 # ══════════════════════════════════════════════════════════════════════
 
+
 class BlockHeightTracker:
     """
     Tracks attested block heights for all bridged chains.
@@ -1035,10 +1048,7 @@ class BlockHeightTracker:
 
     def get_all_heights(self) -> Dict[ChainId, int]:
         """Get latest height for every tracked chain."""
-        return {
-            chain: rec.block_height
-            for chain, rec in self._heights.items()
-        }
+        return {chain: rec.block_height for chain, rec in self._heights.items()}
 
     def get_history(self, chain_id: ChainId, limit: int = 100) -> List[BlockHeightRecord]:
         """Get recent height history for a chain."""
@@ -1050,7 +1060,4 @@ class BlockHeightTracker:
         return chain_id in self._heights
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            str(int(chain)): rec.to_dict()
-            for chain, rec in self._heights.items()
-        }
+        return {str(int(chain)): rec.to_dict() for chain, rec in self._heights.items()}

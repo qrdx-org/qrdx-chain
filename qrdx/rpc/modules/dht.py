@@ -13,10 +13,10 @@ Methods:
     dht_getRoutingTable — Return detailed routing table info
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from ..server import RPCModule, rpc_method, RPCError, RPCErrorCode
 from ...logger import get_logger
+from ..server import RPCError, RPCErrorCode, RPCModule, rpc_method
 
 logger = get_logger(__name__)
 
@@ -34,8 +34,8 @@ class DHTModule(RPCModule):
 
     def __init__(self, context: Any = None):
         super().__init__(context)
-        self._discovery = None        # KademliaDiscovery
-        self._dns_seeds = None         # DNSSeedDiscovery
+        self._discovery: Any = None  # KademliaDiscovery
+        self._dns_seeds: Any = None  # DNSSeedDiscovery
 
     # -- Wiring (called from _init_dht in main.py) -------------------------
 
@@ -79,7 +79,7 @@ class DHTModule(RPCModule):
             return self._discovery.handle_incoming(msg)
         except Exception as e:
             logger.error(f"DHT message handling error: {e}")
-            raise RPCError(RPCErrorCode.INTERNAL_ERROR, f"DHT message error: {e}")
+            raise RPCError(RPCErrorCode.INTERNAL_ERROR, f"DHT message error: {e}") from e
 
     @rpc_method
     async def getStats(self) -> Dict:
@@ -93,7 +93,7 @@ class DHTModule(RPCModule):
         self._require_discovery()
         stats = self._discovery.get_stats()
         if self._dns_seeds is not None:
-            stats['dns_seeds'] = self._dns_seeds.get_stats()
+            stats["dns_seeds"] = self._dns_seeds.get_stats()
         return stats
 
     @rpc_method
@@ -112,15 +112,17 @@ class DHTModule(RPCModule):
         peers: List[Dict] = []
         for bucket in self._discovery.routing_table._buckets:
             for entry in bucket.entries:
-                peers.append({
-                    'node_id': entry.node_id_hex,
-                    'host': entry.host,
-                    'port': entry.port,
-                    'last_seen': entry.last_seen,
-                    'is_inbound': entry.is_inbound,
-                })
+                peers.append(
+                    {
+                        "node_id": entry.node_id_hex,
+                        "host": entry.host,
+                        "port": entry.port,
+                        "last_seen": entry.last_seen,
+                        "is_inbound": entry.is_inbound,
+                    }
+                )
         # Sort by last_seen descending (most recent first)
-        peers.sort(key=lambda p: p['last_seen'], reverse=True)
+        peers.sort(key=lambda p: p["last_seen"], reverse=True)
         return peers[:count]
 
     @rpc_method
@@ -137,10 +139,12 @@ class DHTModule(RPCModule):
         # Add per-bucket fill levels
         bucket_fills = []
         for bucket in rt._buckets:
-            bucket_fills.append({
-                'index': bucket.index,
-                'size': len(bucket.entries),
-                'replacement_cache': len(bucket.replacement_cache),
-            })
-        stats['buckets'] = bucket_fills
+            bucket_fills.append(
+                {
+                    "index": bucket.index,
+                    "size": len(bucket.entries),
+                    "replacement_cache": len(bucket.replacement_cache),
+                }
+            )
+        stats["buckets"] = bucket_fills
         return stats

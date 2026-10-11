@@ -171,9 +171,10 @@ async def test_an_ejected_validator_claims_its_principal_with_stake_exit(db):
 
 # ── cost of the forfeiture scan ───────────────────────────────────────────
 
-async def test_blocks_with_empty_evidence_are_never_parsed(db, monkeypatch):
+async def test_each_block_is_parsed_once_ever_not_per_query(db, monkeypatch):
     """Every block carries a ``slashing_evidence`` key, almost always empty, and blocks run
-    to ~100 KB. Only blocks with evidence may reach the parser — in either stored form."""
+    to ~100 KB. The chain index parses each stored block once — in either stored form — and
+    then answers every later query without parsing anything; only new blocks are parsed."""
     import json
     from qrdx.validator import block_verification as BV
 
@@ -194,7 +195,20 @@ async def test_blocks_with_empty_evidence_are_never_parsed(db, monkeypatch):
                         lambda c: (parsed.append(1) if isinstance(c, str) else None) or real(c))
 
     assert await W.slashed_on_chain(db, who, 100)
-    assert len(parsed) == 1, f"parsed {len(parsed)} blocks; only the one with evidence should be"
+    first = len(parsed)
+    assert 31 <= first <= await db.get_next_block_id(), f"parsed {first} blocks to index them"
+
+    parsed.clear()
+    assert await W.slashed_on_chain(db, who, 100)
+    assert await W.slashed_on_chain(db, who, 100)
+    assert parsed == [], "a query over an indexed chain parses nothing"
+
+    for h in range(61, 66):
+        await db.add_block(block_hash=f"{h:064x}", block_height=h, block_content=str({"number": h}),
+                           validator_address=who, timestamp=1_700_000_000 + h)
+    parsed.clear()
+    assert await W.slashed_on_chain(db, who, 100)
+    assert len(parsed) == 5, "only the new blocks are parsed"
 
 
 async def test_nothing_to_pay_means_no_scan(db, monkeypatch):

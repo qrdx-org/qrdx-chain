@@ -22,7 +22,7 @@ What it does (docs/PROTOCOL_UPGRADES.md §8):
          stale node refuses them — instead of anyone silently following a different chain.
 
 Exit code 0 when every check holds. Uses the larger-slot RANDAO configuration
-(QRDX_SLOT_DURATION=6, QRDX_SLOTS_PER_EPOCH=4) unless the environment says otherwise — RANDAO on
+(QRDX_SLOT_DURATION_MS=6000, QRDX_SLOTS_PER_EPOCH=4) unless the environment says otherwise — RANDAO on
 a 3-validator, 2-second-slot testnet churns (docs/KNOWN_ISSUES.md, RANDAO entry), which would
 blur the result.
 """
@@ -125,7 +125,7 @@ async def _approve_fork_on_chain(client, urls, wallets, fork, check) -> bool:
 
 async def main(args) -> int:
     os.environ["QRDX_TESTNET_RANDAO_FORK_HEIGHT"] = str(args.fork_height)
-    os.environ.setdefault("QRDX_SLOT_DURATION", "6")
+    os.environ.setdefault("QRDX_SLOT_DURATION_MS", "6000")
     os.environ.setdefault("QRDX_SLOTS_PER_EPOCH", "4")
 
     from integration_tests.config import CONFIGS_DIR, GENESIS_FILE, TESTNET_DIR

@@ -26,12 +26,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import math
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,22 +40,23 @@ ZERO = Decimal("0")
 # Constants
 # ---------------------------------------------------------------------------
 
-FUNDING_INTERVAL = 8 * 3600              # 8 hours in seconds
-MAX_FUNDING_RATE = Decimal("0.01")       # ±1 % per interval cap
-MAX_LEVERAGE = Decimal("20")             # 20× max
+FUNDING_INTERVAL = 8 * 3600  # 8 hours in seconds
+MAX_FUNDING_RATE = Decimal("0.01")  # ±1 % per interval cap
+MAX_LEVERAGE = Decimal("20")  # 20× max
 DEFAULT_INITIAL_MARGIN = Decimal("0.05")  # 5 %
-DEFAULT_MAINT_MARGIN = Decimal("0.025")   # 2.5 %
-PREMIUM_EMA_SPAN = 30                     # 30-second EMA span
+DEFAULT_MAINT_MARGIN = Decimal("0.025")  # 2.5 %
+PREMIUM_EMA_SPAN = 30  # 30-second EMA span
 INSURANCE_CLAWBACK_THRESHOLD = Decimal("0.20")  # 20 % of fund depleted → ADL
-LIQUIDATION_PENALTY_RATE = Decimal("0.025")       # 2.5 % penalty → insurance fund
+LIQUIDATION_PENALTY_RATE = Decimal("0.025")  # 2.5 % penalty → insurance fund
 MAX_OPEN_INTEREST_DEFAULT = Decimal("1000000000")  # default cap per market
-ORACLE_STALENESS_SECONDS = 120                      # reject if oracle older than 2 min
-MAX_POSITIONS_PER_OWNER = 100                       # per market
+ORACLE_STALENESS_SECONDS = 120  # reject if oracle older than 2 min
+MAX_POSITIONS_PER_OWNER = 100  # per market
 
 
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
+
 
 class PerpSide(str, Enum):
     LONG = "long"
@@ -73,11 +73,13 @@ class PositionStatus(str, Enum):
 # Data models
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class FundingSnapshot:
     """Recorded funding rate at a given interval."""
+
     timestamp: float
-    rate: Decimal        # signed: +ve means longs pay shorts
+    rate: Decimal  # signed: +ve means longs pay shorts
     mark_price: Decimal
     index_price: Decimal
     premium: Decimal
@@ -86,6 +88,7 @@ class FundingSnapshot:
 @dataclass
 class LiquidationResult:
     """Outcome of a liquidation attempt."""
+
     position_id: str
     owner: str
     side: PerpSide
@@ -96,26 +99,27 @@ class LiquidationResult:
     pnl: Decimal
     insurance_used: Decimal
     adl_triggered: bool = False
-    margin_returned: Decimal = ZERO   # residual equity returned to the trader (>=0)
+    margin_returned: Decimal = ZERO  # residual equity returned to the trader (>=0)
 
 
 @dataclass
 class PerpPosition:
     """A single perpetual futures position."""
+
     id: str
     owner: str
     market_id: str
     side: PerpSide
-    size: Decimal                      # in base units
+    size: Decimal  # in base units
     entry_price: Decimal
-    margin: Decimal                    # collateral deposited
+    margin: Decimal  # collateral deposited
     leverage: Decimal
     status: PositionStatus = PositionStatus.OPEN
-    last_funding_time: float = 0.0     # last time funding was applied
+    last_funding_time: float = 0.0  # last time funding was applied
     realized_pnl: Decimal = ZERO
     accumulated_funding: Decimal = ZERO
     opened_at: float = field(default_factory=time.time)
-    reduce_only: bool = False          # can only reduce exposure, not increase
+    reduce_only: bool = False  # can only reduce exposure, not increase
 
     @property
     def notional(self) -> Decimal:
@@ -163,12 +167,14 @@ class PerpPosition:
 # Perp Market
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class PerpMarket:
     """Configuration for a single perpetual market."""
+
     id: str
-    base_token: str                # e.g. "BTC"
-    quote_token: str               # always "QRDX"
+    base_token: str  # e.g. "BTC"
+    quote_token: str  # always "QRDX"
     initial_margin_rate: Decimal = DEFAULT_INITIAL_MARGIN
     maintenance_margin_rate: Decimal = DEFAULT_MAINT_MARGIN
     max_leverage: Decimal = MAX_LEVERAGE
@@ -196,6 +202,7 @@ class PerpMarket:
 # ---------------------------------------------------------------------------
 # Perp Engine
 # ---------------------------------------------------------------------------
+
 
 class PerpEngine:
     """
@@ -329,17 +336,25 @@ class PerpEngine:
         self._check_oracle_staleness(market)
 
         # --- Max OI check ---
-        new_oi_side = market.open_interest_long + size if side == PerpSide.LONG else market.open_interest_short + size
+        new_oi_side = (
+            market.open_interest_long + size
+            if side == PerpSide.LONG
+            else market.open_interest_short + size
+        )
         if new_oi_side > market.max_open_interest:
             raise ValueError(
                 f"Max open interest exceeded: {new_oi_side} > {market.max_open_interest}"
             )
 
         notional = size * price
-        required_margin = (notional / leverage).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+        required_margin = (notional / leverage).quantize(
+            Decimal("0.00000001"), rounding=ROUND_HALF_UP
+        )
 
         # Validate margin meets initial margin requirement
-        min_margin = (notional * market.initial_margin_rate).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+        min_margin = (notional * market.initial_margin_rate).quantize(
+            Decimal("0.00000001"), rounding=ROUND_HALF_UP
+        )
         if required_margin < min_margin:
             required_margin = min_margin
 
@@ -469,7 +484,11 @@ class PerpEngine:
         premium = market.last_premium
         # EMA smoothing
         alpha = Decimal("2") / (Decimal(PREMIUM_EMA_SPAN) + Decimal("1"))
-        smoothed_premium = alpha * premium + (Decimal("1") - alpha) * (market.mark_price - market.index_price) if market.mark_price > 0 else premium
+        smoothed_premium = (
+            alpha * premium + (Decimal("1") - alpha) * (market.mark_price - market.index_price)
+            if market.mark_price > 0
+            else premium
+        )
         market.mark_price = index_price + smoothed_premium
         if market.mark_price <= 0:
             market.mark_price = index_price
@@ -552,9 +571,9 @@ class PerpEngine:
 
             payment = pos.size * pos.entry_price * rate
             if pos.side == PerpSide.LONG:
-                pos.margin -= payment   # longs pay when rate > 0
+                pos.margin -= payment  # longs pay when rate > 0
             else:
-                pos.margin += payment   # shorts receive when rate > 0
+                pos.margin += payment  # shorts receive when rate > 0
 
             pos.accumulated_funding += payment if pos.side == PerpSide.SHORT else -payment
             pos.last_funding_time = now
@@ -688,9 +707,7 @@ class PerpEngine:
             return  # no update yet — allow (market just created)
         age = self.clock() - market.last_price_update
         if age > ORACLE_STALENESS_SECONDS:
-            raise ValueError(
-                f"Oracle data stale: {age:.0f}s old (max {ORACLE_STALENESS_SECONDS}s)"
-            )
+            raise ValueError(f"Oracle data stale: {age:.0f}s old (max {ORACLE_STALENESS_SECONDS}s)")
 
     @staticmethod
     def _deterministic_position_id(owner: str, market_id: str, side: str, seq: int) -> str:

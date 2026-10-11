@@ -857,10 +857,14 @@ class TestBootstrapDecentralization:
 
         for i in range(30):
             _add_direct(rt, make_entry(host=_diverse_ip(i)))
+        # Random node ids: a k-bucket holds 20, and about half of random ids share the top
+        # bucket, so occasionally fewer than 30 are kept. What must hold is that a restarted
+        # node gets back exactly the table it saved.
+        assert rt.total_nodes >= 10
         rt.save()
 
         rt2 = RoutingTable.load(local_node.node_id, str(tmp_path))
-        assert rt2.total_nodes == 30
+        assert rt2.total_nodes == rt.total_nodes
 
         target = secrets.token_bytes(20)
         closest = rt2.find_closest(target, count=10)

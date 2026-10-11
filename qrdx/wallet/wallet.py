@@ -5,44 +5,50 @@ import sys
 
 import pickledb
 import requests
-from fastecdsa import keys, curve
+from fastecdsa import curve, keys
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, dir_path + "/../..")
 
 from utils import create_transaction, string_to_bytes
-from qrdx import Database
 
+from qrdx import Database
 from qrdx.constants import CURVE
 from qrdx.helpers import point_to_string, sha256
 
 
 async def main():
-    parser = argparse.ArgumentParser(description='Denaro wallet')
-    parser.add_argument('command', metavar='command', type=str, help='action to do with the wallet', choices=['createwallet', 'send', 'balance'])
-    parser.add_argument('-to', metavar='recipient', type=str, required=False)
-    parser.add_argument('-d', metavar='amount', type=str, required=False)
-    parser.add_argument('-m', metavar='message', type=str, dest='message', required=False)
+    parser = argparse.ArgumentParser(description="Denaro wallet")
+    parser.add_argument(
+        "command",
+        metavar="command",
+        type=str,
+        help="action to do with the wallet",
+        choices=["createwallet", "send", "balance"],
+    )
+    parser.add_argument("-to", metavar="recipient", type=str, required=False)
+    parser.add_argument("-d", metavar="amount", type=str, required=False)
+    parser.add_argument("-m", metavar="message", type=str, dest="message", required=False)
 
     args = parser.parse_args()
-    db = pickledb.load(f'{dir_path}/wallet.json', True)
+    db = pickledb.load(f"{dir_path}/wallet.json", True)
     denaro_database: Database = await Database.get()
     node.main.db = denaro_database
 
     command = args.command
 
-    if command == 'createwallet':
-        private_keys = db.get('private_keys') or []
+    if command == "createwallet":
+        private_keys = db.get("private_keys") or []
         private_key = keys.gen_private_key(CURVE)
         private_keys.append(private_key)
-        db.set('private_keys', private_keys)
+        db.set("private_keys", private_keys)
 
         public_key = keys.get_public_key(private_key, curve.P256)
         address = point_to_string(public_key)
 
-        print(f'Private key: {hex(private_key)}\nAddress: {address}')
-    elif command == 'balance':
-        private_keys = db.get('private_keys') or []
+        print(f"Private key: {hex(private_key)}\nAddress: {address}")
+    elif command == "balance":
+        private_keys = db.get("private_keys") or []
         total_balance = 0
         total_pending_balance = 0
         for private_key in private_keys:
@@ -52,32 +58,38 @@ async def main():
             total_balance += balance
             pending_balance = await denaro_database.get_address_balance(address, True)
             total_pending_balance += pending_balance
-            print(f'\nAddress: {address}\nPrivate key: {hex(private_key)}\nBalance: {balance}{f" ({pending_balance - balance} pending)" if pending_balance - balance != 0 else ""}')
-        print(f'\nTotal Balance: {total_balance}{f" ({total_pending_balance - total_balance} pending)" if total_pending_balance - total_balance != 0 else ""}')
-    elif command == 'send':
+            print(
+                f'\nAddress: {address}\nPrivate key: {hex(private_key)}\nBalance: {balance}{f" ({pending_balance - balance} pending)" if pending_balance - balance != 0 else ""}'
+            )
+        print(
+            f'\nTotal Balance: {total_balance}{f" ({total_pending_balance - total_balance} pending)" if total_pending_balance - total_balance != 0 else ""}'
+        )
+    elif command == "send":
         parser = argparse.ArgumentParser()
-        parser.add_argument('command', metavar='command', type=str, help='action to do with the wallet')
-        parser.add_argument('-to', metavar='recipient', type=str, dest='recipient', required=True)
-        parser.add_argument('-d', metavar='amount', type=str, dest='amount', required=True)
-        parser.add_argument('-m', metavar='message', type=str, dest='message', required=False)
+        parser.add_argument(
+            "command", metavar="command", type=str, help="action to do with the wallet"
+        )
+        parser.add_argument("-to", metavar="recipient", type=str, dest="recipient", required=True)
+        parser.add_argument("-d", metavar="amount", type=str, dest="amount", required=True)
+        parser.add_argument("-m", metavar="message", type=str, dest="message", required=False)
 
         args = parser.parse_args()
         receiver = args.recipient
         amount = args.amount
         message = args.message
 
-        tx = await create_transaction(db.get('private_keys'), receiver, amount, string_to_bytes(message))
-        node_url = os.environ.get('QRDX_NODE_URL', 'http://localhost:3006')
+        tx = await create_transaction(
+            db.get("private_keys"), receiver, amount, string_to_bytes(message)
+        )
+        node_url = os.environ.get("QRDX_NODE_URL", "http://localhost:3006")
         try:
-            requests.get(f'{node_url}/push_tx', {'tx_hex': tx.hex()}, timeout=10)
+            requests.get(f"{node_url}/push_tx", {"tx_hex": tx.hex()}, timeout=10)
         except Exception as e:
-            print(f'Could not push transaction to node ({node_url}): {e}')
+            print(f"Could not push transaction to node ({node_url}): {e}")
             await denaro_database.add_pending_transaction(tx)
-        print(f'Transaction pushed. Transaction hash: {sha256(tx.hex())}')
+        print(f"Transaction pushed. Transaction hash: {sha256(tx.hex())}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     loop.run_until_complete(main())
-
-

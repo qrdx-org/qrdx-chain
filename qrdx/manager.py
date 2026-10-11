@@ -6,32 +6,29 @@ This module handles block creation, validation, and difficulty adjustment
 using the consensus engine for rule versioning.
 """
 
-import hashlib
-import time
+import asyncio
 from decimal import Decimal
 from io import BytesIO
 from math import ceil, floor, log
-from typing import Tuple, List, Union
-import asyncio
+from types import SimpleNamespace
+from typing import List, Optional, Tuple, Union, cast
 
 from . import Database
-
+from .consensus import CONSENSUS_ENGINE, get_consensus_info, get_median_time_past
 from .constants import (
-    ENDIAN, MAX_BLOCK_SIZE_HEX, START_DIFFICULTY,
-    BLOCK_TIME, BLOCKS_PER_ADJUSTMENT, INITIAL_REWARD,
-    HALVING_INTERVAL, MAX_HALVINGS, LOG_INCLUDE_BLOCK_SYNC_MESSAGES
+    BLOCK_TIME,
+    BLOCKS_PER_ADJUSTMENT,
+    ENDIAN,
+    HALVING_INTERVAL,
+    INITIAL_REWARD,
+    LOG_INCLUDE_BLOCK_SYNC_MESSAGES,
+    MAX_BLOCK_SIZE_HEX,
+    MAX_HALVINGS,
+    START_DIFFICULTY,
 )
-
-from .helpers import sha256, timestamp, bytes_to_string, string_to_bytes
+from .helpers import bytes_to_string, sha256, string_to_bytes, timestamp
 from .logger import get_logger
 from .transactions import CoinbaseTransaction, Transaction
-
-from .consensus import (
-    CONSENSUS_ENGINE,
-    ConsensusVersion,
-    get_median_time_past,
-    get_consensus_info
-)
 
 logger = get_logger(__name__)
 
@@ -39,11 +36,12 @@ logger = get_logger(__name__)
 # LEGACY DIFFICULTY FUNCTIONS (for Genesis consensus)
 # ============================================================================
 
-def difficulty_to_hashrate(difficulty: Decimal) -> int:
+
+def difficulty_to_hashrate(difficulty: Decimal) -> Decimal:
     """Legacy function for Genesis consensus blocks."""
     decimal_part = difficulty % 1
     integer_part = floor(difficulty)
-    return Decimal(16 ** integer_part) * (
+    return Decimal(16**integer_part) * (
         Decimal(16) / ceil(Decimal(16) * (Decimal(1) - decimal_part))
     )
 
@@ -54,7 +52,7 @@ def hashrate_to_difficulty(hashrate: int) -> Decimal:
         return START_DIFFICULTY
 
     integer_part = floor(log(hashrate, 16))
-    ratio = hashrate / (16 ** integer_part)
+    ratio = hashrate / (16**integer_part)
 
     for i in range(10):
         decimal_step = Decimal(i) / 10
@@ -62,12 +60,13 @@ def hashrate_to_difficulty(hashrate: int) -> Decimal:
         if coeff >= ratio:
             return Decimal(integer_part) + decimal_step
 
-    return Decimal(integer_part) + Decimal('0.9')
+    return Decimal(integer_part) + Decimal("0.9")
 
 
 # ============================================================================
 # DIFFICULTY CALCULATION
 # ============================================================================
+
 
 async def calculate_difficulty() -> Tuple[Decimal, dict]:
     """
@@ -76,46 +75,46 @@ async def calculate_difficulty() -> Tuple[Decimal, dict]:
     database = Database.instance
     if database is None:
         return START_DIFFICULTY, {}
-    
+
     last_block = await database.get_last_block()
 
     if last_block is None:
         return START_DIFFICULTY, {}
 
     last_block = dict(last_block)
-    block_id = last_block['id']
-    
+    block_id = last_block["id"]
+
     if block_id < BLOCKS_PER_ADJUSTMENT:
         return START_DIFFICULTY, last_block
 
     if block_id % BLOCKS_PER_ADJUSTMENT != 0:
-        return last_block['difficulty'], last_block
+        return last_block["difficulty"], last_block
 
     # Get consensus rules for this block height
     rules = CONSENSUS_ENGINE.get_rules(block_id)
-    
-    first_block_of_period = await database.get_block_by_id(
-        block_id - BLOCKS_PER_ADJUSTMENT + 1
-    )
-    
-    time_elapsed = last_block['timestamp'] - first_block_of_period['timestamp']
+
+    first_block_of_period = await database.get_block_by_id(block_id - BLOCKS_PER_ADJUSTMENT + 1)
+
+    time_elapsed = last_block["timestamp"] - first_block_of_period["timestamp"]
     time_elapsed = max(1, time_elapsed)  # Prevent division by zero
-        
+
     avg_block_time = time_elapsed / BLOCKS_PER_ADJUSTMENT
     ratio = Decimal(BLOCK_TIME) / Decimal(avg_block_time)
-    
+
     # Calculate new difficulty using version-specific rules
     new_difficulty = rules.calculate_new_difficulty(
         time_ratio=ratio,
-        current_difficulty=last_block['difficulty'],
-        legacy_hashrate_func=difficulty_to_hashrate
+        current_difficulty=last_block["difficulty"],
+        legacy_hashrate_func=difficulty_to_hashrate,
     )
-    
+
     logger.info(f"╔> Difficulty Adjustment at block: {block_id}")
     logger.info(f"╠> Time Elapsed: {time_elapsed}s for {BLOCKS_PER_ADJUSTMENT} blocks")
     logger.info(f"╠> Average Block Time: {avg_block_time:.2f}s (Target: {BLOCK_TIME}s)")
     logger.info(f"╠> Adjustment Ratio: {ratio:.4f}")
-    logger.info(f"╠> Old Difficulty: {last_block['difficulty']} -> New Difficulty: {new_difficulty}")
+    logger.info(
+        f"╠> Old Difficulty: {last_block['difficulty']} -> New Difficulty: {new_difficulty}"
+    )
     logger.info(f"╚> Consensus Version: {rules.version.name}")
 
     return new_difficulty, last_block
@@ -125,12 +124,13 @@ async def calculate_difficulty() -> Tuple[Decimal, dict]:
 # MANAGER CLASS (Thread-safe difficulty caching)
 # ============================================================================
 
+
 class Manager:
     """Manages blockchain state with thread-safe operations."""
-    
-    difficulty: Tuple[float, dict] = None
+
+    difficulty: Optional[Tuple[Decimal, dict]] = None  # cached (difficulty, last block)
     _difficulty_lock = asyncio.Lock()
-    
+
     @classmethod
     async def get_difficulty_safe(cls) -> Tuple[Decimal, dict]:
         """Thread-safe difficulty retrieval."""
@@ -138,7 +138,7 @@ class Manager:
             if cls.difficulty is None:
                 cls.difficulty = await calculate_difficulty()
             return cls.difficulty
-    
+
     @classmethod
     async def invalidate_difficulty(cls):
         """Thread-safe difficulty invalidation."""
@@ -155,6 +155,7 @@ async def get_difficulty() -> Tuple[Decimal, dict]:
 # PROOF OF WORK VALIDATION
 # ============================================================================
 
+
 async def check_block_is_valid(block_content: str, difficulty: Decimal, last_block: dict) -> bool:
     """Validate block meets proof-of-work requirements against a specific last_block."""
     block_hash = sha256(block_content)
@@ -162,24 +163,25 @@ async def check_block_is_valid(block_content: str, difficulty: Decimal, last_blo
     if not last_block:  # Genesis block case
         return True
 
-    last_block_hash = last_block['hash']
+    last_block_hash = last_block["hash"]
     decimal = difficulty % 1
     difficulty_int = floor(difficulty)
-    
+
     if decimal > 0:
-        charset = '0123456789abcdef'
+        charset = "0123456789abcdef"
         count = ceil(16 * (1 - decimal))
         return (
-            block_hash.startswith(last_block_hash[-difficulty_int:]) and 
-            block_hash[difficulty_int] in charset[:count]
+            block_hash.startswith(last_block_hash[-difficulty_int:])
+            and block_hash[difficulty_int] in charset[:count]
         )
-    
+
     return block_hash.startswith(last_block_hash[-difficulty_int:])
 
 
 # ============================================================================
 # BLOCK REWARD
 # ============================================================================
+
 
 def get_block_reward(block_number: int) -> Decimal:
     """
@@ -197,24 +199,25 @@ def get_block_reward(block_number: int) -> Decimal:
     # halving occurs precisely at block 262,144.
     if block_number <= 0:
         return Decimal(0)
-    
+
     # Determine how many halving events have occurred.
     halvings = floor((block_number - 1) / HALVING_INTERVAL)
 
     # After the maximum number of halvings, the subsidy ends permanently.
     if halvings >= MAX_HALVINGS:
         return Decimal(0)
-        
+
     # Calculate the reward for the current period.
     # The formula is: initial_reward / (2^halvings)
-    block_reward = INITIAL_REWARD / (2 ** halvings)
-    
+    block_reward = INITIAL_REWARD / (2**halvings)
+
     return block_reward
 
 
 # ============================================================================
 # TRANSACTION UTILITIES
 # ============================================================================
+
 
 def get_transactions_size(transactions: List[Transaction]) -> int:
     """Calculate total size of transactions in hex."""
@@ -227,66 +230,53 @@ async def clear_pending_transactions(transactions=None):
     """
     database: Database = Database.instance
     await database.clear_duplicate_pending_transactions()
-    
-    transactions = transactions or await database.get_pending_transactions_limit(
-        hex_only=True
-    )
-    
+
+    transactions = transactions or await database.get_pending_transactions_limit(hex_only=True)
+
     max_iterations = 100
     iteration = 0
-    
+
     while iteration < max_iterations:
         iteration += 1
         used_inputs = []
         to_remove = []
-        
+
         for transaction in transactions:
             if isinstance(transaction, str):
-                transaction = await Transaction.from_hex(
-                    transaction, 
-                    check_signatures=False
-                )
-            
+                transaction = await Transaction.from_hex(transaction, check_signatures=False)
+
             tx_hash = transaction.hash()
-            tx_inputs = [
-                (tx_input.tx_hash, tx_input.index) 
-                for tx_input in transaction.inputs
-            ]
-            
+            tx_inputs = [(tx_input.tx_hash, tx_input.index) for tx_input in transaction.inputs]
+
             if any(used_input in tx_inputs for used_input in used_inputs):
                 to_remove.append(tx_hash)
                 continue
-            
+
             used_inputs += tx_inputs
-        
+
         if to_remove:
             for tx_hash in to_remove:
                 await database.remove_pending_transaction(tx_hash)
-                logger.debug(f'Removed conflicting transaction: {tx_hash}')
-            
-            transactions = await database.get_pending_transactions_limit(
-                hex_only=True
-            )
+                logger.debug(f"Removed conflicting transaction: {tx_hash}")
+
+            transactions = await database.get_pending_transactions_limit(hex_only=True)
             continue
-        
+
         unspent_outputs = await database.get_unspent_outputs(used_inputs)
         double_spend_inputs = set(used_inputs) - set(unspent_outputs)
-        
+
         if double_spend_inputs == set(used_inputs):
             await database.remove_pending_transactions()
             break
         elif double_spend_inputs:
-            await database.remove_pending_transactions_by_contains([
-                tx_input[0] + bytes([tx_input[1]]).hex() 
-                for tx_input in double_spend_inputs
-            ])
-            transactions = await database.get_pending_transactions_limit(
-                hex_only=True
+            await database.remove_pending_transactions_by_contains(
+                [tx_input[0] + bytes([tx_input[1]]).hex() for tx_input in double_spend_inputs]
             )
+            transactions = await database.get_pending_transactions_limit(hex_only=True)
             continue
-        
+
         break
-    
+
     if iteration >= max_iterations:
         logger.warning("Transaction clearing hit iteration limit")
 
@@ -295,21 +285,22 @@ async def clear_pending_transactions(transactions=None):
 # BLOCK SERIALIZATION
 # ============================================================================
 
+
 def block_to_bytes(last_block_hash: str, block: dict) -> bytes:
     """Convert block dict to bytes for hashing."""
-    address_bytes = string_to_bytes(block['address'])
+    address_bytes = string_to_bytes(block["address"])
     version = bytes([])
     if len(address_bytes) != 64:
         version = bytes([2])
-    
+
     return (
-        version +
-        bytes.fromhex(last_block_hash) +
-        address_bytes +
-        bytes.fromhex(block['merkle_tree']) +
-        block['timestamp'].to_bytes(4, byteorder=ENDIAN) +
-        int(float(block['difficulty']) * 10).to_bytes(2, ENDIAN) +
-        block['random'].to_bytes(4, ENDIAN)
+        version
+        + bytes.fromhex(last_block_hash)
+        + address_bytes
+        + bytes.fromhex(block["merkle_tree"])
+        + block["timestamp"].to_bytes(4, byteorder=ENDIAN)
+        + int(float(block["difficulty"]) * 10).to_bytes(2, ENDIAN)
+        + block["random"].to_bytes(4, ENDIAN)
     )
 
 
@@ -325,7 +316,7 @@ def split_block_content(block_content: str) -> Tuple:
     timestamp_val = int.from_bytes(stream.read(4), ENDIAN)
     difficulty = int.from_bytes(stream.read(2), ENDIAN) / Decimal(10)
     random = int.from_bytes(stream.read(4), ENDIAN)
-    
+
     return previous_hash, address, merkle_tree, timestamp_val, difficulty, random
 
 
@@ -335,7 +326,10 @@ def split_block_content(block_content: str) -> Tuple:
 
 # denaro/manager.py
 
-async def check_block(block_content: str, transactions: List[Transaction], mining_info: tuple = None) -> bool:
+
+async def check_block(
+    block_content: str, transactions: List[Transaction], mining_info: Optional[tuple] = None
+) -> bool:
     """
     Comprehensive block validation using version-appropriate consensus rules.
     This function is self-contained and recalculates all necessary context
@@ -347,8 +341,9 @@ async def check_block(block_content: str, transactions: List[Transaction], minin
         return False
 
     # --- PARSE BLOCK CONTENT EARLY ---
-    previous_hash, address, merkle_tree, content_time, content_difficulty, random_val = \
+    previous_hash, address, merkle_tree, content_time, content_difficulty, random_val = (
         split_block_content(block_content)
+    )
 
     database = Database.instance
     last_block_for_validation = await database.get_block(previous_hash)
@@ -356,17 +351,19 @@ async def check_block(block_content: str, transactions: List[Transaction], minin
     # --- REVISED PREDECESSOR CHECK & BLOCK NUMBER DERIVATION ---
     is_genesis = False
     if last_block_for_validation:
-        block_no = last_block_for_validation['id'] + 1
+        block_no = last_block_for_validation["id"] + 1
     elif mining_info and not last_block_for_validation:
         # This is a newly mined block and its predecessor is not in the DB.
         # This is ONLY valid if it's the genesis block.
         _, last_block_from_miner_context = mining_info
-        if not last_block_from_miner_context: # The context last_block is empty {}
+        if not last_block_from_miner_context:  # The context last_block is empty {}
             block_no = 0
             is_genesis = True
         else:
             # Miner submitted a block that doesn't connect to their provided context.
-            logger.warning(f"Block rejected: Miner submitted block with unknown previous hash '{previous_hash}'")
+            logger.warning(
+                f"Block rejected: Miner submitted block with unknown previous hash '{previous_hash}'"
+            )
             return False
     else:
         # A block from sync (no mining_info) whose predecessor is not found is an orphan.
@@ -377,37 +374,43 @@ async def check_block(block_content: str, transactions: List[Transaction], minin
     expected_difficulty = START_DIFFICULTY
     # For genesis, we use START_DIFFICULTY. For all others, we calculate.
     if not is_genesis and last_block_for_validation:
-        last_block_id = last_block_for_validation['id']
-        
+        last_block_id = last_block_for_validation["id"]
+
         if last_block_id > 0 and last_block_id % BLOCKS_PER_ADJUSTMENT == 0:
             start_period_id = last_block_id - BLOCKS_PER_ADJUSTMENT + 1
             first_block_of_period = await database.get_block_by_id(start_period_id)
-            
-            if not first_block_of_period:
-                 logger.error(f"Could not find block {start_period_id} for difficulty calc at height {block_no}")
-                 return False
 
-            time_elapsed = last_block_for_validation['timestamp'] - first_block_of_period['timestamp']
+            if not first_block_of_period:
+                logger.error(
+                    f"Could not find block {start_period_id} for difficulty calc at height {block_no}"
+                )
+                return False
+
+            time_elapsed = (
+                last_block_for_validation["timestamp"] - first_block_of_period["timestamp"]
+            )
             time_elapsed = max(1, time_elapsed)
-            
+
             avg_block_time = time_elapsed / (BLOCKS_PER_ADJUSTMENT - 1)
             ratio = Decimal(BLOCK_TIME) / Decimal(avg_block_time)
 
             rules_for_calc = CONSENSUS_ENGINE.get_rules(last_block_id)
             expected_difficulty = rules_for_calc.calculate_new_difficulty(
                 time_ratio=ratio,
-                current_difficulty=last_block_for_validation['difficulty'],
-                legacy_hashrate_func=difficulty_to_hashrate
+                current_difficulty=last_block_for_validation["difficulty"],
+                legacy_hashrate_func=difficulty_to_hashrate,
             )
         else:
-            expected_difficulty = last_block_for_validation['difficulty']
+            expected_difficulty = last_block_for_validation["difficulty"]
 
     # --- CONSENSUS CHECK: DIFFICULTY ---
     if content_difficulty != expected_difficulty:
-        logger.warning(f"Block {block_no} rejected: Difficulty mismatch. "
-                       f"Expected: {expected_difficulty}, Got: {content_difficulty}")
+        logger.warning(
+            f"Block {block_no} rejected: Difficulty mismatch. "
+            f"Expected: {expected_difficulty}, Got: {content_difficulty}"
+        )
         return False
-        
+
     rules = CONSENSUS_ENGINE.get_rules(block_no)
 
     # --- CONSENSUS CHECK: PROOF OF WORK ---
@@ -426,45 +429,53 @@ async def check_block(block_content: str, transactions: List[Transaction], minin
         return False
 
     # --- CONSENSUS CHECK: TIMESTAMP ---
-    last_timestamp = last_block_for_validation.get('timestamp', 0) if last_block_for_validation else 0
+    last_timestamp = (
+        last_block_for_validation.get("timestamp", 0) if last_block_for_validation else 0
+    )
     current_time = timestamp()
-    
+
     is_valid_timestamp = await rules.validate_timestamp(
         content_time=content_time,
         block_id=block_no,
         last_timestamp=last_timestamp,
         current_time=current_time,
-        get_median_time_past_func=lambda bid: get_median_time_past(database, bid)
+        get_median_time_past_func=lambda bid: get_median_time_past(database, bid),
     )
     if not is_valid_timestamp:
         return False
 
     # --- TRANSACTION VALIDATION ---
     regular_transactions = [
-        tx for tx in transactions 
+        tx
+        for tx in transactions
         if isinstance(tx, Transaction) and not isinstance(tx, CoinbaseTransaction)
     ]
-    
+
     if not rules.validate_coinbase_transactions(regular_transactions):
         return False
-    
+
     if get_transactions_size(regular_transactions) > MAX_BLOCK_SIZE_HEX:
         logger.warning(f"Block {block_no} total transaction size too large")
         return False
 
     if regular_transactions:
-        check_inputs = sum([
-            [(tx_input.tx_hash, tx_input.index) for tx_input in tx.inputs] 
-            for tx in regular_transactions
-        ], [])
-        
+        check_inputs = sum(
+            [
+                [(tx_input.tx_hash, tx_input.index) for tx_input in tx.inputs]
+                for tx in regular_transactions
+            ],
+            [],
+        )
+
         if len(set(check_inputs)) != len(check_inputs):
             logger.warning(f"Block {block_no} contains internal double-spend")
             return False
-        
+
         unspent_outputs = await database.get_unspent_outputs(check_inputs)
         if set(check_inputs) != set(unspent_outputs):
-            logger.warning(f"Block {block_no} attempts to spend non-existent or already spent output")
+            logger.warning(
+                f"Block {block_no} attempts to spend non-existent or already spent output"
+            )
             return False
 
     for transaction in regular_transactions:
@@ -475,20 +486,26 @@ async def check_block(block_content: str, transactions: List[Transaction], minin
     # --- CONSENSUS CHECK: MERKLE ROOT ---
     expected_merkle_root = rules.calculate_merkle_tree(regular_transactions)
     if merkle_tree != expected_merkle_root:
-        logger.warning(f"Block {block_no} Merkle root mismatch. "
-                       f"Expected: {expected_merkle_root}, Got: {merkle_tree}")
+        logger.warning(
+            f"Block {block_no} Merkle root mismatch. "
+            f"Expected: {expected_merkle_root}, Got: {merkle_tree}"
+        )
         return False
-    
+
     if LOG_INCLUDE_BLOCK_SYNC_MESSAGES:
         logger.debug(f"Block {block_no} passed all checks (Consensus: {rules.version.name})")
-    
+
     return True
+
 
 # ============================================================================
 # BLOCK CREATION
 # ============================================================================
 
-async def create_block(block_content: str, transactions: List[Transaction], last_block: dict = None) -> bool:
+
+async def create_block(
+    block_content: str, transactions: List[Transaction], last_block: Optional[dict] = None
+) -> bool:
     """
     Create and commit a new block with version-appropriate validation.
     """
@@ -500,59 +517,65 @@ async def create_block(block_content: str, transactions: List[Transaction], last
         return False
 
     regular_transactions = [
-        tx for tx in transactions 
+        tx
+        for tx in transactions
         if isinstance(tx, Transaction) and not isinstance(tx, CoinbaseTransaction)
     ]
 
     database = Database.instance
-    block_no = last_block_from_db.get('id', 0) + 1
+    block_no = last_block_from_db.get("id", 0) + 1
     block_hash = sha256(block_content)
-    
-    previous_hash, address, merkle_tree, content_time, content_difficulty, random = \
+
+    previous_hash, address, merkle_tree, content_time, content_difficulty, random = (
         split_block_content(block_content)
-    
-    fees = sum(tx.fees for tx in regular_transactions)
-    block_reward = get_block_reward(block_no)
-    
-    coinbase_transaction = CoinbaseTransaction(
-        block_hash, 
-        address, 
-        block_reward + fees
     )
-    
+
+    # Set by verification, which every transaction here has passed.
+    fees = sum(cast(Decimal, tx.fees) for tx in regular_transactions)
+    block_reward = get_block_reward(block_no)
+
+    coinbase_transaction = CoinbaseTransaction(block_hash, address, block_reward + fees)
+
     if not coinbase_transaction.outputs[0].verify():
         return False
 
     try:
         await database.add_block(
-            block_no, block_hash, block_content, address, random, 
-            content_difficulty, block_reward + fees, content_time
+            block_no,
+            block_hash,
+            block_content,
+            address,
+            random,
+            content_difficulty,
+            block_reward + fees,
+            content_time,
         )
         await database.add_transaction(coinbase_transaction, block_hash)
-        
+
         if regular_transactions:
             await database.add_transactions(regular_transactions, block_hash)
 
         await database.add_unspent_transactions_outputs(
             regular_transactions + [coinbase_transaction]
         )
-        
+
         if regular_transactions:
-            await database.remove_pending_transactions_by_hash([
-                tx.hash() for tx in regular_transactions
-            ])
+            await database.remove_pending_transactions_by_hash(
+                [tx.hash() for tx in regular_transactions]
+            )
             await database.remove_unspent_outputs(regular_transactions)
             await database.remove_pending_spent_outputs(regular_transactions)
 
     except Exception as e:
-        logger.error(f'Could not commit block {block_no} to database. '
-                     f'Rolling back. Error: {e}')
+        logger.error(f"Could not commit block {block_no} to database. " f"Rolling back. Error: {e}")
         await database.delete_block(block_no)
         return False
 
     if LOG_INCLUDE_BLOCK_SYNC_MESSAGES:
-        logger.info(f'Added block {block_no} with {len(regular_transactions)} transactions. Reward: {block_reward}, Fees: {fees}')
-    
+        logger.info(
+            f"Added block {block_no} with {len(regular_transactions)} transactions. Reward: {block_reward}, Fees: {fees}"
+        )
+
     await Manager.invalidate_difficulty()
     return True
 
@@ -561,20 +584,25 @@ async def create_block(block_content: str, transactions: List[Transaction], last
 # MERKLE TREE CALCULATION (NEW FUNCTION)
 # ============================================================================
 
-def get_transactions_merkle_tree(transactions: List[Union[Transaction, str]], block_height: int) -> str:
+
+def get_transactions_merkle_tree(
+    transactions: List[Union[Transaction, str]], block_height: int
+) -> str:
     """
     Calculates the Merkle root for a set of transactions using the
     version-appropriate consensus rules for the given block height.
     """
     # Get the correct set of consensus rules from the engine
     rules = CONSENSUS_ENGINE.get_rules(block_height)
-    
+
     # Delegate the calculation to the rules object
     return rules.calculate_merkle_tree(transactions)
+
 
 # ============================================================================
 # PUBLIC API FUNCTIONS
 # ============================================================================
+
 
 def get_consensus_version_info() -> dict:
     """
@@ -587,28 +615,27 @@ def get_consensus_version_info() -> dict:
 async def validate_consensus_compatibility(peer_info: dict) -> bool:
     """
     Validate that a peer is compatible with our consensus rules.
-    
+
     Args:
         peer_info: Dictionary containing peer's consensus information
-        
+
     Returns:
         True if peer is compatible, False otherwise
     """
     our_info = get_consensus_info()
-    
+
     # Check that peer has same activation heights for all versions
-    if len(peer_info.get('activations', [])) != len(our_info['activations']):
+    if len(peer_info.get("activations", [])) != len(our_info["activations"]):
         return False
-    
+
     for our_activation, peer_activation in zip(
-        our_info['activations'], 
-        peer_info.get('activations', [])
+        our_info["activations"], peer_info.get("activations", []), strict=False
     ):
-        if our_activation['height'] != peer_activation['height']:
+        if our_activation["height"] != peer_activation["height"]:
             return False
-        if our_activation['version'] != peer_activation['version']:
+        if our_activation["version"] != peer_activation["version"]:
             return False
-    
+
     return True
 
 
@@ -616,69 +643,68 @@ async def validate_consensus_compatibility(peer_info: dict) -> bool:
 # PROOF OF STAKE BLOCK MANAGEMENT
 # ============================================================================
 
+
 async def validate_pos_block(block_data: dict, validators: list, randao_mix: bytes) -> tuple:
     """
     Validate a PoS block.
-    
+
     Args:
         block_data: Block data dictionary
         validators: List of active validators
         randao_mix: Current RANDAO mix
-        
+
     Returns:
         Tuple of (is_valid, error_message)
     """
     from .consensus import validate_pos_block as consensus_validate
-    
-    # Create a simple object from dict for validation
-    class BlockObj:
-        pass
-    
-    block = BlockObj()
-    block.slot = block_data['slot']
-    block.proposer_address = block_data['proposer_address']
-    block.proposer_public_key = bytes.fromhex(block_data['proposer_public_key'])
-    block.proposer_signature = bytes.fromhex(block_data['proposer_signature'])
-    block.randao_reveal = bytes.fromhex(block_data.get('randao_reveal', ''))
-    block.attestations = block_data.get('attestations', [])
-    block.transactions = block_data.get('transactions', [])
-    block.hash = block_data['hash']
-    block.number = block_data['number']
-    block.height = block_data['number']
-    block.timestamp = block_data.get('timestamp', 0)
-    block.exchange_state_root = block_data.get('exchange_state_root', '0' * 64)
-    
+
     # Signing root: the one definition (network-bound) the proposer and importers use.
     from .validator.block_verification import reconstruct_signing_root
-    block.signing_root = reconstruct_signing_root(block_data)
-    
+
+    # A plain attribute view of the block dict for validation.
+    block = SimpleNamespace(
+        slot=block_data["slot"],
+        proposer_address=block_data["proposer_address"],
+        proposer_public_key=bytes.fromhex(block_data["proposer_public_key"]),
+        proposer_signature=bytes.fromhex(block_data["proposer_signature"]),
+        randao_reveal=bytes.fromhex(block_data.get("randao_reveal", "")),
+        attestations=block_data.get("attestations", []),
+        transactions=block_data.get("transactions", []),
+        hash=block_data["hash"],
+        number=block_data["number"],
+        height=block_data["number"],
+        timestamp=block_data.get("timestamp", 0),
+        exchange_state_root=block_data.get("exchange_state_root", "0" * 64),
+        signing_root=reconstruct_signing_root(block_data),
+    )
+
     return await consensus_validate(block, validators, randao_mix)
 
 
 async def get_pos_chain_head() -> dict:
     """
     Get the current chain head for PoS consensus.
-    
+
     Returns:
         Dictionary with slot, epoch, block_hash, and finalized info
     """
     from .constants import SLOTS_PER_EPOCH
-    
+
     database = Database.instance
     last_block = await database.get_last_block()
-    
+
     if not last_block:
         return {
-            'slot': 0,
-            'epoch': 0,
-            'block_hash': '0' * 64,
-            'finalized_slot': 0,
-            'justified_slot': 0,
+            "slot": 0,
+            "epoch": 0,
+            "block_hash": "0" * 64,
+            "finalized_slot": 0,
+            "justified_slot": 0,
         }
-    
-    slot = last_block.get('slot', last_block['id'])
+
+    slot = last_block.get("slot", last_block["id"])
     epoch = slot // SLOTS_PER_EPOCH
-    
+
     # Get finality info from the epochs table (SQLite). Best-effort: if the
     # table is empty or absent, finality defaults to 0 (handled below).
     finalized = justified = None
@@ -698,11 +724,11 @@ async def get_pos_chain_head() -> dict:
         logger.debug(f"get_pos_chain_head: finality query unavailable: {e}")
 
     return {
-        'slot': slot,
-        'epoch': epoch,
-        'block_hash': last_block['hash'],
-        'finalized_slot': finalized['start_slot'] if finalized else 0,
-        'finalized_epoch': finalized['epoch'] if finalized else 0,
-        'justified_slot': justified['start_slot'] if justified else 0,
-        'justified_epoch': justified['epoch'] if justified else 0,
+        "slot": slot,
+        "epoch": epoch,
+        "block_hash": last_block["hash"],
+        "finalized_slot": finalized["start_slot"] if finalized else 0,
+        "finalized_epoch": finalized["epoch"] if finalized else 0,
+        "justified_slot": justified["start_slot"] if justified else 0,
+        "justified_epoch": justified["epoch"] if justified else 0,
     }

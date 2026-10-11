@@ -167,8 +167,8 @@ This testnet is **not** a unit test harness. It is a full integration environmen
 ```toml
 chain_id              = 9999
 network_name          = "qrdx-testnet-integration"
-slot_duration         = 2        # seconds
-slots_per_epoch       = 8        # 16 seconds per epoch (faster for testing)
+slot_duration_ms      = 250      # the standard slot
+slots_per_epoch       = 32       # the standard epoch: 8 seconds
 min_validators        = 1        # Allow single-validator for development
 attestation_threshold = 0.667    # 2/3 + 1
 ```
@@ -850,9 +850,9 @@ The testnet is considered **complete and passing** when ALL of the following are
 - [ ] PQ handshake completed between all peer pairs
 
 ### Consensus
-- [ ] Blocks produced every 2 seconds by selected proposer
+- [ ] Blocks produced every 250 ms by selected proposer
 - [ ] Attestations created and collected by committee members
-- [ ] Epoch transitions occur every 8 slots (16 seconds)
+- [ ] Epoch transitions occur every 32 slots (8 seconds)
 - [ ] Rewards distributed to validators at epoch boundaries
 - [ ] All nodes agree on canonical chain at every height
 
@@ -924,8 +924,8 @@ The testnet is considered **complete and passing** when ALL of the following are
 | qRC20 | QRDX-native fungible token standard (ERC-20 equivalent) |
 | AMM | Automated Market Maker — algorithmic liquidity pool |
 | DHT | Distributed Hash Table — decentralized peer discovery |
-| Epoch | 8 slots (16 seconds) — period for rewards and finality |
-| Slot | 2 seconds — minimum block production interval |
+| Epoch | 32 slots (8 seconds) — period for rewards and finality |
+| Slot | 250 ms — minimum block production interval |
 
 ---
 

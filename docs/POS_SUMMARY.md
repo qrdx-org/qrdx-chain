@@ -6,7 +6,7 @@ QRDX has been converted from Proof-of-Work (PoW) to Quantum-Resistant Proof-of-S
 
 1. **Decentralization** - Max 150 validators, stake-weighted selection
 2. **Security** - Post-quantum signatures (Dilithium3), slashing for misbehavior
-3. **Functionality** - 2-second blocks, single-slot finality, web3 compatibility
+3. **Functionality** - 250 ms blocks, Casper FFG finality (about two 8 s epochs), web3 compatibility
 
 ## Critical Requirement
 

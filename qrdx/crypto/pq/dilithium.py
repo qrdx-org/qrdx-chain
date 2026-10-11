@@ -12,7 +12,7 @@ A node without liboqs cannot generate keys, sign, or verify — it will fail har
 
 import hashlib
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 try:
     import oqs
@@ -30,18 +30,20 @@ except ImportError as e:
 # Try ML-DSA-65 first (newer liboqs ≥0.9), fallback to Dilithium3 (older)
 ALGORITHM = "ML-DSA-65"
 ALGORITHM_LEGACY = "Dilithium3"
-PRIVATE_KEY_SIZE = 4032   # ML-DSA-65 private key size
-PUBLIC_KEY_SIZE = 1952    # ML-DSA-65 public key size
-SIGNATURE_SIZE = 3309     # ML-DSA-65 signature size
+PRIVATE_KEY_SIZE = 4032  # ML-DSA-65 private key size
+PUBLIC_KEY_SIZE = 1952  # ML-DSA-65 public key size
+SIGNATURE_SIZE = 3309  # ML-DSA-65 signature size
 
 
 class PQCryptoError(Exception):
     """Post-quantum cryptography error."""
+
     pass
 
 
 class PQSignatureError(PQCryptoError):
     """Signature operation failed."""
+
     pass
 
 
@@ -54,12 +56,12 @@ def _get_working_algorithm() -> str:
         try:
             oqs.Signature(ALGORITHM_LEGACY)
             return ALGORITHM_LEGACY
-        except Exception:
+        except Exception as exc:
             raise PQCryptoError(
                 f"Neither {ALGORITHM} nor {ALGORITHM_LEGACY} is supported by "
                 f"the installed liboqs. Upgrade liboqs to a version that "
                 f"supports FIPS 204 (ML-DSA-65)."
-            )
+            ) from exc
 
 
 # Validate at import time that at least one algorithm works
@@ -74,6 +76,7 @@ class PQPublicKey:
     Attributes:
         key_bytes: Raw public key bytes (1952 bytes for ML-DSA-65)
     """
+
     key_bytes: bytes
 
     def __post_init__(self):
@@ -81,19 +84,18 @@ class PQPublicKey:
             raise TypeError("key_bytes must be bytes")
         if len(self.key_bytes) != PUBLIC_KEY_SIZE:
             raise ValueError(
-                f"Public key must be {PUBLIC_KEY_SIZE} bytes, "
-                f"got {len(self.key_bytes)}"
+                f"Public key must be {PUBLIC_KEY_SIZE} bytes, " f"got {len(self.key_bytes)}"
             )
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'PQPublicKey':
+    def from_bytes(cls, data: bytes) -> "PQPublicKey":
         """Create public key from bytes."""
         return cls(key_bytes=data)
 
     @classmethod
-    def from_hex(cls, hex_str: str) -> 'PQPublicKey':
+    def from_hex(cls, hex_str: str) -> "PQPublicKey":
         """Create public key from hex string."""
-        if hex_str.startswith('0x'):
+        if hex_str.startswith("0x"):
             hex_str = hex_str[2:]
         return cls(key_bytes=bytes.fromhex(hex_str))
 
@@ -111,7 +113,8 @@ class PQPublicKey:
 
         Address is first 32 bytes of keccak256(pubkey) with 0xPQ prefix.
         """
-        from ..address import public_key_to_address, AddressType
+        from ..address import AddressType, public_key_to_address
+
         return public_key_to_address(self.key_bytes, AddressType.POST_QUANTUM)
 
     def to_account_id(self) -> str:
@@ -123,6 +126,7 @@ class PQPublicKey:
         ``msg.sender``.  ``to_address()`` remains the human-facing ``0xPQ…`` form.
         """
         from ..account_id import to_account_id
+
         return to_account_id(self.to_address())
 
     def fingerprint(self) -> str:
@@ -154,6 +158,7 @@ class PQSignature:
     Attributes:
         sig_bytes: Raw signature bytes (3309 bytes for ML-DSA-65)
     """
+
     sig_bytes: bytes
 
     def __post_init__(self):
@@ -163,14 +168,14 @@ class PQSignature:
             raise ValueError("Signature cannot be empty")
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'PQSignature':
+    def from_bytes(cls, data: bytes) -> "PQSignature":
         """Create signature from bytes."""
         return cls(sig_bytes=data)
 
     @classmethod
-    def from_hex(cls, hex_str: str) -> 'PQSignature':
+    def from_hex(cls, hex_str: str) -> "PQSignature":
         """Create signature from hex string."""
-        if hex_str.startswith('0x'):
+        if hex_str.startswith("0x"):
             hex_str = hex_str[2:]
         return cls(sig_bytes=bytes.fromhex(hex_str))
 
@@ -232,7 +237,7 @@ class PQPrivateKey:
             self._public_key = PQPublicKey(pub_bytes)
             self._key_bytes = self._signer.export_secret_key()
         except Exception as e:
-            raise PQCryptoError(f"Key generation failed: {e}")
+            raise PQCryptoError(f"Key generation failed: {e}") from e
 
     def _restore_from_bytes(self, key_bytes: bytes):
         """
@@ -255,15 +260,15 @@ class PQPrivateKey:
         try:
             self._signer = oqs.Signature(_WORKING_ALGORITHM, key_bytes)
         except Exception as e:
-            raise PQCryptoError(f"Key restoration failed: {e}")
+            raise PQCryptoError(f"Key restoration failed: {e}") from e
 
     @classmethod
-    def generate(cls) -> 'PQPrivateKey':
+    def generate(cls) -> "PQPrivateKey":
         """Generate a new random keypair."""
         return cls()
 
     @classmethod
-    def from_bytes(cls, data: bytes, public_key: Optional[PQPublicKey] = None) -> 'PQPrivateKey':
+    def from_bytes(cls, data: bytes, public_key: Optional[PQPublicKey] = None) -> "PQPrivateKey":
         """
         Create private key from bytes.
 
@@ -274,7 +279,7 @@ class PQPrivateKey:
         return cls(key_bytes=data, public_key=public_key)
 
     @classmethod
-    def from_hex(cls, hex_str: str, public_key_hex: Optional[str] = None) -> 'PQPrivateKey':
+    def from_hex(cls, hex_str: str, public_key_hex: Optional[str] = None) -> "PQPrivateKey":
         """
         Create private key from hex string.
 
@@ -282,7 +287,7 @@ class PQPrivateKey:
             hex_str: Private key hex (with or without 0x)
             public_key_hex: Optional public key hex for proper restoration
         """
-        if hex_str.startswith('0x'):
+        if hex_str.startswith("0x"):
             hex_str = hex_str[2:]
 
         public_key = None
@@ -345,7 +350,7 @@ class PQPrivateKey:
             sig_bytes = self._signer.sign(message)
             return PQSignature(sig_bytes)
         except Exception as e:
-            raise PQSignatureError(f"Signing failed: {e}")
+            raise PQSignatureError(f"Signing failed: {e}") from e
 
     def sign_hash(self, message_hash: bytes) -> PQSignature:
         """
@@ -456,13 +461,13 @@ def get_algorithm_info() -> dict:
         details = {}
 
     return {
-        'algorithm': algo,
-        'algorithm_family': 'ML-DSA (Dilithium)',
-        'nist_standard': 'FIPS 204',
-        'private_key_size': PRIVATE_KEY_SIZE,
-        'public_key_size': PUBLIC_KEY_SIZE,
-        'signature_size': SIGNATURE_SIZE,
-        'liboqs_available': True,
-        'claimed_nist_level': details.get('claimed_nist_level', 3),
-        'is_euf_cma': details.get('is_euf_cma', True),
+        "algorithm": algo,
+        "algorithm_family": "ML-DSA (Dilithium)",
+        "nist_standard": "FIPS 204",
+        "private_key_size": PRIVATE_KEY_SIZE,
+        "public_key_size": PUBLIC_KEY_SIZE,
+        "signature_size": SIGNATURE_SIZE,
+        "liboqs_available": True,
+        "claimed_nist_level": details.get("claimed_nist_level", 3),
+        "is_euf_cma": details.get("is_euf_cma", True),
     }

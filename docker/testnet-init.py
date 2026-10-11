@@ -23,7 +23,7 @@ Environment
   QRDX_TESTNET_VALIDATORS[3]
   QRDX_CHAIN_ID          [7620]   the QRDX testnet's chain id
   QRDX_NETWORK_NAME      [qrdx-testnet]
-  QRDX_MIN_VALIDATORS, QRDX_SLOT_DURATION, ... — any network parameter
+  QRDX_MIN_VALIDATORS, QRDX_SLOT_DURATION_MS [250], ... — any network parameter
                          (qrdx/chain_spec.py PARAMS). They are written into the genesis
                          file's chain spec, which is where every node reads them from; set
                          them HERE, on the init service, not on the nodes.

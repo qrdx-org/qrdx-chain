@@ -19,8 +19,25 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Dict, Iterable, List, Tuple
 
-# 0.01% of effective stake per epoch — a small, deterministic base amount.
-DEFAULT_REWARD_QUOTIENT = Decimal("10000")
+from ..constants import SLOT_DURATION_MS, SLOTS_PER_EPOCH
+
+# The base amount is 0.01% of effective stake per 64 s of chain time: the per-epoch rate first
+# set for 32 two-second slots, now held per unit of time. A flat per-epoch rate made rewards
+# and penalties accrue 8x faster per day once epochs became 8 s (250 ms slots); an offline
+# validator was ejected for lost stake after ~15 hours instead of ~5 days. Integer arithmetic,
+# so every node derives the same quotient from the same chain spec.
+_REFERENCE_EPOCH_MS = 64_000
+
+
+def reward_quotient(
+    slot_ms: int = SLOT_DURATION_MS, slots_per_epoch: int = SLOTS_PER_EPOCH
+) -> Decimal:
+    """Divisor of effective stake giving one epoch's base amount (10,000 for 64 s epochs,
+    80,000 for the standard 8 s)."""
+    return Decimal(max(1, 10_000 * _REFERENCE_EPOCH_MS // (int(slot_ms) * int(slots_per_epoch))))
+
+
+DEFAULT_REWARD_QUOTIENT = reward_quotient()
 _Q = Decimal("0.00000001")  # 8 dp, matches the token/stake precision
 
 

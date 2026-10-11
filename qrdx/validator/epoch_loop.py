@@ -18,19 +18,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Optional
 
 from ..constants import (
     SLOT_DURATION,
     UNBONDING_PERIOD_EPOCHS,
     VALIDATOR_EJECTION_STAKE,
 )
-from .epoch_rewards import compute_epoch_reward_deltas
 from .epoch_processing import MAX_EFFECTIVE_BALANCE
+from .epoch_rewards import compute_epoch_reward_deltas
 from .finality import update_finality
 
 logger = logging.getLogger(__name__)
 
-_SLEEP = SLOT_DURATION if isinstance(SLOT_DURATION, int) and SLOT_DURATION > 0 else 2
+# How often the loop looks for a newly finalized epoch: once a slot, but no more than once a
+# second (with sub-second slots an epoch still lasts several seconds).
+_SLEEP = max(float(SLOT_DURATION), 1.0)
 
 # Observe-first gate (mirrors node_integration). False = compute + log the would-be
 # validators-table updates without writing; True = write them at each finalized epoch.
@@ -123,11 +126,19 @@ async def apply_epoch_validator_update(db, epoch: int, enforce: bool) -> None:
     activated = await db.get_validators_to_activate(epoch)
     exited = await db.get_validators_to_exit(epoch)
     # Read the refundable principals BEFORE the update flips status to 'exited'.
-    refunds = (await _collect_exit_stake_refunds(db, exited)
-               if enforce and _ENFORCE_EXIT_REFUND_IN_EPOCH_LOOP else {})
+    refunds = (
+        await _collect_exit_stake_refunds(db, exited)
+        if enforce and _ENFORCE_EXIT_REFUND_IN_EPOCH_LOOP
+        else {}
+    )
     res = await db.apply_epoch_validator_updates(
-        rewards, penalties, activated=activated, exited=exited, activation_epoch=epoch,
-        max_effective_balance=MAX_EFFECTIVE_BALANCE, enforce=enforce,
+        rewards,
+        penalties,
+        activated=activated,
+        exited=exited,
+        activation_epoch=epoch,
+        max_effective_balance=MAX_EFFECTIVE_BALANCE,
+        enforce=enforce,
     )
     if refunds:
         await _refund_exited_validator_stakes(db, refunds, epoch)
@@ -141,11 +152,13 @@ async def apply_epoch_validator_update(db, epoch: int, enforce: bool) -> None:
     vhash = await db.get_validators_table_hash()
     logger.info(
         "[epoch-validators %s] epoch=%d active=%d rewarded=%d penalized=%d validators_hash=%s",
-        "ENFORCE" if enforce else "observe", epoch, len(active),
-        res["rewarded"], res["penalized"], vhash[:16],
+        "ENFORCE" if enforce else "observe",
+        epoch,
+        len(active),
+        res["rewarded"],
+        res["penalized"],
+        vhash[:16],
     )
-
-
 
 
 async def _eject_validators_below_stake_floor(db, epoch: int, log: bool = True) -> int:
@@ -207,8 +220,12 @@ async def _eject_validators_below_stake_floor(db, epoch: int, log: bool = True) 
             "[stake-floor] %d validator(s) below the %s ejection floor at epoch %d, but "
             "the active set is only %d — keeping them: ejecting would drop below the "
             "%d-validator liveness backstop",
-            len(below), VALIDATOR_EJECTION_STAKE, epoch, len(active),
-            _MIN_ACTIVE_AFTER_EJECTION)
+            len(below),
+            VALIDATOR_EJECTION_STAKE,
+            epoch,
+            len(active),
+            _MIN_ACTIVE_AFTER_EJECTION,
+        )
         return 0
     if len(below) > room:
         if log:
@@ -216,7 +233,12 @@ async def _eject_validators_below_stake_floor(db, epoch: int, log: bool = True) 
                 "[stake-floor] %d validator(s) below the floor at epoch %d but only %d can "
                 "be ejected without breaching the %d-validator backstop — ejecting the %d "
                 "lowest-staked",
-                len(below), epoch, room, _MIN_ACTIVE_AFTER_EJECTION, room)
+                len(below),
+                epoch,
+                room,
+                _MIN_ACTIVE_AFTER_EJECTION,
+                room,
+            )
         below = below[:room]
 
     exit_epoch = int(epoch) + UNBONDING_PERIOD_EPOCHS
@@ -233,7 +255,12 @@ async def _eject_validators_below_stake_floor(db, epoch: int, log: bool = True) 
                 logger.warning(
                     "[stake-floor] ejecting %s at epoch %d: effective_stake %s < %s "
                     "(exiting, leaves at epoch %d)",
-                    str(address)[:24], epoch, _eff(v), VALIDATOR_EJECTION_STAKE, exit_epoch)
+                    str(address)[:24],
+                    epoch,
+                    _eff(v),
+                    VALIDATOR_EJECTION_STAKE,
+                    exit_epoch,
+                )
         except Exception as e:
             logger.error("[stake-floor] could not eject %s: %s", str(address)[:24], e)
     return ejected
@@ -254,6 +281,7 @@ async def _collect_exit_stake_refunds(db, exiting_addresses) -> dict:
     is off (nothing was ever debited, so nothing is owed).
     """
     from decimal import Decimal
+
     from ..exchange.block_processor import ENFORCE_VALIDATOR_STAKE
 
     if not exiting_addresses or not ENFORCE_VALIDATOR_STAKE:
@@ -263,7 +291,8 @@ async def _collect_exit_stake_refunds(db, exiting_addresses) -> dict:
     for addr in exiting_addresses:
         try:
             cur = await db.connection.execute(
-                "SELECT stake FROM validators WHERE address = ?", (addr,))
+                "SELECT stake FROM validators WHERE address = ?", (addr,)
+            )
             row = await cur.fetchone()
         except Exception as e:
             logger.warning("[exit-refund] cannot read stake for %s: %s", str(addr)[:20], e)
@@ -298,11 +327,16 @@ async def _refund_exited_validator_stakes(db, refunds: dict, epoch: int) -> None
     for addr, principal in refunds.items():
         try:
             await db.apply_account_balance_delta(addr, principal)
-            logger.info("[exit-refund] epoch=%d returned %s QRDX stake to %s",
-                        epoch, principal, str(addr)[:20])
+            logger.info(
+                "[exit-refund] epoch=%d returned %s QRDX stake to %s",
+                epoch,
+                principal,
+                str(addr)[:20],
+            )
         except Exception as e:
-            logger.error("[exit-refund] FAILED to refund %s to %s: %s",
-                         principal, str(addr)[:20], e)
+            logger.error(
+                "[exit-refund] FAILED to refund %s to %s: %s", principal, str(addr)[:20], e
+            )
 
 
 async def apply_epoch_slashings(db, epoch: int, enforce: bool) -> None:
@@ -315,7 +349,9 @@ async def apply_epoch_slashings(db, epoch: int, enforce: bool) -> None:
     if not events:
         return
     from decimal import Decimal
+
     from .slashing import SLASHING_PENALTIES, SlashingConditions
+
     # Worst penalty fraction per offending validator across its recorded conditions.
     worst: dict = {}
     for ev in events:
@@ -328,21 +364,26 @@ async def apply_epoch_slashings(db, epoch: int, enforce: bool) -> None:
             worst[addr] = frac
     for addr, frac in worst.items():
         c = await db.connection.execute(
-            "SELECT effective_stake FROM validators WHERE address = ?", (addr,))
+            "SELECT effective_stake FROM validators WHERE address = ?", (addr,)
+        )
         row = await c.fetchone()
         if not row:
             continue
-        penalty = (Decimal(str(row[0] or 0)) * frac)
+        penalty = Decimal(str(row[0] or 0)) * frac
         res = await db.apply_validator_slash(addr, penalty, enforce=enforce)
         if enforce:
             await db.mark_slashing_events_processed(addr, epoch)
         logger.warning(
             "[slashing %s] epoch=%d validator=%s penalty=%s new_stake=%s (ejected → 'slashed')",
-            "ENFORCE" if enforce else "observe", epoch, str(addr)[:20],
-            res["penalty"], res["new_stake"])
+            "ENFORCE" if enforce else "observe",
+            epoch,
+            str(addr)[:20],
+            res["penalty"],
+            res["new_stake"],
+        )
 
 
-async def epoch_validator_update_loop(db, enforce: bool = None) -> None:
+async def epoch_validator_update_loop(db, enforce: Optional[bool] = None) -> None:
     """Background loop (all nodes): drain finalized epochs, applying the consensus
     validator-set update to each exactly once, in order."""
     if enforce is None:
@@ -358,12 +399,15 @@ async def epoch_validator_update_loop(db, enforce: bool = None) -> None:
                 # canonical chain each time finality advances (import-history-independent).
                 if finalized_epoch >= 0 and finalized_epoch > last_processed:
                     from .validator_reconstruction import reconstruct_validators_live
+
                     await reconstruct_validators_live(db, finalized_epoch)
                     last_processed = finalized_epoch
                     vhash = await db.get_validators_table_hash()
                     logger.info(
                         "[epoch-validators RECONSTRUCT] finalized=%d validators_hash=%s",
-                        finalized_epoch, vhash[:16])
+                        finalized_epoch,
+                        vhash[:16],
+                    )
             else:
                 while last_processed < finalized_epoch:
                     ep = last_processed + 1

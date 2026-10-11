@@ -7,10 +7,11 @@ Professional testnet deployment script for QRDX Chain development and testing.
 - **Configurable Network Size**: Spin up any number of nodes and validators
 - **Automatic Wallet Generation**: Creates PQ (Dilithium3) wallets for validators
 - **Genesis Configuration**: Automatic genesis block creation with prefunded validators
-- **Database Management**: Creates isolated PostgreSQL databases per node
+- **Database Management**: Creates an isolated SQLite database per node
 - **Process Management**: Start, stop, and monitor all nodes
 - **Professional Logging**: Centralized logs with per-node directories
-- **Bootstrap Node**: Automatic bootstrap node configuration for peer discovery
+- **Full Mesh**: Every node bootstraps from every other node, so blocks reach each peer directly
+- **250 ms Blocks**: The standard slot (`--slot-ms` to change it)
 
 ## Quick Start
 
@@ -66,7 +67,8 @@ brew install postgresql python3 jq
 **Default Configuration:**
 - **Nodes**: 4
 - **Validators**: 2 (node 0 and node 1)
-- **Bootstrap**: node 0
+- **Slot**: 250 ms (32-slot, 8 s epochs)
+- **Peers**: every node lists every other node as a bootstrap peer
 - **Genesis Balance**: 1,000,000 QRDX per validator
 - **Validator Stake**: 100,000 QRDX per validator
 - **Base Port**: 3007
@@ -74,22 +76,21 @@ brew install postgresql python3 jq
 ### Network Topology
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Node 0 (Bootstrap + Validator 0)                   │
-│  Port: 3007, RPC: 8545                              │
-│  Role: Primary bootstrap node, Validator            │
-└─────────────────────────────────────────────────────┘
-                      ▲
-                      │
-        ┌─────────────┼─────────────┐
-        │             │             │
-┌───────▼──────┐ ┌────▼──────┐ ┌───▼───────┐
-│ Node 1       │ │ Node 2    │ │ Node 3    │
-│ (Validator)  │ │           │ │           │
-│ Port: 3008   │ │Port: 3009 │ │Port: 3010 │
-│ RPC: 8546    │ │RPC: 8547  │ │RPC: 8548  │
-└──────────────┘ └───────────┘ └───────────┘
+  Node 0 (Validator 0)  ◄──────►  Node 1 (Validator 1)
+  Port 3007, RPC 8545             Port 3008, RPC 8546
+        ▲   ╲                    ╱   ▲
+        │     ╲                ╱     │
+        │       ╲ ◄──────► ╱         │
+        ▼         ╱      ╲           ▼
+  Node 2  ◄──────►         ◄──────►  Node 3
+  Port 3009, RPC 8547             Port 3010, RPC 8548
 ```
+
+Every node lists every other node as a bootstrap peer. A peer that only connects in is recorded
+without a URL, and blocks are pushed only to peers with one, so with a single bootstrap node
+some validators received each other's blocks late or not at all, and at 250 ms slots they
+forked. All nodes start together and genesis is set 15 s or more ahead, so the mesh has formed
+before the first slot.
 
 ### Check Status
 
@@ -101,10 +102,12 @@ Output:
 ```
 ==> QRDX Local Testnet Status
 
-● Node 0 - RUNNING (PID: 12345, Port: 3007)
-● Node 1 - RUNNING (PID: 12346, Port: 3008)
-● Node 2 - RUNNING (PID: 12347, Port: 3009)
-● Node 3 - RUNNING (PID: 12348, Port: 3010)
+[INFO] Slot: 250 ms
+
+● Node 0 - RUNNING (PID: 12345, Port: 3007, RPC: 8545) [healthy] height 520
+● Node 1 - RUNNING (PID: 12346, Port: 3008, RPC: 8546) [healthy] height 520
+● Node 2 - RUNNING (PID: 12347, Port: 3009, RPC: 8547) [healthy] height 520
+● Node 3 - RUNNING (PID: 12348, Port: 3010, RPC: 8548) [healthy] height 520
 
 [INFO] Running: 4 nodes
 ```
@@ -358,13 +361,13 @@ done
 
 ## Performance Tuning
 
-### Increase Block Production
+### Slot Length
 
-Edit node configs to reduce slot duration:
+The standard slot is 250 ms (32-slot, 8 s epochs). The slot goes into the genesis chain spec,
+which every node reads it from, so set it when starting the testnet:
 
 ```bash
-# testnet/configs/node0.env
-QRDX_SLOT_DURATION=1  # 1 second slots (default: 2)
+./scripts/testnet.sh start --slot-ms 500  # slower slots, e.g. on a loaded machine
 ```
 
 ### Increase Network Size

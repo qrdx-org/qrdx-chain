@@ -10,6 +10,7 @@
     qrdx-wallet nft transfer wallet.json 0x… 7 0xPQ…
     qrdx-wallet nft approve-all wallet.json 0x… <operator>
 """
+
 from __future__ import annotations
 
 import json
@@ -23,8 +24,10 @@ from .token import _authority, wait_option, wallet_arg, yes_option
 def _show_collection(c) -> None:
     cap = c.get("max_supply") or "unlimited"
     click.echo(click.style(c["symbol"], bold=True) + f"  {c['name']}  {c['collection']}")
-    click.echo(f"  {c['supply']} NFTs (cap {cap}), royalties {c['royalty_bps']} bps"
-               + (f" to {c['royalty_recipient']}" if c.get("royalty_recipient") else ""))
+    click.echo(
+        f"  {c['supply']} NFTs (cap {cap}), royalties {c['royalty_bps']} bps"
+        + (f" to {c['royalty_recipient']}" if c.get("royalty_recipient") else "")
+    )
     click.echo(f"  uri: {c['uri'] or '(none)'}")
     click.echo(f"  update authority: {c.get('update_authority') or 'none — immutable'}")
     click.echo(f"  mint authority:   {c.get('mint_authority') or 'none — complete'}")
@@ -33,8 +36,10 @@ def _show_collection(c) -> None:
 
 
 def _show_nft(n) -> None:
-    click.echo(click.style(f"{n.get('symbol', '')} #{n['token_id']}", bold=True)
-               + (f"  {n['name']}" if n.get("name") else ""))
+    click.echo(
+        click.style(f"{n.get('symbol', '')} #{n['token_id']}", bold=True)
+        + (f"  {n['name']}" if n.get("name") else "")
+    )
     click.echo(f"  owner: {n['owner']}")
     click.echo(f"  uri:   {n['uri'] or '(none)'}")
     if n.get("approved"):
@@ -111,9 +116,21 @@ def owned_cmd(owner, collection, node, as_json):
 @node_option
 @wait_option
 @yes_option
-def create_cmd(wallet_file, name, symbol, uri, max_supply, royalty_bps, royalty_recipient,
-               soulbound, node, wait, yes):
+def create_cmd(
+    wallet_file,
+    name,
+    symbol,
+    uri,
+    max_supply,
+    royalty_bps,
+    royalty_recipient,
+    soulbound,
+    node,
+    wait,
+    yes,
+):
     """Create a collection (you hold its update and mint authorities)."""
+
     def params(signer):
         p = {"name": name, "symbol": symbol, "uri": uri, "royalty_bps": royalty_bps}
         if max_supply:
@@ -123,8 +140,17 @@ def create_cmd(wallet_file, name, symbol, uri, max_supply, royalty_bps, royalty_
         if soulbound:
             p["non_transferable"] = True
         return p
-    _send(node, wallet_file, "NFT_CREATE_COLLECTION", params,
-          f"Create the {symbol} collection ({name})", wait, yes, group="token")
+
+    _send(
+        node,
+        wallet_file,
+        "NFT_CREATE_COLLECTION",
+        params,
+        f"Create the {symbol} collection ({name})",
+        wait,
+        yes,
+        group="token",
+    )
 
 
 @nft.command("mint")
@@ -152,8 +178,12 @@ def mint_cmd(wallet_file, collection, to, uri, name, token_id, node, wait, yes):
 @click.argument("collection")
 @click.argument("token_id")
 @click.argument("to")
-@click.option("--from", "frm", default=None, help="The owner, when you are its approved account "
-                                                   "or operator")
+@click.option(
+    "--from",
+    "frm",
+    default=None,
+    help="The owner, when you are its approved account " "or operator",
+)
 @click.option("--memo", default=None)
 @node_option
 @wait_option
@@ -165,8 +195,16 @@ def transfer_cmd(wallet_file, collection, token_id, to, frm, memo, node, wait, y
         p["from"] = frm
     if memo:
         p["memo"] = memo
-    _send(node, wallet_file, "NFT_TRANSFER", p, f"Send {collection} #{token_id} to {to}",
-          wait, yes, group="token")
+    _send(
+        node,
+        wallet_file,
+        "NFT_TRANSFER",
+        p,
+        f"Send {collection} #{token_id} to {to}",
+        wait,
+        yes,
+        group="token",
+    )
 
 
 @nft.command("burn")
@@ -178,8 +216,16 @@ def transfer_cmd(wallet_file, collection, token_id, to, frm, memo, node, wait, y
 @yes_option
 def burn_cmd(wallet_file, collection, token_id, node, wait, yes):
     """Burn an NFT."""
-    _send(node, wallet_file, "NFT_BURN", {"collection": collection, "token_id": token_id},
-          f"Burn {collection} #{token_id}", wait, yes, group="token")
+    _send(
+        node,
+        wallet_file,
+        "NFT_BURN",
+        {"collection": collection, "token_id": token_id},
+        f"Burn {collection} #{token_id}",
+        wait,
+        yes,
+        group="token",
+    )
 
 
 @nft.command("approve")
@@ -192,10 +238,20 @@ def burn_cmd(wallet_file, collection, token_id, node, wait, yes):
 @yes_option
 def approve_cmd(wallet_file, collection, token_id, spender, node, wait, yes):
     """Let SPENDER transfer one NFT ('none' clears it)."""
-    _send(node, wallet_file, "NFT_APPROVE",
-          {"collection": collection, "token_id": token_id,
-           "spender": "" if spender.lower() == "none" else spender},
-          f"Approve {spender} for {collection} #{token_id}", wait, yes, group="token")
+    _send(
+        node,
+        wallet_file,
+        "NFT_APPROVE",
+        {
+            "collection": collection,
+            "token_id": token_id,
+            "spender": "" if spender.lower() == "none" else spender,
+        },
+        f"Approve {spender} for {collection} #{token_id}",
+        wait,
+        yes,
+        group="token",
+    )
 
 
 @nft.command("approve-all")
@@ -208,10 +264,16 @@ def approve_cmd(wallet_file, collection, token_id, spender, node, wait, yes):
 @yes_option
 def approve_all_cmd(wallet_file, collection, operator, revoke, node, wait, yes):
     """Let OPERATOR transfer all your NFTs in the collection (or --revoke)."""
-    _send(node, wallet_file, "NFT_SET_APPROVAL_FOR_ALL",
-          {"collection": collection, "operator": operator, "approved": not revoke},
-          f"{'Revoke' if revoke else 'Approve'} {operator} for all your {collection}",
-          wait, yes, group="token")
+    _send(
+        node,
+        wallet_file,
+        "NFT_SET_APPROVAL_FOR_ALL",
+        {"collection": collection, "operator": operator, "approved": not revoke},
+        f"{'Revoke' if revoke else 'Approve'} {operator} for all your {collection}",
+        wait,
+        yes,
+        group="token",
+    )
 
 
 @nft.command("update")
@@ -228,8 +290,13 @@ def approve_all_cmd(wallet_file, collection, operator, revoke, node, wait, yes):
 def update_cmd(wallet_file, collection, token_id, name, symbol, uri, royalty_bps, node, wait, yes):
     """Edit the collection's or an NFT's metadata (the update authority only)."""
     p = {"collection": collection}
-    for key, value in (("token_id", token_id), ("name", name), ("symbol", symbol), ("uri", uri),
-                       ("royalty_bps", royalty_bps)):
+    for key, value in (
+        ("token_id", token_id),
+        ("name", name),
+        ("symbol", symbol),
+        ("uri", uri),
+        ("royalty_bps", royalty_bps),
+    ):
         if value is not None:
             p[key] = value
     _send(node, wallet_file, "NFT_UPDATE", p, f"Update {collection}", wait, yes, group="token")
@@ -245,7 +312,17 @@ def update_cmd(wallet_file, collection, token_id, name, symbol, uri, royalty_bps
 @yes_option
 def set_authority_cmd(wallet_file, collection, authority, new_authority, node, wait, yes):
     """Hand the update or mint authority to NEW_AUTHORITY, or 'none' to renounce it for good."""
-    _send(node, wallet_file, "NFT_SET_AUTHORITY",
-          lambda signer: {"collection": collection, "authority": authority,
-                          "new_authority": _authority(new_authority, signer)},
-          f"Set the {authority} authority of {collection}", wait, yes, group="token")
+    _send(
+        node,
+        wallet_file,
+        "NFT_SET_AUTHORITY",
+        lambda signer: {
+            "collection": collection,
+            "authority": authority,
+            "new_authority": _authority(new_authority, signer),
+        },
+        f"Set the {authority} authority of {collection}",
+        wait,
+        yes,
+        group="token",
+    )

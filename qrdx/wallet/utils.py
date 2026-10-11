@@ -1,4 +1,5 @@
 from decimal import Decimal
+from typing import Optional
 
 from fastecdsa import keys
 
@@ -8,7 +9,9 @@ from qrdx.helpers import point_to_string
 from qrdx.transactions import Transaction, TransactionOutput
 
 
-async def create_transaction(private_keys, receiving_address, amount, message: bytes = None, send_back_address=None):
+async def create_transaction(
+    private_keys, receiving_address, amount, message: Optional[bytes] = None, send_back_address=None
+):
     denaro_database: Database = await Database.get()
     amount = Decimal(amount)
     inputs = []
@@ -20,10 +23,10 @@ async def create_transaction(private_keys, receiving_address, amount, message: b
         if sum(input.amount for input in inputs) >= amount:
             break
     if not inputs:
-        raise Exception('No spendable outputs')
+        raise Exception("No spendable outputs")
 
     if sum(input.amount for input in inputs) < amount:
-        raise Exception(f"Error: You don\'t have enough funds")
+        raise Exception(f"Error: You don't have enough funds")
 
     transaction_inputs = []
 
@@ -38,9 +41,13 @@ async def create_transaction(private_keys, receiving_address, amount, message: b
 
     transaction_amount = sum(input.amount for input in transaction_inputs)
 
-    transaction = Transaction(transaction_inputs, [TransactionOutput(receiving_address, amount=amount)], message)
+    transaction = Transaction(
+        transaction_inputs, [TransactionOutput(receiving_address, amount=amount)], message
+    )
     if transaction_amount > amount:
-        transaction.outputs.append(TransactionOutput(send_back_address, transaction_amount - amount))
+        transaction.outputs.append(
+            TransactionOutput(send_back_address, transaction_amount - amount)
+        )
 
     transaction.sign(private_keys)
 
@@ -53,6 +60,4 @@ def string_to_bytes(string: str) -> bytes:
     try:
         return bytes.fromhex(string)
     except ValueError:
-        return string.encode('utf-8')
-
-
+        return string.encode("utf-8")

@@ -11,3 +11,8 @@ import os
 
 os.environ.setdefault("QRDX_PERP_COLLATERAL_TOKEN", "QRDX")
 os.environ.setdefault("QRDX_PERP_QUOTE", "QRDX")
+
+# Every incremental exchange root is checked against a from-scratch recomputation, so any code
+# that changes exchange state without the commitment tracking seeing it fails the test that
+# exercises it (qrdx/exchange/commitment.py).
+os.environ.setdefault("QRDX_VERIFY_STATE_COMMITMENTS", "1")

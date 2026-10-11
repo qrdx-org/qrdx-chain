@@ -48,6 +48,7 @@ The registry, the allowances and the frozen accounts are exchange state: replaye
 on every path (forward, restart, reorg rebuild) and committed in the exchange state root
 (``state_hash``). The balances stay in the token ledger.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -55,6 +56,8 @@ import json
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+from .commitment import Section, committed, encode_value
 
 ZERO = Decimal(0)
 AMOUNT_QUANTUM = Decimal("1e-18")
@@ -64,7 +67,7 @@ MAX_SYMBOL_LENGTH = 16
 # Non-zero allowances one owner may hold across all tokens: approvals are state every node
 # carries, so they are bounded like resting orders are.
 MAX_ALLOWANCES_PER_OWNER = 256
-MAX_OPERATORS_PER_HOLDER = 64        # authorized operators, across all tokens
+MAX_OPERATORS_PER_HOLDER = 64  # authorized operators, across all tokens
 MAX_DEFAULT_OPERATORS = 8
 MAX_URI_LENGTH = 256
 MAX_METADATA_FIELDS = 16
@@ -72,18 +75,18 @@ MAX_FIELD_KEY_LENGTH = 32
 MAX_FIELD_VALUE_LENGTH = 256
 MAX_MEMO_BYTES = 256
 MAX_FEE_BPS = 10_000
-FEE_UPDATE_DELAY_BLOCKS = 100        # a new transfer-fee rate applies this many blocks later
+FEE_UPDATE_DELAY_BLOCKS = 100  # a new transfer-fee rate applies this many blocks later
 AUTHORITIES = ("mint", "freeze", "metadata", "fee", "withdraw", "pause", "permanent_delegate")
 
 
-NATIVE_ASSET = "QRDX"          # native QRDX, as spot names it (pools, books, swaps)
+NATIVE_ASSET = "QRDX"  # native QRDX, as spot names it (pools, books, swaps)
 
 
 def is_native_asset(asset: Any) -> bool:
     return isinstance(asset, str) and asset.strip().upper() == NATIVE_ASSET
 
 
-def canonical_asset(value: Any, registry: "TokenRegistry" = None) -> str:
+def canonical_asset(value: Any, registry: Optional["TokenRegistry"] = None) -> str:
     """How spot names an asset: "QRDX" for native QRDX (any casing), a registered token's
     canonical lowercase address, anything else as given."""
     text = str(value).strip()
@@ -104,6 +107,7 @@ def account(address: Any) -> str:
     """The account id a token authority, allowance or freeze is keyed by — the same key the
     token ledger uses for balances, so every address form of one account is one holder."""
     from ..crypto.account_id import to_account_id
+
     try:
         return to_account_id(str(address))
     except ValueError as e:
@@ -128,8 +132,8 @@ def amount(value: Any, what: str = "amount", allow_zero: bool = False) -> Decima
     """A token amount: a finite decimal with at most 18 places, positive (or zero if allowed)."""
     try:
         d = Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError):
-        raise TokenError(f"{what} is not a number: {value!r}")
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise TokenError(f"{what} is not a number: {value!r}") from exc
     if not d.is_finite():
         raise TokenError(f"{what} must be finite")
     if d < 0 or (d == 0 and not allow_zero):
@@ -145,19 +149,19 @@ class NativeToken:
     name: str
     symbol: str
     decimals: int
-    creator: str                           # addresses are kept as given and compared by
-    supply: Decimal = ZERO                 # account id (any form of one account matches)
-    max_supply: Optional[Decimal] = None   # None = uncapped (only matters with a mint authority)
-    mint_authority: Optional[str] = None   # None = fixed supply
-    freeze_authority: Optional[str] = None # None = never freezable
+    creator: str  # addresses are kept as given and compared by
+    supply: Decimal = ZERO  # account id (any form of one account matches)
+    max_supply: Optional[Decimal] = None  # None = uncapped (only matters with a mint authority)
+    mint_authority: Optional[str] = None  # None = fixed supply
+    freeze_authority: Optional[str] = None  # None = never freezable
     created_height: int = 0
     # ── extensions (none set = a plain token, hashed exactly as before they existed) ──
     uri: str = ""
     fields: Dict[str, str] = field(default_factory=dict)
     metadata_authority: Optional[str] = None
-    fee_enabled: bool = False              # the transfer-fee extension
+    fee_enabled: bool = False  # the transfer-fee extension
     fee_bps: int = 0
-    max_fee: Optional[Decimal] = None      # None = uncapped
+    max_fee: Optional[Decimal] = None  # None = uncapped
     pending_fee: Optional[Tuple[int, Optional[Decimal], int]] = None  # (bps, max, from height)
     fee_authority: Optional[str] = None
     withdraw_authority: Optional[str] = None
@@ -192,18 +196,30 @@ class NativeToken:
         """The extensions this token has, JSON-safe."""
         ext: Dict[str, Any] = {}
         if self.uri or self.fields or self.metadata_authority:
-            ext["metadata"] = {"uri": self.uri, "fields": dict(sorted(self.fields.items())),
-                               "update_authority": self.metadata_authority}
+            ext["metadata"] = {
+                "uri": self.uri,
+                "fields": dict(sorted(self.fields.items())),
+                "update_authority": self.metadata_authority,
+            }
         if self.fee_enabled:
             ext["transfer_fee"] = {
-                "bps": self.fee_bps, "max_fee": None if self.max_fee is None else str(self.max_fee),
-                "pending": None if self.pending_fee is None else {
-                    "bps": self.pending_fee[0],
-                    "max_fee": None if self.pending_fee[1] is None else str(self.pending_fee[1]),
-                    "from_height": self.pending_fee[2]},
+                "bps": self.fee_bps,
+                "max_fee": None if self.max_fee is None else str(self.max_fee),
+                "pending": (
+                    None
+                    if self.pending_fee is None
+                    else {
+                        "bps": self.pending_fee[0],
+                        "max_fee": (
+                            None if self.pending_fee[1] is None else str(self.pending_fee[1])
+                        ),
+                        "from_height": self.pending_fee[2],
+                    }
+                ),
                 "fee_authority": self.fee_authority,
                 "withdraw_authority": self.withdraw_authority,
-                "withheld_at": self.address}
+                "withheld_at": self.address,
+            }
         if self.non_transferable:
             ext["non_transferable"] = True
         if self.default_frozen:
@@ -218,11 +234,16 @@ class NativeToken:
 
     def summary(self) -> Dict[str, Any]:
         return {
-            "token_address": self.address, "name": self.name, "symbol": self.symbol,
-            "decimals": self.decimals, "total_supply": str(self.supply),
+            "token_address": self.address,
+            "name": self.name,
+            "symbol": self.symbol,
+            "decimals": self.decimals,
+            "total_supply": str(self.supply),
             "max_supply": None if self.max_supply is None else str(self.max_supply),
-            "mint_authority": self.mint_authority, "freeze_authority": self.freeze_authority,
-            "creator": self.creator, "created_height": self.created_height,
+            "mint_authority": self.mint_authority,
+            "freeze_authority": self.freeze_authority,
+            "creator": self.creator,
+            "created_height": self.created_height,
             "extensions": self.extensions(),
         }
 
@@ -235,20 +256,43 @@ class NativeToken:
         return [ext]
 
 
+def _encode_token(_address: str, t: "NativeToken") -> Any:
+    return [
+        t.name,
+        t.symbol,
+        t.decimals,
+        t.creator,
+        str(t.supply),
+        None if t.max_supply is None else str(t.max_supply),
+        t.mint_authority,
+        t.freeze_authority,
+        t.created_height,
+    ] + (t.canonical_extensions() or [])
+
+
 class TokenRegistry:
     """Native tokens, allowances and frozen accounts. Pure, deterministic state: every method
     either changes it completely or raises ``TokenError`` having changed nothing."""
 
+    # Committed entry by entry (qrdx/exchange/commitment.py).
+    tokens = committed("tokens.tokens", _encode_token)
+    allowances = committed("tokens.allowances", encode_value, mutable=False)
+    frozen = committed("tokens.frozen", kind="set")
+    thawed = committed("tokens.thawed", kind="set")
+    operators = committed("tokens.operators", kind="set")
+    revoked_defaults = committed("tokens.revoked_defaults", kind="set")
+
     def __init__(self) -> None:
-        self.tokens: Dict[str, NativeToken] = {}
-        self.allowances: Dict[Tuple[str, str, str], Decimal] = {}   # (token, owner, spender)
-        self.frozen: Set[Tuple[str, str]] = set()                    # (token, holder)
-        self.thawed: Set[Tuple[str, str]] = set()     # (token, holder) of default-frozen tokens
-        self.operators: Set[Tuple[str, str, str]] = set()          # (token, holder, operator)
-        self.revoked_defaults: Set[Tuple[str, str, str]] = set()   # default operators revoked
-        self.allowance_counts: Dict[str, int] = {}   # owner → non-zero allowances (derived)
-        self.operator_counts: Dict[str, int] = {}    # holder → authorized operators (derived)
-        self.changed: Set[str] = set()       # tokens changed this block (the DB mirror)
+        # (committed collections: see the class attributes above)
+        self.tokens = {}  # address → NativeToken
+        self.allowances = {}  # (token, owner, spender) → amount
+        self.frozen = set()  # (token, holder)
+        self.thawed = set()  # (token, holder) of default-frozen tokens
+        self.operators = set()  # (token, holder, operator)
+        self.revoked_defaults = set()  # default operators revoked
+        self.allowance_counts: Dict[str, int] = {}  # owner → non-zero allowances (derived)
+        self.operator_counts: Dict[str, int] = {}  # holder → authorized operators (derived)
+        self.changed: Set[str] = set()  # tokens changed this block (the DB mirror)
 
     # ── lookup ──────────────────────────────────────────────────────────
 
@@ -284,12 +328,17 @@ class TokenRegistry:
         if h == o or (token, h, o) in self.operators:
             return True
         t = self.tokens.get(token)
-        return (t is not None and o in {account(d) for d in t.default_operators}
-                and (token, h, o) not in self.revoked_defaults)
+        return (
+            t is not None
+            and o in {account(d) for d in t.default_operators}
+            and (token, h, o) not in self.revoked_defaults
+        )
 
     def is_permanent_delegate(self, token: str, who: str) -> bool:
         t = self.get(token)
-        return t is not None and t.permanent_delegate is not None and same(t.permanent_delegate, who)
+        return (
+            t is not None and t.permanent_delegate is not None and same(t.permanent_delegate, who)
+        )
 
     def check_transfer(self, token: str, frm: str, height: int, value: Decimal) -> Decimal:
         """May ``frm`` transfer ``value`` of ``token`` to another holder now? Returns the fee
@@ -309,18 +358,29 @@ class TokenRegistry:
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
-    def deploy(self, address: str, creator: str, height: int, *, name: Any, symbol: Any,
-               decimals: Any = MAX_DECIMALS, initial_supply: Any = 0, max_supply: Any = None,
-               mint_authority: Any = None, freeze_authority: Any = None,
-               extensions: Optional[Dict[str, Any]] = None) -> NativeToken:
+    def deploy(
+        self,
+        address: str,
+        creator: str,
+        height: int,
+        *,
+        name: Any,
+        symbol: Any,
+        decimals: Any = MAX_DECIMALS,
+        initial_supply: Any = 0,
+        max_supply: Any = None,
+        mint_authority: Any = None,
+        freeze_authority: Any = None,
+        extensions: Optional[Dict[str, Any]] = None,
+    ) -> NativeToken:
         address = str(address).lower()
         if address in self.tokens:
             raise TokenError(f"token {address} already exists")
         name, symbol = _name(name), _symbol(symbol)
         try:
             decimals = int(decimals)
-        except (TypeError, ValueError):
-            raise TokenError(f"decimals must be an integer, got {decimals!r}")
+        except (TypeError, ValueError) as exc:
+            raise TokenError(f"decimals must be an integer, got {decimals!r}") from exc
         if not 0 <= decimals <= MAX_DECIMALS:
             raise TokenError(f"decimals must be 0-{MAX_DECIMALS}")
         supply = amount(initial_supply, "initial supply", allow_zero=True)
@@ -331,15 +391,22 @@ class TokenRegistry:
         if supply == 0 and minter is None:
             raise TokenError("a token needs an initial supply or a mint authority")
         account(creator)
-        token = NativeToken(address=address, name=name, symbol=symbol, decimals=decimals,
-                            creator=str(creator), supply=supply, max_supply=cap,
-                            mint_authority=minter,
-                            freeze_authority=optional_address(freeze_authority),
-                            created_height=int(height))
+        token = NativeToken(
+            address=address,
+            name=name,
+            symbol=symbol,
+            decimals=decimals,
+            creator=str(creator),
+            supply=supply,
+            max_supply=cap,
+            mint_authority=minter,
+            freeze_authority=optional_address(freeze_authority),
+            created_height=int(height),
+        )
         _apply_extensions(token, dict(extensions or {}), str(creator))
         self.tokens[address] = token
         if token.default_frozen:
-            self.thawed.add((address, account(creator)))     # the deployer starts thawed
+            self.thawed.add((address, account(creator)))  # the deployer starts thawed
         self.changed.add(address)
         return token
 
@@ -426,8 +493,9 @@ class TokenRegistry:
         self.changed.add(t.address)
         return t
 
-    def set_transfer_fee(self, token: str, sender: str, height: int, bps: Any,
-                         max_fee: Any = None) -> Tuple[int, Optional[Decimal], int]:
+    def set_transfer_fee(
+        self, token: str, sender: str, height: int, bps: Any, max_fee: Any = None
+    ) -> Tuple[int, Optional[Decimal], int]:
         """The fee authority sets a new rate and cap; it applies FEE_UPDATE_DELAY_BLOCKS
         later (until then the current one does)."""
         t = self.require(token)
@@ -435,7 +503,7 @@ class TokenRegistry:
             raise TokenError(f"{t.symbol} has no transfer fee")
         if t.fee_authority is None or not same(t.fee_authority, sender):
             raise TokenError(f"only {t.symbol}'s fee authority may change its fee")
-        t.fee_bps, t.max_fee = t.fee_config(height)          # a due pending rate is now current
+        t.fee_bps, t.max_fee = t.fee_config(height)  # a due pending rate is now current
         pending = (_bps(bps), _cap(max_fee), int(height) + FEE_UPDATE_DELAY_BLOCKS)
         t.pending_fee = pending
         self.changed.add(t.address)
@@ -473,8 +541,9 @@ class TokenRegistry:
                 self.revoked_defaults.discard(key)
             elif key not in self.operators:
                 if self.operator_counts.get(h, 0) >= MAX_OPERATORS_PER_HOLDER:
-                    raise TokenError(f"an account may authorize at most "
-                                     f"{MAX_OPERATORS_PER_HOLDER} operators")
+                    raise TokenError(
+                        f"an account may authorize at most " f"{MAX_OPERATORS_PER_HOLDER} operators"
+                    )
                 self.operators.add(key)
                 self.operator_counts[h] = self.operator_counts.get(h, 0) + 1
         else:
@@ -503,8 +572,10 @@ class TokenRegistry:
             return v
         if key not in self.allowances:
             if self.allowance_counts.get(owner_id, 0) >= MAX_ALLOWANCES_PER_OWNER:
-                raise TokenError(f"an account may hold at most {MAX_ALLOWANCES_PER_OWNER} "
-                                 "allowances; revoke one first")
+                raise TokenError(
+                    f"an account may hold at most {MAX_ALLOWANCES_PER_OWNER} "
+                    "allowances; revoke one first"
+                )
             self._count(owner_id, +1)
         self.allowances[key] = v
         return v
@@ -548,11 +619,21 @@ class TokenRegistry:
         # Extensions and the newer sets appear only when used, so a chain that uses none of
         # them commits exactly what it did before they existed.
         out = {
-            "tokens": {a: [t.name, t.symbol, t.decimals, t.creator, str(t.supply),
-                           None if t.max_supply is None else str(t.max_supply),
-                           t.mint_authority, t.freeze_authority, t.created_height]
-                       + (t.canonical_extensions() or [])
-                       for a, t in sorted(self.tokens.items())},
+            "tokens": {
+                a: [
+                    t.name,
+                    t.symbol,
+                    t.decimals,
+                    t.creator,
+                    str(t.supply),
+                    None if t.max_supply is None else str(t.max_supply),
+                    t.mint_authority,
+                    t.freeze_authority,
+                    t.created_height,
+                ]
+                + (t.canonical_extensions() or [])
+                for a, t in sorted(self.tokens.items())
+            },
             "allowances": [[t, o, s, str(v)] for (t, o, s), v in sorted(self.allowances.items())],
             "frozen": [list(k) for k in sorted(self.frozen)],
         }
@@ -568,13 +649,39 @@ class TokenRegistry:
         blob = json.dumps(self.canonical(), sort_keys=True, separators=(",", ":"))
         return hashlib.blake2b(blob.encode(), digest_size=32).digest()
 
+    def commitment(self) -> bytes:
+        """The incremental commitment (``incremental_state_root``)."""
+        return (
+            Section("tokens")
+            .raw(self.tokens.commitment())
+            .raw(self.allowances.commitment())
+            .raw(self.frozen.commitment())
+            .raw(self.thawed.commitment())
+            .raw(self.operators.commitment())
+            .raw(self.revoked_defaults.commitment())
+            .digest()
+        )
+
+    def verify_commitment(self) -> None:
+        for c in (
+            self.tokens,
+            self.allowances,
+            self.frozen,
+            self.thawed,
+            self.operators,
+            self.revoked_defaults,
+        ):
+            c.verify()
+
 
 # ── parameter checks shared by deploy and the extension updates ───────────
+
 
 def _trim(d: Decimal) -> Decimal:
     """``d`` without trailing zeros (and never in exponent form)."""
     n = d.normalize()
-    return n if n.as_tuple().exponent <= 0 else n.quantize(Decimal(1))
+    exponent = n.as_tuple().exponent  # 'n'/'N'/'F' for NaN and infinity
+    return n if isinstance(exponent, int) and exponent <= 0 else n.quantize(Decimal(1))
 
 
 def _name(value: Any) -> str:
@@ -586,10 +693,14 @@ def _name(value: Any) -> str:
 
 def _symbol(value: Any) -> str:
     symbol = str(value).strip()
-    if not 1 <= len(symbol) <= MAX_SYMBOL_LENGTH or not symbol.isprintable() \
-            or any(c in symbol for c in ": "):
-        raise TokenError(f"symbol must be 1-{MAX_SYMBOL_LENGTH} printable characters "
-                         "without spaces or ':'")
+    if (
+        not 1 <= len(symbol) <= MAX_SYMBOL_LENGTH
+        or not symbol.isprintable()
+        or any(c in symbol for c in ": ")
+    ):
+        raise TokenError(
+            f"symbol must be 1-{MAX_SYMBOL_LENGTH} printable characters " "without spaces or ':'"
+        )
     return symbol
 
 
@@ -607,11 +718,14 @@ def _fields(fields: Dict[str, Any]) -> Dict[str, str]:
     for k, v in fields.items():
         k, v = str(k).strip(), str(v)
         if not 1 <= len(k) <= MAX_FIELD_KEY_LENGTH or not k.isprintable():
-            raise TokenError(f"metadata field names must be 1-{MAX_FIELD_KEY_LENGTH} printable "
-                             "characters")
+            raise TokenError(
+                f"metadata field names must be 1-{MAX_FIELD_KEY_LENGTH} printable " "characters"
+            )
         if len(v) > MAX_FIELD_VALUE_LENGTH or not v.isprintable():
-            raise TokenError(f"metadata field values must be at most {MAX_FIELD_VALUE_LENGTH} "
-                             "printable characters")
+            raise TokenError(
+                f"metadata field values must be at most {MAX_FIELD_VALUE_LENGTH} "
+                "printable characters"
+            )
         out[k] = v
     return dict(sorted(out.items()))
 
@@ -619,8 +733,8 @@ def _fields(fields: Dict[str, Any]) -> Dict[str, str]:
 def _bps(value: Any) -> int:
     try:
         bps = int(value)
-    except (TypeError, ValueError):
-        raise TokenError(f"transfer_fee_bps must be an integer, got {value!r}")
+    except (TypeError, ValueError) as exc:
+        raise TokenError(f"transfer_fee_bps must be an integer, got {value!r}") from exc
     if not 0 <= bps <= MAX_FEE_BPS:
         raise TokenError(f"transfer_fee_bps must be 0-{MAX_FEE_BPS}")
     return bps

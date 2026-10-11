@@ -7,19 +7,19 @@ Provides:
   - DoomsdayHook     : Advisory trading flag after Doomsday activation
 """
 
-from .qrc20 import (
-    QRC20Token,
-    QRC20Registry,
-    QRC20TransferEvent,
-    QRC20ApprovalEvent,
-    QRC20Error,
-    InsufficientBalanceError,
-    InsufficientAllowanceError,
-)
 from .doomsday_hook import (
     DoomsdayHook,
     DoomsdayTradingMode,
     DoomsdayTradingPreference,
+)
+from .qrc20 import (
+    InsufficientAllowanceError,
+    InsufficientBalanceError,
+    QRC20ApprovalEvent,
+    QRC20Error,
+    QRC20Registry,
+    QRC20Token,
+    QRC20TransferEvent,
 )
 
 __all__ = [

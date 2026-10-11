@@ -32,18 +32,19 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from ..server import RPCModule, rpc_method, RPCError, RPCErrorCode
+from ...constants import CHAIN_ID as _CHAIN_ID  # the network's chain id (EIP-155 / EIP-695)
+from ..server import RPCError, RPCErrorCode, RPCModule, rpc_method
 
 logger = logging.getLogger(__name__)
 
-# The network's chain id, from its chain spec (EIP-155 / EIP-695).
-from ...constants import CHAIN_ID as _CHAIN_ID
+
 _ZERO_ADDR_HEX = "0x" + "0" * 40
 _ZERO_HASH = "0x" + "0" * 64
 _EMPTY_BLOOM = "0x" + "00" * 256
 
 
 # ─── Filter System ────────────────────────────────────────────────────────────
+
 
 class _FilterKind:
     LOG = "log"
@@ -54,8 +55,7 @@ class _FilterKind:
 class _Filter:
     """Single registered filter with polling state."""
 
-    __slots__ = ("id", "kind", "params", "last_block", "last_poll",
-                 "pending_hashes", "created_at")
+    __slots__ = ("id", "kind", "params", "last_block", "last_poll", "pending_hashes", "created_at")
 
     def __init__(self, kind: str, current_block: int, params: Dict | None = None):
         self.id: str = hex(uuid.uuid4().int >> 96)  # compact hex id
@@ -122,13 +122,13 @@ class _FilterStore:
 
     def _cleanup(self) -> None:
         now = time.monotonic()
-        stale = [k for k, v in self._filters.items()
-                 if (now - v.last_poll) > self.TTL]
+        stale = [k for k, v in self._filters.items() if (now - v.last_poll) > self.TTL]
         for k in stale:
             del self._filters[k]
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
 
 def _to_hex(value: int) -> str:
     """Integer → 0x-prefixed hex string."""
@@ -184,6 +184,7 @@ def _safe_timestamp(val: Any) -> int:
             pass
         try:
             from datetime import datetime
+
             dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
             return int(dt.timestamp())
         except Exception:
@@ -192,6 +193,7 @@ def _safe_timestamp(val: Any) -> int:
 
 
 # ─── EthModule ────────────────────────────────────────────────────────────────
+
 
 class EthModule(RPCModule):
     """
@@ -228,6 +230,7 @@ class EthModule(RPCModule):
         accounts, storage and native token balances (contracts/evm_world.py)."""
         from ...contracts.evm_world import EvmWorld, run
         from ...contracts.native_token_evm import TokenWorld
+
         evm = self._evm()
         db = getattr(self.context, "db", None) if self.context else None
         world = EvmWorld(evm.state_manager, tokens=TokenWorld(db) if db is not None else None)
@@ -279,7 +282,7 @@ class EthModule(RPCModule):
                 (block_hash,),
             )
             row = await cursor.fetchone()
-            count += (row[0] if row else 0)
+            count += row[0] if row else 0
         except Exception:
             pass
         # EVM (contract) transactions
@@ -295,7 +298,7 @@ class EthModule(RPCModule):
                     (brow[0],),
                 )
                 crow = await cursor2.fetchone()
-                count += (crow[0] if crow else 0)
+                count += crow[0] if crow else 0
         except Exception:
             pass
         return count
@@ -382,7 +385,9 @@ class EthModule(RPCModule):
                 {
                     "address": _ensure_0x(row[0]) if row[0] else _ZERO_ADDR_HEX,
                     "topics": [_ensure_0x(t) for t in (row[1], row[2], row[3], row[4]) if t],
-                    "data": _ensure_0x(row[5].hex() if isinstance(row[5], (bytes, memoryview)) else (row[5] or "")),
+                    "data": _ensure_0x(
+                        row[5].hex() if isinstance(row[5], (bytes, memoryview)) else (row[5] or "")
+                    ),
                     "blockNumber": _to_hex(row[6]) if row[6] is not None else "0x0",
                     "transactionHash": _ensure_0x(h),
                     "transactionIndex": "0x0",
@@ -454,17 +459,23 @@ class EthModule(RPCModule):
         amounts = tx.get("outputs_amounts") or ""
 
         if inputs:
-            first = inputs.split(",")[0].strip().strip('"').strip("'").strip("[").strip("]").strip('"')
+            first = (
+                inputs.split(",")[0].strip().strip('"').strip("'").strip("[").strip("]").strip('"')
+            )
             if first:
                 from_addr = first if first.startswith("0x") else first
 
         if outputs:
-            first = outputs.split(",")[0].strip().strip('"').strip("'").strip("[").strip("]").strip('"')
+            first = (
+                outputs.split(",")[0].strip().strip('"').strip("'").strip("[").strip("]").strip('"')
+            )
             if first:
                 to_addr = first if first.startswith("0x") else first
 
         if amounts:
-            first = amounts.split(",")[0].strip().strip('"').strip("'").strip("[").strip("]").strip('"')
+            first = (
+                amounts.split(",")[0].strip().strip('"').strip("'").strip("[").strip("]").strip('"')
+            )
             try:
                 value_hex = _to_hex(_safe_int(first, 0))
             except Exception:
@@ -519,7 +530,11 @@ class EthModule(RPCModule):
             "blockNumber": _to_hex(block_number),
             "transactionIndex": _to_hex(tx_index),
             "from": _ensure_0x(from_addr) if not from_addr.startswith("0x") else from_addr,
-            "to": (_ensure_0x(to_addr) if to_addr and not to_addr.startswith("0x") else to_addr) if to_addr else None,
+            "to": (
+                (_ensure_0x(to_addr) if to_addr and not to_addr.startswith("0x") else to_addr)
+                if to_addr
+                else None
+            ),
             "value": _to_hex(value),
             "gasPrice": _to_hex(gas_price),
             "gas": _to_hex(gas_limit),
@@ -567,9 +582,7 @@ class EthModule(RPCModule):
             highest = current
             if hasattr(db, "connection"):
                 try:
-                    cursor = await db.connection.execute(
-                        "SELECT MAX(block_height) FROM blocks"
-                    )
+                    cursor = await db.connection.execute("SELECT MAX(block_height) FROM blocks")
                     row = await cursor.fetchone()
                     if row and row[0] is not None:
                         highest = max(highest, row[0])
@@ -803,7 +816,11 @@ class EthModule(RPCModule):
                 "blockHash": block_hash,
                 "blockNumber": _to_hex(block_number),
                 "from": _ensure_0x(from_addr) if not from_addr.startswith("0x") else from_addr,
-                "to": (_ensure_0x(to_addr) if to_addr and not to_addr.startswith("0x") else to_addr) if to_addr else None,
+                "to": (
+                    (_ensure_0x(to_addr) if to_addr and not to_addr.startswith("0x") else to_addr)
+                    if to_addr
+                    else None
+                ),
                 "cumulativeGasUsed": _to_hex(gas_used),
                 "gasUsed": _to_hex(gas_used),
                 "effectiveGasPrice": _to_hex(_safe_int(tx.get("gas_price"), 0)),
@@ -817,7 +834,11 @@ class EthModule(RPCModule):
             # Native transaction receipt
             block_hash = _ensure_0x(tx.get("block_hash") or ("0" * 64))
             block_number = 0
-            b = await self._get_block_by_hash(tx.get("block_hash") or "") if tx.get("block_hash") else None
+            b = (
+                await self._get_block_by_hash(tx.get("block_hash") or "")
+                if tx.get("block_hash")
+                else None
+            )
             if b:
                 block_number = _safe_int(b.get("id") or b.get("block_height"), 0)
 
@@ -904,8 +925,8 @@ class EthModule(RPCModule):
     def _pending_nonce(self, address: str, confirmed: int) -> int:
         """Advance ``confirmed`` past any mempool-queued nonces for this sender."""
         try:
-            from qrdx.node import main as node_main
             from qrdx.crypto.account_id import to_account_id
+            from qrdx.node import main as node_main
 
             mp = getattr(node_main, "EVM_MEMPOOL", None)
             if mp is None:
@@ -975,14 +996,14 @@ class EthModule(RPCModule):
         """
         try:
             import rlp as _rlp
-            from eth_utils import decode_hex, encode_hex, to_canonical_address, to_checksum_address
-            from eth_keys import keys
             from eth_hash.auto import keccak
+            from eth_keys import keys
+            from eth_utils import decode_hex, encode_hex
         except ImportError as exc:
             raise RPCError(
                 RPCErrorCode.INTERNAL_ERROR,
                 f"EVM dependencies not installed: {exc}",
-            )
+            ) from exc
 
         evm = self._evm()
         sm = self._state()
@@ -1018,11 +1039,7 @@ class EthModule(RPCModule):
                 unsigned = [tx_data[i] for i in range(6)]
                 message_hash = keccak(_rlp.encode(unsigned))
 
-            sig_bytes = (
-                r_int.to_bytes(32, "big")
-                + s_int.to_bytes(32, "big")
-                + bytes([recovery_id])
-            )
+            sig_bytes = r_int.to_bytes(32, "big") + s_int.to_bytes(32, "big") + bytes([recovery_id])
             signature = keys.Signature(signature_bytes=sig_bytes)
             public_key = signature.recover_public_key_from_msg_hash(message_hash)
             sender = public_key.to_canonical_address()
@@ -1033,7 +1050,11 @@ class EthModule(RPCModule):
 
             logger.info(
                 "eth_sendRawTransaction: from=%s to=%s nonce=%d gas=%d value=%d",
-                sender_hex, to_hex or "CREATE", nonce, gas, value_wei,
+                sender_hex,
+                to_hex or "CREATE",
+                nonce,
+                gas,
+                value_wei,
             )
 
             # ── generate transaction hash ──
@@ -1044,13 +1065,18 @@ class EthModule(RPCModule):
             exec_ctx = None
             block_height = 0
             try:
-                from ...contracts.state_sync import StateSyncManager, ExecutionContext as SyncExecContext
+                from ...contracts.state_sync import (
+                    ExecutionContext as SyncExecContext,
+                    StateSyncManager,
+                )
 
                 latest = await db.get_latest_block()
                 block_height = _safe_int(
                     (latest or {}).get("id") or (latest or {}).get("block_height"), 0
                 )
-                block_hash_str = (latest or {}).get("hash") or (latest or {}).get("block_hash") or ""
+                block_hash_str = (
+                    (latest or {}).get("hash") or (latest or {}).get("block_hash") or ""
+                )
                 block_ts = _safe_timestamp((latest or {}).get("timestamp"))
 
                 sync_mgr = StateSyncManager(db, sm)
@@ -1125,8 +1151,14 @@ class EthModule(RPCModule):
                     for i, log_entry in enumerate(result.logs):
                         if isinstance(log_entry, tuple):
                             addr_bytes, topics, log_data = log_entry
-                            addr_hex = encode_hex(addr_bytes) if isinstance(addr_bytes, bytes) else str(addr_bytes)
-                            topic_strs = [encode_hex(t) if isinstance(t, bytes) else str(t) for t in topics]
+                            addr_hex = (
+                                encode_hex(addr_bytes)
+                                if isinstance(addr_bytes, bytes)
+                                else str(addr_bytes)
+                            )
+                            topic_strs = [
+                                encode_hex(t) if isinstance(t, bytes) else str(t) for t in topics
+                            ]
                             data_bytes = log_data if isinstance(log_data, bytes) else b""
                         else:
                             addr_hex = getattr(log_entry, "address", "")
@@ -1165,7 +1197,11 @@ class EthModule(RPCModule):
                     "eth_sendRawTransaction OK: hash=%s gas_used=%d%s",
                     tx_hash_hex,
                     result.gas_used,
-                    f" contract={encode_hex(result.created_address)}" if result.created_address else "",
+                    (
+                        f" contract={encode_hex(result.created_address)}"
+                        if result.created_address
+                        else ""
+                    ),
                 )
                 return tx_hash_hex
 
@@ -1185,13 +1221,13 @@ class EthModule(RPCModule):
                         )
                     except Exception:
                         pass
-                raise RPCError(RPCErrorCode.INTERNAL_ERROR, f"Transaction failed: {e}")
+                raise RPCError(RPCErrorCode.INTERNAL_ERROR, f"Transaction failed: {e}") from e
 
         except RPCError:
             raise
         except Exception as e:
             logger.error("eth_sendRawTransaction error: %s", e, exc_info=True)
-            raise RPCError(RPCErrorCode.INTERNAL_ERROR, f"Transaction failed: {e}")
+            raise RPCError(RPCErrorCode.INTERNAL_ERROR, f"Transaction failed: {e}") from e
 
     @rpc_method
     async def sendTransaction(self, transaction: Dict) -> str:
@@ -1259,7 +1295,7 @@ class EthModule(RPCModule):
             utxo_micro = row[0] if row and row[0] else 0
             if utxo_micro > 0:
                 # Convert micro-QRDX (10^6 base) to wei (10^18 base)
-                return _to_hex(utxo_micro * (10 ** 12))
+                return _to_hex(utxo_micro * (10**12))
         except Exception:
             pass
 
@@ -1322,9 +1358,9 @@ class EthModule(RPCModule):
         output data.
         """
         try:
-            from eth_utils import to_canonical_address, encode_hex, decode_hex
+            from eth_utils import decode_hex, encode_hex, to_canonical_address
         except ImportError as exc:
-            raise RPCError(RPCErrorCode.INTERNAL_ERROR, f"EVM dependencies missing: {exc}")
+            raise RPCError(RPCErrorCode.INTERNAL_ERROR, f"EVM dependencies missing: {exc}") from exc
 
         sender_hex = transaction.get("from", _ZERO_ADDR_HEX)
         to_hex = transaction.get("to")
@@ -1342,14 +1378,17 @@ class EthModule(RPCModule):
         gas = _parse_hex_int(gas_str)
 
         evm = self._evm()
-        result = await self._run_world(lambda world: evm.call(
-            sender=sender,
-            to=to,
-            data=data,
-            value=value,
-            gas=gas,
-            world=world,
-        ), preload=[sender, to])
+        result = await self._run_world(
+            lambda world: evm.call(
+                sender=sender,
+                to=to,
+                data=data,
+                value=value,
+                gas=gas,
+                world=world,
+            ),
+            preload=[sender, to],
+        )
 
         if not result.success:
             error_data = encode_hex(result.output) if result.output else None
@@ -1409,9 +1448,14 @@ class EthModule(RPCModule):
                 call_data = decode_hex(data_hex) if has_data else b""
             except Exception:
                 call_data = b""
-            return _to_hex(intrinsic_gas_pq(
-                call_data, b"\x00" * PUBLIC_KEY_SIZE, b"\x00" * SIGNATURE_SIZE,
-                is_create=not to_hex))
+            return _to_hex(
+                intrinsic_gas_pq(
+                    call_data,
+                    b"\x00" * PUBLIC_KEY_SIZE,
+                    b"\x00" * SIGNATURE_SIZE,
+                    is_create=not to_hex,
+                )
+            )
 
         # Simple value transfer — no data and not a contract
         if not has_data and to_hex:
@@ -1428,9 +1472,9 @@ class EthModule(RPCModule):
 
         # Contract interaction — use EVM estimator
         try:
-            from eth_utils import to_canonical_address, decode_hex
+            from eth_utils import decode_hex, to_canonical_address
         except ImportError as exc:
-            raise RPCError(RPCErrorCode.INTERNAL_ERROR, f"EVM dependencies missing: {exc}")
+            raise RPCError(RPCErrorCode.INTERNAL_ERROR, f"EVM dependencies missing: {exc}") from exc
 
         evm = self._evm()
 
@@ -1442,13 +1486,16 @@ class EthModule(RPCModule):
         data = decode_hex(data_hex) if has_data else b""
         value = _parse_hex_int(value_str)
 
-        estimated = await self._run_world(lambda world: evm.estimate_gas(
-            sender=sender,
-            to=to,
-            data=data,
-            value=value,
-            world=world,
-        ), preload=[sender, to])
+        estimated = await self._run_world(
+            lambda world: evm.estimate_gas(
+                sender=sender,
+                to=to,
+                data=data,
+                value=value,
+                world=world,
+            ),
+            preload=[sender, to],
+        )
 
         return _to_hex(estimated)
 
@@ -1659,17 +1706,19 @@ class EthModule(RPCModule):
                 except Exception:
                     pass
 
-                results.append({
-                    "address": _ensure_0x(addr),
-                    "topics": topic_list,
-                    "data": data_hex,
-                    "blockNumber": _to_hex(bn) if bn is not None else "0x0",
-                    "transactionHash": _ensure_0x(tx_h),
-                    "transactionIndex": "0x0",
-                    "blockHash": block_hash_val,
-                    "logIndex": _to_hex(li) if li is not None else "0x0",
-                    "removed": removed,
-                })
+                results.append(
+                    {
+                        "address": _ensure_0x(addr),
+                        "topics": topic_list,
+                        "data": data_hex,
+                        "blockNumber": _to_hex(bn) if bn is not None else "0x0",
+                        "transactionHash": _ensure_0x(tx_h),
+                        "transactionIndex": "0x0",
+                        "blockHash": block_hash_val,
+                        "logIndex": _to_hex(li) if li is not None else "0x0",
+                        "removed": removed,
+                    }
+                )
             return results
 
         except Exception as e:
@@ -1724,11 +1773,13 @@ class EthModule(RPCModule):
         storage_proof: List[Dict] = []
         for key in storage_keys:
             value = await self.getStorageAt(address, key, block_number)
-            storage_proof.append({
-                "key": key,
-                "value": value,
-                "proof": [],
-            })
+            storage_proof.append(
+                {
+                    "key": key,
+                    "value": value,
+                    "proof": [],
+                }
+            )
 
         return {
             "address": address,

@@ -31,16 +31,21 @@ exec docker run --rm --user 0 \
     mkdir /tmp/repo
     for entry in /src/* /src/.[!.]*; do
       [ -e "$entry" ] || continue
-      # Not the shipped code, the tests (copied: some write next to themselves), or a local
+      # Symlinked: everything but the shipped code, what is COPIED below, and a local
       # checkout'"'"'s runtime state (a test run writes logs/ and data/ of its own).
       case "${entry##*/}" in
-        qrdx|tests|logs|data|testnet*|ref|miner|dvm|.git) ;;
+        qrdx|tests|integration_tests|docker|scripts|*.py|logs|data|testnet*|ref|miner|dvm|.git) ;;
         *) ln -s "$entry" "/tmp/repo/${entry##*/}" ;;
       esac
     done
     ln -s /app/qrdx /tmp/repo/qrdx
-    cp -R /src/tests /tmp/repo/tests
-    find /tmp/repo/tests -name __pycache__ -prune -exec rm -rf {} +
+    # Copied, not linked: test code writes next to itself (the integration harness puts its
+    # testnet/ beside integration_tests/), and Python puts a script'"'"'s RESOLVED directory on
+    # sys.path — a linked run_node.py would make every node it starts import /src/qrdx, the
+    # checkout, instead of the shipped code.
+    cp -R /src/tests /src/integration_tests /src/docker /src/scripts /tmp/repo/
+    cp /src/*.py /tmp/repo/ 2>/dev/null || true
+    find /tmp/repo -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
     cd /tmp/repo
     python - <<EOF
 import os, sys
@@ -51,5 +56,12 @@ assert where.startswith("/app/qrdx/"), f"testing {where}, not the shipped /app/q
 assert not os.path.realpath(eth.__file__).startswith("/src/"), f"testing {eth.__file__}, not the installed qrdx-evm"
 print(f"testing the shipped code: qrdx -> /app/qrdx, eth -> {os.path.dirname(eth.__file__)}")
 EOF
+    # ...and so does a script started from the workspace, as the harness starts run_node.py.
+    printf "import os, qrdx; print(os.path.realpath(qrdx.__file__))\n" > /tmp/repo/_where.py
+    where="$(python /tmp/repo/_where.py)"; rm -f /tmp/repo/_where.py
+    case "$where" in
+      /app/qrdx/*) echo "scripts started from the workspace import the shipped code too" ;;
+      *) echo "a script started from the workspace imports $where, not /app/qrdx" >&2; exit 1 ;;
+    esac
     exec python -m pytest -p no:cacheprovider "$@"
   ' sh "${PYTEST_ARGS[@]}"

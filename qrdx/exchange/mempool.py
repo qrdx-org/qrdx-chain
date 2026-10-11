@@ -30,15 +30,15 @@ from __future__ import annotations
 import logging
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from .transactions import ExchangeTransaction
 from .block_processor import verify_exchange_tx
+from .transactions import ExchangeTransaction
 
 logger = logging.getLogger(__name__)
 
 # Defaults (DoS resistance + bounded queuing)
-DEFAULT_MAX_MEMPOOL = 8192       # total admitted txs
-DEFAULT_MAX_PER_SENDER = 64      # queued txs per sender
-DEFAULT_MAX_NONCE_GAP = 64       # how far ahead of expected a nonce may be
+DEFAULT_MAX_MEMPOOL = 8192  # total admitted txs
+DEFAULT_MAX_PER_SENDER = 64  # queued txs per sender
+DEFAULT_MAX_NONCE_GAP = 64  # how far ahead of expected a nonce may be
 
 # address -> next expected nonce
 NonceProvider = Callable[[str], int]
@@ -46,6 +46,7 @@ NonceProvider = Callable[[str], int]
 
 def _default_nonce_provider(address: str) -> int:
     from .state_manager import ExchangeStateManager
+
     return ExchangeStateManager.get_instance().get_nonce(address)
 
 
@@ -63,8 +64,8 @@ class ExchangeMempool:
         self.max_per_sender = max_per_sender
         self.max_nonce_gap = max_nonce_gap
         self._nonce_provider = nonce_provider or _default_nonce_provider
-        self._txs: Dict[str, ExchangeTransaction] = {}        # tx_hash -> tx
-        self._by_sender: Dict[str, Set[str]] = {}             # sender -> {tx_hash}
+        self._txs: Dict[str, ExchangeTransaction] = {}  # tx_hash -> tx
+        self._by_sender: Dict[str, Set[str]] = {}  # sender -> {tx_hash}
 
     # ── Admission ──────────────────────────────────────────────────────
 

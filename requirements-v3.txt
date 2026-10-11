@@ -21,7 +21,7 @@ python-dateutil~=2.8.2
 pickleDB~=0.9.2
 base58~=0.2.2
 httpx>=0.26.0
-python-dotenv~=1.0.1
+python-dotenv>=1.2.2
 rich~=14.2.0
 
 # ============================================================================
@@ -111,4 +111,4 @@ tomli-w>=1.0.0
 # ============================================================================
 # fastecdsa is being replaced by eth-keys for secp256k1
 # Keep for now for P256 backward compatibility during migration
-fastecdsa>=2.2.3
+fastecdsa>=2.3.2,<3  # 3+ rejects str messages (transaction_input.py verifies a str fallback)

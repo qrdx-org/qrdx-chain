@@ -96,7 +96,7 @@ qrdx = ["*.sql", "*.toml", "*.json"]
 
 [tool.black]
 line-length = 100
-target-version = ["py310", "py311", "py312"]
+target-version = ["py310", "py311"]
 include = '\.pyi?$'
 exclude = '''
 /(
@@ -112,10 +112,14 @@ exclude = '''
 profile = "black"
 line_length = 100
 skip = [".venv", "ref"]
+known_first_party = ["qrdx"]
+combine_as_imports = true   # as ruff does below: the two must agree, CI runs both
 
 [tool.mypy]
 python_version = "3.10"
-warn_return_any = true
+# Off: returning a value typed Any (json, sqlite rows, untyped libraries) from an annotated
+# function is not a defect, and flagging it buried the real errors.
+warn_return_any = false
 warn_unused_configs = true
 ignore_missing_imports = true
 exclude = ["ref/", "tests/"]
@@ -142,6 +146,21 @@ select = [
 ignore = [
     "E501",  # line too long (handled by black)
 ]
+
+[tool.ruff.lint.isort]
+known-first-party = ["qrdx"]
+combine-as-imports = true
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection markers are meant to be called in parameter defaults.
+extend-immutable-calls = ["fastapi.Body", "fastapi.Depends", "fastapi.Query", "fastapi.Header",
+                          "fastapi.Path"]
+
+[tool.ruff.lint.per-file-ignores]
+# A package's __init__ imports what it re-exports.
+"**/__init__.py" = ["F401"]
+# The node's entry module is organised in sections, each importing what it wires up.
+"qrdx/node/main.py" = ["E402"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

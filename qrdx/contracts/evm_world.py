@@ -19,10 +19,11 @@ Native tokens (qrdx/exchange/tokens.py) are part of the same world: ``tokens`` i
 ``native_token_evm.TokenWorld``, and the state journals token moves so a reverted call undoes
 them (``WorldState``).
 """
+
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+from typing import Dict, Iterable, Optional, Set, Tuple, cast
 
 from eth.constants import BLANK_ROOT_HASH
 from eth.db.account import AccountDB
@@ -30,6 +31,7 @@ from eth.db.atomic import AtomicDB
 from eth.db.backends.memory import MemoryDB
 from eth.vm.forks.qrdx.computation import QRDXComputation
 from eth.vm.forks.qrdx.state import QRDXState
+from eth_typing import Address
 
 from ..crypto.account_id import to_account_id
 
@@ -48,13 +50,19 @@ NATIVE_STUB_CODE = b"\xfe"
 class StateMiss(Exception):
     """The execution read state that is not loaded; load it and run again."""
 
-    def __init__(self, accounts: Iterable[bytes] = (), slots: Iterable[Tuple[bytes, int]] = (),
-                 tokens: Iterable[Tuple[str, str]] = ()):
+    def __init__(
+        self,
+        accounts: Iterable[bytes] = (),
+        slots: Iterable[Tuple[bytes, int]] = (),
+        tokens: Iterable[Tuple[str, str]] = (),
+    ):
         self.accounts = set(accounts)
         self.slots = set(slots)
         self.tokens = set(tokens)
-        super().__init__(f"state not loaded: {len(self.accounts)} account(s), "
-                         f"{len(self.slots)} slot(s), {len(self.tokens)} token balance(s)")
+        super().__init__(
+            f"state not loaded: {len(self.accounts)} account(s), "
+            f"{len(self.slots)} slot(s), {len(self.tokens)} token balance(s)"
+        )
 
 
 def _hex(address: bytes) -> str:
@@ -101,9 +109,11 @@ class _PrecompilesWithTokens(Mapping):
             return fn
         if self.tokens.is_token(address):
             from .native_token_evm import native_token_precompile
+
             return native_token_precompile
         if self.tokens.is_collection(address):
             from .nft_evm import nft_precompile
+
             return nft_precompile
         return default
 
@@ -165,9 +175,9 @@ class EvmWorld:
     def __init__(self, state_manager, tokens=None):
         self.sm = state_manager
         self.tokens = tokens
-        self.accounts: Dict[bytes, Tuple[int, int, bytes]] = {}   # address → (balance, nonce, code)
-        self.storage: Dict[Tuple[bytes, int], int] = {}           # loaded non-zero/known slots
-        self.full_storage: Set[bytes] = set()                     # every slot of these is loaded
+        self.accounts: Dict[bytes, Tuple[int, int, bytes]] = {}  # address → (balance, nonce, code)
+        self.storage: Dict[Tuple[bytes, int], int] = {}  # loaded non-zero/known slots
+        self.full_storage: Set[bytes] = set()  # every slot of these is loaded
         self.touched_slots: Set[Tuple[bytes, int]] = set()
 
     # -- loading ------------------------------------------------------------
@@ -181,8 +191,11 @@ class EvmWorld:
             if address not in self.accounts:
                 h = _hex(address)
                 code = self.sm.get_code_sync(h) or EMPTY_CODE
-                self.accounts[address] = (self.sm.get_balance_sync(h), self.sm.get_nonce_sync(h),
-                                          bytes(code))
+                self.accounts[address] = (
+                    self.sm.get_balance_sync(h),
+                    self.sm.get_nonce_sync(h),
+                    bytes(code),
+                )
         for address, slot in miss.slots:
             raw = self.sm.get_storage_sync(_hex(address), int(slot).to_bytes(32, "big"))
             self.storage[(address, slot)] = int.from_bytes(raw, "big")
@@ -230,17 +243,17 @@ class EvmWorld:
         seed = WorldState(db, execution_context, BLANK_ROOT_HASH)
         for address, (balance, nonce, code) in self.accounts.items():
             if not (balance or nonce or code):
-                continue                       # an empty account stays absent (EIP-161)
-            seed.set_balance(address, balance)
-            seed.set_nonce(address, nonce)
+                continue  # an empty account stays absent (EIP-161)
+            seed.set_balance(Address(address), balance)
+            seed.set_nonce(Address(address), nonce)
             if code:
-                seed.set_code(address, code)
+                seed.set_code(Address(address), code)
         for (address, slot), value in self.storage.items():
             if value and address in self.accounts and any(self.accounts[address]):
-                seed.set_storage(address, slot, value)
+                seed.set_storage(Address(address), slot, value)
         seed.persist()
         state = WorldState(db, execution_context, seed.state_root)
-        state._account_db.world = self
+        cast(WorldAccountDB, state._account_db).world = self  # WorldState.account_db_class
         state.native_tokens = self.tokens
         return state
 
@@ -254,6 +267,7 @@ class EvmWorld:
         for address, (balance, nonce, code) in sorted(self.accounts.items()):
             h = _hex(address)
             existed = bool(balance or nonce or code)
+            address = Address(address)
             if not state.account_exists(address):
                 if existed:
                     sm.destroy_sync(h)
@@ -268,17 +282,19 @@ class EvmWorld:
                 sm.set_balance_sync(h, final_balance)
             if final_nonce != nonce or address in forced:
                 sm.set_nonce_sync(h, final_nonce)
-            if final_code != code and not (final_code == NATIVE_STUB_CODE
-                                           and self.is_native(address)):
+            if final_code != code and not (
+                final_code == NATIVE_STUB_CODE and self.is_native(address)
+            ):
                 sm.set_code_sync(h, final_code)
         for address, slot in sorted(self.touched_slots | set(self.storage)):
-            if address not in self.accounts or not state.account_exists(address):
+            if address not in self.accounts or not state.account_exists(Address(address)):
                 continue
             before = self.storage.get((address, slot), 0)
-            after = state.get_storage(address, slot)
+            after = state.get_storage(Address(address), slot)
             if after != before:
-                sm.set_storage_sync(_hex(address), int(slot).to_bytes(32, "big"),
-                                    int(after).to_bytes(32, "big"))
+                sm.set_storage_sync(
+                    _hex(address), int(slot).to_bytes(32, "big"), int(after).to_bytes(32, "big")
+                )
 
 
 async def run(world: EvmWorld, execute, preload: Iterable[bytes] = ()):

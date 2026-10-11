@@ -9,6 +9,7 @@ every account it touched. Always on, like ``exchange_*``; the REST twins are
     tx_getRecent(limit, cursor, kinds)            → the chain's latest transactions
     tx_getTransaction(tx_hash)                    → one indexed transaction and its accounts
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -36,26 +37,33 @@ class HistoryModule(RPCModule):
         return db
 
     @rpc_method
-    async def getHistory(self, address: str, limit: int = 50, cursor: Optional[str] = None,
-                         kinds: Any = None) -> Dict[str, Any]:
+    async def getHistory(
+        self, address: str, limit: int = 50, cursor: Optional[str] = None, kinds: Any = None
+    ) -> Dict[str, Any]:
         from ... import tx_index
+
         try:
-            return await tx_index.history(self._db(), address, limit=limit, cursor=cursor,
-                                          kinds=_kinds(kinds))
+            return await tx_index.history(
+                self._db(), address, limit=limit, cursor=cursor, kinds=_kinds(kinds)
+            )
         except ValueError as e:
-            raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e))
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e)) from e
 
     @rpc_method
-    async def getRecent(self, limit: int = 50, cursor: Optional[str] = None,
-                        kinds: Any = None) -> Dict[str, Any]:
+    async def getRecent(
+        self, limit: int = 50, cursor: Optional[str] = None, kinds: Any = None
+    ) -> Dict[str, Any]:
         from ... import tx_index
+
         try:
-            return await tx_index.recent(self._db(), limit=limit, cursor=cursor,
-                                         kinds=_kinds(kinds))
+            return await tx_index.recent(
+                self._db(), limit=limit, cursor=cursor, kinds=_kinds(kinds)
+            )
         except ValueError as e:
-            raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e))
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e)) from e
 
     @rpc_method
     async def getTransaction(self, tx_hash: str) -> Optional[Dict[str, Any]]:
         from ... import tx_index
+
         return await tx_index.lookup(self._db(), tx_hash)

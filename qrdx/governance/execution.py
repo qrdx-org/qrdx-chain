@@ -13,19 +13,17 @@ from decimal import Decimal
 from enum import IntEnum
 from typing import Any, Callable, Dict, List, Optional
 
-from ..logger import get_logger
 from ..constants import (
     GOVERNANCE_DEFAULT_PARAMETERS,
     GOVERNANCE_GUARDIAN_THRESHOLD,
-    GOVERNANCE_GUARDIAN_TOTAL,
     GOVERNANCE_TIMELOCK_DEFAULT_DELAY_SECONDS,
     GOVERNANCE_TIMELOCK_MAX_DELAY_SECONDS,
     GOVERNANCE_TIMELOCK_MIN_DELAY_SECONDS,
 )
+from ..logger import get_logger
 from .proposals import (
     GovernanceError,
     Proposal,
-    ProposalLifecycleError,
     ProposalStatus,
     ProposalType,
 )
@@ -36,6 +34,7 @@ logger = get_logger(__name__)
 # ══════════════════════════════════════════════════════════════════════
 #  EXCEPTIONS
 # ══════════════════════════════════════════════════════════════════════
+
 
 class TimelockError(GovernanceError):
     """Timelock-specific errors."""
@@ -53,13 +52,15 @@ class GuardianVetoError(GovernanceError):
 #  TIMELOCK
 # ══════════════════════════════════════════════════════════════════════
 
+
 class TimelockStatus(IntEnum):
     """Status of a queued timelock entry."""
-    PENDING = 0     # Waiting for delay to expire
-    READY = 1       # Delay expired, can execute
-    EXECUTED = 2    # Successfully executed
-    VETOED = 3      # Guardian council vetoed
-    EXPIRED = 4     # Execution window passed (grace period)
+
+    PENDING = 0  # Waiting for delay to expire
+    READY = 1  # Delay expired, can execute
+    EXECUTED = 2  # Successfully executed
+    VETOED = 3  # Guardian council vetoed
+    EXPIRED = 4  # Execution window passed (grace period)
 
 
 @dataclass
@@ -75,6 +76,7 @@ class TimelockEntry:
         grace_period:   Extra time after ETA before entry expires
         status:         Current status
     """
+
     proposal_id: int
     queued_at: float = field(default_factory=time.time)
     delay_seconds: int = GOVERNANCE_TIMELOCK_DEFAULT_DELAY_SECONDS
@@ -102,10 +104,7 @@ class TimelockEntry:
     @property
     def is_expired(self) -> bool:
         now = time.time()
-        return (
-            self.status == TimelockStatus.PENDING
-            and now >= self.eta + self.grace_period
-        )
+        return self.status == TimelockStatus.PENDING and now >= self.eta + self.grace_period
 
     @property
     def time_remaining(self) -> float:
@@ -153,23 +152,15 @@ class TimelockQueue:
         Queue a passed proposal for delayed execution.
         """
         if proposal.status != ProposalStatus.PASSED:
-            raise TimelockError(
-                f"Only PASSED proposals can be queued (got {proposal.status.name})"
-            )
+            raise TimelockError(f"Only PASSED proposals can be queued (got {proposal.status.name})")
         if proposal.id in self._entries:
-            raise TimelockError(
-                f"Proposal #{proposal.id} already queued"
-            )
+            raise TimelockError(f"Proposal #{proposal.id} already queued")
 
         delay = delay_seconds if delay_seconds is not None else self.default_delay
         if delay < self.min_delay:
-            raise TimelockError(
-                f"Delay {delay}s < minimum {self.min_delay}s"
-            )
+            raise TimelockError(f"Delay {delay}s < minimum {self.min_delay}s")
         if delay > self.max_delay:
-            raise TimelockError(
-                f"Delay {delay}s > maximum {self.max_delay}s"
-            )
+            raise TimelockError(f"Delay {delay}s > maximum {self.max_delay}s")
 
         now = time.time()
         entry = TimelockEntry(
@@ -181,10 +172,7 @@ class TimelockQueue:
         self._entries[proposal.id] = entry
         proposal.queue_for_execution(entry.eta)
 
-        logger.info(
-            f"Proposal #{proposal.id} queued with {delay}s delay "
-            f"(ETA={entry.eta:.0f})"
-        )
+        logger.info(f"Proposal #{proposal.id} queued with {delay}s delay " f"(ETA={entry.eta:.0f})")
         return entry
 
     def get_entry(self, proposal_id: int) -> Optional[TimelockEntry]:
@@ -195,10 +183,7 @@ class TimelockQueue:
         return entry is not None and entry.is_ready
 
     def pending_entries(self) -> List[TimelockEntry]:
-        return [
-            e for e in self._entries.values()
-            if e.status == TimelockStatus.PENDING
-        ]
+        return [e for e in self._entries.values() if e.status == TimelockStatus.PENDING]
 
     def ready_entries(self) -> List[TimelockEntry]:
         return [e for e in self._entries.values() if e.is_ready]
@@ -218,21 +203,16 @@ class TimelockQueue:
         if entry is None:
             raise TimelockError(f"No queued entry for proposal #{proposal_id}")
         if entry.status != TimelockStatus.PENDING:
-            raise TimelockError(
-                f"Cannot veto entry in {entry.status.name} status"
-            )
+            raise TimelockError(f"Cannot veto entry in {entry.status.name} status")
         if len(signers) < threshold:
-            raise GuardianVetoError(
-                f"Need {threshold} guardian signatures, got {len(signers)}"
-            )
+            raise GuardianVetoError(f"Need {threshold} guardian signatures, got {len(signers)}")
 
         entry.status = TimelockStatus.VETOED
         entry.vetoed_at = time.time()
         entry.veto_signers = list(signers)
 
         logger.warning(
-            f"GUARDIAN VETO: proposal #{proposal_id} vetoed by "
-            f"{len(signers)} guardians"
+            f"GUARDIAN VETO: proposal #{proposal_id} vetoed by " f"{len(signers)} guardians"
         )
         return entry
 
@@ -242,15 +222,14 @@ class TimelockQueue:
             "minDelay": self.min_delay,
             "maxDelay": self.max_delay,
             "queuedCount": len(self._entries),
-            "entries": {
-                pid: e.to_dict() for pid, e in self._entries.items()
-            },
+            "entries": {pid: e.to_dict() for pid, e in self._entries.items()},
         }
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  GOVERNANCE EXECUTOR
 # ══════════════════════════════════════════════════════════════════════
+
 
 class GovernanceExecutor:
     """
@@ -266,9 +245,7 @@ class GovernanceExecutor:
         initial_parameters: Optional[Dict[str, Any]] = None,
     ):
         self.timelock = timelock_queue or TimelockQueue()
-        self._parameters: Dict[str, Any] = dict(
-            initial_parameters or GOVERNANCE_DEFAULT_PARAMETERS
-        )
+        self._parameters: Dict[str, Any] = dict(initial_parameters or GOVERNANCE_DEFAULT_PARAMETERS)
         self._execution_log: List[Dict[str, Any]] = []
         self._custom_executors: Dict[ProposalType, Callable] = {}
 
@@ -310,28 +287,21 @@ class GovernanceExecutor:
         """
         if proposal.status != ProposalStatus.QUEUED:
             raise GovernanceError(
-                f"Proposal #{proposal.id} is not QUEUED "
-                f"(status={proposal.status.name})"
+                f"Proposal #{proposal.id} is not QUEUED " f"(status={proposal.status.name})"
             )
 
         entry = self.timelock.get_entry(proposal.id)
         if entry is None:
-            raise TimelockError(
-                f"No timelock entry for proposal #{proposal.id}"
-            )
+            raise TimelockError(f"No timelock entry for proposal #{proposal.id}")
 
         if entry.status == TimelockStatus.VETOED:
             proposal.cancel("Guardian veto")
-            raise GuardianVetoError(
-                f"Proposal #{proposal.id} was vetoed by guardians"
-            )
+            raise GuardianVetoError(f"Proposal #{proposal.id} was vetoed by guardians")
 
         if entry.is_expired:
             entry.status = TimelockStatus.EXPIRED
             proposal.mark_expired()
-            raise TimelockError(
-                f"Timelock for proposal #{proposal.id} has expired"
-            )
+            raise TimelockError(f"Timelock for proposal #{proposal.id} has expired")
 
         if not entry.is_ready:
             raise TimelockNotReadyError(
@@ -356,8 +326,7 @@ class GovernanceExecutor:
         self._execution_log.append(log_entry)
 
         logger.info(
-            f"Proposal #{proposal.id} EXECUTED: "
-            f"{proposal.proposal_type.name} — {changes}"
+            f"Proposal #{proposal.id} EXECUTED: " f"{proposal.proposal_type.name} — {changes}"
         )
         return changes
 
@@ -416,8 +385,7 @@ class GovernanceExecutor:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "parameters": {
-                k: str(v) if isinstance(v, Decimal) else v
-                for k, v in self._parameters.items()
+                k: str(v) if isinstance(v, Decimal) else v for k, v in self._parameters.items()
             },
             "timelockQueue": self.timelock.to_dict(),
             "executionLog": self._execution_log,

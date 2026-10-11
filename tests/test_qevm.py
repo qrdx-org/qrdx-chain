@@ -669,26 +669,31 @@ class TestQRDXVMFork:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestExecutorUsesQRDXVM:
-    """Verify executor_v2 imports and uses QRDXVM, not ShanghaiVM."""
+    """The executor runs every message on the QRDX fork's computation and state (PQ
+    precompiles included), never plain Shanghai. It does so through evm_world's
+    WorldComputation / WorldState, which subclass them."""
 
     def test_executor_imports_qrdxvm(self):
-        """executor_v2 module must import QRDXVM, not ShanghaiVM."""
         import qrdx.contracts.evm_executor_v2 as mod
         source = open(mod.__file__).read()
-        assert 'from eth.vm.forks.qrdx import QRDXVM' in source
+        assert 'WorldComputation.apply_message' in source
+        assert 'WorldComputation.apply_create_message' in source
         assert 'from eth.vm.forks.shanghai import ShanghaiVM' not in source
 
     def test_executor_imports_qrdx_computation(self):
+        from eth.vm.forks.qrdx.computation import QRDXComputation
+        from qrdx.contracts.evm_world import WorldComputation
+        assert issubclass(WorldComputation, QRDXComputation)
         import qrdx.contracts.evm_executor_v2 as mod
-        source = open(mod.__file__).read()
-        assert 'QRDXComputation' in source
-        assert 'ShanghaiComputation.apply' not in source
+        assert 'ShanghaiComputation.apply' not in open(mod.__file__).read()
 
     def test_executor_imports_qrdx_state(self):
+        from eth.vm.forks.qrdx.state import QRDXState
+        from qrdx.contracts.evm_world import WorldComputation, WorldState
+        assert issubclass(WorldState, QRDXState)
+        assert WorldState.computation_class is WorldComputation
         import qrdx.contracts.evm_executor_v2 as mod
-        source = open(mod.__file__).read()
-        assert 'QRDXState' in source
-        assert 'ShanghaiState(' not in source
+        assert 'ShanghaiState(' not in open(mod.__file__).read()
 
     def test_executor_has_logger(self):
         """Module-level logger must be defined (no NameError)."""

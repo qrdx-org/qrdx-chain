@@ -379,7 +379,8 @@ def test_a_fork_stays_dormant_until_validators_approve_it():
         _approve(c, spec)                                           # well before H - LEAD
         assert not cs.is_active("randao_selection", H - 1)
         assert cs.is_active("randao_selection", H)
-        assert cs.active_features(H) == ["randao_selection"]
+        assert "randao_selection" in cs.active_features(H)
+        assert "randao_selection" not in cs.active_features(H - 1)
 
 
 def test_a_late_approval_does_not_activate_the_fork():

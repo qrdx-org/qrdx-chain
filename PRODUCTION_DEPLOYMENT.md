@@ -33,7 +33,7 @@ All items must be **✅ checked** before a node goes live.
 
 ### 1.1 Security Blockers (from `QRDX_IMPLEMENTATION_CHECKLIST.md §0`)
 
-- [ ] No private keys, mnemonics, or credentials committed to the repository (`gitleaks` pre-commit hook active)
+- [ ] No private keys, mnemonics, or credentials committed to the repository
 - [ ] `liboqs-python>=0.9.0` is installed in the Docker image (verify: `pip show liboqs-python`)
 - [ ] Dilithium3 verify bypass is gone — `python -c "from qrdx.crypto.pq.dilithium import verify; print('OK')"` exits 0
 - [ ] No default `qrdx`/`qrdx` credentials anywhere in configuration or environment files
@@ -769,7 +769,7 @@ A GitHub Actions pipeline is provided at `.github/workflows/ci.yml`. It runs on 
 | `lint` | push / PR | `ruff`, `black --check`, `isort --check` |
 | `type-check` | push / PR | `mypy qrdx/` |
 | `unit-tests` | push / PR | All tests *except* `integration` marker; coverage report |
-| `security-scan` | push / PR | `gitleaks` secret scan, `pip-audit` dependency audit |
+| `security-scan` | push / PR | `pip-audit` audit of the shipped dependency lock |
 | `integration-tests` | PR to `main` only | `@pytest.mark.integration` suite with real nodes |
 | `docker-build` | push to `main` or tag | Build + push image to registry |
 

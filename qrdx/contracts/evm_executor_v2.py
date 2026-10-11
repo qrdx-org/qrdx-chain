@@ -7,16 +7,15 @@ Uses QRDXVM (extends ShanghaiVM) with quantum-resistant precompiles at
 """
 
 import logging
-import sys
-from typing import Optional, List, Dict, Any, Tuple
-from dataclasses import dataclass
-
-from importlib import util as importlib_util
 
 # Prefer an installed `eth` package (the container installs the py-evm QRDX fork
 # as a wheel). Fall back to the in-repo checkout for local development, resolved
 # relative to this file rather than a hardcoded absolute path.
 import os
+import sys
+from dataclasses import dataclass
+from importlib import util as importlib_util
+from typing import List, Optional, Tuple
 
 if importlib_util.find_spec("eth") is None:
     _vendored_py_evm = os.path.join(
@@ -26,26 +25,16 @@ if importlib_util.find_spec("eth") is None:
     if os.path.isdir(_vendored_py_evm) and _vendored_py_evm not in sys.path:
         sys.path.insert(0, _vendored_py_evm)
 
-from eth.vm.forks.qrdx import QRDXVM
-from eth.db.atomic import AtomicDB
-from eth.db.account import AccountDB
-from eth.vm.forks.qrdx.state import QRDXState
-from eth.vm.forks.qrdx.computation import QRDXComputation
+import rlp
+from eth.constants import CREATE_CONTRACT_ADDRESS, GENESIS_DIFFICULTY, ZERO_ADDRESS
+from eth.vm.execution_context import ExecutionContext
 from eth.vm.message import Message
 from eth.vm.transaction_context import BaseTransactionContext
-from eth.vm.execution_context import ExecutionContext
-from eth.constants import CREATE_CONTRACT_ADDRESS, ZERO_ADDRESS, GENESIS_DIFFICULTY
-from eth_typing import Address
+from eth_typing import Address, BlockNumber, Hash32
 from eth_utils import (
-    to_canonical_address,
-    to_checksum_address,
-    to_bytes,
-    to_int,
     keccak,
-    encode_hex,
-    decode_hex,
+    to_checksum_address,
 )
-import rlp
 
 from ..constants import CHAIN_ID
 
@@ -55,15 +44,16 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EVMResult:
     """Minimal EVM execution result."""
+
     success: bool
     gas_used: int
     output: bytes
-    logs: List[Tuple[bytes, List[bytes], bytes]]  # (address, topics, data)
+    logs: List[Tuple[bytes, Tuple[int, ...], bytes]]  # (address, topics as ints, data)
     error: Optional[str] = None
     created_address: Optional[bytes] = None
     # Native token moves and approvals the execution made (contracts/native_token_evm.py),
     # for the caller to fold into its block's EvmSection when the transaction succeeded.
-    token_journal: List[tuple] = None
+    token_journal: Optional[List[tuple]] = None
 
 
 class QRDXEVMExecutor:
@@ -90,7 +80,7 @@ class QRDXEVMExecutor:
         value: int,
         data: bytes,
         gas: int,
-        code: bytes = b'',
+        code: bytes = b"",
         is_create: bool = False,
     ) -> Message:
         """Create EVM message."""
@@ -98,16 +88,16 @@ class QRDXEVMExecutor:
             return Message(
                 gas=gas,
                 to=CREATE_CONTRACT_ADDRESS,
-                sender=sender,
+                sender=Address(sender),
                 value=value,
-                data=b'',
+                data=b"",
                 code=code,
-                create_address=to,
+                create_address=Address(to),
             )
         return Message(
             gas=gas,
-            to=to,
-            sender=sender,
+            to=Address(to),
+            sender=Address(sender),
             value=value,
             data=data,
             code=code,
@@ -121,11 +111,11 @@ class QRDXEVMExecutor:
         return ExecutionContext(
             coinbase=ZERO_ADDRESS,
             timestamp=max(1, int(timestamp)),
-            block_number=max(1, int(block_number)),
+            block_number=BlockNumber(max(1, int(block_number))),
             difficulty=GENESIS_DIFFICULTY,
-            mix_hash=b'\x00' * 32,
+            mix_hash=Hash32(b"\x00" * 32),
             gas_limit=10_000_000,
-            prev_hashes=[b'\x00' * 32] * 256,
+            prev_hashes=[Hash32(b"\x00" * 32)] * 256,
             chain_id=CHAIN_ID,  # the network's chain id (chain spec) — the CHAINID opcode
             base_fee_per_gas=1000000000,  # 1 gwei
         )
@@ -168,20 +158,64 @@ class QRDXEVMExecutor:
         execution consumed less than it.
         """
         from .evm_world import EvmWorld, run_sync
+
         if world is None:
             legacy = EvmWorld(self.state_manager)
-            return run_sync(legacy, lambda: self._execute(
-                legacy, sender, to, value, data, gas, gas_price, origin, intrinsic_gas,
-                block_number, timestamp, write_back, payer))
-        return self._execute(world, sender, to, value, data, gas, gas_price, origin,
-                             intrinsic_gas, block_number, timestamp, write_back, payer)
+            return run_sync(
+                legacy,
+                lambda: self._execute(
+                    legacy,
+                    sender,
+                    to,
+                    value,
+                    data,
+                    gas,
+                    gas_price,
+                    origin,
+                    intrinsic_gas,
+                    block_number,
+                    timestamp,
+                    write_back,
+                    payer,
+                ),
+            )
+        return self._execute(
+            world,
+            sender,
+            to,
+            value,
+            data,
+            gas,
+            gas_price,
+            origin,
+            intrinsic_gas,
+            block_number,
+            timestamp,
+            write_back,
+            payer,
+        )
 
-    def _execute(self, world, sender, to, value, data, gas, gas_price, origin, intrinsic_gas,
-                 block_number, timestamp, write_back, payer=None) -> EVMResult:
+    def _execute(
+        self,
+        world,
+        sender,
+        to,
+        value,
+        data,
+        gas,
+        gas_price,
+        origin,
+        intrinsic_gas,
+        block_number,
+        timestamp,
+        write_back,
+        payer=None,
+    ) -> EVMResult:
         from .evm_world import StateMiss, WorldComputation
+
         if origin is None:
             origin = sender
-        is_create = (to is None)
+        is_create = to is None
 
         try:
             state = world.build_state(self._execution_context(block_number, timestamp))
@@ -195,7 +229,7 @@ class QRDXEVMExecutor:
                 sender=sender,
                 to=to if to else ZERO_ADDRESS,
                 value=value,
-                data=data if not is_create else b'',
+                data=data if not is_create else b"",
                 gas=gas,
                 code=code,
                 is_create=is_create,
@@ -231,14 +265,26 @@ class QRDXEVMExecutor:
             raise
         except Exception as e:
             logger.error(f"EVM execution error: {e}", exc_info=True)
-            return EVMResult(success=False, gas_used=gas, output=b'', logs=[],
-                             error=f"Execution error: {str(e)}", token_journal=[])
+            return EVMResult(
+                success=False,
+                gas_used=gas,
+                output=b"",
+                logs=[],
+                error=f"Execution error: {str(e)}",
+                token_journal=[],
+            )
 
         created_address = to if (is_create and success) else None
         if not write_back:
-            return EVMResult(success=success, gas_used=gas_used, output=output, logs=logs,
-                             error=error, created_address=created_address,
-                             token_journal=journal)
+            return EVMResult(
+                success=success,
+                gas_used=gas_used,
+                output=output,
+                logs=logs,
+                error=error,
+                created_address=created_address,
+                token_journal=journal,
+            )
 
         # Every account and slot the execution changed — the sender, the recipient, any
         # account a contract paid or created, every storage slot it wrote — into the
@@ -252,7 +298,8 @@ class QRDXEVMExecutor:
         sender_addr = to_checksum_address(payer)
         if success:
             self.state_manager.set_nonce_sync(
-                sender_addr, self.state_manager.get_nonce_sync(sender_addr) + 1)
+                sender_addr, self.state_manager.get_nonce_sync(sender_addr) + 1
+            )
 
         # Charge tx-level gas: py-evm's apply_message does no transaction-level gas
         # accounting. At least the intrinsic floor, never more than the gas limit.
@@ -284,9 +331,18 @@ class QRDXEVMExecutor:
     ) -> EVMResult:
         """Execute a read-only call (eth_call), in the context of ``block_number`` /
         ``timestamp`` (the caller passes the latest block's). Writes nothing."""
-        return self.execute(sender=sender, to=to, value=value, data=data, gas=gas,
-                            gas_price=0, block_number=block_number, timestamp=timestamp,
-                            world=world, write_back=False)
+        return self.execute(
+            sender=sender,
+            to=to,
+            value=value,
+            data=data,
+            gas=gas,
+            gas_price=0,
+            block_number=block_number,
+            timestamp=timestamp,
+            world=world,
+            write_back=False,
+        )
 
     def estimate_gas(
         self,
@@ -301,8 +357,16 @@ class QRDXEVMExecutor:
         low, high = 21000, 10_000_000
         while low < high:
             mid = (low + high) // 2
-            result = self.execute(sender=sender, to=to, value=value, data=data, gas=mid,
-                                  gas_price=0, world=world, write_back=False)
+            result = self.execute(
+                sender=sender,
+                to=to,
+                value=value,
+                data=data,
+                gas=mid,
+                gas_price=0,
+                world=world,
+                write_back=False,
+            )
             if result.success:
                 high = mid
             else:

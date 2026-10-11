@@ -9,8 +9,8 @@ Implements PQ node identity per Whitepaper §5.1:
 All classical identity (P256/ECDSA, secp256k1) has been removed.
 """
 
-import os
 import json
+import os
 import re
 from typing import Optional, Tuple
 
@@ -21,29 +21,31 @@ from ..logger import get_logger
 
 logger = get_logger(__name__)
 
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 # Resolve algorithm name at import time (ML-DSA-65 preferred, Dilithium3 legacy)
 def _resolve_sig_algorithm() -> str:
-    for name in ('ML-DSA-65', 'Dilithium3'):
+    for name in ("ML-DSA-65", "Dilithium3"):
         try:
             oqs.Signature(name)
             return name
         except Exception:
             continue
-    raise RuntimeError('No supported PQ signature algorithm found in liboqs')
+    raise RuntimeError("No supported PQ signature algorithm found in liboqs")
+
 
 PQ_ALGORITHM = _resolve_sig_algorithm()  # NIST Level 3 — CRYSTALS-Dilithium / ML-DSA-65
 
 # Allow per-node key directory via env var (for testnet multi-node on same machine)
-_key_dir = os.environ.get('QRDX_NODE_KEY_DIR', os.path.dirname(__file__))
-KEY_FILE_PATH = os.path.join(_key_dir, 'node_key.pq')
-PUBKEY_FILE_PATH = os.path.join(_key_dir, 'node_key.pq.pub')
+_key_dir = os.environ.get("QRDX_NODE_KEY_DIR", os.path.dirname(__file__))
+KEY_FILE_PATH = os.path.join(_key_dir, "node_key.pq")
+PUBKEY_FILE_PATH = os.path.join(_key_dir, "node_key.pq.pub")
 
 # @-schema regex: dilithium3@qx<hex40>@host:port
 _AT_SCHEMA_RE = re.compile(
-    r'^(?P<algo>[a-zA-Z0-9-]+)@(?P<id>qx[a-fA-F0-9]{40,})@(?P<host>[^:]+):(?P<port>\d+)$'
+    r"^(?P<algo>[a-zA-Z0-9-]+)@(?P<id>qx[a-fA-F0-9]{40,})@(?P<host>[^:]+):(?P<port>\d+)$"
 )
 
 # ---------------------------------------------------------------------------
@@ -58,6 +60,7 @@ _node_id: Optional[str] = None  # qx<blake3_hex_40>
 # Key Management
 # ---------------------------------------------------------------------------
 
+
 def _derive_node_id(public_key: bytes) -> str:
     """
     Derive the node ID from a Dilithium public key.
@@ -66,6 +69,15 @@ def _derive_node_id(public_key: bytes) -> str:
     """
     h = blake3.blake3(public_key).hexdigest()
     return f"qx{h[:40]}"
+
+
+def node_id_for_public_key(pubkey_hex: str) -> Optional[str]:
+    """The node id a public key (hex) stands for, or None if it is not hex. A node id a peer
+    states is believed only when it is this — never on the peer's word."""
+    try:
+        return _derive_node_id(bytes.fromhex(pubkey_hex))
+    except (TypeError, ValueError):
+        return None
 
 
 def generate_new_keypair() -> Tuple[bytes, bytes]:
@@ -78,11 +90,11 @@ def generate_new_keypair() -> Tuple[bytes, bytes]:
 
 def save_keys(secret_key: bytes, public_key: bytes) -> None:
     """Persist keys to disk with restrictive permissions."""
-    with open(KEY_FILE_PATH, 'wb') as f:
+    with open(KEY_FILE_PATH, "wb") as f:
         f.write(secret_key)
     os.chmod(KEY_FILE_PATH, 0o600)
 
-    with open(PUBKEY_FILE_PATH, 'wb') as f:
+    with open(PUBKEY_FILE_PATH, "wb") as f:
         f.write(public_key)
     os.chmod(PUBKEY_FILE_PATH, 0o644)
 
@@ -93,9 +105,9 @@ def load_keys() -> Optional[Tuple[bytes, bytes]]:
     """Load keys from disk. Returns (secret_key, public_key) or None."""
     if not os.path.exists(KEY_FILE_PATH) or not os.path.exists(PUBKEY_FILE_PATH):
         return None
-    with open(KEY_FILE_PATH, 'rb') as f:
+    with open(KEY_FILE_PATH, "rb") as f:
         secret_key = f.read()
-    with open(PUBKEY_FILE_PATH, 'rb') as f:
+    with open(PUBKEY_FILE_PATH, "rb") as f:
         public_key = f.read()
     if not secret_key or not public_key:
         return None
@@ -105,6 +117,7 @@ def load_keys() -> Optional[Tuple[bytes, bytes]]:
 # ---------------------------------------------------------------------------
 # Initialization
 # ---------------------------------------------------------------------------
+
 
 def initialize_identity() -> None:
     """
@@ -129,6 +142,7 @@ def initialize_identity() -> None:
 # ---------------------------------------------------------------------------
 # Accessors
 # ---------------------------------------------------------------------------
+
 
 def get_node_id() -> str:
     """Return the node's BLAKE3-derived ID (e.g. 'qx1a2b3c…')."""
@@ -160,6 +174,7 @@ def get_secret_key_bytes() -> bytes:
 # @-Schema Addressing
 # ---------------------------------------------------------------------------
 
+
 def get_at_schema_address(host: str, port: int) -> str:
     """
     Build the @-schema address for this node.
@@ -181,10 +196,10 @@ def parse_at_schema(address: str) -> dict:
     if not m:
         raise ValueError(f"Invalid @-schema address: {address!r}")
     return {
-        'algo': m.group('algo'),
-        'node_id': m.group('id'),
-        'host': m.group('host'),
-        'port': int(m.group('port')),
+        "algo": m.group("algo"),
+        "node_id": m.group("id"),
+        "host": m.group("host"),
+        "port": int(m.group("port")),
     }
 
 
@@ -196,6 +211,7 @@ def validate_at_schema(address: str) -> bool:
 # ---------------------------------------------------------------------------
 # Signing & Verification
 # ---------------------------------------------------------------------------
+
 
 def sign_message(message: bytes) -> str:
     """
@@ -235,6 +251,7 @@ def verify_signature(pubkey_hex: str, signature_hex: str, message: bytes) -> boo
 # Canonical JSON
 # ---------------------------------------------------------------------------
 
+
 def get_canonical_json_bytes(data: dict) -> bytes:
     """Deterministic JSON serialization for signing payloads."""
-    return json.dumps(data, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")

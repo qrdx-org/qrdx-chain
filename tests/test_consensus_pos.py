@@ -378,16 +378,21 @@ class TestConsensusV2PoS:
         assert rules.epoch_start_slot(3) == 96
 
     def test_timestamp_to_slot(self):
+        from qrdx.constants import SLOT_DURATION_MS
+
         rules = Consensus_V2_PoS()
+        per_10s = 10_000 // SLOT_DURATION_MS  # 40 slots at the standard 250 ms
         assert rules._timestamp_to_slot(0) == 0
-        assert rules._timestamp_to_slot(2) == 1
-        assert rules._timestamp_to_slot(10) == 5
+        assert rules._timestamp_to_slot(SLOT_DURATION_MS / 1000) == 1
+        assert rules._timestamp_to_slot(10) == per_10s
 
     def test_slot_to_timestamp(self):
+        from qrdx.constants import SLOT_DURATION
+
         rules = Consensus_V2_PoS()
         assert rules._slot_to_timestamp(0) == 0
-        assert rules._slot_to_timestamp(5) == 10
-        assert rules._slot_to_timestamp(100) == 200
+        assert rules._slot_to_timestamp(5) == 5 * SLOT_DURATION
+        assert rules._slot_to_timestamp(100) == 100 * SLOT_DURATION
 
 
 class TestConsensusUtilities:

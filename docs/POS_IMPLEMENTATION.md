@@ -7,7 +7,7 @@ This document outlines the comprehensive plan to convert QRDX Chain from Proof-o
 **Core Priorities:**
 1. **Decentralization** - Open validator participation with reasonable stake requirements
 2. **Security** - Post-quantum cryptography (Dilithium3), BFT consensus, slashing conditions
-3. **Functionality** - Web3-compatible, 2-second block time, sub-second finality
+3. **Functionality** - Web3-compatible, 250 ms block time, Casper FFG finality (about two 8 s epochs)
 
 **Critical Requirement:** Validators MUST use Post-Quantum (PQ) wallets for all operations.
 
@@ -53,7 +53,7 @@ This document outlines the comprehensive plan to convert QRDX Chain from Proof-o
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| Block Time | 2 seconds | Time per slot |
+| Block Time | 250 ms | Time per slot |
 | Epoch Length | 32 slots | 64 seconds per epoch |
 | Min Validator Stake | 100,000 QRDX | Minimum to become validator |
 | Max Validators | 150 | Active validator set size |

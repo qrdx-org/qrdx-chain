@@ -77,10 +77,10 @@ class S07Validators(Scenario):
                        f"Each reachable node reports validators (min={min(validator_counts)})")
 
         # Slot-aware: poll for the next block rather than assuming a fixed wall-clock (a larger
-        # QRDX_SLOT_DURATION — e.g. the RANDAO enforce experiment's 6s — produces blocks slower).
+        # QRDX_SLOT_DURATION_MS — e.g. the RANDAO enforce experiment's 6s — produces blocks slower).
         from qrdx.constants import SLOT_DURATION as _SLOT
         after_height = before_height
-        deadline = 3 * int(_SLOT) + 6
+        deadline = 3 * _SLOT + 6
         waited = 0.0
         while waited < deadline:
             await asyncio.sleep(2)

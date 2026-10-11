@@ -55,12 +55,24 @@ class S12ExchangeConsensus(Scenario):
         key = PQPrivateKey.from_hex(w["private_key"], w["public_key"])
         sender = w["address"]
 
-        # 1. Baseline: every node must agree on the (empty) exchange root.
+        # 1. Baseline: nodes at the same height agree on the exchange root. (The root commits
+        # to the block height, and the reads are sequential: with short slots a block can land
+        # between two of them, so roots are compared per height.)
         initial = await self._roots(node_urls)
         self.check(len(initial) >= 2, f"Exchange root readable on {len(initial)} nodes")
-        init_roots = {v["exchange_state_root"] for v in initial.values()}
-        self.check(len(init_roots) == 1, "Initial exchange root consistent across nodes")
-        base_root = next(iter(init_roots), None)
+        consistent, compared, base_root = False, {}, None
+        for _ in range(20):
+            groups = {}
+            for v in (await self._roots(node_urls)).values():
+                groups.setdefault(v.get("block_height"), set()).add(v["exchange_state_root"])
+            shared = {h: r for h, r in groups.items() if h is not None}
+            compared = {h: len(r) for h, r in shared.items()}
+            if shared and all(len(r) == 1 for r in shared.values()) and len(shared) < len(initial):
+                consistent = True
+                base_root = next(iter(shared[max(shared)]))
+                break
+            await asyncio.sleep(0.5)
+        self.check(consistent, f"Initial exchange root consistent across nodes ({compared})")
 
         # 2. Build + PQ-sign a real exchange transaction (create a trading pair).
         tx = ExchangeTransaction(
@@ -103,7 +115,7 @@ class S12ExchangeConsensus(Scenario):
         self.check(included, "Exchange tx included + executed (the pool exists on the proposer)")
 
         # 5. Determinism: nodes at the same height that hold the pool report one root.
-        #    Sampled until a quorum sits at one height (they usually do: blocks are 2 s).
+        #    Sampled until a quorum sits at one height (they usually do between blocks).
         need = max(2, len(node_urls) - 1)
         agreed, seen = False, {}
         for _ in range(30):

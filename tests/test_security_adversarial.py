@@ -925,7 +925,7 @@ class TestOracleSecurity:
 
 
 class TestRouterSecurity:
-    """Step 5.6: Router atomic settlement and circuit breaker."""
+    """Step 5.6: Router atomic settlement."""
 
     def test_deadline_enforcement(self):
         """Trades past deadline must revert."""
@@ -975,22 +975,6 @@ class TestRouterSecurity:
 class TestHooksSecurity:
     """Step 5.6: Hooks cannot steal funds or DoS."""
 
-    def test_hook_circuit_breaker(self):
-        """Circuit breaker halts exchange when triggered."""
-        from qrdx.exchange.hooks import CircuitBreaker
-
-        cb = CircuitBreaker()
-
-        # Not tripped initially
-        assert cb.is_tripped is False
-
-        # Trip it
-        cb.trip("Security incident detected")
-        assert cb.is_tripped is True
-
-        # Reset
-        cb.reset()
-        assert cb.is_tripped is False
 
 
 # ============================================================================
@@ -1219,8 +1203,9 @@ class TestSecurityConstants:
         assert WITHDRAWAL_DELAY_EPOCHS >= 256, "Withdrawal delay too short"
 
     def test_slot_time(self):
-        from qrdx.constants import SLOT_DURATION
-        assert SLOT_DURATION == 2
+        from qrdx.constants import SLOT_DURATION, SLOT_DURATION_MS
+        assert SLOT_DURATION_MS == 250  # the standard: 250 ms blocks
+        assert SLOT_DURATION == 0.25
 
     def test_epoch_length(self):
         from qrdx.constants import SLOTS_PER_EPOCH

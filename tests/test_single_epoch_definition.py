@@ -47,7 +47,8 @@ def _probe(env_overrides):
 @pytest.mark.parametrize("overrides", [
     {},
     {"QRDX_SLOTS_PER_EPOCH": "8"},                          # the testnet
-    {"QRDX_SLOTS_PER_EPOCH": "4", "QRDX_SLOT_DURATION": "6"},  # the RANDAO larger-slot config
+    {"QRDX_SLOTS_PER_EPOCH": "4", "QRDX_SLOT_DURATION_MS": "6000"},  # RANDAO larger-slot
+    {"QRDX_SLOT_DURATION_MS": "250"},                       # sub-second slots
     {"QRDX_UNBONDING_PERIOD_EPOCHS": "2"},                  # the s16 round-trip config
 ])
 def test_validator_constants_follow_the_single_source_of_truth(overrides):

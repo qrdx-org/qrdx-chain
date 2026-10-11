@@ -6,18 +6,18 @@ Environment variables override TOML values.
 """
 
 from .loader import (
+    ConsensusConfig,
+    DatabaseConfig,
+    DiscoveryConfig,
+    GenesisConfig,
+    HealthConfig,
+    MetricsConfig,
     NodeConfig,
     P2PConfig,
-    DiscoveryConfig,
     P2PSecurityConfig,
-    DatabaseConfig,
-    SQLiteConfig,
-    GenesisConfig,
-    ConsensusConfig,
     PoSConfig,
+    SQLiteConfig,
     SyncConfig,
-    MetricsConfig,
-    HealthConfig,
     TLSConfig,
     load_config,
 )

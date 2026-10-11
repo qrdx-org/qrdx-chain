@@ -220,7 +220,7 @@ gossip.on_attestation = my_attestation_handler
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| Slot Duration | 2 seconds | Time per slot |
+| Slot Duration | 250 ms | Time per slot |
 | Slots per Epoch | 32 | 64 seconds per epoch |
 | Min Validator Stake | 100,000 QRDX | Minimum to become validator |
 | Max Validators | 150 | Active validator set size |
@@ -366,7 +366,7 @@ qrdx/validator/
 The QRDX QR-PoS implementation provides:
 
 1. **Security**: Post-quantum cryptography (Dilithium), BFT consensus, comprehensive slashing
-2. **Performance**: 2-second blocks with single-slot finality
+2. **Performance**: 250 ms blocks with Casper FFG finality (about two 8 s epochs)
 3. **Decentralization**: Open validator participation with reasonable 100K QRDX stake
 4. **Compatibility**: Ethereum-compatible reward mechanics and fork choice
 5. **Light Clients**: Sync committee support for efficient verification

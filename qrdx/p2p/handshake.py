@@ -27,13 +27,12 @@ Kyber-derived shared secret with AES-256-GCM.
 
 import os
 import time
-import struct
+from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional, Tuple, NamedTuple
-from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
-import oqs
 import blake3
+import oqs
 
 from ..logger import get_logger
 
@@ -45,24 +44,27 @@ logger = get_logger(__name__)
 NONCE_SIZE = 32  # 32 bytes of randomness per nonce
 HANDSHAKE_TIMEOUT_SEC = 5.0
 
+
 # Resolve algorithm names at import time (ML-DSA-65 preferred, Dilithium3 legacy)
 def _resolve_sig_algorithm() -> str:
-    for name in ('ML-DSA-65', 'Dilithium3'):
+    for name in ("ML-DSA-65", "Dilithium3"):
         try:
             oqs.Signature(name)
             return name
         except Exception:
             continue
-    raise RuntimeError('No supported PQ signature algorithm found in liboqs')
+    raise RuntimeError("No supported PQ signature algorithm found in liboqs")
+
 
 def _resolve_kem_algorithm() -> str:
-    for name in ('ML-KEM-768', 'Kyber768'):
+    for name in ("ML-KEM-768", "Kyber768"):
         try:
             oqs.KeyEncapsulation(name)
             return name
         except Exception:
             continue
-    raise RuntimeError('No supported PQ KEM algorithm found in liboqs')
+    raise RuntimeError("No supported PQ KEM algorithm found in liboqs")
+
 
 PQ_SIG_ALGORITHM = _resolve_sig_algorithm()
 PQ_KEM_ALGORITHM = _resolve_kem_algorithm()
@@ -70,6 +72,7 @@ PQ_KEM_ALGORITHM = _resolve_kem_algorithm()
 
 class HandshakeStep(IntEnum):
     """Handshake message type identifiers."""
+
     HELLO = 1
     HELLO_ACK = 2
     AUTH = 3
@@ -80,96 +83,101 @@ class HandshakeStep(IntEnum):
 # Message Types
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class HelloMessage:
     """Step 1: Initiator says hello."""
-    algorithm: str        # PQ signature algorithm (e.g. 'Dilithium3')
-    pubkey: bytes         # Initiator's Dilithium public key
-    nonce: bytes          # 32-byte random nonce
+
+    algorithm: str  # PQ signature algorithm (e.g. 'Dilithium3')
+    pubkey: bytes  # Initiator's Dilithium public key
+    nonce: bytes  # 32-byte random nonce
 
     def to_dict(self) -> dict:
         return {
-            'step': int(HandshakeStep.HELLO),
-            'algorithm': self.algorithm,
-            'pubkey': self.pubkey.hex(),
-            'nonce': self.nonce.hex(),
+            "step": int(HandshakeStep.HELLO),
+            "algorithm": self.algorithm,
+            "pubkey": self.pubkey.hex(),
+            "nonce": self.nonce.hex(),
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> 'HelloMessage':
+    def from_dict(cls, d: dict) -> "HelloMessage":
         return cls(
-            algorithm=d['algorithm'],
-            pubkey=bytes.fromhex(d['pubkey']),
-            nonce=bytes.fromhex(d['nonce']),
+            algorithm=d["algorithm"],
+            pubkey=bytes.fromhex(d["pubkey"]),
+            nonce=bytes.fromhex(d["nonce"]),
         )
 
 
 @dataclass(frozen=True)
 class HelloAckMessage:
     """Step 2: Responder acknowledges and proves identity."""
-    pubkey: bytes           # Responder's Dilithium public key
-    nonce: bytes            # Responder's 32-byte random nonce
-    signature: bytes        # Dilithium.sign(initiator_nonce, sk_B)
-    kem_pubkey: bytes       # Responder's Kyber public key for key exchange
+
+    pubkey: bytes  # Responder's Dilithium public key
+    nonce: bytes  # Responder's 32-byte random nonce
+    signature: bytes  # Dilithium.sign(initiator_nonce, sk_B)
+    kem_pubkey: bytes  # Responder's Kyber public key for key exchange
 
     def to_dict(self) -> dict:
         return {
-            'step': int(HandshakeStep.HELLO_ACK),
-            'pubkey': self.pubkey.hex(),
-            'nonce': self.nonce.hex(),
-            'signature': self.signature.hex(),
-            'kem_pubkey': self.kem_pubkey.hex(),
+            "step": int(HandshakeStep.HELLO_ACK),
+            "pubkey": self.pubkey.hex(),
+            "nonce": self.nonce.hex(),
+            "signature": self.signature.hex(),
+            "kem_pubkey": self.kem_pubkey.hex(),
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> 'HelloAckMessage':
+    def from_dict(cls, d: dict) -> "HelloAckMessage":
         return cls(
-            pubkey=bytes.fromhex(d['pubkey']),
-            nonce=bytes.fromhex(d['nonce']),
-            signature=bytes.fromhex(d['signature']),
-            kem_pubkey=bytes.fromhex(d['kem_pubkey']),
+            pubkey=bytes.fromhex(d["pubkey"]),
+            nonce=bytes.fromhex(d["nonce"]),
+            signature=bytes.fromhex(d["signature"]),
+            kem_pubkey=bytes.fromhex(d["kem_pubkey"]),
         )
 
 
 @dataclass(frozen=True)
 class AuthMessage:
     """Step 3: Initiator proves identity and encapsulates shared secret."""
-    signature: bytes        # Dilithium.sign(responder_nonce, sk_A)
-    ciphertext: bytes       # Kyber.encapsulate(kem_pubkey_B) → ciphertext
+
+    signature: bytes  # Dilithium.sign(responder_nonce, sk_A)
+    ciphertext: bytes  # Kyber.encapsulate(kem_pubkey_B) → ciphertext
 
     def to_dict(self) -> dict:
         return {
-            'step': int(HandshakeStep.AUTH),
-            'signature': self.signature.hex(),
-            'ciphertext': self.ciphertext.hex(),
+            "step": int(HandshakeStep.AUTH),
+            "signature": self.signature.hex(),
+            "ciphertext": self.ciphertext.hex(),
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> 'AuthMessage':
+    def from_dict(cls, d: dict) -> "AuthMessage":
         return cls(
-            signature=bytes.fromhex(d['signature']),
-            ciphertext=bytes.fromhex(d['ciphertext']),
+            signature=bytes.fromhex(d["signature"]),
+            ciphertext=bytes.fromhex(d["ciphertext"]),
         )
 
 
 @dataclass(frozen=True)
 class AuthAckMessage:
     """Step 4: Responder confirms shared secret."""
+
     success: bool
-    session_id: str         # BLAKE3(shared_secret || nonce_A || nonce_B)
+    session_id: str  # BLAKE3(shared_secret || nonce_A || nonce_B)
 
     def to_dict(self) -> dict:
         return {
-            'step': int(HandshakeStep.AUTH_ACK),
-            'success': self.success,
-            'session_id': self.session_id,
+            "step": int(HandshakeStep.AUTH_ACK),
+            "success": self.success,
+            "session_id": self.session_id,
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> 'AuthAckMessage':
+    def from_dict(cls, d: dict) -> "AuthAckMessage":
         return cls(
-            success=d['success'],
-            session_id=d['session_id'],
+            success=d["success"],
+            session_id=d["session_id"],
         )
 
 
@@ -177,14 +185,16 @@ class AuthAckMessage:
 # Session Result
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class HandshakeResult:
     """Outcome of a completed handshake."""
+
     success: bool
-    peer_pubkey: Optional[bytes] = None     # Peer's Dilithium public key
-    peer_node_id: Optional[str] = None      # Peer's BLAKE3 node ID (qx…)
-    shared_secret: Optional[bytes] = None   # Kyber-derived 32-byte key
-    session_id: Optional[str] = None        # Session identifier
+    peer_pubkey: Optional[bytes] = None  # Peer's Dilithium public key
+    peer_node_id: Optional[str] = None  # Peer's BLAKE3 node ID (qx…)
+    shared_secret: Optional[bytes] = None  # Kyber-derived 32-byte key
+    session_id: Optional[str] = None  # Session identifier
     error: Optional[str] = None
 
 
@@ -201,6 +211,7 @@ def _derive_node_id(pubkey: bytes) -> str:
 # ---------------------------------------------------------------------------
 # Initiator (Node A) — creates HELLO, processes HELLO_ACK, creates AUTH
 # ---------------------------------------------------------------------------
+
 
 class HandshakeInitiator:
     """
@@ -259,15 +270,14 @@ class HandshakeInitiator:
         """Step 4 — verify AUTH_ACK and return session result."""
         if not ack.success:
             return HandshakeResult(success=False, error="Peer rejected AUTH")
+        if self._shared_secret is None or self._peer_nonce is None or self._peer_pubkey is None:
+            return HandshakeResult(success=False, error="AUTH_ACK before the handshake reached it")
 
-        expected_session = _derive_session_id(
-            self._shared_secret, self._nonce_a, self._peer_nonce
-        )
+        expected_session = _derive_session_id(self._shared_secret, self._nonce_a, self._peer_nonce)
 
         if ack.session_id != expected_session:
             return HandshakeResult(
-                success=False,
-                error="Session ID mismatch — shared secret disagrees"
+                success=False, error="Session ID mismatch — shared secret disagrees"
             )
 
         return HandshakeResult(
@@ -282,6 +292,7 @@ class HandshakeInitiator:
 # ---------------------------------------------------------------------------
 # Responder (Node B) — processes HELLO, creates HELLO_ACK, processes AUTH
 # ---------------------------------------------------------------------------
+
 
 class HandshakeResponder:
     """
@@ -338,10 +349,16 @@ class HandshakeResponder:
 
         Returns (AuthAckMessage to send, HandshakeResult).
         """
+        if self._peer_pubkey is None or self._peer_nonce is None:
+            return (
+                AuthAckMessage(success=False, session_id=""),
+                HandshakeResult(success=False, error="AUTH before HELLO"),
+            )
+
         # Verify initiator signed our nonce
         verifier = oqs.Signature(PQ_SIG_ALGORITHM)
         if not verifier.verify(self._nonce_b, auth.signature, self._peer_pubkey):
-            ack = AuthAckMessage(success=False, session_id='')
+            ack = AuthAckMessage(success=False, session_id="")
             return ack, HandshakeResult(success=False, error="AUTH signature verification failed")
 
         # Kyber decapsulation
@@ -366,7 +383,10 @@ class HandshakeResponder:
 # AES-256-GCM Channel Encryption (post-handshake)
 # ---------------------------------------------------------------------------
 
-def derive_channel_keys(shared_secret: bytes, nonce_a: bytes, nonce_b: bytes) -> Tuple[bytes, bytes]:
+
+def derive_channel_keys(
+    shared_secret: bytes, nonce_a: bytes, nonce_b: bytes
+) -> Tuple[bytes, bytes]:
     """
     Derive AES-256-GCM encryption keys from the handshake material.
 
@@ -374,13 +394,9 @@ def derive_channel_keys(shared_secret: bytes, nonce_a: bytes, nonce_b: bytes) ->
     The initiator uses (send_key, recv_key); the responder swaps them.
     """
     # Use BLAKE3 in keyed mode to derive separate directional keys
-    send_key = blake3.blake3(
-        b'qrdx-send' + shared_secret + nonce_a + nonce_b
-    ).digest()
+    send_key = blake3.blake3(b"qrdx-send" + shared_secret + nonce_a + nonce_b).digest()
 
-    recv_key = blake3.blake3(
-        b'qrdx-recv' + shared_secret + nonce_a + nonce_b
-    ).digest()
+    recv_key = blake3.blake3(b"qrdx-recv" + shared_secret + nonce_a + nonce_b).digest()
 
     return send_key, recv_key
 

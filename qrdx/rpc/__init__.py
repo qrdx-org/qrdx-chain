@@ -7,8 +7,8 @@ Provides JSON-RPC 2.0 interfaces for the QRDX blockchain:
 - Legacy Denaro REST endpoints (deprecated, toggleable)
 """
 
-from .server import RPCServer
 from .config import RPCConfig
+from .server import RPCServer
 
 __all__ = [
     "RPCServer",

@@ -455,3 +455,33 @@ def test_a_maintainer_signed_tag_verifies_as_the_release_workflow_checks_it(tmp_
     assert "cannot sign in git" in R.lint_allowed_signers(manifest_only)[0]
     assert "no namespaces" in R.lint_allowed_signers(f"alice@qrdx.org {pub}")[0]
     assert R.lint_allowed_signers((REPO / "release/allowed_signers").read_text()) == []
+
+
+def test_add_signer_writes_a_line_that_verifies_tags_and_manifests(tmp_path):
+    key = _key(tmp_path, "alice")
+    signers = tmp_path / "allowed_signers"
+    signers.write_text("# maintainers\n")
+    line = R.add_signer(signers, "alice@qrdx.org", key.with_suffix(".pub").read_text())
+    assert line.startswith('alice@qrdx.org namespaces="git,qrdx-release" ssh-ed25519 ')
+    assert R.lint_allowed_signers(signers.read_text()) == []
+    manifest = tmp_path / "m.json"
+    manifest.write_text("{}")
+    R.sign(manifest, key, tmp_path / "a.sig", "qrdx-release")
+    assert R.signer_of(manifest, tmp_path / "a.sig", signers, "qrdx-release") == "alice@qrdx.org"
+
+
+def test_add_signer_refuses_duplicates_bad_keys_and_rsa(tmp_path):
+    key = _key(tmp_path, "alice")
+    pub = key.with_suffix(".pub").read_text()
+    signers = tmp_path / "allowed_signers"
+    R.add_signer(signers, "alice@qrdx.org", pub)
+    with pytest.raises(R.ReleaseError, match="already listed"):
+        R.add_signer(signers, "alice@qrdx.org", pub)
+    with pytest.raises(R.ReleaseError, match="key is already listed"):
+        R.add_signer(signers, "alias@qrdx.org", pub)
+    with pytest.raises(R.ReleaseError, match="OpenSSH public key"):
+        R.add_signer(signers, "bob@qrdx.org", "not a key")
+    with pytest.raises(R.ReleaseError, match="not RSA"):
+        R.add_signer(signers, "bob@qrdx.org", "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ== bob")
+    with pytest.raises(R.ReleaseError, match="principal"):
+        R.add_signer(signers, "bad principal", pub)

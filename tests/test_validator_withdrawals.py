@@ -291,6 +291,8 @@ async def test_an_orphaned_exit_is_forgotten():
 
 import inspect
 
+from source_text import source_of
+
 
 def _between(src, before, target, after):
     b, t, a = src.index(before), src.index(target), src.index(after)
@@ -299,14 +301,14 @@ def _between(src, before, target, after):
 
 def test_the_proposer_applies_withdrawals_before_computing_the_root():
     from qrdx.validator import node_integration
-    src = inspect.getsource(node_integration)
+    src = source_of(node_integration)
     assert _between(src, "_evm_section_producer(", "process_block_withdrawals(",
-                    "_compute_unified_state_root()")
+                    "_compute_unified_state_root(")
 
 
 def test_the_sync_import_path_applies_withdrawals_before_e_d4():
     from qrdx.node import main
-    src = inspect.getsource(main)
+    src = source_of(main)
     sync = src[src.index('logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr_evm}")'):]
     assert _between(sync, "Rejecting PoS block", "_apply_block_withdrawals_on_import(",
                     "_verify_unified_state_root(")
@@ -314,7 +316,7 @@ def test_the_sync_import_path_applies_withdrawals_before_e_d4():
 
 def test_the_rest_import_path_applies_withdrawals_before_e_d4():
     from qrdx.node import main
-    src = inspect.getsource(main)
+    src = source_of(main)
     rest = src[src.index("return {'ok': False, 'error': f'Invalid EVM section: {verr_evm}'}"):]
     assert _between(rest, "Invalid EVM section", "_apply_block_withdrawals_on_import(",
                     "_verify_unified_state_root(block_content)")
@@ -322,26 +324,26 @@ def test_the_rest_import_path_applies_withdrawals_before_e_d4():
 
 def test_the_p2p_import_path_applies_withdrawals_before_e_d4():
     from qrdx.rpc.modules import p2p
-    src = inspect.getsource(p2p)
+    src = source_of(p2p)
     assert _between(src, "self._evm_apply_section(", "process_block_withdrawals(",
                     "self._verify_unified_root(block_content)")
 
 
 def test_exits_are_logged_with_their_carrying_block():
     from qrdx.exchange import block_processor
-    src = inspect.getsource(block_processor.flush_validator_lifecycle_deltas)
+    src = source_of(block_processor.flush_validator_lifecycle_deltas)
     assert "record_validator_exit(" in src
 
 
 def test_the_rollback_rebuild_restores_the_ledger():
     from qrdx.node import main
-    src = inspect.getsource(main._rebuild_derived_state_after_rollback)
+    src = source_of(main._rebuild_derived_state_after_rollback)
     # Orphaned rows must be trimmed BEFORE the rebuild, which re-credits every row left.
-    assert "undo_withdrawal_logs_above(" in src and "rebuild_derived_state_interleaved(" in src
-    assert src.index("undo_withdrawal_logs_above(") < src.index("rebuild_derived_state_interleaved(")
+    assert "undo_withdrawal_logs_above(" in src and "rebuild_to_tip(" in src
+    assert src.index("undo_withdrawal_logs_above(") < src.index("rebuild_to_tip(")
     # The A/B-only by-domain path re-credits after its account_state rebuild, or the
     # re-credit would be wiped by it.
-    old = inspect.getsource(main._rebuild_derived_state_by_domain)
+    old = source_of(main._rebuild_derived_state_by_domain)
     assert old.index("rebuild_account_state_from_chain") < old.index("reapply_withdrawal_ledger(")
 
 
@@ -373,7 +375,7 @@ async def test_the_flush_actually_records_an_exit():
 
 # ── An exit must never be silently dropped ─────────────────────────────────
 
-async def test_an_exit_in_the_activation_epoch_is_not_dropped():
+async def test_an_exit_in_the_activation_epoch_is_not_dropped(monkeypatch):
     """
     The reconstruction walk applies an epoch's STAKE ops before that epoch's activations,
     so an exit landing in the activation epoch used to hit a still-pending validator,
@@ -394,6 +396,9 @@ async def test_an_exit_in_the_activation_epoch_is_not_dropped():
             {"epoch": 2, "tx_id": "b", "type": "exit", "address": who},
         ]
         import qrdx.validator.validator_reconstruction as VR
+        # A short unbonding period: the walk visits every epoch, and the standard ~3.7 days of
+        # 8 s epochs is 40,320 of them. What matters here is only the activation epoch.
+        monkeypatch.setattr(VR, "UNBONDING_PERIOD_EPOCHS", 8)
         await reconstruct_validators_state(
             db, genesis_validators=genesis, canonical_ops=ops, attesters_by_epoch={},
             finalized_epoch=2 + VR.UNBONDING_PERIOD_EPOCHS + 1)
