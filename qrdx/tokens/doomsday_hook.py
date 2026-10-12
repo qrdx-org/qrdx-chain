@@ -1,13 +1,14 @@
 """
 shouldTradeAfterDoomsday() Hook — Whitepaper §9.2
 
-Provides advisory trading flags for qRC20 tokens when the Doomsday
+Provides advisory trading flags for native tokens when the Doomsday
 Protocol is active.  Three client modes are supported (Strict, Warning,
 Permissionless) — enforcement is entirely client-side.
 
 Integration:
   - Reads ``DoomsdayProtocol.is_active`` from qrdx.bridge.shielding
-  - Each token carries a per-deployment ``post_doomsday_trade`` flag
+  - Each native token carries a per-deployment ``post_doomsday_trade`` flag
+    (an extension set at TOKEN_DEPLOY: qrdx/exchange/tokens.py)
   - The DoomsdayHook aggregates both signals for client use
 """
 

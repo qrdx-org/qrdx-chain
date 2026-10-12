@@ -1,74 +1,42 @@
 """
-The proposer selects from the same validator set importers check eligibility against
+The proposer selects from exactly the set importers judge its block against
 (qrdx/validator/node_integration.py ValidatorNode._refresh_validator_set).
 
-The proposer's set used to be built once, at startup. The validators table changes — rewards and
-penalties at each finalized epoch, validators joining and leaving — so after the integration
-testnet added a validator, proposers and importers disagreed on whose slot it was: blocks were
-refused and the chain forked. The set is now rebuilt from the table every slot, the way
-block_verification.verify_proposer_eligibility builds it.
+It was once built at startup, then from the node's live ``validators`` table, which moved with
+that node's view of finality, so proposer and importers could disagree on whose slot it was
+(the forks that followed a validator joining the testnet). Both now take ``S_E`` of the tip's
+chain (validator/epoch_state.py), recomputed every slot.
 """
-import os
-import tempfile
-from decimal import Decimal
 from types import SimpleNamespace
 
-from qrdx.database_sqlite import DatabaseSQLite
+from qrdx.constants import ACTIVATION_DELAY_EPOCHS, SLOTS_PER_EPOCH
 from qrdx.validator import block_verification as BV
+from qrdx.validator import epoch_state as ES
 from qrdx.validator.node_integration import ValidatorNode
 from qrdx.validator.selection import ValidatorSelector
 
-ADDRS = [f"0xPQ{i:064x}" for i in range(1, 5)]
+from test_epoch_state import G, J, Chain, chain  # noqa: F401  (fixture)
 
 
-async def _expected(db, slot):
-    rows = await db.get_validators()
-    validators = [
-        (r["address"], Decimal(str(r.get("effective_stake") or r.get("stake") or 0)))
-        for r in rows
-        if str(r.get("status", "active")).upper() in ("ACTIVE", "PENDING", "EXITING")
-    ]
-    return BV.expected_proposer_for_slot(slot, validators)
+async def _agree(node, db, epoch):
+    selector = ValidatorSelector()
+    for slot in range(epoch * SLOTS_PER_EPOCH, (epoch + 1) * SLOTS_PER_EPOCH):
+        await node._refresh_validator_set(slot)
+        mine = node.manager._validator_set.validators
+        chosen = selector.select_proposer(slot, mine, BV.PROPOSER_RANDAO_MIX)
+        expected = BV.expected_proposer_for_slot(slot, await ES.proposers_for_slot(db, slot))
+        assert chosen.address == expected, slot
 
 
-async def test_the_proposer_follows_the_table_the_importers_check_against():
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    db = await DatabaseSQLite.create(path)
-    try:
-        for a in ADDRS[:3]:
-            await db.connection.execute(
-                "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
-                "activation_epoch) VALUES (?, 'pk', '100000', '100000', 'active', 0)", (a,))
-        await db.connection.commit()
-        node = ValidatorNode(db, "unused")
-        node.wallet = SimpleNamespace(address=ADDRS[0], public_key=b"pk")
-        node.manager = SimpleNamespace(_validator_set=None)
-        selector = ValidatorSelector()
-
-        async def agree():
-            await node._refresh_validator_set()
-            mine = node.manager._validator_set.validators
-            for slot in range(200):
-                chosen = selector.select_proposer(slot, mine, BV.PROPOSER_RANDAO_MIX)
-                assert chosen.address == await _expected(db, slot), slot
-
-        await agree()
-        # A finalized epoch's rewards move the stakes; a validator joins; one starts exiting;
-        # one is slashed out.
-        await db.connection.execute("UPDATE validators SET effective_stake = '100045.25' "
-                                    "WHERE address = ?", (ADDRS[1],))
-        await db.connection.execute(
-            "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
-            "activation_epoch) VALUES (?, 'pk', '100000', '100000', 'pending', 11)", (ADDRS[3],))
-        await db.connection.execute("UPDATE validators SET status = 'exiting' WHERE address = ?",
-                                    (ADDRS[2],))
-        await db.connection.commit()
-        await agree()
-        await db.connection.execute("UPDATE validators SET status = 'slashed' WHERE address = ?",
-                                    (ADDRS[1],))
-        await db.connection.commit()
-        await agree()
-    finally:
-        await db.connection.close()
-        os.remove(path)
+async def test_the_proposer_follows_the_set_the_importers_check_against(chain):
+    node = ValidatorNode(chain.db, "unused")
+    node.wallet = SimpleNamespace(address=G[0], public_key=b"pk")
+    node.manager = SimpleNamespace(_validator_set=None)
+    await chain.epoch(1, deposits=[(J, "400000")], exits=[G[2]])
+    for e in range(2, 3 + ACTIVATION_DELAY_EPOCHS):
+        await chain.epoch(e, voters=G[:2])
+    # Rewards and penalties have moved the stakes, a validator has joined, one is exiting.
+    tip_epoch = 2 + ACTIVATION_DELAY_EPOCHS
+    state = await ES.state_at(chain.db, tip_epoch + 1)
+    assert state[J].status == "active" and state[G[2]].status == "exiting"
+    await _agree(node, chain.db, tip_epoch + 1)

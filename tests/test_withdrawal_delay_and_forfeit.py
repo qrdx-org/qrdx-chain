@@ -55,7 +55,7 @@ async def _staked_exit(db, key, exit_epoch=EXIT_EPOCH):
     who = key.public_key.to_address()
     await db.apply_account_balance_delta(who, Decimal("500000"))
     await db.apply_account_balance_delta(who, -STAKE)
-    await db.register_pending_validator(who, "ab" * 100, STAKE, block_height=10)
+    await db.log_validator_deposit(who, "ab" * 100, STAKE, 10)
     await W.record_validator_exit(db, who, exit_epoch, 20)
     await db.connection.commit()
     return who
@@ -153,7 +153,7 @@ async def test_an_ejected_validator_claims_its_principal_with_stake_exit(db):
     """
     who = PQPrivateKey.generate().public_key.to_address()
     await db.apply_account_balance_delta(who, Decimal("500000") - STAKE)
-    await db.register_pending_validator(who, "ab" * 100, STAKE, block_height=10)
+    await db.log_validator_deposit(who, "ab" * 100, STAKE, 10)
     await db.connection.execute(          # what the sweep does: exit it, below the floor
         "UPDATE validators SET status = 'exiting', exit_epoch = 12 WHERE address = ?", (who,))
     await db.connection.commit()
@@ -189,10 +189,11 @@ async def test_each_block_is_parsed_once_ever_not_per_query(db, monkeypatch):
 
     parsed = []
     real = BV._parse_block_content
-    # Count stored bodies (strings) only — verifying a proof also routes its two header
-    # dicts through the same function.
+    # Count stored bodies (text, or compressed as the database stores them) only — verifying
+    # a proof also routes its two header dicts through the same function.
     monkeypatch.setattr(BV, "_parse_block_content",
-                        lambda c: (parsed.append(1) if isinstance(c, str) else None) or real(c))
+                        lambda c: (parsed.append(1) if isinstance(c, (str, bytes)) else None)
+                        or real(c))
 
     assert await W.slashed_on_chain(db, who, 100)
     first = len(parsed)

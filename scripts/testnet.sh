@@ -578,6 +578,27 @@ cmd_start() {
         return 1
     fi
     
+    # Never start over a running testnet: start wipes testnet/databases, configs, wallets and
+    # genesis, and on this kind of mount a running node keeps writing into the files that replace
+    # them, so both networks' databases end up interleaved.
+    local busy=()
+    for pid_file in "${TESTNET_DIR}/pids"/node*.pid; do
+        [ -f "$pid_file" ] || continue
+        if kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+            busy+=("$(basename "$pid_file" .pid) (PID $(cat "$pid_file"))")
+        fi
+    done
+    for i in $(seq 0 $((num_nodes - 1))); do
+        if (exec 3<>"/dev/tcp/127.0.0.1/$((DEFAULT_BASE_PORT + i))") 2>/dev/null; then
+            busy+=("port $((DEFAULT_BASE_PORT + i))")
+        fi
+    done
+    if [ ${#busy[@]} -gt 0 ]; then
+        log_error "A testnet is already running: ${busy[*]}"
+        log_error "Stop it first (./scripts/testnet.sh stop); start would wipe its data."
+        return 1
+    fi
+
     log_step "Starting QRDX Local Testnet"
     log_info "Nodes: ${num_nodes}"
     log_info "Validators: ${num_validators}"

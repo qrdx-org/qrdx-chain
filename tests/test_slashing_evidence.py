@@ -44,7 +44,7 @@ def _signed_header(key: PQPrivateKey, slot=7, **overrides):
         "number": 7, "parent_hash": "ab" * 32, "state_root": "cd" * 32,
         "transactions_root": "ef" * 32, "timestamp": 1700000000,
         "proposer_address": addr, "proposer_public_key": key.public_key.to_bytes().hex(),
-        "slot": slot, "epoch": 0, "randao_reveal": "11" * 32,
+        "slot": slot, "epoch": 0, "randao_reveal": "",  # none unless RANDAO selection is scheduled
     }
     bc.update(overrides)
     bc["proposer_signature"] = key.sign(reconstruct_signing_root(bc)).to_bytes().hex()

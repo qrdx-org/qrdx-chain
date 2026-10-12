@@ -33,8 +33,8 @@ block application and reversed on rollback:
 * ``validator_withdrawals`` — the ledger of what has already been paid (or forfeited);
 * the canonical blocks themselves, for slashing evidence (see below).
 
-It deliberately does NOT read the ``validators`` table, which the epoch loop rebuilds
-asynchronously and which can therefore lag differently on different nodes — nor the
+It deliberately does NOT read the ``validators`` table (a display copy the epoch loop
+rewrites asynchronously; ejections are read from the chain-derived set itself) — nor the
 ``slashing_events`` table, for the same reason: that table also holds offences a node
 detected LOCALLY from gossip and evidence the finality pass recorded asynchronously, so two
 nodes can disagree on it at any given block. The forfeiture check instead reads the
@@ -60,14 +60,12 @@ EVM or exchange transaction, so the rebuild would silently drop it. Two steps re
 then ``reapply_withdrawal_ledger`` re-credits every remaining — canonical — withdrawal onto
 the freshly rebuilt ledger, the way genesis allocations are reseeded.
 
-Scope
------
-Only exits recorded as ``STAKE_EXIT`` operations are paid. A validator ejected for
-inactivity by the stake-floor sweep has no exit operation in the chain (the ejection is
-derived from reward accrual inside the asynchronous reconstruction), so its principal is
-not returned automatically: it claims it by submitting a ``STAKE_EXIT``, which is logged
-even though the validator is no longer active (see ``flush_validator_lifecycle_deltas``)
-and then paid like any other exit.
+Ejections
+---------
+A validator ejected for inactivity (stake-floor ejection) leaves without an exit operation.
+The validator set records the ejection and its exit epoch, and that set is a pure function of
+the chain (validator/epoch_state.py), so it is paid automatically, like any exit
+(``_ejected``). It used to have to claim its principal with a STAKE_EXIT of its own.
 """
 
 from __future__ import annotations
@@ -137,7 +135,7 @@ async def slashed_on_chain(db, address: str, before_height: int) -> bool:
 
 async def slashed_on_chain_by_scan(db, address: str, before_height: int) -> bool:
     """
-    ``slashed_on_chain`` by scanning block bodies (a LIKE over every block below the height).
+    ``slashed_on_chain`` by scanning every block body below the height.
 
     Reads block bodies, not ``slashing_events``: every node holds the same canonical blocks,
     and each proof self-verifies with no external state (a proposer cannot fabricate one —
@@ -147,22 +145,23 @@ async def slashed_on_chain_by_scan(db, address: str, before_height: int) -> bool
     ``slashing_evidence`` key, almost always empty, so blocks whose list is empty (in the
     repr or JSON form a block may be stored in) are excluded before anything is parsed.
     """
+    from ..block_codec import decode
     from .block_verification import _parse_block_content
     from .slashing_block import extract_slashing_evidence_from_dict, verified_offender
 
     cur = await db.connection.execute(
-        "SELECT content FROM blocks WHERE block_height < ? "
-        "AND content LIKE '%slashing_evidence%' "
-        "AND content NOT LIKE ? AND content NOT LIKE ? "
-        "AND content LIKE ? ORDER BY block_height",
-        (
-            int(before_height),
-            "%'slashing_evidence': []%",
-            '%"slashing_evidence": []%',
-            f"%{address}%",
-        ),
+        "SELECT content FROM blocks WHERE block_height < ? ORDER BY block_height",
+        (int(before_height),),
     )
-    for (content,) in await cur.fetchall():
+    for (stored,) in await cur.fetchall():
+        content = decode(stored) or ""  # bodies are stored compressed: filter after decoding
+        if (
+            "slashing_evidence" not in content
+            or "'slashing_evidence': []" in content
+            or '"slashing_evidence": []' in content
+            or address not in content
+        ):
+            continue
         try:
             block = _parse_block_content(content)
         except Exception:
@@ -200,7 +199,9 @@ async def compute_block_withdrawals(
         "ORDER BY LOWER(address), exit_epoch",
         (int(block_height), int(WITHDRAWAL_DELAY_EPOCHS), int(block_epoch)),
     )
-    candidates = await cur.fetchall()
+    candidates = [tuple(r) for r in await cur.fetchall()]
+    candidates += await _ejected(db, block_height, block_epoch)
+    candidates.sort(key=lambda c: (str(c[0]).lower(), int(c[1])))
 
     payable: List[Withdrawal] = []
     forfeited: List[Forfeit] = []
@@ -239,6 +240,30 @@ async def compute_block_withdrawals(
             continue
         payable.append((address, int(exit_epoch), amount))
     return payable, forfeited
+
+
+async def _ejected(db, block_height: int, block_epoch: int) -> List[Tuple[str, int]]:
+    """(address, exit epoch) of validators ejected for inactivity whose principal is due: they
+    left without an exit operation, so only the validator set records it — and that set is a
+    function of the chain (validator/epoch_state.py): ``S`` of this block's epoch on its parent
+    chain. They used to have to claim their principal with a STAKE_EXIT of their own."""
+    from .epoch_state import state_at
+
+    state = await state_at(db, int(block_epoch), int(block_height) - 1)
+    cur = await db.connection.execute(
+        "SELECT DISTINCT LOWER(address) FROM validator_exits WHERE block_height < ?",
+        (int(block_height),),
+    )
+    exited_by_operation = {r[0] for r in await cur.fetchall()}
+    return [
+        (v.address, int(v.exit_epoch))
+        for v in state.values()
+        if v.status in ("exiting", "exited")
+        and not v.slashed
+        and v.exit_epoch is not None
+        and v.exit_epoch + WITHDRAWAL_DELAY_EPOCHS <= int(block_epoch)
+        and v.address.lower() not in exited_by_operation
+    ]
 
 
 async def compute_payable_withdrawals(db, block_height: int, block_epoch: int) -> List[Withdrawal]:
@@ -290,7 +315,8 @@ async def record_forfeits(db, forfeited: List[Forfeit], block_height: int) -> No
 
 
 async def process_block_withdrawals(db, block_height: int, block_epoch: int) -> int:
-    """Compute and apply this block's withdrawals and forfeits. Returns how many were paid."""
+    """Compute and apply this block's withdrawals, forfeits and staking payouts. Returns how
+    many were paid."""
     if not ENFORCE_VALIDATOR_WITHDRAWALS:
         return 0
     payable, forfeited = await compute_block_withdrawals(db, block_height, block_epoch)
@@ -298,7 +324,45 @@ async def process_block_withdrawals(db, block_height: int, block_epoch: int) -> 
         await apply_withdrawals(db, payable, block_height)
     if forfeited:
         await record_forfeits(db, forfeited, block_height)
-    return len(payable)
+    payouts = await compute_block_payouts(db, block_height, block_epoch)
+    if payouts:
+        await apply_payouts(db, payouts, block_height)
+    return len(payable) + len(payouts)
+
+
+# ── staking payouts (docs/STAKING.md) ────────────────────────────────────────────────────
+
+
+async def compute_block_payouts(db, block_height: int, block_epoch: int) -> list:
+    """The staking payouts block ``block_height`` credits — rewards, finished undelegations,
+    refunds: those the validator set of its epoch, on its parent chain, holds as due by then
+    (validator/epoch_state.py) — if it is the first block of its epoch. The next epoch's state
+    drops what that block paid, so each payout is paid once, by a block every node agrees on.
+    """
+    if int(block_height) < 1:
+        return []
+    from .. import chain_index
+    from ..constants import SLOTS_PER_EPOCH
+    from .epoch_state import state_at
+
+    parent_slot = await chain_index.slot_at(db, int(block_height) - 1)
+    parent_epoch = int(parent_slot) // SLOTS_PER_EPOCH if parent_slot is not None else -1
+    if parent_epoch >= int(block_epoch):
+        return []  # not the epoch's first block
+    state = await state_at(db, int(block_epoch), int(block_height) - 1)
+    return [p for p in getattr(state, "payouts", []) if p.due_epoch <= int(block_epoch)]
+
+
+async def apply_payouts(db, payouts: list, block_height: int) -> None:
+    """Credit each payout and record it in the ledger (``staking_payouts``) the rollback and
+    rebuild paths read. Does not commit."""
+    for p in payouts:
+        await db.apply_account_balance_delta(p.address, p.amount)
+        await db.connection.execute(
+            "INSERT INTO staking_payouts (payout_id, address, amount, kind, block_height) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (int(p.id), p.address, str(p.amount), p.kind, int(block_height)),
+        )
 
 
 async def undo_withdrawal_logs_above(db, tip_height: int) -> None:
@@ -309,6 +373,9 @@ async def undo_withdrawal_logs_above(db, tip_height: int) -> None:
     )
     await db.connection.execute(
         "DELETE FROM validator_withdrawals WHERE block_height > ?", (int(tip_height),)
+    )
+    await db.connection.execute(
+        "DELETE FROM staking_payouts WHERE block_height > ?", (int(tip_height),)
     )
 
 
@@ -326,6 +393,10 @@ async def reapply_withdrawal_ledger(db) -> int:
         "SELECT address, amount FROM validator_withdrawals ORDER BY block_height, address"
     )
     rows = [(a, Decimal(str(v))) for a, v in await cur.fetchall()]
+    cur = await db.connection.execute(
+        "SELECT address, amount FROM staking_payouts ORDER BY block_height, payout_id"
+    )
+    rows += [(a, Decimal(str(v))) for a, v in await cur.fetchall()]
     rows = [(a, v) for a, v in rows if v != 0]  # forfeits credit nothing
     for address, amount in rows:
         await db.apply_account_balance_delta(address, amount)

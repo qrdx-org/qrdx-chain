@@ -87,7 +87,7 @@ from qrdx.node.identity import (
 )
 from qrdx.node.nodes_manager import NodeInterface, NodesManager
 from qrdx.transactions import CoinbaseTransaction, Transaction
-from qrdx.validator.block_verification import verify_pos_block_proposer, verify_proposer_eligibility
+from qrdx.validator.block_verification import verify_block_proposer, verify_proposer_eligibility
 
 # Slot-proposer eligibility gate. Enabled after the validator-set convergence fix:
 # with a consistent validator set + correct identities, every node reconstructs the
@@ -995,8 +995,10 @@ startup_time = time.time()
 # TOGGLEABLE (opt-in per operator) via QRDX_ENABLE_STREAMING. The stream is fed by a consensus-
 # decoupled poller (reads chain tip/finality only) so it can never stall or diverge block import.
 from qrdx.node.observability import (
+    CHAIN_CHANGED,
     EVENT_HUB,
     METRICS,
+    SignallingLock,
     chain_event_poller,
     handle_client_frame,
     parse_channels,
@@ -1252,6 +1254,18 @@ from qrdx.rpc.modules.governance import GovernanceModule
 governance_rpc_module = GovernanceModule()
 governance_rpc_module.context = _ExchangeRPCContext()
 rpc_server.register_module(governance_rpc_module)
+# Consensus bridge reads (bridge_*, docs/BRIDGE.md); withdrawals are exchange transactions.
+from qrdx.rpc.modules.bridge_ledger import BridgeLedgerModule
+
+bridge_rpc_module = BridgeLedgerModule()
+bridge_rpc_module.context = _ExchangeRPCContext()
+rpc_server.register_module(bridge_rpc_module)
+# Staking and delegation pools (staking_*, docs/STAKING.md); writes are exchange transactions.
+from qrdx.rpc.modules.staking import StakingModule
+
+staking_rpc_module = StakingModule()
+staking_rpc_module.context = _ExchangeRPCContext()
+rpc_server.register_module(staking_rpc_module)
 
 
 def _rpc_auth_error(request_body: Any, message: str) -> Response:
@@ -1292,7 +1306,9 @@ async def rpc_endpoint(request: Request):
 
 
 LAST_PENDING_TRANSACTIONS_CLEAN = [0]
-block_processing_lock = asyncio.Lock()
+# Held by every path that changes the chain. Releasing it raises CHAIN_CHANGED, which wakes the
+# realtime publishers (qrdx/node/observability.py): a flag, never awaited.
+block_processing_lock = SignallingLock(CHAIN_CHANGED)
 
 # Seen-cache for EVM / account-model transactions (keyed by keccak(raw_tx)).
 # Prevents double execution and terminates gossip loops in Phase 1 cross-node
@@ -1769,7 +1785,7 @@ async def _apply_block_withdrawals_on_import(block_height, block_epoch):
         logger.error(f"withdrawal processing failed on import of block {block_height}: {e}")
 
 
-def _exchange_tick_on_import(block_height, block_timestamp) -> None:
+async def _exchange_tick_on_import(block_height, block_timestamp) -> None:
     """
     The exchange's per-block tick for an imported block that carries no exchange section
     (``block_processor.run_exchange_tick``). Clearinghouse duties — mark prices now,
@@ -1779,8 +1795,10 @@ def _exchange_tick_on_import(block_height, block_timestamp) -> None:
     if not block_height or int(block_height) < 1:
         return
     try:
-        from ..exchange.block_processor import run_exchange_tick
+        from ..exchange.block_processor import ensure_oracle_committee, run_exchange_tick
+        from ..exchange.state_manager import ExchangeStateManager
 
+        await ensure_oracle_committee(db, ExchangeStateManager.get_instance(), int(block_height))
         run_exchange_tick(int(block_height), float(block_timestamp or 0))
     except Exception as e:
         logger.error(f"exchange tick failed at block {block_height}: {e}")
@@ -1816,7 +1834,7 @@ async def _apply_exchange_section_on_import(
     # spot-sufficiency checks can read them during the sync section processing.
     try:
         _decoded = decode_exchange_txs(ex_section)
-        await preload_sender_balances(db, _decoded, mgr)
+        await preload_sender_balances(db, _decoded, mgr, int(block_height))
         await preload_token_balances(db, _decoded, mgr)
     except Exception as e:
         logger.debug(f"exchange balance pre-load skipped at block {block_height}: {e}")
@@ -1838,6 +1856,9 @@ async def _apply_exchange_section_on_import(
             await flush_validator_lifecycle_deltas(
                 db, mgr, block_epoch=block_epoch, block_height=block_height
             )
+        else:
+            # The section is left half-applied (no per-block revert point): back to the tip.
+            await _restore_after_rejected_block(block_height, f"exchange section: {err}")
         return ok, err
     # Trust-replay (sync): adopt the canonical section's computed root.
     try:
@@ -1858,10 +1879,13 @@ async def _apply_exchange_section_on_import(
                 db, mgr, block_epoch=block_epoch, block_height=block_height
             )
         else:
+            # Adopted without its section, as a replay does (it reverts): back to the tip.
             logger.warning(f"Exchange section trust-replay failed at block {block_height}: {err}")
+            await _restore_after_rejected_block(block_height, f"exchange section: {err}")
         return True, ""
     except Exception as e:
         logger.warning(f"Exchange section trust-replay error at block {block_height}: {e}")
+        await _restore_after_rejected_block(block_height, f"exchange section: {e}")
         return True, ""
 
 
@@ -3616,27 +3640,25 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
         # Dilithium signature over the signed header is valid. Without this an
         # imported block is only "from a registered address", not proven to be
         # produced by that validator.
-        ok_prop, prop_err = verify_pos_block_proposer(block_content, validator_address)
+        ok_prop, prop_err = await verify_block_proposer(
+            db, block_content, validator_address, block_height
+        )
         if not ok_prop:
             logger.warning(
                 f"[SYNC] Rejecting PoS block {block_height}: proposer auth failed: {prop_err}"
             )
             return False
 
-        # Security: verify the proposer is the validator selected for this slot
-        # (catches signature-valid but out-of-turn proposals). The proposer SIGNATURE is
-        # already enforced above; slot-eligibility, however, is NOT enforced on the BULK-SYNC
-        # path — a catching-up node's validators table (effective_stake / activation timing)
-        # can transiently differ from the network's at selection time, so it would reject a
-        # genuinely CANONICAL block, abort the sync ("FATAL ERROR: Failed to create blocks
-        # during sync"), and get STUCK behind — which leaves its derived state (tokens /
-        # account_state) diverged. So bulk-sync TRUST-REPLAYS eligibility (observe), exactly
-        # like the E-D4 unified-root check does; live-broadcast import (p2p/REST) still
-        # enforces. See the reorg-derived-state divergence in phase_e_invariants.
+        # Security: verify the proposer is the validator selected for this slot (catches
+        # signature-valid but out-of-turn proposals) — on EVERY path, sync and fork-choice
+        # adoption included. The set is the block's own parent chain's (validator/epoch_state.py),
+        # so a block judged long after its slot is judged against the set it was proposed under.
+        # Sync used to trust-replay this: the set was this node's live table, which moved with
+        # finality, and judging history against it would have refused canonical blocks.
         ok_elig, elig_err = await verify_proposer_eligibility(
             db,
             block_content,
-            enforce=(_ENFORCE_PROPOSER_ELIGIBILITY and not is_bulk_sync),
+            enforce=_ENFORCE_PROPOSER_ELIGIBILITY,
         )
         if not ok_elig:
             logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {elig_err}")
@@ -3691,7 +3713,7 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
                     return False
             else:
                 # No exchange transactions — the exchange still ticks (mark prices, ...).
-                _exchange_tick_on_import(block_height, block.get("timestamp", 0) or 0)
+                await _exchange_tick_on_import(block_height, block.get("timestamp", 0) or 0)
 
             # E-D3b: validate + replay the EVM section (execute-on-mine) before
             # storing — reject any block whose account_state_root doesn't match.
@@ -3823,35 +3845,9 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
     return True
 
 
-# Validators reorg-reconstruction gate (item 3). OFF = the deposited-validator dynamic state stays
-# incrementally-mutated (benign cross-node divergence in recorded schedule + effective_stake; 0
-# eligibility halts). ON = on every rollback, rebuild the validators dynamic state as a pure
-# function of the canonical chain (validator_reconstruction), so it converges across nodes
-# regardless of import history — the 5th reorg-reconstructed domain. Enable only after a cross-node
-# soak proves byte-identical validators_table_hash (mirrors how exchange/EVM rebuilds were adopted).
-# KEPT OFF — the first enable soak DIVERGED: reconstruction on the reorg path runs to the node's
-# CURRENT finalized_epoch, but the incremental epoch loop (epoch_loop, last_processed) keeps mutating
-# subsequent epochs, so the two compose inconsistently across nodes (status active vs exited, act 2
-# vs 7, three effective_stakes). The core reconstruction is proven correct in isolation; enabling it
-# live requires the epoch loop to STOP mutating incrementally and instead drive off reconstruction
-# (or reset last_processed so it re-derives from the rebuilt point) — the reconstruction↔epoch-loop
-# composition, a dedicated follow-up. See tests/test_validator_reconstruction_equivalence.py.
-_ENFORCE_VALIDATOR_RECONSTRUCTION = False
-
-# Reverse deposit-created validator registrations whose carrying block was orphaned.
-#
-# Narrow complement to the (gated-off) full validators reconstruction above: rather than
-# recomputing the whole table from the canonical chain — which diverged when tried,
-# because reconstruction and the incremental epoch loop compose inconsistently — this
-# reverses exactly the logged deposits from rolled-back blocks. It can only remove what
-# a deposit created, never touch a genesis validator, and never recompute reward-driven
-# effective_stake, so it cannot reintroduce that composition problem.
-#
-# ENABLED because leaving it off means a validator keeps stake-weighted influence over
-# proposer selection and fork choice after the deposit that paid for it was orphaned —
-# i.e. the stake enforcement in ExchangeStateManager._op_stake_deposit is bypassable by
-# any party who can get a block orphaned. See docs/EXCHANGE_AND_VALIDATOR_STAKE_AUDIT.md
-# and tests/test_orphaned_deposit_undo.py.
+# Drop the deposit log of rolled-back blocks: the validator set is computed from the chain and
+# this log (validator/epoch_state.py), so a deposit in an orphaned block must leave no input
+# behind. (tests/test_orphaned_deposit_undo.py)
 _ENFORCE_DEPOSIT_REORG_UNDO = True
 
 
@@ -3952,19 +3948,9 @@ async def _rebuild_derived_state_after_rollback():
     except Exception as e:
         logger.error(f"[REORG] mempool nonce reset failed: {e}")
 
-    # Reverse validator registrations created by deposits in ORPHANED blocks.
-    #
-    # The validators table is not reconstructed from the chain
-    # (_ENFORCE_VALIDATOR_RECONSTRUCTION below is off), so a STAKE_DEPOSIT in a block
-    # that just got rolled back would otherwise leave its registration standing while
-    # the rebuild above correctly does NOT re-apply its stake debit — leaving a
-    # validator with the effective_stake that weights proposer selection and fork
-    # choice, but none of the funds locked. That is the stake-enforcement guarantee
-    # reopened through a reorg, so it is undone here.
-    #
-    # This is an exact reversal of the logged deposits, not a recomputation, which is
-    # why it is safe while full reconstruction stays gated: it can only remove what a
-    # deposit created. Genesis validators have no deposit-log rows and are untouched.
+    # Drop the stake-operation log of the orphaned blocks: the validator set is computed from
+    # the chain and that log (validator/epoch_state.py), keyed by each epoch's checkpoint, so
+    # the new branch's states are computed from its own blocks.
     if _ENFORCE_DEPOSIT_REORG_UNDO:
         try:
             tip = (await db.get_next_block_id()) - 1
@@ -3972,33 +3958,12 @@ async def _rebuild_derived_state_after_rollback():
             if res.get("reversed"):
                 await db.connection.commit()
                 logger.warning(
-                    "[REORG] reversed %d orphaned validator deposit(s) above h=%d "
-                    "(%d validator(s) removed, %d stake top-up(s) reduced)",
+                    "[REORG] dropped %d orphaned validator deposit(s) above h=%d",
                     res["reversed"],
                     tip,
-                    res["removed"],
-                    res["reduced"],
                 )
         except Exception as e:
             logger.error(f"[REORG] orphaned validator-deposit undo failed: {e}")
-
-    # Validators reorg-reconstruction (item 3) — gated. Rebuild the deposited-validator dynamic
-    # state as a pure function of the canonical chain so it converges across nodes regardless of
-    # import history. Runs through the current finalized epoch (settled network-wide). Best-effort.
-    if _ENFORCE_VALIDATOR_RECONSTRUCTION:
-        try:
-            from ..validator.finality import update_finality
-            from ..validator.validator_reconstruction import reconstruct_validators_live
-
-            fin = await update_finality(db)
-            finalized_epoch = int(fin.get("finalized_epoch", -1))
-            if finalized_epoch >= 0:
-                await reconstruct_validators_live(db, finalized_epoch)
-                logger.info(
-                    "[REORG] validators reconstructed through finalized epoch %d", finalized_epoch
-                )
-        except Exception as e:
-            logger.error(f"[REORG] validators reconstruction failed: {e}")
 
 
 # Startup rebuild (docs/KNOWN_ISSUES.md — "a restart replayed exchange state without
@@ -4043,7 +4008,11 @@ async def _rebuild_derived_state_on_startup():
         return
 
     try:
-        from ..derived_state_rebuild import rebuild_derived_state_interleaved
+        from ..derived_state_rebuild import (
+            load_persisted_checkpoint,
+            rebuild_derived_state_interleaved,
+            rebuild_to_tip,
+        )
         from ..exchange.state_manager import ExchangeStateManager
         from ..validator.withdrawals import undo_withdrawal_logs_above
 
@@ -4053,9 +4022,18 @@ async def _rebuild_derived_state_on_startup():
         await undo_withdrawal_logs_above(db, tip)
         await db.connection.commit()
 
-        res = await rebuild_derived_state_interleaved(
-            db, EVM_STATE_MANAGER, _evm_defer_execute() if EVM_STATE_MANAGER is not None else None
-        )
+        execute = _evm_defer_execute() if EVM_STATE_MANAGER is not None else None
+        # From the persisted exchange checkpoint when there is a usable one: the blocks since
+        # it, not the chain. QRDX_STARTUP_FULL_REBUILD=1 replays from genesis instead, the
+        # reference the checkpoint path is checked against (the comparison below runs either
+        # way).
+        base = None
+        if os.getenv("QRDX_STARTUP_FULL_REBUILD", "").lower() not in ("1", "true", "yes"):
+            base = await load_persisted_checkpoint(db)
+        if base is not None:
+            res = await rebuild_to_tip(db, EVM_STATE_MANAGER, execute)
+        else:
+            res = await rebuild_derived_state_interleaved(db, EVM_STATE_MANAGER, execute)
         rebuilt_token = await db.get_token_balances_root(tip)
         exchange_root = ExchangeStateManager.get_instance().compute_state_root()
         if res["account_root"] != durable_account or rebuilt_token != durable_token:
@@ -4073,8 +4051,9 @@ async def _rebuild_derived_state_on_startup():
             )
         else:
             logger.info(
-                "[startup] derived state rebuilt from chain (tip=%d, matches durable "
-                "state; exchange root=%s...)",
+                "[startup] derived state rebuilt %s (tip=%d, matches durable state; "
+                "exchange root=%s...)",
+                f"from the checkpoint at {res['base']}" if "base" in res else "from genesis",
                 tip,
                 exchange_root[:16],
             )
@@ -4111,11 +4090,15 @@ async def _restore_after_rejected_block(block_height, reason: str) -> None:
     derived state from it restores exactly the pre-block state, in every domain and in
     memory, using the same rebuild the reorg path relies on.
 
-    Cost: the rebuild replays the chain, so this is O(chain). Acceptable because it only
-    fires when a block that already passed signature, eligibility and parent-continuity
-    checks then fails a state check — which only an eligible proposer can cause, once per
-    slot it owns. Must be called with the block-processing lock held (every import path
-    holds it), since it does not acquire it.
+    It also undoes a failed or mismatched exchange section: there is no per-block revert
+    point any more (process_exchange_transactions).
+
+    Cost: the reorg fast path (rebuild_to_tip) — the changes since the newest exchange
+    checkpoint and the blocks above it, at most about an epoch. It fires only when a block
+    that already passed signature, eligibility and parent-continuity checks then fails a
+    state check — which only an eligible proposer can cause, once per slot it owns. Must be
+    called with the block-processing lock held (every import path holds it), since it does not
+    acquire it.
     """
     logger.warning(
         f"[REJECT] restoring derived state after rejecting block {block_height}: {reason}"
@@ -4503,12 +4486,9 @@ async def resolve_fork_with_peer(peer_id: str, reason: str = "") -> bool:
 
 
 async def _apply_branch(blocks: List[dict], *, lock_held: bool = False) -> bool:
-    """Apply consecutive blocks on top of the tip under the sync import rules — every rule but
-    the two sync has always trust-replayed: slot eligibility, because the validator set it is
-    judged against is today's table, not the one the block was proposed under (see
-    docs/KNOWN_ISSUES.md, "Historical proposer eligibility cannot be re-checked"), and E-D4
-    below the tip. Proposer signatures, parent continuity, slot progression and FFG votes are
-    all enforced."""
+    """Apply consecutive blocks on top of the tip under the sync import rules: proposer
+    signatures, slot eligibility (against each block's own parent chain), parent continuity,
+    slot progression and FFG votes are all enforced; E-D4 below the tip is trust-replayed."""
     async with _block_lock(lock_held):
         for block_data in blocks:
             if not await process_and_create_block(block_data, is_bulk_sync=True):
@@ -5177,6 +5157,7 @@ async def startup():
                     # Phase D2.2: let the proposer include admitted exchange txs.
                     try:
                         validator_node.set_exchange_tx_source(_get_exchange_mempool())
+                        validator_node.set_exchange_submitter(_get_exchange_submitter())
                     except Exception as e:
                         logger.warning(f"Could not attach exchange tx source: {e}")
                     # E-D3b: let the proposer include admitted EVM txs (execute-on-
@@ -5189,6 +5170,7 @@ async def startup():
                         # derived-state rebuild: share the lock they hold.
                         validator_node.set_block_processing_lock(block_processing_lock)
                         validator_node.set_proposal_guard(_validator_wait_reason)
+                        validator_node.set_restore_hook(_restore_after_rejected_block)
                     except Exception as e:
                         logger.warning(f"Could not attach EVM tx source/producer: {e}")
                 else:
@@ -5205,7 +5187,9 @@ async def startup():
     try:
         from ..validator.epoch_loop import epoch_validator_update_loop
 
-        app.state.epoch_validator_task = asyncio.create_task(epoch_validator_update_loop(db))
+        app.state.epoch_validator_task = asyncio.create_task(
+            epoch_validator_update_loop(db, lock=block_processing_lock)
+        )
         logger.info("✅ Consensus epoch validator-update loop scheduled (all nodes)")
     except Exception as e:
         logger.warning(f"Could not start epoch validator-update loop: {e}")
@@ -5226,6 +5210,9 @@ async def startup():
 
         async def _poll_tip():
             return (await db.get_next_block_id()) - 1
+
+        async def _poll_hashes(lo, hi):
+            return await db.get_block_hashes(lo, hi)
 
         async def _poll_finality():
             try:
@@ -5274,6 +5261,8 @@ async def startup():
                 EVENT_HUB,
                 METRICS,
                 get_tip=_poll_tip,
+                get_hashes=_poll_hashes,
+                signal=CHAIN_CHANGED,
                 get_peer_count=_poll_peers,
                 get_finality=_poll_finality,
                 get_slashing_count=_poll_slashing,
@@ -5289,7 +5278,10 @@ async def startup():
 
             app.state.perp_poller_task = asyncio.create_task(
                 perp_stream_poller(
-                    EVENT_HUB, get_manager=ExchangeStateManager.get_instance, interval=1.0
+                    EVENT_HUB,
+                    get_manager=ExchangeStateManager.get_instance,
+                    interval=1.0,
+                    signal=CHAIN_CHANGED,
                 )
             )
         logger.info(
@@ -6512,9 +6504,11 @@ async def submit_block(
             if block_no != next_block_id:
                 return {"ok": False, "error": "Block height does not match expected next block"}
 
-            # Security: verify the claimed validator is registered
-            validator_info = await db.get_validator_info(validator_address)
-            if not validator_info:
+            # Security: the claimed proposer must be a validator on this chain (the set its
+            # slot is selected from: validator/epoch_state.py).
+            from ..validator.epoch_state import is_validator
+
+            if not await is_validator(db, validator_address, block_content, block_no - 1):
                 await security.reputation_manager.record_violation(
                     verified_sender, "unknown_validator", severity=6
                 )
@@ -6523,7 +6517,9 @@ async def submit_block(
             # Security: authenticate the proposer (pubkey↔address binding +
             # Dilithium signature over the signed header). Registration alone does
             # not prove the block was produced by that validator.
-            ok_prop, prop_err = verify_pos_block_proposer(block_content, validator_address)
+            ok_prop, prop_err = await verify_block_proposer(
+                db, block_content, validator_address, block_no
+            )
             if not ok_prop:
                 await security.reputation_manager.record_violation(
                     verified_sender, "invalid_proposer_signature", severity=8
@@ -6592,7 +6588,7 @@ async def submit_block(
                         return {"ok": False, "error": f"Invalid exchange section: {verr}"}
                 else:
                     # No exchange transactions — the exchange still ticks (mark prices, ...).
-                    _exchange_tick_on_import(block_no, body.get("timestamp", 0) or 0)
+                    await _exchange_tick_on_import(block_no, body.get("timestamp", 0) or 0)
 
                 # E-D3b: validate + replay the EVM section (execute-on-mine) before
                 # storing; reject on account_state_root mismatch.

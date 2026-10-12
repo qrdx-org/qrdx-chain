@@ -64,7 +64,8 @@ def test_the_exchange_root_commits_the_book(monkeypatch):
         book._orders["1"].amount = D(6)                    # a node whose order differs,
         with pytest.raises(CommitmentMismatch):            # written past the book's entry
             m.compute_state_root()                         # points: verification notices
-        book._version += 1                                 # what every entry point does
+        book._touch(OrderSide.BUY, D("1"))                  # what every entry point does: mark
+        book._version += 1                                 # the level it changed, bump the version
         assert len({before, mid, m.compute_state_root()}) == 3
     finally:
         ExchangeStateManager.reset_instance()

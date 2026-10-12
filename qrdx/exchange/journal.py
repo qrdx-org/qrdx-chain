@@ -10,10 +10,11 @@ The exchange journal — what each committed block did, for wallets, the API and
 * **Market data** (``self.market``, qrdx/exchange/market_data.py): every trade on every market —
   spot order-book fills, AMM swaps and perps fills — with candles and 24-hour statistics.
 
-This is NOT consensus state: it is never hashed or snapshotted, and it is recorded only when a
-block commits (a reverted block leaves nothing behind). It lives on the ExchangeStateManager, so
-every rebuild — a reorg, a rejected block, a restart — rebuilds it from the canonical chain like
-the rest of the exchange state. Bounded: the oldest receipts and events fall off.
+This is NOT consensus state: it is never hashed, and it is recorded only when a block commits (a
+reverted block leaves nothing behind). It follows the canonical chain: a reorg undoes the
+orphaned blocks (``rollback_to``) before the new branch is applied, and a restart loads it with
+the persisted exchange checkpoint (qrdx/derived_state_rebuild.py). Bounded: the oldest receipts
+and events fall off.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from collections import OrderedDict, deque
 from decimal import Decimal
 from typing import Any, Deque, Dict, Iterable, List, Optional
 
+from .clearinghouse import VAULT as VAULT_OWNER
 from .market_data import MarketData
 
 MAX_RECEIPTS = 50_000
@@ -48,6 +50,7 @@ class ExchangeJournal:
         self.events: Deque[Dict[str, Any]] = deque(maxlen=max_events)
         self.seq = 0  # last event sequence number (monotonic per journal)
         self.market = MarketData()
+        self.height = -1  # the last block recorded
 
     # ── recording (at block commit) ────────────────────────────────────
 
@@ -59,6 +62,7 @@ class ExchangeJournal:
         results: Iterable,
         tick_events: Iterable[Dict[str, Any]],
     ) -> None:
+        self.height = max(self.height, int(height))
         when: Dict[str, Any] = {"block_height": int(height), "block_time": float(timestamp)}
         for tx, result in zip(txs, results, strict=False):
             tx_hash = tx.tx_hash()
@@ -126,9 +130,36 @@ class ExchangeJournal:
                         **fill,
                     )
                     self._perp_trade(fill, when, None, ev.get("owner"))
-            elif ev.get("type") == "funding":
-                self._event("funding", when, **{k: v for k, v in ev.items() if k != "type"})
-        self.market.advance(timestamp)
+            elif ev.get("type") == "vault_unwind":
+                fills = ev.pop("fills", [])
+                self._event("vault_unwind", when, **{k: v for k, v in ev.items() if k != "type"})
+                for fill in fills:
+                    self._event(
+                        "fill", when, tx_hash=None, order_id=None, taker=VAULT_OWNER, **fill
+                    )
+                    self._perp_trade(fill, when, None, VAULT_OWNER)
+            elif ev.get("type") in ("funding", "order_cancelled"):
+                self._event(ev["type"], when, **{k: v for k, v in ev.items() if k != "type"})
+        self.market.advance(timestamp, height)
+
+    def rollback_to(self, height: int) -> None:
+        """Undo every block above ``height`` — a reorg orphaned them. Their receipts, events and
+        trades go; event and trade sequence numbers are not reused, so a stream subscriber sees
+        the new branch's as new. (A receipt or event that one of them pushed out of the window
+        stays out.)"""
+        while self.receipts:
+            tx_hash = next(reversed(self.receipts))
+            if int(self.receipts[tx_hash].get("block_height", -1)) <= height:
+                break
+            del self.receipts[tx_hash]
+        while self.events and int(self.events[-1].get("block_height", -1)) > height:
+            self.events.pop()
+        self.market.rollback_to(height)
+        self.height = min(self.height, int(height))
+
+    def prune(self, height: int) -> None:
+        """No reorg reaches ``height`` or below: forget the undo kept for those blocks."""
+        self.market.prune(height)
 
     def _perp_trade(self, fill: Dict[str, Any], when: Dict[str, Any], tx_hash, taker) -> None:
         maker = fill.get("maker")

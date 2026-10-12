@@ -291,22 +291,16 @@ async def test_import_accepts_valid_votes_and_rejects_every_kind_of_bad_one(keys
 
 
 async def test_a_deposited_validators_key_comes_from_its_deposit(keys):
-    """Keys are read from the chain (genesis, then STAKE_DEPOSITs) so every node verifies votes
-    with the same key; a deposit naming someone else's key gives the depositor no key."""
-    import json
-
+    """Keys are read from the chain (genesis, then executed STAKE_DEPOSITs) so every node
+    verifies votes with the same key; a deposit naming someone else's key gives the depositor
+    no key."""
     c = await Chain.create(keys[:3])
     try:
         newcomer, impostor = keys[3], PQPrivateKey.generate()
         await c.block(1)
-        from qrdx import chain_index
-
-        await chain_index.sync(c.db)  # (creates the index tables)
-        for who, key in ((_addr(newcomer), newcomer), (_addr(impostor), newcomer)):
-            await c.db.connection.execute(
-                "INSERT INTO chain_index_ops (height, epoch, position, op) VALUES (?, 0, 0, ?)",
-                (c.height, json.dumps({"type": "deposit", "address": who,
-                                       "public_key": key.public_key.to_bytes().hex()})))
+        for who in (_addr(newcomer), _addr(impostor)):
+            await c.db.log_validator_deposit(
+                who, newcomer.public_key.to_bytes().hex(), "100000", c.height)
         await c.db.connection.commit()
         assert await ffg.validator_key(c.db, _addr(newcomer), c.height + 1) == \
             newcomer.public_key.to_bytes()

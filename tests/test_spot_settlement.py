@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 from qrdx.exchange.state_manager import ExchangeStateManager
 from qrdx.exchange.amm import FeeTier, PoolType
-from integration_tests.pool_operator import price_to_sqrt_price_q96  # V3 sqrt-price helper
+from integration_tests.amm_math import price_to_sqrt_price_q96  # V3 sqrt-price helper
 
 ZERO = Decimal("0")
 

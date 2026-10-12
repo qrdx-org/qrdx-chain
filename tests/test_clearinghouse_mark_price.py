@@ -201,7 +201,7 @@ async def test_forward_with_ticks_equals_the_rebuild(monkeypatch):
             if txs:
                 await db.add_block_exchange_txs(bh, encode_exchange_txs(txs))
 
-        await add(0, alloc=[(mm, "10000000"), (keys[0].public_key.to_address(), "1000")])
+        await add(0, alloc=[(mm, "10000000"), (keys[0].public_key.to_address(), "5000")])
         await add(1, [tx(keys[0], ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"}),
                       tx(keys[0], ExchangeOpType.UPDATE_ORACLE,
                          {"pair": "BTC:QRDX", "price": "30000"}),

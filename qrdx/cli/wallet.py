@@ -982,6 +982,16 @@ from qrdx.cli.gov import gov as _gov_commands  # noqa: E402
 
 cli.add_command(_gov_commands)
 
+# Staking: qrdx-wallet stake … (qrdx/cli/stake.py)
+from qrdx.cli.stake import stake as _stake_commands  # noqa: E402
+
+cli.add_command(_stake_commands)
+
+# The consensus bridge: qrdx-wallet bridge … (qrdx/cli/bridge.py)
+from qrdx.cli.bridge import bridge as _bridge_commands  # noqa: E402
+
+cli.add_command(_bridge_commands)
+
 
 @cli.command("generate-mnemonic")
 @click.option(

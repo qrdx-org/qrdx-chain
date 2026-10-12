@@ -301,9 +301,15 @@ class P2PModule(RPCModule):
         slot = int(c.get("slot") or 0)
         stated_epoch = c.get("epoch")
         epoch = int(stated_epoch) if stated_epoch is not None else slot // SLOTS_PER_EPOCH
-        # Build the SELF-VALIDATING proof (both signed headers) so the evidence can ride the
-        # canonical chain (block body) and every importer can verify it with no external state.
-        evidence = make_double_sign_evidence(c, _parse_block_content(stored_content))
+        # Build the SELF-VALIDATING proof (both signed headers, and the proposer's key, which
+        # blocks no longer carry) so the evidence can ride the canonical chain (block body) and
+        # every importer can verify it with no external state.
+        from ...validator.ffg import validator_key
+
+        key = await validator_key(self._db, str(proposer), int(block_no))
+        evidence = make_double_sign_evidence(
+            c, _parse_block_content(stored_content), key.hex() if key else None
+        )
         ok_ev, ev_err = verify_double_sign_evidence(evidence)
         if not ok_ev:
             # is_double_sign matched proposer+slot+hash but a header isn't validly signed —
@@ -428,19 +434,22 @@ class P2PModule(RPCModule):
                 if block_no != next_block_id:
                     return {"ok": False, "error": "Block height mismatch"}
 
-                validator_info = await self._db.get_validator_info(validator_address)
-                if not validator_info:
+                from ...validator.epoch_state import is_validator
+
+                if not await is_validator(self._db, validator_address, block_content, block_no - 1):
                     return {"ok": False, "error": "Validator not registered"}
 
                 # Security: authenticate the proposer (pubkey↔address binding +
                 # Dilithium signature over the signed header). Registration alone
                 # does not prove the block was produced by that validator.
                 from ...validator.block_verification import (
-                    verify_pos_block_proposer,
+                    verify_block_proposer,
                     verify_proposer_eligibility,
                 )
 
-                ok_prop, prop_err = verify_pos_block_proposer(block_content, validator_address)
+                ok_prop, prop_err = await verify_block_proposer(
+                    self._db, block_content, validator_address, block_no
+                )
                 if not ok_prop:
                     return {"ok": False, "error": f"Proposer authentication failed: {prop_err}"}
 
@@ -518,13 +527,24 @@ class P2PModule(RPCModule):
                         except Exception as e:
                             ok_ex, verr = False, f"exchange validation error: {e}"
                         if not ok_ex:
+                            # Half-applied (there is no per-block revert point): back to the tip.
+                            await self._restore_after_rejection(
+                                block_no, f"exchange section: {verr}"
+                            )
                             return {"ok": False, "error": f"Invalid exchange section: {verr}"}
                     elif block_no and int(block_no) >= 1:
                         # No exchange transactions — the exchange still ticks every block (mark
                         # prices; liquidations and funding next), exactly as the other paths do.
                         try:
-                            from ...exchange.block_processor import run_exchange_tick
+                            from ...exchange.block_processor import (
+                                ensure_oracle_committee,
+                                run_exchange_tick,
+                            )
+                            from ...exchange.state_manager import ExchangeStateManager
 
+                            await ensure_oracle_committee(
+                                self._db, ExchangeStateManager.get_instance(), int(block_no)
+                            )
                             run_exchange_tick(
                                 int(block_no), float(block_data.get("timestamp", 0) or 0)
                             )

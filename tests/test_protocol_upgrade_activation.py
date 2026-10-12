@@ -28,12 +28,16 @@ SPEC = cs.build_spec("qrdx-dev", 88888, {}, dev=True, forks=[
 
 
 class _DB:
-    async def get_validators(self):
-        return [{"address": a, "effective_stake": str(s), "status": "active"} for a, s in VALIDATORS]
+    """The set every slot is selected from (validator/epoch_state.py, stubbed below)."""
 
 
 @pytest.fixture(autouse=True)
 def scheduled(monkeypatch):
+    from qrdx.validator import epoch_state
+
+    async def _proposers(db, slot, parent_height=None):
+        return list(VALIDATORS)
+    monkeypatch.setattr(epoch_state, "proposers_for_slot", _proposers)
     monkeypatch.setattr(randao, "ENFORCE_RANDAO_SELECTION", False)
 
     async def _mix(db, slot, *a, **k):

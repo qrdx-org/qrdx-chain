@@ -111,7 +111,7 @@ class S15SpotSettlement(Scenario):
         from qrdx.exchange import ExchangeTransaction, ExchangeOpType
         from qrdx.exchange.amm import FeeTier, PoolType, sqrt_price_to_tick
         from qrdx.exchange.state_manager import ExchangeStateManager
-        from integration_tests.pool_operator import price_to_sqrt_price_q96
+        from integration_tests.amm_math import price_to_sqrt_price_q96
 
         key = PQPrivateKey.from_hex(w["private_key"], w["public_key"])
         sender = w["address"]

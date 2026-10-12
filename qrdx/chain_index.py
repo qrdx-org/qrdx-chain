@@ -26,7 +26,6 @@ checks each against it, across reorgs).
 from __future__ import annotations
 
 import asyncio
-import json
 import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -51,13 +50,6 @@ _SCHEMA = [
     " ON chain_index_votes(target_epoch, validator, carry_epoch)",
     "CREATE INDEX IF NOT EXISTS idx_chain_index_votes_carry ON chain_index_votes(carry_epoch)",
     "CREATE INDEX IF NOT EXISTS idx_chain_index_votes_height ON chain_index_votes(height)",
-    "CREATE TABLE IF NOT EXISTS chain_index_ops ("
-    " height INTEGER NOT NULL,"
-    " epoch INTEGER NOT NULL,"
-    " position INTEGER NOT NULL,"
-    " op TEXT NOT NULL)",  # JSON, as enumerate_canonical_validator_ops returns it
-    "CREATE INDEX IF NOT EXISTS idx_chain_index_ops_epoch ON chain_index_ops(epoch)",
-    "CREATE INDEX IF NOT EXISTS idx_chain_index_ops_height ON chain_index_ops(height)",
     "CREATE TABLE IF NOT EXISTS chain_index_offenders ("
     " height INTEGER NOT NULL,"
     " offender TEXT NOT NULL)",  # lower-cased address a verified proof convicts
@@ -80,13 +72,12 @@ _SCHEMA = [
 _TABLES = (
     "chain_index",
     "chain_index_votes",
-    "chain_index_ops",
     "chain_index_offenders",
     "chain_index_ffg",
 )
 # Bumped whenever what is derived per block changes: an index written by an older version is
 # dropped and re-derived (it is derived data; the chain is the source).
-_VERSION = "2"
+_VERSION = "3"  # 3: no stake-op index (it could not tell an executed deposit from a refused one)
 _BATCH = 256  # blocks read per query while catching up
 
 _locks: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = weakref.WeakKeyDictionary()
@@ -112,6 +103,7 @@ async def _ensure(db: Any) -> None:
     if row is None or row[0] != _VERSION:
         for table in _TABLES:
             await db.connection.execute(f"DELETE FROM {table}")
+        await db.connection.execute("DROP TABLE IF EXISTS chain_index_ops")  # retired in v3
         await db.connection.execute(
             "INSERT OR REPLACE INTO chain_index_meta (key, value) VALUES ('version', ?)",
             (_VERSION,),
@@ -149,8 +141,8 @@ def _reveal(bc: Optional[Dict[str, Any]]) -> Optional[bytes]:
 
 
 def _votes(bc: Optional[Dict[str, Any]], carry_epoch: Optional[int]) -> List[Tuple[int, str]]:
-    """(target_epoch, validator) for each attestation the block carries — what
-    validator_reconstruction.enumerate_canonical_epoch_attesters reads."""
+    """(target_epoch, validator) for each attestation the block carries — the reward input of
+    the validator set (validator/epoch_state.py)."""
     if bc is None or carry_epoch is None:
         return []
     from .validator.attestation_block import extract_attestations_from_dict
@@ -185,49 +177,6 @@ def _ffg(bc: Optional[Dict[str, Any]]) -> List[Tuple[str, int, str, int, str]]:
         ]
     except Exception:
         return []
-
-
-async def _ops(db: Any, block_hash: str, epoch: Optional[int]) -> List[Dict[str, Any]]:
-    """The block's STAKE_DEPOSIT / STAKE_EXIT ops, as enumerate_canonical_validator_ops
-    builds them."""
-    if epoch is None:
-        return []
-    from .exchange.block_processor import decode_exchange_txs
-    from .exchange.transactions import ExchangeOpType
-
-    try:
-        section = await db.get_block_exchange_txs(block_hash)
-    except Exception:
-        section = None
-    if not section:
-        return []
-    try:
-        txs = decode_exchange_txs(section)
-    except Exception:
-        return []
-    ops: List[Dict[str, Any]] = []
-    for i, tx in enumerate(txs):
-        if tx.op_type == ExchangeOpType.STAKE_DEPOSIT:
-            ops.append(
-                {
-                    "epoch": int(epoch),
-                    "tx_id": f"{block_hash}:{i}",
-                    "type": "deposit",
-                    "address": tx.sender,
-                    "public_key": str(tx.params.get("validator_public_key", "")),
-                    "stake": str(tx.params.get("stake_amount")),
-                }
-            )
-        elif tx.op_type == ExchangeOpType.STAKE_EXIT:
-            ops.append(
-                {
-                    "epoch": int(epoch),
-                    "tx_id": f"{block_hash}:{i}",
-                    "type": "exit",
-                    "address": tx.sender,
-                }
-            )
-    return ops
 
 
 def _offenders(bc: Optional[Dict[str, Any]]) -> List[str]:
@@ -276,12 +225,6 @@ async def _index_block(db: Any, height: int, block_hash: str, content: Any, mix:
             "INSERT INTO chain_index_votes (height, carry_epoch, target_epoch, validator) "
             "VALUES (?, ?, ?, ?)",
             [(height, epoch, te, v) for te, v in votes],
-        )
-    ops = await _ops(db, block_hash, epoch)
-    if ops:
-        await conn.executemany(
-            "INSERT INTO chain_index_ops (height, epoch, position, op) VALUES (?, ?, ?, ?)",
-            [(height, op["epoch"], i, json.dumps(op, sort_keys=True)) for i, op in enumerate(ops)],
         )
     for offender in _offenders(bc):
         await conn.execute(
@@ -401,67 +344,6 @@ async def highest_height_before_slot(db: Any, slot: int) -> int:
     return int(row[0]) if row and row[0] is not None else -1
 
 
-async def stake_ops(db: Any) -> List[Dict[str, Any]]:
-    """Every STAKE_DEPOSIT / STAKE_EXIT op on the canonical chain, in chain order."""
-    await sync(db)
-    cur = await db.connection.execute("SELECT op FROM chain_index_ops ORDER BY height, position")
-    return [json.loads(r[0]) for r in await cur.fetchall()]
-
-
-async def stake_ops_for_epoch(db: Any, epoch: int) -> List[Dict[str, Any]]:
-    """The STAKE ops carried in blocks of ``epoch``, in chain order."""
-    await sync(db)
-    cur = await db.connection.execute(
-        "SELECT op FROM chain_index_ops WHERE epoch = ? ORDER BY height, position", (int(epoch),)
-    )
-    return [json.loads(r[0]) for r in await cur.fetchall()]
-
-
-async def epoch_attesters(db: Any, finalized_epoch: int) -> Dict[int, List[str]]:
-    """{epoch: attesters} for epochs 0..``finalized_epoch``, counting only votes carried in
-    blocks of an epoch ≤ ``finalized_epoch`` (the finalized ones)."""
-    sets: Dict[int, List[str]] = {e: [] for e in range(int(finalized_epoch) + 1)}
-    await sync(db)
-    cur = await db.connection.execute(
-        "SELECT DISTINCT target_epoch, validator FROM chain_index_votes "
-        "WHERE carry_epoch <= ? AND target_epoch >= 0 AND target_epoch <= ? "
-        "ORDER BY target_epoch, validator",
-        (int(finalized_epoch), int(finalized_epoch)),
-    )
-    for te, validator in await cur.fetchall():
-        sets[int(te)].append(validator)
-    return sets
-
-
-async def attesters_of_epoch(db: Any, epoch: int, finalized_epoch: int) -> List[str]:
-    """Who attested ``epoch``, counting votes carried in blocks of an epoch ≤
-    ``finalized_epoch``."""
-    await sync(db)
-    cur = await db.connection.execute(
-        "SELECT DISTINCT validator FROM chain_index_votes "
-        "WHERE target_epoch = ? AND carry_epoch <= ? ORDER BY validator",
-        (int(epoch), int(finalized_epoch)),
-    )
-    return [r[0] for r in await cur.fetchall()]
-
-
-async def earliest_new_vote_epoch(db: Any, before_epoch: int, through_epoch: int) -> Optional[int]:
-    """The earliest target epoch ≤ ``before_epoch`` that gained an attester when finality moved
-    from ``before_epoch`` to ``through_epoch`` — a vote carried in a block of an epoch in
-    (before, through] by a validator not yet counted for that target. None if there is none."""
-    await sync(db)
-    cur = await db.connection.execute(
-        "SELECT MIN(v.target_epoch) FROM chain_index_votes v "
-        "WHERE v.carry_epoch > ? AND v.carry_epoch <= ? "
-        "AND v.target_epoch >= 0 AND v.target_epoch <= ? "
-        "AND NOT EXISTS (SELECT 1 FROM chain_index_votes w WHERE w.target_epoch = v.target_epoch "
-        "AND w.validator = v.validator AND w.carry_epoch <= ?)",
-        (int(before_epoch), int(through_epoch), int(before_epoch), int(before_epoch)),
-    )
-    row = await cur.fetchone()
-    return int(row[0]) if row and row[0] is not None else None
-
-
 async def slashed_before(db: Any, address: str, before_height: int) -> bool:
     """True if a canonical block below ``before_height`` carries a verified slashing proof
     against ``address``."""
@@ -471,6 +353,16 @@ async def slashed_before(db: Any, address: str, before_height: int) -> bool:
         (address.lower(), int(before_height)),
     )
     return (await cur.fetchone()) is not None
+
+
+async def offenders_before(db: Any, before_height: int) -> List[str]:
+    """Every address a canonical block below ``before_height`` convicts (lower-cased, sorted)."""
+    await sync(db, int(before_height) - 1)
+    cur = await db.connection.execute(
+        "SELECT DISTINCT offender FROM chain_index_offenders WHERE height < ? ORDER BY offender",
+        (int(before_height),),
+    )
+    return [r[0] for r in await cur.fetchall()]
 
 
 # ── Casper FFG (validator/ffg.py) ────────────────────────────────────────────────────────
@@ -549,8 +441,9 @@ async def voted_targets(
 
 async def validator_public_key(db: Any, address: str, before_height: int) -> Optional[bytes]:
     """The public key of ``address`` as the canonical chain records it below ``before_height``:
-    the genesis validator set, or a STAKE_DEPOSIT by the address — only a key that derives to
-    the address counts (a deposit does not otherwise prove the key is the sender's). The same
+    the genesis validator set, or an executed STAKE_DEPOSIT by the address (the
+    ``validator_deposits`` log block application writes) — only a key that derives to the
+    address counts (a deposit does not otherwise prove the key is the sender's). The same
     answer on every node holding the same chain."""
     from .crypto.pq.dilithium import PQPublicKey
 
@@ -569,17 +462,19 @@ async def validator_public_key(db: Any, address: str, before_height: int) -> Opt
                     return key
     except Exception:
         pass
-    await sync(db, int(before_height) - 1)
-    cur = await db.connection.execute(
-        "SELECT op FROM chain_index_ops WHERE height < ? ORDER BY height, position",
-        (int(before_height),),
-    )
-    for (op_json,) in await cur.fetchall():
-        op = json.loads(op_json)
-        if op.get("type") == "deposit" and op.get("address") == address:
-            key = owns(op.get("public_key"))
-            if key:
-                return key
+    try:
+        cur = await db.connection.execute(
+            "SELECT public_key FROM validator_deposits WHERE address = ? AND block_height < ? "
+            "ORDER BY block_height, id",
+            (address, int(before_height)),
+        )
+        rows = await cur.fetchall()
+    except Exception:
+        return None  # no deposit log (a database without validators)
+    for (key_hex,) in rows:
+        key = owns(key_hex)
+        if key:
+            return key
     return None
 
 

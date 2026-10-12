@@ -30,12 +30,26 @@ from .block_verification import verify_pos_block_proposer
 BLOCK_SLASHING_KEY = "slashing_evidence"
 
 
-def make_double_sign_evidence(header_a: Dict[str, Any], header_b: Dict[str, Any]) -> Dict[str, Any]:
+def make_double_sign_evidence(
+    header_a: Dict[str, Any], header_b: Dict[str, Any], public_key_hex: Optional[str] = None
+) -> Dict[str, Any]:
     """Build a canonical DOUBLE_SIGN evidence dict from two signed block-content headers.
 
     The two headers are ordered by hash so the evidence is byte-identical regardless of which
     block a node saw first — the same offence yields the same evidence on every node
-    (deterministic, so ``INSERT OR IGNORE`` on (validator, slot, condition) dedups cleanly)."""
+    (deterministic, so ``INSERT OR IGNORE`` on (validator, slot, condition) dedups cleanly).
+    Blocks no longer carry the proposer's key, so ``public_key_hex`` is attached to both headers
+    for importers to verify with no external state (a wrong key fails: it must derive to the
+    proposer's address)."""
+    if public_key_hex:
+        header_a = {
+            **header_a,
+            "proposer_public_key": header_a.get("proposer_public_key") or public_key_hex,
+        }
+        header_b = {
+            **header_b,
+            "proposer_public_key": header_b.get("proposer_public_key") or public_key_hex,
+        }
     ha = str(header_a.get("hash") or header_a.get("block_hash") or "")
     hb = str(header_b.get("hash") or header_b.get("block_hash") or "")
     if ha > hb:

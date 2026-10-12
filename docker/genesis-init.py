@@ -17,6 +17,19 @@ Idempotent: if the genesis file already exists it is left alone. Genesis is
 fixed for the life of the chain — changing QRDX_GENESIS_ALLOCATIONS afterwards
 only logs a warning; a different genesis needs a wiped data volume.
 
+An existing genesis is first checked with the node's own loader. One written by an
+older release whose chain spec this release cannot run (it lacks a parameter added
+since) fails HERE, with the reason and the fix, instead of passing and leaving the
+node to crash-loop on import. Such a chain cannot be upgraded in place; run once with
+--reset to start a new one:
+
+  docker compose -f docker/docker-compose.tunnel.yml run --rm genesis-init --reset
+
+--reset moves the old genesis and the database directory to <data>/retired/<UTC time>/
+and writes a fresh genesis. The validator wallet and the node identity key are kept
+(unlike `down -v`). It only ever replaces a genesis this release cannot run; on a
+working chain it refuses.
+
 The file is written atomically. A half-written file would fail to parse, and the
 node would refuse to start on it.
 
@@ -31,7 +44,7 @@ Environment
   QRDX_CHAIN_ID                 required — 762 for qrdx-mainnet, 7620 for qrdx-testnet,
                                 otherwise an id no other EVM network uses (every signed
                                 transaction is bound to it)
-  QRDX_NETWORK_NAME             [qrdx-mainnet]
+  QRDX_NETWORK_NAME             [qrdx-mainnet for 762, qrdx-testnet for 7620, else qrdx-mainnet]
   QRDX_SLOT_DURATION_MS, ...    any network parameter (qrdx/chain_spec.py PARAMS)
   QRDX_VALIDATOR_ENABLED        must be true — a genesis node has to propose
   QRDX_VALIDATOR_WALLET         [/app/data/validator/validator.json]
@@ -39,7 +52,10 @@ Environment
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -61,7 +77,7 @@ GENESIS_FILE = DATABASE_PATH.parent.parent / "genesis_config.json"
 ALLOCATIONS_RAW = os.getenv("QRDX_GENESIS_ALLOCATIONS", "")
 VALIDATOR_STAKE_RAW = os.getenv("QRDX_GENESIS_VALIDATOR_STAKE", "100000")
 CHAIN_ID_RAW = os.getenv("QRDX_CHAIN_ID", "").strip()
-NETWORK_NAME = os.getenv("QRDX_NETWORK_NAME", "qrdx-mainnet")
+NETWORK_NAME = os.getenv("QRDX_NETWORK_NAME", "").strip()
 VALIDATOR_ENABLED = os.getenv("QRDX_VALIDATOR_ENABLED", "false").lower() in TRUTHY
 WALLET_PATH = Path(os.getenv("QRDX_VALIDATOR_WALLET") or "/app/data/validator/validator.json")
 
@@ -132,7 +148,72 @@ def warn_if_drifted(allocations: dict) -> None:
         )
 
 
+def unusable_reason():
+    """Why this release cannot run the chain whose genesis is on the volume, or None if it can.
+    The same load the node does when it imports qrdx.constants."""
+    from qrdx import chain_spec as cs  # no qrdx imports of its own; safe before the check
+
+    try:
+        cs.load_genesis_file(str(GENESIS_FILE))
+    except cs.ChainSpecError as e:
+        return str(e)
+    return None
+
+
+def activate_spec(spec) -> None:
+    """Make qrdx.constants load THIS chain's spec when it is imported. With no genesis file it
+    would build a dev network's spec from the environment instead, which refuses a QRDX
+    network's chain id (762, 7620), and the genesis would be built under rules other than the
+    ones its nodes will run. A stub holding only the spec stands in for the genesis file."""
+    if "qrdx.constants" in sys.modules:
+        raise RuntimeError("qrdx.constants was imported before the chain spec was activated")
+    stub = Path(tempfile.mkdtemp()) / "genesis_config.json"
+    stub.write_text(json.dumps({"chain_spec": spec.to_dict()}))
+    os.environ["QRDX_GENESIS_FILE"] = str(stub)
+
+
+def retire_chain() -> Path:
+    """Move the old genesis and database directory to <data>/retired/<UTC time>/. Moved, not
+    deleted: the old chain stays on the volume until you remove it."""
+    db_dir = DATABASE_PATH.parent
+    dest = GENESIS_FILE.parent / "retired" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest.mkdir(parents=True)
+    # The database directory goes first, while the old genesis is still in place: a node
+    # restarting meanwhile reads the old genesis and exits at import, before it opens a database.
+    if db_dir.exists():
+        shutil.move(str(db_dir), str(dest / db_dir.name))
+    shutil.copy2(GENESIS_FILE, dest / GENESIS_FILE.name)  # the new one replaces it atomically
+    return dest
+
+
 def main() -> int:
+    reset = "--reset" in sys.argv[1:]
+    unusable = unusable_reason() if GENESIS_FILE.exists() else None
+
+    if unusable and not reset:
+        log.error("%s cannot be run by this release:", GENESIS_FILE)
+        log.error("  %s", unusable)
+        log.error(
+            "It was written by an older release, and a chain cannot be upgraded in place. The "
+            "node would crash on startup, so it is not started. To start a NEW chain (keeping "
+            "this node's validator key and identity), run once:"
+        )
+        log.error("  docker compose -f docker/docker-compose.tunnel.yml run --rm genesis-init --reset")
+        log.error("(with the same -f files you start the stack with), then `up -d` again.")
+        return 1
+    if reset and GENESIS_FILE.exists() and not unusable:
+        log.error(
+            "--reset refused: this release can run the chain on this volume. --reset only "
+            "replaces a genesis it cannot run; to discard a working chain use `down -v` (which "
+            "also deletes the validator key — back it up first)."
+        )
+        return 1
+    if unusable:
+        if WALLET_PATH.resolve().is_relative_to(DATABASE_PATH.parent.resolve()):
+            log.error("--reset refused: the validator wallet %s is inside the database directory "
+                      "%s, which --reset moves away", WALLET_PATH, DATABASE_PATH.parent)
+            return 1
+
     try:
         allocations = parse_allocations(ALLOCATIONS_RAW)
         validator_stake = parse_amount(VALIDATOR_STAKE_RAW, "QRDX_GENESIS_VALIDATOR_STAKE")
@@ -140,7 +221,7 @@ def main() -> int:
         log.error("%s", e)
         return 1
 
-    if GENESIS_FILE.exists():
+    if GENESIS_FILE.exists() and not unusable:
         log.info("%s already exists — leaving it untouched.", GENESIS_FILE)
         warn_if_drifted(allocations)
         return 0
@@ -159,18 +240,23 @@ def main() -> int:
         return 1
 
     from qrdx import chain_spec as cs
-    from qrdx.constants import MIN_VALIDATOR_STAKE
-    from qrdx.validator.genesis import GenesisConfig, GenesisCreator
 
     if not CHAIN_ID_RAW.isdigit():
         log.error("QRDX_CHAIN_ID must be set to this chain's id (a positive integer no other EVM "
                   "network uses — every signed transaction is bound to it); got %r", CHAIN_ID_RAW)
         return 1
+    chain_id = int(CHAIN_ID_RAW)
+    # A QRDX network's own chain id implies its name; otherwise the historical default.
+    network = NETWORK_NAME or cs.QRDX_NETWORKS.get(chain_id, "qrdx-mainnet")
     try:
-        spec = cs.build_spec(NETWORK_NAME, int(CHAIN_ID_RAW), cs.params_from_environment())
+        spec = cs.build_spec(network, chain_id, cs.params_from_environment())
     except cs.ChainSpecError as e:
         log.error("invalid chain spec: %s", e)
         return 1
+
+    activate_spec(spec)
+    from qrdx.constants import MIN_VALIDATOR_STAKE
+    from qrdx.validator.genesis import GenesisConfig, GenesisCreator
 
     if validator_stake < MIN_VALIDATOR_STAKE:
         log.error("QRDX_GENESIS_VALIDATOR_STAKE %s is below the minimum %s", validator_stake, MIN_VALIDATOR_STAKE)
@@ -192,6 +278,9 @@ def main() -> int:
     GENESIS_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = GENESIS_FILE.with_name(GENESIS_FILE.name + ".tmp")
     creator.export_genesis(state, block, str(tmp))
+    if unusable:
+        retired = retire_chain()
+        log.info("retired the old chain to %s", retired)
     os.replace(tmp, GENESIS_FILE)
 
     log.info("wrote %s", GENESIS_FILE)

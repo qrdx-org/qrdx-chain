@@ -89,7 +89,7 @@ class S18ClobMatch(Scenario):
         from qrdx.exchange import ExchangeTransaction, ExchangeOpType
         from qrdx.exchange.amm import FeeTier, PoolType
         from qrdx.exchange.state_manager import ExchangeStateManager
-        from integration_tests.pool_operator import price_to_sqrt_price_q96
+        from integration_tests.amm_math import price_to_sqrt_price_q96
 
         mkey = PQPrivateKey.from_hex(maker["private_key"], maker["public_key"])
         tkey = PQPrivateKey.from_hex(taker["private_key"], taker["public_key"])

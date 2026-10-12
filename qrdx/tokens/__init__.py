@@ -1,10 +1,9 @@
 """
-QRDX Token Standard (qRC20) — Whitepaper §9
+The Doomsday advisory hook — Whitepaper §9.2.
 
-Provides:
-  - QRC20Token       : PQ-verified fungible token with ERC-20–style interface
-  - QRC20Registry    : Global token registry (deploy / lookup)
-  - DoomsdayHook     : Advisory trading flag after Doomsday activation
+Tokens are the native token standard (qrdx/exchange/tokens.py, docs/NATIVE_TOKENS.md); a token's
+deployer sets the ``post_doomsday_trade`` extension. The in-memory qRC20 class that used to live
+here backed no consensus path and is retired.
 """
 
 from .doomsday_hook import (
@@ -12,26 +11,8 @@ from .doomsday_hook import (
     DoomsdayTradingMode,
     DoomsdayTradingPreference,
 )
-from .qrc20 import (
-    InsufficientAllowanceError,
-    InsufficientBalanceError,
-    QRC20ApprovalEvent,
-    QRC20Error,
-    QRC20Registry,
-    QRC20Token,
-    QRC20TransferEvent,
-)
 
 __all__ = [
-    # Core token
-    "QRC20Token",
-    "QRC20Registry",
-    "QRC20TransferEvent",
-    "QRC20ApprovalEvent",
-    "QRC20Error",
-    "InsufficientBalanceError",
-    "InsufficientAllowanceError",
-    # Doomsday hook
     "DoomsdayHook",
     "DoomsdayTradingMode",
     "DoomsdayTradingPreference",

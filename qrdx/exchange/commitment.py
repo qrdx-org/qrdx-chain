@@ -92,42 +92,71 @@ class CommittedDict(dict):
         self._acc = lthash.ZERO
         self._digests: Dict[Any, bytes] = {}
         self._dirty: Set[Any] = set(dict.keys(self))
+        self._changes: Optional[Set[Any]] = None  # see track_changes
+
+    # ── changes, for derived indexes (the liquidation index) ─────────────
+
+    def track_changes(self) -> None:
+        """Start keeping every key marked from now on for ``take_changes``."""
+        if self._changes is None:
+            self._changes = set()
+
+    def take_changes(self) -> Set[Any]:
+        """Every key marked since the last call (since ``track_changes`` the first time). Each
+        mark is kept as it happens, so a derived index syncing many times a block processes
+        each change once (it used to get every key marked since the last commitment, each
+        call)."""
+        if self._changes is None:
+            return set(self._dirty)
+        out, self._changes = self._changes, set()
+        return out
 
     # ── marking writes ───────────────────────────────────────────────────
 
+    def _mark(self, key: Any) -> None:
+        self._dirty.add(key)
+        if self._changes is not None:
+            self._changes.add(key)
+
+    def _mark_all(self, keys: Iterable[Any]) -> None:
+        keys = list(keys)
+        self._dirty.update(keys)
+        if self._changes is not None:
+            self._changes.update(keys)
+
     def __setitem__(self, key: Any, value: Any) -> None:
         dict.__setitem__(self, key, value)
-        self._dirty.add(key)
+        self._mark(key)
 
     def __delitem__(self, key: Any) -> None:
         dict.__delitem__(self, key)
-        self._dirty.add(key)
+        self._mark(key)
 
     def pop(self, key: Any, *default: Any) -> Any:
         if dict.__contains__(self, key):
-            self._dirty.add(key)
+            self._mark(key)
         return dict.pop(self, key, *default)
 
     def popitem(self) -> Tuple[Any, Any]:
         key, value = dict.popitem(self)
-        self._dirty.add(key)
+        self._mark(key)
         return key, value
 
     def setdefault(self, key: Any, default: Any = None) -> Any:
-        self._dirty.add(key)
+        self._mark(key)
         return dict.setdefault(self, key, default)
 
     def update(self, *args: Any, **kwargs: Any) -> None:
         other = dict(*args, **kwargs)
         dict.update(self, other)
-        self._dirty.update(other)
+        self._mark_all(other)
 
     def __ior__(self, other: Any) -> "CommittedDict":  # type: ignore[misc]
         self.update(other)
         return self
 
     def clear(self) -> None:
-        self._dirty.update(dict.keys(self))
+        self._mark_all(dict.keys(self))
         dict.clear(self)
 
     # ── reads (marking when values are mutable) ──────────────────────────
@@ -135,22 +164,22 @@ class CommittedDict(dict):
     def __getitem__(self, key: Any) -> Any:
         value = dict.__getitem__(self, key)
         if self._mutable:
-            self._dirty.add(key)
+            self._mark(key)
         return value
 
     def get(self, key: Any, default: Any = None) -> Any:
         if self._mutable and dict.__contains__(self, key):
-            self._dirty.add(key)
+            self._mark(key)
         return dict.get(self, key, default)
 
     def values(self):  # type: ignore[override]
         if self._mutable:
-            self._dirty.update(dict.keys(self))
+            self._mark_all(dict.keys(self))
         return dict.values(self)
 
     def items(self):  # type: ignore[override]
         if self._mutable:
-            self._dirty.update(dict.keys(self))
+            self._mark_all(dict.keys(self))
         return dict.items(self)
 
     # ── unmarked reads, for code that only reads ─────────────────────────
@@ -172,6 +201,7 @@ class CommittedDict(dict):
         new.__dict__.update(self.__dict__)
         new._digests = dict(self._digests)
         new._dirty = set(self._dirty)
+        new._changes = None if self._changes is None else set(self._changes)
         return new
 
     def __copy__(self) -> "CommittedDict":
@@ -185,6 +215,10 @@ class CommittedDict(dict):
         new.__dict__.update(self.__dict__)
         new._digests = dict(self._digests)  # keys and digests are immutable
         new._dirty = set(self._dirty)
+        new._changes = None if self._changes is None else set(self._changes)
+        # The marker tying a derived index to this dict (it is copied with it).
+        if "_index_token" in self.__dict__:
+            new.__dict__["_index_token"] = copy.deepcopy(self.__dict__["_index_token"], memo)
         return new
 
     def __reduce__(self):  # pickling: rebuild from the entries (every entry dirty)

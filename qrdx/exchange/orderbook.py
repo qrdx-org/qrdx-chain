@@ -32,13 +32,17 @@ from __future__ import annotations
 import copy
 import functools
 import hashlib
+import itertools
 import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Context, Decimal, localcontext
 from enum import Enum
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+
+from ..crypto import lthash
+from .commitment import CommittedDict, _apply, _vector, as_committed_dict, encode_value
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +210,11 @@ class OrderBook:
       - Emergency pause
     """
 
+    # Set by the perps clearinghouse for the length of one match: called as
+    # ``maker_guard(maker, amount)`` before a maker fills; False cancels the maker (it no longer
+    # qualifies for the fill) and matching moves on. Never left set (the book is pickled).
+    maker_guard: Optional[Callable[[Order, Decimal], bool]] = None
+
     def __init__(
         self,
         pool_id: str = "",
@@ -236,7 +245,10 @@ class OrderBook:
         # --- Security state ---
         self._owner_order_count: Dict[str, int] = {}
         self._owner_stop_count: Dict[str, int] = {}
-        self._owner_nonces: Dict[str, int] = {}
+        # Committed per owner (it grows with every owner who ever traded on the book).
+        self._owner_nonces: Dict[str, int] = as_committed_dict(
+            {}, "book.nonces", encode_value, mutable=False
+        )
         self._block_order_count: Dict[str, int] = {}
         self._trade_sequence: int = 0
         self._paused: bool = False
@@ -250,18 +262,33 @@ class OrderBook:
         self._version: int = 0
         self._digest: Optional[bytes] = None
         self._digest_version: int = -1
+        # Per price level (qrdx/exchange/commitment.py): each level's digest, their LtHash, and
+        # the levels touched since — so a block costs the levels it changed, not the book.
+        self._level_digests: Optional[Dict[Tuple[str, Decimal], bytes]] = None
+        self._level_acc: bytes = lthash.ZERO
+        self._dirty_levels: set = set()
+        self._has_expiring = False  # an order with an expiry was ever added
 
     # -- Properties ---------------------------------------------------------
 
     @property
     def best_bid(self) -> Optional[Decimal]:
-        active = [p for p, lvl in self._bids.items() if lvl.total_amount > 0]
-        return max(active) if active else None
+        return next((p for p, _amount in self.iter_levels(bids=True)), None)
 
     @property
     def best_ask(self) -> Optional[Decimal]:
-        active = [p for p, lvl in self._asks.items() if lvl.total_amount > 0]
-        return min(active) if active else None
+        return next((p for p, _amount in self.iter_levels(bids=False)), None)
+
+    def iter_levels(self, bids: bool):
+        """(price, resting amount) of each live level, best first, lazily: a reader that needs
+        the top of the book stops there (every block's tick reads it; summing every level's
+        orders cost 4 ms at 4,000 resting orders)."""
+        levels = self._bids if bids else self._asks
+        for price in sorted(levels, reverse=bids):
+            with localcontext(_CTX):  # a generator: pinned per step, whoever iterates it
+                amount = levels[price].total_amount
+            if amount > 0:
+                yield price, amount
 
     @property
     def spread(self) -> Optional[Decimal]:
@@ -325,13 +352,29 @@ class OrderBook:
         self.__dict__.clear()
         self.__dict__.update(state)
         self._trades = deque(trades, maxlen=MAX_RECENT_TRADES)
+        self._level_digests = None  # recomputed in full
         self._version += 1
 
-    @_pinned
-    def state_digest(self) -> bytes:
-        """Every consensus-relevant field: each resting order in priority order (price level,
-        then time), each parked stop order, the owners' order nonces, the trade sequence, the
-        last trade price and the totals — not the display history or any wall-clock stamp."""
+    def _touch(self, side: OrderSide, price: Decimal) -> None:
+        """A resting level changed: an order added, filled, cancelled or removed, or the level
+        itself dropped. Its digest is redone at the next ``cached_digest``."""
+        dirty = self.__dict__.get("_dirty_levels")
+        if dirty is not None:
+            dirty.add(("b" if side == OrderSide.BUY else "a", price))
+
+    def _level_digest(self, tag: str, price: Decimal, level: PriceLevel) -> bytes:
+        parts = [f"{tag}{price}"]
+        for o in level.orders:  # time priority
+            parts.append(
+                f"{o.id}:{o.owner}:{o.side.value}:{o.order_type.value}:"
+                f"{o.price}:{o.amount}:{o.filled}:{o.status.value}:{o.nonce}:"
+                f"{o.expire_time}"
+            )
+        return hashlib.blake2b("|".join(parts).encode(), digest_size=32).digest()
+
+    def _compose(self, levels: bytes, nonces: bytes) -> bytes:
+        """The book digest from its parts: the header fields, the levels' LtHash, every parked
+        stop order (few), the owners' nonces."""
         parts = [
             self.pool_id,
             str(self._trade_sequence),
@@ -339,31 +382,67 @@ class OrderBook:
             str(self.total_volume),
             str(self.last_price),
         ]
-        for tag, levels, best_first in (("b", self._bids, True), ("a", self._asks, False)):
-            for price in sorted(levels, reverse=best_first):
-                parts.append(f"{tag}{price}")
-                for o in levels[price].orders:
-                    parts.append(
-                        f"{o.id}:{o.owner}:{o.side.value}:{o.order_type.value}:"
-                        f"{o.price}:{o.amount}:{o.filled}:{o.status.value}:{o.nonce}:"
-                        f"{o.expire_time}"
-                    )
         for oid in sorted(self._stop_orders):
             o = self._stop_orders[oid]
             parts.append(
                 f"s{o.id}:{o.owner}:{o.side.value}:{o.stop_price}:{o.amount}:"
                 f"{o.filled}:{o.status.value}:{o.nonce}:{o.expire_time}"
             )
-        for owner in sorted(self._owner_nonces):
-            parts.append(f"n{owner}:{self._owner_nonces[owner]}")
-        return hashlib.blake2b("|".join(parts).encode(), digest_size=32).digest()
+        h = hashlib.blake2b(digest_size=32)
+        h.update("|".join(parts).encode())
+        h.update(levels)
+        h.update(nonces)
+        return h.digest()
 
+    def _nonces(self) -> CommittedDict:
+        if not isinstance(self._owner_nonces, CommittedDict):  # a book from before
+            self._owner_nonces = as_committed_dict(
+                dict(self._owner_nonces), "book.nonces", encode_value, mutable=False
+            )
+        return self._owner_nonces
+
+    @_pinned
+    def state_digest(self) -> bytes:
+        """Every consensus-relevant field, from scratch: each resting order in priority order
+        (per price level, then time), each parked stop order, the owners' order nonces, the
+        trade sequence, the last trade price and the totals — not the display history or any
+        wall-clock stamp. ``cached_digest`` keeps the same value up to date incrementally."""
+        acc = lthash.Accumulator()
+        for tag, levels in (("b", self._bids), ("a", self._asks)):
+            for price, level in levels.items():
+                acc.add(_vector("book.level", self._level_digest(tag, price, level)))
+        return self._compose(acc.digest(), self._nonces().full_commitment())
+
+    @_pinned
     def cached_digest(self) -> bytes:
-        """``state_digest()``, recomputed only after an entry point that may have changed the
-        book (place, cancel, expiry, restore, pause)."""
-        if self._digest is None or self._digest_version != self._version:
-            self._digest = self.state_digest()
-            self._digest_version = self._version
+        """``state_digest()``, redoing only the levels touched since the last call (a book used
+        to be re-digested whole — 6 ms at 4,000 resting orders — whenever a block touched it)."""
+        if self._digest is not None and self._digest_version == self._version:
+            return self._digest
+        digests = self.__dict__.get("_level_digests")
+        if digests is None:
+            digests, self._level_acc = {}, lthash.ZERO
+            dirty = {("b", p) for p in self._bids} | {("a", p) for p in self._asks}
+        else:
+            dirty = self.__dict__.get("_dirty_levels") or set()
+        removed, added = lthash.Accumulator(), lthash.Accumulator()
+        for key in dirty:
+            tag, price = key
+            old = digests.pop(key, None)
+            level = (self._bids if tag == "b" else self._asks).get(price)
+            new = self._level_digest(tag, price, level) if level is not None else None
+            if new is not None:
+                digests[key] = new
+            if old != new:
+                if old is not None:
+                    removed.add(_vector("book.level", old))
+                if new is not None:
+                    added.add(_vector("book.level", new))
+        self._level_acc = _apply(self._level_acc, removed, added)
+        self._level_digests = digests
+        self._dirty_levels = set()
+        self._digest = self._compose(self._level_acc, self._nonces().commitment())
+        self._digest_version = self._version
         return self._digest
 
     def verify_digest(self) -> None:
@@ -451,6 +530,7 @@ class OrderBook:
         order.status = OrderStatus.CANCELLED
 
         # Remove from price level
+        self._touch(order.side, order.price)
         book = self._bids if order.side == OrderSide.BUY else self._asks
         level = book.get(order.price)
         if level:
@@ -525,6 +605,7 @@ class OrderBook:
 
     def _match_at_level(self, taker: Order, level: PriceLevel, price: Decimal) -> List[Trade]:
         """Match taker against all makers at a price level (time priority)."""
+        self._touch(OrderSide.SELL if taker.side == OrderSide.BUY else OrderSide.BUY, price)
         trades: List[Trade] = []
         for maker in list(level.orders):
             if taker.remaining <= 0:
@@ -554,6 +635,12 @@ class OrderBook:
                     return trades
 
             fill_amount = min(taker.remaining, maker.remaining)
+            if self.maker_guard is not None and not self.maker_guard(maker, fill_amount):
+                maker.status = OrderStatus.CANCELLED
+                level.remove_order(maker.id)
+                self._orders.pop(maker.id, None)
+                self._decrement_owner_count(maker.owner)
+                continue
 
             maker_fee = (fill_amount * price * self.maker_fee_rate).quantize(
                 Decimal("0.00000001"), rounding=ROUND_HALF_UP
@@ -630,6 +717,12 @@ class OrderBook:
                 triggered.append(oid)
 
         for oid in triggered:
+            # Matching a triggered stop checks the triggers again (its fills move the last
+            # price), so a stop listed here may already have been triggered and removed by that
+            # inner check. It used to raise KeyError out of the order book — any two stop orders
+            # could make a block's exchange section fail.
+            if oid not in self._stop_orders:
+                continue
             order = self._stop_orders.pop(oid)
             self._decrement_owner_count(order.owner, is_stop=True)
             order.order_type = OrderType.MARKET
@@ -654,6 +747,9 @@ class OrderBook:
         if order.price not in book:
             book[order.price] = PriceLevel(price=order.price)
 
+        self._touch(order.side, order.price)
+        if order.expire_time:
+            self._has_expiring = True
         book[order.price].add_order(order)
         self._orders[order.id] = order
         self._owner_order_count[order.owner] = count + 1
@@ -707,6 +803,8 @@ class OrderBook:
     def _cleanup_expired(self) -> None:
         """Remove expired orders during new_block. (No exchange operation sets an expiry today;
         one that did would also have to refund an expired spot order's escrow.)"""
+        if not self.__dict__.get("_has_expiring", True):
+            return  # nothing resting can expire: no walk over every order each block
         for oid in list(self._orders):
             order = self._orders[oid]
             if order.expired(self._now) and order.is_active:
@@ -729,16 +827,12 @@ class OrderBook:
     @_pinned
     def get_bids(self, depth: int = 10) -> List[Tuple[Decimal, Decimal]]:
         """Top N bid levels as (price, total_amount)."""
-        active = [(p, lvl.total_amount) for p, lvl in self._bids.items() if lvl.total_amount > 0]
-        active.sort(key=lambda x: x[0], reverse=True)
-        return active[:depth]
+        return list(itertools.islice(self.iter_levels(bids=True), max(0, depth)))
 
     @_pinned
     def get_asks(self, depth: int = 10) -> List[Tuple[Decimal, Decimal]]:
         """Top N ask levels as (price, total_amount)."""
-        active = [(p, lvl.total_amount) for p, lvl in self._asks.items() if lvl.total_amount > 0]
-        active.sort(key=lambda x: x[0])
-        return active[:depth]
+        return list(itertools.islice(self.iter_levels(bids=False), max(0, depth)))
 
     def get_recent_trades(self, count: int = 50) -> List[Trade]:
         return list(self._trades)[-count:] if count > 0 else []

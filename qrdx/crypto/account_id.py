@@ -89,10 +89,11 @@ ACCOUNT_ID_LENGTH = 20  # bytes
 # user-supplied recipient silently keyable, which is exactly the strictness that
 # catches an unspendable TOKEN_TRANSFER recipient before it burns the tokens.
 # Adding a new protocol-derived holder form means adding it here, deliberately.
-SYNTHETIC_HOLDER_PREFIXES = ("0xPOOL", "0xCLOB", "0xPERP", "0xVETO")
+SYNTHETIC_HOLDER_PREFIXES = ("0xPOOL", "0xCLOB", "0xPERP", "0xVETO", "0xBRDG")
 
 # 0xPERP is the perps clearinghouse holder (docs/PERPS_CLEARINGHOUSE.md): all perp collateral.
 # 0xVETO is the governance veto escrow (docs/GOVERNANCE.md): QRDX locked against proposals.
+# 0xBRDG is the bridge's mint authority (docs/BRIDGE.md): no key can mint a bridged token.
 # Every synthetic form is <prefix> + blake2b(digest_size=18).hexdigest() = 36 hex chars.
 # Validated, so a malformed one raises like any other bad address rather than being
 # hashed into some arbitrary account.

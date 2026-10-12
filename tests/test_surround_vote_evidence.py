@@ -120,15 +120,16 @@ def test_pubkey_address_mismatch_rejected():
 
 
 async def test_surround_vote_records_and_enforces_50pct():
-    """Full path: a surround-vote proof in a block is recorded (verified) as a SURROUND_VOTE
-    slashing_event → the enforced finalized-epoch slash penalises 50% + ejects. Mirrors the
-    DOUBLE_SIGN enforce path (both ride the same evidence-in-blocks transport)."""
+    """Full path: a surround-vote proof in a block is verified, recorded, and slashes the
+    offender in the validator set of the next epoch — half its stake, and out. Mirrors the
+    DOUBLE_SIGN path (both ride the same evidence-in-blocks transport)."""
     import os
     import tempfile
     from decimal import Decimal
+    from qrdx.constants import SLOTS_PER_EPOCH
     from qrdx.database_sqlite import DatabaseSQLite
+    from qrdx.validator import epoch_state as ES
     from qrdx.validator.slashing_block import record_block_slashing_evidence, BLOCK_SLASHING_KEY
-    from qrdx.validator.epoch_loop import apply_epoch_slashings
 
     key = PQPrivateKey.generate()
     addr = key.public_key.to_address()
@@ -141,18 +142,18 @@ async def test_surround_vote_records_and_enforces_50pct():
     os.close(fd)
     db = await DatabaseSQLite.create(path)
     try:
-        await db.connection.execute(
-            "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
-            "activation_epoch) VALUES (?, 'pk', '100000', '100000', 'active', 0)", (addr,))
-        await db.connection.commit()
+        others = [f"0xPQ{c * 64}" for c in "abc"]
+        await db.record_genesis_validators(
+            [{"address": x, "public_key": "", "stake": "100000"} for x in [addr, *others]])
+        for h, slot, extra in ((0, 0, {}), (1, SLOTS_PER_EPOCH + 1, {BLOCK_SLASHING_KEY: [ev]})):
+            content = {"number": h, "slot": slot, "epoch": slot // SLOTS_PER_EPOCH, **extra}
+            await db.connection.execute(
+                "INSERT INTO blocks (block_hash, block_height, content, timestamp) "
+                "VALUES (?, ?, ?, 0)", (f"{h:064x}", h, repr(content)))
         assert await record_block_slashing_evidence(db, {BLOCK_SLASHING_KEY: [ev]}) == 1
         await db.connection.commit()
-        await apply_epoch_slashings(db, epoch=6, enforce=True)  # offence epoch 3 <= 6
-        await db.connection.commit()
-        c = await db.connection.execute(
-            "SELECT status, effective_stake FROM validators WHERE address = ?", (addr,))
-        status, eff = await c.fetchone()
-        assert status == "slashed" and Decimal(eff) == Decimal("50000")  # 50% slash + eject
+        state = await ES.state_at(db, 2)
+        assert state[addr].status == "slashed" and state[addr].effective_stake == Decimal("50000")
     finally:
         await db.connection.close()
         os.remove(path)

@@ -25,7 +25,7 @@ import statistics
 import threading
 import time
 from decimal import Decimal, InvalidOperation
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from ..logger import get_logger
 
@@ -40,8 +40,15 @@ def _positive(value) -> Optional[Decimal]:
     return d if d.is_finite() and d > 0 else None
 
 
+# A vote key for a market's external perp price ("BTC:perp"): the median of other venues'
+# perpetuals, the mark price's third input (exchange/clearinghouse.py ``_refresh_mark``).
+PERP_SUFFIX = ":perp"
+
+
 def underlying(base: str) -> str:
-    """qBTC → BTC: a bridged asset is priced as what it bridges."""
+    """qBTC → BTC: a bridged asset is priced as what it bridges (its perp key likewise)."""
+    if base.endswith(PERP_SUFFIX):
+        return underlying(base[: -len(PERP_SUFFIX)]) + PERP_SUFFIX
     return base[1:] if len(base) > 1 and base[0] == "q" and base[1:].isupper() else base
 
 
@@ -93,6 +100,22 @@ _EXCHANGES: List[Callable[[str], tuple]] = [
     lambda s: (f"https://api.binance.com/api/v3/ticker/price?symbol={s}USDT", lambda j: j["price"]),
 ]
 
+# Public USD-margined perpetual endpoints, for the "<base>:perp" keys.
+_PERP_EXCHANGES: List[Callable[[str], tuple]] = [
+    lambda s: (
+        f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={s}USDT",
+        lambda j: j["price"],
+    ),
+    lambda s: (
+        f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={s}USDT",
+        lambda j: j["result"]["list"][0]["lastPrice"],
+    ),
+    lambda s: (
+        f"https://www.okx.com/api/v5/market/ticker?instId={s}-USDT-SWAP",
+        lambda j: j["data"][0]["last"],
+    ),
+]
+
 
 class ExchangePriceFeed(PriceFeed):
     """Median of the exchanges that answered, per asset, refreshed every ``interval`` seconds in
@@ -124,8 +147,10 @@ class ExchangePriceFeed(PriceFeed):
                 wanted = sorted(self._wanted)
             for symbol in wanted:
                 quotes = []
-                for endpoint in _EXCHANGES:
-                    url, read = endpoint(symbol)
+                perp = symbol.endswith(PERP_SUFFIX)
+                asset = symbol[: -len(PERP_SUFFIX)] if perp else symbol
+                for endpoint in _PERP_EXCHANGES if perp else _EXCHANGES:
+                    url, read = endpoint(asset)
                     try:
                         r = httpx.get(url, timeout=self.timeout)
                         p = _positive(read(r.json()))
@@ -153,15 +178,21 @@ def feed_from_env(spec: Optional[str] = None) -> Optional[PriceFeed]:
     return None
 
 
-def build_vote(wallet, nonce: int, prices: Dict[str, Decimal]):
-    """An ORACLE_VOTE exchange transaction signed by the validator's PQ wallet."""
+def build_vote(wallet, nonce: int, prices: Dict[str, Decimal], deposits=None):
+    """An ORACLE_VOTE exchange transaction signed by the validator's PQ wallet. ``nonce`` is the
+    vote's own sequence (the slot it was made in): it must exceed the voter's last applied one,
+    and does not touch the account's exchange nonce. ``deposits``: bridge deposits it attests
+    (docs/BRIDGE.md)."""
     from ..exchange import ExchangeOpType, ExchangeTransaction
 
+    params: Dict[str, Any] = {"prices": {b: str(p) for b, p in sorted(prices.items())}}
+    if deposits:
+        params["deposits"] = list(deposits)
     tx = ExchangeTransaction(
         op_type=ExchangeOpType.ORACLE_VOTE,
         sender=wallet.address,
         nonce=nonce,
-        params={"prices": {b: str(p) for b, p in sorted(prices.items())}},
+        params=params,
         gas_limit=100_000,
     )  # gas_price: the floor (default)
     tx.public_key = wallet.public_key

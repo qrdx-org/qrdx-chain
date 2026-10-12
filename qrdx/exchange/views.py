@@ -382,6 +382,8 @@ def market_summary(m: Market) -> Dict[str, Any]:
         "maintenance_rate": _s(m.maintenance_rate),
         "oracle_price": _s(m.oracle_price),
         "oracle_time": _s(m.oracle_time),
+        "external_perp_price": _s(m.external_price) if m.external_price > 0 else None,
+        "external_perp_time": _s(m.external_time) if m.external_price > 0 else None,
         "mark_price": _s(m.mark_price),
         "last_trade_price": _s(m.last_trade_price),
         "open_interest": _s(m.open_interest),

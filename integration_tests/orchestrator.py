@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from integration_tests.config import (
+    BRIDGE_SOURCE_FILE,
     ORACLE_FEED_FILE,
     PROJECT_ROOT, TESTNET_DIR, WALLETS_DIR, DATABASES_DIR, CONFIGS_DIR,
     LOGS_DIR, DATA_DIR, GENESIS_FILE,
@@ -168,12 +169,30 @@ class TestnetOrchestrator:
         logger.info("  Chain ID: %d, Network: %s", CHAIN_ID, NETWORK_NAME)
         logger.info("=" * 60)
 
+        # Never set up over a running network: setup deletes the node databases and rewrites the
+        # wallets and genesis that a running testnet (scripts/testnet.sh shares this directory)
+        # is using, and its nodes would go on writing into the replacements.
+        import socket
+
+        busy = []
+        for spec in self.node_specs:
+            with socket.socket() as probe:
+                probe.settimeout(0.2)
+                if probe.connect_ex(("127.0.0.1", spec.node_port)) == 0:
+                    busy.append(spec.node_port)
+        if busy:
+            raise RuntimeError(
+                f"a node is already listening on port(s) {busy} — stop the running testnet "
+                f"(./scripts/testnet.sh stop) first; setup would delete its databases"
+            )
+
         # Create directories
         for d in [TESTNET_DIR, WALLETS_DIR, DATABASES_DIR, CONFIGS_DIR, LOGS_DIR, DATA_DIR]:
             os.makedirs(d, exist_ok=True)
 
         # A fresh run starts with no scripted prices: validators vote only what scenarios set.
         ORACLE_FEED_FILE.unlink(missing_ok=True)
+        BRIDGE_SOURCE_FILE.unlink(missing_ok=True)  # and no scripted bridge deposits
 
         # Step 1: Generate wallets
         logger.info("\n[1/4] Generating wallets...")
@@ -254,6 +273,8 @@ class TestnetOrchestrator:
             # to the blocks they propose (docs/PERPS_CLEARINGHOUSE.md §8). Node-local, not a
             # consensus parameter.
             "QRDX_ORACLE_FEED": f"file:{ORACLE_FEED_FILE}",
+            # …and attest the bridge deposits the scripted source chain lists (docs/BRIDGE.md).
+            "QRDX_BRIDGE_SOURCES": f"file:{BRIDGE_SOURCE_FILE}",
             "LOG_LEVEL": "DEBUG",
             "PYTHONWARNINGS": "ignore",
             "QRDX_RPC_ENABLED": "true",

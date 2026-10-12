@@ -16,10 +16,11 @@ under this chain's failure modes:
   1. a deposit below ``MIN_VALIDATOR_STAKE`` is rejected;
   2. a deposit the sender cannot afford is rejected, and registers no validator;
   3. an affordable deposit is genuinely DEBITED from ``account_state``;
-  4. rejection and debit are deterministic across independent nodes (the validators
-     table and account_state must stay byte-identical);
-  5. the principal comes back at the deterministic finalized exit epoch — and a
-     SLASHED validator never gets it back.
+  4. rejection and debit are deterministic across independent nodes (the executed-deposit
+     log the validator set is computed from, and account_state, byte-identical).
+
+The principal's return after an exit — never to a slashed validator — is an in-block
+withdrawal: tests/test_validator_withdrawals.py, tests/test_withdrawal_delay_and_forfeit.py.
 """
 import os
 import tempfile
@@ -74,9 +75,15 @@ async def _run_deposit(db, mgr, tx, block_epoch=0):
     res = mgr._op_stake_deposit(tx)
     mgr.commit_block()
     await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
-    await flush_validator_lifecycle_deltas(db, mgr, block_epoch=block_epoch)
+    await flush_validator_lifecycle_deltas(db, mgr, block_epoch=block_epoch, block_height=1)
     await db.connection.commit()
     return res
+
+
+async def _deposit_log(db):
+    cur = await db.connection.execute(
+        "SELECT block_height, address, stake FROM validator_deposits ORDER BY id")
+    return [tuple(r) for r in await cur.fetchall()]
 
 
 async def _close(db):
@@ -179,12 +186,8 @@ async def test_affordable_deposit_is_debited_and_registers_the_validator():
         # The stake really left the account — it is at risk, and cannot be respent.
         assert await db.get_address_balance(staker) == Decimal("500000") - MIN_VALIDATOR_STAKE
 
-        validators = await db.get_validators()
-        assert len(validators) == 1
-        row = validators[0]
-        assert Decimal(str(row["stake"])) == MIN_VALIDATOR_STAKE
-        assert Decimal(str(row["effective_stake"])) == MIN_VALIDATOR_STAKE
-        assert row["status"] == "pending"
+        # Logged against its block: the validator set's input (validator/epoch_state.py).
+        assert await _deposit_log(db) == [(1, staker, str(MIN_VALIDATOR_STAKE))]
     finally:
         await _close(db)
 
@@ -237,7 +240,7 @@ async def test_two_nodes_agree_on_the_debit_and_the_validator_set():
         r2 = await _run_deposit(db2, mgr2, _deposit_tx(staker, MIN_VALIDATOR_STAKE))
         assert r1.success and r2.success
         assert await db1.get_address_balance(staker) == await db2.get_address_balance(staker)
-        assert await db1.get_validators_table_hash() == await db2.get_validators_table_hash()
+        assert await _deposit_log(db1) == await _deposit_log(db2)
         assert await db1.get_account_state_root() == await db2.get_account_state_root()
     finally:
         await _close(db1)
@@ -253,92 +256,9 @@ async def test_two_nodes_agree_on_a_rejection():
         r1 = await _run_deposit(db1, mgr1, _deposit_tx(attacker, "999999999"))
         r2 = await _run_deposit(db2, mgr2, _deposit_tx(attacker, "999999999"))
         assert not r1.success and not r2.success
-        assert await db1.get_validators_table_hash() == await db2.get_validators_table_hash()
+        assert await _deposit_log(db1) == await _deposit_log(db2) == []
         assert await db1.get_account_state_root() == await db2.get_account_state_root()
         assert await db1.get_address_balance(attacker) == Decimal("1000")
     finally:
         await _close(db1)
         await _close(db2)
-
-
-# ── 5. The stake comes back on exit — but not to a slashed validator ───────
-
-async def test_exit_refunds_the_principal_at_the_finalized_exit_epoch():
-    from qrdx.validator.epoch_loop import (
-        _collect_exit_stake_refunds, _refund_exited_validator_stakes,
-    )
-
-    staker = pq("exiting-staker")
-    db, mgr = await _node(funded="500000", holder=staker)
-    try:
-        assert (await _run_deposit(db, mgr, _deposit_tx(staker, MIN_VALIDATOR_STAKE))).success
-        after_deposit = await db.get_address_balance(staker)
-        assert after_deposit == Decimal("500000") - MIN_VALIDATOR_STAKE
-
-        # Reach the exit: activate, then request exit.
-        await db.connection.execute(
-            "UPDATE validators SET status = 'exiting', exit_epoch = 5 WHERE address = ?",
-            (staker,))
-        await db.connection.commit()
-
-        exiting = await db.get_validators_to_exit(5)
-        assert exiting == [staker]
-        refunds = await _collect_exit_stake_refunds(db, exiting)
-        assert refunds == {staker: MIN_VALIDATOR_STAKE}
-        await _refund_exited_validator_stakes(db, refunds, epoch=5)
-        await db.connection.commit()
-
-        # Supply-neutral: the principal is back, nothing minted.
-        assert await db.get_address_balance(staker) == Decimal("500000")
-    finally:
-        await _close(db)
-
-
-async def test_a_slashed_validator_forfeits_its_stake():
-    """
-    Slashing moves a validator to status 'slashed', which get_validators_to_exit does
-    not select — so it is never refunded. That forfeiture is what makes the penalty
-    real rather than a status label.
-    """
-    from qrdx.validator.epoch_loop import _collect_exit_stake_refunds
-
-    slashed = pq("slashed-staker")
-    db, mgr = await _node(funded="500000", holder=slashed)
-    try:
-        assert (await _run_deposit(db, mgr, _deposit_tx(slashed, MIN_VALIDATOR_STAKE))).success
-        await db.connection.execute(
-            "UPDATE validators SET status = 'slashed', exit_epoch = 5 WHERE address = ?",
-            (slashed,))
-        await db.connection.commit()
-
-        assert await db.get_validators_to_exit(5) == [], "a slashed validator must not exit-refund"
-        assert await _collect_exit_stake_refunds(db, await db.get_validators_to_exit(5)) == {}
-        # The stake stays gone.
-        assert await db.get_address_balance(slashed) == Decimal("500000") - MIN_VALIDATOR_STAKE
-    finally:
-        await _close(db)
-
-
-async def test_refund_is_principal_only_not_accrued_rewards():
-    """
-    effective_stake also carries attestation rewards; refunding those would MINT them
-    into account_state. The refund tracks the deposited principal so staking is exactly
-    supply-neutral.
-    """
-    from qrdx.validator.epoch_loop import _collect_exit_stake_refunds
-
-    staker = pq("rewarded-staker")
-    db, mgr = await _node(funded="500000", holder=staker)
-    try:
-        assert (await _run_deposit(db, mgr, _deposit_tx(staker, MIN_VALIDATOR_STAKE))).success
-        # Simulate accrued rewards inflating effective_stake well above principal.
-        await db.connection.execute(
-            "UPDATE validators SET status = 'exiting', exit_epoch = 5, "
-            "effective_stake = ? WHERE address = ?",
-            (str(MIN_VALIDATOR_STAKE + Decimal("77777")), staker))
-        await db.connection.commit()
-
-        refunds = await _collect_exit_stake_refunds(db, await db.get_validators_to_exit(5))
-        assert refunds == {staker: MIN_VALIDATOR_STAKE}, "refund must not include rewards"
-    finally:
-        await _close(db)

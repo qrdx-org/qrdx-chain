@@ -187,7 +187,22 @@ class Node:
         mgr = ExchangeStateManager.get_instance()
         out["exchange"] = (mgr._sequential_state_root(), mgr._incremental_state_root(),
                            mgr._current_block_height)
+        out["journal"] = journal_view(mgr.journal)
         return out
+
+
+def journal_view(j):
+    """The journal as the API serves it, minus sequence numbers (never reused, so they differ
+    between a journal that saw a reorg and one rebuilt from genesis)."""
+    return (
+        sorted((h, r["block_height"], r["op"], r["success"], r["error"]) for h, r in j.receipts.items()),
+        [{k: v for k, v in e.items() if k != "seq"} for e in j.events],
+        {name: ([{k: v for k, v in t.items() if k != "seq"} for t in m.trades],
+                {sec: dict(c) for sec, c in m.candles.items()}, m.last_price, m.trade_count)
+         for name, m in sorted(j.market.markets.items())},
+        j.market.now,
+        j.height,
+    )
 
 
 async def _full(node):
@@ -235,5 +250,103 @@ async def test_a_write_outside_any_block_forces_the_full_rebuild():
         res = await node.rollback(tip - 2)
         assert "base" not in res  # the full replay — which also discards the stray write
         assert await node.state() == await _full(node)
+    finally:
+        await node.close()
+
+
+# ── Restarts (derived_state_rebuild.persist_checkpoint / load_persisted_checkpoint) ─────────
+# A restart used to replay every derived domain from genesis: the exchange lives in memory. The
+# finalized base checkpoint and the exchange journal are now persisted every
+# PERSIST_INTERVAL_BLOCKS, and a restart takes the reorg fast path from it.
+
+def _forget_everything_in_memory():
+    from qrdx import derived_state_rebuild as D
+
+    ExchangeStateManager.reset_instance()
+    CHECKPOINTS.clear()
+    D._LAST_EPOCH.clear()
+    D._PERSISTED.clear()
+
+
+async def test_a_restart_from_the_persisted_checkpoint_equals_the_full_replay(monkeypatch):
+    from qrdx import derived_state_rebuild as D
+
+    monkeypatch.setattr(D, "PERSIST_INTERVAL_BLOCKS", 4)
+    w = Workload(5)
+    node = await Node.create(w)
+    try:
+        for txs in w.script():
+            await node.apply(txs)
+        for _ in range(12):
+            await node.apply(w.transfer())
+        tip = await node.db.get_next_block_id() - 1
+        await D.prune_reorg_state(node.db, tip - 3)          # finality: the base is persisted
+        await node.db.connection.commit()
+        persisted = D._PERSISTED["height"]
+        for _ in range(7):                                   # blocks above the checkpoint
+            await node.apply(w.transfer())
+        before = await node.state()
+
+        _forget_everything_in_memory()                       # the restart
+        assert await D.load_persisted_checkpoint(node.db) == persisted
+        res = await D.rebuild_to_tip(node.db)
+        assert res["base"] == persisted and res["blocks"] < 12
+        assert await node.state() == before
+        assert await node.state() == await _full(node)
+    finally:
+        await node.close()
+
+
+async def test_a_checkpoint_whose_block_was_orphaned_is_not_used(monkeypatch):
+    from qrdx import derived_state_rebuild as D
+
+    monkeypatch.setattr(D, "PERSIST_INTERVAL_BLOCKS", 1)
+    w = Workload(6)
+    node = await Node.create(w)
+    try:
+        for txs in w.script():
+            await node.apply(txs)
+        for _ in range(6):
+            await node.apply(w.transfer())
+        tip = await node.db.get_next_block_id() - 1
+        await D.prune_reorg_state(node.db, tip)
+        await node.db.connection.commit()
+        persisted = D._PERSISTED["height"]
+        await node.db.remove_blocks(persisted)               # its block left the chain
+        for _ in range(4):
+            await node.apply(w.transfer(), tag="z")
+        _forget_everything_in_memory()
+        assert await D.load_persisted_checkpoint(node.db) is None   # → the full rebuild
+    finally:
+        await node.close()
+
+
+
+async def test_a_rejected_section_is_undone_by_the_fast_path():
+    """No per-block revert point: a section applied and then refused (a wrong declared root) is
+    undone by the restore every import path runs, rebuild_to_tip. The block is not stored, so
+    the state at the tip is the state before it — databases, exchange and journal."""
+    from qrdx.exchange.block_processor import apply_block_exchange_section
+
+    w = Workload(8)
+    node = await Node.create(w)
+    try:
+        for txs in w.script():
+            await node.apply(txs)
+        for _ in range(9):
+            await node.apply(w.transfer())
+        before = await node.state()
+        height = await node.db.get_next_block_id()
+        bad = [w.tx(w.k1, ExchangeOpType.TOKEN_TRANSFER, token_address=w.tokenA, to=w.t2,
+                    amount="77")]
+        async with await before_block(node.db, height, (height * SPACING) // S):
+            await BP.preload_sender_balances(node.db, bad, node.mgr)
+            await BP.preload_token_balances(node.db, bad, node.mgr)
+            ok, err = apply_block_exchange_section(height, float(TS0 + height * SPACING),
+                                                   encode_exchange_txs(bad), "ab" * 64, node.mgr)
+        assert not ok and "mismatch" in err
+        assert (await node.state())["exchange"] != before["exchange"]
+        await rebuild_to_tip(node.db)
+        assert await node.state() == before
     finally:
         await node.close()

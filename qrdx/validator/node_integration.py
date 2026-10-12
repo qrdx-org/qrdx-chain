@@ -9,6 +9,7 @@ and canary wallet monitoring for the Doomsday Protocol (§8.5).
 import asyncio
 import json
 import os
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, List, Optional
@@ -34,14 +35,6 @@ _PROPOSER_PROPAGATION_GRACE = os.getenv("QRDX_PROPOSER_PROPAGATION_GRACE", "0").
     "yes",
 )
 _PROPOSER_PROPAGATION_GRACE_SECONDS = SLOT_DURATION_SECONDS / 2
-
-# Validator-lifecycle unification rollout gate. False = OBSERVE (each epoch the
-# reward/penalty deltas are computed + the would-be validators-table hash is logged,
-# but NOT written → zero consensus impact, used to confirm cross-node determinism).
-# True = ENFORCE (write the deltas to the consensus validators table at each epoch
-# boundary, so effective_stake evolves with participation). Flip only after a soak
-# shows the validators-table hash is identical across all nodes per epoch.
-_ENFORCE_EPOCH_VALIDATOR_UPDATES = False
 
 
 def parse_block_timestamp(ts) -> Optional[datetime]:
@@ -173,6 +166,7 @@ class ValidatorNode:
         # then skips its slot rather than build on a tip that is about to change.
         self._proposal_guard = None
         self._last_skip_reason = None
+        self._restore_hook = None  # main._restore_after_rejected_block
 
         logger.info(f"ValidatorNode initialized for wallet: {validator_wallet_path}")
 
@@ -355,6 +349,7 @@ class ValidatorNode:
         self._block_production_task = asyncio.create_task(self._block_production_loop())
         self._attestation_task = asyncio.create_task(self._attestation_loop())
         self._epoch_processing_task = asyncio.create_task(self._epoch_processing_loop())
+        self._oracle_task = asyncio.create_task(self._oracle_vote_loop())
 
         # Start canary monitor if adapter & doomsday are configured
         if self._eth_adapter is not None and self._doomsday_protocol is not None:
@@ -375,6 +370,8 @@ class ValidatorNode:
             self._attestation_task.cancel()
         if self._epoch_processing_task:
             self._epoch_processing_task.cancel()
+        if getattr(self, "_oracle_task", None):
+            self._oracle_task.cancel()
         if self._canary_monitor_task:
             self._canary_monitor_task.cancel()
 
@@ -428,7 +425,7 @@ class ValidatorNode:
                 # for this height has landed — so a slow/offline primary no longer leaves
                 # the slot empty. Eligibility is re-checked identically in propose_block +
                 # on import (deterministic top-K for the slot).
-                await self._refresh_validator_set()
+                await self._refresh_validator_set(current_slot)
                 rank = await self.manager.proposer_rank(current_slot)
                 if rank is None:
                     await self._sleep_until(current_slot + 1)
@@ -553,12 +550,6 @@ class ValidatorNode:
                             except Exception as e:
                                 logger.warning(f"Exchange tx selection failed: {e}")
                                 exchange_txs = []
-                            try:
-                                vote = await self._oracle_vote(exchange_txs)
-                                if vote is not None:
-                                    exchange_txs = list(exchange_txs) + [vote]
-                            except Exception as e:
-                                logger.warning(f"Oracle vote skipped: {e}")
                             if exchange_txs:
                                 try:
                                     from ..exchange.block_processor import (
@@ -577,7 +568,9 @@ class ValidatorNode:
                                     apply_enforcement(mgr)
                                     # Phase E: pre-load senders' real QRDX + token balances for
                                     # the collateral + spot-sufficiency checks during processing.
-                                    await preload_sender_balances(self.db, exchange_txs, mgr)
+                                    await preload_sender_balances(
+                                        self.db, exchange_txs, mgr, next_height
+                                    )
                                     await preload_token_balances(self.db, exchange_txs, mgr)
                                     ok, err, root = process_exchange_transactions(
                                         next_height,
@@ -610,19 +603,28 @@ class ValidatorNode:
                                             f"Exchange execution failed, dropping section: {err}"
                                         )
                                         exchange_txs = []
+                                        await self._restore_state(next_height, err)
                                 except Exception as e:
                                     logger.warning(
                                         f"Exchange execution error, dropping section: {e}"
                                     )
                                     exchange_txs = []
+                                    await self._restore_state(next_height, str(e))
 
                         # A block without exchange transactions — none selected, or the section
                         # dropped — still ticks: mark prices (and later liquidations and funding)
                         # advance on every block. Importers and the rebuild tick identically.
                         if not exchange_txs:
                             try:
-                                from ..exchange.block_processor import run_exchange_tick
+                                from ..exchange.block_processor import (
+                                    ensure_oracle_committee,
+                                    run_exchange_tick,
+                                )
+                                from ..exchange.state_manager import ExchangeStateManager
 
+                                await ensure_oracle_committee(
+                                    self.db, ExchangeStateManager.get_instance(), next_height
+                                )
                                 run_exchange_tick(next_height, float(block_timestamp))
                             except Exception as e:
                                 logger.error(f"Exchange tick failed for block #{next_height}: {e}")
@@ -866,32 +868,25 @@ class ValidatorNode:
 
         logger.info("Attestation loop stopped")
 
-    async def _refresh_validator_set(self) -> None:
-        """Rebuild the proposer's validator set from the validators table — every slot, and
-        exactly as importers build the set they check eligibility against
-        (block_verification.verify_proposer_eligibility: the same rows, statuses and stakes).
+    async def _refresh_validator_set(self, slot: int) -> None:
+        """The set the proposer selects from for ``slot``: ``S_E`` of its tip's chain
+        (validator/epoch_state.py) — the very set every importer judges the block against
+        (block_verification.verify_proposer_eligibility), recomputed every slot.
 
-        It used to be built once, at startup. The table changes — rewards and penalties at each
-        finalized epoch, validators joining and leaving — so a proposer kept selecting from a
-        set its peers no longer used, proposed in slots they gave to someone else, and had its
-        blocks refused: the forks that followed a validator joining the testnet."""
+        It was once built at startup, then from the node's live ``validators`` table, which
+        moved with this node's view of finality: proposer and importers could disagree on
+        whose slot it was whenever one had processed a finalized epoch the other had not."""
         if self.manager is None or self.wallet is None:
             return
+        from .epoch_state import proposers_for_slot
+
         try:
-            rows = await self.db.get_validators()
+            selected = await proposers_for_slot(self.db, slot)
         except Exception as e:
             logger.debug(f"validator set refresh skipped: {e}")
             return
         members: List[Validator] = []
-        for r in rows:
-            addr = r.get("address")
-            if not addr or str(r.get("status", "active")).upper() not in (
-                "ACTIVE",
-                "PENDING",
-                "EXITING",
-            ):
-                continue
-            stake = Decimal(str(r.get("effective_stake") or r.get("stake") or 0))
+        for addr, stake in selected:
             members.append(
                 Validator(
                     address=addr,
@@ -948,44 +943,6 @@ class ValidatorNode:
                 slot,
             )
         return True
-
-    async def _epoch_validator_updates(self, epoch: int) -> None:
-        """Validator-lifecycle unification: deterministically reward/penalize the
-        active validator set in the consensus `validators` table based on this
-        epoch's attestation participation, then log the table hash so cross-node
-        convergence is observable. OBSERVE by default (`_ENFORCE_EPOCH_VALIDATOR_UPDATES`
-        False → computed + logged, not written); when enforced it writes + commits.
-        Pure deterministic inputs (validators table + epoch attesters), so every
-        node computes the same deltas → the table stays identical. See
-        docs/VALIDATOR_LIFECYCLE_UNIFICATION.md (Phase 1b/2)."""
-        from .epoch_processing import MAX_EFFECTIVE_BALANCE
-        from .epoch_rewards import compute_epoch_reward_deltas
-
-        active = await self.db.get_validators(status="active")
-        attesters = await self.db.get_epoch_attesters(epoch)
-        rewards, penalties = compute_epoch_reward_deltas(active, attesters)
-        res = await self.db.apply_epoch_validator_updates(
-            rewards,
-            penalties,
-            activated=[],
-            exited=[],
-            activation_epoch=epoch,
-            max_effective_balance=MAX_EFFECTIVE_BALANCE,
-            enforce=_ENFORCE_EPOCH_VALIDATOR_UPDATES,
-        )
-        if _ENFORCE_EPOCH_VALIDATOR_UPDATES:
-            await self.db.connection.commit()
-        vhash = await self.db.get_validators_table_hash()
-        logger.info(
-            "[epoch-validators %s] epoch=%d active=%d rewarded=%d penalized=%d "
-            "validators_hash=%s",
-            "ENFORCE" if _ENFORCE_EPOCH_VALIDATOR_UPDATES else "observe",
-            epoch,
-            len(active),
-            res["rewarded"],
-            res["penalized"],
-            vhash[:16],
-        )
 
     async def _epoch_processing_loop(self):
         """
@@ -1049,10 +1006,8 @@ class ValidatorNode:
                         except Exception as e:
                             logger.error(f"Legacy lifecycle process_epoch failed for {ep}: {e}")
 
-                    # NOTE: the consensus validators-table update is NOT done here —
-                    # it runs in qrdx.validator.epoch_loop.epoch_validator_update_loop,
-                    # started for ALL nodes (validators + full) so the set converges
-                    # network-wide (Phase 2d). This loop keeps only the legacy
+                    # NOTE: the validator set is not maintained here: it is a function of
+                    # the chain (validator/epoch_state.py). This loop keeps only the legacy
                     # lifecycle-tables tracking.
 
                     last_processed_epoch = ep
@@ -1089,36 +1044,96 @@ class ValidatorNode:
         self._doomsday_protocol = doomsday
         logger.info("ValidatorNode: DoomsdayProtocol attached for canary monitoring")
 
-    async def _oracle_vote(self, selected):
-        """This validator's price vote, appended to the block it proposes
-        (docs/PERPS_CLEARINGHOUSE.md §8): USD prices from its feed (QRDX_ORACLE_FEED) for every
-        perp market, when it sits on the oracle committee. Its nonce follows any of its own
-        transactions already selected for the block. None when it has nothing to vote."""
+    def set_exchange_submitter(self, submitter) -> None:
+        """Attach the node's exchange submitter (admit + gossip): oracle votes go through it."""
+        self._exchange_submitter = submitter
+
+    async def _oracle_vote_loop(self) -> None:
+        """Vote this validator's prices (docs/PERPS_CLEARINGHOUSE.md §8) like any exchange
+        transaction: admitted to the node's mempool and gossiped, so whichever validator proposes
+        next includes it. Votes used to ride only in the voter's own blocks — refreshed only as
+        often as it proposed — and moved its exchange nonce. Votes when a price changes, and at
+        least every quarter of the vote lifetime (PERP_ORACLE_VOTE_MAX_AGE)."""
+        from .. import constants
+
+        refresh = max(1.0, float(constants.PERP_ORACLE_VOTE_MAX_AGE) / 4)
+        last_content: Any = None
+        last_at = 0.0
+        while self._running:
+            try:
+                await asyncio.sleep(1.0)
+                submitter = getattr(self, "_exchange_submitter", None)
+                if submitter is None:
+                    continue
+                if self._proposal_guard is not None and self._proposal_guard():
+                    continue  # not before the first sync: a stale tip, a stale committee
+                vote = await self._oracle_vote()
+                if vote is None:
+                    continue
+                # What the vote says: prices, and bridge deposits (a new one is voted at once).
+                content = (vote.params.get("prices"), vote.params.get("deposits"))
+                now = time.monotonic()
+                if content == last_content and now - last_at < refresh:
+                    continue
+                ok, err, _hash = await submitter.submit(vote)
+                if ok:
+                    last_content, last_at = content, now
+                else:
+                    logger.debug(f"oracle vote not admitted: {err}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"oracle vote skipped: {e}")
+
+    async def _oracle_vote(self):
+        """This validator's vote, when it sits on the oracle committee: USD prices from its feed
+        (QRDX_ORACLE_FEED) for every perp market, other venues' perp prices for them
+        ("<base>:perp"), and the bridge deposits its watcher (QRDX_BRIDGE_SOURCES) has seen and
+        the chain has not minted (docs/BRIDGE.md). Its nonce is the current slot — a vote's own
+        sequence, not the account's exchange nonce. None when it has nothing to vote."""
         if self.wallet is None:
             return None
         if not hasattr(self, "_price_feed"):
+            from .bridge_watcher import watcher_from_env
             from .price_feed import feed_from_env
 
             self._price_feed = feed_from_env()
-        if self._price_feed is None:
+            self._bridge_watcher = watcher_from_env()
+        watcher = getattr(self, "_bridge_watcher", None)
+        if self._price_feed is None and watcher is None:
             return None
         from .. import constants
-        from ..exchange.block_processor import ensure_oracle_committee
+        from ..exchange.bridge import MAX_VOTE_DEPOSITS
         from ..exchange.state_manager import ExchangeStateManager
-        from .price_feed import build_vote
+        from .epoch_state import committee_for_block
+        from .price_feed import PERP_SUFFIX, build_vote
 
         mgr = ExchangeStateManager.get_instance()
-        await ensure_oracle_committee(self.db, mgr)
-        if not mgr.oracle_committee or self.wallet.address.lower() not in mgr.oracle_committee:
+        # Whether the next block would count this vote: read-only — the committee the exchange
+        # judges blocks by is set by each block's own processing.
+        committee = await committee_for_block(self.db, int(await self.db.get_next_block_id()))
+        if self.wallet.address.lower() not in committee:
             return None
         bases = sorted(
             m.base for m in mgr.clearinghouse.markets.values() if m.quote == constants.PERP_QUOTE
         )
-        prices = self._price_feed.prices(bases) if bases else {}
-        if not prices:
+        # The oracle price, and other venues' perp price where the feed has one (the mark's
+        # third input).
+        wanted = bases + [b + PERP_SUFFIX for b in bases]
+        got = self._price_feed.prices(wanted) if bases and self._price_feed is not None else {}
+        keys = [k for k in wanted if k in got]
+        limit = ExchangeStateManager.MAX_VOTE_PRICES
+        if len(keys) > limit:
+            # More prices than a vote carries: each vote takes the next window, so with votes
+            # every quarter of the vote lifetime every market's stays fresh up to 4 × limit.
+            start = getattr(self, "_vote_cursor", 0) % len(keys)
+            self._vote_cursor = start + limit
+            keys = (keys + keys)[start : start + limit]
+        prices = {k: got[k] for k in keys}
+        deposits = watcher.outstanding(mgr.bridge.done, MAX_VOTE_DEPOSITS) if watcher else []
+        if not prices and not deposits:
             return None
-        own = sum(1 for t in selected if t.sender == self.wallet.address)
-        return build_vote(self.wallet, mgr.get_nonce(self.wallet.address) + own, prices)
+        return build_vote(self.wallet, await self._get_current_slot(), prices, deposits)
 
     def set_exchange_tx_source(self, source) -> None:
         """
@@ -1179,6 +1194,18 @@ class ValidatorNode:
         """Share the node's block-processing lock, so block production never interleaves
         with an import or a derived-state rebuild (see _block_production_loop)."""
         self._block_processing_lock = lock
+
+    def set_restore_hook(self, hook) -> None:
+        """Attach main's restore (``_restore_after_rejected_block``): undoes a section this
+        proposer applied and then dropped. There is no per-block revert point any more."""
+        self._restore_hook = hook
+
+    async def _restore_state(self, height: int, reason: str) -> None:
+        if self._restore_hook is not None:
+            try:
+                await self._restore_hook(height, f"own exchange section dropped: {reason}")
+            except Exception as e:
+                logger.error(f"restoring state after a dropped section failed: {e}")
 
     def set_proposal_guard(self, guard) -> None:
         """Attach main.py's guard (_validator_wait_reason): a reason this slot must be skipped,

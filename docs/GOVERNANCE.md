@@ -26,9 +26,10 @@ It governs three things:
 
 ## 1. Who does what
 
-- **Validators propose and vote.** A proposer must be in the validator committee: the genesis
-  validator set, plus stake deposits, minus exits. That is the same committee that prices the
-  perps oracle.
+- **Validators propose and vote.** A proposer must be in the validator committee: the validator
+  set in force at the block's parent (active and exiting validators, weighted by effective stake
+  plus delegated stake; docs/STAKING.md). That is the same committee that prices the perps oracle
+  and attests bridge deposits.
 - **Votes are weighted by stake**, taken as a snapshot when the proposal is created, so stake
   moved during the vote doesn't count. Votes are final.
 - **A proposal passes** when "yes" reaches `GOV_APPROVAL_THRESHOLD_BPS` of the snapshot's total
@@ -153,9 +154,8 @@ transactions (`exchange_sendTransaction`).
 
 ## 7. Limitations
 
-- **Voting weight is principal stake in the validator committee.** A new deposit counts as soon
-  as it is made, and a slashed validator keeps its weight until it exits. This is the same as
-  the oracle committee (docs/KNOWN_ISSUES.md, perps entry).
+- **Voting weight is the validator set's.** A new deposit counts once it activates; a slashed,
+  ejected or exited validator stops counting at the next epoch (a convicted one at once).
 - **Only post-quantum accounts can veto.** Exchange operations are PQ-only (docs/KNOWN_ISSUES.md,
   "Exchange operations are PQ-only senders"), so a `0x` holder must move QRDX to a `0xPQ` account
   first.

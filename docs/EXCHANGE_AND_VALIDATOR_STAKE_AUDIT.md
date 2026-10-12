@@ -1,5 +1,11 @@
 # Exchange & Validator-Stake Audit
 
+> **Superseded (2026-10-12).** The validator set is no longer a table rebuilt from the chain
+> when finality advances: it is a pure function of the chain, `S_E` per epoch, computed by
+> `qrdx/validator/epoch_state.py` and described in [STAKING.md](STAKING.md). The reconstruction
+> and the import-time registration this document describes are removed; the history below is kept
+> for the reasoning.
+
 Companion to [UNIFIED_ACCOUNT_IDENTITY.md](UNIFIED_ACCOUNT_IDENTITY.md), which
 describes the `0x` ↔ `0xPQ` ledger unification. This document answers three questions:
 

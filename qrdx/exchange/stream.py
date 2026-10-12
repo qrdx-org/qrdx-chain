@@ -2,8 +2,9 @@
 Realtime exchange streams (the WebSocket ``/ws`` and SSE ``/stream`` channels) — perps, spot and
 native tokens.
 
-A background poller — read-only, like the chain-tip poller in qrdx/node/observability.py, so it
-can never stall or diverge block processing — publishes to the event hub:
+A background publisher, read-only like the block feed in qrdx/node/observability.py so it can
+never stall or diverge block processing, wakes as soon as a block is applied (the
+``CHAIN_CHANGED`` signal) and publishes to the event hub:
 
     perp_markets            every market's summary when it changes (prices, OI, top of book,
                             funding); "perp_markets:<id>" for one market
@@ -248,24 +249,35 @@ async def perp_stream_poller(
     get_manager: Callable[[], Any],
     interval: float = 1.0,
     book_depth: int = 20,
+    signal=None,
     _max_iterations: Optional[int] = None,
 ) -> None:
+    """Publish what each block changed as soon as ``signal`` (observability.ChangeSignal) says
+    the chain changed, or every ``interval`` without one. It used to run only on the timer, so
+    at 250 ms slots trades and books arrived four blocks at a time."""
     publisher = PerpStreamPublisher(hub, book_depth)
+    listener = signal.listener() if signal is not None else None
     iterations = 0
-    while True:
-        try:
-            publisher.step(get_manager())
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            pass
-        iterations += 1
-        if _max_iterations is not None and iterations >= _max_iterations:
-            break
-        try:
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            break
+    try:
+        while True:
+            try:
+                publisher.step(get_manager())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            iterations += 1
+            if _max_iterations is not None and iterations >= _max_iterations:
+                break
+            if listener is not None:
+                await signal.wait(listener, interval)
+            else:
+                await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if listener is not None:
+            signal.drop(listener)
 
 
 def initial_snapshots(mgr, channels, book_depth: int = 20):

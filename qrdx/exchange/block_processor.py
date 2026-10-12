@@ -26,7 +26,7 @@ import logging
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..constants import ACTIVATION_DELAY_EPOCHS, UNBONDING_PERIOD_EPOCHS
+from ..constants import UNBONDING_PERIOD_EPOCHS
 from .state_manager import ExchangeStateManager
 from .transactions import ExchangeOpType, ExchangeTransaction
 
@@ -121,28 +121,43 @@ def apply_enforcement(mgr: "ExchangeStateManager") -> None:
     mgr.enforce_fees = ENFORCE_EXCHANGE_FEES
 
 
-async def ensure_oracle_committee(db, mgr: ExchangeStateManager) -> None:
-    """Load the validator oracle's committee from the genesis block's validator set, once per
-    manager. Every path that applies a block section calls this first (through
-    ``preload_sender_balances``, or directly in the by-domain rebuild), so the committee is in
-    place before any vote or staking op is judged — on every node, whatever height it loaded at.
-    That is also why the committee is not hashed into the state root: a restarted node loads it
-    at height 0, a long-running one at its first section, and between them it decides nothing."""
-    if mgr.oracle_committee is not None and mgr.governance.genesis_loaded:
+async def ensure_oracle_committee(
+    db, mgr: ExchangeStateManager, height: Optional[int] = None
+) -> None:
+    """Set the committee that weighs block ``height``'s oracle votes, bridge attestations and
+    governance votes (default: the next block): the validator set in force at its parent, by
+    weight (validator/epoch_state.py ``committee_for_block``), less the members a slashing
+    proof below the block convicts. Every path calls this before every block — its section
+    and its tick — so every node judges each block by the same committee, whatever it
+    processed before. (The committee used to be its own record — the genesis set plus executed
+    deposits and exits — a second definition of the validator set: a validator voted prices
+    and governance while still pending, kept voting after ejection, and its delegators' stake
+    did not count. The convictions were read up to the node's TIP, so a rebuild of history
+    excluded a validator from blocks before its conviction.)"""
+    if getattr(db, "connection", None) is not None:
+        if height is None:
+            height = int(await db.get_next_block_id())
+        try:
+            from .. import chain_index
+            from ..validator.epoch_state import committee_for_block
+
+            mgr.oracle_committee = await committee_for_block(db, int(height))
+            mgr.oracle_excluded = set(await chain_index.offenders_before(db, int(height)))
+        except Exception as e:
+            logger.warning("validator committee not refreshed for block %s: %s", height, e)
+    if mgr.governance.genesis_loaded:
         return
     try:
         genesis = await db.get_block_by_id(0)
         if genesis:
-            content = genesis.get("content") or genesis.get("block_content")
-            mgr.load_oracle_committee(content)
-            # Governance's genesis facts (whether system wallets exist) come from block 0 too.
-            mgr.governance.load_genesis(content)
+            # Governance's genesis facts (whether system wallets exist) come from block 0.
+            mgr.governance.load_genesis(genesis.get("content") or genesis.get("block_content"))
     except Exception as e:
-        logger.debug("oracle committee not loaded: %s", e)
+        logger.debug("governance genesis not loaded: %s", e)
 
 
 async def preload_sender_balances(
-    db, txs, state_manager: Optional[ExchangeStateManager] = None
+    db, txs, state_manager: Optional[ExchangeStateManager] = None, height: Optional[int] = None
 ) -> None:
     """
     Phase E: pre-load each exchange-tx sender's real account_state balance into the
@@ -153,7 +168,7 @@ async def preload_sender_balances(
     """
     mgr = state_manager or ExchangeStateManager.get_instance()
     mgr.clear_available_balances()
-    await ensure_oracle_committee(db, mgr)
+    await ensure_oracle_committee(db, mgr, height)
     seen = set()
     for tx in txs or []:
         sender = getattr(tx, "sender", None)
@@ -216,6 +231,8 @@ async def preload_token_balances(
             # Native tokens are keyed by their canonical (lowercase) address. A burn may name
             # another holder (``from``: an operator's or the permanent delegate's burn).
             wanted.add((str(p.get("from") or sender), str(p["token_address"]).lower()))
+        elif op == ExchangeOpType.BRIDGE_WITHDRAW and p.get("token_address"):
+            wanted.add((sender, str(p["token_address"]).lower()))  # the bridged token burned
         elif op == ExchangeOpType.TOKEN_WITHDRAW_FEES and p.get("token_address"):
             # Withheld transfer fees are held by the token's own address.
             token = str(p["token_address"]).lower()
@@ -386,69 +403,45 @@ async def flush_validator_lifecycle_deltas(
     block_hash: Optional[str] = None,
 ) -> None:
     """
-    Validator-lifecycle Phase 3: apply this block's staking ops to the consensus
-    ``validators`` table — a STAKE_DEPOSIT registers the sender as a PENDING validator,
-    a STAKE_EXIT marks an active validator 'exiting' (still eligible through unbonding).
-    Called AFTER the section commits, BEFORE the unified root, on every import path.
+    Log this block's EXECUTED staking operations against the block: a STAKE_DEPOSIT in
+    ``validator_deposits``, a STAKE_EXIT in ``validator_exits`` (with the exit epoch the
+    block's epoch implies: ``block_epoch + UNBONDING_PERIOD_EPOCHS``). Called after the
+    section commits, before the unified root, on every path; the logs are reversed when the
+    block is rolled back.
 
-    The activation/exit epoch is derived DETERMINISTICALLY from ``block_epoch`` — the
-    epoch of the block carrying the op (identical on every node that imports it):
-      * activation_epoch = block_epoch + ACTIVATION_DELAY_EPOCHS
-      * exit_epoch       = block_epoch + UNBONDING_PERIOD_EPOCHS
-    The all-nodes epoch loop then activates/removes the validator when the FINALIZED
-    epoch reaches that scheduled epoch. Computing the schedule from the block (not from
-    when the epoch loop happens to observe the pending validator) is what makes it
-    cross-node deterministic: an earlier loop-tick scheduler assigned different epochs
-    on different nodes depending on import timing. ``block_epoch=None`` leaves it
-    unscheduled (legacy/rebuild paths). Does not commit.
+    These logs are the validator set's stake inputs (validator/epoch_state.py) and the
+    withdrawals' (validator/withdrawals.py). Only operations the exchange executed are here
+    (``validator_lifecycle_ops`` holds only those); a refused deposit — one naming more stake
+    than the sender holds — must register nothing, and the per-block index, which records
+    every STAKE_DEPOSIT a block carries, cannot tell them apart. Nothing else is written: the
+    ``validators`` table is a display copy of the epoch state. Does not commit.
     """
     mgr = state_manager or ExchangeStateManager.get_instance()
     ops = mgr.validator_lifecycle_ops()
-    if not ops:
+    if not ops or block_height is None:
         return
-    act_epoch = (int(block_epoch) + ACTIVATION_DELAY_EPOCHS) if block_epoch is not None else None
     exit_epoch = (int(block_epoch) + UNBONDING_PERIOD_EPOCHS) if block_epoch is not None else None
     for op in ops:
         try:
             if op.get("type") == "deposit":
-                # block_height/block_hash log the carrying block so an ORPHANED
-                # deposit's registration can be reversed exactly on reorg rollback
-                # (db.undo_validator_deposits_above) — the validators table itself is
-                # not reconstructed from the chain.
-                await db.register_pending_validator(
-                    op["address"],
-                    op["public_key"],
-                    op["stake"],
-                    activation_epoch=act_epoch,
-                    block_height=block_height,
-                    block_hash=block_hash,
+                await db.log_validator_deposit(
+                    op["address"], op["public_key"], op["stake"], block_height, block_hash
                 )
-            elif op.get("type") == "exit":
-                # Phase 3c: a STAKE_EXIT moves an active validator to 'exiting'. This is
-                # SAFE at live-import because 'exiting' stays ELIGIBLE for proposer
-                # selection (it keeps validating through unbonding — see the ACTIVE/
-                # PENDING/EXITING filter in node_integration + block_verification), so
-                # the eligible SET is unchanged at import (only a status label flips;
-                # benign table-hash churn, no proposer-selection flip → no halt). The
-                # eligibility-REMOVING transition (exiting→exited) happens later, at the
-                # deterministic FINALIZED exit_epoch in the all-nodes epoch loop
-                # (get_validators_to_exit → exited), so every node drops the validator at
-                # the same converged chain point.
-                moved = await db.mark_validator_exiting(op["address"], exit_epoch=exit_epoch)
-                # Log the exit against its carrying block so the principal can be returned
-                # by an in-block withdrawal once exit_epoch is reached. Logged even when
-                # `moved` is False: the withdrawal inputs must be a pure function of the
-                # chain, and the validators table this flag comes from is rebuilt
-                # asynchronously, so its state here can differ between nodes.
-                if block_height is not None and exit_epoch is not None:
-                    from ..validator.withdrawals import record_validator_exit
+            elif op.get("type") == "exit" and exit_epoch is not None:
+                from ..validator.withdrawals import record_validator_exit
 
-                    await record_validator_exit(db, op["address"], exit_epoch, block_height)
-                logger.info(
-                    "[Phase 3c] STAKE_EXIT by %s → %s (exit_epoch=%s)",
-                    str(op.get("address"))[:20],
-                    "exiting" if moved else "no-op (not active)",
-                    exit_epoch,
+                await record_validator_exit(db, op["address"], exit_epoch, block_height)
+            elif op.get("type") == "delegate":
+                await db.log_staking_op(
+                    "delegate", op["address"], op["validator"], op["amount"], block_height
+                )
+            elif op.get("type") == "undelegate":
+                await db.log_staking_op(
+                    "undelegate", op["address"], op["validator"], op["shares"], block_height
+                )
+            elif op.get("type") == "commission":
+                await db.log_staking_op(
+                    "commission", op["address"], None, op["commission_bps"], block_height
                 )
         except Exception as e:
             logger.warning("flush_validator_lifecycle: %s for %s", e, str(op.get("address"))[:20])
@@ -497,6 +490,7 @@ def process_exchange_transactions(
     block_timestamp: float,
     exchange_txs: List[ExchangeTransaction],
     state_manager: Optional[ExchangeStateManager] = None,
+    revertible: bool = False,
 ) -> Tuple[bool, str, str]:
     """
     Process all exchange transactions in a block.
@@ -514,10 +508,13 @@ def process_exchange_transactions(
     """
     mgr = state_manager or ExchangeStateManager.get_instance()
 
-    # Take snapshot for potential revert. A block with no transactions only runs the per-block
-    # tick, which has nothing to revert — and a deep copy of every book on every block would
-    # be the most expensive thing the node does.
-    if exchange_txs:
+    # A revert point only for a replay (``revertible``), which must undo a section that fails
+    # exactly where forward application undid it. It is a deep copy of the whole exchange: on
+    # every block with transactions it was the most expensive thing a node did (115 ms at
+    # 10,000 accounts). A live path that sees a section fail restores through the reorg fast
+    # path instead (main._restore_after_rejected_block): the block is not stored, so the state
+    # at the tip is the state before it. Without a revert point, revert_block() is a no-op.
+    if exchange_txs and revertible:
         mgr.take_snapshot()
 
     # Begin block processing
@@ -590,6 +587,7 @@ def validate_exchange_state_root(
         block_timestamp,
         exchange_txs,
         state_manager,
+        revertible=True,  # it reverts on a mismatch itself
     )
 
     if not success:
@@ -674,7 +672,6 @@ async def rebuild_exchange_state_from_chain(
 
     applied = 0
     flushed = 0
-    await ensure_oracle_committee(db, mgr)
     for height in range(0, tip + 1):
         try:
             block = await db.get_block_by_id(height)
@@ -685,6 +682,8 @@ async def rebuild_exchange_state_from_chain(
         block_hash = block.get("hash") or block.get("block_hash")
         if not block_hash:
             continue
+        if height >= 1:
+            await ensure_oracle_committee(db, mgr, height)  # as forward judged this block
         try:
             section = await db.get_block_exchange_txs(block_hash)
         except Exception:
@@ -705,11 +704,11 @@ async def rebuild_exchange_state_from_chain(
         # would at this height. Must run BEFORE process_exchange_transactions.
         if flush_to_account_state:
             try:
-                await preload_sender_balances(db, txs, mgr)
+                await preload_sender_balances(db, txs, mgr, height)
                 await preload_token_balances(db, txs, mgr)
             except Exception as e:
                 logger.debug("rebuild_exchange_state preload skipped at %d: %s", height, e)
-        ok, err, _root = process_exchange_transactions(height, ts, txs, mgr)
+        ok, err, _root = process_exchange_transactions(height, ts, txs, mgr, revertible=True)
         if ok:
             mgr.commit_block()
             applied += 1
@@ -795,10 +794,10 @@ def apply_block_exchange_section(
         mgr,
     )
     if not success:
-        # process_exchange_transactions already reverted on critical failure.
+        # The caller restores the pre-block state (the reorg fast path): there is no revert
+        # point (process_exchange_transactions).
         return False, error
     if computed_root != declared_state_root:
-        mgr.revert_block()  # undo the wrongly-applied state
         return False, (
             f"exchange_state_root mismatch at block {block_height}: "
             f"declared {declared_state_root[:16]}..., computed {computed_root[:16]}..."

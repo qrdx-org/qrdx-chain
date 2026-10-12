@@ -50,9 +50,10 @@ logger = get_logger(__name__)
 VOTE_OFFSET_SLOTS = max(1, SLOTS_PER_EPOCH // 4) if SLOTS_PER_EPOCH > 1 else 0
 # A vote may be included this many epochs after its target, then no longer.
 INCLUSION_EPOCHS = 2
-# Validator statuses whose stake counts (pending validators do not vote yet; rows an orphaned
-# block registered are pending, so they never skew the total).
-_VOTING_STATUSES = ("ACTIVE", "EXITING")
+# Epochs of each node's vote history (attestation_votes, with every vote's 3.3 KB signature) kept
+# below the finalized epoch. The slashing detector compares a new vote with a validator's 128
+# latest; older rows were never read again and grew the database by ~0.5 KB a block.
+VOTE_HISTORY_EPOCHS = 256
 
 Checkpoint = Tuple[int, str]  # (epoch, block hash)
 
@@ -158,16 +159,18 @@ class Finality:
         return e, self.justified[e]
 
 
-async def _voting_stake(db: Any) -> Dict[str, Decimal]:
-    stakes: Dict[str, Decimal] = {}
-    try:
-        for r in await db.get_validators():
-            if str(r.get("status", "")).upper() not in _VOTING_STATUSES or not r.get("address"):
-                continue
-            stakes[r["address"]] = Decimal(str(r.get("effective_stake") or r.get("stake") or 0))
-    except Exception as e:
-        logger.debug("ffg: could not load validators: %s", e)
-    return stakes
+async def _target_stakes(db: Any, view: "ChainView", target: int) -> Dict[str, Decimal]:
+    """The stake a vote for ``target`` weighs: each active or exiting validator's effective
+    stake in ``S_target`` of the chain the vote is counted on (validator/epoch_state.py) — so
+    finality is a function of the chain, not of this node's live table. For a branch view,
+    an epoch past the common prefix is weighed by the newest state the prefix determines: its
+    own would need the branch's blocks applied (their stake operations executed)."""
+    from .epoch_state import state_at, voting_stakes
+
+    if view.ancestor is None:
+        return voting_stakes(await state_at(db, target))
+    first = view.branch[0][2] // SLOTS_PER_EPOCH if view.branch else target
+    return voting_stakes(await state_at(db, min(target, first), view.ancestor))
 
 
 async def _stored_finalized(db: Any) -> Optional[Tuple[int, str, int]]:
@@ -264,11 +267,6 @@ async def compute(db: Any, view: Optional[ChainView] = None) -> Optional[Finalit
     if stored is not None and await view.block_hash(stored[2]) == stored[1]:
         state.justified = {stored[0]: stored[1]}
         state.finalized, state.finalized_height = (stored[0], stored[1]), stored[2]
-    stakes = await _voting_stake(db)
-    total = sum(stakes.values(), Decimal(0))
-    if total <= 0:
-        return state
-
     # First vote per (validator, target), in chain order. A validator's second, different vote
     # for one target is a double vote: slashable, never counted.
     votes: Dict[int, Dict[str, Tuple[int, str, str]]] = {}
@@ -279,6 +277,10 @@ async def compute(db: Any, view: Optional[ChainView] = None) -> Optional[Finalit
         cp = await view.checkpoint(t)
         if cp is None:
             break
+        stakes = await _target_stakes(db, view, t)
+        total = sum(stakes.values(), Decimal(0))
+        if total <= 0:
+            continue
         support = link = Decimal(0)
         for validator, (se, sr, tr) in votes[t].items():
             if tr != cp[1] or se >= t or state.justified.get(se) != sr:
@@ -383,6 +385,11 @@ async def update(db: Any) -> Dict[str, int]:
             await prune_reorg_state(db, state.finalized_height)
         except Exception as e:
             logger.debug("reorg-state prune skipped: %s", e)
+        if hasattr(db, "prune_attestation_votes"):
+            try:
+                await db.prune_attestation_votes(fin_epoch - VOTE_HISTORY_EPOCHS)
+            except Exception as e:
+                logger.debug("vote-history prune skipped: %s", e)
         if prev is not None and fin_epoch > prev[0]:
             logger.info(
                 "[finality] finalized epoch %d (block %d, %s…), justified %d",

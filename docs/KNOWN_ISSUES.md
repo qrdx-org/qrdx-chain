@@ -13,7 +13,7 @@ Companions: [UNIFIED_ACCOUNT_IDENTITY.md](UNIFIED_ACCOUNT_IDENTITY.md),
 
 # Open defects
 
-## OPEN — Perpetuals: rebuilt on a zero-sum clearinghouse; waiting on the bridged stablecoin
+## OPEN — Perpetuals: rebuilt on a zero-sum clearinghouse; mainnet needs its bridge deployed
 
 **Severity: critical (design) → being closed in phases.** Design and status:
 docs/PERPS_CLEARINGHOUSE.md.
@@ -107,30 +107,55 @@ funding paid none (caught by S19's funding check). The duplicate is gone and
 `tests/test_constants_single_definition.py` now fails on any name assigned twice there.
 
 **Still open:**
-* **The bridged stablecoin does not exist yet.** The token standard can now carry one — a token
-  deployed with zero supply and a mint authority ([NATIVE_TOKENS.md](NATIVE_TOKENS.md)) — but the
-  bridge cannot drive it: its `BridgeMinter` (`qrdx/bridge/shielding.py`) only tallies
-  minted/burned totals in memory and credits no ledger. What is missing is a consensus bridge:
-  deposits attested by a validator quorum, minted through a protocol-held mint authority, and
-  burns released on the source chain by its custodian. Until then mainnet has no collateral to
-  configure (the default, unset, refuses deposits); the testnet deploys a test token.
-  Native-QRDX settlement remains for development only.
-* **Oracle votes are not gossiped.** A vote rides only in its voter's own blocks, so on a large
-  validator set each validator's vote refreshes only as often as it proposes. Slashing does not
-  yet remove a committee member (only `STAKE_EXIT` does); weights are principal stake.
-* **A validator's exchange nonce now moves on its own.** Each vote consumes one. A validator's
-  own exchange transactions (e.g. `STAKE_EXIT`) should be submitted to its own node, whose
-  proposer orders them ahead of its vote; signed elsewhere with a predicted nonce they can go
-  stale. (The integration scenarios that signed spot trades as validators now use their own
-  wallets — S15 failed on exactly this.)
-* **Mark-price robustness** — without other venues' perp prices as the third input, a
-  sustained squeeze on a thin book can move the mark to the ±5 % band in about a minute.
-  Depth is the defence; validators could also vote an external perp price.
-* Smaller gaps: a resting order reserves margin even when it would only reduce the position
-  (conservative); large positions are liquidated whole, not in Hyperliquid's 20 % slices; the
-  vault holds the positions it takes over rather than unwinding them (it is book-liquidated
-  only if it falls under maintenance); after a halt spanning several funding intervals, one is
-  paid; anyone may create a market (it trades only once validators price it).
+* **The bridge is built; mainnet still has to deploy it.** The consensus bridge
+  ([BRIDGE.md](BRIDGE.md)) mints a listed source-chain token once validators holding two thirds
+  of the stake attest its lockbox deposit, through a mint authority no key controls, and records
+  burns for the lockbox's custodian to release. What remains is not code: the lockbox
+  (`contracts/bridge/QRDXLockbox.sol`) audited and deployed, a custodian chosen (a multisig —
+  the source chains cannot verify Dilithium, so releases are its act), and mainnet's chain spec
+  listing the asset (`BRIDGE_ASSETS`) and settling perps in it (`PERP_COLLATERAL_TOKEN`). Until
+  then the default (unset) collateral refuses deposits; the testnet deploys a test token.
+  Native-QRDX settlement remains for development only. The older bridge scaffolding in
+  `qrdx/bridge/` is not part of it and could not have been: its `BridgeMinter`
+  (`qrdx/bridge/shielding.py`) only tallies totals in memory, and its Ethereum lock-event scan
+  matches a sha256 topic (Ethereum uses keccak) and never decodes the amount or recipient. It
+  remains for the Doomsday Protocol's reads only.
+
+**Fixed (2026-10-12):**
+* **Oracle votes are gossiped and have their own sequence.** A vote used to ride only in its
+  voter's own blocks, so on a large validator set it refreshed only as often as the voter
+  proposed, and each one consumed the validator's exchange nonce, so its own transactions signed
+  elsewhere went stale. Validators now vote from a background loop through the mempool (a vote
+  lane that keeps each voter's newest vote, gossiped and included votes-first); a vote's nonce is
+  the slot it was made in, checked against the voter's last applied vote, never the account nonce.
+* **Convicted validators leave the oracle committee.** Slashing evidence on the chain below the
+  block excludes the offender (only `STAKE_EXIT` used to remove a member).
+* **Mark-price robustness.** Validators vote other venues' perp prices (`"BTC:perp"`; the
+  exchanges feed reads Binance, Bybit and OKX perps), aggregated like the oracle. While fresh it is
+  the mark's third input in place of the 30 s book EMA, so a squeeze of the local book moves the
+  mark ~5× slower (a 10 % squeeze: ~54 s to move it 3 %, not ~12 s).
+* **Margin for closing orders.** A resting order that only closes the position reserves nothing
+  (it reserved as if it opened, unless flagged reduce-only). Orders are re-checked when the
+  position changes and at match time, so one left opening by a smaller position cannot fill
+  unmargined. Found on the way: **a resting order far from mark reserved nothing at placement**
+  — the check valued it as filled now, at the gap to mark — so a sell at twice the mark rested
+  against almost no collateral. Placement now also checks the order resting whole.
+* **Large liquidations in 20 % slices** with a 30 s cooldown above 100,000 of notional
+  (Hyperliquid); the backstop still acts during the cooldown.
+* **The vault unwinds what it takes over**, a slice every 30 s per market, never more than 0.5 %
+  through mark (it held the positions until it fell under maintenance itself).
+* **Funding after a halt** pays every interval the halt spanned, those with no block in them at
+  the interest-only rate (one interval used to be paid).
+* **Market listing is not free:** `CREATE_MARKET` burns `PERP_MARKET_LISTING_FEE` QRDX (a
+  chain-spec parameter, default 1,000). Every market costs every node work in every block and a
+  place in the validators' votes; it cost only gas.
+* Found on the way: **placing a perp order walked every resting order in the market** to prune
+  finished ones (most of its cost: 1.9 ms at 10,000 orders, now 0.3 ms), and derived indexes
+  re-read every change since the last commitment on each sync. Both now touch only what changed.
+
+Tests: `tests/test_validator_oracle.py`, `tests/test_clearinghouse_order_reservations.py`,
+`tests/test_clearinghouse_liquidation_slices.py`, `tests/test_clearinghouse_funding.py`,
+`tests/test_exchange_fees.py`.
 
 ## OPEN — The first release needs maintainer keys
 
@@ -170,106 +195,231 @@ replayable.
 
 **To close:** submit `eip155-762.json` and `eip155-7620.json` to ethereum-lists/chains.
 
-## OPEN — A second, unused token class remains
+## FIXED — A second, unused token class remained
 
-**Severity: low.** What remains of the 2026-10-02 audit of the spot exchange: its spot findings
-are fixed ([below](#fixed-spot-exchange-liquidity-could-be-stolen-or-lost-pools-moved-for-free-replays-diverged)),
-tokens are one native standard ([NATIVE_TOKENS.md](NATIVE_TOKENS.md)) that is also a real ERC-20
-inside the EVM ([below](#fixed-evm-state-lived-in-a-per-node-trie)), and the simulated EVM
-exchange precompiles are retired.
+**Severity: low.** This was what remained of the 2026-10-02 spot exchange audit.
+`qrdx/tokens/qrc20.py` was an in-memory token class (approvals, permits, bridge mint/burn,
+freeze) that no consensus path used. The Doomsday trading hook (Whitepaper §9.2) read its
+per-token flag, and integration scenarios S05/S06 drove it on a scratch database.
 
-`qrdx/tokens/qrc20.py` still exists — an in-memory token class (approvals, permits, bridge
-mint/burn, freeze) used by no consensus path. The Doomsday trading hook (Whitepaper §9.2) reads
-its per-token flag, and integration scenarios S05/S06 drive it on a scratch database. To retire
-it, give native tokens the Doomsday flag and move S05/S06 onto them.
+**Fixed:** native tokens carry the Doomsday flag as an extension, `post_doomsday_trade`, set at
+`TOKEN_DEPLOY`. A plain token is committed exactly as before. The hook evaluates native tokens.
+`qrc20.py`, its persistence layer, its constants and S05/S06 are removed. S14, S15 and S20 cover
+the native standard and the AMM through consensus. The suite is now 21 scenarios.
 
 ---
 
 # Accepted limitations
 
-## OPEN — Historical proposer eligibility cannot be re-checked
+## FIXED — Historical proposer eligibility could not be re-checked (and refused deposits became validators)
 
-**Severity: medium (consensus).** A block's proposer must be the validator selected for its slot
-(`verify_proposer_eligibility`). The selection is computed from the `validators` table as it is
-*now*. That table changes every finalized epoch (rewards, penalties, joins, exits), so a block
-judged long after its slot — during sync, or when fork choice adopts a competing branch — can be
-assigned a different expected proposer than the one it was proposed under. Sync has therefore
-always trust-replayed eligibility, and fork-choice adoption does the same
-(`main._apply_branch`). Proposer signatures, parent continuity, slot progression and FFG votes
-are still enforced on those paths. What is not checked there is whether the signer owned the
-slot.
+**Severity: critical (consensus).** A block's proposer must be the validator selected for its
+slot. The set it was selected from was this node's live `validators` table, which the epoch
+loop rebuilt each time *this node's* finality advanced. Three consequences:
 
-The risk is bounded but real. A branch of out-of-turn blocks by one validator cannot justify a
-checkpoint, which needs ⅔ of the stake, and fork choice puts the newest justified checkpoint
-first. Between justified checkpoints, though, such a branch could win on height.
+- A block judged long after its slot was judged against a different set: during a sync, or on
+  a branch fork choice adopted. So sync and adoption trust-replayed eligibility, and a branch of
+  out-of-turn blocks could win on height between justified checkpoints.
+- Live import and the proposer could disagree for a moment whenever one had processed a
+  finalized epoch the other had not.
+- Casper FFG weighed votes by that same live table, so finality depended on node-local timing.
 
-**Closing it:** record the selection set per epoch (address and stake, as of the epoch's
-start), derived deterministically from the canonical chain, and check every block, historical
-or live, against the set of its own epoch. The validator reconstruction already keeps
-per-epoch snapshots it could serve from.
+**Found on the way: refused deposits became validators.** The rebuild took its stake inputs
+from the per-block index, which records every `STAKE_DEPOSIT` a block carries. That includes
+deposits the exchange **refused**: a failed transaction is still included, because it pays its
+gas.
 
-## OPEN — Restarts replay derived state from genesis
+- **Measured:** an account holding 1 QRDX submitted a deposit naming 1,000,000 of stake. The
+  exchange refused it and debited nothing, yet the rebuild registered an **active validator with
+  ~1,000,000 effective stake**. Against three 100,000 genesis validators that is ~77 % of all
+  stake, enough to finalize on its own.
+- **Second bug:** a pending validator that exited became "exiting", a proposing status, so it
+  gained proposal rights without ever activating.
 
-**Severity: medium (scaling).** Reorgs no longer replay the chain (see "FIXED — A reorg
-replayed derived state from genesis"), but a restart still does. The exchange state lives only
-in memory, and the reorg checkpoints are in-memory copies, so a starting node rebuilds every
-derived domain from genesis (`rebuild_derived_state_interleaved`). That is ~26 µs per block plus
-the blocks that carry transactions: ~2 s at 75,000 blocks, ~9 s per day of 250 ms blocks.
+**Fixed:** the validator set is a pure function of the chain (`qrdx/validator/epoch_state.py`,
+[STAKING.md](STAKING.md)).
 
-**Closing it:** persist the exchange checkpoint at the finalized height to disk. At startup,
-undo the journal back to it (`undo_journal.rollback_to`), load it, and replay the blocks above.
-The `[RESTART-REBUILD]` equivalence check should keep running periodically against a full
-replay, so a bad checkpoint cannot persist unnoticed.
+- `S_E`, the set at the start of epoch `E`, comes from an epoch-by-epoch transition from the
+  genesis set over the chain's blocks: executed stake operations, votes within the inclusion
+  window, slashing proofs. Finality and node timing are not inputs.
+- Stake operations are read only from the logs block application writes for operations that
+  executed, which rollback reverses.
+- States are cached per (epoch, checkpoint hash), so a reorg never reuses one.
+- Every block is judged against `S_E` of its own parent chain, on every path. Sync and
+  fork-choice adoption now enforce eligibility.
+- The proposer selects from the same function, and FFG weighs a vote for target `t` by `S_t`.
+- Pending validators no longer propose before they activate, and a pending exit leaves at once.
+- The `validators` table is now a display copy that the epoch loop writes. The finality-gated
+  reconstruction, its snapshots and the index's unfiltered stake-op table are removed.
 
-## OPEN — Two exchange duties still cost O(state) per block
+**Verification:**
 
-**Severity: medium (scaling; it decides how far sub-second blocks scale).** The state roots no
-longer grow with the state (see "FIXED — State roots were recomputed from all state every
-block"). Two exchange costs still do, and at 250 ms slots they are what a busy node runs out of
-first:
+- `tests/test_epoch_state.py`:
+  - the transition rules;
+  - refused deposits;
+  - identical states across different import histories;
+  - historical judgement of a block after the chain moved on;
+  - every path enforcing;
+  - FFG weights;
+  - caching across reorgs;
+  - restarts;
+  - cost per epoch.
+- The integration suite: all scenarios, S16's deposit, activation and exit included, with no
+  eligibility rejections in any node log.
 
-- **The liquidation scan.** `Clearinghouse.tick` runs on every block. It sorts every margin
-  account and computes the equity of each one that has positions. That is about 3 µs per
-  account: 29 ms at 10,000 accounts and 148 ms at 50,000.
-- **The per-block revert snapshot.** A block that carries exchange transactions first
-  deep-copies the whole exchange state (`take_snapshot`), so that a section that fails halfway
-  can be undone. That is about 11 µs per account: 115 ms at 10,000. (A *rejected block* no
-  longer needs it: it is restored through the fast reorg path.)
+## FIXED — The exchange kept a second validator set
 
-**Closing them:**
+**Severity: medium (consensus).** Oracle prices, bridge attestations and governance votes are
+weighted by a validator "committee" the exchange kept as its own record: the genesis set, plus
+executed deposits, minus exits. That was a second definition of the validator set, and it
+disagreed with the first:
 
-- *Liquidation:* index positions by the mark price at which they fall below maintenance, per
-  market, and check only those the new mark crosses.
-- *Snapshot:* journal the exchange like the database. The commitment tracking
-  (`qrdx/exchange/commitment.py`) already marks every entry a block may change, at the moment it
-  is handed out. Copying an entry the first time it is marked in a block makes the undo cost what
-  the block touched. Pools and books need the same at their version bumps.
+- a validator voted prices, attested bridge deposits and proposed governance while still
+  **pending**;
+- one **ejected** for inactivity kept voting until it filed an exit itself;
+- delegated stake did not count;
+- weights were principal, not effective stake.
 
-The order books and pools are re-digested whole when touched, which is O(that book or pool)
-rather than O(changes). Their size is bounded by market structure, not by the number of users,
-but per-order and per-position digests would remove it.
+**Found on the way.** The members a slashing proof convicts were read below the node's tip,
+not below the block being applied. A rebuild of history therefore excluded a validator from
+blocks before its conviction, and its earlier votes counted differently.
 
-## OPEN — Sub-second slots make the chain large
+**Fixed:** the committee for block `h` is the chain-derived validator set in force at its parent
+(`epoch_state.committee_for_block`): active and exiting validators, weighted like everywhere else.
+Convictions below `h` are excluded, for governance proposals too. Every path sets it before every
+block, section and tick alike, for that block's own height (`block_processor.ensure_oracle_committee`).
+Stake operations no longer edit it, and the validators' vote loop reads it without touching the
+exchange's. Tests: `tests/test_validator_oracle.py`
+(`test_the_committee_is_the_validator_set_in_force_at_the_parent`,
+`test_every_path_sets_the_committee_before_each_block`, the conviction height).
 
-**Severity: medium (operations).** A block is about 20 KB. Votes are now cast once per validator
-per epoch (about 0.3 per block on the testnet), not every slot, which removed most of the
-attestations that used to make blocks 45 KB. What remains is mostly Dilithium signatures,
-stored as hex inside the Python-literal body:
+## FIXED — Restarts replayed derived state from genesis (and fast reorgs kept orphaned history)
+
+**Severity: medium (scaling).** Reorgs no longer replayed the chain, but a restart still did: the
+exchange state lives only in memory, and the reorg checkpoints were in-memory copies. A starting
+node rebuilt every derived domain from genesis, at about 26 µs per block plus the blocks that
+carry transactions. That is ~2 s at 75,000 blocks and ~9 s per day of 250 ms blocks.
+
+Found on the way: **the fast reorg path left the exchange journal behind.** It restored the
+exchange state from a checkpoint but not the journal (receipts, perps events, trades, candles).
+Receipts and trades of orphaned blocks stayed, and the replayed blocks were journaled a second
+time.
+
+**Fixed:**
+
+- **The journal follows reorgs.** `ExchangeJournal.rollback_to` and `MarketData.rollback_to`
+  undo every block above a height: receipts, events, trades, candle updates, last prices.
+  Sequence numbers are never reused, so stream subscribers see the new branch as new. A replay
+  records only the blocks above the journal's height.
+- **Restarts start from a persisted checkpoint.** Every 1,024 blocks of finality
+  (`PERSIST_INTERVAL_BLOCKS`), the base checkpoint (the exchange state after a finalized block)
+  and the journal are pickled, compressed and stored in `exchange_checkpoint`. The undo journal
+  is kept back to that checkpoint. A starting node loads it if its block is still on the chain
+  and takes the reorg fast path: undo the database to it, restore the exchange, replay the
+  blocks above. Otherwise it falls back to the full replay.
+- **The equivalence check still runs.** Every restart compares the rebuilt account and token
+  roots with the durable ones, as before. `QRDX_STARTUP_FULL_REBUILD=1` forces the replay from
+  genesis, which is the reference the checkpoint path is checked against.
+
+Live: a node restarted at tip 545 replayed 514 blocks from its checkpoint, matched its durable
+state and rejoined. Tests: `tests/test_fast_reorg_rebuild.py`. The fast path equals the full
+rebuild, journal included, across reorgs and across a restart from the persisted checkpoint;
+without the journal rollback the reorg cases fail.
+
+## FIXED — Exchange duties cost O(state) per block
+
+**Severity: medium (scaling; it decided how far sub-second blocks scale).** The state roots no
+longer grew with the state, but four per-block exchange costs still did. At 250 ms slots they
+were what a busy node would run out of first:
+
+| Duty | Cost before |
+|---|---|
+| The liquidation scan: equity of every account with a position | 3 µs an account; 29 ms at 10,000, 148 ms (now measured 305 ms) at 50,000 |
+| The per-block revert snapshot: a deep copy of the whole exchange for a block with transactions | 11 µs an account; 115 ms at 10,000 |
+| Order-book digests: a touched book re-digested whole | 6 ms at 4,000 resting orders |
+| Top-of-book reads in the tick: every level's orders summed | 4.3 ms a tick at 4,000 resting orders |
+
+**Fixed:**
+
+- **Liquidation index** (`clearinghouse._LiquidationIndex`). Equity and maintenance are linear in
+  the mark, so a position whose margin covers one market (isolated, or an account's only cross
+  market) has an exact liquidation price. Those prices are kept sorted per market, and a tick
+  checks only the owners whose price the new mark crossed, plus every account with cross
+  positions in several markets. It is kept current from the accounts the commitment tracking
+  marks. During a pass, owners that a liquidation pushes under join the pass, so the result is
+  exactly the full scan's, in the same order. With `QRDX_VERIFY_STATE_COMMITMENTS` (tests, the
+  harness) every pass is compared with the full scan on a copy. **8 µs** a tick at 50,000
+  accounts.
+- **No per-block revert snapshot.** Live paths that see a section fail or mismatch restore
+  through the reorg fast path (`main._restore_after_rejected_block`; the proposer through an
+  injected hook). Only replays, which must undo a failed section exactly where forward
+  application did, still take one.
+- **Order books are committed per price level.** Each level's digest is kept, the book holds
+  their LtHash, and the entry points mark the levels they change. Owner nonces are a committed
+  dict.
+- **Top-of-book reads are lazy and best-first** (`OrderBook.iter_levels`): the impact price and
+  best bid/ask stop at what they need. A tick: **0.09 ms** at 4,000 resting orders.
+
+Found on the way: **two stop orders could make an exchange section fail.** A triggered stop is
+matched as a market order whose fills re-check the triggers. The inner check removed stops the
+outer one still listed, and the outer `pop` raised `KeyError` out of the order book, which fails
+the whole section.
+
+Tests: `tests/test_liquidation_index.py`, `tests/test_orderbook_digest.py`,
+`tests/test_fast_reorg_rebuild.py` (a rejected section undone by the fast path).
+
+## FIXED — Live streams arrived in bursts, not as blocks landed
+
+**Severity: medium (interfaces).** The `/ws` and `/stream` publishers polled: the chain poller
+every 2 s, the perps and market-data pollers every 1 s. At 250 ms slots a subscriber got eight
+`block` events at once every two seconds, and trades, book changes and marks up to a second
+late. A reorg at equal height was never announced: the poller only looked for a taller tip.
+
+**Fixed:** the publishers are event-driven. `block_processing_lock` is a `SignallingLock` that
+raises `CHAIN_CHANGED` (`qrdx/node/observability.py`) each time it is released, which is when a
+block was applied, proposed or rolled back. The pollers wake on it, with their old interval left
+only as a fallback. `block` events carry the block hash. A tip whose hash changed at a height
+already announced is published as a `reorg` event (ancestor, its hash, the orphaned hashes),
+followed by the new branch's blocks. Measured on the local 250 ms testnet: the median gap between
+`block` events is 250 ms, as the blocks are produced. Tests: `tests/test_observability.py`
+(signal, latency, reorg detection, the exchange stream waking on a block).
+
+## OPEN — Each block still carries a 3.3 KB signature (was: the chain grew 7 GB a day)
+
+**Severity: low (operations).** At 250 ms slots a node grew by 21.8 KB a block, about 7.5 GB a
+day. Three hex fields made most of each 17.8 KB body:
 
 | Part | Size |
 |---|---|
 | Proposer signature | 6.6 KB |
 | RANDAO reveal | 6.6 KB |
 | Proposer public key | 3.9 KB |
-| Each vote | ~7 KB |
 
-That is about 0.9 GB a day at 2 s slots and 7 GB a day at 250 ms.
+Vote history kept a second copy of every vote's signature besides.
 
-**Closing it:**
+**Fixed:**
 
-- Store signatures as bytes, not hex: half the size.
-- Drop the public key from the body. The chain-derived key registry
-  (`chain_index.validator_public_key`) already supplies every validator's key.
+- **Bodies are stored compressed** (`qrdx/block_codec.py`). Hex holds 4 bits a character, so
+  zlib recovers about the raw size. Every reader sees the same text, signed and sent unchanged.
+- **The proposer's public key is gone from the body.** Importers take it from the chain's key
+  registry (`block_verification.verify_block_proposer`), as FFG votes already did. DOUBLE_SIGN
+  evidence carries it instead, and a wrong key fails because it must derive to the address.
+- **A RANDAO reveal is carried only from 256 blocks before RANDAO selection activates.** Before
+  that nothing reads the mix. The reveal is now also verified as the proposer's signature of the
+  slot's reveal message: it used to be taken unchecked, so a proposer could have chosen the
+  bytes folded into the mix.
+- **Vote history is pruned** 256 epochs below finality (`prune_attestation_votes`).
+
+Measured on the local testnet: 7.25 KB a block before the vote-history pruning (about 0.5 KB
+less after it), about 2.3 GB a day at 250 ms.
+
+**What remains** is the proposer's Dilithium signature, about 3.4 KB stored, roughly 1.2 GB a
+day. Going lower needs one of two choices:
+
+- **Prune finalized signatures on non-archive nodes.** New nodes would then sync history from
+  archive nodes, or verify it against finality proofs.
+- **Produce no block for an empty slot.** Inclusion latency is unchanged, but votes, oracle
+  updates and exchange ticks would have to ride the next block, or a periodic one.
 
 ## ACCEPTED — Oracle reporters are trusted (development override only)
 
@@ -279,31 +429,35 @@ directly with `UPDATE_ORACLE` — trusted outright, no aggregation — which uni
 development setups use. No production network should configure one; the integration testnet no
 longer does.
 
-## ACCEPTED — A finality stall longer than the withdrawability delay reopens the slashing window
+## FIXED — A finality stall longer than the withdrawability delay reopened the slashing window
 
-An exiting validator stays eligible until the **finalized** epoch reaches its `exit_epoch`;
-its principal is paid at head epoch `exit_epoch + WITHDRAWAL_DELAY_EPOCHS` (256 in
-production). While finality keeps pace, the validator is ineligible long before payout. If
-finality stalls for longer than the delay, it can still be eligible when paid, and an
-offence after that point is slashed from a stake already returned.
+An exiting validator stayed eligible until the **finalized** epoch reached its `exit_epoch`,
+while its principal was paid at head epoch `exit_epoch + WITHDRAWAL_DELAY_EPOCHS`. If finality
+stalled for longer than the delay, it could still be eligible when paid, and an offence after
+that point would be slashed from a stake already returned.
 
-Closing it fully means gating payout on the exit being finalized, which needs a finalized
-epoch that is a pure function of the chain at each block — the finality view today is a
-node-local table. 256 epochs is Ethereum's figure for the same window, and a stall that
-long is itself a network emergency.
+Fixed with the chain-derived validator set (see "Historical proposer eligibility" above):
+eligibility no longer follows finality. A validator leaves the set when the *chain's* epoch
+reaches its exit epoch, so it is out a full withdrawal delay before its principal is paid,
+however long finality stalls. The delay remains the window for evidence of its earlier offences
+to reach a block.
 
-## ACCEPTED — Ejected validators claim their principal manually; staking has no CLI
+## FIXED — Ejected validators had to claim their principal manually
 
-The stake-floor sweep ejects inside the asynchronous reconstruction, so it writes no exit
-record on chain and nothing is paid automatically. The validator claims by submitting a
-`STAKE_EXIT`, which is logged even though it is no longer active and then paid like any
-exit (`tests/test_withdrawal_delay_and_forfeit.py`). Automatic payout would need the
-ejection itself to be a block-level, chain-derived event.
+The stake-floor ejection happened in the asynchronous reconstruction, so it wrote no exit record
+on the chain and nothing paid the validator's principal. It had to submit a `STAKE_EXIT` of its
+own. The ejection is now part of the validator set's transition, a function of the chain, so
+the in-block withdrawals read it and pay the principal like any exit
+(`withdrawals._ejected`; `tests/test_validator_withdrawals.py`).
 
-Neither `STAKE_DEPOSIT` nor `STAKE_EXIT` has wallet-CLI support: both are signed exchange
-transactions posted to `/submit_exchange_tx`, as `integration_tests/scenarios/s16` does.
+Staking had no wallet support: `STAKE_DEPOSIT` and `STAKE_EXIT` were posted by hand to
+`/submit_exchange_tx`. **Fixed (2026-10-12):** `qrdx-wallet stake` now covers it:
 
----
+- `deposit`, `exit`, `status` and `receipt` (`qrdx/cli/stake.py`): signed with the wallet's PQ
+  key for the node's network; a deposit under the minimum is refused before signing; `status`
+  shows each validator and the epoch its principal is paid from (`tests/test_stake_cli.py`);
+- `commission`, `pools`, `delegate`, `undelegate` and `delegations` for delegation pools
+  ([STAKING.md](STAKING.md)).
 
 ## ACCEPTED — 20-byte account ids give ~80-bit collision resistance
 
@@ -407,6 +561,9 @@ These are not defects, but they are the reason two real bugs survived a green su
 
 | Issue | Where |
 |---|---|
+| Exchange duties cost O(state) per block (liquidation scan, revert snapshot, book digests, top-of-book reads); two stop orders could fail a section | [below](#fixed-exchange-duties-cost-ostate-per-block) |
+| Restarts replayed derived state from genesis, and fast reorgs kept orphaned exchange history | [below](#fixed-restarts-replayed-derived-state-from-genesis-and-fast-reorgs-kept-orphaned-history) |
+| Each block carried 17 KB of hex (key, unused RANDAO reveal, signature); the chain grew 7.5 GB a day | [below](#open-each-block-still-carries-a-33-kb-signature-was-the-chain-grew-7-gb-a-day) |
 | A proposer could build on an all-zero parent during a reorg | [below](#fixed-a-proposer-could-build-on-an-all-zero-parent-during-a-reorg) |
 | Fork choice let a branch carrying the votes for a shared checkpoint beat a taller one (a lone validator never rejoined) | [below](#fixed-fork-choice-let-a-branch-carrying-the-votes-for-a-shared-checkpoint-beat-a-taller-one) |
 | A peer that dropped out came back without a URL, so the network stayed split after a validator restart | [below](#fixed-a-peer-that-dropped-out-came-back-without-a-url-and-the-network-stayed-split) |

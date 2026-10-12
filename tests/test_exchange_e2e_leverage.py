@@ -31,7 +31,6 @@ from decimal import Decimal
 import pytest
 
 from qrdx.crypto.pq.dilithium import PQPrivateKey, PQPublicKey, PQSignature, verify
-from qrdx.tokens.qrc20 import QRC20Token, QRC20Registry, _make_transfer_digest
 from qrdx.exchange import (
     ExchangeStateManager,
     ExchangeTransaction,
@@ -100,51 +99,6 @@ async def run_exchange_e2e(report=False):
     say("\n=== 1. Wallets + capital ===")
     for w in wallets:
         say(f"  {w.label:14} {w.address[:26]}…  capital={w.capital} QRDX")
-
-    # ---- 2. Custom qRC20 tokens with real PQ-signed transfers -----------
-    # Inject a real Dilithium verifier so transfers are genuinely PQ-verified.
-    pubkeys = {w.address: w.pub for w in wallets}
-
-    async def pq_verify(address: str, message: bytes, signature: bytes) -> bool:
-        pk = pubkeys.get(address)
-        if pk is None:
-            return False
-        return verify(pk, message, PQSignature.from_bytes(signature))
-
-    registry = QRC20Registry()
-    qbtc = registry.deploy(QRC20Token(
-        "Quantum Bitcoin", "qBTC", decimals=8,
-        total_supply=Decimal("1000"), deployer=issuer.address,
-        verify_signature_fn=pq_verify,
-    ))
-    qusd = registry.deploy(QRC20Token(
-        "Quantum USD", "qUSD", decimals=2,
-        total_supply=Decimal("100000000"), deployer=issuer.address,
-        verify_signature_fn=pq_verify,
-    ))
-    assert qbtc.balance_of(issuer.address) == Decimal("1000")
-    assert qusd.balance_of(issuer.address) == Decimal("100000000")
-
-    async def signed_transfer(token, frm: Wallet, to: Wallet, amount: Decimal):
-        nonce = token._nonces.get(frm.address, 0)
-        digest = _make_transfer_digest(token.symbol, frm.address, to.address, amount, nonce)
-        sig = frm.key.sign(digest).to_bytes()
-        return await token.transfer(frm.address, to.address, amount, signature=sig)
-
-    # Distribute token capital from the issuer to the participants.
-    await signed_transfer(qbtc, issuer, maker,  Decimal("100"))
-    await signed_transfer(qbtc, issuer, lp,     Decimal("50"))
-    await signed_transfer(qusd, issuer, taker,  Decimal("3000000"))
-    await signed_transfer(qusd, issuer, hedger, Decimal("3000000"))
-    await signed_transfer(qusd, issuer, lp,     Decimal("1500000"))
-
-    assert qbtc.balance_of(maker.address) == Decimal("100")
-    assert qusd.balance_of(taker.address) == Decimal("3000000")
-    # Conservation: issuer balance reduced by exactly what was distributed.
-    assert qbtc.balance_of(issuer.address) == Decimal("1000") - Decimal("150")
-    say("\n=== 2. Custom qRC20 tokens (real PQ-signed transfers) ===")
-    say(f"  qBTC supply={qbtc.total_supply}  maker={qbtc.balance_of(maker.address)} qBTC")
-    say(f"  qUSD supply={qusd.total_supply}  taker={qusd.balance_of(taker.address)} qUSD")
 
     # ---- 3. Trading pair (AMM pool + order book + oracle) ---------------
     ExchangeStateManager.reset_instance()

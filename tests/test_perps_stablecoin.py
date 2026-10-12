@@ -62,7 +62,8 @@ async def chain(monkeypatch):
             await db.add_block_exchange_txs(bh, encode_exchange_txs(list(txs)))
         blocks.append((h, list(txs)))
 
-    await add(0, alloc=[(k.addr, "1000") for k in (issuer, rep, alice, bob)])
+    # The reporter lists the market: the listing fee, when a path runs with the fee gate on.
+    await add(0, alloc=[(k.addr, "5000" if k is rep else "1000") for k in (issuer, rep, alice, bob)])
     await db.seed_genesis_account_state()
     await db.connection.commit()
     ExchangeStateManager.reset_instance()

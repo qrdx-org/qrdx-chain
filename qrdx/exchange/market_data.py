@@ -3,8 +3,8 @@ Market data for trading interfaces — recent trades, OHLCV candles and 24-hour 
 every market: spot pairs (order-book fills and AMM swaps alike) and perps.
 
 Like the journal it lives on (qrdx/exchange/journal.py), this is NOT consensus state: it is fed
-only when a block commits, never hashed, and rebuilt with the exchange manager from the
-canonical chain. Times are block times. Bounded: the newest MAX_TRADES trades per market and
+only when a block commits, never hashed, and follows the canonical chain: a reorg undoes the
+orphaned blocks' trades (``rollback_to``) before the new branch is applied. Times are block times. Bounded: the newest MAX_TRADES trades per market and
 MAX_CANDLES candles per interval.
 
 A market is named the way the exchange names it: a spot pair "base:quote" in canonical order
@@ -42,6 +42,11 @@ class MarketData:
         self.markets: Dict[str, _Market] = {}
         self.seq = 0  # last trade sequence number (monotonic)
         self.now = 0.0  # latest block time recorded
+        # What each block changed, newest last, to undo it on a reorg (``rollback_to``): per
+        # trade (height, market, the candles it touched as they were, the market's last price
+        # and trade count before it, the trade it pushed out of the recent-trades window).
+        self._undo: Deque[tuple] = deque()
+        self._undo_now: Deque[tuple] = deque()  # (height, ``now`` before that block)
 
     def _market(self, market: str) -> _Market:
         m = self.markets.get(market)
@@ -87,6 +92,9 @@ class MarketData:
             "taker": taker,
             "pool_id": pool_id,
         }
+        evicted = m.trades[0] if len(m.trades) == m.trades.maxlen else None
+        before: List[tuple] = []
+        self._undo.append((int(block_height), market, before, m.last_price, m.trade_count, evicted))
         m.trades.append(trade)
         m.last_price = price
         m.trade_count += 1
@@ -94,6 +102,7 @@ class MarketData:
         for seconds, candles in m.candles.items():
             start = t - t % seconds
             c = candles.get(start)
+            before.append((seconds, start, None if c is None else list(c)))
             if c is None:
                 # open, high, low, close, base volume, quote volume, trades
                 candles[start] = [price, price, price, price, amount, price * amount, 1]
@@ -108,8 +117,40 @@ class MarketData:
                 c[6] += 1
         return trade
 
-    def advance(self, block_time: float) -> None:
+    def advance(self, block_time: float, block_height: Optional[int] = None) -> None:
+        if block_height is not None:
+            self._undo_now.append((int(block_height), self.now))
         self.now = max(self.now, float(block_time))
+
+    # ── reorgs ─────────────────────────────────────────────────────────
+
+    def rollback_to(self, height: int) -> None:
+        """Undo every block above ``height``: its trades, their candle updates, last prices and
+        counts, and the block time. (A candle a trade pushed out of a market's MAX_CANDLES
+        window stays out.) Sequence numbers are not reused."""
+        while self._undo and self._undo[-1][0] > height:
+            _h, market, before, last_price, count, evicted = self._undo.pop()
+            m = self.markets[market]
+            if m.trades:
+                m.trades.pop()
+            if evicted is not None:
+                m.trades.appendleft(evicted)
+            m.last_price, m.trade_count = last_price, count
+            for seconds, start, candle in before:
+                candles = m.candles[seconds]
+                if candle is None:
+                    candles.pop(start, None)
+                else:
+                    candles[start] = candle
+        while self._undo_now and self._undo_now[-1][0] > height:
+            self.now = self._undo_now.pop()[1]
+
+    def prune(self, height: int) -> None:
+        """Forget the undo of blocks at or below ``height`` (no reorg reaches them)."""
+        while self._undo and self._undo[0][0] <= height:
+            self._undo.popleft()
+        while self._undo_now and self._undo_now[0][0] <= height:
+            self._undo_now.popleft()
 
     # ── queries ────────────────────────────────────────────────────────
 

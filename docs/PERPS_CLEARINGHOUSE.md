@@ -70,7 +70,8 @@ with no balance: it minted QRDX on every winning trade and burned it on every lo
 | Trade | The order book's fill price | Entry, exit, realized PnL |
 | Oracle (index) | Stake-weighted median of the validator committee's fresh price votes (§8). A configured reporter's `UPDATE_ORACLE` also sets it — development and tests only; production configures none | Funding notional and premium; mark price input |
 | Impact bid / ask | Average price to sell / buy 1,000 QRDX of notional on the book (none if the book is shallower) | Funding premium |
-| Mark | Median of: oracle + 150 s EMA(book mid − oracle); median(best bid, best ask, last trade); 30 s EMA of that book median — held within ±5 % of the oracle | Margin, liquidation triggers, unrealized PnL |
+| External perp | Stake-weighted median of the committee's votes for other venues' perp price (`"BTC:perp"`, §8); fresh for 120 s of block time | Mark price input |
+| Mark | Median of: oracle + 150 s EMA(book mid − oracle); median(best bid, best ask, last trade); the external perp price while fresh, else the 30 s EMA of that book median — held within ±5 % of the oracle. With two inputs (no book), their mean | Margin, liquidation triggers, unrealized PnL |
 
 Liquidations trigger on mark, not the last trade: a single large trade or a spoofed order on a
 thin book cannot then liquidate everyone on the other side. The liquidation itself still
@@ -84,12 +85,13 @@ proposer, the p2p / sync / REST importers, and both rebuilds. A quiet block stil
 mark; skipping it would split nodes (pinned by `tests/test_clearinghouse_mark_price.py`).
 
 **What a manipulator can do.** Hyperliquid's third mark input is the median of other venues'
-perp prices; we have none yet, so — as Hyperliquid does when that input is missing — the
-30 s EMA of the book median stands in, and the ±5 % band is added on top. On an empty or thin
-book a squeeze moves the mark only as fast as the EMAs let it (a 50 % squeeze moves it ~3 %
-in two seconds), never past the band, and it decays within about three minutes once the
-honest book returns. A deep book is the real defence; a validator-voted external perp price
-(Phase 5) would restore the third input.
+perp prices. Validators vote it with their oracle prices (§8); while no vote is fresh, the 30 s
+EMA of the book median stands in, and the ±5 % band is added on top either way. With the
+external price, a squeeze of the local book moves the mark only at the pace of the 150 s premium
+EMA: a book held 10 % over a flat oracle takes ~54 s to move the mark 3 % (~12 s through the
+book EMA alone) and ~104 s to reach the band (~22 s) — time for arbitrage with the other venues
+to close the gap. A deep book remains the first defence
+(`tests/test_validator_oracle.py::test_the_external_price_slows_a_squeeze_of_the_local_book`).
 
 **The book never crosses.** Self-trade prevention used to skip the sender's own resting
 order and rest the remainder across it — a crossed book that moved the mid, and so the mark,
@@ -105,8 +107,18 @@ made against others stand, resting orders are untouched (so no escrow moves).
 * Cross: one collateral record backs all cross positions; equity = collateral + Σ unrealized PnL
   at mark. Isolated: margin is moved from cross collateral into the position when it grows and
   released (with its PnL) when it shrinks; equity is per position.
-* An order is accepted only if the account could carry the resulting position at initial margin.
-  Resting orders reserve their margin. Reduce-only orders need none.
+* An order is accepted only if the account could carry both worst cases at initial margin: a
+  full fill now, at its limit, and resting whole (the margin it reserves at its own price, and any
+  it shifts onto the account's other orders).
+* Resting orders reserve margin for the part that would open exposure. Per market, the position's
+  size is closing capacity, used by the orders on the closing side in the order they would fill;
+  a take-profit reserves nothing. Reduce-only orders never reserve.
+* When a position changes, the account's resting orders there are re-checked: a reduce-only order
+  that would now open is cancelled, and so are opening orders the account can no longer carry,
+  the least likely to fill first. At match time, a maker whose fill would open exposure is
+  cancelled instead if it is reduce-only or neither its reservation nor the free margin covers
+  it (Hyperliquid's `reduceOnlyCanceled` / `marginCanceled`). Cancellations are reported in the
+  order's receipt (`cancelled`) or, from the tick, as `order_cancelled` events.
 * Withdrawals are limited to realized collateral that is not needed as margin.
 
 ## 6. Liquidations and the backstop vault (Phase 3)
@@ -118,6 +130,8 @@ by one, then each cross account as a whole — in owner order:
    only, for an isolated position) and send a reduce-only IOC for each position, limited to its
    **bankruptcy price** — the price at which closing it, taker fee included, leaves exactly zero.
    No book fill can therefore create bad debt; whatever margin is left stays with the trader.
+   A position above 100,000 of notional is sent in **slices** (Hyperliquid): 20 % of it, then
+   it cools down for 30 s of block time, during which only the backstop acts.
 2. **Backstop.** Still below ⅔ of maintenance (or the book could not take it): the vault takes the
    positions over **at mark** together with the margin that backed them — all cross collateral
    for a cross account, only that position's margin for an isolated one (the trader's cross
@@ -135,6 +149,12 @@ so passes repeat (at most four) until one changes nothing. Liquidation orders by
 per-block rate limit and nonce sequence (`OrderBook.place_order(protocol=True)`): a liquidation
 cannot fail because the account traded heavily that block. The vault is liquidated like any
 account (book, then ADL) but never backstopped into itself.
+
+**The vault unwinds what it takes over.** Every 30 s of block time per market (the first one 30 s
+after the takeover, since the book had just failed to absorb it), it sends a slice of its
+position — as for a liquidation — to the book as a reduce-only IOC at most 0.5 % through mark. It
+never dumps through a thin book: an attempt that finds no bid or ask within the limit fills
+nothing and waits for the next interval (`vault_unwind` events).
 
 **The vault** is the margin account `@vault`. Trading fees accrue to it. `VAULT_DEPOSIT` moves free
 collateral in for shares at NAV (collateral + unrealized PnL at mark); `VAULT_WITHDRAW` redeems at
@@ -155,8 +175,9 @@ hour), F = average premium + clamp(0.01 % − premium, ±0.05 %) is the 8-hour r
 interval's share of it is paid, capped at 4 % per hour. Each position pays
 size × oracle × rate — longs to shorts when positive; isolated positions from their own margin.
 Each payment is rounded to wei and the vault takes the few wei left over, so the payments sum to
-exactly zero. After a halt spanning several intervals one interval is paid (there were no premium
-samples for the rest). Funding runs before liquidations in the tick, so a payment that pushes an
+exactly zero. After a halt spanning several intervals, the interval the premium samples cover is
+paid at its rate and each interval with no block in it at the interest-only rate (dYdX's rule: a
+position held through a halt kept its exposure, and pays its carry). Funding runs before liquidations in the tick, so a payment that pushes an
 account under is acted on in the same block. The legacy `PerpEngine` funding duty is removed.
 
 ## 8. The validator oracle (Phase 5)
@@ -164,33 +185,44 @@ account under is acted on in the same block. The legacy `PerpEngine` funding dut
 Settled in USD, an oracle price is something every validator can observe (BTC/USD on any
 exchange), so the chain takes it from them:
 
-* **Committee.** The genesis block records the validator set (`validator_set`: address, stake);
-  the exchange domain loads it before the first block section on every path
-  (`block_processor.ensure_oracle_committee`) and follows `STAKE_DEPOSIT` (adds the stake) and
-  `STAKE_EXIT` (removes the member). A genesis without a validator set leaves votes disabled — a
-  committee of joiners alone would hand the oracle to the first one. The committee is not hashed
-  into the state root (a restarted node loads it at height 0, a long-running one at its first
-  section, and between those points it decides nothing); the votes are.
-* **Votes.** `ORACLE_VOTE {"prices": {"BTC": "65000.5", …}}`, signed like every exchange
-  transaction, from a committee member, for existing markets only (1–64 prices). A proposer
-  attaches its own vote to each block it proposes — after any of its own queued transactions,
-  with the next nonce — from its feed (`QRDX_ORACLE_FEED`: `exchanges` = the median of public USD
-  spot prices from several exchanges, refreshed in the background; `file:<path>` = the
-  testnet's scripted feed; `static:BTC=…`). A vote is an input like any transaction: a node whose
-  feed fails simply does not vote.
+* **Committee.** The validator set in force at the block's parent
+  (`qrdx/validator/epoch_state.py`, [STAKING.md](STAKING.md)): active and exiting validators,
+  each weighted by its effective stake plus what is delegated to it. Every path sets it before
+  every block, section and tick alike (`block_processor.ensure_oracle_committee`), so every node
+  judges each block by the same committee. A pending validator votes once it activates; an
+  ejected or exited one stops. It is not hashed into the state root, since it is a function of
+  the chain, but the votes are.
+* **Votes.** `ORACLE_VOTE {"prices": {"BTC": "65000.5", "BTC:perp": "65020", …}}`, signed like
+  every exchange transaction, from a committee member, for existing markets only (1–64 prices).
+  `"<base>"` keys are the oracle; `"<base>:perp"` keys are other venues' perp price, the mark's
+  third input. A vote's nonce is its own sequence (the slot it was made in), not the account's
+  exchange nonce, so voting never moves the validator's other transactions. Each validator votes
+  from a background loop — on a price change, and at least every quarter of the vote lifetime —
+  through the mempool, which keeps each voter's newest vote and gossips it like any exchange
+  transaction; whoever proposes next includes it, votes first. Prices come from the feed
+  (`QRDX_ORACLE_FEED`: `exchanges` = the median of public USD spot prices — and of USDT-margined
+  perp prices on Binance, Bybit and OKX for the `:perp` keys — refreshed in the background;
+  `file:<path>` = the testnet's scripted feed; `static:BTC=…,BTC:perp=…`). With more prices than a
+  vote carries, successive votes rotate through them. A vote is an input like any transaction: a
+  node whose feed fails simply does not vote.
 * **Aggregation.** Every block, before the clearinghouse tick, each voted market's oracle becomes
   the stake-weighted (lower) median of the committee's votes no older than
   `QRDX_PERP_ORACLE_VOTE_MAX_AGE` (60 s of block time) — only if those votes carry a strict
   majority of the committee's stake. A minority cannot set the price at all, and within a
-  majority the median ignores outliers. Expired votes are dropped.
+  majority the median ignores outliers. Expired votes are dropped. The `:perp` votes set each
+  market's external perp price the same way.
+* **Convictions.** A member convicted by slashing evidence on the chain below the block leaves the
+  committee: its votes stop counting and the majority is of the rest
+  (`chain_index.offenders_before`, refreshed before every section on every path).
 * **Staleness.** A market whose oracle has not been set for `QRDX_PERP_ORACLE_STALE_SECONDS`
   (300 s) refuses orders that add exposure; reduce-only orders still work, and liquidations run.
 
-**Known limits.** Votes ride only in their voter's own blocks (exchange transactions are not
-gossiped), so on a large validator set each validator's vote refreshes only as often as it
-proposes; vote gossip would fix that. Slashing does not yet remove a member (only `STAKE_EXIT`
-does); the median tolerates a minority of bad voters. Weights are principal stake, not
-reward-adjusted effective stake.
+**Known limits.** The median tolerates a minority of bad voters.
+
+**Listing.** `CREATE_MARKET` burns `PERP_MARKET_LISTING_FEE` QRDX (a chain-spec parameter, 1,000 by
+default) with the fee gate on: every market costs every node work in every block and a place in
+the validators' votes, so listing one must not be nearly free. A market trades only once
+validators price it.
 
 ## 9. Phases
 
@@ -200,4 +232,4 @@ reward-adjusted effective stake.
 | **2. Mark price** ✅ | Mark per §4 from oracle + book; per-block tick on every path; margin checks and PnL at mark; self-trade prevention that cannot cross the book | Manipulation bound tested; forward-with-ticks ≡ rebuild over quiet blocks — **met** (`tests/test_clearinghouse_mark_price.py`) |
 | **3. Liquidations** ✅ | Book-first liquidation in the per-block tick; backstop vault (treasury seed + user shares); auto-deleveraging | No account ends negative; invariants hold through crashes; soak with forced liquidations — **met** (`tests/test_clearinghouse_liquidation.py`: each stage pinned to exact numbers; 16 randomized runs with crashes, spikes and thin books — with a funded vault and an empty one — keep the identity exact, net size zero and no account below −1e-6 after every block; forward ≡ rebuild with a liquidation inside a block's tick; cross-node scenario s19) |
 | **4. Funding** ✅ | Interval boundaries of block time, premium + clamped interest, capped; peer-to-peer on oracle notional | Σ funding payments = 0 per market per interval — **met** (`tests/test_clearinghouse_funding.py`: exact zero-sum with uneven sizes, direction, clamp, cap, cadence, isolated margin; forward ≡ rebuild across several settlements) |
-| **5. Stablecoin + validator oracle** ✅ | USD-stablecoin settlement (token deposits/withdrawals, USD markets); committee from the genesis validator set + staking; signed `ORACLE_VOTE`s in blocks; stake-weighted median with a majority quorum per block; staleness halt; price feeds in validators; scripted feed for the testnet | Votes verified on import; median identical on all nodes; stale/absent votes handled — **met** (`tests/test_perps_stablecoin.py`: the stablecoin conserved end to end, QRDX untouched, refusals, forward ≡ rebuild with a liquidation; `tests/test_validator_oracle.py`: committee, admission, weighted median, quorum, expiry, departures, staleness, signed proposer votes, forward ≡ rebuild with the committee loaded at different heights; cross-node scenarios s13/s19 with prices set only by validator votes) |
+| **5. Stablecoin + validator oracle** ✅ | USD-stablecoin settlement (token deposits/withdrawals, USD markets); committee = the chain-derived validator set; signed `ORACLE_VOTE`s in blocks; stake-weighted median with a majority quorum per block; staleness halt; price feeds in validators; scripted feed for the testnet | Votes verified on import; median identical on all nodes; stale/absent votes handled — **met** (`tests/test_perps_stablecoin.py`: the stablecoin conserved end to end, QRDX untouched, refusals, forward ≡ rebuild with a liquidation; `tests/test_validator_oracle.py`: committee, admission, weighted median, quorum, expiry, departures, staleness, signed proposer votes, forward ≡ rebuild with the committee loaded at different heights; cross-node scenarios s13/s19 with prices set only by validator votes) |

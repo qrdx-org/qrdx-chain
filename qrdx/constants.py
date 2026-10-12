@@ -611,6 +611,14 @@ ACTIVATION_DELAY_EPOCHS = _NETWORK_PARAMS[
 # payout); standard 2,048, ~4.6 hours of 8 s epochs.
 WITHDRAWAL_DELAY_EPOCHS = _NETWORK_PARAMS["WITHDRAWAL_DELAY_EPOCHS"]
 
+# Staking rewards and delegation pools (docs/STAKING.md, qrdx/validator/epoch_state.py). Each
+# epoch a validator whose vote the chain carried earns STAKING_REWARD_RATE_BPS a year (minted)
+# on its principal and on the QRDX delegated to its pool; it keeps its own share and its
+# commission on the pool's, and the rest compounds into the pool. A chain-spec parameter.
+STAKING_REWARD_RATE_BPS = _NETWORK_PARAMS["STAKING_REWARD_RATE_BPS"]
+STAKING_DEFAULT_COMMISSION_BPS = 1_000  # a pool's commission until its validator sets one
+STAKE_MIN_DELEGATION = Decimal("1")  # QRDX: smaller delegations are refused (dust)
+
 # Addresses allowed to submit UPDATE_ORACLE. Oracle prices drive perp execution, margin,
 # PnL and liquidations — all settled into real balances — so an unrestricted update let any
 # user set the price their own position closed at. A chain-spec parameter: every node must
@@ -645,6 +653,14 @@ PERP_ORACLE_STALE_SECONDS = _NETWORK_PARAMS["PERP_ORACLE_STALE_SECONDS"]
 # Perp funding is paid at every boundary of this much block time (Hyperliquid: hourly). A
 # chain-spec parameter (a fast testnet shortens it to see several settlements).
 PERP_FUNDING_INTERVAL_SECONDS = _NETWORK_PARAMS["PERP_FUNDING_INTERVAL_SECONDS"]
+# QRDX burned by CREATE_MARKET (with the fee gate on). Every market costs every node work in
+# every block (its mark, funding and liquidation duties) and a place in the validators' price
+# votes, so listing one must not be nearly free. A chain-spec parameter.
+PERP_MARKET_LISTING_FEE = _NETWORK_PARAMS["PERP_MARKET_LISTING_FEE"]
+# Tokens the consensus bridge carries from other chains (docs/BRIDGE.md), each
+# "SYMBOL:CHAIN_ID:SOURCE_TOKEN:DECIMALS". Validators attest deposits into the lockbox there; a
+# quorum mints them here. Empty: no bridge. A chain-spec parameter (adding an asset is a fork).
+BRIDGE_ASSETS = tuple(_NETWORK_PARAMS["BRIDGE_ASSETS"])
 
 # --- Exchange fees ---
 # Exchange transactions pay gas like EVM ones: gas_price is in WEI (1 QRDX = 10^18 wei), at least
@@ -830,38 +846,6 @@ TREASURY_MULTISIG_THRESHOLD = 5  # 5-of-9 for main treasury
 TREASURY_MULTISIG_TOTAL = 9
 EMERGENCY_RECOVERY_THRESHOLD = 3  # 3-of-5 for emergency
 EMERGENCY_RECOVERY_TOTAL = 5
-
-
-# ==================================================================================
-# qRC20 TOKEN STANDARD (Whitepaper §9)
-# ==================================================================================
-
-# Maximum supply for a single qRC20 token (2^96 - 1 raw units)
-QRC20_MAX_SUPPLY = Decimal("79228162514264337593543950335")
-
-# Default token decimals (same as ERC-20 convention)
-QRC20_DEFAULT_DECIMALS = 18
-
-# Maximum tokens that can be registered in one registry
-QRC20_MAX_REGISTRY_SIZE = 10_000
-
-# Batch transfer limit per call
-QRC20_MAX_BATCH_SIZE = 256
-
-# Domain separators for PQ signature verification
-QRC20_DOMAIN_TRANSFER = b"QRDX-QRC20-TRANSFER-v1"
-QRC20_DOMAIN_APPROVE = b"QRDX-QRC20-APPROVE-v1"
-QRC20_DOMAIN_PERMIT = b"QRDX-QRC20-PERMIT-v1"
-
-# Well-known shielded tokens (§9.4) — mapped to bridge source chains
-QRC20_SHIELDED_TOKENS = {
-    "qETH": {"source_chain": "ETHEREUM", "post_doomsday_trade": True},
-    "qBTC": {"source_chain": "BITCOIN", "post_doomsday_trade": True},
-    "qSOL": {"source_chain": "SOLANA", "post_doomsday_trade": True},
-    "qUSDC": {"source_chain": "ETHEREUM", "post_doomsday_trade": True},
-    "qUSDT": {"source_chain": "ETHEREUM", "post_doomsday_trade": True},
-    "QRDX": {"source_chain": "NATIVE", "post_doomsday_trade": True},
-}
 
 
 # ==================================================================================

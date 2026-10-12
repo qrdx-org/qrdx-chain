@@ -128,6 +128,18 @@ def randao_reveal_message(slot: int, spec=None) -> bytes:
     return signing_domain("randao", spec) + int(slot).to_bytes(8, "little") + b"RANDAO_REVEAL"
 
 
+# Blocks carry RANDAO reveals from this many blocks before RANDAO selection activates, so the mix
+# has accumulated entropy by then. Before that, a block carries none: nothing uses the mix.
+RANDAO_REVEAL_LEAD_BLOCKS = 256
+
+
+def randao_reveal_required(number: int) -> bool:
+    """Must the block numbered ``number`` (its signed ``number``, as ``randao_selection_active``
+    reads it) carry a RANDAO reveal? Only from RANDAO_REVEAL_LEAD_BLOCKS before RANDAO selection
+    activates: until then a reveal is 3.3 KB a block that nothing reads."""
+    return randao_selection_active(int(number) + RANDAO_REVEAL_LEAD_BLOCKS)
+
+
 def randao_selection_active(height: int) -> bool:
     """Is RANDAO proposer selection in force for the block at ``height``?
 

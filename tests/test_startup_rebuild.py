@@ -129,7 +129,7 @@ def test_startup_initialises_evm_then_rebuilds_before_anything_consumes_state():
     init = src.index("EVM_STATE_MANAGER = ContractStateManager(db)")
     rebuild = src.index("await _rebuild_derived_state_on_startup()")
     assert init < rebuild, "the rebuild replays EVM sections, so EVM must be initialised first"
-    for consumer in ("initialize_validator_node(", "epoch_validator_update_loop(db)",
+    for consumer in ("initialize_validator_node(", "epoch_validator_update_loop(",
                      "chain_event_poller("):
         assert rebuild < src.index(consumer), (
             f"{consumer} starts before derived state is rebuilt — it would act on the "

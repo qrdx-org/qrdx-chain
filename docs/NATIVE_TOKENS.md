@@ -11,8 +11,8 @@ inside the EVM (§6) — wallets send it, contracts hold and move it. Tokens opt
 Token-2022-style **extensions** (§7): metadata, transfer fees, soulbound, default-frozen,
 permanent delegate, pause, ERC-777 operators. **NFTs** are native too (§8): collections of
 supply-1 tokens, each collection an ERC-721 in the EVM. Native QRDX trades against any token
-with no wrapping ([PERPS_API.md §7](PERPS_API.md)). Not yet: retiring the old
-`qrdx/tokens/qrc20.py` class ([KNOWN_ISSUES.md](KNOWN_ISSUES.md)).
+with no wrapping ([PERPS_API.md §7](PERPS_API.md)). It is the only token standard: the old
+in-memory qRC-20 class is retired.
 
 ---
 
@@ -172,6 +172,7 @@ Like an SPL Token-2022 mint, a token opts into extensions **when it is deployed*
 | permanent delegate | `permanent_delegate` | may transfer (`TOKEN_TRANSFER_FROM`) and burn (`TOKEN_BURN` with `from`) anyone's balance without an allowance — a regulated issuer's clawback. Frozen balances stay frozen |
 | pausable | `pausable: true`, `pause_authority` (default: the deployer) | `TOKEN_PAUSE` stops every transfer, mint and burn of the token — spot and perps moves included — until `TOKEN_RESUME` |
 | default operators | `default_operators` (≤ 8 addresses) | ERC-777: operators for every holder, until that holder revokes one |
+| Doomsday trading flag | `post_doomsday_trade: true` | Whitepaper §9.2: the deployer declares the token backed by locked classical assets, so clients may keep trading it after the Doomsday Protocol triggers. Advisory only: `qrdx/tokens/doomsday_hook.py` combines it with the protocol's state for a client's Strict / Warning / Permissionless mode |
 
 **Operators (ERC-777).** Any holder may authorize operators (`TOKEN_AUTHORIZE_OPERATOR`, at
 most 64 per holder across tokens) that move and burn its balance without an allowance, and
@@ -241,9 +242,11 @@ read on every node natively and through `ownerOf`).
 
 ## 9. Next
 
-* **Retire** `qrdx/tokens/qrc20.py` (used by no consensus path; integration scenarios S05/S06
-  still drive it on a scratch database). The simulated EVM exchange precompiles 0x0100–0x0104
-  are retired already: reserved, they revert.
-* **Bridges.** A bridged stablecoin is a token deployed with zero supply and the bridge as mint
-  authority: minted when a deposit is proven, burned by the holder to withdraw. That is the piece
-  mainnet perps wait on ([PERPS_CLEARINGHOUSE.md](PERPS_CLEARINGHOUSE.md)).
+* The simulated EVM exchange precompiles 0x0100–0x0104 are retired: reserved, they revert.
+  So is the in-memory `qrdx/tokens/qrc20.py` class and the scenarios that drove it (S05/S06;
+  S14, S15 and S20 cover the native standard through consensus).
+* **Bridges.** A bridged token is a native token the consensus bridge creates at its first
+  deposit: zero supply, the source's decimals, and the bridge's `0xBRDG…` holder — which no key
+  controls — as mint authority. It is minted when validators holding two thirds of the stake
+  attest a lockbox deposit and burned by `BRIDGE_WITHDRAW` ([BRIDGE.md](BRIDGE.md)). Mainnet perps
+  settle in one ([PERPS_CLEARINGHOUSE.md](PERPS_CLEARINGHOUSE.md)).

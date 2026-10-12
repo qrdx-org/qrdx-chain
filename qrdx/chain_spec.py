@@ -145,6 +145,10 @@ PARAMS: Dict[str, Param] = {
     "UNBONDING_PERIOD_EPOCHS": Param("int", 40_320, "QRDX_UNBONDING_PERIOD_EPOCHS", minimum=0),
     "ACTIVATION_DELAY_EPOCHS": Param("int", 4, "QRDX_ACTIVATION_DELAY_EPOCHS", minimum=0),
     "WITHDRAWAL_DELAY_EPOCHS": Param("int", 2_048, "QRDX_WITHDRAWAL_DELAY_EPOCHS", minimum=0),
+    # Staking rewards (docs/STAKING.md): QRDX minted per year, in basis points of the stake that
+    # earns it (a validator's principal and the QRDX delegated to it), paid each epoch to the
+    # validators whose vote the chain carried. 500 = 5 % a year.
+    "STAKING_REWARD_RATE_BPS": Param("int", 500, "QRDX_STAKING_REWARD_RATE_BPS", minimum=0),
     # Exchange / perps.
     "ORACLE_REPORTERS": Param("list", [], "QRDX_ORACLE_REPORTERS"),
     "PERP_VAULT_LOCKUP_SECONDS": Param(
@@ -158,6 +162,10 @@ PARAMS: Dict[str, Param] = {
     "PERP_FUNDING_INTERVAL_SECONDS": Param(
         "int", 3600, "QRDX_PERP_FUNDING_INTERVAL_SECONDS", minimum=1
     ),
+    # QRDX burned to list a perp market: every market costs every node work in every block.
+    "PERP_MARKET_LISTING_FEE": Param("int", 1_000, "QRDX_PERP_MARKET_LISTING_FEE", minimum=0),
+    # Tokens the consensus bridge carries (docs/BRIDGE.md): SYMBOL:CHAIN_ID:SOURCE_TOKEN:DECIMALS.
+    "BRIDGE_ASSETS": Param("list", [], "QRDX_BRIDGE_ASSETS"),
     "EXCHANGE_MIN_GAS_PRICE_WEI": Param("int", 10**9, "QRDX_EXCHANGE_MIN_GAS_PRICE_WEI", minimum=0),
     # On-chain governance (qrdx/exchange/governance.py, docs/GOVERNANCE.md). Block counts, not
     # wall time: every node judges a deadline by the height of the block being applied.

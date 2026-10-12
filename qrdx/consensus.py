@@ -982,6 +982,7 @@ async def execute_and_validate_exchange(
             block_height,
             block_timestamp,
             exchange_txs,
+            revertible=True,
         )
 
         if not success:

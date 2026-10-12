@@ -337,7 +337,7 @@ async def test_forward_and_rebuild_liquidate_identically(monkeypatch):
                 await db.add_block_exchange_txs(bh, encode_exchange_txs(txs))
 
         # every sender pays gas: Alice keeps a little beyond her deposit, the reporter is funded
-        await add(0, alloc=[(alice, "3500.01"), (bob, "1000000"), (rep, "1000")])
+        await add(0, alloc=[(alice, "3500.01"), (bob, "1000000"), (rep, "5000")])
         await add(1, [tx(0, ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"}),
                       tx(0, ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": "30000"}),
                       tx(1, ExchangeOpType.PERP_DEPOSIT, {"amount": "3500"}),

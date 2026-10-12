@@ -131,3 +131,124 @@ async def test_sse_stream_yields_hello_then_events():
     frame = await gen.__anext__()
     assert '"height": 11' in frame
     await gen.aclose()
+
+
+# ── Real time: the publishers wake when a block is applied, not on a timer ──────────────────
+
+from qrdx.node.observability import ChangeSignal, SignallingLock  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_releasing_the_block_lock_raises_the_signal():
+    signal = ChangeSignal()
+    listener = signal.listener()
+    lock = SignallingLock(signal)
+    async with lock:
+        assert not listener.is_set()
+    assert listener.is_set() and signal.raised == 1
+    assert await ChangeSignal.wait(listener, 0.01) is True
+    assert not listener.is_set()                        # reset for the next change
+    assert await ChangeSignal.wait(listener, 0.01) is False
+
+
+async def _drain(q):
+    out = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return out
+
+
+@pytest.mark.asyncio
+async def test_a_block_is_published_as_soon_as_it_is_applied():
+    """The block feed used to wake every 2 s, so 250 ms blocks arrived eight at a time. With the
+    signal it publishes each block within a moment of the lock's release, long before the
+    (here 60 s) fallback timer."""
+    import asyncio
+    import time
+
+    hub, m, signal = EventHub(), Metrics(), ChangeSignal()
+    q = hub.subscribe()
+    chain = {"tip": 5}
+    task = asyncio.create_task(chain_event_poller(
+        hub, m, get_tip=lambda: chain["tip"], get_hashes=lambda lo, hi: {
+            h: f"h{h}" for h in range(lo, hi + 1)}, interval=60, signal=signal))
+    await asyncio.sleep(0.05)
+    assert [e["height"] for e in await _drain(q)] == [5]
+    for height in (6, 7, 8):
+        chain["tip"] = height
+        t0 = time.monotonic()
+        signal.raise_()
+        event = await asyncio.wait_for(q.get(), 1.0)
+        assert event["height"] == height and event["hash"] == f"h{height}"
+        assert time.monotonic() - t0 < 0.2
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_replaced_blocks_are_announced_as_a_reorg():
+    hub, m = EventHub(), Metrics()
+    q = hub.subscribe()
+    a = {h: f"a{h}" for h in range(12)}
+    chain = {"tip": 8, "hashes": a}
+    steps = iter([
+        lambda: None,                                        # the feed starts at 8
+        lambda: chain.update(tip=10),                        # 9 and 10 arrive
+        lambda: chain.update(tip=11, hashes={**{h: a[h] for h in range(9)},
+                                             9: "b9", 10: "b10", 11: "b11"}),
+    ])
+
+    def tip():
+        next(steps)()
+        return chain["tip"]
+
+    await chain_event_poller(hub, m, get_tip=tip,
+                             get_hashes=lambda lo, hi: {h: chain["hashes"][h]
+                                                        for h in range(lo, hi + 1)},
+                             interval=0, _max_iterations=3)
+    events = await _drain(q)
+    assert [(e["type"], e.get("height")) for e in events] == [
+        ("block", 8), ("block", 9), ("block", 10), ("reorg", None),
+        ("block", 9), ("block", 10), ("block", 11)]
+    reorg = events[3]
+    assert reorg["ancestor"] == 8 and reorg["ancestor_hash"] == "a8"
+    assert reorg["orphaned"] == ["a9", "a10"]
+    assert [e["hash"] for e in events[4:]] == ["b9", "b10", "b11"]
+    assert m.snapshot()["qrdx_reorgs_streamed_total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_exchange_channels_wake_on_the_signal():
+    import asyncio
+
+    from qrdx.exchange.stream import perp_stream_poller
+
+    signal, steps = ChangeSignal(), []
+
+    class Mgr:
+        pass
+
+    class Publisher:
+        def __init__(self, hub, depth):
+            pass
+
+        def step(self, mgr):
+            steps.append(1)
+
+    import qrdx.exchange.stream as stream
+
+    original = stream.PerpStreamPublisher
+    stream.PerpStreamPublisher = Publisher
+    try:
+        task = asyncio.create_task(perp_stream_poller(
+            EventHub(), get_manager=Mgr, interval=60, signal=signal))
+        await asyncio.sleep(0.05)
+        assert len(steps) == 1
+        for n in (2, 3):
+            signal.raise_()
+            await asyncio.sleep(0.05)
+            assert len(steps) == n
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    finally:
+        stream.PerpStreamPublisher = original

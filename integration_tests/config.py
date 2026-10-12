@@ -24,6 +24,13 @@ TESTNET_DIR = PROJECT_ROOT / "testnet"          # Data directory (gitignored)
 # The testnet's scripted price feed: every validator reads it (QRDX_ORACLE_FEED=file:…) and votes
 # what it says; scenarios move prices by writing it.
 ORACLE_FEED_FILE = TESTNET_DIR / "oracle_prices.json"
+# The bridge's scripted source chain: every validator reads it (QRDX_BRIDGE_SOURCES=file:…) as if
+# it were a lockbox's finalized deposits, and attests what it lists (docs/BRIDGE.md).
+BRIDGE_SOURCE_FILE = TESTNET_DIR / "bridge_deposits.json"
+# The asset the testnet bridges, from a stand-in source chain (31337, a local EVM's id).
+BRIDGE_TEST_CHAIN = 31337
+BRIDGE_TEST_TOKEN = "0x" + "a1" * 20
+BRIDGE_TEST_ASSET = f"tUSDC:{BRIDGE_TEST_CHAIN}:{BRIDGE_TEST_TOKEN}:6"
 WALLETS_DIR = TESTNET_DIR / "wallets"
 DATABASES_DIR = TESTNET_DIR / "databases"
 CONFIGS_DIR = TESTNET_DIR / "configs"

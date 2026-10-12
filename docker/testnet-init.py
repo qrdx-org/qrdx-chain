@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -96,6 +97,16 @@ def main() -> int:
         (TESTNET_DIR / sub).mkdir(parents=True, exist_ok=True)
 
     if GENESIS_FILE.exists():
+        # Checked with the node's own loader: a genesis from an older release that this one
+        # cannot run fails here, not as a crash loop in every node.
+        from qrdx import chain_spec as cs
+
+        try:
+            cs.load_genesis_file(str(GENESIS_FILE))
+        except cs.ChainSpecError as e:
+            log.error("%s cannot be run by this release: %s", GENESIS_FILE, e)
+            log.error("It was written by an older release; start a new testnet with `down -v`.")
+            return 1
         log.info("%s already exists — nothing to do.", GENESIS_FILE)
         return 0
 
@@ -113,10 +124,18 @@ def main() -> int:
     ]
 
     from qrdx import chain_spec as cs
-    from qrdx.validator.genesis import GenesisConfig, GenesisCreator
 
     # The network's consensus definition, committed to by genesis (docs/PROTOCOL_UPGRADES.md).
     spec = cs.build_spec(NETWORK_NAME, CHAIN_ID, cs.params_from_environment())
+    # qrdx.constants (imported by the genesis module) loads THIS spec: with no genesis file it
+    # would build a dev spec from the environment, which refuses qrdx-testnet's chain id.
+    if "qrdx.constants" in sys.modules:
+        raise RuntimeError("qrdx.constants was imported before the chain spec was activated")
+    stub = Path(tempfile.mkdtemp()) / "genesis_config.json"
+    stub.write_text(json.dumps({"chain_spec": spec.to_dict()}))
+    os.environ["QRDX_GENESIS_FILE"] = str(stub)
+    from qrdx.validator.genesis import GenesisConfig, GenesisCreator
+
     config = GenesisConfig(
         chain_spec=spec,
         min_genesis_validators=1,

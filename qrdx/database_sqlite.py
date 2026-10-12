@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 
 import aiosqlite
 
+from . import block_codec
 from .logger import get_logger
 
 logger = get_logger(__name__)
@@ -31,6 +32,16 @@ _BLOCK_COLS = (
     "validator_address, validator_address AS address, "
     "validator_signature, content, created_at"
 )
+
+
+def _block_row(row: Any) -> Optional[Dict[str, Any]]:
+    """A blocks row as a dict, its body decoded (qrdx/block_codec.py)."""
+    if row is None:
+        return None
+    block = dict(row)
+    if "content" in block:
+        block["content"] = block_codec.decode(block["content"])
+    return block
 
 
 class DatabaseSQLite:
@@ -317,17 +328,11 @@ class DatabaseSQLite:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
-        -- Append-only log of every consensus STAKE_DEPOSIT, keyed to the block that
-        -- carried it. This exists to make a deposit-created registration REORG-SAFE:
-        -- the `validators` table is not reconstructed on reorg
-        -- (_ENFORCE_VALIDATOR_RECONSTRUCTION is off), so without this log a deposit in
-        -- a later-ORPHANED block would leave its registration behind while the stake
-        -- debit was correctly not re-applied — a validator holding stake weight it no
-        -- longer paid for. On rollback, rows above the new tip are reversed exactly
-        -- (see undo_validator_deposits_above), which is why the log must record each
-        -- deposit individually: register_pending_validator is ADDITIVE, so a top-up
-        -- can only be undone if its own increment is known.
-        -- Genesis validators have NO rows here and so can never be touched by the undo.
+        -- Every EXECUTED STAKE_DEPOSIT, keyed to the block that carried it (a refused one
+        -- is not here), written by block application and dropped when the block is rolled
+        -- back. The validator set's stake input (qrdx/validator/epoch_state.py) and the
+        -- withdrawals' (qrdx/validator/withdrawals.py). Genesis validators have no rows.
+        -- (created_new: unused, kept for existing databases.)
         CREATE TABLE IF NOT EXISTS validator_deposits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             block_height INTEGER NOT NULL,
@@ -350,6 +355,31 @@ class DatabaseSQLite:
             address TEXT NOT NULL,
             exit_epoch INTEGER NOT NULL
         );
+        -- Executed delegation operations (STAKE_DELEGATE / STAKE_UNDELEGATE /
+        -- STAKE_SET_COMMISSION), keyed to the carrying block like validator_deposits: the
+        -- pools' input (qrdx/validator/epoch_state.py). value: QRDX, shares (NULL = all) or
+        -- basis points.
+        CREATE TABLE IF NOT EXISTS staking_ops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            block_height INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            validator TEXT,
+            value TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_staking_ops_height ON staking_ops(block_height);
+        -- The ledger of staking payouts (rewards, finished undelegations, refunds) blocks have
+        -- credited, like validator_withdrawals: undone above a rollback, re-credited after an
+        -- account rebuild.
+        CREATE TABLE IF NOT EXISTS staking_payouts (
+            payout_id INTEGER NOT NULL,
+            address TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            block_height INTEGER NOT NULL,
+            PRIMARY KEY (payout_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_staking_payouts_height ON staking_payouts(block_height);
         CREATE TABLE IF NOT EXISTS validator_withdrawals (
             address TEXT NOT NULL,
             exit_epoch INTEGER NOT NULL,
@@ -441,7 +471,7 @@ class DatabaseSQLite:
             PRIMARY KEY (validator_address, slot, condition)
         );
 
-        -- QRC-20 token ledger (Phase E spot). Mirrors qrdx.tokens.persistence
+        -- Native token ledger (Phase E spot; qrdx/exchange/tokens.py).
         -- TOKEN_SCHEMA so the node owns these tables natively (token state is a
         -- consensus object: balances are bound into the unified state root and
         -- moved only by replayed exchange-section ops). IF NOT EXISTS keeps it
@@ -613,7 +643,7 @@ class DatabaseSQLite:
             f"SELECT {_BLOCK_COLS} FROM blocks ORDER BY block_height DESC LIMIT 1"
         )
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        return _block_row(row)
 
     async def get_block_height(self):
         """Get current block height"""
@@ -659,13 +689,13 @@ class DatabaseSQLite:
             else kwargs.get("timestamp", datetime.now(timezone.utc))
         )
 
-        # Insert block
+        # Insert block (its body compressed: qrdx/block_codec.py)
         await self.connection.execute(
             """
             INSERT INTO blocks (block_hash, block_height, validator_address, content, timestamp)
             VALUES (?, ?, ?, ?, ?)
         """,
-            (_hash, _id, _addr, _content, _ts),
+            (_hash, _id, _addr, block_codec.encode(_content), _ts),
         )
         await self.connection.commit()
         logger.info(f"Block {_id} added: {_hash[:16]}...")
@@ -1044,7 +1074,7 @@ class DatabaseSQLite:
         """
         Phase E (spot): apply a token-balance delta (negative = debit) to the
         ``token_balances`` ledger. Balances are stored as Decimal-string token
-        units (matching qrdx.tokens.persistence). The token analog of
+        units. The token analog of
         ``apply_account_balance_delta``. Returns True if a row was updated/created.
         Does NOT commit — the caller commits with the block.
 
@@ -1574,6 +1604,16 @@ class DatabaseSQLite:
         )
         await self.connection.commit()
 
+    async def prune_attestation_votes(self, below_target_epoch: int) -> int:
+        """Drop retained votes for target epochs below ``below_target_epoch`` (ffg.update, as
+        finality advances). Returns the rows removed."""
+        if below_target_epoch <= 0:
+            return 0
+        cur = await self.connection.execute(
+            "DELETE FROM attestation_votes WHERE target_epoch < ?", (int(below_target_epoch),)
+        )
+        return cur.rowcount or 0
+
     async def get_validator_votes(self, validator_address: str, limit: int = 128) -> list:
         """The validator's retained attestation votes as fully-signed Attestation dicts
         (most recent target first), for surround/double-vote slashing detection. Only rows
@@ -1644,21 +1684,6 @@ class DatabaseSQLite:
             for r in rows
         ]
 
-    async def get_unprocessed_slashing_events(self, up_to_epoch: int) -> list:
-        """Unprocessed slashing evidence whose offence epoch is at or below
-        ``up_to_epoch`` (so the finalized-epoch loop applies penalties only for
-        offences in already-finalized epochs — deterministic ordering)."""
-        cur = await self.connection.execute(
-            "SELECT validator_address, condition, slot, epoch FROM slashing_events "
-            "WHERE processed = 0 AND epoch <= ? ORDER BY validator_address, slot",
-            (int(up_to_epoch),),
-        )
-        rows = await cur.fetchall()
-        return [
-            {"validator_address": r[0], "condition": r[1], "slot": r[2], "epoch": r[3]}
-            for r in rows
-        ]
-
     async def get_pending_slashing_evidence(self, limit: int = 16) -> list:
         """The full self-validating PROOFS for unprocessed slashing events, for a proposer to
         include in the block body so they propagate to every node. Returns the parsed evidence
@@ -1686,47 +1711,6 @@ class DatabaseSQLite:
             except Exception:
                 continue
         return out
-
-    async def apply_validator_slash(self, address: str, penalty, enforce: bool = False) -> dict:
-        """Apply a slashing penalty to one validator: effective_stake -= penalty
-        (clamped at 0), total_slashed += penalty, status='slashed' (ejecting it from the
-        eligible set {active,pending,exiting}). Decimal arithmetic, identical on every
-        node given the same evidence. ``enforce=False`` previews without writing. No
-        commit. Returns {address, penalty, new_stake, applied}."""
-        from decimal import Decimal
-
-        c = await self.connection.execute(
-            "SELECT effective_stake, total_slashed FROM validators WHERE address = ?", (address,)
-        )
-        row = await c.fetchone()
-        if not row:
-            return {"address": address, "penalty": "0", "new_stake": None, "applied": False}
-        pen = Decimal(str(penalty))
-        cur_stake = Decimal(str(row[0] or 0))
-        new_stake = cur_stake - pen
-        if new_stake < 0:
-            new_stake = Decimal(0)
-        new_slashed = Decimal(str(row[1] or 0)) + pen
-        if enforce:
-            await self.connection.execute(
-                "UPDATE validators SET effective_stake = ?, total_slashed = ?, "
-                "slashed = 1, status = 'slashed', updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                (str(new_stake), str(new_slashed), address),
-            )
-        return {
-            "address": address,
-            "penalty": str(pen),
-            "new_stake": str(new_stake),
-            "applied": bool(enforce),
-        }
-
-    async def mark_slashing_events_processed(self, address: str, up_to_epoch: int) -> None:
-        """Mark a validator's slashing evidence (offence epoch ≤ up_to_epoch) processed,
-        so the penalty is applied exactly once. No commit."""
-        await self.connection.execute(
-            "UPDATE slashing_events SET processed = 1 WHERE validator_address = ? AND epoch <= ?",
-            (address, int(up_to_epoch)),
-        )
 
     async def get_epoch_attesters(self, target_epoch: int) -> list:
         """Return the validator addresses that have voted for ``target_epoch``."""
@@ -1800,339 +1784,45 @@ class DatabaseSQLite:
             validators.append(entry)
         return validators
 
-    async def get_validators_table_hash(self) -> str:
-        """Deterministic hash of the consensus validator set (Validator-lifecycle
-        unification probe). Hashes every validator row in canonical address order
-        over its consensus-relevant fields, so the per-epoch processing can be
-        checked for cross-node convergence (the `validators` table must be identical
-        on every node — eligibility is enforced off it). Empty set → all-zero."""
-        cursor = await self.connection.execute("""
-            SELECT address, effective_stake, status, activation_epoch, exit_epoch,
-                   slashed, total_slashed, total_rewards
-            FROM validators ORDER BY address ASC
-        """)
-        rows = await cursor.fetchall()
-        if not rows:
-            return "0" * 64
-        import hashlib
-
-        h = hashlib.sha256()
-        for r in rows:
-            h.update(f"{r[0]}:{r[1]}:{r[2]}:{r[3]}:{r[4]}:{int(bool(r[5]))}:{r[6]}:{r[7]}".encode())
-        return h.hexdigest()
-
-    async def apply_epoch_validator_updates(
-        self,
-        rewards: dict,
-        penalties: dict,
-        activated: list,
-        exited: list,
-        activation_epoch: int,
-        max_effective_balance,
-        enforce: bool = False,
-    ) -> dict:
-        """
-        Validator-lifecycle unification (SQLite port of the PostgreSQL
-        ``epoch_processing._persist_epoch_data`` validators-table writes):
-        deterministically apply an epoch's per-validator deltas to the consensus
-        ``validators`` table —
-          * reward  → effective_stake += reward (clamped to max_effective_balance),
-                      total_rewards += reward
-          * penalty → effective_stake -= penalty (clamped at 0), total_slashed += penalty
-          * activated → status='active', activation_epoch set
-          * exited    → status='exited'
-        All arithmetic is Decimal (the columns are TEXT Decimal strings), so the
-        result is identical on every node. ``enforce=False`` (OBSERVE) computes the
-        new effective_stake per touched validator and returns it WITHOUT writing —
-        for cross-node determinism checks during rollout. Does NOT commit; the
-        caller commits atomically at the epoch boundary. Returns a summary dict.
-        """
+    async def log_validator_deposit(
+        self, address: str, public_key: str, stake, block_height: int, block_hash=None
+    ) -> None:
+        """Log an executed STAKE_DEPOSIT against its carrying block (the validator set's input:
+        qrdx/validator/epoch_state.py). Reversed by ``undo_validator_deposits_above``. No
+        commit."""
         from decimal import Decimal
 
-        max_bal = Decimal(str(max_effective_balance)) if max_effective_balance is not None else None
-
-        async def _cur(addr):
-            c = await self.connection.execute(
-                "SELECT effective_stake, total_rewards, total_slashed FROM validators WHERE address = ?",
-                (addr,),
-            )
-            return await c.fetchone()
-
-        preview = {}
-        # Rewards
-        for addr, amt in (rewards or {}).items():
-            amt = Decimal(str(amt))
-            if amt <= 0:
-                continue
-            row = await _cur(addr)
-            if not row:
-                continue
-            new_stake = Decimal(str(row[0] or 0)) + amt
-            if max_bal is not None and new_stake > max_bal:
-                new_stake = max_bal
-            new_rewards = Decimal(str(row[1] or 0)) + amt
-            preview[addr] = str(new_stake)
-            if enforce:
-                await self.connection.execute(
-                    "UPDATE validators SET effective_stake = ?, total_rewards = ?, "
-                    "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                    (str(new_stake), str(new_rewards), addr),
-                )
-        # Penalties
-        for addr, amt in (penalties or {}).items():
-            amt = Decimal(str(amt))
-            if amt <= 0:
-                continue
-            row = await _cur(addr)
-            if not row:
-                continue
-            new_stake = Decimal(str(row[0] or 0)) - amt
-            if new_stake < 0:
-                new_stake = Decimal(0)
-            new_slashed = Decimal(str(row[2] or 0)) + amt
-            preview[addr] = str(new_stake)
-            if enforce:
-                await self.connection.execute(
-                    "UPDATE validators SET effective_stake = ?, total_slashed = ?, "
-                    "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                    (str(new_stake), str(new_slashed), addr),
-                )
-        # Activations
-        if enforce:
-            for addr in activated or []:
-                await self.connection.execute(
-                    "UPDATE validators SET status = 'active', activation_epoch = ?, "
-                    "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                    (int(activation_epoch), addr),
-                )
-            for addr in exited or []:
-                await self.connection.execute(
-                    "UPDATE validators SET status = 'exited', exit_epoch = COALESCE(exit_epoch, ?), "
-                    "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                    (int(activation_epoch), addr),
-                )
-        return {
-            "rewarded": len([a for a, v in (rewards or {}).items() if Decimal(str(v)) > 0]),
-            "penalized": len([a for a, v in (penalties or {}).items() if Decimal(str(v)) > 0]),
-            "activated": len(activated or []),
-            "exited": len(exited or []),
-            "effective_stake_preview": preview,
-            "applied": enforce,
-        }
-
-    async def schedule_pending_activations(self, activation_epoch: int) -> int:
-        """Phase 3: assign an activation epoch to any just-deposited PENDING validator
-        that has none yet (activation_epoch IS NULL). Called deterministically by the
-        all-nodes epoch loop at a finalized epoch, so every node schedules the same
-        validators to the same epoch. Returns the count scheduled. No commit."""
-        cur = await self.connection.execute(
-            "UPDATE validators SET activation_epoch = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE status = 'pending' AND activation_epoch IS NULL",
-            (int(activation_epoch),),
+        await self.connection.execute(
+            "INSERT INTO validator_deposits "
+            "(block_height, block_hash, address, public_key, stake, created_new) "
+            "VALUES (?, ?, ?, ?, ?, 0)",
+            (int(block_height), block_hash, address, public_key, str(Decimal(str(stake)))),
         )
-        return cur.rowcount if cur.rowcount is not None else 0
 
-    async def schedule_pending_exits(self, exit_epoch: int) -> int:
-        """Phase 3: assign an exit epoch to any validator marked 'exiting' without one
-        (exit_epoch IS NULL). Deterministic (epoch-loop driven). No commit."""
-        cur = await self.connection.execute(
-            "UPDATE validators SET exit_epoch = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE status = 'exiting' AND exit_epoch IS NULL",
-            (int(exit_epoch),),
+    async def log_staking_op(
+        self, kind: str, sender: str, validator, value, block_height: int
+    ) -> None:
+        """Log an executed delegation operation against its carrying block (the pools' input:
+        qrdx/validator/epoch_state.py). Dropped by ``undo_validator_deposits_above``. No
+        commit."""
+        await self.connection.execute(
+            "INSERT INTO staking_ops (block_height, kind, sender, validator, value) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (int(block_height), kind, sender, validator, None if value is None else str(value)),
         )
-        return cur.rowcount if cur.rowcount is not None else 0
-
-    async def mark_validator_exiting(self, address: str, exit_epoch=None) -> bool:
-        """Phase 3 (voluntary exit): move an active validator to 'exiting' and set its
-        ``exit_epoch`` (the finalized epoch at which the epoch loop removes it). The
-        caller passes a DETERMINISTIC exit_epoch derived from the exit block's epoch, so
-        every node assigns the same value. ``exit_epoch=None`` leaves it unscheduled.
-        Applies to 'active' AND 'pending' validators. A pending validator that exits leaves
-        without ever activating: activation only selects 'pending' rows, so moving it to
-        'exiting' removes it from activation, and it becomes 'exited' at exit_epoch.
-
-        Previously only 'active' rows moved. The reconstruction walk applies an epoch's
-        STAKE ops BEFORE that epoch's activations, so an exit landing in (or before) the
-        activation epoch hit a still-pending validator, no-op'd, and the validator was
-        then activated and stayed active FOREVER despite having exited. With in-block
-        withdrawals that becomes an exploit — the exit log pays the stake back while the
-        validator keeps its stake weight — so the gap is closed here, for every caller.
-        No-op for any other status. No commit."""
-        cur = await self.connection.execute(
-            "UPDATE validators SET status = 'exiting', "
-            "exit_epoch = COALESCE(?, exit_epoch), updated_at = CURRENT_TIMESTAMP "
-            "WHERE address = ? AND status IN ('active', 'pending')",
-            (int(exit_epoch) if exit_epoch is not None else None, address),
-        )
-        return bool(cur.rowcount)
-
-    async def register_pending_validator(
-        self,
-        address: str,
-        public_key: str,
-        stake,
-        activation_epoch=None,
-        block_height=None,
-        block_hash=None,
-    ) -> bool:
-        """
-        Validator-lifecycle Phase 3 (staking deposit / join): insert a PENDING
-        validator into the consensus ``validators`` table, scheduled to activate at
-        ``activation_epoch``. Idempotent on address (a repeat deposit tops up stake).
-        Stake stored as a Decimal string (matching effective_stake). Does NOT commit
-        — the caller commits with the block/flush. Deterministic: every node that
-        replays the same deposit creates the identical row.
-
-        ``block_height``/``block_hash`` record the carrying block in the
-        ``validator_deposits`` log, which is what makes the registration REORG-SAFE:
-        if that block is later orphaned, ``undo_validator_deposits_above`` reverses
-        exactly this increment. Omitting them (legacy callers) leaves the
-        registration un-reversible, so every consensus path passes them.
-        """
-        from decimal import Decimal
-
-        s = str(Decimal(str(stake)))
-        cur = await self.connection.execute(
-            "SELECT stake, effective_stake FROM validators WHERE address = ?", (address,)
-        )
-        row = await cur.fetchone()
-        created_new = row is None
-
-        if row:
-            new_stake = str(Decimal(str(row[0] or 0)) + Decimal(str(stake)))
-            new_eff = str(Decimal(str(row[1] or 0)) + Decimal(str(stake)))
-            await self.connection.execute(
-                "UPDATE validators SET stake = ?, effective_stake = ?, public_key = ?, "
-                "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                (new_stake, new_eff, public_key, address),
-            )
-        else:
-            await self.connection.execute(
-                "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
-                "activation_epoch) VALUES (?, ?, ?, ?, 'pending', ?)",
-                (
-                    address,
-                    public_key,
-                    s,
-                    s,
-                    int(activation_epoch) if activation_epoch is not None else None,
-                ),
-            )
-
-        if block_height is not None:
-            await self.connection.execute(
-                "INSERT INTO validator_deposits "
-                "(block_height, block_hash, address, public_key, stake, created_new) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (int(block_height), block_hash, address, public_key, s, 1 if created_new else 0),
-            )
-
-        return created_new
 
     async def undo_validator_deposits_above(self, tip_height: int) -> dict:
-        """
-        Reverse every logged STAKE_DEPOSIT from a block above ``tip_height``.
-
-        Called after a reorg rollback. The ``validators`` table is not reconstructed
-        from the chain (``_ENFORCE_VALIDATOR_RECONSTRUCTION`` is off), so without this
-        a deposit in an ORPHANED block would leave its registration behind: the stake
-        debit is correctly not re-applied by the rebuild, but the validator would keep
-        the ``effective_stake`` that weights proposer selection and fork choice — stake
-        weight it no longer paid for.
-
-        Reversal is exact rather than a recomputation, which is what lets this be safe
-        while full reconstruction stays gated off:
-
-          * a deposit that CREATED the row → delete the validator entirely (it was
-            never validly registered on the canonical chain, so its accrued rewards
-            and status go with it);
-          * a deposit that TOPPED UP an existing row → subtract exactly that
-            increment from ``stake`` and ``effective_stake``.
-
-        Newest-first so a create/top-up sequence for one address unwinds in reverse
-        order. **Genesis validators have no rows in the log and are therefore never
-        touched** — the undo can only remove what a deposit created.
-
-        Does NOT commit; the caller commits with the rest of the rollback.
-
-        Returns ``{"reversed": n, "removed": n, "reduced": n}``.
-        """
-        from decimal import Decimal
-
+        """Drop the deposit log of every block above ``tip_height`` (after a rollback). The
+        validator set is computed from the chain and these logs (validator/epoch_state.py),
+        so nothing else needs reversing. Does NOT commit. Returns ``{"reversed": n}``."""
         cur = await self.connection.execute(
-            "SELECT id, address, stake, created_new FROM validator_deposits "
-            "WHERE block_height > ? ORDER BY block_height DESC, id DESC",
-            (int(tip_height),),
+            "DELETE FROM validator_deposits WHERE block_height > ?", (int(tip_height),)
         )
-        rows = list(await cur.fetchall())
-        if not rows:
-            return {"reversed": 0, "removed": 0, "reduced": 0}
-
-        removed = reduced = 0
-        for dep_id, address, stake, created_new in rows:
-            if created_new:
-                await self.connection.execute(
-                    "DELETE FROM validators WHERE address = ?", (address,)
-                )
-                removed += 1
-            else:
-                cur2 = await self.connection.execute(
-                    "SELECT stake, effective_stake FROM validators WHERE address = ?", (address,)
-                )
-                v = await cur2.fetchone()
-                if v:
-                    back = Decimal(str(stake))
-                    new_stake = Decimal(str(v[0] or 0)) - back
-                    new_eff = Decimal(str(v[1] or 0)) - back
-                    if new_stake < 0:
-                        new_stake = Decimal(0)
-                    if new_eff < 0:
-                        new_eff = Decimal(0)
-                    await self.connection.execute(
-                        "UPDATE validators SET stake = ?, effective_stake = ?, "
-                        "updated_at = CURRENT_TIMESTAMP WHERE address = ?",
-                        (str(new_stake), str(new_eff), address),
-                    )
-                    reduced += 1
-            await self.connection.execute("DELETE FROM validator_deposits WHERE id = ?", (dep_id,))
-
-        return {"reversed": len(rows), "removed": removed, "reduced": reduced}
-
-    async def seed_genesis_validators(self, genesis_validators: list) -> int:
-        """Reset the consensus ``validators`` table to its GENESIS BASE — the reset primitive for
-        validators reorg-reconstruction (mirror of ``seed_genesis_account_state``). Removes every
-        non-genesis (DEPOSITED) validator and resets each genesis validator's DYNAMIC state
-        (effective_stake=stake, status='active', activation_epoch=0, exit_epoch=NULL,
-        total_rewards/total_slashed=0, slashed=0). After this, replaying the canonical STAKE ops +
-        re-running finalized epoch processing rebuilds the dynamic state as a pure function of the
-        chain. ``genesis_validators`` = [{address, public_key, stake}]. Does NOT commit.
-
-        Genesis is defined by this passed-in set (from the genesis config/snapshot), NOT by a
-        table heuristic — a deposited validator can also sit at activation_epoch 0 mid-reorg."""
-        from decimal import Decimal
-
-        addrs = [v["address"] for v in genesis_validators]
-        if addrs:
-            ph = ",".join("?" * len(addrs))
-            await self.connection.execute(
-                f"DELETE FROM validators WHERE address NOT IN ({ph})", addrs
-            )
-        else:
-            await self.connection.execute("DELETE FROM validators")
-        for v in genesis_validators:
-            s = str(Decimal(str(v["stake"])))
-            await self.connection.execute(
-                "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
-                "activation_epoch, exit_epoch, slashed, total_slashed, total_rewards) "
-                "VALUES (?, ?, ?, ?, 'active', 0, NULL, 0, '0', '0') "
-                "ON CONFLICT(address) DO UPDATE SET "
-                "public_key=excluded.public_key, stake=excluded.stake, "
-                "effective_stake=excluded.effective_stake, status='active', "
-                "activation_epoch=0, exit_epoch=NULL, slashed=0, "
-                "total_slashed='0', total_rewards='0', updated_at=CURRENT_TIMESTAMP",
-                (v["address"], v["public_key"], s, s),
-            )
-        return len(genesis_validators)
+        n = cur.rowcount if cur.rowcount is not None else 0
+        cur = await self.connection.execute(
+            "DELETE FROM staking_ops WHERE block_height > ?", (int(tip_height),)
+        )
+        return {"reversed": n + (cur.rowcount if cur.rowcount is not None else 0)}
 
     async def get_genesis_validators(self) -> list:
         """The GENESIS validator set as [{address, public_key, stake}] for the reconstruction
@@ -2176,28 +1866,6 @@ class DatabaseSQLite:
             "INSERT OR IGNORE INTO chain_metadata (key, value) VALUES ('genesis_validators', ?)",
             (json.dumps(base, sort_keys=True),),
         )
-
-    async def get_validators_to_activate(self, current_epoch: int) -> list:
-        """Pending validators whose scheduled activation_epoch has arrived
-        (<= current_epoch). Deterministic, canonical address order."""
-        cur = await self.connection.execute(
-            "SELECT address FROM validators WHERE status = 'pending' "
-            "AND activation_epoch IS NOT NULL AND activation_epoch <= ? "
-            "ORDER BY address ASC",
-            (int(current_epoch),),
-        )
-        return [r[0] for r in await cur.fetchall()]
-
-    async def get_validators_to_exit(self, current_epoch: int) -> list:
-        """Validators marked 'exiting' whose exit_epoch has arrived (<= current_epoch),
-        to be moved to 'exited'. Deterministic, canonical address order."""
-        cur = await self.connection.execute(
-            "SELECT address FROM validators WHERE status = 'exiting' "
-            "AND exit_epoch IS NOT NULL AND exit_epoch <= ? "
-            "ORDER BY address ASC",
-            (int(current_epoch),),
-        )
-        return [r[0] for r in await cur.fetchall()]
 
     async def get_attestations_filtered(self, filters: dict, limit: int, offset: int):
         """Get attestations with filters"""
@@ -2267,7 +1935,7 @@ class DatabaseSQLite:
             f"SELECT {_BLOCK_COLS} FROM blocks WHERE block_height = ?", (block_id,)
         )
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        return _block_row(row)
 
     async def get_block_header(self, block_id: int) -> Optional[Dict[str, Any]]:
         """A block's row without its body (``content`` is ~45 KB of signatures): for callers
@@ -2296,7 +1964,7 @@ class DatabaseSQLite:
             f"SELECT {_BLOCK_COLS} FROM blocks WHERE block_hash = ?", (block_hash,)
         )
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        return _block_row(row)
 
     async def get_last_block(self):
         """Get latest block"""
@@ -2541,7 +2209,7 @@ class DatabaseSQLite:
             (offset, limit),
         )
         rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        return [_block_row(row) for row in rows]
 
     async def get_spendable_outputs(self, address: str):
         """Get spendable outputs for address"""

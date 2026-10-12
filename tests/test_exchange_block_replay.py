@@ -119,17 +119,23 @@ def test_tampered_params_rejected():
     assert importer.compute_state_root() == before
 
 
-def test_wrong_declared_root_rejected_and_reverted():
+def test_wrong_declared_root_rejected_and_left_for_the_caller_to_restore():
+    """A section with a wrong root is refused. Undoing it is the caller's job: it restores
+    through the reorg fast path (main._restore_after_rejected_block), because a per-block deep
+    copy of the whole exchange cost more than anything else a node did. That restore is tested
+    end to end in tests/test_fast_reorg_rebuild.py."""
     txs = _block_section()
     _propose(txs)  # ignore real root
     wrong_root = "ab" * 64  # 128-hex but wrong
 
     importer = ExchangeStateManager()
     before = importer.compute_state_root()
+    taken = []
+    importer.take_snapshot = lambda: taken.append(1)   # no deep copy on the live path
     ok, err = apply_block_exchange_section(HEIGHT, TS, encode_exchange_txs(txs), wrong_root, importer)
     assert not ok and "mismatch" in err
-    # CRITICAL: state reverted, not left in the wrongly-applied state.
-    assert importer.compute_state_root() == before
+    assert taken == []
+    assert importer.compute_state_root() != before     # applied: the caller restores
 
 
 def test_section_without_declared_root_rejected():

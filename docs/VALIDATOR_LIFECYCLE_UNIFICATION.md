@@ -1,5 +1,11 @@
 # Validator Lifecycle Unification — Design
 
+> **Superseded (2026-10-12).** The validator set is no longer a table rebuilt from the chain
+> when finality advances: it is a pure function of the chain, `S_E` per epoch, computed by
+> `qrdx/validator/epoch_state.py` and described in [STAKING.md](STAKING.md). The reconstruction
+> and the import-time registration this document describes are removed; the history below is kept
+> for the reasoning.
+
 > **Status:** design (June 2026). `CONSENSUS_REMAINING_WORK.md` item 4. Makes the
 > consensus validator set a runtime-converged function of the chain (activations,
 > exits, stake updates) instead of the static genesis set — the prerequisite for

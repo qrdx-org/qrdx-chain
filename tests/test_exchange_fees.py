@@ -136,3 +136,37 @@ def test_the_receipt_reports_the_fee(mgr):
     receipt = mgr.journal.receipt(tx.tx_hash())
     assert receipt["fee"] == str(fee_of(ExchangeOpType.TOKEN_DEPLOY))
     assert receipt["gas_price"] == GWEI
+
+
+# ── listing a perp market burns the listing fee ───────────────────────────
+
+def _create_market(m, base="BTC", nonce=0):
+    return m.process_transaction(_tx(ExchangeOpType.CREATE_MARKET, {"base_token": base},
+                                     nonce=nonce))
+
+
+def test_listing_a_market_burns_the_listing_fee(mgr):
+    """A market costs every node work in every block; listing one used to cost only gas."""
+    listing = D(constants.PERP_MARKET_LISTING_FEE)
+    assert listing > 0
+    mgr.set_available_balance(ALICE, listing + 1)
+    r = _create_market(mgr)
+    assert r.success and r.data["listing_fee"] == str(listing)
+    gas = fee_of(ExchangeOpType.CREATE_MARKET)
+    assert mgr.balance_deltas() == {ALICE: -(listing + gas)}   # debited, credited to no one
+    assert mgr.available_balance(ALICE) == 1 - gas
+
+
+def test_a_creator_who_cannot_pay_the_listing_fee_lists_nothing(mgr):
+    listing = D(constants.PERP_MARKET_LISTING_FEE)
+    mgr.set_available_balance(ALICE, listing - 1)
+    r = _create_market(mgr)
+    assert not r.success and "market listing fee" in r.error
+    assert not mgr.clearinghouse.markets
+    assert mgr.balance_deltas() == {ALICE: -fee_of(ExchangeOpType.CREATE_MARKET)}  # gas only
+
+
+def test_without_the_fee_gate_listing_costs_nothing(mgr):
+    mgr.enforce_fees = False
+    r = _create_market(mgr)
+    assert r.success and "listing_fee" not in r.data and mgr.balance_deltas() == {}

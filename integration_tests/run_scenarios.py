@@ -32,8 +32,6 @@ from integration_tests.scenarios.s02_peer_mesh import S02PeerMesh
 from integration_tests.scenarios.s03_block_production import S03BlockProduction
 from integration_tests.scenarios.s04_transactions import S04Transactions
 from integration_tests.scenarios.s04b_cross_type_transfers import S04bCrossTypeTransfers
-from integration_tests.scenarios.s05_tokens import S05Tokens
-from integration_tests.scenarios.s06_pools import S06Pools
 from integration_tests.scenarios.s07_validators import S07Validators
 from integration_tests.scenarios.s08_governance import S08Governance
 from integration_tests.scenarios.s09_bridge import S09Bridge
@@ -50,6 +48,8 @@ from integration_tests.scenarios.s19_perp_liquidation import S19PerpLiquidation
 from integration_tests.scenarios.s20_native_tokens import S20NativeTokens
 from integration_tests.scenarios.s21_interfaces_nfts import S21InterfacesNfts
 from integration_tests.scenarios.s22_governance import S22Governance
+from integration_tests.scenarios.s23_bridge import S23Bridge
+from integration_tests.scenarios.s24_staking_pools import S24StakingPools
 
 
 ALL_SCENARIOS = [
@@ -58,8 +58,6 @@ ALL_SCENARIOS = [
     S03BlockProduction,
     S04Transactions,
     S04bCrossTypeTransfers,
-    S05Tokens,
-    S06Pools,
     S07Validators,
     S08Governance,
     S09Bridge,
@@ -75,6 +73,8 @@ ALL_SCENARIOS = [
     S19PerpLiquidation,
     S20NativeTokens,
     S21InterfacesNfts,
+    S23Bridge,
+    S24StakingPools,
     S22Governance,       # last: freezing the master controller is irreversible
 ]
 

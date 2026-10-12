@@ -172,6 +172,9 @@ class NativeToken:
     pause_authority: Optional[str] = None
     paused: bool = False
     default_operators: Tuple[str, ...] = ()
+    # Whitepaper §9.2: the deployer's advisory flag that the token stays tradable after the
+    # Doomsday Protocol (backed by locked classical assets). Read by qrdx/tokens/doomsday_hook.
+    post_doomsday_trade: bool = False
 
     def fee_config(self, height: int) -> Tuple[int, Optional[Decimal]]:
         """The transfer-fee rate and cap in force at ``height``."""
@@ -230,6 +233,8 @@ class NativeToken:
             ext["pausable"] = {"pause_authority": self.pause_authority, "paused": self.paused}
         if self.default_operators:
             ext["default_operators"] = list(self.default_operators)
+        if self.post_doomsday_trade:
+            ext["post_doomsday_trade"] = True
         return ext
 
     def summary(self) -> Dict[str, Any]:
@@ -800,3 +805,4 @@ def _apply_extensions(t: NativeToken, p: Dict[str, Any], creator: str) -> None:
         seen.add(account(o))
         out.append(o)
     t.default_operators = tuple(out)
+    t.post_doomsday_trade = _flag(p.get("post_doomsday_trade", False))

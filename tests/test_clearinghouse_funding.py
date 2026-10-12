@@ -113,6 +113,31 @@ def test_nothing_is_paid_before_the_boundary_and_once_at_it():
     assert m.premium_time == 2 and m.funding_time == T0 + HOUR
 
 
+def test_a_halt_pays_every_interval_it_spanned_at_the_interest_rate():
+    """The chain halts for three intervals with a premium on the book. The interval the
+    samples cover pays its rate; the two with no block in them pay interest only. (One interval
+    used to be paid for the whole halt.)"""
+    ch = _ch()
+    ch.deposit("mm", D(1_000_000))
+    ch.place_order("mm", BTC, "bid", "buy", D(1), D(30300), 0)    # a 1 % premium
+    a = ch.accounts["alice"]
+    ch.tick(T0)
+    ch.tick(T0 + 10)
+    start, total = a.collateral, _value(ch)
+    events = ch.tick(T0 + 3 * HOUR + 5)                            # resumes 3 boundaries on
+    (ev,) = [e for e in events if e["type"] == "funding"]
+    measured = (D("0.01") - FUNDING_PREMIUM_CLAMP) / 8
+    interest = FUNDING_INTEREST_8H / 8
+    assert D(ev["rate"]) == measured and ev["intervals"] == 3
+    assert D(ev["paid_rate"]) == measured + 2 * interest
+    assert start - a.collateral == D(30000) * (measured + 2 * interest)
+    m = ch.markets[BTC]
+    assert m.funding_rate == measured and m.funding_time == T0 + 3 * HOUR
+    assert _value(ch) == total and ch.identity_gap() == 0
+    later = ch.tick(T0 + 4 * HOUR)                                 # back to one at a time
+    assert [e for e in later if e["type"] == "funding"][0].get("intervals") is None
+
+
 def test_isolated_positions_pay_from_their_own_margin():
     ch = Clearinghouse()
     ch.create_market("BTC")
@@ -183,7 +208,7 @@ async def test_forward_and_rebuild_pay_the_same_funding(monkeypatch):
             if txs:
                 await db.add_block_exchange_txs(bh, encode_exchange_txs(txs))
 
-        await add(0, alloc=[(alice, "100000"), (bob, "100000"), (rep, "1000")])  # rep pays gas
+        await add(0, alloc=[(alice, "100000"), (bob, "100000"), (rep, "5000")])  # rep pays gas and the listing fee
         await add(1, [tx(0, ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"}),
                       tx(0, ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": "30000"}),
                       tx(1, ExchangeOpType.PERP_DEPOSIT, {"amount": "50000"}),

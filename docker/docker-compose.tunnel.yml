@@ -146,10 +146,16 @@ services:
       # The chain id is bound into every signed transaction, so it must be one no other EVM
       # network uses (1 is Ethereum's). genesis-init writes it into the genesis chain spec.
       QRDX_CHAIN_ID: "${QRDX_CHAIN_ID:?set QRDX_CHAIN_ID to this chain's id, one no other EVM network uses}"
-      QRDX_NETWORK_NAME: "${QRDX_NETWORK_NAME:-qrdx-mainnet}"
+      # Empty: genesis-init names the chain after its id (762 qrdx-mainnet, 7620 qrdx-testnet),
+      # any other id qrdx-mainnet. Set it to name a chain on another id.
+      QRDX_NETWORK_NAME: "${QRDX_NETWORK_NAME:-}"
       # address:amount[,address:amount...], amounts in QRDX.
       QRDX_GENESIS_ALLOCATIONS: "${QRDX_GENESIS_ALLOCATIONS:-0xPQ4Bd03Abf07B8302EA2547c881F597530638848a3d245296da543A40F8b05884C:1000000000}"
       QRDX_GENESIS_VALIDATOR_STAKE: "${QRDX_GENESIS_VALIDATOR_STAKE:-100000}"
+      # Network parameters (qrdx/chain_spec.py PARAMS) are written into the genesis chain
+      # spec, so they are set HERE, never on the node: a node whose environment sets one to a
+      # different value than the spec refuses to start.
+      QRDX_PERP_COLLATERAL_TOKEN: "${QRDX_PERP_COLLATERAL_TOKEN:-QRDX}"
       QRDX_VALIDATOR_ENABLED: "${QRDX_VALIDATOR_ENABLED:-true}"
       QRDX_VALIDATOR_WALLET: "${QRDX_VALIDATOR_WALLET:-/app/data/validator/validator.json}"
     depends_on:
@@ -206,7 +212,8 @@ services:
       QRDX_BOOTSTRAP_NODE: "${QRDX_BOOTSTRAP_NODE:-self}"
       # Must match the genesis chain spec (the node refuses to start otherwise).
       QRDX_CHAIN_ID: "${QRDX_CHAIN_ID:?set QRDX_CHAIN_ID to this chain's id, one no other EVM network uses}"
-      QRDX_NETWORK_NAME: "${QRDX_NETWORK_NAME:-qrdx-mainnet}"
+      # Empty: the node takes the name from the chain spec.
+      QRDX_NETWORK_NAME: "${QRDX_NETWORK_NAME:-}"
       QRDX_RPC_ENABLED: "${QRDX_RPC_ENABLED:-true}"
       QRDX_ENABLE_STREAMING: "true"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
@@ -223,7 +230,8 @@ services:
       QRDX_RPC_ADMIN_TOKEN: "${QRDX_RPC_ADMIN_TOKEN:-}"
 
       QRDX_ORACLE_FEED: "exchanges"
-      QRDX_PERP_COLLATERAL_TOKEN: "QRDX"
+      # The perp collateral token is a network parameter: genesis-init writes it into the
+      # chain spec (see that service), and the node reads it from there.
 
     # Do not start the node until the validator identity and the genesis exist on
     # the volume. Without the genesis file the node silently builds its built-in

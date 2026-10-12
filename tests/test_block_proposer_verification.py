@@ -33,7 +33,7 @@ def _signed_block(key: PQPrivateKey, **overrides):
         "proposer_public_key": key.public_key.to_bytes().hex(),
         "slot": 7,
         "epoch": 0,
-        "randao_reveal": "11" * 32,
+        "randao_reveal": "",  # none unless RANDAO selection is scheduled
         "attestations": [],
         "graffiti": "",
     }
@@ -86,7 +86,7 @@ def test_missing_fields_fail():
     bc, addr = _signed_block(key)
     no_sig = dict(bc); no_sig.pop("proposer_signature")
     ok, err = verify_pos_block_proposer(str(no_sig), addr)
-    assert not ok and "proposer_public_key/proposer_signature" in err
+    assert not ok and "proposer_signature" in err
 
     no_field = dict(bc); no_field.pop("epoch")
     ok2, err2 = verify_pos_block_proposer(str(no_field), addr)
@@ -96,3 +96,51 @@ def test_missing_fields_fail():
 def test_garbage_content_fails():
     ok, err = verify_pos_block_proposer("not a dict", "0xPQabc")
     assert not ok
+
+
+
+# ── A block body no longer carries the proposer's key; the reveal only when RANDAO is near ──
+
+def test_a_block_without_its_key_verifies_against_the_registry_key():
+    """The 3.9 KB key is gone from every block; importers pass the key the chain registered."""
+    key = PQPrivateKey.generate()
+    bc, addr = _signed_block(key)
+    del bc["proposer_public_key"]
+    assert not verify_pos_block_proposer(str(bc), addr)[0]          # no key at all
+    ok, err = verify_pos_block_proposer(str(bc), addr, key.public_key.to_bytes())
+    assert ok, err
+    other = PQPrivateKey.generate().public_key.to_bytes()
+    ok, err = verify_pos_block_proposer(str(bc), addr, other)        # a key not the proposer's
+    assert not ok and "does not match address" in err
+
+
+def test_a_reveal_is_refused_unless_randao_selection_is_near(monkeypatch):
+    from qrdx.validator import randao
+    from qrdx.validator.randao import randao_reveal_message
+
+    key = PQPrivateKey.generate()
+    reveal = key.sign(randao_reveal_message(7)).to_bytes().hex()
+    bc, addr = _signed_block(key, randao_reveal=reveal)
+    ok, err = verify_pos_block_proposer(str(bc), addr)
+    assert not ok and "not scheduled" in err                         # 3.3 KB nothing reads
+
+    monkeypatch.setattr(randao, "randao_reveal_required", lambda number: True)
+    assert verify_pos_block_proposer(str(bc), addr)[0]               # a real reveal
+    missing, _ = _signed_block(key)
+    ok, err = verify_pos_block_proposer(str(missing), addr)
+    assert not ok and "missing RANDAO reveal" in err
+    forged, _ = _signed_block(key, randao_reveal=key.sign(b"another message").to_bytes().hex())
+    ok, err = verify_pos_block_proposer(str(forged), addr)
+    assert not ok and "invalid RANDAO reveal" in err                 # chosen bytes, not a reveal
+    wrong_slot, _ = _signed_block(key, randao_reveal=key.sign(randao_reveal_message(8)).to_bytes().hex())
+    assert not verify_pos_block_proposer(str(wrong_slot), addr)[0]
+
+
+def test_reveals_start_ahead_of_randao_selection(monkeypatch):
+    from qrdx.validator import randao
+
+    monkeypatch.setattr(randao, "randao_selection_active", lambda h: h >= 10_000)
+    lead = randao.RANDAO_REVEAL_LEAD_BLOCKS
+    assert not randao.randao_reveal_required(10_000 - lead - 1)
+    assert randao.randao_reveal_required(10_000 - lead)
+    assert randao.randao_reveal_required(20_000)

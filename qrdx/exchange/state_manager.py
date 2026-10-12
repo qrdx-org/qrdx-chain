@@ -27,8 +27,8 @@ import copy
 import hashlib
 import json
 import logging
-from decimal import ROUND_FLOOR, Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .amm import (
     FEE_CREATOR_SHARE,
@@ -39,6 +39,16 @@ from .amm import (
     FeeTier,
     PoolManager,
     PoolType,
+)
+from .bridge import (
+    BRIDGE_AUTHORITY,
+    MAX_VOTE_DEPOSITS,
+    Bridge,
+    BridgeError,
+    Deposit,
+    asset_by_token,
+    configured_assets,
+    parse_deposit,
 )
 from .clearinghouse import Clearinghouse, ClearinghouseError
 from .commitment import Section, committed, encode_value, verifying
@@ -132,6 +142,13 @@ class ExchangeStateManager:
         self.oracle_committee: Optional[Dict[str, Decimal]] = None
         # market_id → voter → (price, block time of the vote)
         self.oracle_votes: Dict[str, Dict[str, Tuple[Decimal, Decimal]]] = {}
+        # Each voter's last applied vote sequence: an ORACLE_VOTE's nonce is this sequence,
+        # not the account's exchange nonce (process_transaction).
+        self.oracle_vote_seqs: Dict[str, int] = {}
+        # Votes for other venues' perp price, per market (the mark price's third input).
+        self.perp_votes: Dict[str, Dict[str, Tuple[Decimal, Decimal]]] = {}
+        # Committee members convicted by slashing evidence (block_processor.ensure_oracle_committee).
+        self.oracle_excluded: Set[str] = set()
         # Node-local receipts + perps event feed for wallets, the API and streams — NOT
         # consensus state (see journal.py). Recorded at commit, rebuilt with the manager.
         from .journal import ExchangeJournal
@@ -203,6 +220,8 @@ class ExchangeStateManager:
         # master controller's freeze and fork approvals. Exchange state like the rest — replayed
         # on every path, committed in the root, snapshotted, rebuilt after a reorg.
         self.governance = Governance()
+        # The consensus bridge (docs/BRIDGE.md): attested deposits, minted ids, withdrawals.
+        self.bridge = Bridge()
         # Per-block validator-lifecycle ops (STAKE_DEPOSIT / STAKE_EXIT) to flush to
         # the consensus validators table. Deterministic (same txs on every node),
         # reset per block. See qrdx.validator.epoch_loop for activation scheduling.
@@ -339,7 +358,11 @@ class ExchangeStateManager:
         validated and accepted by consensus. Records the block in the journal.
         """
         self._snapshot = None
-        if not getattr(self, "_block_journaled", False):
+        # A replay after a reorg re-applies blocks the journal already holds (it was rolled back
+        # only to the new tip): record only the blocks above what it has.
+        if not getattr(self, "_block_journaled", False) and (
+            self._current_block_height > self.journal.height
+        ):
             self._block_journaled = True
             try:
                 self.journal.record_block(
@@ -383,14 +406,27 @@ class ExchangeStateManager:
         except ValueError as e:
             return ExchangeExecResult(success=False, gas_used=0, error=str(e))
 
-        # 2. Nonce check (replay protection)
-        expected_nonce = self._nonces.get(tx.sender, 0)
-        if tx.nonce != expected_nonce:
-            return ExchangeExecResult(
-                success=False,
-                gas_used=0,
-                error=f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}",
-            )
+        # 2. Nonce check (replay protection). An oracle vote carries its own sequence instead:
+        #    it must be newer than the voter's last applied vote, and never moves the account's
+        #    exchange nonce — which used to advance with every vote, so a validator's own
+        #    transactions signed elsewhere with a predicted nonce went stale.
+        is_vote = tx.op_type == ExchangeOpType.ORACLE_VOTE
+        if is_vote:
+            last = self.oracle_vote_seq(tx.sender)
+            if tx.nonce <= last:
+                return ExchangeExecResult(
+                    success=False,
+                    gas_used=0,
+                    error=f"Stale oracle vote: sequence {tx.nonce} is not after {last}",
+                )
+        else:
+            expected_nonce = self._nonces.get(tx.sender, 0)
+            if tx.nonce != expected_nonce:
+                return ExchangeExecResult(
+                    success=False,
+                    gas_used=0,
+                    error=f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}",
+                )
 
         # 3. Gas limit check
         base_gas = EXCHANGE_GAS_COSTS.get(tx.op_type, 100_000)
@@ -432,7 +468,10 @@ class ExchangeStateManager:
         #    re-included indefinitely at the same nonce: one signed transaction, unlimited
         #    block space. Transactions rejected before execution (malformed, wrong nonce,
         #    under-gassed — steps 1-3) are not includable and consume nothing.
-        self._nonces[tx.sender] = tx.nonce + 1
+        if is_vote:
+            self.oracle_vote_seqs[tx.sender.lower()] = tx.nonce
+        else:
+            self._nonces[tx.sender] = tx.nonce + 1
 
         # 6. Charge gas: gas_used × gas_price, burned; the rest of the reservation comes back.
         if result.gas_used == 0:
@@ -508,6 +547,10 @@ class ExchangeStateManager:
             ExchangeOpType.GOV_VOTE: self._op_gov_vote,
             ExchangeOpType.GOV_VETO: self._op_gov_veto,
             ExchangeOpType.GOV_EXECUTE: self._op_gov_execute,
+            ExchangeOpType.BRIDGE_WITHDRAW: self._op_bridge_withdraw,
+            ExchangeOpType.STAKE_DELEGATE: self._op_stake_delegate,
+            ExchangeOpType.STAKE_UNDELEGATE: self._op_stake_undelegate,
+            ExchangeOpType.STAKE_SET_COMMISSION: self._op_stake_set_commission,
         }
         handler = handlers.get(tx.op_type)
         if handler is None:
@@ -1107,13 +1150,24 @@ class ExchangeStateManager:
 
         Maintenance margin is half the initial margin at ``max_leverage``; the old
         ``initial_margin_rate`` / ``maintenance_margin_rate`` params are no longer read.
-        A duplicate market is a non-critical failure, not a block-breaking error.
+        A duplicate market is a non-critical failure, not a block-breaking error. With the fee
+        gate on, the creator burns PERP_MARKET_LISTING_FEE QRDX: a market costs every node work
+        in every block, so listing one must not be nearly free.
         """
         from .. import constants
 
         p = tx.params
         base = str(p["base_token"])
         quote = str(p.get("quote_token", constants.PERP_QUOTE))
+        fee = Decimal(constants.PERP_MARKET_LISTING_FEE) if self.enforce_fees else ZERO
+        if fee > 0:
+            avail = self.available_balance(tx.sender)  # less this transaction's gas reservation
+            if avail is None or avail < fee:
+                return ExchangeExecResult(
+                    success=False,
+                    error=f"insufficient QRDX for the market listing fee: need {fee}, "
+                    f"available {avail}",
+                )
         try:
             if "max_leverage" in p:
                 market = self.clearinghouse.create_market(
@@ -1123,10 +1177,12 @@ class ExchangeStateManager:
                 market = self.clearinghouse.create_market(base, quote)
         except ClearinghouseError as e:
             return ExchangeExecResult(success=False, error=str(e))
+        data: Dict[str, Any] = {"market_id": market.id}
+        if fee > 0:
+            self._record_balance_delta(tx.sender, -fee)  # burned
+            data["listing_fee"] = str(fee)
         return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.CREATE_MARKET],
-            data={"market_id": market.id},
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.CREATE_MARKET], data=data
         )
 
     @staticmethod
@@ -1762,9 +1818,8 @@ class ExchangeStateManager:
                 "stake": str(stake),
             }
         )
-        if self.oracle_committee is not None:
-            key = tx.sender.lower()
-            self.oracle_committee[key] = self.oracle_committee.get(key, ZERO) + stake
+        # (It joins the committee that weighs votes when it activates: the committee is the
+        # chain-derived validator set — block_processor.ensure_oracle_committee.)
 
         # (3) Lock it. Gate the RECORDING, not just the flush: the shared
         # account_state flush is already enforced for collateral, so recording
@@ -1784,20 +1839,112 @@ class ExchangeStateManager:
         )
 
     def _op_stake_exit(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """Validator-lifecycle Phase 3: the sender signals a voluntary exit. Records a
-        deterministic 'exit' op; the all-nodes epoch loop schedules exit_epoch and moves
-        the validator exiting→exited."""
+        """The sender signals a voluntary exit: logged against the block, it moves the validator
+        to exiting in the next epoch's set and out after unbonding (validator/epoch_state.py)."""
         self._validator_lifecycle_ops.append({"type": "exit", "address": tx.sender})
-        if self.oracle_committee is not None:
-            self.oracle_committee.pop(tx.sender.lower(), None)
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.STAKE_EXIT],
             data={"validator": tx.sender, "status": "exiting"},
         )
 
+    def _op_stake_delegate(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Lock ``amount`` QRDX in ``validator``'s delegation pool (docs/STAKING.md): debited
+        now, it joins the pool after a warm-up of ACTIVATION_DELAY_EPOCHS — or comes back, if
+        the address is not a validator then (validator/epoch_state.py). The pool's shares earn
+        the staking rate, less the validator's commission."""
+        from ..constants import STAKE_MIN_DELEGATION
+
+        p = tx.params
+        try:
+            amount = Decimal(str(p["amount"]))
+            validator = str(p["validator"])
+            token_account(validator)
+        except (InvalidOperation, ValueError, TypeError, TokenError) as e:
+            return ExchangeExecResult(success=False, error=f"STAKE_DELEGATE: {e}")
+        if not amount.is_finite() or amount < STAKE_MIN_DELEGATION:
+            return ExchangeExecResult(
+                success=False, error=f"STAKE_DELEGATE: at least {STAKE_MIN_DELEGATION} QRDX"
+            )
+        if amount != amount.quantize(Decimal("1e-18")):
+            return ExchangeExecResult(success=False, error="STAKE_DELEGATE: whole wei only")
+        if self.enforce_validator_stake:
+            avail = self.available_balance(tx.sender)
+            if avail is None or avail < amount:
+                return ExchangeExecResult(
+                    success=False,
+                    error=f"STAKE_DELEGATE: insufficient balance: need {amount}, "
+                    f"available {avail}",
+                )
+            self._record_balance_delta(tx.sender, -amount)
+        self._validator_lifecycle_ops.append(
+            {
+                "type": "delegate",
+                "address": tx.sender,
+                "validator": validator,
+                "amount": str(amount),
+            }
+        )
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.STAKE_DELEGATE],
+            data={"validator": validator, "amount": str(amount), "status": "warming up"},
+        )
+
+    def _op_stake_undelegate(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Redeem ``shares`` (default: all, warming-up delegations included) of the sender's
+        stake in ``validator``'s pool: worth the pool's price at the end of the epoch, paid
+        after UNBONDING_PERIOD_EPOCHS and the withdrawal delay — slashed with the pool
+        meanwhile."""
+        p = tx.params
+        raw = p.get("shares", "all")
+        shares: Optional[str] = None
+        if str(raw).lower() != "all":
+            try:
+                value = Decimal(str(raw))
+            except InvalidOperation:
+                value = Decimal(0)
+            if not value.is_finite() or value <= 0:
+                return ExchangeExecResult(
+                    success=False, error="STAKE_UNDELEGATE: shares must be positive, or all"
+                )
+            shares = str(value)
+        self._validator_lifecycle_ops.append(
+            {
+                "type": "undelegate",
+                "address": tx.sender,
+                "validator": str(p["validator"]),
+                "shares": shares,
+            }
+        )
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.STAKE_UNDELEGATE],
+            data={"validator": str(p["validator"]), "shares": shares or "all"},
+        )
+
+    def _op_stake_set_commission(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """A validator sets its commission on its pool's rewards (basis points, 0–10,000),
+        from the next epoch. From an address that is not a validator it does nothing."""
+        try:
+            bps = int(tx.params["commission_bps"])
+        except (TypeError, ValueError):
+            bps = -1
+        if not 0 <= bps <= 10_000:
+            return ExchangeExecResult(
+                success=False, error="STAKE_SET_COMMISSION: 0 to 10,000 basis points"
+            )
+        self._validator_lifecycle_ops.append(
+            {"type": "commission", "address": tx.sender, "commission_bps": bps}
+        )
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.STAKE_SET_COMMISSION],
+            data={"commission_bps": bps},
+        )
+
     def validator_lifecycle_ops(self) -> List[Dict[str, Any]]:
-        """This block's accumulated staking deposit/exit ops (Phase 3)."""
+        """This block's executed staking operations: deposits, exits, delegations."""
         return list(self._validator_lifecycle_ops)
 
     # =====================================================================
@@ -1825,7 +1972,7 @@ class ExchangeStateManager:
 
         def go():
             p = self.governance.propose(
-                tx.sender, tx.params, self._current_block_height, self.oracle_committee
+                tx.sender, tx.params, self._current_block_height, self._oracle_members()
             )
             return {
                 "proposal_id": p.id,
@@ -2055,10 +2202,12 @@ class ExchangeStateManager:
         # Not resting after its fills: filled, IOC, or stopped by self-trade prevention
         # (an order that would hit the sender's own resting order is cancelled there).
         resting = order_id in self.clearinghouse.markets[str(p["market_id"])].orders
+        data: Dict[str, Any] = {"order_id": order_id, "fills": fills, "resting": resting}
+        if self.clearinghouse.last_cancelled:
+            # Resting orders the fills left an account unqualified for (theirs or a maker's).
+            data["cancelled"] = self.clearinghouse.last_cancelled
         return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_ORDER],
-            data={"order_id": order_id, "fills": fills, "resting": resting},
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_ORDER], data=data
         )
 
     def _op_perp_cancel(self, tx: ExchangeTransaction) -> ExchangeExecResult:
@@ -2115,9 +2264,10 @@ class ExchangeStateManager:
     MAX_VOTE_PRICES = 64
 
     def load_oracle_committee(self, genesis_content: Any) -> None:
-        """Seed the committee from the genesis block's ``validator_set`` (address, stake) — the
-        one source every node holds identically. A genesis without one leaves votes disabled
-        (None): a committee built from joiners alone would hand the oracle to the first one."""
+        """Seed the committee from a genesis block's ``validator_set`` (address, stake) — for a
+        manager with no chain behind it (tests, tools). On a node the committee is set before
+        every block from the chain-derived validator set (block_processor.ensure_oracle_committee).
+        A genesis without a validator set leaves votes disabled (None)."""
         if self.oracle_committee is not None:
             return
         try:
@@ -2138,60 +2288,189 @@ class ExchangeStateManager:
         self.oracle_committee = committee
 
     def _op_oracle_vote(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """A committee member's USD prices, keyed by market base ("BTC" → BTC-USD-PERP). Votes
-        only for existing markets; each replaces the voter's previous one for that market."""
+        """A committee member's USD prices, keyed by market base ("BTC" → BTC-USD-PERP), and
+        other venues' perp prices ("BTC:perp", the mark's third input). Votes only for existing
+        markets; each replaces the voter's previous one for that market. A vote may also attest
+        bridge deposits (``deposits``, docs/BRIDGE.md): the one that brings a deposit to a
+        quorum mints it."""
         from .. import constants
 
-        committee = self.oracle_committee
+        committee = self._oracle_members()
         if not committee or tx.sender.lower() not in committee:
             return ExchangeExecResult(success=False, error="sender is not in the oracle committee")
-        prices = tx.params.get("prices")
-        if not isinstance(prices, dict) or not prices or len(prices) > self.MAX_VOTE_PRICES:
+        prices = tx.params.get("prices", {})
+        deposits_raw = tx.params.get("deposits", [])
+        if not isinstance(deposits_raw, list) or len(deposits_raw) > MAX_VOTE_DEPOSITS:
             return ExchangeExecResult(
-                success=False, error=f"a vote carries 1 to {self.MAX_VOTE_PRICES} prices"
+                success=False, error=f"a vote attests at most {MAX_VOTE_DEPOSITS} deposits"
             )
+        if (
+            not isinstance(prices, dict)
+            or len(prices) > self.MAX_VOTE_PRICES
+            or not (prices or deposits_raw)
+        ):
+            return ExchangeExecResult(
+                success=False,
+                error=f"a vote carries 1 to {self.MAX_VOTE_PRICES} prices, or only deposits",
+            )
+        deposits: List[Deposit] = []
+        if deposits_raw:
+            assets = configured_assets()
+            for raw in deposits_raw:
+                try:
+                    deposits.append(parse_deposit(raw, assets))
+                except BridgeError as e:
+                    return ExchangeExecResult(success=False, error=f"deposit: {e}")
         parsed: Dict[str, Decimal] = {}
-        for base in sorted(prices):
-            market_id = Clearinghouse.market_id(str(base), constants.PERP_QUOTE)
+        perp: Dict[str, Decimal] = {}
+        for key in sorted(prices):
+            base = str(key)
+            is_perp = base.endswith(":perp")
+            if is_perp:
+                base = base[: -len(":perp")]
+            market_id = Clearinghouse.market_id(base, constants.PERP_QUOTE)
             if market_id not in self.clearinghouse.markets:
                 return ExchangeExecResult(success=False, error=f"no market {market_id}")
             try:
-                price = Decimal(str(prices[base]))
+                price = Decimal(str(prices[key]))
             except Exception:
                 return ExchangeExecResult(success=False, error=f"invalid price for {base}")
             if not price.is_finite() or price <= 0:
                 return ExchangeExecResult(success=False, error=f"invalid price for {base}")
-            parsed[market_id] = price
+            (perp if is_perp else parsed)[market_id] = price
         now = Decimal(str(self._block_clock()))
         voter = tx.sender.lower()
         for market_id, price in parsed.items():
             self.oracle_votes.setdefault(market_id, {})[voter] = (price, now)
+        for market_id, price in perp.items():
+            self.perp_votes.setdefault(market_id, {})[voter] = (price, now)
+        data: Dict[str, Any] = {"markets": sorted(parsed)}
+        if perp:
+            data["perp_prices"] = sorted(perp)
+        if deposits:
+            data["deposits"] = [d.id for d in deposits]
+            minted = []
+            for d in deposits:
+                if not self.bridge.attest(d, voter, now, committee):
+                    continue
+                try:
+                    self._mint_deposit(d)
+                except TokenError as e:  # left pending: a later attestation retries
+                    logger.warning(
+                        "bridge deposit %s reached a quorum but cannot mint: %s", d.id, e
+                    )
+                    continue
+                self.bridge.complete(d)
+                minted.append(d.id)
+            if minted:
+                data["minted"] = minted
+        return ExchangeExecResult(
+            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ORACLE_VOTE], data=data
+        )
+
+    def _mint_deposit(self, d: Deposit) -> None:
+        """Mint a deposit that reached a quorum to its recipient, creating the bridged token at
+        its first deposit (zero supply, the bridge's mint authority)."""
+        asset = configured_assets()[(d.chain, d.token)]
+        if self.tokens.get(asset.address) is None:
+            self.tokens.deploy(
+                asset.address,
+                BRIDGE_AUTHORITY,
+                self._current_block_height,
+                name=f"{asset.symbol} (bridged)",
+                symbol=asset.symbol,
+                decimals=asset.decimals,
+                initial_supply=0,
+                mint_authority=BRIDGE_AUTHORITY,
+            )
+        minted = self.tokens.mint(asset.address, BRIDGE_AUTHORITY, d.amount)
+        self._record_token_delta(d.to, asset.address, minted)
+
+    def _op_bridge_withdraw(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Burn ``amount`` of a bridged token and record the withdrawal to ``to`` on its source
+        chain, for the lockbox's custodian to release (docs/BRIDGE.md)."""
+        p = tx.params
+        asset = asset_by_token(str(p["token_address"]))
+        if asset is None:
+            return ExchangeExecResult(success=False, error="BRIDGE_WITHDRAW: not a bridged token")
+        to = str(p["to"]).strip().lower()
+        if not (
+            len(to) == 42 and to.startswith("0x") and all(c in "0123456789abcdef" for c in to[2:])
+        ):
+            return ExchangeExecResult(
+                success=False,
+                error="BRIDGE_WITHDRAW: the recipient is a 0x address on the source chain",
+            )
+        try:
+            v = token_amount(p["amount"])
+            if v != v.quantize(Decimal(1).scaleb(-asset.decimals)):
+                raise TokenError(f"{asset.symbol} has {asset.decimals} decimals")
+            self.tokens.require(asset.address)
+            avail = self.available_token_balance(tx.sender, asset.address)
+            if self.enforce_spot_settlement and (avail is None or avail < v):
+                raise TokenError(f"insufficient token balance: need {v}, available {avail}")
+            self.tokens.burn(asset.address, v)
+        except TokenError as e:
+            return ExchangeExecResult(success=False, error=f"BRIDGE_WITHDRAW: {e}")
+        self._record_token_delta(tx.sender, asset.address, -v)
+        wid = self.bridge.record_withdrawal(
+            {
+                "chain": asset.chain,
+                "token": asset.source_token,
+                "to": to,
+                "amount": str(v),
+                "from": tx.sender,
+                "height": self._current_block_height,
+                "tx_hash": tx.tx_hash(),
+            }
+        )
         return ExchangeExecResult(
             success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ORACLE_VOTE],
-            data={"markets": sorted(parsed)},
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.BRIDGE_WITHDRAW],
+            data={"withdrawal_id": wid, "amount": str(v), "chain": asset.chain, "to": to},
         )
+
+    def _oracle_members(self) -> Dict[str, Decimal]:
+        """The committee less the members slashing evidence has convicted."""
+        committee = self.oracle_committee or {}
+        excluded: Set[str] = getattr(self, "oracle_excluded", set())
+        return {v: w for v, w in committee.items() if v not in excluded}
 
     def apply_oracle_votes(self, now) -> None:
         """Each block (before the clearinghouse tick): set every voted market's oracle to the
         stake-weighted median of fresh committee votes — when they carry a majority of the
         committee's stake. Without that the oracle is not refreshed, and goes stale. Votes
-        older than the window are dropped, so the state stays small."""
-        from .. import constants
-
-        committee = self.oracle_committee
+        older than the window are dropped, so the state stays small. Votes for other venues'
+        perp price (``"<base>:perp"`` keys) set each market's external price the same way."""
+        now = Decimal(str(now))
+        self.bridge.expire(now)  # deposits that never reached a quorum
+        committee = self._oracle_members()
         if not committee:
             return
-        now = Decimal(str(now))
+        self.oracle_votes = self._aggregate_votes(
+            self.oracle_votes, committee, now, self.clearinghouse.set_oracle_price
+        )
+        self.perp_votes = self._aggregate_votes(
+            self.perp_votes, committee, now, self.clearinghouse.set_external_perp_price
+        )
+
+    def _aggregate_votes(self, all_votes, committee, now: Decimal, apply) -> Dict[str, Any]:
+        """Per market: drop votes older than the window or from non-members; when the fresh
+        ones carry a majority of the committee's stake, ``apply`` their stake-weighted (lower)
+        median. Returns the votes kept."""
+        from .. import constants
+
         max_age = Decimal(constants.PERP_ORACLE_VOTE_MAX_AGE)
         total = sum(committee.values(), ZERO)
-        for market_id in sorted(self.oracle_votes):
+        kept: Dict[str, Any] = {}
+        for market_id in sorted(all_votes):
             votes = {
                 v: pt
-                for v, pt in self.oracle_votes[market_id].items()
+                for v, pt in all_votes[market_id].items()
                 if v in committee and now - pt[1] <= max_age
             }
-            self.oracle_votes[market_id] = votes
+            if votes:
+                kept[market_id] = votes
             if market_id not in self.clearinghouse.markets or not votes:
                 continue
             weighted = sorted((price, committee[v]) for v, (price, _t) in votes.items())
@@ -2202,9 +2481,9 @@ class ExchangeStateManager:
             for price, w in weighted:  # lower weighted median
                 acc += w
                 if acc * 2 >= weight:
-                    self.clearinghouse.set_oracle_price(market_id, price, now)
+                    apply(market_id, price, now)
                     break
-        self.oracle_votes = {m: v for m, v in self.oracle_votes.items() if v}
+        return kept
 
     def oracle_state_hash(self) -> bytes:
         """The live votes. (Not the committee: see block_processor.ensure_oracle_committee —
@@ -2213,7 +2492,15 @@ class ExchangeStateManager:
             m: {v: [str(p), str(t)] for v, (p, t) in sorted(vs.items())}
             for m, vs in sorted(self.oracle_votes.items())
         }
-        blob = json.dumps(votes, sort_keys=True, separators=(",", ":"))
+        state: Any = votes
+        if self.oracle_vote_seqs:  # absent while no vote has run (a root unchanged till then)
+            state = {"votes": votes, "seqs": dict(sorted(self.oracle_vote_seqs.items()))}
+            if self.perp_votes:
+                state["perp"] = {
+                    m: {v: [str(p), str(t)] for v, (p, t) in sorted(vs.items())}
+                    for m, vs in sorted(self.perp_votes.items())
+                }
+        blob = json.dumps(state, sort_keys=True, separators=(",", ":"))
         return hashlib.blake2b(blob.encode(), digest_size=32).digest()
 
     # =====================================================================
@@ -2289,6 +2576,8 @@ class ExchangeStateManager:
             self._current_block_height.to_bytes(8, "big"),
         ):
             hasher.update(part)
+        if self.bridge.touched:  # (nothing until the first deposit or withdrawal)
+            hasher.update(self.bridge.commitment())
         if verifying():
             self.verify_commitments()
         return hasher.digest(length=STATE_ROOT_SIZE).hex()
@@ -2304,6 +2593,7 @@ class ExchangeStateManager:
         self.tokens.verify_commitment()
         self.nfts.verify_commitment()
         self.governance.verify_commitment()
+        self.bridge.verify_commitment()
         self._nonces.verify()
 
     @_pinned
@@ -2363,6 +2653,8 @@ class ExchangeStateManager:
             hasher.update(self.nfts.state_hash())
         if self.governance.touched:  # (nothing until the first proposal)
             hasher.update(self.governance.state_hash())
+        if self.bridge.touched:  # (nothing until the first deposit or withdrawal)
+            hasher.update(self.bridge.commitment())
 
         # 5. Nonce state
         for addr in sorted(self._nonces.keys()):
@@ -2418,9 +2710,13 @@ class ExchangeStateManager:
             "clearinghouse": copy.deepcopy(self.clearinghouse),
             "oracle_committee": copy.deepcopy(self.oracle_committee),
             "oracle_votes": copy.deepcopy(self.oracle_votes),
+            "oracle_vote_seqs": dict(self.oracle_vote_seqs),
+            "perp_votes": copy.deepcopy(self.perp_votes),
+            "oracle_excluded": set(self.oracle_excluded),
             "tokens": copy.deepcopy(self.tokens),
             "nfts": copy.deepcopy(self.nfts),
             "governance": copy.deepcopy(self.governance),
+            "bridge": copy.deepcopy(self.bridge),
             "router_clob_sequence": self.router._clob_sequence,
         }
         return snapshot
@@ -2476,10 +2772,14 @@ class ExchangeStateManager:
         self.clearinghouse = copy.deepcopy(snapshot["clearinghouse"])
         self.oracle_committee = copy.deepcopy(snapshot.get("oracle_committee"))
         self.oracle_votes = copy.deepcopy(snapshot.get("oracle_votes", {}))
+        self.oracle_vote_seqs = dict(snapshot.get("oracle_vote_seqs", {}))
+        self.perp_votes = copy.deepcopy(snapshot.get("perp_votes", {}))
+        self.oracle_excluded = set(snapshot.get("oracle_excluded", set()))
 
         self.tokens = copy.deepcopy(snapshot.get("tokens", TokenRegistry()))
         self.nfts = copy.deepcopy(snapshot.get("nfts", NftRegistry()))
         self.governance = copy.deepcopy(snapshot.get("governance", Governance()))
+        self.bridge = copy.deepcopy(snapshot.get("bridge", Bridge()))
         self.router._clob_sequence = snapshot.get("router_clob_sequence", 0)
 
     # =====================================================================
@@ -2500,6 +2800,10 @@ class ExchangeStateManager:
 
     def get_nonce(self, address: str) -> int:
         return self._nonces.get(address, 0)
+
+    def oracle_vote_seq(self, address: str) -> int:
+        """The voter's last applied oracle vote sequence (-1: none)."""
+        return self.oracle_vote_seqs.get(str(address).lower(), -1)
 
     # --- Phase E: real-balance bridge ---
 

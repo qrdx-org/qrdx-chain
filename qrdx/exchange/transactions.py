@@ -130,6 +130,12 @@ class ExchangeOpType(IntEnum):
     GOV_VOTE = 49  # a validator votes, weighted by its committee stake
     GOV_VETO = 50  # a holder locks QRDX against a passed proposal (timelock only)
     GOV_EXECUTE = 51  # anyone executes a proposal whose timelock has ended
+    # Consensus bridge (docs/BRIDGE.md): deposits are attested in ORACLE_VOTEs.
+    BRIDGE_WITHDRAW = 52  # burn a bridged token; the lockbox's custodian releases it
+    # Delegation pools (docs/STAKING.md): stake with a validator without running one.
+    STAKE_DELEGATE = 53  # lock QRDX in a validator's pool
+    STAKE_UNDELEGATE = 54  # redeem pool shares (unbonding, then paid)
+    STAKE_SET_COMMISSION = 55  # a validator sets its cut of its pool's rewards
 
 
 # ---------------------------------------------------------------------------
@@ -447,8 +453,29 @@ class ExchangeTransaction:
                 raise ValueError("VAULT_WITHDRAW missing param: shares")
 
         elif op == ExchangeOpType.ORACLE_VOTE:
-            if not isinstance(p.get("prices"), dict) or not p["prices"]:
-                raise ValueError("ORACLE_VOTE needs a non-empty prices map")
+            prices, deposits = p.get("prices", {}), p.get("deposits", [])
+            if not isinstance(prices, dict) or not isinstance(deposits, list):
+                raise ValueError("ORACLE_VOTE: prices is a map, deposits a list")
+            if not prices and not deposits:
+                raise ValueError("ORACLE_VOTE needs prices or deposits")
+
+        elif op == ExchangeOpType.STAKE_DELEGATE:
+            for key in ("validator", "amount"):
+                if key not in p:
+                    raise ValueError(f"STAKE_DELEGATE missing param: {key}")
+
+        elif op == ExchangeOpType.STAKE_UNDELEGATE:
+            if "validator" not in p:
+                raise ValueError("STAKE_UNDELEGATE missing param: validator")
+
+        elif op == ExchangeOpType.STAKE_SET_COMMISSION:
+            if "commission_bps" not in p:
+                raise ValueError("STAKE_SET_COMMISSION missing param: commission_bps")
+
+        elif op == ExchangeOpType.BRIDGE_WITHDRAW:
+            for key in ("token_address", "amount", "to"):
+                if key not in p:
+                    raise ValueError(f"BRIDGE_WITHDRAW missing param: {key}")
 
         elif op == ExchangeOpType.GOV_PROPOSE:
             if not isinstance(p.get("action"), str):
@@ -628,6 +655,10 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.GOV_VOTE: 30_000,
     ExchangeOpType.GOV_VETO: 50_000,
     ExchangeOpType.GOV_EXECUTE: 80_000,
+    ExchangeOpType.BRIDGE_WITHDRAW: 60_000,
+    ExchangeOpType.STAKE_DELEGATE: 60_000,
+    ExchangeOpType.STAKE_UNDELEGATE: 40_000,
+    ExchangeOpType.STAKE_SET_COMMISSION: 25_000,
 }
 
 _NFT_REQUIRED = {

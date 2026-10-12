@@ -31,7 +31,7 @@ import logging
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .block_processor import verify_exchange_tx
-from .transactions import ExchangeTransaction
+from .transactions import ExchangeOpType, ExchangeTransaction
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,12 @@ def _default_nonce_provider(address: str) -> int:
     return ExchangeStateManager.get_instance().get_nonce(address)
 
 
+def _default_vote_seq_provider(address: str) -> int:
+    from .state_manager import ExchangeStateManager
+
+    return ExchangeStateManager.get_instance().oracle_vote_seq(address)
+
+
 class ExchangeMempool:
     """In-memory admission queue for exchange transactions."""
 
@@ -59,13 +65,19 @@ class ExchangeMempool:
         max_per_sender: int = DEFAULT_MAX_PER_SENDER,
         max_nonce_gap: int = DEFAULT_MAX_NONCE_GAP,
         nonce_provider: Optional[NonceProvider] = None,
+        vote_seq_provider: Optional[NonceProvider] = None,
     ):
         self.max_size = max_size
         self.max_per_sender = max_per_sender
         self.max_nonce_gap = max_nonce_gap
         self._nonce_provider = nonce_provider or _default_nonce_provider
+        self._vote_seq = vote_seq_provider or _default_vote_seq_provider
         self._txs: Dict[str, ExchangeTransaction] = {}  # tx_hash -> tx
         self._by_sender: Dict[str, Set[str]] = {}  # sender -> {tx_hash}
+        # Oracle votes: their own lane, the newest per voter. A vote's nonce is its own
+        # sequence (state_manager: not the account nonce), so it neither waits in a sender's
+        # nonce run nor moves the validator's exchange nonce.
+        self._votes: Dict[str, ExchangeTransaction] = {}  # voter (lower) -> tx
 
     # ── Admission ──────────────────────────────────────────────────────
 
@@ -85,6 +97,9 @@ class ExchangeMempool:
             return False, str(e)
 
         tx_hash = tx.tx_hash()
+
+        if tx.op_type == ExchangeOpType.ORACLE_VOTE:
+            return self._admit_vote(tx)
 
         # 2. Replay / dedup.
         if tx_hash in self._txs:
@@ -134,13 +149,16 @@ class ExchangeMempool:
     # ── Queries ────────────────────────────────────────────────────────
 
     def contains(self, tx_hash: str) -> bool:
-        return tx_hash in self._txs
+        return self.get(tx_hash) is not None
 
     def get(self, tx_hash: str) -> Optional[ExchangeTransaction]:
-        return self._txs.get(tx_hash)
+        tx = self._txs.get(tx_hash)
+        if tx is None:
+            tx = next((t for t in self._votes.values() if t.tx_hash() == tx_hash), None)
+        return tx
 
     def size(self) -> int:
-        return len(self._txs)
+        return len(self._txs) + len(self._votes)
 
     def sender_txs(self, sender: str) -> List[ExchangeTransaction]:
         """All queued txs for a sender, ordered by nonce."""
@@ -148,6 +166,24 @@ class ExchangeMempool:
         return sorted((self._txs[h] for h in hashes), key=lambda t: t.nonce)
 
     # ── Selection (canonical, deterministic) ───────────────────────────
+
+    def _admit_vote(self, tx: ExchangeTransaction) -> Tuple[bool, str]:
+        voter = tx.sender.lower()
+        if tx.nonce <= self._vote_seq(voter):
+            return False, f"oracle vote {tx.nonce} is not newer than the voter's last applied one"
+        held = self._votes.get(voter)
+        if held is not None:
+            if held.tx_hash() == tx.tx_hash():
+                return False, "duplicate: transaction already in mempool"
+            if held.nonce >= tx.nonce:
+                return False, "a newer oracle vote from this voter is already queued"
+        self._votes[voter] = tx  # replaces the voter's older pending vote
+        return True, ""
+
+    def votes(self) -> List[ExchangeTransaction]:
+        """Pending oracle votes newer than what each voter last had applied, by voter."""
+        self._votes = {v: t for v, t in self._votes.items() if t.nonce > self._vote_seq(v)}
+        return [self._votes[v] for v in sorted(self._votes)]
 
     def select_for_block(self, limit: int = 256) -> List[ExchangeTransaction]:
         """
@@ -161,7 +197,7 @@ class ExchangeMempool:
         the same mempool contents + committed state — the basis for D2.
         """
         self.prune_stale()
-        selected: List[ExchangeTransaction] = []
+        selected: List[ExchangeTransaction] = self.votes()[:limit]  # prices first
         for sender in sorted(self._by_sender.keys()):
             by_nonce = {self._txs[h].nonce: self._txs[h] for h in self._by_sender[sender]}
             n = self._nonce_provider(sender)
@@ -177,6 +213,10 @@ class ExchangeMempool:
     def remove(self, tx_hashes: List[str]) -> int:
         """Remove included/invalidated txs. Returns the number removed."""
         removed = 0
+        hashes = set(tx_hashes)
+        for voter in [v for v, t in self._votes.items() if t.tx_hash() in hashes]:
+            del self._votes[voter]
+            removed += 1
         for h in tx_hashes:
             tx = self._txs.pop(h, None)
             if tx is None:

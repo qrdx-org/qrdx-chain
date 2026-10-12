@@ -30,7 +30,7 @@ def _header(slot=9, **overrides):
         "number": 7, "parent_hash": "ab" * 32, "state_root": "cd" * 32,
         "transactions_root": "ef" * 32, "timestamp": 1700000000,
         "proposer_address": ADDR, "proposer_public_key": KEY.public_key.to_bytes().hex(),
-        "slot": slot, "epoch": 0, "randao_reveal": "11" * 32,
+        "slot": slot, "epoch": 0, "randao_reveal": "",  # none unless RANDAO selection is scheduled
     }
     bc.update(overrides)
     bc["proposer_signature"] = KEY.sign(reconstruct_signing_root(bc)).to_bytes().hex()

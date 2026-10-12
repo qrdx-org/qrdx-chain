@@ -468,8 +468,12 @@ def vault_withdraw_cmd(wallet_file, shares, node, wait, yes):
 @wait_option
 @yes_option
 def create_market_cmd(wallet_file, base, max_leverage, node, wait, yes):
-    """Open a market for BASE, such as BTC. It trades once validators price it."""
+    """Open a market for BASE, such as BTC. It trades once validators price it. Listing burns
+    the network's market listing fee (PERP_MARKET_LISTING_FEE QRDX)."""
+    from ..constants import PERP_MARKET_LISTING_FEE
+
     params = {"base_token": base}
     if max_leverage:
         params["max_leverage"] = str(Decimal(max_leverage))
-    _send(node, wallet_file, "CREATE_MARKET", params, f"Create the {base} perp market", wait, yes)
+    what = f"Create the {base} perp market (burns {PERP_MARKET_LISTING_FEE} QRDX)"
+    _send(node, wallet_file, "CREATE_MARKET", params, what, wait, yes)

@@ -24,8 +24,10 @@ so the identity says the holder holds exactly what all the accounts are worth.
 
 from __future__ import annotations
 
+import bisect
 import functools
 import hashlib
+import heapq
 import json
 from dataclasses import dataclass, field
 from decimal import (
@@ -37,9 +39,16 @@ from decimal import (
     Decimal,
     localcontext,
 )
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .commitment import Section, as_committed_dict, committed, encode_value, tracked
+from .commitment import (
+    Section,
+    as_committed_dict,
+    committed,
+    encode_value,
+    tracked,
+    verifying,
+)
 from .orderbook import Order, OrderBook, OrderSide, OrderType, SelfTradeAction
 
 ZERO = Decimal(0)
@@ -53,19 +62,35 @@ ENTRY_QUANTUM = Decimal("1e-18")  # entry prices are stored at this precision
 AMOUNT_QUANTUM = Decimal("1e-18")  # deposits/withdrawals: QRDX wei precision
 
 # Mark price (Phase 2). Hyperliquid: median of (oracle + 150 s EMA of book premium),
-# (median of best bid, best ask, last trade) and external perp prices — with a 30 s EMA of the
-# book median standing in when only two inputs exist, as here (no external perp feed). Without
-# that external anchor a thin book could drag the mark, so it is also held within a band of the
-# oracle — a deliberate addition to Hyperliquid's rule.
+# (median of best bid, best ask, last trade) and external perp prices — the validators vote the
+# last (other venues' perps, ``set_external_perp_price``), with a 30 s EMA of the book median
+# standing in while no vote is fresh. A thin book could then drag the mark, so it is also held
+# within a band of the oracle — a deliberate addition to Hyperliquid's rule.
 PREMIUM_EMA_SECONDS = Decimal("150")
 BOOK_EMA_SECONDS = Decimal("30")
 MARK_ORACLE_BAND = Decimal("0.05")
+# Other venues' perp price (the validators' vote, ``set_external_perp_price``) is the mark's
+# third input while it is this fresh; older, the book-median EMA stands in for it.
+EXTERNAL_PRICE_MAX_AGE = Decimal("120")
 
 # Liquidations and the backstop vault (Phase 3). An account below maintenance margin is first
 # closed on the book, never past its bankruptcy price; one still below BACKSTOP_FRACTION of
 # maintenance is taken over by the vault at mark; one the vault cannot cover is auto-deleveraged.
 BACKSTOP_FRACTION = Decimal(2) / Decimal(3)
 LIQUIDATION_PASSES = 4  # an auto-deleverage can push a counterparty under; re-check, bounded
+# Large positions are closed in slices (Hyperliquid): above LIQUIDATION_SLICE_NOTIONAL at mark,
+# a book liquidation sends LIQUIDATION_SLICE_FRACTION of the position, then the position cools
+# down for LIQUIDATION_COOLDOWN_SECONDS of block time — meanwhile only the backstop acts (below
+# BACKSTOP_FRACTION of maintenance). One whole-position market order on a thin book would sweep
+# it to the bankruptcy price.
+LIQUIDATION_SLICE_NOTIONAL = Decimal("100000")
+LIQUIDATION_SLICE_FRACTION = Decimal("0.2")
+LIQUIDATION_COOLDOWN_SECONDS = Decimal("30")
+# The vault unwinds what it takes over instead of holding it: every VAULT_UNWIND_SECONDS per
+# market (the first one after the takeover), it sends a slice — as for a liquidation — to the
+# book as a reduce-only IOC at most VAULT_UNWIND_SLIPPAGE through mark.
+VAULT_UNWIND_SECONDS = Decimal("30")
+VAULT_UNWIND_SLIPPAGE = Decimal("0.005")
 SHARE_QUANTUM = Decimal("1e-18")
 # Funding (Phase 4), Hyperliquid's formula. Each block samples the premium of the book's impact
 # prices (the average price to trade IMPACT_NOTIONAL) over the oracle; at every interval boundary
@@ -138,6 +163,15 @@ class Position:
     size: Decimal = ZERO  # signed: + long, − short
     entry_price: Decimal = ZERO  # average entry, quantized
     isolated_margin: Decimal = ZERO  # only for isolated positions
+    # Block time of the last protocol close: a liquidation slice, or (the vault's) a takeover
+    # or unwind slice. 0 = none. Committed only once set.
+    close_time: Decimal = ZERO
+
+    def encode(self) -> List[str]:
+        out = [str(self.size), str(self.entry_price), str(self.isolated_margin)]
+        if self.close_time > 0:
+            out.append(str(self.close_time))
+        return out
 
     @property
     def basis(self) -> Decimal:
@@ -185,6 +219,9 @@ class Market:
     premium_sum: Decimal = ZERO
     premium_time: Decimal = ZERO
     funding_rate: Decimal = ZERO  # the rate last paid, per interval
+    # Other venues' perp price, as the validators voted it (0 = none yet), and when it was set.
+    external_price: Decimal = ZERO
+    external_time: Decimal = ZERO
 
     def __post_init__(self) -> None:
         # Resting orders' clearinghouse metadata, committed per order (never changed in place).
@@ -205,10 +242,7 @@ def _encode_order_meta(_oid: str, meta: OrderMeta) -> Any:
 def _encode_account(_owner: str, a: Account) -> Any:
     return {
         "collateral": str(a.collateral),
-        "positions": {
-            mid: [str(p.size), str(p.entry_price), str(p.isolated_margin)]
-            for mid, p in sorted(a.positions.items())
-        },
+        "positions": {mid: p.encode() for mid, p in sorted(a.positions.items())},
         "leverage": {mid: str(v) for mid, v in sorted(a.leverage.items())},
         "isolated": dict(sorted(a.isolated.items())),
     }
@@ -217,7 +251,7 @@ def _encode_account(_owner: str, a: Account) -> Any:
 def _market_header(m: Market) -> Dict[str, Any]:
     """A market's own fields — everything the commitment covers but its orders and book."""
     d = str
-    return {
+    header = {
         "base": m.base,
         "quote": m.quote,
         "max_lev": d(m.max_leverage),
@@ -229,6 +263,64 @@ def _market_header(m: Market) -> Dict[str, Any]:
         "ema": [d(m.premium_num), d(m.premium_den), d(m.book_num), d(m.book_den), d(m.ema_time)],
         "funding": [d(m.funding_time), d(m.premium_sum), d(m.premium_time), d(m.funding_rate)],
     }
+    if m.external_price > 0:  # absent until first voted (a root unchanged till then)
+        header["ext"] = [d(m.external_price), d(m.external_time)]
+    return header
+
+
+class _LiquidationIndex:
+    """Where each margin account turns liquidatable, by market — derived from ``accounts``,
+    never committed.
+
+    ``_liquidation_pass`` used to compute the equity of every account with a position on every
+    block: about 3 µs an account, 148 ms at 50,000, more than half a 250 ms slot. Equity and
+    maintenance are linear in the mark, so a position whose margin covers that market alone
+    (isolated, or the account's only cross market) has an exact liquidation price; an account
+    with cross positions in several markets is checked every pass (``always``). A tick takes the
+    thresholds the new marks have crossed and runs the exact check on those owners only."""
+
+    def __init__(self) -> None:
+        # market → sorted [(threshold, owner)]: a long is liquidatable below its threshold, a
+        # short above it.
+        self.longs: Dict[str, List[Tuple[Decimal, str]]] = {}
+        self.shorts: Dict[str, List[Tuple[Decimal, str]]] = {}
+        self.entries: Dict[str, List[Tuple[str, bool, Decimal]]] = {}  # owner → its thresholds
+        self.always: set = set()
+        self.rates: Dict[str, Decimal] = {}  # the maintenance rate each market was indexed at
+        self.token: List[Any] = []  # ties the index to the accounts dict it was built from
+
+    def put(self, owner: str, entries: List[Tuple[str, bool, Decimal]], always: bool) -> None:
+        for mid, is_long, t in self.entries.pop(owner, ()):
+            side = self.longs if is_long else self.shorts
+            lst = side[mid]
+            i = bisect.bisect_left(lst, (t, owner))
+            if i < len(lst) and lst[i] == (t, owner):
+                del lst[i]
+        self.always.discard(owner)
+        if always:
+            self.always.add(owner)
+        if entries:
+            self.entries[owner] = entries
+            for mid, is_long, t in entries:
+                bisect.insort(
+                    (self.longs if is_long else self.shorts).setdefault(mid, []), (t, owner)
+                )
+
+    def crossed(self, mid: str, mark: Decimal) -> List[str]:
+        """Owners whose threshold in market ``mid`` the mark has reached — a superset (by a
+        relative 1e-15) of those the exact check liquidates."""
+        tol = abs(mark) * _INDEX_TOLERANCE + _INDEX_TOLERANCE
+        out = []
+        longs = self.longs.get(mid)
+        if longs:
+            out += [o for _t, o in longs[bisect.bisect_left(longs, (mark - tol, "")) :]]
+        shorts = self.shorts.get(mid)
+        if shorts:
+            out += [o for _t, o in shorts[: bisect.bisect_right(shorts, (mark + tol, "\uffff"))]]
+        return out
+
+
+_INDEX_TOLERANCE = Decimal("1e-15")
 
 
 class Clearinghouse:
@@ -249,6 +341,12 @@ class Clearinghouse:
         self.vault_unlock = {}  # owner → block time its shares unlock
         # Mirror of the clearinghouse holder's real balance: deposits minus withdrawals.
         self.holder_balance: Decimal = ZERO
+        # Per operation, not state: the positions it changed (their orders are re-checked), the
+        # orders that cancelled, and the block time of the running tick.
+        self._touched: set = set()
+        self._cancelled: List[dict] = []
+        self.last_cancelled: List[dict] = []
+        self._now: Decimal = ZERO
 
     @property
     def vault_collateral(self) -> Decimal:
@@ -303,6 +401,18 @@ class Clearinghouse:
             m.oracle_time = Decimal(str(now))
         self._refresh_mark(m, m.ema_time)
 
+    def set_external_perp_price(self, market_id: str, price: Decimal, now=None) -> None:
+        """Set other venues' perp price for the market (the validators' vote) — the mark's third
+        input while fresh — and re-derive the mark, like ``set_oracle_price``."""
+        price = Decimal(str(price))
+        if price <= 0:
+            raise ClearinghouseError("external price must be positive")
+        m = self.market(market_id)
+        m.external_price = price
+        if now is not None:
+            m.external_time = Decimal(str(now))
+        self._refresh_mark(m, m.ema_time)
+
     def new_block(self, now=None) -> None:
         for m in self.markets.values():
             m.book.new_block(now)
@@ -312,8 +422,11 @@ class Clearinghouse:
         """Per-block duties, run on EVERY block on every path (block_processor.run_exchange_tick):
         advance the mark-price EMAs to block time ``now``, sample the funding premium and pay
         funding at an interval boundary, then liquidate every account below maintenance at the
-        new marks. Returns what happened, as events: ``{"type": "funding", ...}`` for each
-        settlement and ``{"type": "liquidation", ...}`` for each liquidation that acted."""
+        new marks, and let the vault unwind a slice of what it holds. Returns what happened, as
+        events: ``{"type": "funding", ...}`` for each settlement, ``{"type": "liquidation",
+        ...}`` for each liquidation that acted, ``{"type": "vault_unwind", ...}`` for each
+        unwind that filled and ``{"type": "order_cancelled", ...}`` for each resting order a
+        position change left the account unqualified for (``_trim_orders``)."""
         now = Decimal(str(now))
         interval = Decimal(str(funding_interval or DEFAULT_FUNDING_INTERVAL))
         events: List[dict] = []
@@ -325,14 +438,19 @@ class Clearinghouse:
             settled = self._settle_funding(m, now, interval)
             if settled is not None:
                 events.append(settled)
-        return events + self._liquidate_all()
+        self._now = now  # block time, for the liquidation slices' cooldowns
+        self._touched, self._cancelled = set(), []
+        events += self._liquidate_all()
+        events += self._vault_unwind(now)
+        self._trim_touched()
+        return events + self._cancelled
 
     # ------------------------------------------------------------------ funding
 
     def _impact_price(self, m: Market, bids: bool) -> Optional[Decimal]:
         """Average price to sell (``bids``) or buy IMPACT_NOTIONAL on the book; None if the
         book is not that deep."""
-        levels = m.book.get_bids(10**9) if bids else m.book.get_asks(10**9)
+        levels = m.book.iter_levels(bids=bids)  # best first, read only as deep as needed
         cost = size = ZERO
         for price, amount in levels:
             price, amount = Decimal(str(price)), Decimal(str(amount))
@@ -359,9 +477,12 @@ class Clearinghouse:
         m.premium_time += dt
 
     def _settle_funding(self, m: Market, now: Decimal, interval: Decimal) -> Optional[dict]:
-        """At each interval boundary of block time, pay one interval's funding. (After a halt
-        of several intervals, one is paid: there were no premium samples for the rest.)
-        Returns the settlement as an event, or None when nothing was due."""
+        """At each interval boundary of block time, pay the interval's funding. After a halt
+        the chain resumes past several boundaries: the interval the premium samples cover is
+        paid at its rate, and each interval with no block in it at the interest-only rate (no
+        premium was observed — dYdX's rule): a position held through a halt kept its exposure,
+        and pays its carry, for that time. Returns the settlement as an event, or None when
+        nothing was due."""
         if m.oracle_price <= 0:
             return None
         boundary = (now // interval) * interval
@@ -371,16 +492,14 @@ class Clearinghouse:
         if now < m.funding_time + interval:
             return None
         avg = m.premium_sum / m.premium_time if m.premium_time > 0 else ZERO
-        f8 = avg + min(
-            max(FUNDING_INTEREST_8H - avg, -FUNDING_PREMIUM_CLAMP), FUNDING_PREMIUM_CLAMP
-        )
-        cap = FUNDING_CAP_PER_HOUR * interval / 3600
-        rate = min(max(f8 * interval / EIGHT_HOURS, -cap), cap).quantize(RATE_QUANTUM)
-        self._pay_funding(m, rate)
+        rate = self._funding_rate(avg, interval)
+        intervals = int((boundary - m.funding_time) // interval)
+        paid = rate + self._funding_rate(ZERO, interval) * (intervals - 1)
+        self._pay_funding(m, paid)
         m.funding_rate = rate
         m.funding_time = boundary
         m.premium_sum = m.premium_time = ZERO
-        return {
+        event: Dict[str, Any] = {
             "type": "funding",
             "market": m.id,
             "rate": str(rate),
@@ -389,6 +508,19 @@ class Clearinghouse:
             "open_interest": str(m.open_interest),
             "funding_time": str(boundary),
         }
+        if intervals > 1:
+            event.update(intervals=intervals, paid_rate=str(paid))
+        return event
+
+    @staticmethod
+    def _funding_rate(avg_premium: Decimal, interval: Decimal) -> Decimal:
+        """One interval's rate: F = premium + clamp(interest − premium, ±0.05 %) is the 8-hour
+        rate; the interval's share of it, capped per hour."""
+        f8 = avg_premium + min(
+            max(FUNDING_INTEREST_8H - avg_premium, -FUNDING_PREMIUM_CLAMP), FUNDING_PREMIUM_CLAMP
+        )
+        cap = FUNDING_CAP_PER_HOUR * interval / 3600
+        return min(max(f8 * interval / EIGHT_HOURS, -cap), cap).quantize(RATE_QUANTUM)
 
     def _pay_funding(self, m: Market, rate: Decimal) -> None:
         """size × oracle × rate from every position (longs pay when positive, shorts receive).
@@ -412,9 +544,13 @@ class Clearinghouse:
             self.account(VAULT).collateral += total
 
     def _refresh_mark(self, m: Market, now: Decimal) -> None:
-        """mark = median(oracle + premium EMA, book median, book-median EMA), held within
-        ±MARK_ORACLE_BAND of the oracle. Liquidations trigger on mark, not the last trade, so
-        one large trade or a spoofed order on a thin book cannot move it far on its own."""
+        """mark = median(oracle + premium EMA, book median, other venues' perp price), held
+        within ±MARK_ORACLE_BAND of the oracle; the book-median EMA stands in for the external
+        price while none is fresh. Liquidations trigger on mark, not the last trade, so one
+        large trade or a spoofed order on a thin book cannot move it far on its own. With the
+        external price, a squeeze of the local book moves the mark only at the pace of the
+        150 s premium EMA, about 5× slower than through the 30 s book EMA it replaces — time
+        for arbitrage with the other venues to close the gap."""
         if m.oracle_price <= 0:
             return
         dt = max(ZERO, now - m.ema_time) if m.ema_time > 0 else ZERO
@@ -440,9 +576,17 @@ class Clearinghouse:
             m.ema_time = now
         premium = m.premium_num / m.premium_den if m.premium_den > 0 else ZERO
         inputs = [m.oracle_price + premium]
+        external = None
+        if m.external_price > 0 and (now <= 0 or now - m.external_time <= EXTERNAL_PRICE_MAX_AGE):
+            external = m.external_price
         if book is not None:
-            inputs += [book, m.book_num / m.book_den if m.book_den > 0 else book]
-        mark = sorted(inputs)[len(inputs) // 2]
+            ema = m.book_num / m.book_den if m.book_den > 0 else book
+            inputs += [book, external if external is not None else ema]
+        elif external is not None:
+            inputs.append(external)
+        inputs.sort()
+        half = len(inputs) // 2
+        mark = inputs[half] if len(inputs) % 2 else (inputs[half - 1] + inputs[half]) / TWO
         lo = m.oracle_price * (1 - MARK_ORACLE_BAND)
         hi = m.oracle_price * (1 + MARK_ORACLE_BAND)
         m.mark_price = _q_entry(min(max(mark, lo), hi))
@@ -638,16 +782,72 @@ class Clearinghouse:
     @_pinned
     def open_order_margin(self, owner: str) -> Decimal:
         """Margin reserved by resting orders that could increase exposure (cross or isolated:
-        isolated margin is drawn from cross collateral when the order fills)."""
-        total = ZERO
-        for m in self.markets.values():
-            for oid, meta in m.orders.items():
-                if meta.owner != owner or meta.reduce_only:
-                    continue
-                order = m.book.get_order(oid)
-                if order is not None and order.is_active:
-                    total += order.remaining * order.price / meta.leverage
-        return total
+        isolated margin is drawn from cross collateral when the order fills). What would only
+        close the position reserves nothing (``_opening_amounts``); it used to reserve as if it
+        opened, unless flagged reduce-only."""
+        return sum((self._reserved_in(owner, m) for m in self.markets.values()), ZERO)
+
+    def _resting(self, owner: str, m: Market) -> List[Tuple[Order, OrderMeta]]:
+        """``owner``'s active resting orders in ``m``, by id."""
+        out = []
+        for oid in sorted(self._orders_by_owner(m).get(owner, ())):
+            meta = tracked(m.orders).peek(oid)
+            order = m.book.get_order(oid)
+            if meta is not None and order is not None and order.is_active:
+                out.append((order, meta))
+        return out
+
+    @staticmethod
+    def _orders_by_owner(m: Market) -> Dict[str, set]:
+        """owner → the ids of its orders in ``m``: derived from the order metadata, never
+        committed. Built in full when missing (a new or unpickled market) and otherwise brought
+        up to date with the ids marked since — as the liquidation index is — so finding one
+        account's orders does not scan every order in the market."""
+        orders = tracked(m.orders)
+        index = m.__dict__.get("_by_owner")
+        if index is None or orders.__dict__.get("_index_token") is not index["token"]:
+            index = {"token": [], "owners": {}, "owner_of": {}}
+            orders.track_changes()
+            orders.take_changes()
+            orders.__dict__["_index_token"] = index["token"]
+            for oid, meta in orders.peek_items():
+                index["owner_of"][oid] = meta.owner
+                index["owners"].setdefault(meta.owner, set()).add(oid)
+            m.__dict__["_by_owner"] = index
+        else:
+            for oid in orders.take_changes():
+                old = index["owner_of"].pop(oid, None)
+                if old is not None:
+                    index["owners"][old].discard(oid)
+                meta = orders.peek(oid)
+                if meta is not None:
+                    index["owner_of"][oid] = meta.owner
+                    index["owners"].setdefault(meta.owner, set()).add(oid)
+        return index["owners"]
+
+    def _opening_amounts(
+        self, owner: str, m: Market, extra: Optional[Tuple[Order, OrderMeta]] = None
+    ) -> List[Tuple[Order, OrderMeta, Decimal]]:
+        """Each resting order (and ``extra``, as if resting) with the part of it that would
+        open exposure. The position's size is closing capacity, used by the orders on the side
+        that closes it (sells against a long, buys against a short) in the order they would
+        fill — by price, then id; every order on the other side opens whole."""
+        acct = self.accounts.peek(owner)
+        pos = acct.positions.get(m.id) if acct is not None else None
+        size = pos.size if pos is not None else ZERO
+        sell = size > 0
+        orders = self._resting(owner, m) + ([extra] if extra is not None else [])
+        closing = [x for x in orders if size != 0 and (x[0].side == OrderSide.SELL) == sell]
+        closing.sort(key=lambda x: (x[0].price if sell else -x[0].price, x[0].id))
+        capacity = abs(size)
+        out = []
+        for order, meta in closing:
+            used = min(capacity, order.remaining)
+            capacity -= used
+            out.append((order, meta, order.remaining - used))
+        closing_ids = {o.id for o, _ in closing}
+        out += [(o, meta, o.remaining) for o, meta in orders if o.id not in closing_ids]
+        return out
 
     @_pinned
     def cross_requirement(self, owner: str) -> Decimal:
@@ -696,6 +896,7 @@ class Clearinghouse:
         allows.
         """
         self._user(owner)
+        self._touched, self._cancelled, self.last_cancelled = set(), [], []
         m = self.market(market_id)
         if m.mark_price <= 0:
             raise ClearinghouseError(f"market {market_id} has no price yet")
@@ -715,6 +916,8 @@ class Clearinghouse:
                 raise ClearinghouseError("reduce-only order would not reduce the position")
         else:
             self._check_initial_margin(owner, acct, m, pos, q, price, lev)
+        if not ioc:
+            self._check_resting_margin(owner, m, order_id, buy, size, price, lev, reduce_only)
 
         order = Order(
             id=order_id,
@@ -726,7 +929,7 @@ class Clearinghouse:
             nonce=nonce,
             timestamp=0.0,
         )
-        trades = m.book.place_order(order)
+        trades = self._match(m, order)
         m.orders[order_id] = OrderMeta(owner=owner, leverage=lev, reduce_only=bool(reduce_only))
 
         fills = []
@@ -734,8 +937,105 @@ class Clearinghouse:
             fills.append(self._apply_fill(m, tr, taker_limit=price))
         if ioc and order.is_active:
             m.book.cancel_order(order_id, caller=owner)
-        self._prune_orders(m)
+        self._prune_orders(m, self._match_ids(m, order_id, trades))
+        self._trim_touched()
+        self.last_cancelled = self._cancelled
         return fills
+
+    def _match(self, m: Market, order: Order, protocol: bool = False) -> List[Any]:
+        """Match ``order`` on the book, guarding each maker's fill (Hyperliquid checks makers
+        at match time). A maker whose fill would open exposure is cancelled instead if it is
+        reduce-only, or if the margin its order reserved does not cover that exposure and the
+        account's free margin does not either — the reservation assumed the position as it
+        stood, and an earlier fill (maybe in this very match) can turn a closing order into an
+        opening one."""
+        pending: Dict[str, Decimal] = {}  # owner → position change from this match's fills
+        free: Dict[str, Decimal] = {}  # owner → free margin left for unreserved openings
+        reserved: Dict[str, Decimal] = {}  # order id → its opening part, as reserved
+
+        def guard(maker: Order, amount: Decimal) -> bool:
+            meta = tracked(m.orders).peek(maker.id)
+            if meta is None:
+                return True
+            owner = meta.owner
+            if owner not in free:  # first fill of this owner in this match: book as reserved
+                free[owner] = self.cross_equity(owner) - self.cross_requirement(owner)
+                for o, _meta, opening in self._opening_amounts(owner, m):
+                    reserved[o.id] = opening
+            acct = self.accounts.peek(owner)
+            pos = acct.positions.get(m.id) if acct is not None else None
+            size = (pos.size if pos is not None else ZERO) + pending.get(owner, ZERO)
+            q = amount if maker.side == OrderSide.BUY else -amount
+            opening = max(ZERO, abs(size + q) - abs(size))
+            if opening > 0:
+                if meta.reduce_only:
+                    self._cancel_event(owner, m.id, maker.id, "reduce_only")
+                    return False
+                covered = min(opening, reserved.get(maker.id, ZERO))
+                reserved[maker.id] = reserved.get(maker.id, ZERO) - covered
+                need = (opening - covered) * maker.price / meta.leverage
+                if need > free[owner]:
+                    self._cancel_event(owner, m.id, maker.id, "margin")
+                    return False
+                free[owner] -= need
+            pending[owner] = pending.get(owner, ZERO) + q
+            return True
+
+        m.book.maker_guard = guard
+        try:
+            return m.book.place_order(order, protocol=protocol)
+        finally:
+            m.book.maker_guard = None
+
+    def _cancel_event(self, owner: str, mid: str, order_id: str, reason: str) -> None:
+        self._cancelled.append(
+            {
+                "type": "order_cancelled",
+                "market": mid,
+                "order_id": order_id,
+                "owner": owner,
+                "reason": reason,
+            }
+        )
+
+    def _trim_touched(self) -> None:
+        """Every account whose position just changed: the resting orders it no longer
+        qualifies for are cancelled (``_trim_orders``)."""
+        touched = sorted(self._touched)
+        self._touched = set()
+        for owner, mid in touched:
+            if owner != VAULT:
+                self._trim_orders(owner, mid)
+
+    def _trim_orders(self, owner: str, mid: str) -> None:
+        """After ``owner``'s position in ``mid`` changed: a reduce-only order that would now
+        open exposure is cancelled (Hyperliquid's reduceOnlyCanceled); then, while the account
+        cannot carry its resting orders at initial margin, its opening orders there are
+        cancelled, the least likely to fill first (marginCanceled). An order that only closed
+        the position reserved nothing, so one left opening by a smaller position would
+        otherwise fill unmargined."""
+        m = self.markets[mid]
+
+        def cancel(order: Order, reason: str) -> None:
+            m.book.cancel_order(order.id, caller=owner)
+            self._prune_orders(m, [order.id])
+            self._cancel_event(owner, mid, order.id, reason)
+
+        for order, meta, opening in self._opening_amounts(owner, m):
+            if meta.reduce_only and opening > 0:
+                cancel(order, "reduce_only")
+        if self.cross_equity(owner) >= self.cross_requirement(owner):
+            return
+        opening_orders = [
+            order
+            for order, meta, opening in self._opening_amounts(owner, m)
+            if opening > 0 and not meta.reduce_only
+        ]
+        opening_orders.sort(key=lambda o: (o.price if o.side == OrderSide.BUY else -o.price, o.id))
+        for order in opening_orders:
+            if self.cross_equity(owner) >= self.cross_requirement(owner):
+                break
+            cancel(order, "margin")
 
     @_pinned
     def cancel_order(self, owner: str, market_id: str, order_id: str) -> None:
@@ -744,13 +1044,37 @@ class Clearinghouse:
         if meta is None or meta.owner != owner:
             raise ClearinghouseError(f"no open order {order_id} for this account")
         m.book.cancel_order(order_id, caller=owner)
-        self._prune_orders(m)
+        self._prune_orders(m, [order_id])
 
-    def _prune_orders(self, m: Market) -> None:
-        for oid in [
-            oid for oid in m.orders if (o := m.book.get_order(oid)) is None or not o.is_active
-        ]:
+    def _prune_orders(self, m: Market, ids: Optional[Iterable[str]] = None) -> None:
+        """Drop the metadata of orders no longer resting. ``ids``: the orders the operation
+        placed, filled or cancelled — the only ones that can have stopped resting (no perp
+        order expires) — so a placement does not walk every order in the market (it did:
+        most of its cost at 10,000 resting orders). Without ``ids``, every order; verifying,
+        both, and they must agree."""
+
+        def stopped(oid: str) -> bool:
+            o = m.book.get_order(oid)
+            return o is None or not o.is_active
+
+        if ids is None or verifying():
+            stale = [oid for oid in dict.keys(m.orders) if stopped(oid)]
+            if ids is not None and not set(stale) <= set(ids):
+                raise AssertionError(
+                    f"order pruning: {sorted(set(stale) - set(ids))[:3]} stopped resting "
+                    "outside the operation's orders"
+                )
+        else:
+            stale = [oid for oid in dict.fromkeys(ids) if oid in m.orders and stopped(oid)]
+        for oid in stale:
             del m.orders[oid]
+
+    def _match_ids(self, m: Market, order_id: str, trades: List[Any]) -> List[str]:
+        """The orders a match can have stopped: the taker, its makers, and makers the guard
+        cancelled."""
+        ids = [order_id] + [tr.maker_order_id for tr in trades]
+        ids += [c["order_id"] for c in self._cancelled if c["market"] == m.id]
+        return ids
 
     def _check_initial_margin(
         self,
@@ -762,8 +1086,23 @@ class Clearinghouse:
         limit: Decimal,
         lev: Decimal,
     ) -> None:
-        """Worst case of a full fill at the limit: buys fill at or below it, sells at or above."""
-        increase = max(ZERO, abs(pos.size + q) - abs(pos.size))
+        """Worst case of a full fill at the limit: buys fill at or below it, sells at or above.
+        Resting orders that close the position and would fill no later than this one (at its
+        price or better) use its capacity first: this one closes only what they leave."""
+        size = pos.size
+        closes_with_sells = size > 0
+        if size != 0 and (q < 0) == closes_with_sells:
+            ahead = sum(
+                (
+                    o.remaining
+                    for o, _meta in self._resting(owner, m)
+                    if (o.side == OrderSide.SELL) == closes_with_sells
+                    and (o.price <= limit if closes_with_sells else o.price >= limit)
+                ),
+                ZERO,
+            )
+            size -= min(abs(size), ahead) * (1 if size > 0 else -1)
+        increase = max(ZERO, abs(size + q) - abs(size))
         worst_pnl = q * (m.mark_price - limit)  # value change vs mark at the limit
         worst_fee = abs(q) * limit * TAKER_FEE_RATE
         free = self.cross_equity(owner) - self.cross_requirement(owner)
@@ -773,13 +1112,53 @@ class Clearinghouse:
             iso_equity = (
                 pos.isolated_margin + self._upnl(m, pos) + worst_pnl + increase * limit / lev
             )
-            if free < need or iso_equity < abs(pos.size + q) * m.mark_price / lev:
+            if free < need or iso_equity < abs(size + q) * m.mark_price / lev:
                 raise ClearinghouseError("insufficient margin for the order")
             return
-        current = abs(pos.size) * m.mark_price / lev
-        after = abs(pos.size + q) * m.mark_price / lev
+        current = abs(size) * m.mark_price / lev
+        after = abs(size + q) * m.mark_price / lev
         if free + worst_pnl - worst_fee < after - current:
             raise ClearinghouseError("insufficient margin for the order")
+
+    def _check_resting_margin(
+        self,
+        owner: str,
+        m: Market,
+        order_id: str,
+        buy: bool,
+        size: Decimal,
+        limit: Decimal,
+        lev: Decimal,
+        reduce_only: bool,
+    ) -> None:
+        """The other worst case: the order rests whole. The margin its opening part reserves,
+        and any it shifts onto the account's other orders by closing the position before them,
+        must fit in the free margin. (The fill check alone let a sell far above mark rest
+        against almost no collateral: filled there, it would be worth the gap.)"""
+        probe = Order(
+            id=order_id,
+            owner=owner,
+            side=OrderSide.BUY if buy else OrderSide.SELL,
+            order_type=OrderType.LIMIT,
+            price=limit,
+            amount=size,
+            nonce=0,
+            timestamp=0.0,
+        )
+        meta = OrderMeta(owner=owner, leverage=lev, reduce_only=reduce_only)
+        delta = self._reserved_in(owner, m, extra=(probe, meta)) - self._reserved_in(owner, m)
+        if delta > 0 and self.cross_equity(owner) - self.cross_requirement(owner) < delta:
+            raise ClearinghouseError("insufficient margin for the order")
+
+    def _reserved_in(
+        self, owner: str, m: Market, extra: Optional[Tuple[Order, OrderMeta]] = None
+    ) -> Decimal:
+        """The margin ``owner``'s resting orders in ``m`` reserve (with ``extra`` resting)."""
+        total = ZERO
+        for order, meta, opening in self._opening_amounts(owner, m, extra):
+            if opening > 0 and not meta.reduce_only:
+                total += opening * order.price / meta.leverage
+        return total
 
     # ------------------------------------------------------------------ fills
 
@@ -824,6 +1203,7 @@ class Clearinghouse:
         pos = acct.positions.setdefault(m.id, Position())
         s, entry = pos.size, pos.entry_price
         realized = ZERO
+        self._touched.add((owner, m.id))  # its resting orders are re-checked (_trim_touched)
 
         if s == 0 or (s > 0) == (q > 0):  # open / increase
             new = s + q
@@ -892,31 +1272,148 @@ class Clearinghouse:
         return events
 
     def _liquidation_pass(self) -> List[dict]:
-        events = []
-        for owner in sorted(self.accounts):
-            acct = self.accounts.peek(owner)  # a scan; _liquidate marks what it changes
-            if acct is None:
+        """One pass over the owners the liquidation index says may be under maintenance, in
+        owner order — exactly what checking every owner would liquidate, in the same order. A
+        liquidation can push an owner later in the order under (auto-deleveraging closes
+        counterparties worse than mark), so after each one the index is brought up to date and
+        newly crossed owners above it join the pass. With QRDX_VERIFY_STATE_COMMITMENTS the full
+        scan runs alongside on a copy, and the two must agree."""
+        reference = None
+        if verifying():
+            import copy
+
+            reference = copy.deepcopy(self)
+        index = self._liquidation_index()
+        queue = sorted(self._liquidation_candidates(index))
+        heapq.heapify(queue)
+        seen: set = set()
+        events: List[dict] = []
+        while queue:
+            owner = heapq.heappop(queue)
+            if owner in seen:
                 continue
-            for mid in sorted(
-                mid
-                for mid, p in acct.positions.items()
-                if p.size != 0 and acct.isolated.get(mid, False)
-            ):
-                pos = acct.positions.get(mid)
-                if (
-                    pos is not None
-                    and pos.size != 0
-                    and self._iso_equity(acct, mid) < self._maintenance(pos, self.markets[mid])
-                ):
-                    events.append(self._liquidate(owner, [mid], isolated=True))
-            cross = sorted(
-                mid
-                for mid, p in acct.positions.items()
-                if p.size != 0 and not acct.isolated.get(mid, False)
-            )
-            if cross and self.cross_equity(owner) < self.cross_maintenance(owner):
-                events.append(self._liquidate(owner, cross, isolated=False))
+            seen.add(owner)
+            before = len(events)
+            self._check_owner(owner, events)
+            if len(events) > before:
+                self._sync_liquidation_index(index)
+                for later in self._liquidation_candidates(index):
+                    if later > owner and later not in seen:
+                        heapq.heappush(queue, later)
+        if reference is not None:
+            want = reference._liquidation_pass_full()
+            if want != events or reference.canonical() != self.canonical():
+                raise AssertionError(
+                    "liquidation index: the indexed pass differs from the full scan "
+                    f"({len(events)} vs {len(want)} events)"
+                )
         return events
+
+    def _liquidation_pass_full(self) -> List[dict]:
+        """Every owner, in order: the definition ``_liquidation_pass`` reproduces."""
+        events: List[dict] = []
+        for owner in sorted(self.accounts):
+            self._check_owner(owner, events)
+        return events
+
+    def _check_owner(self, owner: str, events: List[dict]) -> None:
+        """The exact check: isolated positions one by one, then the cross account as a whole."""
+        acct = self.accounts.peek(owner)  # a scan; _liquidate marks what it changes
+        if acct is None:
+            return
+        for mid in sorted(
+            mid
+            for mid, p in acct.positions.items()
+            if p.size != 0 and acct.isolated.get(mid, False)
+        ):
+            pos = acct.positions.get(mid)
+            if (
+                pos is not None
+                and pos.size != 0
+                and self._iso_equity(acct, mid) < self._maintenance(pos, self.markets[mid])
+            ):
+                events.append(self._liquidate(owner, [mid], isolated=True))
+        cross = sorted(
+            mid
+            for mid, p in acct.positions.items()
+            if p.size != 0 and not acct.isolated.get(mid, False)
+        )
+        if cross and self.cross_equity(owner) < self.cross_maintenance(owner):
+            events.append(self._liquidate(owner, cross, isolated=False))
+
+    # ------------------------------------------------------------------ liquidation index
+
+    def _liquidation_index(self) -> _LiquidationIndex:
+        """The index, built in full when missing (a new or unpickled clearinghouse, a changed
+        maintenance rate) and otherwise brought up to date with the accounts marked since."""
+        index: Optional[_LiquidationIndex] = getattr(self, "_liq", None)
+        accounts = self.accounts
+        if (
+            index is None
+            or getattr(accounts, "_index_token", None) is not index.token
+            or any(index.rates.get(mid) != m.maintenance_rate for mid, m in self.markets.items())
+        ):
+            index = _LiquidationIndex()
+            accounts.track_changes()
+            accounts.take_changes()
+            accounts._index_token = index.token
+            index.rates = {mid: m.maintenance_rate for mid, m in self.markets.items()}
+            for owner, acct in accounts.peek_items():
+                index.put(owner, *self._thresholds(acct))
+            self._liq = index
+        else:
+            self._sync_liquidation_index(index)
+        return index
+
+    def _sync_liquidation_index(self, index: _LiquidationIndex) -> None:
+        for owner in self.accounts.take_changes():
+            index.put(owner, *self._thresholds(self.accounts.peek(owner)))
+
+    def _liquidation_candidates(self, index: _LiquidationIndex) -> set:
+        found = set(index.always)
+        for mid, m in self.markets.items():
+            found.update(index.crossed(mid, m.mark_price))
+        return found
+
+    def _thresholds(self, acct: Optional[Account]) -> Tuple[List[Tuple[str, bool, Decimal]], bool]:
+        """(the account's liquidation prices, whether it must be checked every pass)."""
+        if acct is None:
+            return [], False
+        out: List[Tuple[str, bool, Decimal]] = []
+        cross: List[Tuple[str, Position]] = []
+        for mid, pos in acct.positions.items():
+            if pos.size == 0:
+                continue
+            if acct.isolated.get(mid, False):
+                t = self._threshold(pos, mid, pos.isolated_margin)
+                if t is None:
+                    return [], True
+                out.append((mid, pos.size > 0, t))
+            else:
+                cross.append((mid, pos))
+        if len(cross) > 1:
+            return [], True  # equity spans several marks: no single price
+        if cross:
+            mid, pos = cross[0]
+            t = self._threshold(pos, mid, acct.collateral)
+            if t is None:
+                return [], True
+            out.append((mid, pos.size > 0, t))
+        return out, False
+
+    def _threshold(self, pos: Position, mid: str, margin: Decimal) -> Optional[Decimal]:
+        """The mark at which margin + size·(mark − entry) = |size|·mark·rate: a long is under
+        maintenance below it, a short above it. None when there is no such price."""
+        m = self.markets.get(mid)
+        if m is None:
+            return None
+        rate = m.maintenance_rate
+        if pos.size > 0:
+            if rate >= 1:
+                return None
+            return (pos.size * pos.entry_price - margin) / (pos.size * (1 - rate))
+        size = -pos.size
+        return (margin + size * pos.entry_price) / (size * (1 + rate))
 
     def _margin_state(self, owner: str, mids: List[str], isolated: bool):
         """(equity, maintenance, any position still open) for what is being liquidated."""
@@ -975,19 +1472,29 @@ class Clearinghouse:
             if market_id is not None and mid != market_id:
                 continue
             m = self.markets[mid]
-            for oid in sorted(oid for oid, meta in m.orders.items() if meta.owner == owner):
-                m.book.cancel_order(oid, caller=owner)
-            self._prune_orders(m)
+            mine = sorted(self._orders_by_owner(m).get(owner, ()))
+            for oid in mine:
+                if tracked(m.orders).peek(oid) is not None:
+                    m.book.cancel_order(oid, caller=owner)
+            self._prune_orders(m, mine)
 
     def _close_on_book(self, owner: str, mid: str, isolated: bool) -> List[dict]:
-        """A reduce-only IOC for the whole position, limited to the bankruptcy price — the
-        price at which closing it, taker fee included, leaves exactly zero — so no book fill
-        can create bad debt. Returns the fills."""
+        """A reduce-only IOC for the position, limited to the bankruptcy price — the price at
+        which closing it, taker fee included, leaves exactly zero — so no book fill can create
+        bad debt (a slice closed at that price loses at most its share of the equity). Above
+        LIQUIDATION_SLICE_NOTIONAL only a slice is sent, and then the position cools down.
+        Returns the fills."""
         acct = self.accounts[owner]
         pos = acct.positions.get(mid)
         if pos is None or pos.size == 0:
             return []
         m = self.markets[mid]
+        amount = self._slice(pos, m)
+        if amount < abs(pos.size):
+            now = getattr(self, "_now", ZERO)
+            if pos.close_time > 0 and now - pos.close_time < LIQUIDATION_COOLDOWN_SECONDS:
+                return []  # cooling down from the last slice: only the backstop acts
+            pos.close_time = now
         eq = self._iso_equity(acct, mid) if isolated else self.cross_equity(owner)
         q = pos.size
         if q > 0:  # sell, at no less than bankruptcy
@@ -1002,18 +1509,35 @@ class Clearinghouse:
             )
             if limit <= 0:
                 return []
+        return self._protocol_ioc(owner, m, "liq", q > 0, amount, limit)
+
+    @staticmethod
+    def _slice(pos: Position, m: Market) -> Decimal:
+        """How much of a position one protocol close sends to the book: all of it, or a slice
+        of a large one."""
+        size = abs(pos.size)
+        if size * m.mark_price <= LIQUIDATION_SLICE_NOTIONAL:
+            return size
+        return (size * LIQUIDATION_SLICE_FRACTION).quantize(AMOUNT_QUANTUM, rounding=ROUND_FLOOR)
+
+    def _protocol_ioc(
+        self, owner: str, m: Market, tag: str, sell: bool, amount: Decimal, limit: Decimal
+    ) -> List[dict]:
+        """A reduce-only IOC the protocol sends for ``owner``: what fills, at ``limit`` or
+        better, is applied; the rest is cancelled. Returns the fills."""
+        acct = self.accounts[owner]
         order = Order(
-            id=f"liq:{mid}:{owner}",
+            id=f"{tag}:{m.id}:{owner}",
             owner=owner,
-            side=OrderSide.SELL if q > 0 else OrderSide.BUY,
+            side=OrderSide.SELL if sell else OrderSide.BUY,
             order_type=OrderType.LIMIT,
             price=limit,
-            amount=abs(q),
+            amount=amount,
             nonce=0,
             timestamp=0.0,
         )
         try:
-            trades = m.book.place_order(order, protocol=True)
+            trades = self._match(m, order, protocol=True)
         except ValueError:
             return []  # e.g. dust below the book's minimum size: backstop takes it
         m.orders[order.id] = OrderMeta(
@@ -1022,8 +1546,43 @@ class Clearinghouse:
         fills = [self._apply_fill(m, tr, taker_limit=limit) for tr in trades]
         if order.is_active:
             m.book.cancel_order(order.id, caller=owner)
-        self._prune_orders(m)
+        self._prune_orders(m, self._match_ids(m, order.id, trades))
         return fills
+
+    def _vault_unwind(self, now: Decimal) -> List[dict]:
+        """The vault closes what it took over, a slice at a time: per market, once every
+        VAULT_UNWIND_SECONDS of block time, a reduce-only IOC at most VAULT_UNWIND_SLIPPAGE
+        through mark. It used to hold the positions until it fell under maintenance itself."""
+        vault = self.accounts.peek(VAULT)
+        if vault is None:
+            return []
+        events: List[dict] = []
+        for mid in sorted(mid for mid, p in vault.positions.items() if p.size != 0):
+            m = self.markets[mid]
+            pos = vault.positions[mid]
+            if m.mark_price <= 0 or now - pos.close_time < VAULT_UNWIND_SECONDS:
+                continue
+            self.accounts[VAULT].positions[mid].close_time = now  # this account changes
+            sell = pos.size > 0
+            if sell:
+                limit = (m.mark_price * (1 - VAULT_UNWIND_SLIPPAGE)).quantize(
+                    ENTRY_QUANTUM, rounding=ROUND_CEILING
+                )
+            else:
+                limit = (m.mark_price * (1 + VAULT_UNWIND_SLIPPAGE)).quantize(
+                    ENTRY_QUANTUM, rounding=ROUND_FLOOR
+                )
+            fills = self._protocol_ioc(VAULT, m, "unwind", sell, self._slice(pos, m), limit)
+            if fills:
+                events.append(
+                    {
+                        "type": "vault_unwind",
+                        "market": mid,
+                        "filled": sum((Decimal(f["amount"]) for f in fills), ZERO),
+                        "fills": fills,
+                    }
+                )
+        return events
 
     def _backstop(self, owner: str, mids: List[str], isolated: bool) -> None:
         """The vault takes the positions over at mark, with the margin that backed them
@@ -1045,6 +1604,10 @@ class Clearinghouse:
                 acct.collateral -= released
                 vault.collateral += released
             self._trade_into(VAULT, m, q, m.mark_price, self._leverage(vault, m), m.mark_price)
+            # The unwind starts a full interval later: the book just failed to absorb this.
+            taken = vault.positions.get(mid)
+            if taken is not None:  # (none if it netted the vault's own position to zero)
+                taken.close_time = getattr(self, "_now", ZERO)
         if not isolated:
             vault.collateral += acct.collateral
             acct.collateral = ZERO
@@ -1180,10 +1743,7 @@ class Clearinghouse:
             a = self.accounts[owner]
             accounts[owner] = {
                 "collateral": d(a.collateral),
-                "positions": {
-                    mid: [d(p.size), d(p.entry_price), d(p.isolated_margin)]
-                    for mid, p in sorted(a.positions.items())
-                },
+                "positions": {mid: p.encode() for mid, p in sorted(a.positions.items())},
                 "leverage": {mid: d(v) for mid, v in sorted(a.leverage.items())},
                 "isolated": dict(sorted(a.isolated.items())),
             }

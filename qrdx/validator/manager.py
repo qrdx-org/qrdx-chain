@@ -121,7 +121,7 @@ class PoSBlock:
             "transactions_root": self.transactions_root,
             "timestamp": self.timestamp,
             "proposer_address": self.proposer_address,
-            "proposer_public_key": self.proposer_public_key.hex(),
+            # No proposer_public_key: importers take it from the chain's key registry.
             "proposer_signature": self.proposer_signature.hex(),
             "slot": self.slot,
             "epoch": self.epoch,
@@ -561,10 +561,13 @@ class ValidatorManager:
         slots_per_epoch = POS_CONSTANTS["SLOTS_PER_EPOCH"]
         epoch = slot // slots_per_epoch
 
-        # Generate RANDAO reveal (network-bound: randao.randao_reveal_message)
-        from .randao import randao_reveal_message
+        # RANDAO reveal (network-bound: randao.randao_reveal_message), only once RANDAO
+        # selection is near (randao.randao_reveal_required); importers refuse one otherwise.
+        from .randao import randao_reveal_message, randao_reveal_required
 
-        randao_reveal = self._sign_message(randao_reveal_message(slot))
+        randao_reveal = (
+            self._sign_message(randao_reveal_message(slot)) if randao_reveal_required(slot) else b""
+        )
 
         # CRITICAL: Execute contract transactions BEFORE creating block
         # This sets gas_used on each transaction for validation

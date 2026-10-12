@@ -13,12 +13,12 @@ import tempfile
 
 import pytest
 
-from qrdx import chain_index
+from qrdx import block_codec, chain_index
 from qrdx.constants import SLOTS_PER_EPOCH
 from qrdx.crypto.pq.dilithium import PQPrivateKey
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.exchange.transactions import ExchangeOpType, ExchangeTransaction
-from qrdx.validator import randao, validator_reconstruction as vr, withdrawals as W
+from qrdx.validator import randao, withdrawals as W
 from qrdx.validator.slashing_block import make_double_sign_evidence
 
 from test_slashing_evidence import _signed_header
@@ -97,6 +97,33 @@ async def _build(db, rng, n, key, tag="a", start=0, slot0=0):
     return slot
 
 
+async def _indexed_votes(db, carried_through_epoch):
+    """(target epoch, validator) of every vote the index says blocks of an epoch ≤ the given
+    one carry — what the validator set's rewards read (validator/epoch_state.py)."""
+    await chain_index.sync(db)
+    cur = await db.connection.execute(
+        "SELECT DISTINCT target_epoch, validator FROM chain_index_votes WHERE carry_epoch <= ?",
+        (carried_through_epoch,))
+    return sorted(tuple(r) for r in await cur.fetchall())
+
+
+async def _walked_votes(db, carried_through_epoch):
+    import ast
+    from qrdx.validator.attestation_block import extract_attestations_from_dict
+    from qrdx.validator.block_verification import epoch_from_block
+    out = set()
+    for h in range(await db.get_next_block_id()):
+        block = await db.get_block_by_id(h)
+        if not block:
+            continue
+        bc = ast.literal_eval(block["content"])
+        carry = epoch_from_block(bc)
+        if carry is None or carry > carried_through_epoch:
+            continue
+        out |= {(int(a.target_epoch), a.validator_address) for a in extract_attestations_from_dict(bc)}
+    return sorted(out)
+
+
 async def _assert_matches_the_walk(db, rng, key):
     walk = _NoSQL(db)
     tip = await db.get_next_block_id() - 1
@@ -105,12 +132,9 @@ async def _assert_matches_the_walk(db, rng, key):
     max_slot = (tip + 2) * 3
     for s in sorted({0, 1, max_slot} | {rng.randint(0, max_slot) for _ in range(12)}):
         assert await randao._boundary_height_for_slot(db, s) == await randao._boundary_height_for_slot(walk, s), s
-    assert await vr.enumerate_canonical_validator_ops(db) == await vr.enumerate_canonical_validator_ops(walk)
     last_epoch = ((tip + 1) * 3) // SLOTS_PER_EPOCH
     for f in sorted({0, last_epoch} | {rng.randint(0, last_epoch) for _ in range(5)}):
-        mine = await vr.enumerate_canonical_epoch_attesters(db, f)
-        theirs = await vr.enumerate_canonical_epoch_attesters(walk, f)
-        assert {e: sorted(v) for e, v in mine.items()} == {e: sorted(v) for e, v in theirs.items()}, f
+        assert await _indexed_votes(db, f) == await _walked_votes(db, f), f
     offender = key.public_key.to_address()
     for before in sorted({0, tip + 1} | {rng.randint(0, tip + 1) for _ in range(6)}):
         for who in (offender, VALIDATORS[1]):
@@ -130,7 +154,7 @@ async def test_every_answer_equals_the_walk_across_reorgs(db, offender_key, seed
         await db.connection.execute("DELETE FROM blocks WHERE block_height > ?", (cut,))
         await db.connection.commit()
         cur = await db.connection.execute("SELECT content FROM blocks WHERE block_height = ?", (cut,))
-        slot = int(eval((await cur.fetchone())[0])["slot"])
+        slot = int(eval(block_codec.decode((await cur.fetchone())[0]))["slot"])
         slot = await _build(db, rng, rng.randint(10, 40), offender_key, tag="bcdef"[round_],
                             start=cut + 1, slot0=slot)
         await _assert_matches_the_walk(db, rng, offender_key)

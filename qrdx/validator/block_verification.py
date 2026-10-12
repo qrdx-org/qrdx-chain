@@ -116,9 +116,14 @@ _SIGNING_FIELDS = (
 
 
 def _parse_block_content(block_content: Any) -> Dict[str, Any]:
-    """Block content is ``str(block.to_dict())`` — a Python-dict repr."""
+    """Block content is ``str(block.to_dict())`` — a Python-dict repr — or that text as it is
+    stored, compressed (qrdx/block_codec.py)."""
     if isinstance(block_content, dict):
         return block_content
+    if isinstance(block_content, (bytes, bytearray, memoryview)):
+        from ..block_codec import decode
+
+        block_content = decode(block_content)
     if not isinstance(block_content, str) or not block_content:
         raise ValueError("empty/invalid block_content")
     return ast.literal_eval(block_content)
@@ -218,19 +223,19 @@ async def verify_proposer_eligibility(
     """
     Verify the block's proposer is the validator selected for its slot.
 
-    Reconstructs the proposer's validator set from the ``validators`` table (the
-    exact source `node_integration` builds from — seeded identically on every node
-    from genesis, with ``effective_stake`` already in QRDX), derives the
-    deterministic slot proposer, and compares to the block's claimed
-    ``proposer_address``. This catches a registered validator proposing
-    out-of-turn (signature-valid but not its slot).
+    The set it is selected from is ``S_E`` of the block's own parent chain
+    (qrdx/validator/epoch_state.py): a pure function of that chain, so the proposer
+    and every node judging the block — at once, during a sync, or when adopting the
+    branch it is on — compute the same set, however long after its slot. (It used to
+    be this node's live ``validators`` table, which changed with finality, so sync and
+    fork-choice adoption could not check it and trust-replayed instead.) The block's
+    parent must be the stored tip: every path applies blocks onto their parent.
 
     Safe for liveness: a propagation-latency fork block still carries a *valid*
     (slot, proposer) pair, so it passes — only genuinely out-of-turn blocks fail.
 
     ``enforce=False`` (observe): a mismatch only warns and returns ``ok=True``.
-    Returns ``(True, "")`` when the set can't be reconstructed (never reject a
-    block we can't check).
+    Returns ``(True, "")`` when the chain has no validators to select from.
     """
     try:
         bc = _parse_block_content(block_content)
@@ -245,17 +250,9 @@ async def verify_proposer_eligibility(
     if not proposer:
         return True, ""
 
-    try:
-        rows = await db.get_validators()
-        validators = [
-            (r["address"], Decimal(str(r.get("effective_stake") or r.get("stake") or 0)))
-            for r in rows
-            if r.get("address")
-            and str(r.get("status", "active")).upper() in ("ACTIVE", "PENDING", "EXITING")
-        ]
-    except Exception as e:
-        logger.debug("eligibility: could not load validator set: %s", e)
-        return True, ""
+    from .epoch_state import proposers_for_slot
+
+    validators = await proposers_for_slot(db, slot, height - 1)
     if not validators:
         return True, ""
 
@@ -312,13 +309,16 @@ async def verify_proposer_eligibility(
 def verify_pos_block_proposer(
     block_content: Any,
     validator_address: str,
+    public_key: Optional[bytes] = None,
 ) -> Tuple[bool, str]:
     """
     Authenticate a PoS block's proposer. Returns ``(ok, error)``.
 
-    On ``False`` the block MUST be rejected. Requires the block to carry
-    ``proposer_public_key`` + ``proposer_signature`` and the signed header fields
-    (all present in ``str(PoSBlock.to_dict())``).
+    On ``False`` the block MUST be rejected. The proposer's Dilithium key is ``public_key`` (from
+    the chain's key registry: ``verify_block_proposer``) or, for a header that carries it as
+    slashing evidence does, ``proposer_public_key``. Blocks no longer carry it: at 3.9 KB of hex
+    it was a fifth of every block, and the registry already holds every validator's key. Also
+    checks the RANDAO reveal (``randao.randao_reveal_required``).
     """
     try:
         bc = _parse_block_content(block_content)
@@ -329,15 +329,17 @@ def verify_pos_block_proposer(
 
     pubkey_hex = bc.get("proposer_public_key")
     sig_hex = bc.get("proposer_signature")
-    if not pubkey_hex or not sig_hex:
-        return False, "block missing proposer_public_key/proposer_signature"
+    if not sig_hex:
+        return False, "block missing proposer_signature"
+    if not pubkey_hex and not public_key:
+        return False, "proposer's public key unknown (not a registered validator)"
 
     for f in _SIGNING_FIELDS:
         if f not in bc:
             return False, f"block missing signed header field '{f}'"
 
     try:
-        pubkey = bytes.fromhex(pubkey_hex)
+        pubkey = bytes.fromhex(pubkey_hex) if pubkey_hex else bytes(public_key or b"")
         sig = bytes.fromhex(sig_hex)
     except Exception as e:
         return False, f"malformed proposer key/signature hex: {e}"
@@ -369,7 +371,41 @@ def verify_pos_block_proposer(
     if not ok:
         return False, "invalid proposer Dilithium signature"
 
+    # 3. The RANDAO reveal: from shortly before RANDAO selection activates, the proposer's
+    # signature of the slot's reveal message (it used to be taken unchecked, so a proposer could
+    # have chosen the bytes folded into the mix); before that, absent (3.3 KB a block nothing
+    # used).
+    from .randao import randao_reveal_message, randao_reveal_required
+
+    reveal_hex = bc.get("randao_reveal") or ""
+    if randao_reveal_required(int(bc["number"])):
+        if not reveal_hex:
+            return False, "missing RANDAO reveal"
+        try:
+            ok = pq_verify(
+                PK.from_bytes(pubkey),
+                randao_reveal_message(int(bc["slot"])),
+                PQSignature.from_bytes(bytes.fromhex(reveal_hex)),
+            )
+        except Exception as e:
+            return False, f"RANDAO reveal verification error: {e}"
+        if not ok:
+            return False, "invalid RANDAO reveal"
+    elif reveal_hex:
+        return False, "RANDAO reveal present but RANDAO selection is not scheduled"
+
     return True, ""
+
+
+async def verify_block_proposer(
+    db: Any, block_content: Any, validator_address: str, height: int
+) -> Tuple[bool, str]:
+    """``verify_pos_block_proposer`` with the proposer's key from the chain's key registry
+    (``ffg.validator_key``: the genesis record and canonical STAKE_DEPOSITs)."""
+    from .ffg import validator_key
+
+    key = await validator_key(db, validator_address, int(height))
+    return verify_pos_block_proposer(block_content, validator_address, key)
 
 
 # How far ahead of this node's clock a block's slot may be: about a second (clock skew between

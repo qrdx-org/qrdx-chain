@@ -157,14 +157,24 @@ class GovernanceError(ValueError):
     pass
 
 
+# Commitment encoders (qrdx/exchange/commitment.py). Named, not lambdas, so the state pickles
+# (the restart checkpoint: qrdx/derived_state_rebuild.py).
+def _encode_proposal(_pid: Any, proposal: Any) -> Any:
+    return proposal.to_dict()
+
+
+def _encode_fork_approval(_key: Any, record: Any) -> Any:
+    return record
+
+
 class Governance:
     """Governance state and its transitions. Pure and deterministic: every method takes the
     block height it is judged at; balances it needs are passed in by the exchange state
     manager, which also applies the QRDX moves it returns."""
 
     # Committed entry by entry (qrdx/exchange/commitment.py).
-    proposals = committed("gov.proposals", lambda _pid, p: p.to_dict())
-    fork_approvals = committed("gov.fork_approvals", lambda _key, rec: rec)
+    proposals = committed("gov.proposals", _encode_proposal)
+    fork_approvals = committed("gov.fork_approvals", _encode_fork_approval)
 
     def __init__(self) -> None:
         self.proposals = {}  # id → Proposal (committed: see the class attributes)

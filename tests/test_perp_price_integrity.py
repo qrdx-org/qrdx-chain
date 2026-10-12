@@ -65,6 +65,11 @@ def test_two_colluding_accounts_cannot_create_value_at_any_price(mgr):
     assert _oracle(mgr, REPORTER, 30000).success
     for who in (ATTACKER_A, ATTACKER_B):
         assert _tx(mgr, ExchangeOpType.PERP_DEPOSIT, who, {"amount": "10000"}).success
+    # Resting a sell at 1e9 reserves its margin at that price (1e8 at 10x): it once rested
+    # against 10,000, the fill check alone valuing it at the gap to mark.
+    unfunded = _order(mgr, ATTACKER_A, "sell", 1, 1_000_000_000)
+    assert not unfunded.success and "margin" in unfunded.error
+    assert _tx(mgr, ExchangeOpType.PERP_DEPOSIT, ATTACKER_A, {"amount": "100000000"}).success
     assert _order(mgr, ATTACKER_A, "sell", 1, 1_000_000_000).success   # rests
     refused = _order(mgr, ATTACKER_B, "buy", 1, 1_000_000_000)
     assert not refused.success and "margin" in refused.error
@@ -78,7 +83,7 @@ def test_two_colluding_accounts_cannot_create_value_at_any_price(mgr):
     assert sum(mgr.balance_deltas().values()) == 0
     # Equity at the oracle price: A is up ~1e9 exactly where B is down ~1e9.
     a_eq, b_eq = ch.cross_equity(ATTACKER_A), ch.cross_equity(ATTACKER_B)
-    assert a_eq + b_eq + ch.vault_collateral == D("1100020000")
+    assert a_eq + b_eq + ch.vault_collateral == D("1200020000")
 
 
 def test_only_configured_reporters_may_set_prices(mgr):

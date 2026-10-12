@@ -55,7 +55,7 @@ async def _stake(db, who, *, funded="500000", deposit_height=10, exit_height=20,
     """Fund → deposit (debited, logged) → exit (logged), as block application does."""
     await db.apply_account_balance_delta(who, Decimal(funded))
     await db.apply_account_balance_delta(who, -STAKE)
-    await db.register_pending_validator(who, "ab" * 100, STAKE, block_height=deposit_height)
+    await db.log_validator_deposit(who, "ab" * 100, STAKE, deposit_height)
     if exit_height is not None:
         await W.record_validator_exit(db, who, exit_epoch, exit_height)
     await db.connection.commit()
@@ -171,7 +171,7 @@ async def test_exit_redeposit_exit_pays_each_stake_once():
         await db.connection.commit()
         # Re-stake, exit again.
         await db.apply_account_balance_delta(who, -STAKE)
-        await db.register_pending_validator(who, "ab" * 100, STAKE, block_height=60)
+        await db.log_validator_deposit(who, "ab" * 100, STAKE, 60)
         await W.record_validator_exit(db, who, 80, 70)
         await db.connection.commit()
         assert await W.process_block_withdrawals(db, 90, 80) == 1
@@ -188,7 +188,7 @@ async def test_top_ups_are_returned_in_full():
         who = pq("topped-up")
         await _stake(db, who, exit_height=None)
         await db.apply_account_balance_delta(who, -Decimal("50000"))
-        await db.register_pending_validator(who, "ab" * 100, Decimal("50000"), block_height=12)
+        await db.log_validator_deposit(who, "ab" * 100, Decimal("50000"), 12)
         await W.record_validator_exit(db, who, 30, 20)
         await db.connection.commit()
         assert await W.process_block_withdrawals(db, 50, 30) == 1
@@ -375,49 +375,60 @@ async def test_the_flush_actually_records_an_exit():
 
 # ── An exit must never be silently dropped ─────────────────────────────────
 
-async def test_an_exit_in_the_activation_epoch_is_not_dropped(monkeypatch):
+async def test_an_exit_in_the_activation_epoch_is_not_dropped():
     """
-    The reconstruction walk applies an epoch's STAKE ops before that epoch's activations,
-    so an exit landing in the activation epoch used to hit a still-pending validator,
-    no-op, and leave it active forever. With withdrawals that is an exploit: refunded AND
-    still stake-weighted. The validator must end 'exited' and never be active.
+    An exit landing in the very epoch a validator was due to activate used to hit a
+    still-pending validator, no-op, and leave it active forever. With withdrawals that is an
+    exploit: refunded AND still stake-weighted. It must leave and never propose.
     """
-    from qrdx.validator.validator_reconstruction import reconstruct_validators_state
+    from qrdx.validator.epoch_state import EpochInputs, genesis_state, proposers, transition
 
+    genesis = [{"address": pq(f"wd-genesis-{i}"), "stake": str(STAKE)} for i in range(4)]
+    who = pq("exits-while-pending")
+    s = genesis_state(genesis)
+    s = transition(s, 1, EpochInputs([("deposit", who, "cd", STAKE)], [], []))
+    activation = s[who].activation_epoch
+    for e in range(2, activation):
+        s = transition(s, e, EpochInputs([], [], []))
+    s = transition(s, activation, EpochInputs([("exit", who, None, None)], [], []))
+    for e in range(activation + 1, activation + 4):
+        s = transition(s, e, EpochInputs([], [], []))
+        assert s[who].status == "exited" and who not in dict(proposers(s)), e
+
+
+async def test_an_ejected_validator_is_paid_without_claiming(monkeypatch):
+    """Stake-floor ejection leaves no exit operation on the chain. The validator set records
+    it (validator/epoch_state.py), and the principal is paid once the exit epoch plus the
+    withdrawal delay has passed — it used to need a STAKE_EXIT of its own to claim it."""
+    from qrdx import constants
+    from qrdx.validator import epoch_state as ES
+    from qrdx.validator import withdrawals as W
+    from test_epoch_state import Chain
+
+    monkeypatch.setattr(constants, "UNBONDING_PERIOD_EPOCHS", 3)   # (else 40,320 epochs)
+    monkeypatch.setattr(W, "WITHDRAWAL_DELAY_EPOCHS", 2)
     db = await _db()
     try:
-        genesis = [{"address": pq(f"wd-genesis-{i}"), "public_key": "ab" * 100,
-                    "stake": str(STAKE)} for i in range(4)]
-        who = pq("exits-while-pending")
-        ops = [
-            {"epoch": 1, "tx_id": "a", "type": "deposit", "address": who,
-             "public_key": "cd" * 100, "stake": str(STAKE)},
-            # Activation is scheduled for epoch 2 (ACTIVATION_DELAY 1): exit in that epoch.
-            {"epoch": 2, "tx_id": "b", "type": "exit", "address": who},
-        ]
-        import qrdx.validator.validator_reconstruction as VR
-        # A short unbonding period: the walk visits every epoch, and the standard ~3.7 days of
-        # 8 s epochs is 40,320 of them. What matters here is only the activation epoch.
-        monkeypatch.setattr(VR, "UNBONDING_PERIOD_EPOCHS", 8)
-        await reconstruct_validators_state(
-            db, genesis_validators=genesis, canonical_ops=ops, attesters_by_epoch={},
-            finalized_epoch=2 + VR.UNBONDING_PERIOD_EPOCHS + 1)
-        cur = await db.connection.execute(
-            "SELECT status FROM validators WHERE address = ?", (who,))
-        assert (await cur.fetchone())[0] == "exited", (
-            "an exit in the activation epoch was dropped — the validator stayed active")
-    finally:
-        await _close(db)
-
-
-async def test_a_pending_validator_that_exits_never_activates():
-    db = await _db()
-    try:
-        who = pq("never-activates")
-        await db.register_pending_validator(who, "ab" * 100, STAKE, activation_epoch=5)
-        assert await db.mark_validator_exiting(who, exit_epoch=9)
-        await db.connection.commit()
-        assert await db.get_validators_to_activate(5) == []
-        assert await db.get_validators_to_exit(9) == [who]
+        chain = Chain(db)
+        await chain.genesis(stakes=(100_000, 100_000, 100_000))
+        joiner = pq("ejected-joiner")
+        await chain.epoch(1, deposits=[(joiner, str(STAKE))])
+        # Never attests, and its stake is marked down below the floor once active.
+        delay = constants.ACTIVATION_DELAY_EPOCHS
+        for e in range(2, 3 + delay):
+            await chain.epoch(e)
+        state = await ES.state_at(db, 2 + delay)
+        assert state[joiner].status == "active"
+        state[joiner].effective_stake = Decimal("1")       # (as if decayed; cached state)
+        await ES._store(db, 2 + delay, (await ES._checkpoint(db, 2 + delay, None))[1], state)
+        await chain.epoch(2 + delay)
+        after = await ES.state_at(db, 3 + delay)
+        assert after[joiner].status == "exiting"
+        exit_epoch = after[joiner].exit_epoch
+        due = exit_epoch + W.WITHDRAWAL_DELAY_EPOCHS
+        not_yet, _ = await W.compute_block_withdrawals(db, chain.height + 1, due - 1)
+        assert not_yet == []
+        paid, forfeited = await W.compute_block_withdrawals(db, chain.height + 1, due)
+        assert paid == [(joiner, exit_epoch, STAKE)] and forfeited == []
     finally:
         await _close(db)

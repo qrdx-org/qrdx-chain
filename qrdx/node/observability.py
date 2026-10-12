@@ -3,8 +3,11 @@ Operational-readiness surface: health/readiness probes, Prometheus metrics, and 
 event stream (WebSocket + SSE) fed by an in-process pub/sub hub.
 
 Design goals:
-  * ZERO coupling to the consensus/import path — realtime events come from a background POLLER
-    that reads the chain tip + finality, so nothing here can stall or diverge block processing.
+  * ZERO coupling to the consensus/import path. Every path that changes the chain raises
+    ``CHAIN_CHANGED`` when it releases the block-processing lock (``SignallingLock``): setting a
+    flag, never awaiting. Background publishers wake on it, read the chain tip, finality and the
+    exchange, and publish, so a block reaches subscribers as soon as it is applied. Nothing here
+    can stall or diverge block processing. A timer is only the fallback.
   * Bounded memory under load — each subscriber has a bounded queue that DROPS OLDEST on overflow
     (telemetry favors the freshest data; a slow client never grows the node's memory).
   * Toggleable streaming — the WebSocket/SSE endpoints are opt-in (a node operator enables them),
@@ -20,7 +23,18 @@ import asyncio
 import json
 import time
 from collections import defaultdict
-from typing import AbstractSet, Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Set, Union
+from typing import (
+    AbstractSet,
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Union,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pub/sub event hub
@@ -300,7 +314,59 @@ def _esc(v: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Realtime chain-event poller (the consensus-decoupled event source)
+# "The chain changed" — what the publishers wake on
+# ─────────────────────────────────────────────────────────────────────────────
+class ChangeSignal:
+    """Raised (never awaited) whenever the chain may have changed; each publisher waits on its own
+    listener. The publishers used to wake on timers (the block feed every 2 s, the exchange every
+    1 s), so at 250 ms slots subscribers received blocks and trades in bursts of four to eight."""
+
+    def __init__(self) -> None:
+        self._listeners: List[asyncio.Event] = []
+        self.raised = 0
+
+    def listener(self) -> asyncio.Event:
+        event = asyncio.Event()
+        self._listeners.append(event)
+        return event
+
+    def drop(self, listener: asyncio.Event) -> None:
+        if listener in self._listeners:
+            self._listeners.remove(listener)
+
+    def raise_(self) -> None:
+        self.raised += 1
+        for event in self._listeners:
+            event.set()
+
+    @staticmethod
+    async def wait(listener: asyncio.Event, timeout: float) -> bool:
+        """Until the signal is raised (True) or ``timeout`` passes (False). The listener is reset
+        before returning, so a change raised while the caller works wakes its next wait."""
+        try:
+            await asyncio.wait_for(listener.wait(), timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            listener.clear()
+
+
+class SignallingLock(asyncio.Lock):
+    """An asyncio lock that raises ``signal`` each time it is released: main.block_processing_lock,
+    held by every path that changes the chain (proposing, importing, syncing, a reorg)."""
+
+    def __init__(self, signal: ChangeSignal) -> None:
+        super().__init__()
+        self._signal = signal
+
+    def release(self) -> None:
+        super().release()
+        self._signal.raise_()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Realtime chain-event publisher (the consensus-decoupled event source)
 # ─────────────────────────────────────────────────────────────────────────────
 _MaybeAsync = Union[Callable[[], Any], Callable[[], Awaitable[Any]]]
 
@@ -316,78 +382,163 @@ async def chain_event_poller(
     metrics: Metrics,
     *,
     get_tip: _MaybeAsync,
+    get_hashes: Optional[Callable[[int, int], Any]] = None,
     get_peer_count: Optional[_MaybeAsync] = None,
     get_finality: Optional[_MaybeAsync] = None,
     get_slashing_count: Optional[_MaybeAsync] = None,
     get_mempool_depth: Optional[_MaybeAsync] = None,
     interval: float = 1.0,
+    signal: Optional[ChangeSignal] = None,
     _max_iterations: Optional[int] = None,  # test hook
 ) -> None:
-    """Poll chain tip + finality (+ peer count) and publish deltas to ``hub`` while updating
-    ``metrics``. Reads only — never touches the import path. A new-tip transition emits a ``block``
-    event per newly-observed height (capped) so streaming clients get a per-block feed. Best-effort:
-    a getter error is swallowed and retried next tick."""
+    """Publish every new block to ``hub`` as soon as ``signal`` says the chain changed (or every
+    ``interval`` without one), and keep ``metrics`` current. Reads only, never the import path.
+
+    Each block is one ``block`` event with its height and hash (``get_hashes(lo, hi)`` →
+    {height: hash}). When blocks this feed already announced are replaced, it first publishes a
+    ``reorg`` event naming the last block that survived, then the new blocks above it, so a
+    subscriber can drop what it showed. The slower gauges (peers, finality, slashing, mempool)
+    are refreshed at most every ``interval``. Best-effort: a getter error is retried on the next
+    wake."""
     metrics.describe("qrdx_chain_height", "Current chain tip height")
     metrics.describe("qrdx_finalized_epoch", "Highest finalized epoch")
     metrics.describe("qrdx_peer_count", "Connected peer count")
     metrics.describe("qrdx_blocks_streamed_total", "Blocks emitted to the realtime stream")
+    metrics.describe("qrdx_reorgs_streamed_total", "Reorgs announced on the realtime stream")
     metrics.set("qrdx_up", 1)
 
+    listener = signal.listener() if signal is not None else None
+    announced: Dict[int, str] = {}  # recently announced height → hash
     last_height = -1
+    gauges_at = float("-inf")
+    fin: Dict[str, Any] = {}
     iterations = 0
-    while True:
-        try:
-            tip = int(await _maybe_await(get_tip()))
-            metrics.set("qrdx_chain_height", tip)
-            metrics.set("qrdx_stream_subscribers", hub.subscriber_count)
-            metrics.set("qrdx_stream_dropped_total", hub.dropped_count)
-            if get_peer_count is not None:
-                metrics.set("qrdx_peer_count", int(await _maybe_await(get_peer_count())))
-            fin: Dict[str, Any] = {}
-            if get_finality is not None:
-                fin = (await _maybe_await(get_finality())) or {}
-                fin_ep = int(fin.get("finalized_epoch", -1))
-                metrics.set("qrdx_finalized_epoch", fin_ep)
-                metrics.set("qrdx_justified_epoch", int(fin.get("justified_epoch", -1)))
-                # Finality lag = how many epochs the tip is ahead of the finalized boundary. A
-                # healthy chain keeps this small + bounded; a growing lag = finality falling behind
-                # (the key production alert). -1 finalized (pre-finality) → lag 0 (not yet meaningful).
-                max_ep = int(fin.get("max_epoch", -1))
-                metrics.set(
-                    "qrdx_finality_lag_epochs", max(0, max_ep - fin_ep) if fin_ep >= 0 else 0
-                )
-            if get_slashing_count is not None:
-                metrics.set("qrdx_slashing_events", int(await _maybe_await(get_slashing_count())))
-            if get_mempool_depth is not None:
-                metrics.set("qrdx_mempool_pending", int(await _maybe_await(get_mempool_depth())))
-
-            if tip > last_height:
-                # Emit a per-height block event (cap the catch-up burst so a fresh node that jumps
-                # far doesn't flood subscribers).
-                start = last_height + 1 if last_height >= 0 else tip
-                for h in range(max(start, tip - 63), tip + 1):
-                    await hub.publish(
-                        {
-                            "type": "block",
-                            "channel": "blocks",
-                            "height": h,
-                            "ts": time.time(),
-                            "finalized_epoch": int(fin.get("finalized_epoch", -1)) if fin else None,
-                        }
+    try:
+        while True:
+            try:
+                tip = int(await _maybe_await(get_tip()))
+                metrics.set("qrdx_chain_height", tip)
+                now = time.monotonic()
+                if now - gauges_at >= interval:
+                    gauges_at = now
+                    fin = await _refresh_gauges(
+                        hub,
+                        metrics,
+                        get_peer_count,
+                        get_finality,
+                        get_slashing_count,
+                        get_mempool_depth,
                     )
-                    metrics.inc("qrdx_blocks_streamed_total")
-                last_height = tip
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            pass
-        iterations += 1
-        if _max_iterations is not None and iterations >= _max_iterations:
-            break
-        try:
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            break
+                if tip != last_height or get_hashes is not None:
+                    last_height = await _publish_blocks(
+                        hub, metrics, tip, last_height, announced, get_hashes, fin
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            iterations += 1
+            if _max_iterations is not None and iterations >= _max_iterations:
+                break
+            if listener is not None:
+                await ChangeSignal.wait(listener, interval)
+            else:
+                await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if listener is not None and signal is not None:
+            signal.drop(listener)
+
+
+async def _refresh_gauges(
+    hub: EventHub,
+    metrics: Metrics,
+    get_peer_count: Optional[_MaybeAsync],
+    get_finality: Optional[_MaybeAsync],
+    get_slashing_count: Optional[_MaybeAsync],
+    get_mempool_depth: Optional[_MaybeAsync],
+) -> Dict[str, Any]:
+    metrics.set("qrdx_stream_subscribers", hub.subscriber_count)
+    metrics.set("qrdx_stream_dropped_total", hub.dropped_count)
+    if get_peer_count is not None:
+        metrics.set("qrdx_peer_count", int(await _maybe_await(get_peer_count())))
+    fin: Dict[str, Any] = {}
+    if get_finality is not None:
+        fin = (await _maybe_await(get_finality())) or {}
+        fin_ep = int(fin.get("finalized_epoch", -1))
+        metrics.set("qrdx_finalized_epoch", fin_ep)
+        metrics.set("qrdx_justified_epoch", int(fin.get("justified_epoch", -1)))
+        # Finality lag = how many epochs the tip is ahead of the finalized boundary. A healthy
+        # chain keeps this small and bounded; a growing lag means finality is falling behind
+        # (the key production alert). Before anything is finalized the lag is 0.
+        max_ep = int(fin.get("max_epoch", -1))
+        metrics.set("qrdx_finality_lag_epochs", max(0, max_ep - fin_ep) if fin_ep >= 0 else 0)
+    if get_slashing_count is not None:
+        metrics.set("qrdx_slashing_events", int(await _maybe_await(get_slashing_count())))
+    if get_mempool_depth is not None:
+        metrics.set("qrdx_mempool_pending", int(await _maybe_await(get_mempool_depth())))
+    return fin
+
+
+_ANNOUNCED_KEEP = 512  # heights whose hash the feed remembers, to recognise a reorg
+_CATCH_UP_MAX = 64  # blocks published at most per wake (a node that jumps far is not replayed)
+
+
+async def _publish_blocks(
+    hub: EventHub,
+    metrics: Metrics,
+    tip: int,
+    last_height: int,
+    announced: Dict[int, str],
+    get_hashes: Optional[Callable[[int, int], Any]],
+    fin: Dict[str, Any],
+) -> int:
+    """Publish the blocks above what was announced (after a ``reorg`` event if announced blocks
+    were replaced). Returns the new last announced height."""
+    start = last_height + 1 if last_height >= 0 else tip
+    hashes: Dict[int, str] = {}
+    if get_hashes is not None:
+        lo = max(0, min(start, last_height if last_height >= 0 else tip) - _CATCH_UP_MAX)
+        hashes = {int(h): bh for h, bh in ((await _maybe_await(get_hashes(lo, tip))) or {}).items()}
+        # The highest announced block still on the chain: the reorg's surviving ancestor.
+        ancestor = last_height
+        for h in sorted((h for h in announced if h >= lo), reverse=True):
+            if h <= tip and hashes.get(h) == announced[h]:
+                ancestor = h
+                break
+            ancestor = h - 1
+        if last_height >= 0 and ancestor < last_height:
+            hub.publish_nowait(
+                {
+                    "type": "reorg",
+                    "channel": "blocks",
+                    "ancestor": ancestor,
+                    "ancestor_hash": hashes.get(ancestor),
+                    "orphaned": [announced[h] for h in sorted(announced) if h > ancestor],
+                    "ts": time.time(),
+                }
+            )
+            metrics.inc("qrdx_reorgs_streamed_total")
+            for h in [h for h in announced if h > ancestor]:
+                del announced[h]
+            start = ancestor + 1
+    for h in range(max(start, tip - _CATCH_UP_MAX + 1), tip + 1):
+        event = {
+            "type": "block",
+            "channel": "blocks",
+            "height": h,
+            "ts": time.time(),
+            "finalized_epoch": int(fin.get("finalized_epoch", -1)) if fin else None,
+        }
+        if h in hashes:
+            event["hash"] = hashes[h]
+            announced[h] = hashes[h]
+        hub.publish_nowait(event)
+        metrics.inc("qrdx_blocks_streamed_total")
+    for h in [h for h in announced if h <= tip - _ANNOUNCED_KEEP]:
+        del announced[h]
+    return max(tip, last_height) if not hashes else tip
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -401,6 +552,7 @@ async def chain_event_poller(
 # ─────────────────────────────────────────────────────────────────────────────
 METRICS = Metrics()
 EVENT_HUB = EventHub()
+CHAIN_CHANGED = ChangeSignal()
 
 
 def record(name: str, amount: float = 1.0, labels: Optional[Dict[str, Any]] = None) -> None:

@@ -16,6 +16,7 @@ from integration_tests.config import (
     CHAIN_ID, NETWORK_NAME, GENESIS_FILE,
     VALIDATOR_STAKE, WALLET_ROSTER,
     CONTRACT_TEST_BALANCE, SLOT_DURATION_MS, SLOTS_PER_EPOCH, STABLECOIN_SYMBOL,
+    BRIDGE_TEST_ASSET,
 )
 from integration_tests.wallet_factory import generate_all_wallets, get_wallet_address, get_wallet_public_key_hex
 
@@ -81,6 +82,8 @@ def testnet_chain_spec(wallets: Dict[str, dict]):
         # fixed in advance by the issuer's first nonce.
         "PERP_COLLATERAL_TOKEN": stablecoin_address(wallets),
         "PERP_QUOTE": "USD",
+        # One bridged asset, from the scripted source chain S23 deposits into.
+        "BRIDGE_ASSETS": [BRIDGE_TEST_ASSET],
         # Governance on testnet time (standard: a week of voting, a 2-day timelock, a
         # 256-block fork-approval lead): 2 minutes of voting, a 16 s timelock, ~13 minutes to
         # execute. The veto threshold is small enough for a test holder to reach (S22); the

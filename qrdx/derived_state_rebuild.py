@@ -68,6 +68,7 @@ async def rebuild_derived_state_interleaved(db, evm_state_manager=None, execute_
     await undo_journal.reset(db)
     CHECKPOINTS.clear()
     _LAST_EPOCH.clear()
+    await drop_persisted_checkpoint(db)  # re-taken from the rebuilt state as finality moves
     async with undo_journal.suspended(db):
         await db.clear_account_state()
         _clear_evm_caches(evm_state_manager)
@@ -127,8 +128,17 @@ async def rebuild_to_tip(db, evm_state_manager=None, execute_tx=None) -> dict:
     reversed_entries = await undo_journal.rollback_to(db, base)
     if reversed_entries is None:
         return await rebuild_derived_state_interleaved(db, evm_state_manager, execute_tx)
+    from .exchange.block_processor import apply_enforcement
+
     mgr = ExchangeStateManager.get_instance()
     mgr._restore_snapshot(CHECKPOINTS[base][1])
+    # The forward path's exact enforce flags (a restarted node's manager has not run a block
+    # yet): a replay with a different set accepts ops the network rejected.
+    apply_enforcement(mgr)
+    # The journal (receipts, events, market data) drops the orphaned blocks; the replay then
+    # records only the blocks above what it still holds — none after a reorg (base..tip are
+    # still canonical and journaled), those above the checkpoint after a restart.
+    mgr.journal.rollback_to(tip)
     _LAST_EPOCH.clear()
     _clear_evm_caches(evm_state_manager)
     counts = await _replay(db, mgr, evm_state_manager, execute_tx, base + 1, tip)
@@ -191,15 +201,124 @@ async def checkpoint_before(db, height: int, epoch: Optional[int]) -> None:
 
 async def prune_reorg_state(db, finalized_height: int) -> None:
     """Finality moved: no reorg can reach below the finalized checkpoint. Keep the newest exchange
-    checkpoint at or below it (the base a reorg just above it restores) and every later one, and
-    drop the journal below that base."""
+    checkpoint at or below it (the base a reorg just above it restores) and every later one,
+    persist that base every PERSIST_INTERVAL_BLOCKS for a restart, and drop the journal below
+    whichever of the two is lower."""
+    from . import undo_journal
+    from .exchange.state_manager import ExchangeStateManager
+
     below = sorted(h for h in CHECKPOINTS if h <= finalized_height)
     for h in below[:-1]:
         del CHECKPOINTS[h]
-    if below:
-        from . import undo_journal
+    if not below:
+        return
+    base = below[-1]
+    persisted = _PERSISTED.get("height")
+    if persisted is None or base - persisted >= PERSIST_INTERVAL_BLOCKS:
+        try:
+            await persist_checkpoint(db, base)
+            persisted = base
+        except Exception as e:
+            logger.warning("exchange checkpoint at %d not persisted: %s", base, e)
+    await undo_journal.prune(db, min(base, persisted) if persisted is not None else base)
+    try:
+        ExchangeStateManager.get_instance().journal.prune(base)
+    except Exception:
+        pass
 
-        await undo_journal.prune(db, below[-1])
+
+# ── the restart checkpoint ────────────────────────────────────────────────────────────────
+#
+# A restart used to rebuild every derived domain by replaying the chain from genesis: the
+# exchange lives in memory only. Every PERSIST_INTERVAL_BLOCKS of finality, the base checkpoint
+# (the exchange state after a finalized block) and the exchange journal are written to the
+# database, and the undo journal is kept back to it. A restart loads it and takes the reorg fast
+# path: undo the database to that block, restore the exchange, replay what is above.
+
+PERSIST_INTERVAL_BLOCKS = 1024
+_PERSISTED: Dict[str, int] = {}
+_CHECKPOINT_TABLE = (
+    "CREATE TABLE IF NOT EXISTS exchange_checkpoint ("
+    " id INTEGER PRIMARY KEY CHECK (id = 1),"
+    " height INTEGER NOT NULL,"
+    " block_hash TEXT NOT NULL,"
+    " state BLOB NOT NULL,"  # the exchange state after that block (pickled, compressed)
+    " journal BLOB NOT NULL)"  # the exchange journal, rolled back to that block on load
+)
+
+
+async def persist_checkpoint(db, height: int) -> None:
+    """Write checkpoint ``height`` (and the journal as of now, which ``load_persisted_checkpoint``
+    rolls back to it) to the database. Encoding runs off the event loop."""
+    import asyncio
+    import pickle
+    import zlib
+
+    from .exchange.state_manager import ExchangeStateManager
+
+    root, snapshot = CHECKPOINTS[height]
+    journal = pickle.dumps(ExchangeStateManager.get_instance().journal, protocol=5)
+
+    def encode():
+        return zlib.compress(pickle.dumps(snapshot, protocol=5), 6), zlib.compress(journal, 6)
+
+    state_blob, journal_blob = await asyncio.to_thread(encode)
+    await db.connection.execute(_CHECKPOINT_TABLE)
+    await db.connection.execute(
+        "INSERT OR REPLACE INTO exchange_checkpoint (id, height, block_hash, state, journal) "
+        "VALUES (1, ?, ?, ?, ?)",
+        (int(height), root, state_blob, journal_blob),
+    )
+    _PERSISTED["height"] = int(height)
+    logger.info(
+        "exchange checkpoint persisted at %d (%d KB state, %d KB journal)",
+        height,
+        len(state_blob) // 1024,
+        len(journal_blob) // 1024,
+    )
+
+
+async def drop_persisted_checkpoint(db) -> None:
+    _PERSISTED.clear()
+    try:
+        await db.connection.execute("DELETE FROM exchange_checkpoint")
+    except Exception:
+        pass  # no table yet
+
+
+async def load_persisted_checkpoint(db) -> Optional[int]:
+    """At startup: make the persisted checkpoint the reorg base, so ``rebuild_to_tip`` takes the
+    fast path. Returns its height, or None (then the full rebuild runs) when there is none, its
+    block is no longer on the chain, or the undo journal does not reach back to it."""
+    import pickle
+    import zlib
+
+    from . import undo_journal
+    from .exchange.state_manager import ExchangeStateManager
+
+    try:
+        cur = await db.connection.execute(
+            "SELECT height, block_hash, state, journal FROM exchange_checkpoint WHERE id = 1"
+        )
+        row = await cur.fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    height, root, state_blob, journal_blob = int(row[0]), row[1], row[2], row[3]
+    if await _block_hash(db, height) != root or not await undo_journal.can_roll_back_to(db, height):
+        logger.info("persisted exchange checkpoint at %d is unusable: full rebuild", height)
+        return None
+    # The node wrote these rows itself, in its own database: trusted as far as the database is.
+    snapshot = pickle.loads(zlib.decompress(state_blob))
+    journal = pickle.loads(zlib.decompress(journal_blob))
+    journal.rollback_to(height)
+    CHECKPOINTS.clear()
+    CHECKPOINTS[height] = (root, snapshot)
+    _LAST_EPOCH.clear()
+    _PERSISTED["height"] = height
+    ExchangeStateManager.get_instance().journal = journal
+    return height
 
 
 async def before_block(db, height: int, epoch: Optional[int]):
@@ -234,6 +353,7 @@ async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, An
     from .exchange.block_processor import (
         ENFORCE_EXCHANGE_COLLATERAL,
         decode_exchange_txs,
+        ensure_oracle_committee,
         flush_exchange_balance_deltas,
         flush_token_balance_deltas,
         preload_sender_balances,
@@ -248,8 +368,16 @@ async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, An
         "WHERE block_height BETWEEN ? AND ? ORDER BY block_height, address",
         (start, end),
     )
+    paid = list(await cur.fetchall())
+    # …and staking payouts (rewards, undelegations, refunds), the same way.
+    cur = await db.connection.execute(
+        "SELECT block_height, address, amount FROM staking_payouts "
+        "WHERE block_height BETWEEN ? AND ? ORDER BY block_height, payout_id",
+        (start, end),
+    )
+    paid += list(await cur.fetchall())
     paid_by_block: dict = {}
-    for height, address, amount in await cur.fetchall():
+    for height, address, amount in paid:
         if Decimal(str(amount)) != 0:  # a forfeited exit is settled with a zero row
             paid_by_block.setdefault(int(height), []).append((address, Decimal(str(amount))))
 
@@ -298,9 +426,11 @@ async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, An
                 section = None
             if section:
                 txs = decode_exchange_txs(section)
-                await preload_sender_balances(db, txs, mgr)
+                await preload_sender_balances(db, txs, mgr, height)
                 await preload_token_balances(db, txs, mgr)
-                ok, err, _root = process_exchange_transactions(height, float(raw_ts), txs, mgr)
+                ok, err, _root = process_exchange_transactions(
+                    height, float(raw_ts), txs, mgr, revertible=True
+                )
                 if ok:
                     mgr.commit_block()
                     await flush_exchange_balance_deltas(
@@ -311,7 +441,9 @@ async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, An
                 else:
                     logger.error("rebuild: exchange section at %d failed: %s", height, err)
             elif height >= 1:
-                # No exchange transactions: the exchange still ticks, as on every forward path.
+                # No exchange transactions: the exchange still ticks, as on every forward path,
+                # judged by the committee forward judged it by.
+                await ensure_oracle_committee(db, mgr, height)
                 run_exchange_tick(height, float(raw_ts), mgr)
 
             # 2. EVM section — sees the exchange effects of this and every earlier block.

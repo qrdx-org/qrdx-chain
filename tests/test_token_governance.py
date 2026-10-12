@@ -2,9 +2,9 @@
 Phase 7 — Token Standard & Governance Test Suite
 
 Coverage:
-  Step 9.1 : qRC20 Base Standard — deploy, transfer, approve, transferFrom,
-             batchTransfer, bridgeMint, bridgeBurn, freeze, registry
   Step 9.2 : shouldTradeAfterDoomsday() — advisory hook, DoomsdayHook,
+             over native tokens' post_doomsday_trade extension (the in-memory
+             qRC20 class is retired: tokens are qrdx/exchange/tokens.py),
              three client modes (Strict / Warning / Permissionless)
   Step 10.1: On-Chain Governance — proposal lifecycle, stake-weighted voting,
              quorum/approval thresholds, delegation, timelock, guardian veto,
@@ -25,20 +25,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-# ── qRC20 Token Standard (Step 9) ────────────────────────────────────
-from qrdx.tokens.qrc20 import (
-    QRC20Token,
-    QRC20Registry,
-    QRC20TransferEvent,
-    QRC20ApprovalEvent,
-    QRC20BridgeMintEvent,
-    QRC20BridgeBurnEvent,
-    QRC20Error,
-    InsufficientBalanceError,
-    InsufficientAllowanceError,
-    InvalidSignatureError,
-    TokenFrozenError,
-)
+# ── Native tokens (the Doomsday flag is a token extension) ────────────
+from qrdx.exchange.tokens import TokenRegistry
 from qrdx.tokens.doomsday_hook import (
     DoomsdayHook,
     DoomsdayTradingMode,
@@ -91,12 +79,6 @@ from qrdx.constants import (
     GOVERNANCE_VOTE_AGAINST,
     GOVERNANCE_VOTE_FOR,
     GOVERNANCE_VOTING_PERIOD_DAYS,
-    QRC20_DEFAULT_DECIMALS,
-    QRC20_DOMAIN_APPROVE,
-    QRC20_DOMAIN_TRANSFER,
-    QRC20_MAX_BATCH_SIZE,
-    QRC20_MAX_SUPPLY,
-    QRC20_SHIELDED_TOKENS,
 )
 
 
@@ -117,15 +99,18 @@ def make_token(
     symbol="TST",
     supply=Decimal("1000000"),
     deployer=ALICE,
-    **kwargs,
-) -> QRC20Token:
-    """Helper to create a qRC20 token for testing."""
-    return QRC20Token(
+    post_doomsday_trade=False,
+):
+    """A native token (qrdx/exchange/tokens.py) with the Doomsday extension as asked."""
+    address = "0x" + hashlib.sha256(symbol.encode()).hexdigest()[:40]
+    return TokenRegistry().deploy(
+        address,
+        deployer,
+        0,
         name=name,
         symbol=symbol,
-        total_supply=supply,
-        deployer=deployer,
-        **kwargs,
+        initial_supply=supply,
+        extensions={"post_doomsday_trade": post_doomsday_trade},
     )
 
 
@@ -149,389 +134,6 @@ def make_proposal(
         deposit=dep,
         **kwargs,
     )
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  STEP 9.1 — qRC20 BASE STANDARD
-# ══════════════════════════════════════════════════════════════════════
-
-
-class TestQRC20Deploy:
-    """Token deployment and basic properties."""
-
-    def test_deploy_basic(self):
-        token = make_token()
-        assert token.name == "TestToken"
-        assert token.symbol == "TST"
-        assert token.decimals == QRC20_DEFAULT_DECIMALS
-        assert token.total_supply == Decimal("1000000")
-        assert token.balance_of(ALICE) == Decimal("1000000")
-        assert token.deployer == ALICE
-
-    def test_deploy_custom_decimals(self):
-        token = make_token(decimals=8)
-        assert token.decimals == 8
-
-    def test_deploy_zero_supply(self):
-        token = QRC20Token(name="Zero", symbol="ZRO", total_supply=Decimal("0"))
-        assert token.total_supply == Decimal("0")
-
-    def test_deploy_empty_name_raises(self):
-        with pytest.raises(QRC20Error, match="name cannot be empty"):
-            QRC20Token(name="", symbol="X")
-
-    def test_deploy_empty_symbol_raises(self):
-        with pytest.raises(QRC20Error, match="symbol cannot be empty"):
-            QRC20Token(name="X", symbol="")
-
-    def test_deploy_negative_supply_raises(self):
-        with pytest.raises(QRC20Error, match="negative"):
-            make_token(supply=Decimal("-1"))
-
-    def test_deploy_invalid_decimals_raises(self):
-        with pytest.raises(QRC20Error, match="Decimals"):
-            make_token(decimals=19)
-
-    def test_deploy_exceeds_max_supply_raises(self):
-        with pytest.raises(QRC20Error, match="exceeds max"):
-            make_token(supply=QRC20_MAX_SUPPLY + 1)
-
-    def test_to_dict(self):
-        token = make_token()
-        d = token.to_dict()
-        assert d["symbol"] == "TST"
-        assert d["totalSupply"] == "1000000"
-        assert d["frozen"] is False
-        assert d["holders"] == 1
-
-    def test_repr(self):
-        token = make_token()
-        assert "TST" in repr(token)
-
-
-class TestQRC20BalanceOf:
-    """balanceOf queries."""
-
-    def test_balance_of_deployer(self):
-        token = make_token()
-        assert token.balance_of(ALICE) == Decimal("1000000")
-
-    def test_balance_of_unknown(self):
-        token = make_token()
-        assert token.balance_of(BOB) == Decimal("0")
-
-    def test_nonce_starts_at_zero(self):
-        token = make_token()
-        assert token.nonce_of(ALICE) == 0
-
-
-class TestQRC20Transfer:
-    """transfer() with PQ proof."""
-
-    @pytest.mark.asyncio
-    async def test_basic_transfer(self):
-        token = make_token()
-        event = await token.transfer(ALICE, BOB, Decimal("100"))
-        assert isinstance(event, QRC20TransferEvent)
-        assert token.balance_of(ALICE) == Decimal("999900")
-        assert token.balance_of(BOB) == Decimal("100")
-        assert event.amount == Decimal("100")
-        assert event.proof_hash  # non-empty
-
-    @pytest.mark.asyncio
-    async def test_transfer_increments_nonce(self):
-        token = make_token()
-        await token.transfer(ALICE, BOB, Decimal("1"))
-        assert token.nonce_of(ALICE) == 1
-        await token.transfer(ALICE, BOB, Decimal("1"))
-        assert token.nonce_of(ALICE) == 2
-
-    @pytest.mark.asyncio
-    async def test_transfer_insufficient_balance(self):
-        token = make_token()
-        with pytest.raises(InsufficientBalanceError):
-            await token.transfer(ALICE, BOB, Decimal("1000001"))
-
-    @pytest.mark.asyncio
-    async def test_transfer_zero_amount_raises(self):
-        token = make_token()
-        with pytest.raises(QRC20Error, match="positive"):
-            await token.transfer(ALICE, BOB, Decimal("0"))
-
-    @pytest.mark.asyncio
-    async def test_transfer_to_self_raises(self):
-        token = make_token()
-        with pytest.raises(QRC20Error, match="self"):
-            await token.transfer(ALICE, ALICE, Decimal("10"))
-
-    @pytest.mark.asyncio
-    async def test_transfer_emits_event(self):
-        token = make_token()
-        await token.transfer(ALICE, BOB, Decimal("50"))
-        assert len(token.events) == 1
-        assert token.events[0].token_symbol == "TST"
-
-    @pytest.mark.asyncio
-    async def test_transfer_with_signature_verification(self):
-        """When verify_signature_fn rejects, transfer fails."""
-        async def reject_all(addr, msg, sig):
-            return False
-
-        token = make_token(verify_signature_fn=reject_all)
-        with pytest.raises(InvalidSignatureError):
-            await token.transfer(ALICE, BOB, Decimal("10"), signature=b"bad")
-
-    @pytest.mark.asyncio
-    async def test_transfer_with_valid_signature(self):
-        """When verify_signature_fn accepts, transfer succeeds."""
-        async def accept_all(addr, msg, sig):
-            return True
-
-        token = make_token(verify_signature_fn=accept_all)
-        ev = await token.transfer(ALICE, BOB, Decimal("10"), signature=b"good")
-        assert ev.amount == Decimal("10")
-
-
-class TestQRC20Approve:
-    """approve() and allowance()."""
-
-    @pytest.mark.asyncio
-    async def test_approve(self):
-        token = make_token()
-        event = await token.approve(ALICE, BOB, Decimal("500"))
-        assert isinstance(event, QRC20ApprovalEvent)
-        assert token.allowance(ALICE, BOB) == Decimal("500")
-
-    @pytest.mark.asyncio
-    async def test_approve_overwrite(self):
-        token = make_token()
-        await token.approve(ALICE, BOB, Decimal("500"))
-        await token.approve(ALICE, BOB, Decimal("200"))
-        assert token.allowance(ALICE, BOB) == Decimal("200")
-
-    @pytest.mark.asyncio
-    async def test_approve_negative_raises(self):
-        token = make_token()
-        with pytest.raises(QRC20Error, match="negative"):
-            await token.approve(ALICE, BOB, Decimal("-1"))
-
-    @pytest.mark.asyncio
-    async def test_approve_zero_allowed(self):
-        token = make_token()
-        await token.approve(ALICE, BOB, Decimal("0"))
-        assert token.allowance(ALICE, BOB) == Decimal("0")
-
-
-class TestQRC20TransferFrom:
-    """transferFrom() with allowance and PQ proof."""
-
-    @pytest.mark.asyncio
-    async def test_transfer_from_basic(self):
-        token = make_token()
-        await token.approve(ALICE, BOB, Decimal("300"))
-        event = await token.transfer_from(BOB, ALICE, CAROL, Decimal("200"))
-        assert isinstance(event, QRC20TransferEvent)
-        assert token.balance_of(ALICE) == Decimal("999800")
-        assert token.balance_of(CAROL) == Decimal("200")
-        assert token.allowance(ALICE, BOB) == Decimal("100")
-
-    @pytest.mark.asyncio
-    async def test_transfer_from_exceeds_allowance(self):
-        token = make_token()
-        await token.approve(ALICE, BOB, Decimal("100"))
-        with pytest.raises(InsufficientAllowanceError):
-            await token.transfer_from(BOB, ALICE, CAROL, Decimal("200"))
-
-    @pytest.mark.asyncio
-    async def test_transfer_from_exceeds_balance(self):
-        token = make_token()
-        await token.approve(ALICE, BOB, Decimal("2000000"))
-        with pytest.raises(InsufficientBalanceError):
-            await token.transfer_from(BOB, ALICE, CAROL, Decimal("1000001"))
-
-    @pytest.mark.asyncio
-    async def test_transfer_from_zero_amount_raises(self):
-        token = make_token()
-        await token.approve(ALICE, BOB, Decimal("100"))
-        with pytest.raises(QRC20Error, match="positive"):
-            await token.transfer_from(BOB, ALICE, CAROL, Decimal("0"))
-
-
-class TestQRC20BatchTransfer:
-    """Batch transfers."""
-
-    @pytest.mark.asyncio
-    async def test_batch_transfer(self):
-        token = make_token()
-        events = await token.batch_transfer(
-            ALICE,
-            [(BOB, Decimal("100")), (CAROL, Decimal("200"))],
-        )
-        assert len(events) == 2
-        assert token.balance_of(BOB) == Decimal("100")
-        assert token.balance_of(CAROL) == Decimal("200")
-        assert token.balance_of(ALICE) == Decimal("999700")
-
-    @pytest.mark.asyncio
-    async def test_batch_exceeds_max_size(self):
-        token = make_token()
-        too_many = [(BOB, Decimal("1"))] * (QRC20_MAX_BATCH_SIZE + 1)
-        with pytest.raises(QRC20Error, match="Batch size"):
-            await token.batch_transfer(ALICE, too_many)
-
-
-class TestQRC20Bridge:
-    """Bridge mint/burn hooks."""
-
-    @pytest.mark.asyncio
-    async def test_bridge_mint(self):
-        token = make_token(supply=Decimal("0"))
-        token.add_bridge_operator(BRIDGE_OP)
-        event = await token.bridge_mint(
-            BRIDGE_OP, BOB, Decimal("500"), source_chain_id=1, source_tx_hash="0xabc123"
-        )
-        assert isinstance(event, QRC20BridgeMintEvent)
-        assert token.balance_of(BOB) == Decimal("500")
-        assert token.total_supply == Decimal("500")
-
-    @pytest.mark.asyncio
-    async def test_bridge_mint_unauthorized_raises(self):
-        token = make_token(supply=Decimal("0"))
-        with pytest.raises(QRC20Error, match="not an authorized"):
-            await token.bridge_mint(
-                BOB, CAROL, Decimal("100"), source_chain_id=1, source_tx_hash="0x"
-            )
-
-    @pytest.mark.asyncio
-    async def test_bridge_burn(self):
-        token = make_token()
-        token.add_bridge_operator(BRIDGE_OP)
-        event = await token.bridge_burn(
-            BRIDGE_OP, ALICE, Decimal("100"), destination_address="0xETH_ADDR"
-        )
-        assert isinstance(event, QRC20BridgeBurnEvent)
-        assert token.balance_of(ALICE) == Decimal("999900")
-        assert token.total_supply == Decimal("999900")
-
-    @pytest.mark.asyncio
-    async def test_bridge_burn_insufficient_balance(self):
-        token = make_token()
-        token.add_bridge_operator(BRIDGE_OP)
-        with pytest.raises(InsufficientBalanceError):
-            await token.bridge_burn(
-                BRIDGE_OP, BOB, Decimal("1"), destination_address="0x"
-            )
-
-    @pytest.mark.asyncio
-    async def test_bridge_mint_exceeds_max_supply(self):
-        token = make_token(supply=QRC20_MAX_SUPPLY)
-        token.add_bridge_operator(BRIDGE_OP)
-        with pytest.raises(QRC20Error, match="exceed max supply"):
-            await token.bridge_mint(
-                BRIDGE_OP, BOB, Decimal("1"), source_chain_id=1, source_tx_hash="0x"
-            )
-
-    def test_bridge_info(self):
-        token = make_token(source_chain_id=1, source_token_address="0xETH")
-        info = token.bridge_info()
-        assert info["sourceChainId"] == 1
-        assert info["sourceToken"] == "0xETH"
-
-    def test_add_remove_bridge_operator(self):
-        token = make_token()
-        token.add_bridge_operator(BRIDGE_OP)
-        token.remove_bridge_operator(BRIDGE_OP)
-        with pytest.raises(QRC20Error, match="not an authorized"):
-            import asyncio
-            asyncio.get_event_loop().run_until_complete(
-                token.bridge_mint(BRIDGE_OP, BOB, Decimal("1"), 1, "0x")
-            )
-
-
-class TestQRC20Freeze:
-    """Governance-controlled freeze."""
-
-    @pytest.mark.asyncio
-    async def test_frozen_transfer_raises(self):
-        token = make_token()
-        token.freeze()
-        assert token.is_frozen
-        with pytest.raises(TokenFrozenError):
-            await token.transfer(ALICE, BOB, Decimal("10"))
-
-    @pytest.mark.asyncio
-    async def test_unfreeze_allows_transfer(self):
-        token = make_token()
-        token.freeze()
-        token.unfreeze()
-        assert not token.is_frozen
-        await token.transfer(ALICE, BOB, Decimal("10"))
-
-    @pytest.mark.asyncio
-    async def test_frozen_approve_raises(self):
-        token = make_token()
-        token.freeze()
-        with pytest.raises(TokenFrozenError):
-            await token.approve(ALICE, BOB, Decimal("100"))
-
-    @pytest.mark.asyncio
-    async def test_frozen_bridge_mint_raises(self):
-        token = make_token(supply=Decimal("0"))
-        token.add_bridge_operator(BRIDGE_OP)
-        token.freeze()
-        with pytest.raises(TokenFrozenError):
-            await token.bridge_mint(BRIDGE_OP, BOB, Decimal("10"), 1, "0x")
-
-
-class TestQRC20Registry:
-    """Token registry operations."""
-
-    def test_deploy_and_get(self):
-        registry = QRC20Registry()
-        token = make_token(symbol="AAA")
-        registry.deploy(token)
-        assert registry.get("AAA") is token
-        assert registry.exists("AAA")
-        assert registry.count == 1
-
-    def test_deploy_duplicate_raises(self):
-        registry = QRC20Registry()
-        registry.deploy(make_token(symbol="DUP"))
-        with pytest.raises(QRC20Error, match="already registered"):
-            registry.deploy(make_token(symbol="DUP"))
-
-    def test_registry_full_raises(self):
-        registry = QRC20Registry(max_tokens=2)
-        registry.deploy(make_token(symbol="A1"))
-        registry.deploy(make_token(symbol="A2"))
-        with pytest.raises(QRC20Error, match="full"):
-            registry.deploy(make_token(symbol="A3"))
-
-    def test_get_or_raise(self):
-        registry = QRC20Registry()
-        with pytest.raises(QRC20Error, match="not found"):
-            registry.get_or_raise("NOPE")
-
-    def test_list_and_all_tokens(self):
-        registry = QRC20Registry()
-        registry.deploy(make_token(symbol="X1"))
-        registry.deploy(make_token(symbol="X2"))
-        assert set(registry.list_tokens()) == {"X1", "X2"}
-        assert len(registry.all_tokens()) == 2
-
-    def test_remove(self):
-        registry = QRC20Registry()
-        registry.deploy(make_token(symbol="REM"))
-        assert registry.remove("REM")
-        assert not registry.exists("REM")
-        assert not registry.remove("REM")  # idempotent
-
-    def test_to_dict(self):
-        registry = QRC20Registry()
-        registry.deploy(make_token(symbol="D1"))
-        d = registry.to_dict()
-        assert d["tokenCount"] == 1
-        assert "D1" in d["tokens"]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1527,28 +1129,6 @@ class TestEndToEndGovernance:
         assert "bridge_fee_bps" in changes
 
 
-class TestEndToEndTokenAndGovernance:
-    """Token + governance integration."""
-
-    @pytest.mark.asyncio
-    async def test_governance_freezes_token(self):
-        """Governance can freeze a qRC20 token."""
-        registry = QRC20Registry()
-        token = make_token(symbol="qETH")
-        registry.deploy(token)
-
-        # Simulate governance execution
-        token.freeze()
-        assert token.is_frozen
-        with pytest.raises(TokenFrozenError):
-            await token.transfer(ALICE, BOB, Decimal("10"))
-
-        # Governance unfreezes
-        token.unfreeze()
-        await token.transfer(ALICE, BOB, Decimal("10"))
-        assert token.balance_of(BOB) == Decimal("10")
-
-
 # ══════════════════════════════════════════════════════════════════════
 #  CONSTANTS VERIFICATION
 # ══════════════════════════════════════════════════════════════════════
@@ -1556,20 +1136,6 @@ class TestEndToEndTokenAndGovernance:
 
 class TestConstants:
     """Verify governance and qRC20 constants are properly defined."""
-
-    def test_qrc20_constants(self):
-        assert QRC20_DEFAULT_DECIMALS == 18
-        assert QRC20_MAX_BATCH_SIZE == 256
-        assert QRC20_MAX_SUPPLY > 0
-        assert len(QRC20_DOMAIN_TRANSFER) > 0
-        assert len(QRC20_DOMAIN_APPROVE) > 0
-
-    def test_qrc20_shielded_tokens(self):
-        assert "qETH" in QRC20_SHIELDED_TOKENS
-        assert "QRDX" in QRC20_SHIELDED_TOKENS
-        for sym, info in QRC20_SHIELDED_TOKENS.items():
-            assert "source_chain" in info
-            assert "post_doomsday_trade" in info
 
     def test_governance_voting_constants(self):
         assert GOVERNANCE_PROPOSAL_DEPOSIT == Decimal("10000000")
