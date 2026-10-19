@@ -578,7 +578,9 @@ SYNC_COMMITTEE_SUBNET_COUNT = 4  # Number of subnets for distribution
 
 # --- Validator Set ---
 MIN_VALIDATORS = _NETWORK_PARAMS["MIN_VALIDATORS"]  # Chain-spec parameter (mainnet: 4)
-MAX_VALIDATORS = 150  # Maximum active validators
+# Validators proposing and voting at once; more wait in the activation queue
+# (validator/epoch_state.py). Chain-spec parameter.
+MAX_VALIDATORS = _NETWORK_PARAMS["MAX_VALIDATORS"]
 MIN_VALIDATOR_STAKE = Decimal("100000")  # 100,000 QRDX minimum stake to ACTIVATE
 MAX_EFFECTIVE_STAKE = Decimal("1000000")  # 1,000,000 QRDX max effective stake
 
@@ -653,6 +655,12 @@ PERP_ORACLE_STALE_SECONDS = _NETWORK_PARAMS["PERP_ORACLE_STALE_SECONDS"]
 # Perp funding is paid at every boundary of this much block time (Hyperliquid: hourly). A
 # chain-spec parameter (a fast testnet shortens it to see several settlements).
 PERP_FUNDING_INTERVAL_SECONDS = _NETWORK_PARAMS["PERP_FUNDING_INTERVAL_SECONDS"]
+# What one block may carry (docs/BLOCK_LIMITS.md): the sum of its EVM transactions' gas limits,
+# and of its exchange operations'. Checked on every import path before anything executes; a
+# transaction over the limit is refused at admission (it could never be included). Chain-spec
+# parameters.
+BLOCK_GAS_LIMIT = _NETWORK_PARAMS["BLOCK_GAS_LIMIT"]
+BLOCK_EXCHANGE_GAS_LIMIT = _NETWORK_PARAMS["BLOCK_EXCHANGE_GAS_LIMIT"]
 # QRDX burned by CREATE_MARKET (with the fee gate on). Every market costs every node work in
 # every block (its mark, funding and liquidation duties) and a place in the validators' price
 # votes, so listing one must not be nearly free. A chain-spec parameter.
@@ -667,6 +675,9 @@ BRIDGE_ASSETS = tuple(_NETWORK_PARAMS["BRIDGE_ASSETS"])
 # this floor (1 gwei, eth_gasPrice's answer). Every executed operation pays gas_used × gas_price
 # in QRDX, and the fee is burned, as EVM gas is. A chain-spec parameter.
 EXCHANGE_MIN_GAS_PRICE_WEI = _NETWORK_PARAMS["EXCHANGE_MIN_GAS_PRICE_WEI"]
+# The EVM's floor, likewise. Above the floors each block's base fees rise and fall with demand
+# (qrdx/fee_market.py, docs/BLOCK_LIMITS.md). A chain-spec parameter.
+EVM_MIN_GAS_PRICE_WEI = _NETWORK_PARAMS["EVM_MIN_GAS_PRICE_WEI"]
 
 # --- On-chain governance (qrdx/exchange/governance.py, docs/GOVERNANCE.md) ---
 # Chain-spec parameters, in blocks. Validators propose and decide by stake; holders veto by
@@ -687,6 +698,12 @@ ATTESTATION_THRESHOLD = Decimal("0.667")  # 2/3 + 1 of stake for finality
 MIN_ATTESTATION_INCLUSION_DELAY = 1  # Minimum slots before attestation included
 MAX_ATTESTATION_INCLUSION_DELAY = 32  # Maximum slots for attestation inclusion
 MAX_ATTESTATIONS_PER_BLOCK = 128  # Maximum attestations in a block
+# Every validator votes once an epoch and its vote must fit in the epoch's blocks.
+if MAX_VALIDATORS > MAX_ATTESTATIONS_PER_BLOCK * SLOTS_PER_EPOCH:
+    raise ValueError(
+        f"MAX_VALIDATORS {MAX_VALIDATORS} exceeds the votes an epoch's blocks can carry "
+        f"({MAX_ATTESTATIONS_PER_BLOCK} x {SLOTS_PER_EPOCH} slots)"
+    )
 
 # --- Rewards ---
 BASE_REWARD_FACTOR = 64  # Base reward calculation factor

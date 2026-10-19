@@ -530,11 +530,15 @@ class TestOperationHandlers:
             ExchangeOpType.PERP_ORDER, sender=ALICE, nonce=2, params={
                 "market_id": "AVAX-QRDX-PERP", "side": "sell", "size": "10",
                 "price": "30"})).success
+        # The taker's gas pays for each resting order it visits (docs/BLOCK_LIMITS.md).
+        from qrdx.exchange.transactions import EXCHANGE_GAS_PER_MAKER
+        base = EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_ORDER]
         result = mgr.process_transaction(make_tx(
             ExchangeOpType.PERP_ORDER, sender=BOB, nonce=1, params={
                 "market_id": "AVAX-QRDX-PERP", "side": "buy", "size": "10",
-                "price": "30"}))
+                "price": "30"}, gas_limit=base + EXCHANGE_GAS_PER_MAKER))
         assert result.success and len(result.data["fills"]) == 1
+        assert result.gas_used == base + EXCHANGE_GAS_PER_MAKER
         ch = mgr.clearinghouse
         assert ch.accounts[BOB].positions["AVAX-QRDX-PERP"].size == 10
         assert ch.accounts[ALICE].positions["AVAX-QRDX-PERP"].size == -10

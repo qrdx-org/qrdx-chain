@@ -540,13 +540,24 @@ class ValidatorNode:
                         # oracle staleness and swap deadlines by it.
                         block_timestamp = int(datetime.now(timezone.utc).timestamp())
 
+                        # The base fees the parent sets (qrdx/fee_market.py): the block carries
+                        # them, and only transactions offering at least them.
+                        from ..fee_market import base_fees_at
+
+                        base_fees = await base_fees_at(self.db, next_height)
+
                         # Exchange section: select + execute (commit on success). Drop on
                         # failure rather than ship a bad block.
                         exchange_txs = []
                         exchange_state_root = None
                         if self._exchange_tx_source is not None:
                             try:
-                                exchange_txs = self._exchange_tx_source.select_for_block() or []
+                                exchange_txs = (
+                                    self._exchange_tx_source.select_for_block(
+                                        min_price=base_fees[1]
+                                    )
+                                    or []
+                                )
                             except Exception as e:
                                 logger.warning(f"Exchange tx selection failed: {e}")
                                 exchange_txs = []
@@ -637,7 +648,10 @@ class ValidatorNode:
                             and self._evm_section_producer is not None
                         ):
                             try:
-                                evm_raws = self._evm_tx_source.select_for_block() or []
+                                evm_raws = (
+                                    self._evm_tx_source.select_for_block(min_price=base_fees[0])
+                                    or []
+                                )
                             except Exception as e:
                                 logger.warning(f"EVM tx selection failed: {e}")
                                 evm_raws = []
@@ -713,12 +727,22 @@ class ValidatorNode:
                         # this signed root — full cryptographic binding of all state domains.
                         unified_root = await self._compute_unified_state_root(next_height)
 
+                        # The sections in their wire form: the header commits to them
+                        # (body_root), exactly as importers will receive them.
+                        from ..contracts.evm_block import encode_evm_txs
+                        from ..exchange.block_processor import encode_exchange_txs
+
                         block = await self.manager.propose_block(
                             slot=current_slot,
                             parent_hash=parent_hash,
                             transactions=pending_txs[:100],  # Limit to 100 txs per block
                             state_root=unified_root,
                             timestamp=block_timestamp,
+                            exchange_section=(
+                                encode_exchange_txs(exchange_txs) if exchange_txs else []
+                            ),
+                            evm_section=encode_evm_txs(evm_txs) if evm_txs else [],
+                            base_fees=base_fees,
                         )
 
                         if block:

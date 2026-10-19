@@ -80,19 +80,28 @@ class PoSBlock:
     # Graffiti (optional message from proposer)
     graffiti: str = ""
 
+    # Everything above that is not header — votes, slashing proofs, graffiti — and the exchange
+    # and EVM sections that travel with the block, hashed (block_verification.body_root). Signed:
+    # set it (``commit_body``) before signing.
+    body_root: str = ""
+
+    # The block's base fees, wei per unit of EVM / exchange gas (qrdx/fee_market.py: set by the
+    # parent). Signed.
+    base_fee: int = 0
+    exchange_base_fee: int = 0
+
+    def commit_body(self, exchange_section=None, evm_section=None) -> None:
+        """Bind the body (and the sections, in their wire form) into the header."""
+        from .block_verification import body_root
+
+        self.body_root = body_root(self.to_dict(), exchange_section or [], evm_section or [])
+
     @property
     def hash(self) -> str:
-        """Compute block hash."""
-        data = (
-            self.number.to_bytes(8, "little")
-            + bytes.fromhex(self.parent_hash)
-            + bytes.fromhex(self.state_root)
-            + bytes.fromhex(self.transactions_root)
-            + self.timestamp.to_bytes(8, "little")
-            + self.slot.to_bytes(8, "little")
-            + self.proposer_address.encode("utf-8")
-        )
-        return hashlib.sha256(data).hexdigest()
+        """The block's hash: its signing root, which commits to every signed header field —
+        the body through ``body_root``, the ancestry through ``parent_hash``. (It used to cover
+        a few header fields only.)"""
+        return self.signing_root.hex()
 
     @property
     def signing_root(self) -> bytes:
@@ -109,6 +118,10 @@ class PoSBlock:
                 "timestamp": self.timestamp,
                 "slot": self.slot,
                 "epoch": self.epoch,
+                "proposer_address": self.proposer_address,
+                "body_root": self.body_root,
+                "base_fee": self.base_fee,
+                "exchange_base_fee": self.exchange_base_fee,
                 "randao_reveal": self.randao_reveal.hex(),
             }
         )
@@ -129,6 +142,9 @@ class PoSBlock:
             "attestations": [a.to_dict() for a in self.attestations],
             "slashing_evidence": list(self.slashing_evidence),
             "graffiti": self.graffiti,
+            "body_root": self.body_root,
+            "base_fee": self.base_fee,
+            "exchange_base_fee": self.exchange_base_fee,
             "hash": self.hash,
         }
 
@@ -524,6 +540,9 @@ class ValidatorManager:
         transactions: List[Any],
         state_root: Optional[str] = None,
         timestamp: Optional[int] = None,
+        exchange_section: Optional[List[Any]] = None,
+        evm_section: Optional[List[Any]] = None,
+        base_fees: Optional[Tuple[int, int]] = None,
     ) -> Optional[PoSBlock]:
         """
         Propose a block if selected for this slot.
@@ -543,6 +562,11 @@ class ValidatorManager:
                 MUST be the one the block carries: importers execute the sections at the
                 block's timestamp, and the exchange judges time-dependent rules (funding,
                 oracle staleness, swap deadlines) by it. Defaults to now.
+            exchange_section, evm_section: the sections the block will travel with, in their
+                wire form (``encode_exchange_txs`` / ``encode_evm_txs``): the header commits to
+                them (``body_root``).
+            base_fees: (EVM, exchange) base fees the parent sets (``fee_market.base_fees_at``);
+                the floors when not given.
 
         Returns:
             Proposed block or None if not selected
@@ -582,6 +606,13 @@ class ValidatorManager:
 
         # Votes to include: checked against this chain (qrdx/validator/ffg.py) — valid for it and
         # not already carried by it, so a vote that rode an orphaned block is included again.
+        # At most what a block may carry (qrdx/block_limits.py), whatever this node's config says.
+        from ..block_limits import MAX_SLASHING_EVIDENCE_PER_BLOCK
+        from ..constants import MAX_ATTESTATIONS_PER_BLOCK
+
+        max_votes = min(
+            self.config.attestation.max_attestations_per_block, MAX_ATTESTATIONS_PER_BLOCK
+        )
         if self.database is not None:
             from .ffg import INCLUSION_EPOCHS, votes_to_include
 
@@ -589,12 +620,12 @@ class ValidatorManager:
                 self.database,
                 await self.attestation_pool.votes(max(1, epoch - INCLUSION_EPOCHS)),
                 epoch,
-                self.config.attestation.max_attestations_per_block,
+                max_votes,
             )
         else:
             attestations = await self.attestation_pool.select_attestations_for_inclusion(
                 slot,
-                self.config.attestation.max_attestations_per_block,
+                max_votes,
                 self.config.attestation.max_inclusion_distance,
             )
 
@@ -603,7 +634,9 @@ class ValidatorManager:
         slashing_evidence = []
         try:
             if self.database is not None:
-                slashing_evidence = await self.database.get_pending_slashing_evidence()
+                slashing_evidence = (await self.database.get_pending_slashing_evidence())[
+                    :MAX_SLASHING_EVIDENCE_PER_BLOCK
+                ]  # the rest ride the next blocks
         except Exception as e:
             logger.debug("slashing-evidence inclusion skipped: %s", e)
 
@@ -626,7 +659,11 @@ class ValidatorManager:
             graffiti=self.config.graffiti,
         )
 
-        # Sign the block
+        # The base fees, then the body, then the header's signature (which commits to both).
+        from ..fee_market import floors
+
+        block.base_fee, block.exchange_base_fee = base_fees or floors()
+        block.commit_body(exchange_section, evm_section)
         block.proposer_signature = self._sign_message(block.signing_root)
 
         # Record in slashing protection

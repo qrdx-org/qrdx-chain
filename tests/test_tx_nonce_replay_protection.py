@@ -39,7 +39,7 @@ RECIPIENT = "0x" + "cd" * 20
 def _signed_tx(nonce, value=WEI, key=SENDER_KEY, gas=100_000):
     from eth_utils import to_checksum_address
     signed = EthAccount.sign_transaction(
-        {"nonce": nonce, "gasPrice": 0, "gas": gas,
+        {"nonce": nonce, "gasPrice": 10 ** 9, "gas": gas,
          "to": to_checksum_address(RECIPIENT), "value": value, "data": b"",
          "chainId": CHAIN_ID}, key)
     raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction

@@ -49,7 +49,7 @@ from .commitment import (
     tracked,
     verifying,
 )
-from .orderbook import Order, OrderBook, OrderSide, OrderType, SelfTradeAction
+from .orderbook import MatchBudget, Order, OrderBook, OrderSide, OrderType, SelfTradeAction
 
 ZERO = Decimal(0)
 TWO = Decimal(2)
@@ -326,6 +326,8 @@ _INDEX_TOLERANCE = Decimal("1e-15")
 class Clearinghouse:
     """Perp markets, their order books, and every trader's margin account."""
 
+    last_makers_visited = 0  # (a clearinghouse restored from before it existed reads this)
+
     # Committed entry by entry (qrdx/exchange/commitment.py). Read-only scans use peek*.
     accounts = committed("ch.accounts", _encode_account)
     vault_shares = committed("ch.vault_shares", encode_value, mutable=False)
@@ -346,6 +348,7 @@ class Clearinghouse:
         self._touched: set = set()
         self._cancelled: List[dict] = []
         self.last_cancelled: List[dict] = []
+        self.last_makers_visited = 0  # resting orders the last placement visited (its gas)
         self._now: Decimal = ZERO
 
     @property
@@ -888,15 +891,18 @@ class Clearinghouse:
         nonce: int,
         reduce_only: bool = False,
         ioc: bool = False,
+        max_makers: Optional[int] = None,
     ) -> List[dict]:
         """
         Place a limit order. Matches against the book; any remainder rests (or is cancelled if
         ``ioc``). Returns the fills. Refuses — changing nothing — if the account could not
         carry the result at initial margin assuming a full fill at the worst price the limit
-        allows.
+        allows. ``max_makers``: how many resting orders it may visit (what its gas pays for,
+        ``orderbook.MatchBudget``); the remainder is cancelled when they run out.
         """
         self._user(owner)
         self._touched, self._cancelled, self.last_cancelled = set(), [], []
+        self.last_makers_visited = 0
         m = self.market(market_id)
         if m.mark_price <= 0:
             raise ClearinghouseError(f"market {market_id} has no price yet")
@@ -929,7 +935,9 @@ class Clearinghouse:
             nonce=nonce,
             timestamp=0.0,
         )
-        trades = self._match(m, order)
+        budget = MatchBudget(max_makers) if max_makers is not None else None
+        trades = self._match(m, order, budget=budget)
+        self.last_makers_visited = budget.visited if budget is not None else 0
         m.orders[order_id] = OrderMeta(owner=owner, leverage=lev, reduce_only=bool(reduce_only))
 
         fills = []
@@ -942,7 +950,13 @@ class Clearinghouse:
         self.last_cancelled = self._cancelled
         return fills
 
-    def _match(self, m: Market, order: Order, protocol: bool = False) -> List[Any]:
+    def _match(
+        self,
+        m: Market,
+        order: Order,
+        protocol: bool = False,
+        budget: Optional[MatchBudget] = None,
+    ) -> List[Any]:
         """Match ``order`` on the book, guarding each maker's fill (Hyperliquid checks makers
         at match time). A maker whose fill would open exposure is cancelled instead if it is
         reduce-only, or if the margin its order reserved does not cover that exposure and the
@@ -983,7 +997,7 @@ class Clearinghouse:
 
         m.book.maker_guard = guard
         try:
-            return m.book.place_order(order, protocol=protocol)
+            return m.book.place_order(order, protocol=protocol, budget=budget)
         finally:
             m.book.maker_guard = None
 

@@ -138,6 +138,10 @@ PARAMS: Dict[str, Param] = {
     "SLOT_DURATION_MS": Param("int", 250, "QRDX_SLOT_DURATION_MS", minimum=100),
     "SLOTS_PER_EPOCH": Param("int", 32, "QRDX_SLOTS_PER_EPOCH", minimum=1),
     "MIN_VALIDATORS": Param("int", 4, "QRDX_MIN_VALIDATORS", minimum=1),
+    # The most validators that propose and vote at once (qrdx/validator/epoch_state.py); more
+    # wait to activate until one leaves. Every validator's vote is a 3.3 KB signature each epoch
+    # that every node verifies and stores, and a block carries at most 128.
+    "MAX_VALIDATORS": Param("int", 150, "QRDX_MAX_VALIDATORS", minimum=4),
     # Staking lifecycle.
     # Unbonding ~3.7 days. Activation waits a number of epochs (a finality depth, not a
     # duration). The withdrawal delay, the window for carrying evidence of an offence before
@@ -149,6 +153,17 @@ PARAMS: Dict[str, Param] = {
     # earns it (a validator's principal and the QRDX delegated to it), paid each epoch to the
     # validators whose vote the chain carried. 500 = 5 % a year.
     "STAKING_REWARD_RATE_BPS": Param("int", 500, "QRDX_STAKING_REWARD_RATE_BPS", minimum=0),
+    # Block resource limits (docs/BLOCK_LIMITS.md). Every node executes every block, so what a
+    # block may carry is bounded by what a node can execute within the slot clock. Gas is the
+    # sum of the transactions' declared gas limits, checked before anything runs.
+    # The EVM's: py-evm runs its cheapest instructions at ~1.9 Mgas/s (measured), so a block of
+    # them takes ~0.5 s — two 250 ms slots — while 1,000,000 still fits a token contract's
+    # deployment. The exchange's: its operations run ~200x faster per unit of gas; 20,000,000
+    # is ~500 orders, ~40 ms of execution.
+    "BLOCK_GAS_LIMIT": Param("int", 1_000_000, "QRDX_BLOCK_GAS_LIMIT", minimum=21_000),
+    "BLOCK_EXCHANGE_GAS_LIMIT": Param(
+        "int", 20_000_000, "QRDX_BLOCK_EXCHANGE_GAS_LIMIT", minimum=1_000_000
+    ),
     # Exchange / perps.
     "ORACLE_REPORTERS": Param("list", [], "QRDX_ORACLE_REPORTERS"),
     "PERP_VAULT_LOCKUP_SECONDS": Param(
@@ -167,6 +182,9 @@ PARAMS: Dict[str, Param] = {
     # Tokens the consensus bridge carries (docs/BRIDGE.md): SYMBOL:CHAIN_ID:SOURCE_TOKEN:DECIMALS.
     "BRIDGE_ASSETS": Param("list", [], "QRDX_BRIDGE_ASSETS"),
     "EXCHANGE_MIN_GAS_PRICE_WEI": Param("int", 10**9, "QRDX_EXCHANGE_MIN_GAS_PRICE_WEI", minimum=0),
+    # The EVM's floor under its base fee (qrdx/fee_market.py): EVM gas had no price floor at all
+    # (a gas price of 0 executed for free).
+    "EVM_MIN_GAS_PRICE_WEI": Param("int", 10**9, "QRDX_EVM_MIN_GAS_PRICE_WEI", minimum=0),
     # On-chain governance (qrdx/exchange/governance.py, docs/GOVERNANCE.md). Block counts, not
     # wall time: every node judges a deadline by the height of the block being applied.
     # At 250 ms slots (345,600 blocks a day): 7 days of voting, a 2-day timelock (the holders'
@@ -293,6 +311,10 @@ PINNED_NETWORKS: Dict[str, str] = {}
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 _NETWORK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _SPEC_KEYS = {"format", "network", "chain_id", "dev", "params", "features", "forks"}
+# Optional: trusted checkpoints (qrdx/checkpoints.py), appended by releases like forks and, like
+# them, outside what genesis commits to.
+_OPTIONAL_SPEC_KEYS = {"checkpoints"}
+_NOT_IN_GENESIS = ("forks", "checkpoints")
 _FORK_KEYS = {"name", "height", "features", "params", "approval"}
 # How a fork is authorised to activate. "validators": only once an on-chain governance proposal
 # approving this exact fork definition has executed in time (the default, and the only option
@@ -391,7 +413,7 @@ class ChainSpec:
         it cannot follow."""
         if not isinstance(raw, Mapping):
             raise ChainSpecError("chain spec must be a JSON object")
-        unknown = set(raw) - _SPEC_KEYS
+        unknown = set(raw) - _SPEC_KEYS - _OPTIONAL_SPEC_KEYS
         missing = _SPEC_KEYS - set(raw)
         if unknown:
             raise ChainSpecError(f"chain spec: unknown key(s) {sorted(unknown)}")
@@ -510,6 +532,27 @@ class ChainSpec:
                 entry["approval"] = approval
             clean_forks.append(entry)
 
+        checkpoints = raw.get("checkpoints", [])
+        if not isinstance(checkpoints, list):
+            raise ChainSpecError("chain spec: checkpoints must be a list")
+        clean_checkpoints: List[Dict[str, Any]] = []
+        for i, cp in enumerate(checkpoints):
+            where = f"chain spec: checkpoints[{i}]"
+            if not isinstance(cp, Mapping) or set(cp) != {"height", "hash"}:
+                raise ChainSpecError(f"{where} must be {{'height': int, 'hash': hex}}")
+            height, block_hash = cp["height"], cp["hash"]
+            if not _is_int(height) or height < 1:
+                raise ChainSpecError(f"{where}: height must be an int >= 1")
+            if (
+                not isinstance(block_hash, str)
+                or len(block_hash) != 64
+                or any(c not in "0123456789abcdef" for c in block_hash)
+            ):
+                raise ChainSpecError(f"{where}: hash must be 64 lower-case hex characters")
+            if clean_checkpoints and height <= clean_checkpoints[-1]["height"]:
+                raise ChainSpecError(f"{where}: heights must increase")
+            clean_checkpoints.append({"height": height, "hash": block_hash})
+
         return cls(
             {
                 "format": SPEC_FORMAT,
@@ -519,6 +562,7 @@ class ChainSpec:
                 "params": clean_params,
                 "features": genesis_features,
                 "forks": clean_forks,
+                "checkpoints": clean_checkpoints,
             },
             _CONSTRUCT,
         )
@@ -529,8 +573,13 @@ class ChainSpec:
         return copy.deepcopy(self._data)
 
     def genesis_part(self) -> Dict[str, Any]:
-        """Everything genesis commits to: the spec minus its upgrade schedule."""
-        return {k: copy.deepcopy(v) for k, v in self._data.items() if k != "forks"}
+        """Everything genesis commits to: the spec minus its upgrade schedule and its trusted
+        checkpoints (both appended by later releases)."""
+        return {k: copy.deepcopy(v) for k, v in self._data.items() if k not in _NOT_IN_GENESIS}
+
+    def checkpoints(self) -> List[Tuple[int, str]]:
+        """(height, block hash) of each trusted checkpoint, ascending (qrdx/checkpoints.py)."""
+        return [(int(c["height"]), str(c["hash"])) for c in self._data.get("checkpoints", [])]
 
     def genesis_hash(self) -> str:
         """The hash the genesis state root commits to."""

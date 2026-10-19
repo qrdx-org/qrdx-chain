@@ -96,6 +96,15 @@ class ExchangeMempool:
         except ValueError as e:
             return False, str(e)
 
+        # More gas than a block may carry: it could never be included (docs/BLOCK_LIMITS.md).
+        from ..constants import BLOCK_EXCHANGE_GAS_LIMIT
+
+        if int(tx.gas_limit) > BLOCK_EXCHANGE_GAS_LIMIT:
+            return False, (
+                f"gas limit {tx.gas_limit} exceeds the block's exchange gas limit "
+                f"{BLOCK_EXCHANGE_GAS_LIMIT}"
+            )
+
         tx_hash = tx.tx_hash()
 
         if tx.op_type == ExchangeOpType.ORACLE_VOTE:
@@ -185,24 +194,45 @@ class ExchangeMempool:
         self._votes = {v: t for v, t in self._votes.items() if t.nonce > self._vote_seq(v)}
         return [self._votes[v] for v in sorted(self._votes)]
 
-    def select_for_block(self, limit: int = 256) -> List[ExchangeTransaction]:
+    def select_for_block(
+        self, limit: int = 256, gas_limit: Optional[int] = None, min_price: int = 0
+    ) -> List[ExchangeTransaction]:
         """
         Deterministically select an executable set for block inclusion.
 
         For each sender, include a *gap-free* run of nonces starting at the
         sender's expected next nonce (expected, expected+1, …). Senders are
-        ordered by address and the runs concatenated, capped at ``limit``.
+        ordered by address and the runs concatenated, capped at ``limit`` operations and
+        ``gas_limit`` declared gas (default ``BLOCK_EXCHANGE_GAS_LIMIT``, docs/BLOCK_LIMITS.md),
+        offering at least ``min_price`` (the block's exchange base fee; oracle votes are exempt);
+        a sender's run stops at the first operation that does not fit or pays too little.
+        Oracle votes go first.
 
         The result is the canonical ordering every validator would compute from
         the same mempool contents + committed state — the basis for D2.
         """
+        if gas_limit is None:
+            from ..constants import BLOCK_EXCHANGE_GAS_LIMIT
+
+            gas_limit = BLOCK_EXCHANGE_GAS_LIMIT
         self.prune_stale()
-        selected: List[ExchangeTransaction] = self.votes()[:limit]  # prices first
+        selected: List[ExchangeTransaction] = []
+        gas = 0
+        for vote in self.votes():  # prices first
+            if len(selected) >= limit or gas + int(vote.gas_limit) > gas_limit:
+                break
+            selected.append(vote)
+            gas += int(vote.gas_limit)
         for sender in sorted(self._by_sender.keys()):
             by_nonce = {self._txs[h].nonce: self._txs[h] for h in self._by_sender[sender]}
             n = self._nonce_provider(sender)
             while n in by_nonce and len(selected) < limit:
+                if gas + int(by_nonce[n].gas_limit) > gas_limit:
+                    break
+                if int(by_nonce[n].gas_price) < min_price:
+                    break
                 selected.append(by_nonce[n])
+                gas += int(by_nonce[n].gas_limit)
                 n += 1
             if len(selected) >= limit:
                 break

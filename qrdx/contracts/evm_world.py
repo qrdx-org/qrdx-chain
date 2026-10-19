@@ -2,18 +2,26 @@
 EVM execution state, loaded on demand from the canonical account store.
 
 Every EVM execution — a block's transactions, ``eth_call``, gas estimation — runs on a fresh
-py-evm state populated from the ContractStateManager (this block's pending changes over the
-database). Anything the execution reads that is not loaded yet raises ``StateMiss``; the async
-caller loads it and runs the execution again from the start (``run``), so the result is exactly
-what it would be had everything been loaded up front. When it finishes, every account and
-storage slot it touched is written back to the state manager, and from there to the database.
+py-evm state over the ContractStateManager (this block's pending changes over the database).
+The state is flat (``WorldAccountDB``: accounts and slots in dictionaries, journaled for the
+EVM's call frames), and what the execution reads that is not loaded yet goes through
+``EvmWorld.need``:
 
-It replaced a persistent per-node in-memory trie into which only a transaction's sender and
-recipient were copied, and from which only their balances and nonces were copied back.
-Contract storage never reached the database or the state root, a contract's payment to any
-other account was lost the next time that account transacted, code a contract created was not
-saved, and a reorg or restart left the trie disagreeing with the chain (docs/KNOWN_ISSUES.md,
-"EVM state lived in a per-node trie").
+* under ``run`` (async callers) the execution runs in a greenlet: a read of something not
+  loaded switches back to ``run``, which loads it and resumes the execution where it stopped.
+  Each account and slot costs one load, however many the execution touches.
+* under ``run_sync`` (legacy synchronous callers) it raises ``StateMiss``: the state manager's
+  cache supplies it and the execution runs again.
+
+When the execution finishes, every account and storage slot it touched is written back to the
+state manager, and from there to the database.
+
+The execution used to start over on every miss, on a state rebuilt and re-hashed from
+everything loaded so far: a transaction touching n new accounts did O(n²) work — 800,000 gas
+of BALANCE calls took 2.8 s, and the 10,000,000 gas a transaction could carry took minutes, on
+every node (docs/KNOWN_ISSUES.md, "A transaction could stall every node"). Before that, a
+persistent per-node trie received only a transaction's sender and recipient and returned only
+their balances and nonces (docs/KNOWN_ISSUES.md, "EVM state lived in a per-node trie").
 
 Native tokens (qrdx/exchange/tokens.py) are part of the same world: ``tokens`` is a
 ``native_token_evm.TokenWorld``, and the state journals token moves so a reverted call undoes
@@ -22,23 +30,32 @@ them (``WorldState``).
 
 from __future__ import annotations
 
+import contextvars
 from collections.abc import Mapping
-from typing import Dict, Iterable, Optional, Set, Tuple, cast
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, cast
 
-from eth.constants import BLANK_ROOT_HASH
-from eth.db.account import AccountDB
+from eth.abc import AccountDatabaseAPI, MetaWitnessAPI
+from eth.constants import BLANK_ROOT_HASH, EMPTY_SHA3
 from eth.db.atomic import AtomicDB
 from eth.db.backends.memory import MemoryDB
+from eth.db.witness import MetaWitness
+from eth.validation import (
+    validate_canonical_address,
+    validate_is_bytes,
+    validate_uint64,
+    validate_uint256,
+)
 from eth.vm.forks.qrdx.computation import QRDXComputation
 from eth.vm.forks.qrdx.state import QRDXState
-from eth_typing import Address
+from eth_hash.auto import keccak
+from eth_typing import Address, Hash32
+from eth_utils import ValidationError
+from greenlet import greenlet
 
 from ..crypto.account_id import to_account_id
 
-# A touched account's whole storage is loaded at once when it has at most this many slots
-# (otherwise slot by slot): fewer re-runs, the same result either way.
-FULL_STORAGE_LIMIT = 4096
-# Each re-run loads at least one more item; gas bounds what one execution can touch.
+# ``run_sync`` re-runs an execution once per miss (``run`` loads in place and never re-runs);
+# each re-run loads at least one more item, and gas bounds what one execution can touch.
 MAX_LOAD_ROUNDS = 100_000
 EMPTY_CODE = b""
 # What a native token's or NFT collection's address reports as its code: its precompile runs
@@ -69,49 +86,346 @@ def _hex(address: bytes) -> str:
     return "0x" + bytes(address).hex()
 
 
-class WorldAccountDB(AccountDB):
-    """py-evm's account database, refusing to read what the world has not loaded."""
+Record = Tuple[int, int, bytes]  # (balance, nonce, code)
 
-    world: Optional["EvmWorld"] = None
 
-    def _get_encoded_account(self, address, from_journal: bool = True) -> bytes:
+class WorldAccountDB(AccountDatabaseAPI):
+    """py-evm's account database as dictionaries over the world, journaled for the EVM's call
+    frames. It has the semantics of ``eth.db.account.AccountDB`` on a state seeded with what
+    the world holds, including those gas depends on:
+
+    * an account exists once anything is written to it, even nothing (``touch_account``, which
+      every message does, and ``delete_storage``, which every CREATE does);
+    * an account that holds nothing (no balance, nonce or code) when the execution begins has
+      no storage;
+    * a slot's *original* value (EIP-2200) is its value when the execution began — or 0 once
+      the account's storage was deleted and until that is reverted;
+    * warm accounts and slots (EIP-2929) are journaled with everything else.
+
+    State roots are not computed here (the account store computes its own): ``state_root`` is
+    the empty root throughout."""
+
+    world: Optional["EvmWorld"] = None  # set by EvmWorld.build_state
+
+    def __init__(self, db: Any = None, state_root: Hash32 = BLANK_ROOT_HASH) -> None:
+        self._records: Dict[bytes, Optional[Record]] = {}  # written this execution; None = gone
+        self._storage: Dict[bytes, Dict[int, int]] = {}  # slots written since the last wipe
+        self._wiped: Set[bytes] = set()  # storage deleted this execution
+        self._warm: Set[Any] = set()
+        self._log: List[Tuple[Any, ...]] = []  # undo entries, while a checkpoint is open
+        self._checkpoints: List[Tuple[int, int]] = []  # (checkpoint, log length)
+        self._next_checkpoint = 0
+        self._locked: Optional[Tuple[Dict[bytes, Dict[int, int]], Set[bytes]]] = None
+
+    # -- the world underneath ------------------------------------------------
+
+    def _base(self, address: bytes) -> Record:
         world = self.world
-        if world is not None and address not in world.accounts:
-            raise StateMiss(accounts=[address])
-        return super()._get_encoded_account(address, from_journal)
+        if world is None:
+            return (0, 0, EMPTY_CODE)
+        record = world.accounts.get(address)
+        if record is None:
+            world.need(accounts=[address])
+            record = world.accounts[address]
+        return record
 
-    def get_code(self, address) -> bytes:
-        code = super().get_code(address)
+    def _base_slot(self, address: bytes, slot: int) -> int:
+        base = self._base(address)
+        if not (base[0] or base[1] or base[2]):
+            return 0  # an account that held nothing has no storage (never seeded)
+        world = cast("EvmWorld", self.world)
+        key = (address, slot)
+        if key not in world.storage:
+            world.need(slots=[key])
+        return world.storage[key]
+
+    def _record(self, address: bytes) -> Optional[Record]:
+        if address in self._records:
+            return self._records[address]
+        base = self._base(address)
+        return base if (base[0] or base[1] or base[2]) else None
+
+    # -- the journal -----------------------------------------------------------
+
+    def _note(self, entry: Tuple[Any, ...]) -> None:
+        if self._checkpoints:
+            self._log.append(entry)
+
+    def _set_record(self, address: bytes, record: Optional[Record]) -> None:
+        self._note(("record", address, address in self._records, self._records.get(address)))
+        self._records[address] = record
+
+    def _wipe(self, address: bytes) -> None:
+        self._note(("wipe", address, self._storage.get(address), address in self._wiped))
+        self._storage[address] = {}
+        self._wiped.add(address)
+
+    def _undo(self, entry: Tuple[Any, ...]) -> None:
+        kind = entry[0]
+        if kind == "record":
+            _, address, had, old = entry
+            if had:
+                self._records[address] = old
+            else:
+                self._records.pop(address, None)
+        elif kind == "slot":
+            _, address, slot, had, old = entry
+            slots = self._storage.setdefault(address, {})
+            if had:
+                slots[slot] = old
+            else:
+                slots.pop(slot, None)
+        elif kind == "wipe":
+            _, address, old, was_wiped = entry
+            if old is None:
+                self._storage.pop(address, None)
+            else:
+                self._storage[address] = old
+            if not was_wiped:
+                self._wiped.discard(address)
+        elif kind == "warm":
+            self._warm.discard(entry[1])
+
+    def record(self) -> Any:
+        checkpoint = self._next_checkpoint
+        self._next_checkpoint += 1
+        self._checkpoints.append((checkpoint, len(self._log)))
+        return checkpoint
+
+    def _find(self, checkpoint: Any) -> int:
+        for i in range(len(self._checkpoints) - 1, -1, -1):
+            if self._checkpoints[i][0] == checkpoint:
+                return i
+        raise ValidationError(f"checkpoint {checkpoint} is not open")
+
+    def discard(self, checkpoint: Any) -> None:
+        i = self._find(checkpoint)
+        length = self._checkpoints[i][1]
+        while len(self._log) > length:
+            self._undo(self._log.pop())
+        del self._checkpoints[i:]
+
+    def commit(self, checkpoint: Any) -> None:
+        del self._checkpoints[self._find(checkpoint) :]
+        if not self._checkpoints:
+            self._log.clear()
+
+    def lock_changes(self) -> None:
+        """End of a transaction: its changes become the next one's original values and can no
+        longer be reverted, and nothing is warm."""
+        self._locked = (
+            {address: dict(slots) for address, slots in self._storage.items()},
+            set(self._wiped),
+        )
+        self._warm.clear()
+        self._log.clear()
+        self._checkpoints.clear()
+
+    # -- roots (computed by the account store, not here) -----------------------
+
+    @property
+    def state_root(self) -> Hash32:
+        return BLANK_ROOT_HASH
+
+    @state_root.setter
+    def state_root(self, value: Hash32) -> None:
+        pass
+
+    def has_root(self, state_root: bytes) -> bool:
+        return state_root == BLANK_ROOT_HASH
+
+    def make_state_root(self) -> Hash32:
+        return BLANK_ROOT_HASH
+
+    def persist(self) -> MetaWitnessAPI:
+        return MetaWitness(set(), {})
+
+    # -- storage ----------------------------------------------------------------
+
+    def get_storage(self, address: Address, slot: int, from_journal: bool = True) -> int:
+        validate_canonical_address(address, title="Storage Address")
+        validate_uint256(slot, title="Storage Slot")
+        world = self.world
+        if world is not None:
+            world.touched_slots.add((address, slot))
+        if from_journal:
+            slots = self._storage.get(address)
+            if slots is not None and slot in slots:
+                return slots[slot]
+            if address in self._wiped:
+                return 0
+            return self._base_slot(address, slot)
+        if self._locked is not None:
+            locked, locked_wiped = self._locked
+            if address in locked and slot in locked[address]:
+                return locked[address][slot]
+            if address in locked_wiped:
+                return 0
+        if address in self._wiped:
+            return 0  # deleted storage: py-evm reads originals from the emptied trie
+        return self._base_slot(address, slot)
+
+    def set_storage(self, address: Address, slot: int, value: int) -> None:
+        validate_uint256(value, title="Storage Value")
+        validate_uint256(slot, title="Storage Slot")
+        validate_canonical_address(address, title="Storage Address")
+        world = self.world
+        if world is not None:
+            world.touched_slots.add((address, slot))
+            if address not in self._wiped:
+                self._base_slot(address, slot)  # loaded, so writing it back compares exactly
+        slots = self._storage.setdefault(address, {})
+        self._note(("slot", address, slot, slot in slots, slots.get(slot)))
+        slots[slot] = value
+
+    def delete_storage(self, address: Address) -> None:
+        validate_canonical_address(address, title="Storage Address")
+        self._set_record(address, self._record(address) or (0, 0, EMPTY_CODE))
+        self._wipe(address)
+
+    def is_storage_warm(self, address: Address, slot: int) -> bool:
+        return (address, slot) in self._warm
+
+    def mark_storage_warm(self, address: Address, slot: int) -> None:
+        key = (address, slot)
+        if key not in self._warm:
+            self._warm.add(key)
+            self._note(("warm", key))
+
+    # -- balance, nonce, code ----------------------------------------------------
+
+    def get_balance(self, address: Address) -> int:
+        validate_canonical_address(address, title="Storage Address")
+        record = self._record(address)
+        return record[0] if record else 0
+
+    def set_balance(self, address: Address, balance: int) -> None:
+        validate_canonical_address(address, title="Storage Address")
+        validate_uint256(balance, title="Account Balance")
+        _, nonce, code = self._record(address) or (0, 0, EMPTY_CODE)
+        self._set_record(address, (balance, nonce, code))
+
+    def get_nonce(self, address: Address) -> int:
+        validate_canonical_address(address, title="Storage Address")
+        record = self._record(address)
+        return record[1] if record else 0
+
+    def set_nonce(self, address: Address, nonce: int) -> None:
+        validate_canonical_address(address, title="Storage Address")
+        validate_uint64(nonce, title="Nonce")
+        balance, _, code = self._record(address) or (0, 0, EMPTY_CODE)
+        self._set_record(address, (balance, nonce, code))
+
+    def increment_nonce(self, address: Address) -> None:
+        self.set_nonce(address, self.get_nonce(address) + 1)
+
+    def get_code(self, address: Address) -> bytes:
+        validate_canonical_address(address, title="Storage Address")
+        record = self._record(address)
+        code = record[2] if record else EMPTY_CODE
         world = self.world
         if not code and world is not None and world.is_native(address):
             return NATIVE_STUB_CODE
         return code
 
-    def get_storage(self, address, slot: int, from_journal: bool = True) -> int:
-        world = self.world
-        if world is not None:
-            if not world.has_slot(address, slot):
-                raise StateMiss(slots=[(address, slot)])
-            world.touched_slots.add((address, slot))
-        return super().get_storage(address, slot, from_journal)
+    def set_code(self, address: Address, code: bytes) -> None:
+        validate_canonical_address(address, title="Storage Address")
+        validate_is_bytes(code, title="Code")
+        balance, nonce, _ = self._record(address) or (0, 0, EMPTY_CODE)
+        self._set_record(address, (balance, nonce, bytes(code)))
+
+    def get_code_hash(self, address: Address) -> Hash32:
+        validate_canonical_address(address, title="Storage Address")
+        record = self._record(address)
+        return Hash32(keccak(record[2])) if record and record[2] else EMPTY_SHA3
+
+    def delete_code(self, address: Address) -> None:
+        validate_canonical_address(address, title="Storage Address")
+        balance, nonce, _ = self._record(address) or (0, 0, EMPTY_CODE)
+        self._set_record(address, (balance, nonce, EMPTY_CODE))
+
+    # -- accounts -----------------------------------------------------------------
+
+    def account_has_code_or_nonce(self, address: Address) -> bool:
+        return self.get_nonce(address) != 0 or self.get_code_hash(address) != EMPTY_SHA3
+
+    def delete_account(self, address: Address) -> None:
+        validate_canonical_address(address, title="Storage Address")
+        self._record(address)  # loaded, so writing it back removes it
+        self._wipe(address)
+        self._set_record(address, None)
+
+    def account_exists(self, address: Address) -> bool:
+        validate_canonical_address(address, title="Storage Address")
+        return self._record(address) is not None
+
+    def touch_account(self, address: Address) -> None:
+        validate_canonical_address(address, title="Storage Address")
+        self._set_record(address, self._record(address) or (0, 0, EMPTY_CODE))
+
+    def account_is_empty(self, address: Address) -> bool:
+        return not self.account_has_code_or_nonce(address) and self.get_balance(address) == 0
+
+    def is_address_warm(self, address: Address) -> bool:
+        return address in self._warm
+
+    def mark_address_warm(self, address: Address) -> None:
+        if address not in self._warm:
+            self._warm.add(address)
+            self._note(("warm", address))
 
 
-class _PrecompilesWithTokens(Mapping):
-    """The fork's precompiles, plus every native token's and NFT collection's address (when
-    tokens are in play)."""
+# Precompiles py-evm runs in pure Python far slower than their Ethereum gas prices assume
+# (Ethereum clients run them natively): each is charged extra here so that, like everything
+# else, a block's worth of them executes at least as fast as the cheapest instructions do
+# (~1.9 Mgas/s: docs/BLOCK_LIMITS.md, measured with scripts/bench/evm_gas.py). Without it, a block
+# of bn128 pairings would take ~6 s on every node. Extra gas = per-call + per-input-unit.
+BN128_MUL_ADDRESS = (7).to_bytes(20, "big")
+BN128_PAIRING_ADDRESS = (8).to_bytes(20, "big")
+BN128_MUL_SURCHARGE = 12_000  # 6,000 → 18,000 (py_ecc: ~8.5 ms a multiplication)
+BN128_PAIRING_SURCHARGE_PER_PAIR = 316_000  # 34,000 → 350,000 a pair (~180 ms a pair)
+_PAIR_SIZE = 192
+
+
+def _surcharged(precompile, extra):
+    def run(computation):
+        computation.consume_gas(extra(computation.msg.data), reason="QRDX precompile surcharge")
+        return precompile(computation)
+
+    return run
+
+
+_SURCHARGES = {
+    BN128_MUL_ADDRESS: lambda data: BN128_MUL_SURCHARGE,
+    BN128_PAIRING_ADDRESS: lambda data: BN128_PAIRING_SURCHARGE_PER_PAIR
+    * (len(data) // _PAIR_SIZE),
+}
+
+
+class _WorldPrecompiles(Mapping):
+    """The fork's precompiles — the slow ones surcharged — plus every native token's and NFT
+    collection's address (when tokens are in play)."""
 
     def __init__(self, base, tokens):
         self.base, self.tokens = base, tokens
+        self._wrapped = {
+            address: _surcharged(base[address], extra)
+            for address, extra in _SURCHARGES.items()
+            if address in base
+        }
 
     def get(self, address, default=None):
-        fn = self.base.get(address)
+        fn = self._wrapped.get(address) or self.base.get(address)
         if fn is not None:
             return fn
-        if self.tokens.is_token(address):
+        tokens = self.tokens
+        if tokens is None:
+            return default
+        if tokens.is_token(address):
             from .native_token_evm import native_token_precompile
 
             return native_token_precompile
-        if self.tokens.is_collection(address):
+        if tokens.is_collection(address):
             from .nft_evm import nft_precompile
 
             return nft_precompile
@@ -136,9 +450,7 @@ class _PrecompilesWithTokens(Mapping):
 class WorldComputation(QRDXComputation):
     @property
     def precompiles(self):
-        tokens = getattr(self.state, "native_tokens", None)
-        base = super().precompiles
-        return base if tokens is None else _PrecompilesWithTokens(base, tokens)
+        return _WorldPrecompiles(super().precompiles, getattr(self.state, "native_tokens", None))
 
 
 class WorldState(QRDXState):
@@ -176,14 +488,22 @@ class EvmWorld:
         self.sm = state_manager
         self.tokens = tokens
         self.accounts: Dict[bytes, Tuple[int, int, bytes]] = {}  # address → (balance, nonce, code)
-        self.storage: Dict[Tuple[bytes, int], int] = {}  # loaded non-zero/known slots
-        self.full_storage: Set[bytes] = set()  # every slot of these is loaded
+        self.storage: Dict[Tuple[bytes, int], int] = {}  # loaded slots
         self.touched_slots: Set[Tuple[bytes, int]] = set()
+        self._loader: Optional[greenlet] = None  # where ``need`` switches to, under ``run``
 
     # -- loading ------------------------------------------------------------
 
     def has_slot(self, address: bytes, slot: int) -> bool:
-        return (address, slot) in self.storage or address in self.full_storage
+        return (address, slot) in self.storage
+
+    def need(self, accounts=(), slots=(), tokens=()) -> None:
+        """Make sure these are loaded before the execution reads them: in place under ``run``
+        (switching to it while it loads them), by raising StateMiss under ``run_sync``."""
+        miss = StateMiss(accounts, slots, tokens)
+        if self._loader is None:
+            raise miss
+        self._loader.switch(miss)
 
     def load_sync(self, miss: StateMiss) -> None:
         """Load from the manager's cache only (legacy synchronous callers)."""
@@ -209,14 +529,9 @@ class EvmWorld:
         account = await self.sm.get_account(h)
         code = await self.sm.get_code(h) if account.code_hash else EMPTY_CODE
         self.accounts[address] = (int(account.balance), int(account.nonce), bytes(code or b""))
-        slots = await self.sm.get_all_storage(h, limit=FULL_STORAGE_LIMIT)
-        if slots is not None:
-            for key, value in slots.items():
-                self.storage[(address, int.from_bytes(key, "big"))] = int.from_bytes(value, "big")
-            self.full_storage.add(address)
 
     async def load_slot(self, address: bytes, slot: int) -> None:
-        if (address, slot) in self.storage or address in self.full_storage:
+        if (address, slot) in self.storage:
             return
         raw = await self.sm.get_storage(_hex(address), int(slot).to_bytes(32, "big"))
         self.storage[(address, slot)] = int.from_bytes(raw, "big")
@@ -238,21 +553,9 @@ class EvmWorld:
     # -- a state for one execution ------------------------------------------
 
     def build_state(self, execution_context) -> WorldState:
-        """A fresh state holding exactly what is loaded, read through the world."""
-        db = AtomicDB(MemoryDB())
-        seed = WorldState(db, execution_context, BLANK_ROOT_HASH)
-        for address, (balance, nonce, code) in self.accounts.items():
-            if not (balance or nonce or code):
-                continue  # an empty account stays absent (EIP-161)
-            seed.set_balance(Address(address), balance)
-            seed.set_nonce(Address(address), nonce)
-            if code:
-                seed.set_code(Address(address), code)
-        for (address, slot), value in self.storage.items():
-            if value and address in self.accounts and any(self.accounts[address]):
-                seed.set_storage(Address(address), slot, value)
-        seed.persist()
-        state = WorldState(db, execution_context, seed.state_root)
+        """A fresh state over the world: it reads what is loaded, and what is not through
+        ``need``."""
+        state = WorldState(AtomicDB(MemoryDB()), execution_context, BLANK_ROOT_HASH)
         cast(WorldAccountDB, state._account_db).world = self  # WorldState.account_db_class
         state.native_tokens = self.tokens
         return state
@@ -298,16 +601,27 @@ class EvmWorld:
 
 
 async def run(world: EvmWorld, execute, preload: Iterable[bytes] = ()):
-    """Run ``execute()`` (a synchronous EVM execution over ``world``) until nothing it needs is
-    missing: each StateMiss is loaded and the execution starts again from the beginning."""
+    """Run ``execute()`` (a synchronous EVM execution over ``world``) in a greenlet: whenever it
+    needs something not loaded, it switches back here, the world loads it, and the execution
+    resumes where it stopped. (A StateMiss raised outright — by code that does not go through
+    ``need`` — is loaded and the execution started again.)"""
     for address in preload:
         if address:
             await world.load_account(bytes(address))
     for _ in range(MAX_LOAD_ROUNDS):
+        child = greenlet(execute)
+        child.gr_context = contextvars.copy_context()  # a new greenlet's context is empty
+        world._loader = greenlet.getcurrent()
         try:
-            return execute()
+            result = child.switch()
+            while not child.dead:
+                await world.load(result)  # what the execution needs
+                result = child.switch()
+            return result
         except StateMiss as miss:
             await world.load(miss)
+        finally:
+            world._loader = None
     raise RuntimeError("EVM execution kept needing more state")
 
 

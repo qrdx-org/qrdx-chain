@@ -55,7 +55,15 @@ from .commitment import Section, committed, encode_value, verifying
 from .governance import Governance, GovernanceError, veto_escrow_address
 from .nfts import NftError, NftRegistry, token_id as nft_token_id
 from .oracle import TWAPOracle
-from .orderbook import Order, OrderBook, OrderSide, OrderType, SelfTradeAction, _pinned
+from .orderbook import (
+    MatchBudget,
+    Order,
+    OrderBook,
+    OrderSide,
+    OrderType,
+    SelfTradeAction,
+    _pinned,
+)
 from .perpetual import PerpEngine
 from .router import FillSource, UnifiedRouter
 from .tokens import (
@@ -69,8 +77,10 @@ from .tokens import (
 )
 from .transactions import (
     EXCHANGE_GAS_COSTS,
+    EXCHANGE_GAS_PER_MAKER,
     ExchangeOpType,
     ExchangeTransaction,
+    match_budget,
 )
 
 logger = logging.getLogger(__name__)
@@ -1054,9 +1064,11 @@ class ExchangeStateManager:
                     f"available {avail}",
                 )
 
+        makers = match_budget(ExchangeOpType.PLACE_ORDER, getattr(tx, "gas_limit", None))
+        budget = MatchBudget(makers) if makers is not None else None
         try:
             with self._atomic(book):
-                trades = book.place_order(order)
+                trades = book.place_order(order, budget=budget)
                 if self.enforce_orderbook_settlement:
                     self._settle_orderbook(order, trades, base, quote, pair)
         except ValueError as e:
@@ -1065,7 +1077,8 @@ class ExchangeStateManager:
         self._total_orders += 1
         return ExchangeExecResult(
             success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PLACE_ORDER],
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PLACE_ORDER]
+            + (budget.visited if budget is not None else 0) * EXCHANGE_GAS_PER_MAKER,
             data={
                 "order_id": order.id,
                 "trades": len(trades),
@@ -2196,6 +2209,7 @@ class ExchangeStateManager:
                 tx.nonce,
                 reduce_only=bool(p.get("reduce_only", False)),
                 ioc=str(p.get("tif", "gtc")).lower() == "ioc",
+                max_makers=match_budget(ExchangeOpType.PERP_ORDER, getattr(tx, "gas_limit", None)),
             )
         except (ClearinghouseError, ValueError) as e:
             return ExchangeExecResult(success=False, error=str(e))
@@ -2206,8 +2220,12 @@ class ExchangeStateManager:
         if self.clearinghouse.last_cancelled:
             # Resting orders the fills left an account unqualified for (theirs or a maker's).
             data["cancelled"] = self.clearinghouse.last_cancelled
+        visited = self.clearinghouse.last_makers_visited
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_ORDER], data=data
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_ORDER]
+            + visited * EXCHANGE_GAS_PER_MAKER,
+            data=data,
         )
 
     def _op_perp_cancel(self, tx: ExchangeTransaction) -> ExchangeExecResult:

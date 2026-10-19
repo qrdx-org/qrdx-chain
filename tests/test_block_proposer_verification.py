@@ -11,10 +11,10 @@ a tampered signed field, a forged signature, a swapped public key, and a
 missing-field block all fail.
 """
 
-import hashlib
 
 from qrdx.crypto.pq.dilithium import PQPrivateKey
 from qrdx.validator.block_verification import (
+    body_root,
     verify_pos_block_proposer,
     reconstruct_signing_root,
 )
@@ -36,11 +36,14 @@ def _signed_block(key: PQPrivateKey, **overrides):
         "randao_reveal": "",  # none unless RANDAO selection is scheduled
         "attestations": [],
         "graffiti": "",
+        "base_fee": 10 ** 9,
+        "exchange_base_fee": 10 ** 9,
     }
     bc.update(overrides)
+    bc.setdefault("body_root", body_root(bc))
     signing_root = reconstruct_signing_root(bc)
     bc["proposer_signature"] = key.sign(signing_root).to_bytes().hex()
-    bc["hash"] = hashlib.sha256(b"whatever").hexdigest()
+    bc["hash"] = signing_root.hex()
     return bc, addr
 
 

@@ -8,7 +8,6 @@ the SAME proposer for the SAME slot with different hashes. A malicious proposer 
 able to fabricate a slash for an honest validator (it would need that validator's signature
 over two blocks), and the benign equal-height race (distinct proposers) must never validate.
 """
-import hashlib
 import os
 import tempfile
 
@@ -16,7 +15,7 @@ import pytest
 
 from qrdx.crypto.pq.dilithium import PQPrivateKey
 from qrdx.database_sqlite import DatabaseSQLite
-from qrdx.validator.block_verification import reconstruct_signing_root
+from qrdx.validator.block_verification import body_root, reconstruct_signing_root
 from qrdx.validator.slashing_block import (
     make_double_sign_evidence, verify_double_sign_evidence,
     extract_slashing_evidence_from_dict, record_block_slashing_evidence, BLOCK_SLASHING_KEY,
@@ -45,11 +44,12 @@ def _signed_header(key: PQPrivateKey, slot=7, **overrides):
         "transactions_root": "ef" * 32, "timestamp": 1700000000,
         "proposer_address": addr, "proposer_public_key": key.public_key.to_bytes().hex(),
         "slot": slot, "epoch": 0, "randao_reveal": "",  # none unless RANDAO selection is scheduled
+        "base_fee": 10 ** 9, "exchange_base_fee": 10 ** 9,
     }
     bc.update(overrides)
+    bc.setdefault("body_root", body_root(bc))            # the header commits to the body
     bc["proposer_signature"] = key.sign(reconstruct_signing_root(bc)).to_bytes().hex()
-    # hash is derived from content (distinct content → distinct hash); make it explicit.
-    bc["hash"] = hashlib.sha256(repr(sorted(bc.items())).encode()).hexdigest()
+    bc["hash"] = reconstruct_signing_root(bc).hex()      # a block's hash is its signing root
     return bc, addr
 
 

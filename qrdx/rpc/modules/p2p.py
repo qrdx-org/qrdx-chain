@@ -143,7 +143,8 @@ class P2PModule(RPCModule):
         )
         self._network_identity: Any = None  # async () -> this node's network identity (main)
         self._check_peer_identity: Any = None  # async (remote) -> (ok, reason) (main)
-        self._verify_chain_rules: Any = None  # async (content, height) -> (ok, err) (main)
+        # async (content, height, exchange section, evm section, hash) -> (ok, err) (main)
+        self._verify_chain_rules: Any = None
         self._on_fork: Any = None  # (peer id, reason) -> None: resolve a fork now (main)
 
     # ---- wiring (called once at startup from main.py) --------------------
@@ -237,7 +238,10 @@ class P2PModule(RPCModule):
         differ (an equal-height fork), decide whether the incoming WINS the
         lowest-hash canonical rule. Logs the comparison and returns True iff the
         incoming should replace the stored block. Pure read; never mutates state."""
-        from ...validator.block_verification import _parse_block_content
+        from ...validator.block_verification import (
+            _parse_block_content,
+            reconstruct_signing_root,
+        )
 
         stored = await self._db.get_block_by_id(block_no)
         if not stored:
@@ -246,6 +250,14 @@ class P2PModule(RPCModule):
         incoming_hash = block_data.get("block_hash")
         if not stored_hash or not incoming_hash or stored_hash == incoming_hash:
             return False  # same block (a re-broadcast) — not a fork
+        try:  # the hash it was sent under must be its header's: a sender cannot choose it
+            if (
+                str(incoming_hash).lower().removeprefix("0x")
+                != reconstruct_signing_root(_parse_block_content(block_content)).hex()
+            ):
+                return False
+        except Exception:
+            return False
         try:
             inc_parent = _parse_block_content(block_content).get("parent_hash")
             stored_parent = _parse_block_content(
@@ -477,11 +489,15 @@ class P2PModule(RPCModule):
                         self._signal_fork(block_no, block_data, "a block on another branch")
                         return {"ok": False, "error": f"Parent discontinuity: {par_err}"}
 
-                # Slot progression and FFG votes (main._verify_chain_rules).
+                # Block limits, slot progression and FFG votes (main._verify_chain_rules).
                 if self._verify_chain_rules is not None:
                     try:
                         ok_votes, votes_err = await self._verify_chain_rules(
-                            block_content, block_no
+                            block_content,
+                            block_no,
+                            block_data.get("exchange_transactions"),
+                            block_data.get("evm_transactions"),
+                            block_hash,
                         )
                     except Exception as e:
                         ok_votes, votes_err = False, f"vote verification error: {e}"

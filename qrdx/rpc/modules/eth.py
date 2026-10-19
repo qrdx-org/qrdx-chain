@@ -641,12 +641,12 @@ class EthModule(RPCModule):
     @rpc_method
     async def gasPrice(self) -> str:
         """
-        Returns the current gas price.
-
-        QRDX is fee-less for native transactions; EVM transactions use
-        a minimum base fee of 1 gwei for EIP-1559 compatibility.
+        The gas price to offer: the next block's EVM base fee, with headroom for one more full
+        block (qrdx/fee_market.py) — the floor when the chain is quiet.
         """
-        return _to_hex(1_000_000_000)  # 1 gwei
+        from ...fee_market import suggested_prices
+
+        return _to_hex((await suggested_prices(self._db()))[0])
 
     @rpc_method
     async def maxPriorityFeePerGas(self) -> str:
@@ -660,22 +660,41 @@ class EthModule(RPCModule):
         newest_block: str = "latest",
         reward_percentiles: Optional[List[float]] = None,
     ) -> Dict:
-        """Returns base-fee-per-gas history (EIP-1559)."""
+        """Base fee per gas of each block in the range and of the next one, and the share of its
+        gas limit each block's EVM transactions declared (qrdx/fee_market.py)."""
+        from ...constants import BLOCK_GAS_LIMIT
+        from ...fee_market import base_fees_at, fee_gas, header_fees
+        from ...validator.block_verification import _parse_block_content
+
         count = _safe_int(block_count, 1)
         count = max(1, min(count, 1024))
         newest = await self._resolve_block_tag(newest_block)
-
-        base_fees = ["0x0"] * (count + 1)
-        gas_used_ratios = [0.0] * count
         oldest = max(0, newest - count + 1)
+        db = self._db()
+
+        base_fees, gas_used_ratios = [], []
+        for height in range(oldest, newest + 1):
+            block = await self._get_block(height)
+            content = None
+            if block:
+                try:
+                    content = _parse_block_content(
+                        block.get("content") or block.get("block_content")
+                    )
+                except Exception:
+                    content = None
+            base_fees.append(_to_hex(header_fees(content)[0]))
+            evm = await db.get_block_evm_txs(block.get("hash")) if block else []
+            gas_used_ratios.append(fee_gas([], evm)[0] / BLOCK_GAS_LIMIT)
+        base_fees.append(_to_hex((await base_fees_at(db, newest + 1))[0]))
 
         result: Dict[str, Any] = {
             "oldestBlock": _to_hex(oldest),
             "baseFeePerGas": base_fees,
             "gasUsedRatio": gas_used_ratios,
         }
-        if reward_percentiles:
-            result["reward"] = [["0x0"] * len(reward_percentiles)] * count
+        if reward_percentiles:  # no priority fees: everything is burned
+            result["reward"] = [["0x0"] * len(reward_percentiles)] * len(gas_used_ratios)
         return result
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1366,7 +1385,7 @@ class EthModule(RPCModule):
         to_hex = transaction.get("to")
         data_hex = transaction.get("data", transaction.get("input", "0x"))
         value_str = transaction.get("value", "0x0")
-        gas_str = transaction.get("gas", "0x989680")  # 10M default
+        gas_str = transaction.get("gas")  # at most the block gas limit (QRDXEVMExecutor.call)
 
         if not to_hex:
             raise RPCError(RPCErrorCode.INVALID_PARAMS, "eth_call requires 'to' address")
@@ -1375,7 +1394,7 @@ class EthModule(RPCModule):
         to = to_canonical_address(to_hex)
         data = decode_hex(data_hex)
         value = _parse_hex_int(value_str)
-        gas = _parse_hex_int(gas_str)
+        gas = _parse_hex_int(gas_str) if gas_str else None
 
         evm = self._evm()
         result = await self._run_world(

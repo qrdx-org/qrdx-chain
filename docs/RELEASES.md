@@ -192,7 +192,10 @@ the diff, and run `scripts/release/test-image.sh` on an image built with it.
    the same `X.Y.Z`. Run `scripts/release/lock-deps.sh --check`. Make sure every submodule
    commit is pushed to its public repository: a fresh clone must be able to fetch it. If the
    release ships a new fork, append it to the network's `networks/<name>/genesis_config.json`
-   (PROTOCOL_UPGRADES.md §4 and §8).
+   (PROTOCOL_UPGRADES.md §4 and §8). Append each live network's latest finalized block to its
+   spec's `checkpoints`. Read it with `qrdx_weakSubjectivityCheckpoint` from several nodes the
+   maintainers run, and check that they agree. New nodes trust it, so they cannot be led down a
+   long-range fork (WEAK_SUBJECTIVITY.md).
 2. **Preflight.** Run `python3 scripts/release/release.py preflight --ref HEAD`. It refuses
    when:
    - the tree is dirty;

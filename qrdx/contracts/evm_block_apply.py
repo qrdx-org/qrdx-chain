@@ -38,11 +38,33 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
+from ..fee_market import CURRENT_EVM_BASE_FEE, base_fees_at
 from .evm_mempool import parse_eth_raw_tx, verify_delegated_spend
 from .native_token_evm import CURRENT_SECTION, EvmSection
 from .state import ContractStateManager
 
 logger = logging.getLogger(__name__)
+
+
+def section_gas_error(raw_txs: Optional[List[str]]) -> str:
+    """Why an EVM section may not be in a block, or "" if it may: its transactions' declared gas
+    limits must sum to at most ``BLOCK_GAS_LIMIT`` (docs/BLOCK_LIMITS.md). Checked before any
+    of them runs, on every import path, so a block cannot make every node execute more than the
+    limit allows. Each transaction must authenticate (``parse_eth_raw_tx``) to be counted."""
+    from ..constants import BLOCK_GAS_LIMIT
+
+    total = 0
+    for i, raw in enumerate(raw_txs or ()):
+        try:
+            total += int(parse_eth_raw_tx(raw)["gas"])
+        except Exception as e:
+            return f"evm tx {i} failed verification: {e}"
+        if total > BLOCK_GAS_LIMIT:
+            return (
+                f"evm section exceeds the block gas limit ({total} > {BLOCK_GAS_LIMIT} at tx {i})"
+            )
+    return ""
+
 
 # execute_tx(raw_tx_hex, block_height, block_hash, block_timestamp) -> result dict
 #   The callable MUST execute the tx with deferred commit (changes stay in the
@@ -95,6 +117,7 @@ async def produce_block_evm_section(
     state_manager.reset_cache()
     section = EvmSection()  # this section's native token moves, pending
     token = CURRENT_SECTION.set(section)
+    fee_token = CURRENT_EVM_BASE_FEE.set((await base_fees_at(db, block_height))[0])  # BASEFEE
     block_snap = await state_manager.snapshot()
     try:
         for _i, raw in enumerate(raw_txs):
@@ -107,6 +130,7 @@ async def produce_block_evm_section(
         return None, []
     finally:
         CURRENT_SECTION.reset(token)
+        CURRENT_EVM_BASE_FEE.reset(fee_token)
 
     await state_manager.commit(block_height, flush_only=True)
     root = await db.get_account_state_root(block_height)
@@ -242,6 +266,10 @@ async def apply_block_evm_section(
     if not declared_state_root:
         return False, "evm section present but block declares no account_state_root"
 
+    gas_error = section_gas_error(raw_txs)
+    if gas_error:
+        return False, f"block {block_height}: {gas_error}"
+
     # 1. Authenticate every tx before mutating any state.
     for i, raw in enumerate(raw_txs):
         try:
@@ -260,6 +288,7 @@ async def apply_block_evm_section(
     state_manager.reset_cache()
     section = EvmSection()
     token = CURRENT_SECTION.set(section)
+    fee_token = CURRENT_EVM_BASE_FEE.set((await base_fees_at(db, block_height))[0])  # BASEFEE
     block_snap = await state_manager.snapshot()
 
     # 3. Replay deterministically, deferring per-tx commits.
@@ -280,6 +309,7 @@ async def apply_block_evm_section(
         return False, f"evm execution raised in block {block_height}: {e}"
     finally:
         CURRENT_SECTION.reset(token)
+        CURRENT_EVM_BASE_FEE.reset(fee_token)
 
     # 4. Flush-read-decide on a single connection (no competing commit here).
     await state_manager.commit(block_height, flush_only=True)

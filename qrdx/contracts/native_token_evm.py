@@ -416,7 +416,10 @@ class TokenWorld:
 
         key = (token, holder)
         if key not in self.loaded:
-            raise StateMiss(tokens=[key])
+            world = getattr(getattr(state, "_account_db", None), "world", None)
+            if world is None:
+                raise StateMiss(tokens=[key])
+            world.need(tokens=[key])  # loaded in place (or StateMiss for run_sync)
         value = self.loaded[key]
         for entry in state.token_journal:
             if entry[0] == "bal" and entry[1] == token and entry[2] == holder:

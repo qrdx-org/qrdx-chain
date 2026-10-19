@@ -103,8 +103,24 @@ async def _tip(chain):
 
 
 async def _common(ours, theirs, epochs):
-    for c in (ours, theirs):
-        await c.epochs(1, epochs, voters=[0, 1, 2, 3])
+    """The shared history: built once and copied, block for block (a vote is a fresh,
+    randomized signature, and a block's hash commits to the votes it carries)."""
+    await ours.epochs(1, epochs, voters=[0, 1, 2, 3])
+    await copy_blocks(ours, theirs)
+
+
+async def copy_blocks(src, dst):
+    cur = await src.db.connection.execute(
+        "SELECT block_hash, block_height, content FROM blocks WHERE block_height > ? "
+        "ORDER BY block_height", (dst.height,))
+    for bh, height, content in await cur.fetchall():
+        await dst.db.connection.execute(
+            "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, ?, ?, 0)",
+            (bh, height, content))
+        dst.height = height
+        dst.hashes.append(bh)
+        dst.slots.append(src.slots[height])
+    await dst.db.connection.commit()
 
 
 async def test_a_newer_justified_checkpoint_wins_over_a_longer_branch(setup):

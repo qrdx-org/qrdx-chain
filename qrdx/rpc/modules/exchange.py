@@ -67,6 +67,8 @@ class ExchangeModule(RPCModule):
     async def getSigningPayload(self, tx: Dict[str, Any]) -> Dict[str, Any]:
         from ...exchange.submission import signing_payload
 
+        if isinstance(tx, dict) and "gas_price" not in tx:
+            tx = dict(tx, gas_price=str(await self.gasPrice()))  # what the next block takes
         try:
             return signing_payload(tx)
         except Exception as e:
@@ -80,10 +82,16 @@ class ExchangeModule(RPCModule):
 
     @rpc_method
     async def gasPrice(self) -> int:
-        """The exchange gas price to use, in wei per gas: the consensus floor."""
+        """The exchange gas price to offer, in wei per gas: the next block's base fee with
+        headroom for one more full block (qrdx/fee_market.py) — the floor when the chain is
+        quiet."""
         from ... import constants
+        from ...fee_market import suggested_prices
 
-        return constants.EXCHANGE_MIN_GAS_PRICE_WEI
+        db = getattr(self.context, "db", None)
+        if db is None:
+            return constants.EXCHANGE_MIN_GAS_PRICE_WEI
+        return (await suggested_prices(db))[1]
 
     @rpc_method
     async def getNonce(self, address: str) -> int:

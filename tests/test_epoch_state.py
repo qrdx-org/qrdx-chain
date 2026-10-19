@@ -578,3 +578,37 @@ async def test_the_batched_computation_equals_the_per_epoch_one(chain, monkeypat
     chain.tag = "r"
     await build(epoch_of[tip // 2] + 1, 45)                    # … and a different future
     await check([44, 45, 39, 12], chain.height, fresh=False)   # never from a stale state
+
+
+# ── the validator cap: an activation queue ──────────────────────────────────
+
+def test_no_more_than_max_validators_propose_the_rest_wait_their_turn(monkeypatch):
+    """MAX_VALIDATORS was declared and never enforced: any number of validators could join, each
+    adding a 3.3 KB vote every epoch that every node verifies and stores. Past the cap a
+    deposit waits — in the order it became due — until a validator leaves."""
+    monkeypatch.setattr(constants, "MAX_VALIDATORS", 4)
+    s = genesis_state([{"address": a, "stake": 100_000} for a in G])          # 3 proposing
+    joiners = [f"0xPQ{c * 64}" for c in "123"]
+    s = transition(s, 1, _inputs([("deposit", j, "pk", D(100_000)) for j in reversed(joiners)]))
+    for e in range(2, 2 + ACTIVATION_DELAY_EPOCHS):
+        s = transition(s, e, _inputs())
+    statuses = {j: s[j].status for j in joiners}
+    assert statuses == {joiners[0]: "active", joiners[1]: "pending", joiners[2]: "pending"}
+    assert len(ES.proposers(s)) == 4
+    # A validator leaves: the next in line takes its place once its exit completes.
+    e = 2 + ACTIVATION_DELAY_EPOCHS
+    s = transition(s, e, _inputs([("exit", G[0], None, None)]))
+    s = transition(s, s[G[0]].exit_epoch, _inputs())
+    assert s[G[0]].status == "exited" and s[joiners[1]].status == "active"
+    assert s[joiners[2]].status == "pending" and len(ES.proposers(s)) == 4
+
+
+def test_a_queued_validator_can_leave_the_queue():
+    s = genesis_state([{"address": a, "stake": 100_000} for a in G])
+    s = transition(s, 1, _inputs([("deposit", J, "pk", D(100_000))]))
+    s = transition(s, 2, _inputs([("exit", J, None, None)]))
+    assert s[J].status == "exited"                    # (its principal is paid back as any exit)
+
+
+def test_the_cap_fits_the_votes_an_epoch_can_carry():
+    assert constants.MAX_VALIDATORS <= constants.MAX_ATTESTATIONS_PER_BLOCK * SLOTS_PER_EPOCH

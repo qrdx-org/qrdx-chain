@@ -76,11 +76,20 @@ class Chain:
         os.remove(self.path)
 
     async def block(self, slot, votes=(), tag="a"):
+        """A block as a proposer makes it: a full header committing to its body, whose hash is
+        its signing root (the tag keeps branches apart)."""
+        from qrdx.validator.block_verification import body_root, reconstruct_signing_root
+
         self.height += 1
-        h = hashlib.sha256(f"{tag}:{self.height}:{slot}".encode()).hexdigest()
         content = {"number": self.height, "slot": slot, "epoch": slot // S,
                    "parent_hash": self.hashes[-1] if self.hashes else "0" * 64,
+                   "state_root": hashlib.sha256(f"{tag}:{self.height}:{slot}".encode()).hexdigest(),
+                   "transactions_root": "0" * 64, "timestamp": 1_700_000_000 + slot,
+                   "proposer_address": "0xPQ" + "0" * 64, "randao_reveal": "",
+                   "base_fee": 10 ** 9, "exchange_base_fee": 10 ** 9,
                    "attestations": [v.to_dict() for v in votes]}
+        content["body_root"] = body_root(content)
+        h = reconstruct_signing_root(content).hex()
         await self.db.connection.execute(
             "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, ?, ?, 0)",
             (h, self.height, repr(content)),

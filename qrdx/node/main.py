@@ -1999,10 +1999,62 @@ async def _current_slot() -> Optional[int]:
     return max(0, int((time.time() - _GENESIS_TIME["t"]) // SLOT_DURATION))
 
 
-async def _verify_chain_rules(block_content, block_height) -> Tuple[bool, str]:
+async def _verify_trusted_checkpoints() -> None:
+    """The database must be on the trusted chain (qrdx/checkpoints.py): refuse to start if it
+    holds another block at a checkpoint height; warn if it is older than the weak-subjectivity
+    period and nothing newer is trusted."""
+    from .. import checkpoints
+    from ..validator.node_integration import parse_block_timestamp
+
+    error = await checkpoints.startup_error(db)
+    if error:
+        raise ChainIdentityError(error)
+    tip = int(await db.get_next_block_id()) - 1
+    block = await db.get_block_by_id(tip) if tip >= 1 else None
+    stamp = parse_block_timestamp(block.get("timestamp")) if block else None
+    warning = checkpoints.staleness_warning(
+        tip, stamp.timestamp() if stamp is not None else None, time.time()
+    )
+    if warning:
+        logger.warning(f"[weak subjectivity] {warning}")
+    height, block_hash = checkpoints.describe()
+    if height >= 0:
+        logger.info(
+            f"[weak subjectivity] trusting checkpoint {block_hash[:16]}… at height {height}"
+        )
+
+
+def _warn_slow_crypto() -> None:
+    """Without coincurve (a release dependency), eth-keys recovers each EVM transaction's sender
+    in pure Python — ~15 ms instead of ~0.1 ms — and this node falls behind any block carrying
+    many (docs/BLOCK_LIMITS.md). Same results, so it is a warning, not a refusal."""
+    try:
+        from eth_keys.backends import get_backend
+
+        backend = type(get_backend()).__name__
+    except Exception as e:
+        backend = f"unavailable ({e})"
+    if "CoinCurve" not in backend:
+        logger.error(
+            f"secp256k1 runs on the {backend} backend, not coincurve: install the release "
+            "dependencies (release/requirements.lock) — this node verifies EVM transactions ~100x "
+            "slower and will fall behind full blocks"
+        )
+
+
+async def _verify_chain_rules(
+    block_content, block_height, exchange_section=None, evm_section=None, block_hash=None
+) -> Tuple[bool, str]:
     """The rules a block must satisfy against the chain it extends, run by every import path
     after the parent check and before anything is applied:
 
+    * it is the block its proposer signed: its body matches the ``body_root`` in its signed
+      header, and ``block_hash`` (as received) is its header's hash
+      (block_verification.block_integrity_error; the sections, where they travel beside the
+      content, are passed in);
+    * at a trusted checkpoint's height, it is that checkpoint (qrdx/checkpoints.py);
+    * it carries no more than a block may — gas, votes, slashing proofs (qrdx/block_limits.py);
+    * it declares the base fees its parent sets, and pays them (qrdx/fee_market.py);
     * its slot is later than its parent's and not ahead of the clock
       (block_verification.verify_slot_progression);
     * every attestation it carries is a valid Casper FFG vote for this chain — known key,
@@ -2020,6 +2072,30 @@ async def _verify_chain_rules(block_content, block_height) -> Tuple[bool, str]:
         return False, f"unparseable block: {e}"
     if not isinstance(bc, dict):
         return False, "unparseable block"
+    from .. import checkpoints
+    from ..block_limits import block_resource_error
+    from ..fee_market import base_fees_at, block_fee_error
+    from ..validator.block_verification import block_integrity_error, reconstruct_signing_root
+
+    if exchange_section is None:
+        exchange_section = bc.get("exchange_transactions")
+    if evm_section is None:
+        evm_section = bc.get("evm_transactions")
+    try:
+        wrong = block_integrity_error(bc, exchange_section, evm_section, block_hash)
+        trusted = checkpoints.trusted()
+        if not wrong and int(block_height) in trusted:  # weak subjectivity (checkpoints.py)
+            own_hash = block_hash or reconstruct_signing_root(bc).hex()
+            wrong = checkpoints.checkpoint_error(int(block_height), own_hash, trusted)
+        if not wrong:
+            wrong = block_resource_error(bc, exchange_section, evm_section)
+        if not wrong:
+            expected = await base_fees_at(db, int(block_height))
+            wrong = block_fee_error(bc, exchange_section, evm_section, expected)
+    except Exception as e:
+        wrong = f"unreadable block contents: {e}"
+    if wrong:
+        return False, wrong
     try:
         ok, err = await verify_slot_progression(db, bc, int(block_height), await _current_slot())
         if not ok:
@@ -2147,6 +2223,11 @@ async def _apply_evm_section_on_import(
     """
     if not evm_section:
         return True, ""
+    from ..contracts.evm_block_apply import section_gas_error
+
+    gas_error = section_gas_error(evm_section)  # a validity rule on every path (BLOCK_LIMITS.md)
+    if gas_error:
+        return False, f"block {block_height}: {gas_error}"
     if EVM_STATE_MANAGER is None:
         logger.warning(
             "EVM section present but EVM disabled on this node — storing without applying"
@@ -3676,8 +3757,14 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
             logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {par_err}")
             return False
 
-        # Slot progression and FFG votes (qrdx/validator/ffg.py) — _verify_chain_rules.
-        ok_votes, votes_err = await _verify_chain_rules(block_content, block_height)
+        # Block limits, slot progression and FFG votes — _verify_chain_rules.
+        ok_votes, votes_err = await _verify_chain_rules(
+            block_content,
+            block_height,
+            block.get("exchange_transactions") or block_info.get("exchange_transactions"),
+            block.get("evm_transactions") or block_info.get("evm_transactions"),
+            block_hash,
+        )
         if not ok_votes:
             logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {votes_err}")
             return False
@@ -4248,10 +4335,10 @@ async def _rollback_to(
     # showed legitimate reorgs never cross finality (0 crossings, deterministic
     # boundary across nodes). Gated for revertibility.
     if _ENFORCE_FINALITY_REORG_GUARD:
-        try:
-            from ..validator.finality import finalized_block_height
+        try:  # finality, or a trusted checkpoint above it (qrdx/checkpoints.py)
+            from ..checkpoints import reorg_floor
 
-            _final_h = await finalized_block_height(db)
+            _final_h = await reorg_floor(db)
         except Exception as e:
             logger.debug(f"[REORG] finality guard check skipped: {e}")
             _final_h = -1
@@ -4342,16 +4429,20 @@ def _transfer_parent(block_info: dict) -> Optional[str]:
 
 def _parse_transfer_block(block_info: dict) -> Optional[Tuple[int, str, int, list]]:
     """(height, hash, slot, attestations) of a block as peers transfer it (fork-choice
-    scoring), or None if it cannot be read."""
+    scoring), or None if it cannot be read — or if the hash it was sent under is not its
+    header's (a branch is scored by its hashes; the import verifies everything else)."""
     from ..validator.attestation_block import extract_attestations_from_dict
-    from ..validator.block_verification import _parse_block_content
+    from ..validator.block_verification import _parse_block_content, reconstruct_signing_root
 
     try:
         b = block_info["block"]
         bc = _parse_block_content(b.get("content") or b.get("block_content"))
+        claimed = str(b.get("hash") or b.get("block_hash") or "")
+        if claimed.lower().removeprefix("0x") != reconstruct_signing_root(bc).hex():
+            return None
         return (
             int(b.get("id", b.get("block_height"))),
-            b.get("hash") or b.get("block_hash"),
+            claimed,
             int(bc["slot"]),
             extract_attestations_from_dict(bc),
         )
@@ -4379,7 +4470,6 @@ async def resolve_fork_with_peer(peer_id: str, reason: str = "") -> bool:
     if not peer or not peer.get("url"):
         return False
     from ..validator import ffg
-    from ..validator.finality import finalized_block_height
 
     async with _fork_resolution_lock:
         iface = NodeInterface(peer["url"], client=http_client, db=db)
@@ -4395,8 +4485,10 @@ async def resolve_fork_with_peer(peer_id: str, reason: str = "") -> bool:
         if remote_height < 0 or remote.get("last_block_hash") == local_tip:
             return False
 
-        # 1. The common ancestor.
-        final_h = await finalized_block_height(db)
+        # 1. The common ancestor — never below finality or a trusted checkpoint.
+        from ..checkpoints import reorg_floor
+
+        final_h = await reorg_floor(db)
         hi = min(local_height, remote_height)
         lo = max(0, final_h, hi - _FORK_SEARCH_DEPTH)
         resp = await iface.get_block_hashes(lo, hi)
@@ -5072,6 +5164,8 @@ async def startup():
 
     # The database must belong to this chain spec before anything applies a block to it.
     GENESIS_BLOCK_HASH = await _verify_chain_identity()
+    _warn_slow_crypto()
+    await _verify_trusted_checkpoints()
     _next = CHAIN_SPEC.next_fork(max(0, await db.get_next_block_id() - 1))
     logger.info(
         f"[chain-spec] genesis {GENESIS_BLOCK_HASH[:16]}… verified; "
@@ -5434,7 +5528,6 @@ async def startup():
                         to=to,
                         data=data,
                         value=0,
-                        gas=10000000,
                         block_number=max(tip, 1),
                         timestamp=_evm_block_timestamp((tip_block or {}).get("timestamp")),
                         world=world,
@@ -6550,7 +6643,13 @@ async def submit_block(
             if not ok_par:
                 return {"ok": False, "error": f"Parent discontinuity: {par_err}"}
 
-            ok_votes, votes_err = await _verify_chain_rules(block_content, block_no)
+            ok_votes, votes_err = await _verify_chain_rules(
+                block_content,
+                block_no,
+                body.get("exchange_transactions"),
+                body.get("evm_transactions"),
+                block_hash,
+            )
             if not ok_votes:
                 return {"ok": False, "error": f"Chain rules: {votes_err}"}
 

@@ -443,6 +443,30 @@ class QRDXModule(RPCModule):
             CHAIN_SPEC, genesis.get("hash") or genesis.get("block_hash"), tip, NODE_VERSION
         )
 
+    @rpc_method
+    async def weakSubjectivityCheckpoint(self) -> Dict[str, Any]:
+        """A checkpoint to give a new node (qrdx/checkpoints.py, docs/WEAK_SUBJECTIVITY.md): the
+        finalized block this node holds, as ``QRDX_TRUSTED_CHECKPOINT`` takes it, with the
+        checkpoint this node itself trusts and the weak-subjectivity period. Ask a node you
+        trust: a checkpoint is only as good as its source."""
+        from ... import checkpoints
+        from ...validator.finality import finalized_block_height
+
+        if not self.context or not self.context.db:
+            raise RPCError(RPCErrorCode.RESOURCE_UNAVAILABLE, "Node not ready")
+        db = self.context.db
+        height = int(await finalized_block_height(db))
+        block_hash = ""
+        if height >= 1:
+            block_hash = (await db.get_block_hashes(height, height)).get(height, "")
+        trusted_height, trusted_hash = checkpoints.describe()
+        return {
+            "finalized": {"height": height, "hash": block_hash},
+            "env": f"{checkpoints.ENV}={height}:{block_hash}" if block_hash else "",
+            "trusted": {"height": trusted_height, "hash": trusted_hash},
+            "weak_subjectivity_seconds": checkpoints.weak_subjectivity_seconds(),
+        }
+
     # Helper methods
 
     def _calculate_reward(self, block_height: int) -> Decimal:

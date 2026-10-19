@@ -29,6 +29,10 @@ rich~=14.2.0
 # ============================================================================
 # Ethereum-compatible cryptography
 eth-keys>=0.5.0
+# eth-keys' native secp256k1 backend. Without it eth-keys falls back to pure Python: ~15 ms to
+# recover a transaction's sender (and ECRECOVER at 0.2 Mgas/s) instead of ~0.1 ms — every EVM
+# transaction a block carries is recovered on every node (docs/BLOCK_LIMITS.md).
+coincurve>=20.0
 eth-account>=0.11.0
 eth-typing>=4.0.0
 eth-utils>=3.0.0
@@ -36,6 +40,10 @@ eth-utils>=3.0.0
 # Hash functions (keccak256)
 eth-hash[pycryptodome]>=0.6.0
 pycryptodome>=3.20.0
+
+# The EVM loads missing state in place by switching out of the execution (greenlets) instead of
+# restarting it (qrdx/contracts/evm_world.py).
+greenlet>=3.0
 
 # RLP encoding
 # NOTE: the package is `rlp` (imported as `rlp` by qrdx/contracts/*). `pyrlp` is a

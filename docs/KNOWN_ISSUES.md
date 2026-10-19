@@ -195,6 +195,121 @@ replayable.
 
 **To close:** submit `eip155-762.json` and `eip155-7620.json` to ethereum-lists/chains.
 
+## FIXED — A block's body was not signed, and its hash was taken as sent
+
+**Severity: critical (consensus).** The proposer signed only header fields: number, parent hash,
+state root, transactions root, timestamp, slot, epoch, RANDAO reveal. The votes a block
+carried, its slashing proofs, and its exchange and EVM sections were covered by nothing.
+
+- **Votes and evidence could be rewritten in transit.** Anyone relaying or serving a block
+  could strip or swap the valid votes and slashing proofs it carried, under the same hash.
+  Those inputs decide finality, rewards and the validator set. Nodes holding different copies
+  of one block therefore derived different validator sets from it, and so different verdicts on
+  who may propose next: a split. A syncing node could be served history with its votes stripped.
+- **The block hash was not checked.** The p2p path took a block's hash as sent: it only checked
+  that it was hex. So one sender could store an honest block under a hash of its choosing, and
+  fork choice prefers the lowest. The hash covered only some header fields anyway.
+
+**Fixed:**
+
+- The header carries `body_root`, signed. It is a hash of the block's votes, slashing proofs,
+  graffiti and both sections, exactly as they travel (`block_verification.body_root`).
+- The header also signs the proposer's address and the base fees.
+- A block's hash is its signing root.
+- Every import path recomputes both before anything else and refuses a mismatch
+  (`block_integrity_error` in `_verify_chain_rules`).
+- Fork-choice scoring and the equal-height tie-break ignore blocks sent under hashes that are
+  not theirs. The tie-break also used to roll back the tip before validating the incoming block.
+  It is off by default (`_ENFORCE_EQUAL_HEIGHT_TIEBREAK`), and can no longer be pointed at a
+  forged hash.
+
+A block format change: existing networks need a new genesis. Tests:
+`tests/test_block_body_commitment.py`.
+
+## FIXED — A transaction could stall every node
+
+**Severity: critical (liveness).** EVM state is loaded on demand. On every read of something
+not yet loaded, the execution started over from the beginning, on a py-evm state rebuilt and
+re-hashed from everything loaded so far. A transaction touching n new accounts did O(n²) work.
+Measured: 200,000 gas of BALANCE calls on new addresses took 0.35 s, 400,000 took 0.85 s, and
+800,000 took 2.8 s. The 10,000,000 gas a transaction could carry, about 0.01 QRDX at 1 gwei,
+meant minutes on every node.
+
+**Fixed:**
+
+- Execution runs in a greenlet and switches out to load what it misses. Each account and slot is
+  loaded once, where the execution stopped for it (`evm_world.run`). 800,000 gas of the same
+  calls now takes 49 ms.
+- The state is a journaled dictionary store with py-evm's semantics (`WorldAccountDB`), where
+  the trie seeded per restart used to be.
+- A differential test runs random contracts on both stores and requires identical results, gas,
+  logs and state roots (`tests/test_evm_world_equivalence.py`). Planted bugs in the new store
+  fail it.
+
+## FIXED — Blocks had no bound on execution, and gas no price
+
+**Severity: high (liveness).** A block was bounded only by its size in bytes:
+- 1.9 MB of EVM transactions with any gas limits;
+- as many exchange operations as fit;
+- any number of votes, each a Dilithium signature to verify.
+
+Gas had no price: EVM transactions had no floor at all (a gas price of 0 executed for free),
+and exchange gas cost the floor however full blocks were. An order paid its base gas however
+many resting orders it swept: 1,600 makers took 38 ms for 60,000 gas. py-evm runs bn128 in pure
+Python, so a block of pairings at Ethereum's prices took ~6 s. Nodes without coincurve recovered
+every EVM sender in pure Python: ~15 ms each.
+
+**Fixed** (docs/BLOCK_LIMITS.md):
+
+- **Limits:** per-block limits on EVM gas (1,000,000) and exchange gas (20,000,000), both
+  chain-spec parameters, plus caps on votes (128) and slashing proofs (16). Every import path
+  checks them before anything runs. The proposer packs to them, and the mempools refuse what no
+  block could carry. `eth_call` and estimation are capped too.
+- **Base fees:** EIP-1559-style base fees in the signed header, one per kind of gas, with an EVM
+  floor (`EVM_MIN_GAS_PRICE_WEI`). Validators' oracle votes are exempt.
+- **Per-maker gas:** matching costs 10,000 gas per resting order visited, within the order's own
+  gas limit.
+- **Precompiles:** bn128 is surcharged to the cheapest instruction's speed.
+- **Dependencies:** coincurve is in the release lock, and a node without it logs an error.
+
+Calibrate with `scripts/bench/evm_gas.py`. Tests: `tests/test_block_limits.py`,
+`tests/test_match_budget.py`, `tests/test_fee_market.py`.
+
+**Consequence:** a zk-SNARK verification (3–4 pairings, 1.4M gas here) does not fit a block until
+a native pairing backend replaces py_ecc.
+
+## FIXED — The validator cap was never enforced
+
+**Severity: medium (scalability).** `MAX_VALIDATORS` (150) was declared and never read, so any
+number of validators could join. Each adds a 3.3 KB vote every epoch that every node verifies and
+stores: at 150 validators that is ~5 GB a day. Past a few thousand, honest votes no longer fit
+the blocks of their inclusion window, and their validators are penalized for votes they cast.
+
+**Fixed:** `MAX_VALIDATORS` is a chain-spec parameter and an activation queue
+(`epoch_state.transition`, step 4). Past the cap, validators that are due wait in order: by when
+they became due, then by address. One activates when another's exit completes. A queued validator
+can leave at once. Startup refuses a cap above what an epoch's blocks can carry (128 votes × 32
+slots). Tests: `tests/test_epoch_state.py`.
+
+## FIXED — A syncing node could follow a long-range fork
+
+**Severity: high (consensus, new nodes).** A running node never reorganizes below finality. A
+node syncing from genesis had nothing to hold on to. Validators that left long ago can sign
+another history from an old block onward, finality included: their stake is withdrawn and
+nothing is slashable. A new node would follow whichever history it was shown.
+
+**Fixed** (docs/WEAK_SUBJECTIVITY.md): trusted checkpoints, from the chain spec (appended by each
+signed release) and from the operator (`QRDX_TRUSTED_CHECKPOINT`).
+- A block at a checkpoint's height must be the checkpoint, on every import path.
+- No reorganization goes below the highest checkpoint held, or below finality.
+- A node whose database contradicts a checkpoint refuses to start.
+- A node offline longer than the weak-subjectivity period (~3.9 days) is warned.
+- `qrdx_weakSubjectivityCheckpoint` gives operators a checkpoint to hand to new nodes.
+
+Tests: `tests/test_trusted_checkpoints.py`.
+
+**Still open:** checkpoint sync. A new node still replays from genesis.
+
 ## FIXED — A second, unused token class remained
 
 **Severity: low.** This was what remained of the 2026-10-02 spot exchange audit.
@@ -420,6 +535,16 @@ day. Going lower needs one of two choices:
   archive nodes, or verify it against finality proofs.
 - **Produce no block for an empty slot.** Inclusion latency is unchanged, but votes, oracle
   updates and exchange ticks would have to ride the next block, or a periodic one.
+
+## OPEN — An EVM precompile reads a node-local table
+
+**Severity: low (latent).** The QRDX fork's `getChainState` precompile (0x0200,
+`py-evm/eth/vm/forks/qrdx/precompiles.py`) answers from `_oracle_chain_states`, a module-level
+dictionary, and `oracle_set_chain_state` writes it. Nothing in the node writes it, only a test,
+so in production it answers zeros on every node, deterministically. Anything that ever filled it
+from a node's own observations would make contracts see different values on different nodes: a
+split. **To close:** answer from consensus state (the bridge's attested chain heads), or make the
+precompile revert.
 
 ## ACCEPTED — Oracle reporters are trusted (development override only)
 

@@ -36,7 +36,8 @@ from eth_utils import (
     to_checksum_address,
 )
 
-from ..constants import CHAIN_ID
+from ..constants import BLOCK_GAS_LIMIT, CHAIN_ID
+from ..fee_market import current_evm_base_fee
 
 logger = logging.getLogger(__name__)
 
@@ -114,10 +115,10 @@ class QRDXEVMExecutor:
             block_number=BlockNumber(max(1, int(block_number))),
             difficulty=GENESIS_DIFFICULTY,
             mix_hash=Hash32(b"\x00" * 32),
-            gas_limit=10_000_000,
+            gas_limit=BLOCK_GAS_LIMIT,  # GASLIMIT: what a block may carry
             prev_hashes=[Hash32(b"\x00" * 32)] * 256,
             chain_id=CHAIN_ID,  # the network's chain id (chain spec) — the CHAINID opcode
-            base_fee_per_gas=1000000000,  # 1 gwei
+            base_fee_per_gas=current_evm_base_fee(),  # BASEFEE: the block's (fee_market.py)
         )
 
     def execute(
@@ -324,13 +325,15 @@ class QRDXEVMExecutor:
         to: bytes,
         data: bytes,
         value: int = 0,
-        gas: int = 10_000_000,
+        gas: Optional[int] = None,
         block_number: int = 1,
         timestamp: int = 1,
         world=None,
     ) -> EVMResult:
         """Execute a read-only call (eth_call), in the context of ``block_number`` /
-        ``timestamp`` (the caller passes the latest block's). Writes nothing."""
+        ``timestamp`` (the caller passes the latest block's). Writes nothing. Never more gas
+        than a block may carry (a node runs it on its own time, docs/BLOCK_LIMITS.md)."""
+        gas = BLOCK_GAS_LIMIT if gas is None else min(int(gas), BLOCK_GAS_LIMIT)
         return self.execute(
             sender=sender,
             to=to,
@@ -354,7 +357,7 @@ class QRDXEVMExecutor:
     ) -> int:
         """Estimate gas by binary search for the least gas the call succeeds with (+10 %).
         Writes nothing."""
-        low, high = 21000, 10_000_000
+        low, high = 21000, BLOCK_GAS_LIMIT  # no transaction may need more
         while low < high:
             mid = (low + high) // 2
             result = self.execute(

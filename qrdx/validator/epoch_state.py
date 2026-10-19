@@ -238,6 +238,7 @@ def transition(state: State, epoch: int, inputs: EpochInputs) -> State:
     """``S_(epoch+1)`` from ``S_epoch`` and the epoch's inputs. Pure: the input is not changed."""
     from ..constants import (
         ACTIVATION_DELAY_EPOCHS,
+        MAX_VALIDATORS,
         STAKING_DEFAULT_COMMISSION_BPS,
         UNBONDING_PERIOD_EPOCHS,
         VALIDATOR_EJECTION_STAKE,
@@ -353,13 +354,24 @@ def transition(state: State, epoch: int, inputs: EpochInputs) -> State:
                 v.earned += own + commission
                 s.payout(v.address, own + commission, e + 1, "reward")
 
-    # 4. Scheduled activations and exits; delegations whose warm-up is over join their pool.
+    # 4. Scheduled exits, then activations — while fewer than MAX_VALIDATORS propose, in the
+    #    order they became due (then by address); the rest wait their turn. Delegations whose
+    #    warm-up is over join their pool.
     for address in sorted(s):
         v = s[address]
-        if v.status == "pending" and v.activation_epoch is not None and v.activation_epoch <= e:
-            v.status, v.activation_epoch = "active", e
-        elif v.status == "exiting" and v.exit_epoch is not None and v.exit_epoch <= e:
+        if v.status == "exiting" and v.exit_epoch is not None and v.exit_epoch <= e:
             v.status = "exited"
+    proposing = sum(1 for v in s.values() if v.status in PROPOSING_STATUSES)
+    due = sorted(
+        (v.activation_epoch, a)
+        for a, v in s.items()
+        if v.status == "pending" and v.activation_epoch is not None and v.activation_epoch <= e
+    )
+    for _due_epoch, address in due:
+        if proposing >= MAX_VALIDATORS:
+            break
+        s[address].status, s[address].activation_epoch = "active", e
+        proposing += 1
     for validator in sorted(s.pools):
         pool = s.pools[validator]
         warming = []

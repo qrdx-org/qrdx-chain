@@ -8,7 +8,6 @@ one key on two networks could be slashed on one with signatures it made on the o
 its testnet headers at the same slot are a valid DOUBLE_SIGN proof anywhere — and an exchange
 transaction signed on a testnet would execute on any network where its nonce lined up.
 """
-import hashlib
 
 import pytest
 
@@ -16,7 +15,11 @@ from qrdx import chain_spec as cs
 from qrdx.crypto.pq.dilithium import PQPrivateKey
 from qrdx.exchange.transactions import ExchangeOpType, ExchangeTransaction
 from qrdx.validator.attestation import Attestation
-from qrdx.validator.block_verification import reconstruct_signing_root, verify_pos_block_proposer
+from qrdx.validator.block_verification import (
+    body_root,
+    reconstruct_signing_root,
+    verify_pos_block_proposer,
+)
 from qrdx.validator.slashing_block import make_double_sign_evidence, verify_double_sign_evidence
 
 NET_A = cs.build_spec("qrdx-net-a", 4242, {})
@@ -31,10 +34,12 @@ def _header(slot=9, **overrides):
         "transactions_root": "ef" * 32, "timestamp": 1700000000,
         "proposer_address": ADDR, "proposer_public_key": KEY.public_key.to_bytes().hex(),
         "slot": slot, "epoch": 0, "randao_reveal": "",  # none unless RANDAO selection is scheduled
+        "base_fee": 10 ** 9, "exchange_base_fee": 10 ** 9,
     }
     bc.update(overrides)
+    bc.setdefault("body_root", body_root(bc))
     bc["proposer_signature"] = KEY.sign(reconstruct_signing_root(bc)).to_bytes().hex()
-    bc["hash"] = hashlib.sha256(repr(sorted(bc.items())).encode()).hexdigest()
+    bc["hash"] = reconstruct_signing_root(bc).hex()
     return bc
 
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -111,8 +112,72 @@ _SIGNING_FIELDS = (
     "timestamp",
     "slot",
     "epoch",
+    "proposer_address",
+    "body_root",
+    "base_fee",
+    "exchange_base_fee",
     "randao_reveal",
 )
+
+
+def body_root(
+    block: Dict[str, Any],
+    exchange_section: Optional[List[Any]] = None,
+    evm_section: Optional[List[Any]] = None,
+) -> str:
+    """What a block carries besides its header — its votes, slashing proofs, graffiti, exchange
+    operations and EVM transactions, exactly as they travel — hashed into one root the header
+    commits to (``body_root``, signed). Nothing in a block can then change without breaking its
+    signature and its hash.
+
+    None of it used to be signed or hashed: anyone relaying or serving a block could strip or
+    swap the valid votes and slashing proofs it carried — which decide finality, rewards and
+    the validator set, so nodes holding different copies of one block derived different
+    validator sets — under the same hash (docs/KNOWN_ISSUES.md, "A block's body was not
+    signed"). The sections travel beside the content on some paths; pass them when they do."""
+    if exchange_section is None:
+        exchange_section = block.get("exchange_transactions")
+    if evm_section is None:
+        evm_section = block.get("evm_transactions")
+    body = {
+        "attestations": list(block.get("attestations") or ()),
+        "slashing_evidence": list(block.get("slashing_evidence") or ()),
+        "graffiti": block.get("graffiti") or "",
+        "exchange_transactions": list(exchange_section or ()),
+        "evm_transactions": list(evm_section or ()),
+    }
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(b"qrdx-block-body:" + encoded.encode()).hexdigest()
+
+
+def block_integrity_error(
+    block: Dict[str, Any],
+    exchange_section: Optional[List[Any]] = None,
+    evm_section: Optional[List[Any]] = None,
+    block_hash: Optional[str] = None,
+) -> str:
+    """Why a received block is not the block its proposer signed, or "" if it is: its body must
+    hash to the ``body_root`` its header carries, and its hash — as claimed by whoever sent it —
+    must be the one its header defines (``reconstruct_signing_root``). A claimed hash used to be
+    taken as given: one sender could store an honest block under a hash of its choosing (and
+    fork choice prefers the lowest)."""
+    declared = block.get("body_root")
+    if not declared:
+        return "block commits to no body (no body_root)"
+    try:
+        actual = body_root(block, exchange_section, evm_section)
+    except (TypeError, ValueError) as e:
+        return f"unreadable block body: {e}"
+    if actual != declared:
+        return f"block body does not match its body_root ({actual[:16]}… ≠ {str(declared)[:16]}…)"
+    if block_hash is not None:
+        try:
+            expected = reconstruct_signing_root(block).hex()
+        except Exception as e:
+            return f"unreadable block header: {e}"
+        if str(block_hash).lower().removeprefix("0x") != expected:
+            return f"block hash {str(block_hash)[:16]}… is not its header's ({expected[:16]}…)"
+    return ""
 
 
 def _parse_block_content(block_content: Any) -> Dict[str, Any]:
@@ -199,7 +264,9 @@ def reconstruct_signing_root(bc: Dict[str, Any]) -> bytes:
     """The block signing root (``PoSBlock.signing_root``) for a block-content dict: this
     network's block signing domain (chain_spec.signing_domain), then the signed header fields.
     The domain makes a header signed on another network fail verification here — including as
-    DOUBLE_SIGN evidence."""
+    DOUBLE_SIGN evidence. It is also the block's hash (``PoSBlock.hash``): the hash commits to
+    everything the proposer signed — its body through ``body_root``, its ancestry through
+    ``parent_hash``."""
     from ..chain_spec import signing_domain
 
     data = signing_domain("block") + (
@@ -210,7 +277,11 @@ def reconstruct_signing_root(bc: Dict[str, Any]) -> bytes:
         + int(bc["timestamp"]).to_bytes(8, "little")
         + int(bc["slot"]).to_bytes(8, "little")
         + int(bc["epoch"]).to_bytes(8, "little")
-        + bytes.fromhex(bc["randao_reveal"])
+        + hashlib.sha256(str(bc["proposer_address"]).encode("utf-8")).digest()
+        + bytes.fromhex(bc["body_root"])
+        + int(bc["base_fee"]).to_bytes(32, "big")
+        + int(bc["exchange_base_fee"]).to_bytes(32, "big")
+        + bytes.fromhex(bc["randao_reveal"])  # the one variable-length field: last
     )
     return hashlib.sha256(data).digest()
 

@@ -168,24 +168,43 @@ async def test_a_payment_to_a_third_account_is_kept(chain):
     assert await restarted.sm.get_balance(_hex(BOB)) == 10 ** 18
 
 
-async def test_storage_too_big_to_load_whole_is_loaded_slot_by_slot(chain, monkeypatch):
-    from qrdx.contracts import evm_world
+async def test_storage_is_loaded_slot_by_slot(chain):
     many = await chain.deploy(STORE_AT)
     for slot in range(5):
         assert (await chain.tx(ALICE, many, word(100 + slot) + word(slot))).success
-    monkeypatch.setattr(evm_world, "FULL_STORAGE_LIMIT", 2)
-    reader = await chain.deploy(LOAD_AT)
-    # LOAD_AT reads its OWN storage; check through a restarted node instead
-    rows = await (await chain.db.connection.execute(
-        "SELECT COUNT(*) FROM contract_storage WHERE contract_address = ?",
-        (to_account_id(many),))).fetchone()
-    assert rows[0] == 5
-    world = EvmWorld(Chain(chain.db).sm)
+    world = EvmWorld(Chain(chain.db).sm)                       # a restarted node's world
     await world.load_account(many)
-    assert many not in world.full_storage                     # too many: per slot
+    assert not any(a == many for a, _ in world.storage)       # nothing until it is read
     await world.load_slot(many, 3)
     assert world.storage[(many, 3)] == 103
-    assert reader
+
+
+# Loop: BALANCE of address i, i + 1, …, until out of gas (each a different, unloaded account).
+BALANCES = bytes.fromhex("6000" "5b8031506001016002" "56")
+
+
+async def test_an_execution_loads_each_account_once_and_runs_once(chain, monkeypatch):
+    """Missing state is loaded where the execution stopped for it. It used to start over on
+    every miss, on a state rebuilt from everything loaded so far: O(n²) for n accounts (a
+    transaction could stall every node for minutes for a few cents of gas)."""
+    from qrdx.contracts import evm_world
+
+    c = await chain.deploy(BALANCES)
+    loads, runs = [], []
+    real_load = evm_world.EvmWorld.load
+
+    async def counting(self, miss):
+        loads.append(miss)
+        return await real_load(self, miss)
+
+    monkeypatch.setattr(evm_world.EvmWorld, "load", counting)
+    real_execute = chain.ex._execute
+    monkeypatch.setattr(chain.ex, "_execute", lambda *a, **k: runs.append(1) or real_execute(*a, **k))
+    r = await chain.tx(ALICE, c, gas=300_000)
+    touched = sum(len(m.accounts) for m in loads)
+    assert not r.success and r.gas_used == 300_000             # ran until out of gas
+    assert runs == [1]                                         # once, never re-run
+    assert 100 < touched == len({a for m in loads for a in m.accounts})   # each loaded once
 
 
 async def test_selfdestruct_removes_the_account_and_all_its_storage(chain):

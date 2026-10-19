@@ -603,6 +603,22 @@ class ExchangeTransaction:
 # Gas cost table (consensus-critical constants)
 # ---------------------------------------------------------------------------
 
+# Matching's cost (docs/BLOCK_LIMITS.md): each resting order an order visits — filled, skipped
+# or cancelled — costs this on top of the operation's base gas, and an order visits no more
+# than its gas limit pays for (``orderbook.MatchBudget``). A visit takes ~25 µs; at the rate the
+# base costs imply (~2.5 ns a unit of exchange gas) that is 10,000.
+EXCHANGE_GAS_PER_MAKER = 10_000
+
+
+def match_budget(op_type: "ExchangeOpType", gas_limit: Optional[int]) -> Optional[int]:
+    """How many resting orders an order with this gas limit may visit (None: no limit given —
+    an operation built in process, never one from a block)."""
+    if gas_limit is None:
+        return None
+    base = EXCHANGE_GAS_COSTS.get(op_type, 100_000)
+    return max(0, (int(gas_limit) - base) // EXCHANGE_GAS_PER_MAKER)
+
+
 EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.CREATE_POOL: 150_000,
     ExchangeOpType.ADD_LIQUIDITY: 90_000,

@@ -192,6 +192,30 @@ class PriceLevel:
 # ---------------------------------------------------------------------------
 
 
+class MatchBudget:
+    """How many resting orders one placement may visit — filled, skipped or cancelled alike,
+    since each costs the matching engine the same — paid for by its transaction's gas
+    (``EXCHANGE_GAS_PER_MAKER``, docs/BLOCK_LIMITS.md). When it runs out the order stops
+    matching and its remainder is cancelled, never rested (it would cross the book). An order
+    used to sweep any number of makers for its base gas: 1,600 makers took ~38 ms."""
+
+    __slots__ = ("left", "visited", "exhausted")
+
+    def __init__(self, makers: int):
+        self.left = max(0, int(makers))
+        self.visited = 0
+        self.exhausted = False
+
+    def take(self) -> bool:
+        """One more maker visited — False (and exhausted) if none is left."""
+        if self.left <= 0:
+            self.exhausted = True
+            return False
+        self.left -= 1
+        self.visited += 1
+        return True
+
+
 class OrderBook:
     """
     On-chain order book with price-time priority matching.
@@ -454,7 +478,9 @@ class OrderBook:
     # -- Order placement ----------------------------------------------------
 
     @_pinned
-    def place_order(self, order: Order, *, protocol: bool = False) -> List[Trade]:
+    def place_order(
+        self, order: Order, *, protocol: bool = False, budget: Optional[MatchBudget] = None
+    ) -> List[Trade]:
         """
         Place an order on the book. Attempts immediate matching.
 
@@ -463,6 +489,7 @@ class OrderBook:
             protocol: the protocol's own order (a liquidation), not the owner's. It is not
                 subject to the owner's per-block rate limit or nonce sequence — a liquidation
                 must not fail because the account traded heavily this block.
+            budget: how many resting orders it may visit (``MatchBudget``); None: any number.
 
         Returns:
             List of trades generated (empty if fully resting)
@@ -485,10 +512,10 @@ class OrderBook:
 
         # Market order: match immediately, reject remainder
         if order.order_type == OrderType.MARKET:
-            return self._match_market(order)
+            return self._match_market(order, budget)
 
         # Limit order: match what we can, rest goes on the book
-        return self._match_limit(order)
+        return self._match_limit(order, budget)
 
     @_pinned
     def cancel_order(self, order_id: str, caller: str = "") -> Optional[Order]:
@@ -544,7 +571,7 @@ class OrderBook:
 
     # -- Matching engine ----------------------------------------------------
 
-    def _match_market(self, taker: Order) -> List[Trade]:
+    def _match_market(self, taker: Order, budget: Optional[MatchBudget] = None) -> List[Trade]:
         """Match a market order against the book."""
         trades = []
         opposite = self._asks if taker.side == OrderSide.BUY else self._bids
@@ -557,8 +584,10 @@ class OrderBook:
         for price in list(prices):
             if taker.remaining <= 0 or taker.status == OrderStatus.CANCELLED:
                 break
+            if budget is not None and budget.exhausted:
+                break
             level = opposite[price]
-            trades.extend(self._match_at_level(taker, level, price))
+            trades.extend(self._match_at_level(taker, level, price, budget))
             if level.total_amount == 0:
                 del opposite[price]
 
@@ -573,8 +602,9 @@ class OrderBook:
         self._check_stop_triggers()
         return trades
 
-    def _match_limit(self, taker: Order) -> List[Trade]:
-        """Match a limit order against the book, rest on the book."""
+    def _match_limit(self, taker: Order, budget: Optional[MatchBudget] = None) -> List[Trade]:
+        """Match a limit order against the book, rest on the book — unless its budget ran out:
+        then the remainder is cancelled (it could still cross the book)."""
         trades = []
         opposite = self._asks if taker.side == OrderSide.BUY else self._bids
 
@@ -586,14 +616,19 @@ class OrderBook:
         for price in list(matchable_prices):
             if taker.remaining <= 0 or taker.status == OrderStatus.CANCELLED:
                 break
+            if budget is not None and budget.exhausted:
+                break
             level = opposite[price]
-            trades.extend(self._match_at_level(taker, level, price))
+            trades.extend(self._match_at_level(taker, level, price, budget))
             if level.total_amount == 0:
                 del opposite[price]
 
-        # Rest on the book if unfilled (never once self-trade prevention cancelled it)
+        # Rest on the book if unfilled (never once self-trade prevention cancelled it, never
+        # once its budget ran out: the remainder could still cross the book)
         if taker.status == OrderStatus.CANCELLED:
             pass
+        elif taker.remaining > 0 and budget is not None and budget.exhausted:
+            taker.status = OrderStatus.FILLED if taker.filled > 0 else OrderStatus.CANCELLED
         elif taker.remaining > 0:
             taker.status = OrderStatus.OPEN if taker.filled == 0 else OrderStatus.PARTIALLY_FILLED
             self._add_to_book(taker)
@@ -603,12 +638,20 @@ class OrderBook:
         self._check_stop_triggers()
         return trades
 
-    def _match_at_level(self, taker: Order, level: PriceLevel, price: Decimal) -> List[Trade]:
+    def _match_at_level(
+        self,
+        taker: Order,
+        level: PriceLevel,
+        price: Decimal,
+        budget: Optional[MatchBudget] = None,
+    ) -> List[Trade]:
         """Match taker against all makers at a price level (time priority)."""
         self._touch(OrderSide.SELL if taker.side == OrderSide.BUY else OrderSide.BUY, price)
         trades: List[Trade] = []
         for maker in list(level.orders):
             if taker.remaining <= 0:
+                break
+            if budget is not None and not budget.take():
                 break
             if not maker.is_active:
                 continue

@@ -11,7 +11,7 @@ different block at a height it holds hands the decision to fork choice.
 from qrdx.node import main as node_main
 
 from test_finality_compute import keys  # noqa: F401  (the module fixture)
-from test_fork_resolution import PEER, _Peer, setup  # noqa: F401  (the fixture)
+from test_fork_resolution import PEER, _Peer, copy_blocks, setup  # noqa: F401  (the fixture)
 
 
 async def _sync(monkeypatch, ours, theirs, pushed):
@@ -48,8 +48,8 @@ async def _sync(monkeypatch, ours, theirs, pushed):
 
 async def test_blocks_pushed_during_the_fetch_are_skipped_not_fatal(setup, monkeypatch):
     ours, theirs, _ = setup
-    for c in (ours, theirs):
-        await c.epochs(1, 1, voters=[0, 1, 2, 3])
+    await ours.epochs(1, 1, voters=[0, 1, 2, 3])
+    await copy_blocks(ours, theirs)          # one shared history (votes are randomized)
     for i in range(6):
         await theirs.block(100 + i, tag="T")
     violations, forks = await _sync(monkeypatch, ours, theirs, pushed=2)
@@ -63,8 +63,8 @@ async def test_a_peer_that_reorged_mid_sync_hands_off_to_fork_choice(setup, monk
     """The peer agreed with our tip at the integrity check, then reorged: its batch builds on
     another parent. That is a fork, not an invalid block: no violation, fork choice decides."""
     ours, theirs, _ = setup
-    for c in (ours, theirs):
-        await c.epochs(1, 1, voters=[0, 1, 2, 3])
+    await ours.epochs(1, 1, voters=[0, 1, 2, 3])
+    await copy_blocks(ours, theirs)
     mine = await ours.block(100, tag="O")
     for i in range(4):
         await theirs.block(100 + i, tag="T")

@@ -35,7 +35,10 @@ Each epoch's transition applies, in order:
    An active validator whose vote for `t` the chain carries gains effective stake. One whose
    vote it doesn't carry loses it.
 3. **QRDX rewards** for `t` (below).
-4. Scheduled activations and exits. Delegations whose warm-up is over join their pool.
+4. Scheduled exits, then activations: while fewer than `MAX_VALIDATORS` propose, validators
+   that are due activate in the order they became due (then by address). The rest wait in the
+   queue until a validator leaves, and can leave the queue at once. Delegations whose warm-up is
+   over join their pool.
 5. Slashing proofs the epoch's blocks carry (a double sign, or a double or surround vote):
    - the validator loses half its stake and is out;
    - its pool loses half its value;
@@ -122,6 +125,7 @@ paid without having to claim it.
 | `ACTIVATION_DELAY_EPOCHS` | chain spec | 4 (warm-up, validators and delegations) |
 | `UNBONDING_PERIOD_EPOCHS` | chain spec | 40,320 (~3.7 days of 8 s epochs) |
 | `WITHDRAWAL_DELAY_EPOCHS` | chain spec | 2,048 (~4.6 hours) |
+| `MAX_VALIDATORS` | chain spec | 150 (more wait in the activation queue) |
 | `MIN_VALIDATOR_STAKE` | constant | 100,000 QRDX |
 | `STAKING_DEFAULT_COMMISSION_BPS` | constant | 1,000 (10 %) |
 | `STAKE_MIN_DELEGATION` | constant | 1 QRDX |

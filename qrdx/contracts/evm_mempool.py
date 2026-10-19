@@ -395,6 +395,19 @@ class EVMMempool:
         sender = str(parsed["sender"]).lower()
         nonce = int(parsed["nonce"])
 
+        # More gas than a block may carry, or a price under the floor: it could never be included
+        # (docs/BLOCK_LIMITS.md). (Above the floor it waits for the base fee to come down to it.)
+        from ..constants import BLOCK_GAS_LIMIT, EVM_MIN_GAS_PRICE_WEI
+
+        if int(parsed["gas"]) > BLOCK_GAS_LIMIT:
+            return False, f"gas {parsed['gas']} exceeds the block gas limit {BLOCK_GAS_LIMIT}", None
+        if int(parsed["gas_price"]) < EVM_MIN_GAS_PRICE_WEI:
+            return (
+                False,
+                f"gas price {parsed['gas_price']} is under the minimum {EVM_MIN_GAS_PRICE_WEI}",
+                None,
+            )
+
         # Replay / dedup.
         if tx_hash in self._txs:
             return False, "duplicate: transaction already in mempool", None
@@ -420,7 +433,13 @@ class EVMMempool:
             if int(self._txs[h]["nonce"]) == nonce:
                 return False, f"nonce {nonce} already queued for sender", None
 
-        self._txs[tx_hash] = {"raw": raw_tx_hex, "sender": sender, "nonce": nonce}
+        self._txs[tx_hash] = {
+            "raw": raw_tx_hex,
+            "sender": sender,
+            "nonce": nonce,
+            "gas": int(parsed["gas"]),
+            "gas_price": int(parsed["gas_price"]),
+        }
         self._by_sender.setdefault(sender, set()).add(tx_hash)
         return True, "", tx_hash
 
@@ -456,20 +475,34 @@ class EVMMempool:
 
     # ── Selection (canonical, deterministic) ───────────────────────────
 
-    def select_for_block(self, limit: int = 256) -> List[str]:
+    def select_for_block(
+        self, limit: int = 256, gas_limit: Optional[int] = None, min_price: int = 0
+    ) -> List[str]:
         """
         Deterministically select executable raw txs for block inclusion.
 
         For each sender, include a gap-free run of nonces starting at the
         sender's expected next nonce; senders ordered by address; capped at
-        ``limit``. Identical mempool + state ⇒ identical selection on every node.
+        ``limit`` transactions and ``gas_limit`` gas (default ``BLOCK_GAS_LIMIT``: a block's
+        declared gas, docs/BLOCK_LIMITS.md), offering at least ``min_price`` (the block's base
+        fee). A sender's run stops at the first transaction that does not fit or pays too
+        little. Identical mempool + state ⇒ identical selection on every node.
         """
+        if gas_limit is None:
+            from ..constants import BLOCK_GAS_LIMIT
+
+            gas_limit = BLOCK_GAS_LIMIT
         selected: List[str] = []
+        gas = 0
         for sender in sorted(self._by_sender.keys()):
             by_nonce = {int(self._txs[h]["nonce"]): self._txs[h] for h in self._by_sender[sender]}
             n = self._nonce_provider(sender)
             while n in by_nonce and len(selected) < limit:
+                tx_gas = int(by_nonce[n].get("gas") or 0)
+                if gas + tx_gas > gas_limit or int(by_nonce[n].get("gas_price", 0)) < min_price:
+                    break
                 selected.append(str(by_nonce[n]["raw"]))
+                gas += tx_gas
                 n += 1
             if len(selected) >= limit:
                 break
