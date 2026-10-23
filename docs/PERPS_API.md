@@ -36,15 +36,31 @@ post-quantum (Dilithium / ML-DSA-65) key. A traditional `0x` key cannot sign one
 | `PERP_DEPOSIT` | 18 | `amount` — collateral (the stablecoin) moved from the wallet into the clearinghouse |
 | `PERP_WITHDRAW` | 19 | `amount` — at most `withdrawable` |
 | `PERP_SET_LEVERAGE` | 20 | `market_id`, `leverage`, `mode` (`cross` \| `isolated`) |
-| `PERP_ORDER` | 21 | `market_id`, `side` (`buy` \| `sell`), `size`, `price`, optional `reduce_only` (bool), `tif` (`gtc` default \| `ioc`) |
+| `PERP_ORDER` | 21 | `market_id`, `side` (`buy` \| `sell`), `size`, `price`, optional `reduce_only` (bool), `tif` (`gtc` default \| `ioc` \| `fok` \| `alo`), `hidden` (bool), `display_size` (an iceberg) |
 | `PERP_CANCEL` | 22 | `market_id`, `order_id` |
 | `VAULT_DEPOSIT` | 23 | `amount` — free collateral into the backstop vault, for shares |
 | `VAULT_WITHDRAW` | 24 | `shares` |
-| `CREATE_MARKET` | 12 | `base_token` (e.g. `BTC`), optional `max_leverage` (default 20) |
+| `CREATE_MARKET` | 12 | `base_token` (e.g. `BTC`), optional `max_leverage` (default 20), `liquidity` (at least `PERP_MARKET_MIN_LIQUIDITY` of perps collateral for the market's liquidity vault — TRADING_FEATURES.md §14), `sz_decimals` (the order grid); a deployer market (`dex:ASSET`) also takes `oracle_price` and `fee_share_bps` |
+| `PERP_ISOLATED_MARGIN` | 76 | `market_id`, `amount` — into an isolated position's margin (negative: out of it) |
+| `SCHEDULE_CANCEL` | 77 | optional `time` — every order cancelled at that block time (none: cleared) |
+| `APPROVE_BUILDER_FEE` | 78 | `builder`, `max_fee_rate` — an order then carries `builder: {b, f}` |
+| `DEPLOYER_BOND` | 79 | `amount`, `dex` (the first bond names the namespace) |
+| `DEPLOYER_UNBOND` | 80 | `amount`, or `claim: true` |
+| `DEPLOYER_SET_ORACLE` | 81 | `market_id`, `price` — a deployer market's oracle |
+| `DEPLOYER_HALT` | 82 | `market_id` — the deployer settles its market at its oracle price |
 
-Amounts, sizes and prices are decimal strings. There are only limit orders; a "market order" is
-`tif: "ioc"` at an aggressive price. An order's id is the first 16 characters of its
-transaction hash (the receipt also returns it).
+Amounts, sizes and prices are decimal strings. A "market order" is `tif: "ioc"` at an aggressive
+price. An order's id is the first 16 characters of its transaction hash (the receipt also
+returns it). Trigger orders (stop-loss / take-profit, a position's TP/SL), modify, cancel-all,
+batches, TWAPs, agent keys, sub-accounts, user vaults, fee tiers and referrals, portfolio margin
+and the trading history are in [TRADING_FEATURES.md](TRADING_FEATURES.md).
+
+[HYPERLIQUID_PARITY.md](HYPERLIQUID_PARITY.md) covers:
+- action expiry: any transaction's `expires_at`;
+- isolated margin, the dead man's switch and builder codes;
+- the order grid and staking fee discounts;
+- contracts trading through the `0x…0401` precompile;
+- deployer markets.
 
 **Nonce.** `GET /get_exchange_nonce?address=` or `exchange_getNonce`. A transaction that
 executes consumes its nonce whether it succeeds or fails (e.g. an order refused for margin); one
@@ -67,6 +83,7 @@ returns (1 gwei). Every executed transaction — success or failure — pays its
 | `params` | Python `json.dumps(params, sort_keys=True, default=str)` (note the `", "` / `": "` separators) |
 | `gas_limit` | 8 bytes, big-endian |
 | `gas_price` | the integer wei amount as a decimal string, UTF-8 (`"1000000000"`) |
+| `signer` | only when the transaction has one (an agent, a sub-account's master, a vault's leader): one zero byte, `signer:`, the address, UTF-8 |
 
 The transaction hash is BLAKE2b-256 of the same bytes, in hex. A transaction signed for another
 network's chain id — or carrying none — is refused (docs/PROTOCOL_UPGRADES.md §7); the signing
@@ -92,6 +109,35 @@ its peers and any validator can include it. It **executes only in a block**: pol
 
 `null` means pending (or aged out — each node keeps the latest 50,000 receipts and rebuilds them
 from the chain on restart).
+
+**What an order can be refused for** (besides margin) — docs/CONSENSUS_ROADMAP.md 2–4:
+
+| Refusal | When |
+|---|---|
+| `an order may be at most 20% worse than the oracle` | a buy above oracle × (1 + `PERP_PRICE_BAND_BPS`), a sell below oracle × (1 − it) |
+| `…'s circuit breaker has tripped: reduce-only orders until block time …` | the mark moved `PERP_BREAKER_MOVE_BPS` within the window; only `reduce_only` orders pass until the cooldown ends |
+| `…'s open interest is capped at …` | the order's fills would raise open interest past the market's cap (its liquidity vault's equity × 50, or `PERP_MIN_OI_CAP`); refused whole |
+| `… is delisted` | governance settled the market (`delist_market`); nothing more trades there |
+| `the validators have frozen …: only reduce-only orders are accepted` | a deployer market the validators froze (docs/HYPERLIQUID_PARITY.md 8) |
+| `… sizes are multiples of …` / `… prices have at most 5 significant figures and … decimals` / `an order is worth at least …` | off the market's order grid (docs/HYPERLIQUID_PARITY.md 5) |
+| `expired at block time …` | the block is later than the transaction's `expires_at` |
+
+**Initial margin is tiered.** Each slice of a position's notional above a floor carries a lower
+maximum leverage — full to 1,000,000, half to 10,000,000, a quarter beyond — so a large position
+needs proportionally more initial margin than its leverage setting alone says; maintenance (and so
+the liquidation price) is unchanged. `perp_getAccount` reports the requirement.
+
+**Order of a block's transactions.** Cancels (and oracle votes) run first, then post-only
+(`alo`) orders, then everything else; each sender's — each nonce lane's — transactions keep their
+nonce order (docs/CONSENSUS_ROADMAP.md 1). A maker's cancel therefore always beats a taker in the
+same block.
+
+**Tick events** a stream or receipt can show: `circuit_breaker` `{market, from, to,
+halted_until}`.
+
+**State proofs.** `state_getProof("account", address)` (or `"token"`, `"storage"`) proves a
+balance at a block against its signed state root, for a light client, a bridge or a contract
+(the precompile at `0x…0300`) — docs/STATE_PROOFS.md.
 
 ---
 

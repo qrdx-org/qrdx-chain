@@ -72,10 +72,12 @@ class StateMiss(Exception):
         accounts: Iterable[bytes] = (),
         slots: Iterable[Tuple[bytes, int]] = (),
         tokens: Iterable[Tuple[str, str]] = (),
+        roots: Iterable[int] = (),
     ):
         self.accounts = set(accounts)
         self.slots = set(slots)
         self.tokens = set(tokens)
+        self.roots = set(roots)  # heights whose signed state root is needed (state proofs)
         super().__init__(
             f"state not loaded: {len(self.accounts)} account(s), "
             f"{len(self.slots)} slot(s), {len(self.tokens)} token balance(s)"
@@ -380,11 +382,51 @@ class WorldAccountDB(AccountDatabaseAPI):
 # else, a block's worth of them executes at least as fast as the cheapest instructions do
 # (~1.9 Mgas/s: docs/BLOCK_LIMITS.md, measured with scripts/bench/evm_gas.py). Without it, a block
 # of bn128 pairings would take ~6 s on every node. Extra gas = per-call + per-input-unit.
+# Verifies a proof of one account, storage slot or token balance against an ancestor block's
+# signed state root (qrdx/contracts/state_proof_evm.py, docs/STATE_PROOFS.md).
+STATE_PROOF_ADDRESS = (0x0300).to_bytes(20, "big")
+# getChainState: a source chain's finalized head as validators attested it (consensus state,
+# qrdx/exchange/bridge.py) — in place of the fork's module-level table, which a node could
+# fill from its own observations (docs/KNOWN_ISSUES.md).
+CHAIN_STATE_ADDRESS = (0x0200).to_bytes(20, "big")
+# verifyExternalProof: an account (and slot) on a bridged chain, proven against an attested head
+# (qrdx/contracts/external_proof_evm.py) — in place of the fork's, which fails closed.
+EXTERNAL_PROOF_ADDRESS = (0x0201).to_bytes(20, "big")  # (0x0100-0x0104: retired; 0x0200: oracle)
+# The exchange from a contract (qrdx/contracts/exchange_evm.py): read its state, and send actions
+# as the contract's account (run at the start of the next block).
+EXCHANGE_READ_ADDRESS = (0x0400).to_bytes(20, "big")
+EXCHANGE_WRITE_ADDRESS = (0x0401).to_bytes(20, "big")
 BN128_MUL_ADDRESS = (7).to_bytes(20, "big")
 BN128_PAIRING_ADDRESS = (8).to_bytes(20, "big")
 BN128_MUL_SURCHARGE = 12_000  # 6,000 → 18,000 (py_ecc: ~8.5 ms a multiplication)
 BN128_PAIRING_SURCHARGE_PER_PAIR = 316_000  # 34,000 → 350,000 a pair (~180 ms a pair)
 _PAIR_SIZE = 192
+
+
+def chain_state_precompile(computation):
+    """0x0200 ``getChainState(chain_id)``: the source chain's attested finalized head — height (8)
+    · hash (32) · state root (32) · timestamp (8) — or 80 zero bytes if none is attested. Read
+    from the exchange's consensus state as of this point of the block, so it is the same on every
+    node."""
+    from eth.vm.forks.qrdx.precompiles import GAS_ORACLE_GET_CHAIN_STATE
+
+    from ..exchange.state_manager import ExchangeStateManager
+
+    computation.consume_gas(GAS_ORACLE_GET_CHAIN_STATE, reason="getChainState")
+    data = bytes(computation.msg.data_as_bytes)
+    head = None
+    if len(data) >= 4:
+        head = ExchangeStateManager.get_instance().bridge.head(int.from_bytes(data[:4], "big"))
+    if head is None:
+        computation.output = bytes(80)
+    else:
+        computation.output = (
+            head.height.to_bytes(8, "big")
+            + bytes.fromhex(head.hash[2:])
+            + bytes.fromhex(head.state_root[2:])
+            + head.timestamp.to_bytes(8, "big")
+        )
+    return computation
 
 
 def _surcharged(precompile, extra):
@@ -415,9 +457,27 @@ class _WorldPrecompiles(Mapping):
         }
 
     def get(self, address, default=None):
+        if address == CHAIN_STATE_ADDRESS:  # (before the fork's own: see the constant)
+            return chain_state_precompile
+        if address == EXTERNAL_PROOF_ADDRESS:
+            from .external_proof_evm import external_proof_precompile
+
+            return external_proof_precompile
         fn = self._wrapped.get(address) or self.base.get(address)
         if fn is not None:
             return fn
+        if address == STATE_PROOF_ADDRESS:
+            from .state_proof_evm import state_proof_precompile
+
+            return state_proof_precompile
+        if address == EXCHANGE_READ_ADDRESS:
+            from .exchange_evm import exchange_read_precompile
+
+            return exchange_read_precompile
+        if address == EXCHANGE_WRITE_ADDRESS:
+            from .exchange_evm import exchange_write_precompile
+
+            return exchange_write_precompile
         tokens = self.tokens
         if tokens is None:
             return default
@@ -490,6 +550,8 @@ class EvmWorld:
         self.accounts: Dict[bytes, Tuple[int, int, bytes]] = {}  # address → (balance, nonce, code)
         self.storage: Dict[Tuple[bytes, int], int] = {}  # loaded slots
         self.touched_slots: Set[Tuple[bytes, int]] = set()
+        # height → the block's signed state root (None: no such block, or none signed)
+        self.header_roots: Dict[int, Optional[str]] = {}
         self._loader: Optional[greenlet] = None  # where ``need`` switches to, under ``run``
 
     # -- loading ------------------------------------------------------------
@@ -497,10 +559,10 @@ class EvmWorld:
     def has_slot(self, address: bytes, slot: int) -> bool:
         return (address, slot) in self.storage
 
-    def need(self, accounts=(), slots=(), tokens=()) -> None:
+    def need(self, accounts=(), slots=(), tokens=(), roots=()) -> None:
         """Make sure these are loaded before the execution reads them: in place under ``run``
         (switching to it while it loads them), by raising StateMiss under ``run_sync``."""
-        miss = StateMiss(accounts, slots, tokens)
+        miss = StateMiss(accounts, slots, tokens, roots)
         if self._loader is None:
             raise miss
         self._loader.switch(miss)
@@ -521,6 +583,8 @@ class EvmWorld:
             self.storage[(address, slot)] = int.from_bytes(raw, "big")
         if miss.tokens:
             raise RuntimeError("native token balances need an async loader (use run)")
+        for height in miss.roots:  # (no database here: a proof against it does not verify)
+            self.header_roots.setdefault(height, None)
 
     async def load_account(self, address: bytes) -> None:
         if address in self.accounts:
@@ -544,6 +608,25 @@ class EvmWorld:
             await self.load_slot(address, slot)
         if miss.tokens and self.tokens is not None:
             await self.tokens.load(miss.tokens)
+        for height in sorted(miss.roots):
+            if height not in self.header_roots:
+                self.header_roots[height] = await self._signed_root(height)
+
+    async def _signed_root(self, height: int) -> Optional[str]:
+        """The state root block ``height`` of this chain signed (its header's ``state_root``)."""
+        db = getattr(self.sm, "db", None)
+        if db is None:
+            return None
+        try:
+            block = await db.get_block_by_id(int(height))
+            if not block:
+                return None
+            from ..validator.block_verification import _parse_block_content
+
+            root = _parse_block_content(block.get("content")).get("state_root")
+            return str(root) if root else None
+        except Exception:
+            return None
 
     def is_native(self, address) -> bool:
         """Is ``address`` a native token or NFT collection (its precompile, not code)?"""

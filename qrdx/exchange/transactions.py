@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import IntEnum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 ZERO = Decimal("0")
 
@@ -136,6 +136,39 @@ class ExchangeOpType(IntEnum):
     STAKE_DELEGATE = 53  # lock QRDX in a validator's pool
     STAKE_UNDELEGATE = 54  # redeem pool shares (unbonding, then paid)
     STAKE_SET_COMMISSION = 55  # a validator sets its cut of its pool's rewards
+    # Trading (docs/TRADING_FEATURES.md).
+    PERP_TRIGGER = 56  # a stop / take-profit order, fired on the mark price
+    CANCEL_ALL = 57  # every resting order and trigger of the sender (or of one market)
+    PERP_MODIFY = 58  # change a perp order or trigger in one step
+    MODIFY_ORDER = 59  # change a spot order in one step
+    BATCH = 60  # several trading operations, all or nothing
+    TWAP_ORDER = 61  # a size worked into the market in slices over a duration
+    TWAP_CANCEL = 62  # stop a TWAP (a spot TWAP's unspent escrow comes back)
+    # Acting for an account (docs/TRADING_FEATURES.md).
+    AGENT_APPROVE = 63  # let an agent key sign trading operations for the account
+    AGENT_REVOKE = 64  # … and stop it
+    SUBACCOUNT_CREATE = 65  # a sub-account: its own balances and margin, signed for by the master
+    SUBACCOUNT_TRANSFER = 66  # move QRDX or a token between the master and a sub-account
+    VAULT_CREATE = 67  # a user vault: a margin account its leader trades and others join
+    REFERRAL_REGISTER = 68  # take a referral code
+    REFERRAL_JOIN = 69  # join a referrer's code (a fee discount; the referrer shares the fees)
+    # Account control (docs/ACCOUNT_CONTROL.md).
+    ACCOUNT_POLICY = 70  # bind controllers, turn the own key off or on, set the delay, cancel
+    # QNS, the QRDX Name Service (docs/QNS.md): names are native NFTs.
+    QNS_REGISTER = 71  # register label.qrdx for some years
+    QNS_RENEW = 72  # extend a name (anyone may pay)
+    QNS_SET_RECORD = 73  # the owner sets where it resolves, or a text record
+    QNS_SET_PRIMARY = 74  # an account's reverse record
+    ACCOUNT_RECOVER = 75  # a guardian backs a new controller for an account (social recovery)
+    PERP_ISOLATED_MARGIN = 76  # add margin to (or remove it from) an isolated position
+    SCHEDULE_CANCEL = 77  # the dead man's switch: cancel every order at a block time
+    APPROVE_BUILDER_FEE = 78  # let a front-end (builder) charge up to a fee rate on orders
+    # Deployer markets (docs/HYPERLIQUID_PARITY.md, Hyperliquid's HIP-3): perp markets a bonded
+    # deployer lists under its own namespace and runs the oracle of.
+    DEPLOYER_BOND = 79  # bond QRDX as a market deployer (the first bond names its namespace)
+    DEPLOYER_UNBOND = 80  # start unbonding some of it, or claim what has unbonded
+    DEPLOYER_SET_ORACLE = 81  # the deployer's oracle price for one of its markets
+    DEPLOYER_HALT = 82  # the deployer settles one of its markets at its oracle price
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +197,12 @@ class ExchangeTransaction:
     # checked against the verifying node's chain id — a transaction signed for another network
     # never verifies here. Defaults to this process's network.
     chain_id: int = field(default_factory=_network_chain_id)
+    # Who signed it, when that is not ``sender`` (docs/TRADING_FEATURES.md, "Acting for an
+    # account"): an agent key the account approved (AGENT_APPROVE), trading only, or the master
+    # of a sub-account. Signed and part of the hash; the signature binds to this key, and
+    # execution refuses — consuming nothing — unless the account authorized it. Its nonces
+    # are its own lane (``nonce_key``), so a bot and its owner's wallet never race.
+    signer: str = ""
 
     # --- Computed after execution ---
     gas_used: int = 0
@@ -181,6 +220,9 @@ class ExchangeTransaction:
                 raise ValueError(f"chain_id must be an integer, got {self.chain_id!r}") from None
         if not 0 <= self.chain_id < 2**63:
             raise ValueError(f"chain_id out of range: {self.chain_id}")
+        self.signer = str(self.signer or "")
+        if self.signer == self.sender:
+            self.signer = ""  # the account itself: one form, one hash
         # Wei are whole: hold the price as an int, so it hashes and signs as "1000000000"
         # however the caller wrote it. A fractional price is left as given and refused by
         # validate_fee.
@@ -212,7 +254,21 @@ class ExchangeTransaction:
             self.gas_limit.to_bytes(8, "big"),
             str(self.gas_price).encode("utf-8"),
         ]
+        if self.signer:  # (only then: every other transaction keeps its bytes and hash)
+            parts.append(b"\x00signer:" + self.signer.encode("utf-8"))
         return b"".join(parts)
+
+    def signature_gas(self) -> int:
+        """What verifying the signature costs beyond a single key's: a multisig's every
+        partial signature (``MULTISIG_GAS_PER_SIGNATURE`` each)."""
+        from ..crypto import multisig_wire
+
+        return multisig_wire.signer_count(self.signature) * MULTISIG_GAS_PER_SIGNATURE
+
+    def nonce_key(self) -> str:
+        """The nonce sequence this transaction takes its nonce from: the account's own, or
+        — signed by an agent or a sub-account's master — that signer's lane for it."""
+        return f"{self.sender}|{self.signer}" if self.signer else self.sender
 
     def signing_bytes(self) -> bytes:
         """Bytes that the sender must sign."""
@@ -247,13 +303,22 @@ class ExchangeTransaction:
             return False
         if self.chain_error():
             return False
+        signing_address = str(self.signer or self.sender)
+        from ..crypto import multisig_wire
+
+        if multisig_wire.is_multisig_material(self.public_key):
+            # An m-of-n multisig (docs/ACCOUNT_CONTROL.md): the keyset derives the address it
+            # signs for, and at least m of its keys signed.
+            proven = multisig_wire.verify(self.public_key, self.signature, self.signing_bytes())
+            return proven is not None and proven.lower() == signing_address.lower()
         try:
             from ..crypto.pq.dilithium import PQPublicKey, PQSignature, verify as pq_verify
 
             pub = PQPublicKey.from_bytes(self.public_key)
 
-            # Binding: the key must derive to the claimed sender address.
-            if pub.to_address().lower() != str(self.sender).lower():
+            # Binding: the key must derive to the claimed sender address — or to the signer
+            # acting for it, whose authority execution checks (``signer_error``).
+            if pub.to_address().lower() != signing_address.lower():
                 return False
 
             return pq_verify(pub, self.signing_bytes(), PQSignature.from_bytes(self.signature))
@@ -291,6 +356,7 @@ class ExchangeTransaction:
             "signature": self.signature.hex() if self.signature else "",
             "public_key": self.public_key.hex() if self.public_key else "",
             "chain_id": self.chain_id,
+            **({"signer": self.signer} if self.signer else {}),
             "tx_hash": self.tx_hash(),
         }
 
@@ -310,6 +376,7 @@ class ExchangeTransaction:
             # Absent means unbound (0): such a transaction never verifies. Never defaulted to
             # this network's id — that would make an unbound signature valid everywhere.
             chain_id=data.get("chain_id") or 0,
+            signer=data.get("signer") or "",
         )
 
     def to_hex(self) -> str:
@@ -342,6 +409,19 @@ class ExchangeTransaction:
 
     # -- Validation ---------------------------------------------------------
 
+    def expires_at(self) -> Optional[Decimal]:
+        """The block time after which the action may not be included (the signed
+        ``params.expires_at``, as Hyperliquid's ``expiresAfter``); None if it never expires (or
+        the value is not a time)."""
+        raw = (self.params or {}).get("expires_at")
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            value = Decimal(str(raw))
+        except (ArithmeticError, ValueError):
+            return None
+        return value if value.is_finite() and value >= 0 else None
+
     def validate_basic(self) -> bool:
         """
         Basic structural validation (no state access needed).
@@ -362,6 +442,10 @@ class ExchangeTransaction:
             raise ValueError("Gas price must be positive")
         if self.op_type not in ExchangeOpType:
             raise ValueError(f"Unknown operation type: {self.op_type}")
+        if self.signer and self.op_type == ExchangeOpType.ORACLE_VOTE:
+            raise ValueError("an oracle vote is signed by its validator")
+        if (self.params or {}).get("expires_at") is not None and self.expires_at() is None:
+            raise ValueError("expires_at is a block time (seconds)")
 
         # Type-specific parameter validation
         self._validate_params()
@@ -392,7 +476,9 @@ class ExchangeTransaction:
                     raise ValueError(f"REMOVE_LIQUIDITY missing param: {key}")
 
         elif op == ExchangeOpType.SWAP:
-            for key in ("token_in", "token_out", "amount_in"):
+            for key in (
+                ("token_in", "token_out", "amount_in") if "path" not in p else ("amount_in",)
+            ):
                 if key not in p:
                     raise ValueError(f"SWAP missing param: {key}")
 
@@ -444,6 +530,126 @@ class ExchangeTransaction:
                 if key not in p:
                     raise ValueError(f"PERP_CANCEL missing param: {key}")
 
+        elif op == ExchangeOpType.PERP_TRIGGER:
+            for key in ("market_id", "side", "kind", "trigger_price"):
+                if key not in p:
+                    raise ValueError(f"PERP_TRIGGER missing param: {key}")
+
+        elif op == ExchangeOpType.PERP_MODIFY:
+            for key in ("market_id", "order_id"):
+                if key not in p:
+                    raise ValueError(f"PERP_MODIFY missing param: {key}")
+
+        elif op == ExchangeOpType.MODIFY_ORDER:
+            for key in ("pair", "order_id"):
+                if key not in p:
+                    raise ValueError(f"MODIFY_ORDER missing param: {key}")
+
+        elif op == ExchangeOpType.CANCEL_ALL:
+            if p.get("scope", "all") not in ("all", "spot", "perps"):
+                raise ValueError("CANCEL_ALL scope is all, spot or perps")
+
+        elif op == ExchangeOpType.TWAP_ORDER:
+            if "duration" not in p:
+                raise ValueError("TWAP_ORDER missing param: duration")
+            need = (
+                ("market_id", "side", "size")
+                if "market_id" in p
+                else ("token_in", "token_out", "amount_in")
+            )
+            for key in need:
+                if key not in p:
+                    raise ValueError(f"TWAP_ORDER missing param: {key}")
+
+        elif op == ExchangeOpType.TWAP_CANCEL:
+            if "twap_id" not in p:
+                raise ValueError("TWAP_CANCEL missing param: twap_id")
+
+        elif op in (ExchangeOpType.AGENT_APPROVE, ExchangeOpType.AGENT_REVOKE):
+            if "agent" not in p:
+                raise ValueError(f"{op.name} missing param: agent")
+
+        elif op == ExchangeOpType.ACCOUNT_POLICY:
+            action = p.get("action")
+            required = {
+                "add_controller": "controller",
+                "remove_controller": "controller",
+                "own_key": "enabled",
+                "delay": "seconds",
+                "cancel": "change_id",
+                "publish_keyset": "keyset",
+                "guardians": "guardians",
+            }
+            if action not in required:
+                raise ValueError(f"ACCOUNT_POLICY action is one of {', '.join(required)}")
+            if required[action] not in p:
+                raise ValueError(f"ACCOUNT_POLICY {action} missing param: {required[action]}")
+
+        elif op in (
+            ExchangeOpType.QNS_REGISTER,
+            ExchangeOpType.QNS_RENEW,
+            ExchangeOpType.QNS_SET_RECORD,
+            ExchangeOpType.QNS_SET_PRIMARY,
+        ):
+            if not isinstance(p.get("name"), str):
+                raise ValueError(f"{op.name} missing param: name")
+            if op == ExchangeOpType.QNS_SET_RECORD and "key" not in p:
+                raise ValueError("QNS_SET_RECORD missing param: key")
+
+        elif op == ExchangeOpType.PERP_ISOLATED_MARGIN:
+            for key in ("market_id", "amount"):
+                if key not in p:
+                    raise ValueError(f"PERP_ISOLATED_MARGIN missing param: {key}")
+
+        elif op == ExchangeOpType.APPROVE_BUILDER_FEE:
+            for key in ("builder", "max_fee_rate"):
+                if key not in p:
+                    raise ValueError(f"APPROVE_BUILDER_FEE missing param: {key}")
+
+        elif op == ExchangeOpType.DEPLOYER_BOND:
+            if "amount" not in p:
+                raise ValueError("DEPLOYER_BOND missing param: amount")
+            if "dex" in p and not isinstance(p["dex"], str):
+                raise ValueError("DEPLOYER_BOND dex is a name")
+
+        elif op == ExchangeOpType.DEPLOYER_UNBOND:
+            if ("amount" in p) == bool(p.get("claim")):
+                raise ValueError("DEPLOYER_UNBOND takes an amount, or claim: true")
+
+        elif op == ExchangeOpType.DEPLOYER_SET_ORACLE:
+            for key in ("market_id", "price"):
+                if key not in p:
+                    raise ValueError(f"DEPLOYER_SET_ORACLE missing param: {key}")
+
+        elif op == ExchangeOpType.DEPLOYER_HALT:
+            if "market_id" not in p:
+                raise ValueError("DEPLOYER_HALT missing param: market_id")
+
+        elif op == ExchangeOpType.ACCOUNT_RECOVER:
+            if not isinstance(p.get("account"), str):
+                raise ValueError("ACCOUNT_RECOVER missing param: account")
+            if not isinstance(p.get("new_controller", ""), str):
+                raise ValueError('ACCOUNT_RECOVER new_controller is an address ("": withdraw)')
+
+        elif op in (ExchangeOpType.REFERRAL_REGISTER, ExchangeOpType.REFERRAL_JOIN):
+            if not isinstance(p.get("code"), str):
+                raise ValueError(f"{op.name} missing param: code")
+
+        elif op == ExchangeOpType.VAULT_CREATE:
+            if "amount" not in p:
+                raise ValueError("VAULT_CREATE missing param: amount")
+
+        elif op == ExchangeOpType.SUBACCOUNT_TRANSFER:
+            for key in ("subaccount", "asset", "amount", "direction"):
+                if key not in p:
+                    raise ValueError(f"SUBACCOUNT_TRANSFER missing param: {key}")
+
+        elif op == ExchangeOpType.BATCH:
+            for _op, _params in batch_actions(p):
+                ExchangeTransaction(
+                    op_type=_op, sender=self.sender, nonce=0, params=_params, chain_id=self.chain_id
+                )._validate_params()
+
         elif op == ExchangeOpType.VAULT_DEPOSIT:
             if "amount" not in p:
                 raise ValueError("VAULT_DEPOSIT missing param: amount")
@@ -454,10 +660,16 @@ class ExchangeTransaction:
 
         elif op == ExchangeOpType.ORACLE_VOTE:
             prices, deposits = p.get("prices", {}), p.get("deposits", [])
-            if not isinstance(prices, dict) or not isinstance(deposits, list):
-                raise ValueError("ORACLE_VOTE: prices is a map, deposits a list")
-            if not prices and not deposits:
-                raise ValueError("ORACLE_VOTE needs prices or deposits")
+            heads, freeze = p.get("heads", []), p.get("freeze", [])
+            if (
+                not isinstance(prices, dict)
+                or not isinstance(deposits, list)
+                or not isinstance(heads, list)
+                or not isinstance(freeze, list)
+            ):
+                raise ValueError("ORACLE_VOTE: prices is a map, deposits, heads and freeze lists")
+            if not prices and not deposits and not heads and not freeze:
+                raise ValueError("ORACLE_VOTE needs prices, deposits, chain heads or freezes")
 
         elif op == ExchangeOpType.STAKE_DELEGATE:
             for key in ("validator", "amount"):
@@ -608,6 +820,83 @@ class ExchangeTransaction:
 # than its gas limit pays for (``orderbook.MatchBudget``). A visit takes ~25 µs; at the rate the
 # base costs imply (~2.5 ns a unit of exchange gas) that is 10,000.
 EXCHANGE_GAS_PER_MAKER = 10_000
+# A transaction signed by a multisig pays this for each partial signature it carries — each is a
+# Dilithium verification, like the one a single-key transaction's base gas covers.
+MULTISIG_GAS_PER_SIGNATURE = 20_000
+# CANCEL_ALL: each order or trigger it cancels costs this on top of its base gas.
+EXCHANGE_GAS_PER_CANCEL = 5_000
+
+# BATCH: up to this many actions, each one of these operations (never a batch), run in order as
+# the batch's sender — all or nothing. Each action's gas counts against the batch's gas limit.
+BATCH_MAX_ACTIONS = 20
+BATCH_ACTIONS = frozenset(
+    {
+        ExchangeOpType.PLACE_ORDER,
+        ExchangeOpType.CANCEL_ORDER,
+        ExchangeOpType.MODIFY_ORDER,
+        ExchangeOpType.SWAP,
+        ExchangeOpType.PERP_DEPOSIT,
+        ExchangeOpType.PERP_WITHDRAW,
+        ExchangeOpType.PERP_SET_LEVERAGE,
+        ExchangeOpType.PERP_ORDER,
+        ExchangeOpType.PERP_CANCEL,
+        ExchangeOpType.PERP_TRIGGER,
+        ExchangeOpType.PERP_MODIFY,
+        ExchangeOpType.CANCEL_ALL,
+        ExchangeOpType.TWAP_ORDER,
+        ExchangeOpType.TWAP_CANCEL,
+    }
+)
+
+# What an agent key may sign for the account that approved it: trading — never moving funds out
+# (withdrawals, transfers, deposits), never approving agents, staking or governance.
+AGENT_SCOPE = frozenset(
+    {
+        ExchangeOpType.PLACE_ORDER,
+        ExchangeOpType.CANCEL_ORDER,
+        ExchangeOpType.MODIFY_ORDER,
+        ExchangeOpType.SWAP,
+        ExchangeOpType.PERP_SET_LEVERAGE,
+        ExchangeOpType.PERP_ORDER,
+        ExchangeOpType.PERP_CANCEL,
+        ExchangeOpType.PERP_TRIGGER,
+        ExchangeOpType.PERP_MODIFY,
+        ExchangeOpType.CANCEL_ALL,
+        ExchangeOpType.TWAP_ORDER,
+        ExchangeOpType.TWAP_CANCEL,
+        ExchangeOpType.PERP_ISOLATED_MARGIN,  # (moves value only within the account)
+        ExchangeOpType.SCHEDULE_CANCEL,
+        ExchangeOpType.DEPLOYER_SET_ORACLE,  # (a deployer's oracle bot signs with an agent key)
+        ExchangeOpType.BATCH,  # (if every action is in scope)
+    }
+)
+
+
+def batch_actions(params: Dict[str, Any]) -> List[Tuple["ExchangeOpType", Dict[str, Any]]]:
+    """A BATCH's actions as (operation, params). Raises ValueError unless it is a list of 1 to
+    BATCH_MAX_ACTIONS ``{"op": name or number, "params": {...}}``, each a batchable
+    operation."""
+    actions = params.get("actions")
+    if not isinstance(actions, list) or not 1 <= len(actions) <= BATCH_MAX_ACTIONS:
+        raise ValueError(f"BATCH needs actions: a list of 1 to {BATCH_MAX_ACTIONS}")
+    out = []
+    for i, action in enumerate(actions):
+        if not isinstance(action, dict) or not isinstance(action.get("params", {}), dict):
+            raise ValueError(f"BATCH action {i}: {{op, params}} expected")
+        raw = action.get("op")
+        try:
+            if isinstance(raw, str):
+                op = ExchangeOpType[raw]
+            elif isinstance(raw, int) and not isinstance(raw, bool):
+                op = ExchangeOpType(raw)
+            else:
+                raise TypeError(raw)
+        except (KeyError, ValueError, TypeError):
+            raise ValueError(f"BATCH action {i}: unknown operation {raw!r}") from None
+        if op not in BATCH_ACTIONS:
+            raise ValueError(f"BATCH action {i}: {op.name} cannot be batched")
+        out.append((op, action.get("params", {})))
+    return out
 
 
 def match_budget(op_type: "ExchangeOpType", gas_limit: Optional[int]) -> Optional[int]:
@@ -675,6 +964,33 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.STAKE_DELEGATE: 60_000,
     ExchangeOpType.STAKE_UNDELEGATE: 40_000,
     ExchangeOpType.STAKE_SET_COMMISSION: 25_000,
+    ExchangeOpType.PERP_TRIGGER: 40_000,  # + the matching it prepays (max_makers)
+    ExchangeOpType.CANCEL_ALL: 20_000,  # + EXCHANGE_GAS_PER_CANCEL for each cancelled
+    ExchangeOpType.PERP_MODIFY: 60_000,  # + matching, as PERP_ORDER
+    ExchangeOpType.MODIFY_ORDER: 40_000,  # + matching, as PLACE_ORDER
+    ExchangeOpType.BATCH: 10_000,  # + each action's
+    ExchangeOpType.TWAP_ORDER: 40_000,  # + each slice's work and matching, paid up front
+    ExchangeOpType.TWAP_CANCEL: 25_000,
+    ExchangeOpType.AGENT_APPROVE: 30_000,
+    ExchangeOpType.AGENT_REVOKE: 20_000,
+    ExchangeOpType.SUBACCOUNT_CREATE: 50_000,
+    ExchangeOpType.SUBACCOUNT_TRANSFER: 40_000,
+    ExchangeOpType.VAULT_CREATE: 100_000,
+    ExchangeOpType.REFERRAL_REGISTER: 30_000,
+    ExchangeOpType.REFERRAL_JOIN: 30_000,
+    ExchangeOpType.ACCOUNT_POLICY: 40_000,
+    ExchangeOpType.QNS_REGISTER: 80_000,
+    ExchangeOpType.QNS_RENEW: 40_000,
+    ExchangeOpType.QNS_SET_RECORD: 30_000,
+    ExchangeOpType.QNS_SET_PRIMARY: 25_000,
+    ExchangeOpType.ACCOUNT_RECOVER: 40_000,
+    ExchangeOpType.PERP_ISOLATED_MARGIN: 30_000,
+    ExchangeOpType.SCHEDULE_CANCEL: 20_000,
+    ExchangeOpType.APPROVE_BUILDER_FEE: 25_000,
+    ExchangeOpType.DEPLOYER_BOND: 40_000,
+    ExchangeOpType.DEPLOYER_UNBOND: 40_000,
+    ExchangeOpType.DEPLOYER_SET_ORACLE: 25_000,
+    ExchangeOpType.DEPLOYER_HALT: 200_000,  # + what settling the market's positions costs
 }
 
 _NFT_REQUIRED = {

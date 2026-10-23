@@ -171,6 +171,10 @@ PARAMS: Dict[str, Param] = {
     ),
     "PERP_VAULT_SEEDERS": Param("list", [], "QRDX_PERP_VAULT_SEEDERS"),
     "PERP_COLLATERAL_TOKEN": Param("str", "", "QRDX_PERP_COLLATERAL_TOKEN"),
+    # Tokens accepted as perps margin beside the settlement token (portfolio margin,
+    # docs/TRADING_FEATURES.md): TOKEN:MARKET_ID:HAIRCUT — valued at that perp market's oracle
+    # price less the haircut (0.2 = counted at 80 %). Empty: none.
+    "PERP_PORTFOLIO_ASSETS": Param("list", [], "QRDX_PERP_PORTFOLIO_ASSETS"),
     "PERP_QUOTE": Param("str", "USD", "QRDX_PERP_QUOTE", empty_env_is_default=True),
     "PERP_ORACLE_VOTE_MAX_AGE": Param("int", 60, "QRDX_PERP_ORACLE_VOTE_MAX_AGE", minimum=1),
     "PERP_ORACLE_STALE_SECONDS": Param("int", 300, "QRDX_PERP_ORACLE_STALE_SECONDS", minimum=1),
@@ -179,6 +183,55 @@ PARAMS: Dict[str, Param] = {
     ),
     # QRDX burned to list a perp market: every market costs every node work in every block.
     "PERP_MARKET_LISTING_FEE": Param("int", 1_000, "QRDX_PERP_MARKET_LISTING_FEE", minimum=0),
+    # Liquidity a perp market's creator puts into the market's liquidity vault (the settlement
+    # unit), which the protocol quotes on its book; locked this long (docs/TRADING_FEATURES.md).
+    "PERP_MARKET_MIN_LIQUIDITY": Param("int", 10_000, "QRDX_PERP_MARKET_MIN_LIQUIDITY", minimum=0),
+    # The share of the protocol's QRDX fee income that goes to validators and delegators
+    # (docs/CONSENSUS_ROADMAP.md 6), in basis points; distributed each epoch like rewards.
+    "STAKER_FEE_SHARE_BPS": Param("int", 2000, "QRDX_STAKER_FEE_SHARE_BPS", minimum=0),
+    # Oracle hardening (docs/CONSENSUS_ROADMAP.md 5). A price applies only with this many fresh
+    # votes (or the whole committee, if smaller) as well as a stake majority; it moves at most
+    # ORACLE_MAX_STEP_BPS a second of block time since the last; votes further than
+    # ORACLE_OUTLIER_BAND_BPS from the applied median are counted against their validator.
+    # Basis points; 0 turns the bound or the record off.
+    "ORACLE_MIN_VOTERS": Param("int", 3, "QRDX_ORACLE_MIN_VOTERS", minimum=1),
+    "ORACLE_MAX_STEP_BPS": Param("int", 500, "QRDX_ORACLE_MAX_STEP_BPS", minimum=0),
+    "ORACLE_OUTLIER_BAND_BPS": Param("int", 200, "QRDX_ORACLE_OUTLIER_BAND_BPS", minimum=0),
+    # Perp order grid (docs/HYPERLIQUID_PARITY.md): a non-reduce-only order is worth at least
+    # PERP_MIN_ORDER_VALUE (0: no minimum); a market lists sizes in PERP_DEFAULT_SZ_DECIMALS
+    # decimals unless CREATE_MARKET says otherwise (-1: no grid).
+    "PERP_MIN_ORDER_VALUE": Param("int", 10, "QRDX_PERP_MIN_ORDER_VALUE", minimum=0),
+    "PERP_DEFAULT_SZ_DECIMALS": Param("int", 4, "QRDX_PERP_DEFAULT_SZ_DECIMALS", minimum=-1),
+    # Perp risk limits (docs/CONSENSUS_ROADMAP.md 3), in basis points; 0 turns one off. An order
+    # more than the band worse than the oracle is refused; the mark moving the breaker's move
+    # within its window holds the market to reduce-only orders for the cooldown.
+    "PERP_PRICE_BAND_BPS": Param("int", 2000, "QRDX_PERP_PRICE_BAND_BPS", minimum=0),
+    "PERP_BREAKER_MOVE_BPS": Param("int", 1000, "QRDX_PERP_BREAKER_MOVE_BPS", minimum=0),
+    "PERP_BREAKER_WINDOW_SECONDS": Param("int", 300, "QRDX_PERP_BREAKER_WINDOW_SECONDS", minimum=1),
+    "PERP_BREAKER_COOLDOWN_SECONDS": Param(
+        "int", 60, "QRDX_PERP_BREAKER_COOLDOWN_SECONDS", minimum=1
+    ),
+    # A perp market's open-interest floor (notional): its cap is the larger of this and its
+    # liquidity vault's equity × OI_CAP_MULTIPLE; 0 with no vault: uncapped.
+    "PERP_MIN_OI_CAP": Param("int", 0, "QRDX_PERP_MIN_OI_CAP", minimum=0),
+    # Deployer markets (docs/HYPERLIQUID_PARITY.md): the QRDX bond a deployer keeps while it has
+    # markets (slashable by governance, unbonding over DEPLOYER_UNBOND_SECONDS — longer than a
+    # proposal's voting period and timelock), its markets at most, the largest share of their
+    # protocol fees it may take (basis points), and how far its oracle may move a second.
+    "DEPLOYER_MIN_BOND": Param("int", 100_000, "QRDX_DEPLOYER_MIN_BOND", minimum=0),
+    "DEPLOYER_UNBOND_SECONDS": Param(
+        "int", 14 * 24 * 3600, "QRDX_DEPLOYER_UNBOND_SECONDS", minimum=0
+    ),
+    "DEPLOYER_MAX_MARKETS": Param("int", 10, "QRDX_DEPLOYER_MAX_MARKETS", minimum=0),
+    "DEPLOYER_MAX_FEE_SHARE_BPS": Param("int", 5_000, "QRDX_DEPLOYER_MAX_FEE_SHARE_BPS", minimum=0),
+    "DEPLOYER_ORACLE_MAX_STEP_BPS": Param(
+        "int", 100, "QRDX_DEPLOYER_ORACLE_MAX_STEP_BPS", minimum=0
+    ),
+    # QNS (docs/QNS.md): QRDX a name costs a year, paid to the treasury.
+    "QNS_PRICE_PER_YEAR": Param("int", 10, "QRDX_QNS_PRICE_PER_YEAR", minimum=0),
+    "PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS": Param(
+        "int", 30 * 24 * 3600, "QRDX_PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS", minimum=0
+    ),
     # Tokens the consensus bridge carries (docs/BRIDGE.md): SYMBOL:CHAIN_ID:SOURCE_TOKEN:DECIMALS.
     "BRIDGE_ASSETS": Param("list", [], "QRDX_BRIDGE_ASSETS"),
     "EXCHANGE_MIN_GAS_PRICE_WEI": Param("int", 10**9, "QRDX_EXCHANGE_MIN_GAS_PRICE_WEI", minimum=0),
@@ -240,11 +293,26 @@ FEATURES: Dict[str, str] = {
         "change (qrdx/state_commitment.py, qrdx/exchange/commitment.py) instead of a hash over "
         "every entry in order: a root costs O(changes) rather than O(state)."
     ),
+    "fair_ordering": (
+        "A block's exchange transactions run cancels first, then post-only orders, then the "
+        "rest, each nonce lane in nonce order (qrdx/exchange/fair_ordering.py): a proposer "
+        "cannot trade ahead of a maker's cancel."
+    ),
+    "provable_state": (
+        "The unified state root also commits to a sparse Merkle tree over the accounts, "
+        "contract storage and token balances (qrdx/state_proofs.py), so one entry can be proven "
+        "against a block's signed root — by a light client, a bridge, or a contract (the state "
+        "proof precompile)."
+    ),
 }
 
 # The rules a network created by this release has from genesis unless its spec says otherwise
 # (dev networks, and specs assembled by ``build_spec`` without an explicit feature list).
-GENESIS_DEFAULT_FEATURES: Tuple[str, ...] = ("incremental_state_root",)
+GENESIS_DEFAULT_FEATURES: Tuple[str, ...] = (
+    "incremental_state_root",
+    "provable_state",
+    "fair_ordering",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

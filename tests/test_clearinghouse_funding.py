@@ -89,7 +89,7 @@ def test_a_shallow_book_is_no_impact_price():
     assert ch.markets[BTC].funding_rate == FUNDING_INTEREST_8H / 8
 
 
-def test_the_rate_is_capped_per_hour():
+def test_the_rate_is_capped_per_hour(no_risk_limits):
     ch = _ch()
     ch.deposit("mm", D(10_000_000))
     ch.place_order("mm", BTC, "bid", "buy", D(1), D(60000), 0)        # a 100 % premium

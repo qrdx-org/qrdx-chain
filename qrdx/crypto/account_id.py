@@ -89,11 +89,31 @@ ACCOUNT_ID_LENGTH = 20  # bytes
 # user-supplied recipient silently keyable, which is exactly the strictness that
 # catches an unspendable TOKEN_TRANSFER recipient before it burns the tokens.
 # Adding a new protocol-derived holder form means adding it here, deliberately.
-SYNTHETIC_HOLDER_PREFIXES = ("0xPOOL", "0xCLOB", "0xPERP", "0xVETO", "0xBRDG")
+SYNTHETIC_HOLDER_PREFIXES = (
+    "0xPOOL",
+    "0xCLOB",
+    "0xPERP",
+    "0xVETO",
+    "0xBRDG",
+    "0xSUBA",
+    "0xUVLT",
+    "0xHLPV",
+    "0xPROT",
+    "0xQNSA",
+    "0xFEES",
+    "0xDBND",
+)
 
 # 0xPERP is the perps clearinghouse holder (docs/PERPS_CLEARINGHOUSE.md): all perp collateral.
 # 0xVETO is the governance veto escrow (docs/GOVERNANCE.md): QRDX locked against proposals.
 # 0xBRDG is the bridge's mint authority (docs/BRIDGE.md): no key can mint a bridged token.
+# 0xSUBA is a sub-account (docs/TRADING_FEATURES.md): its own balances and margin, acted for only
+# by its master's signature (an exchange transaction's ``signer``).
+# 0xUVLT is a user vault (docs/TRADING_FEATURES.md): a perps margin account its leader trades.
+# 0xHLPV is the perps backstop vault, 0xPROT the owner of the protocol's own vault shares.
+# 0xQNSA is QNS's mint authority: no key can mint a name (docs/CONSENSUS_ROADMAP.md C).
+# 0xFEES holds the stakers' share of trading fees until an epoch distributes it.
+# 0xDBND holds market deployers' QRDX bonds (docs/HYPERLIQUID_PARITY.md).
 # Every synthetic form is <prefix> + blake2b(digest_size=18).hexdigest() = 36 hex chars.
 # Validated, so a malformed one raises like any other bad address rather than being
 # hashed into some arbitrary account.
@@ -107,7 +127,7 @@ def _derive(tag: bytes, payload: bytes) -> str:
 
 
 def is_synthetic_holder(value: object) -> bool:
-    """True iff ``value`` is a well-formed protocol holder address (0xPOOL/0xCLOB/0xPERP/0xVETO)."""
+    """True iff ``value`` is a well-formed protocol holder address (``SYNTHETIC_HOLDER_PREFIXES``)."""
     if not isinstance(value, str):
         return False
     for prefix in SYNTHETIC_HOLDER_PREFIXES:

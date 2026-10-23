@@ -75,6 +75,9 @@ class GovernanceModule(RPCModule):
             "committee": {
                 a: str(w) for a, w in sorted((_manager().oracle_committee or {}).items())
             },
+            # Each validator's count of oracle votes outside the outlier band of the applied
+            # median (docs/CONSENSUS_ROADMAP.md 5).
+            "oracle_outliers": dict(sorted(_manager().oracle_outliers.items())),
             "scheduled_forks": [
                 {**f, "approval": chain_spec.fork_approval(chain_spec.active(), f)}
                 for f in chain_spec.active().forks

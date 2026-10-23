@@ -10,6 +10,8 @@ passed. It governs three things:
                        before SYSTEM_WALLET_MASTER_SUNSET_HEIGHT, when it would end anyway.
 * ``approve_fork``   — authorise a fork scheduled in the chain spec to activate
                        (docs/PROTOCOL_UPGRADES.md). An unapproved fork stays dormant.
+* ``delist_market``  — settle a perp market for good (docs/CONSENSUS_ROADMAP.md 4): every
+                       position closed at one price (given, or the oracle's at execution).
 
 Lifecycle, all judged by block height (never a clock):
 
@@ -47,7 +49,7 @@ from .commitment import Section, committed
 ZERO = Decimal(0)
 BPS = 10_000
 
-ACTIONS = ("system_spend", "freeze_master", "approve_fork")
+ACTIONS = ("system_spend", "freeze_master", "approve_fork", "delist_market", "slash_deployer")
 
 VOTING, PASSED, REJECTED, VETOED, EXECUTED, EXPIRED = (
     "voting",
@@ -64,6 +66,7 @@ MAX_OPEN_TOTAL = 64
 MAX_MEMO = 280
 
 _FORK_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+_MARKET_ID = re.compile(r"^[A-Za-z0-9._:-]{1,96}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -308,6 +311,30 @@ class Governance:
                     "the master controller's authority has already ended (sunset)"
                 )
             return {}
+        if action == "delist_market":
+            # The market is checked when the proposal executes (it is the clearinghouse's).
+            market = str(params.get("market_id", ""))
+            if not _MARKET_ID.match(market):
+                raise GovernanceError(f"invalid market id {market!r}")
+            body: Dict[str, Any] = {"market_id": market}
+            if params.get("price") not in (None, ""):
+                try:
+                    body["price"] = _fmt(_amount(params["price"]))
+                except ValueError as e:
+                    raise GovernanceError(f"settlement price: {e}") from None
+            return body
+        if action == "slash_deployer":
+            # A market deployer that ran a market dishonestly (docs/HYPERLIQUID_PARITY.md): burn
+            # ``bps`` of its bond — what is unbonding too — and, with ``halt``, settle every
+            # market it still runs at its oracle price. Checked when it executes (the bond is
+            # the exchange's).
+            deployer = str(params.get("deployer", "")).strip()
+            if not deployer:
+                raise GovernanceError("slash_deployer names the deployer")
+            bps = params.get("bps")
+            if isinstance(bps, bool) or not isinstance(bps, int) or not 0 < bps <= BPS:
+                raise GovernanceError(f"bps is 1 to {BPS}")
+            return {"deployer": deployer, "bps": bps, "halt": bool(params.get("halt", False))}
         # approve_fork — recorded as given; deliberately NOT checked against this node's spec
         # (see the module docstring).
         fork = str(params.get("fork", ""))
@@ -436,6 +463,12 @@ class Governance:
                 )
             moves = [(p.params["wallet"], -amount), (p.params["to"], amount)]
             result.update(wallet=p.params["wallet"], to=p.params["to"], amount=_fmt(amount))
+        elif p.action == "delist_market":
+            # Settled by the caller (the exchange's clearinghouse): see the manager's GOV_EXECUTE.
+            result.update(market_id=p.params["market_id"], price=p.params.get("price"))
+        elif p.action == "slash_deployer":
+            # Carried out by the caller (the exchange holds the bond): the manager's GOV_EXECUTE.
+            result.update(deployer=p.params["deployer"], bps=p.params["bps"], halt=p.params["halt"])
         elif p.action == "freeze_master":
             if self.master_frozen_at is None:
                 self.master_frozen_at = height

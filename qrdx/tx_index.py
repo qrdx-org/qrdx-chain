@@ -196,8 +196,12 @@ def _exchange_summary(op: str, p: Dict[str, Any], data: Dict[str, Any]) -> Dict[
             "asset": p.get("token_in"),
             "amount": p.get("amount_in"),
         }
-    if op in ("PLACE_ORDER", "CANCEL_ORDER"):
+    if op in ("PLACE_ORDER", "CANCEL_ORDER", "MODIFY_ORDER"):
         return {"target": p.get("pair"), "amount": p.get("amount")}
+    if op == "CANCEL_ALL":
+        return {"target": p.get("market"), "amount": data.get("cancelled")}
+    if op == "BATCH":
+        return {"amount": len(p.get("actions") or [])}
     if op in ("CREATE_POOL", "ADD_LIQUIDITY", "REMOVE_LIQUIDITY", "REMOVE_POOL"):
         return {
             "target": p.get("pool_id")

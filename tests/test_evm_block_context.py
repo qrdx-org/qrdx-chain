@@ -70,10 +70,11 @@ def test_block_timestamps_map_to_evm_seconds(value, expected):
 
 def test_eth_call_uses_the_latest_block():
     from qrdx.node import main as node_main
-    src = source_of(node_main.startup)
+    src = source_of(node_main._eth_call)
     call = src[src.index("evm_executor.call("):]
-    call = call[:call.index("), preload=")]
+    call = call[:call.index("preload=")]
     assert "block_number=max(tip, 1)" in call and "timestamp=_evm_block_timestamp(" in call
+    assert "_eth_call(evm_executor" in source_of(node_main.startup)
 
 
 def test_there_is_one_write_path():
@@ -85,3 +86,31 @@ def test_there_is_one_write_path():
     from qrdx.rpc.modules.eth import EthModule
     refusal = source_of(EthModule.sendTransaction)
     assert "eth_sendRawTransaction" in refusal and "not supported" in refusal
+
+
+async def test_eth_call_honours_the_calls_value_and_gas(tmp_path, monkeypatch):
+    """A payable call is simulated as sent: CALLVALUE is the call's value (it used to be
+    dropped — every payable call ran as if it sent nothing), the caller must hold it, and the
+    call's gas is honoured."""
+    from eth_utils import to_checksum_address
+
+    from qrdx.database_sqlite import DatabaseSQLite
+    from qrdx.node import main as node_main
+
+    db = await DatabaseSQLite.create(db_path=str(tmp_path / "call.db"))
+    try:
+        sm = ContractStateManager(db)
+        ex = QRDXEVMExecutor(sm)
+        sm.set_code_sync(CONTRACT, _probe(0x34))                      # returns CALLVALUE
+        sm.set_balance_sync("0x" + CALLER.hex(), 10 ** 18)
+        await sm.commit(1)
+        monkeypatch.setattr(node_main, "db", db)
+        call = {"from": to_checksum_address(CALLER), "to": CONTRACT}
+        assert int(await node_main._eth_call(ex, dict(call, value="0x2a")), 16) == 42
+        assert int(await node_main._eth_call(ex, dict(call)), 16) == 0
+        with pytest.raises(Exception, match="Call failed"):           # more than it holds
+            await node_main._eth_call(ex, dict(call, value=hex(10 ** 19)))
+        with pytest.raises(Exception, match="Call failed"):           # too little gas
+            await node_main._eth_call(ex, dict(call, value="0x1", gas="0x5"))
+    finally:
+        await db.close()

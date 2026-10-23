@@ -16,6 +16,12 @@ import pytest
 from qrdx.exchange.state_manager import ExchangeStateManager
 from qrdx.exchange.orderbook import OrderBook, OrderSide
 
+
+@pytest.fixture(autouse=True)
+def _fee_free(no_trading_fees):
+    """Escrow and settlement mechanics, amounts exact: fees off (tests/test_spot_fees.py)."""
+
+
 PAIR = "TKA:TKB"   # base:quote
 BASE, QUOTE = "TKA", "TKB"
 
@@ -117,11 +123,32 @@ def test_enforce_rejects_unaffordable_limit():
     assert mgr.token_balance_deltas() == {}              # no match, no settlement
 
 
-def test_enforce_rejects_market_order():
+def test_enforce_market_order_settles_live_and_escrows_nothing():
+    """A market order takes what the book has and never rests: each fill is paid live."""
     mgr = _mgr()
+    mgr.set_available_token_balance("0xPQm", BASE, Decimal("100"))
+    mgr._op_place_order(_order_tx("0xPQm", "sell", 5, 10, "m" * 16))   # rests, escrows 10 base
     mgr.set_available_token_balance("0xPQt", QUOTE, Decimal("100000"))
+    res = mgr._op_place_order(_order_tx("0xPQt", "buy", 0, 15, "t" * 16, order_type="market"))
+    assert res.success and res.data["filled"] == "10"
+    d = mgr.token_balance_deltas()
+    assert d[("0xPQt", BASE)] == Decimal("10") and d[("0xPQt", QUOTE)] == Decimal("-50")
+    assert d[(_escrow(mgr), BASE)] == 0 and d.get((_escrow(mgr), QUOTE), 0) == 0
+    assert mgr._order_books[PAIR].get_order("t" * 16) is None
+    _assert_conserves(mgr)
+
+
+def test_enforce_market_order_the_taker_cannot_pay_fails_whole():
+    mgr = _mgr()
+    mgr.enforce_spot_settlement = True
+    mgr.set_available_token_balance("0xPQm", BASE, Decimal("100"))
+    mgr.set_available_token_balance(_escrow(mgr), BASE, Decimal("0"))
+    mgr._op_place_order(_order_tx("0xPQm", "sell", 5, 10, "m" * 16))
+    before = (mgr.token_balance_deltas(), mgr._order_books[PAIR].state_digest())
+    mgr.set_available_token_balance("0xPQt", QUOTE, Decimal("10"))     # 10 base cost 50
     res = mgr._op_place_order(_order_tx("0xPQt", "buy", 0, 10, "t" * 16, order_type="market"))
-    assert not res.success and "LIMIT" in res.error
+    assert not res.success and "cannot cover" in res.error
+    assert (mgr.token_balance_deltas(), mgr._order_books[PAIR].state_digest()) == before
 
 
 def test_observe_off_is_behaviour_neutral():

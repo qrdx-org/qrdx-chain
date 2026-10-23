@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import contextvars
 from decimal import ROUND_FLOOR, Decimal
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from eth.exceptions import Revert
 from eth_utils import keccak
@@ -157,6 +157,9 @@ class EvmSection:
         self.nft_approvals: Dict[Tuple[str, int], Optional[str]] = {}
         self.nft_operators: Dict[Tuple[str, str, str], bool] = {}
         self.nft_balances: Dict[Tuple[str, str], int] = {}
+        # exchange actions contracts sent (qrdx/contracts/exchange_evm.py):
+        # (contract, op, params JSON, exchange gas limit)
+        self.exchange_actions: List[Tuple[str, str, str, int]] = []
         self.receipts: list = []
 
     def record(self, **receipt) -> None:
@@ -193,6 +196,8 @@ class EvmSection:
             elif entry[0] == "nft_bal":
                 key = (entry[1], entry[2])
                 self.nft_balances[key] = self.nft_balances.get(key, 0) + entry[3]
+            elif entry[0] == "xact":
+                self.exchange_actions.append((entry[1], entry[2], entry[3], entry[4]))
 
     async def commit(self, db) -> None:
         """Write the section's moves to the token ledger and its approvals to the registry."""
@@ -230,6 +235,10 @@ class EvmSection:
                 import logging
 
                 logging.getLogger(__name__).error("[NFT] operator change dropped: %s", e)
+        if self.exchange_actions:  # run at the start of the next block
+            from ..exchange.state_manager import ExchangeStateManager
+
+            ExchangeStateManager.get_instance().queue_evm_actions(self.exchange_actions)
         for r in self.receipts:
             try:
                 await _write_receipt(db, r)
@@ -247,6 +256,7 @@ class EvmSection:
         self.nft_approvals.clear()
         self.nft_operators.clear()
         self.nft_balances.clear()
+        self.exchange_actions = []
         self.receipts.clear()
 
 

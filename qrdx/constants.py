@@ -643,6 +643,9 @@ PERP_VAULT_SEEDERS = tuple(_NETWORK_PARAMS["PERP_VAULT_SEEDERS"])
 # (development and tests only). Empty (the default): no collateral is configured and perps
 # deposits are refused. Chain-spec parameters, like the two below.
 PERP_COLLATERAL_TOKEN = _NETWORK_PARAMS["PERP_COLLATERAL_TOKEN"]
+# Portfolio margin: tokens accepted as perps margin beside the settlement token, each
+# "TOKEN:MARKET_ID:HAIRCUT" (qrdx/exchange/clearinghouse.py ``portfolio_assets``). Chain-spec.
+PERP_PORTFOLIO_ASSETS = tuple(_NETWORK_PARAMS["PERP_PORTFOLIO_ASSETS"])
 # The unit perp markets are quoted in: "BTC-USD-PERP", priced by oracle pair "BTC:USD".
 PERP_QUOTE = _NETWORK_PARAMS["PERP_QUOTE"] or "USD"
 # Validator price oracle (docs/PERPS_CLEARINGHOUSE.md §8). Each block, a market's oracle is the
@@ -665,6 +668,34 @@ BLOCK_EXCHANGE_GAS_LIMIT = _NETWORK_PARAMS["BLOCK_EXCHANGE_GAS_LIMIT"]
 # every block (its mark, funding and liquidation duties) and a place in the validators' price
 # votes, so listing one must not be nearly free. A chain-spec parameter.
 PERP_MARKET_LISTING_FEE = _NETWORK_PARAMS["PERP_MARKET_LISTING_FEE"]
+# A perp market's creator seeds the market's liquidity vault with at least this much of its perps
+# collateral, locked for the lockup (qrdx/exchange/clearinghouse.py MARKET_MAKER_*). Chain-spec.
+PERP_MARKET_MIN_LIQUIDITY = _NETWORK_PARAMS["PERP_MARKET_MIN_LIQUIDITY"]
+# Stakers' share of the protocol's QRDX fee income (validator/epoch_state.py). Chain-spec.
+STAKER_FEE_SHARE_BPS = _NETWORK_PARAMS["STAKER_FEE_SHARE_BPS"]
+# Oracle hardening (state_manager._aggregate_votes). Chain-spec.
+ORACLE_MIN_VOTERS = _NETWORK_PARAMS["ORACLE_MIN_VOTERS"]
+ORACLE_MAX_STEP_BPS = _NETWORK_PARAMS["ORACLE_MAX_STEP_BPS"]
+ORACLE_OUTLIER_BAND_BPS = _NETWORK_PARAMS["ORACLE_OUTLIER_BAND_BPS"]
+# Perp order grid: minimum order value, default size decimals (clearinghouse._check_grid).
+PERP_MIN_ORDER_VALUE = _NETWORK_PARAMS["PERP_MIN_ORDER_VALUE"]
+PERP_DEFAULT_SZ_DECIMALS = _NETWORK_PARAMS["PERP_DEFAULT_SZ_DECIMALS"]
+# Perp price band and circuit breaker (qrdx/exchange/clearinghouse.py). Chain-spec; 0 is off.
+PERP_PRICE_BAND_BPS = _NETWORK_PARAMS["PERP_PRICE_BAND_BPS"]
+PERP_BREAKER_MOVE_BPS = _NETWORK_PARAMS["PERP_BREAKER_MOVE_BPS"]
+PERP_BREAKER_WINDOW_SECONDS = _NETWORK_PARAMS["PERP_BREAKER_WINDOW_SECONDS"]
+PERP_BREAKER_COOLDOWN_SECONDS = _NETWORK_PARAMS["PERP_BREAKER_COOLDOWN_SECONDS"]
+# A perp market's open-interest floor (qrdx/exchange/clearinghouse.py ``oi_cap``). Chain-spec.
+PERP_MIN_OI_CAP = _NETWORK_PARAMS["PERP_MIN_OI_CAP"]
+# Deployer markets (docs/HYPERLIQUID_PARITY.md). Chain-spec.
+DEPLOYER_MIN_BOND = _NETWORK_PARAMS["DEPLOYER_MIN_BOND"]
+DEPLOYER_UNBOND_SECONDS = _NETWORK_PARAMS["DEPLOYER_UNBOND_SECONDS"]
+DEPLOYER_MAX_MARKETS = _NETWORK_PARAMS["DEPLOYER_MAX_MARKETS"]
+DEPLOYER_MAX_FEE_SHARE_BPS = _NETWORK_PARAMS["DEPLOYER_MAX_FEE_SHARE_BPS"]
+DEPLOYER_ORACLE_MAX_STEP_BPS = _NETWORK_PARAMS["DEPLOYER_ORACLE_MAX_STEP_BPS"]
+# QNS: QRDX a name costs a year (docs/QNS.md). Chain-spec.
+QNS_PRICE_PER_YEAR = _NETWORK_PARAMS["QNS_PRICE_PER_YEAR"]
+PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS = _NETWORK_PARAMS["PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS"]
 # Tokens the consensus bridge carries from other chains (docs/BRIDGE.md), each
 # "SYMBOL:CHAIN_ID:SOURCE_TOKEN:DECIMALS". Validators attest deposits into the lockbox there; a
 # quorum mints them here. Empty: no bridge. A chain-spec parameter (adding an asset is a fork).

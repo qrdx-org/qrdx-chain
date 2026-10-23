@@ -471,6 +471,7 @@ class P2PModule(RPCModule):
                     self._db,
                     block_content,
                     enforce=bool(self._enforce_proposer_eligibility),
+                    height=int(block_no),
                 )
                 if not ok_elig:
                     return {"ok": False, "error": f"Proposer ineligible: {elig_err}"}
@@ -554,15 +555,15 @@ class P2PModule(RPCModule):
                         try:
                             from ...exchange.block_processor import (
                                 ensure_oracle_committee,
-                                run_exchange_tick,
+                                tick_and_flush,
                             )
                             from ...exchange.state_manager import ExchangeStateManager
 
                             await ensure_oracle_committee(
                                 self._db, ExchangeStateManager.get_instance(), int(block_no)
                             )
-                            run_exchange_tick(
-                                int(block_no), float(block_data.get("timestamp", 0) or 0)
+                            await tick_and_flush(
+                                self._db, int(block_no), float(block_data.get("timestamp", 0) or 0)
                             )
                         except Exception as e:
                             logger.error(f"exchange tick failed at block {block_no}: {e}")
@@ -608,7 +609,9 @@ class P2PModule(RPCModule):
                     # root (after section replay, before storing).
                     if self._verify_unified_root is not None:
                         try:
-                            ok_root, root_err = await self._verify_unified_root(block_content)
+                            ok_root, root_err = await self._verify_unified_root(
+                                block_content, height=int(block_no)
+                            )
                         except Exception as e:
                             ok_root, root_err = True, f"unified root check error: {e}"
                         if not ok_root:

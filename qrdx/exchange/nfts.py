@@ -28,6 +28,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from . import undo
 from .commitment import Section, committed
 from .tokens import (
     MAX_NAME_LENGTH,
@@ -288,6 +289,7 @@ class NftRegistry:
             raise NftError(f"an NFT's name must be at most {MAX_NAME_LENGTH} printable characters")
         nft = Nft(owner=str(to), uri=_uri(uri), name=name, minted_height=int(height))
         self.items[(c.address, i)] = nft
+        undo.keep_entry(self.by_owner, account(to))  # (derived, but read by consensus code)
         self.by_owner.setdefault(account(to), set()).add((c.address, i))
         c.minted += 1
         if i >= c.next_id:
@@ -334,6 +336,7 @@ class NftRegistry:
         if o == op:
             raise NftError("cannot approve yourself as an operator")
         key = (c.address, o, op)
+        undo.keep_entry(self.operator_counts, o, mutable=False)
         if approved and key not in self.operators:
             if self.operator_counts.get(o, 0) >= MAX_OPERATORS_PER_OWNER:
                 raise NftError(
@@ -354,6 +357,9 @@ class NftRegistry:
         ownership changes, so the owner index always agrees."""
         key = (str(collection).lower(), tid)
         n = self.items[key]
+        undo.keep_entry(self.by_owner, account(n.owner))
+        if owner is not None:
+            undo.keep_entry(self.by_owner, account(owner))
         held = self.by_owner.get(account(n.owner))
         if held is not None:
             held.discard(key)

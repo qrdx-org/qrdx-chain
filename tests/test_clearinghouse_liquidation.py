@@ -111,7 +111,7 @@ def test_no_book_fill_is_worse_than_the_bankruptcy_price():
 
 # ── 2. the backstop vault ──────────────────────────────────────────────────
 
-def test_the_vault_takes_over_at_mark_with_the_remaining_margin():
+def test_the_vault_takes_over_at_mark_with_the_remaining_margin(no_staker_fees):
     ch = _ch()
     _open(ch, "alice", "bob", 1, 30000, 3500)
     fees = D(30000) * (MAKER_FEE_RATE + TAKER_FEE_RATE)    # 21: already the vault's
@@ -126,7 +126,7 @@ def test_the_vault_takes_over_at_mark_with_the_remaining_margin():
     _sound(ch)
 
 
-def test_an_isolated_backstop_takes_only_that_positions_margin():
+def test_an_isolated_backstop_takes_only_that_positions_margin(no_staker_fees):
     ch = _ch()
     ch.deposit("alice", D(10000))
     ch.set_leverage("alice", BTC, D(10), isolated=True)
@@ -142,7 +142,7 @@ def test_an_isolated_backstop_takes_only_that_positions_margin():
 
 # ── 3. auto-deleveraging ───────────────────────────────────────────────────
 
-def test_bad_debt_beyond_the_vault_is_auto_deleveraged_to_exactly_zero():
+def test_bad_debt_beyond_the_vault_is_auto_deleveraged_to_exactly_zero(no_staker_fees):
     ch = _ch()
     _open(ch, "alice", "bob", 1, 30000, 3500)              # vault holds only the 21 of fees
     events = _crash(ch, 26000)                              # equity −515: bankrupt
@@ -181,7 +181,7 @@ def test_orders_are_cancelled_before_the_book_close():
 
 # ── the vault's shares ─────────────────────────────────────────────────────
 
-def test_vault_shares_are_priced_at_nav_and_locked():
+def test_vault_shares_are_priced_at_nav_and_locked(no_staker_fees):
     ch = _ch()
     _open(ch, "alice", "bob", 1, 30000, 3500)              # 21 of fees, no shares yet
     ch.deposit("eve", D(5000))
@@ -260,8 +260,11 @@ def _random_run(seed, steps=160, vault_capital=20000):
             spread = D(rng.choice(["0.001", "0.005", "0.02"]))
             for side, k in (("buy", 1 - spread), ("sell", 1 + spread)):
                 n += 1
-                ch.place_order("mm", BTC, f"mm{n}", side, D(rng.randint(1, 20)) / 10,
-                               (oracle * k).quantize(D("0.01")), 0)
+                try:  # refused while a crash has tripped the circuit breaker
+                    ch.place_order("mm", BTC, f"mm{n}", side, D(rng.randint(1, 20)) / 10,
+                                   (oracle * k).quantize(D("0.01")), 0)
+                except ClearinghouseError:
+                    pass
         for _ in range(rng.randint(0, 4)):
             n += 1
             t = rng.choice(traders)

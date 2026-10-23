@@ -72,12 +72,12 @@ def test_a_winners_profit_is_exactly_the_losers_loss(ch, seq):
     a, b = ch.accounts["alice"], ch.accounts["bob"]
     assert not a.positions and not b.positions
     # Alice +3,000 and Bob −3,000 exactly; each paid fees (taker 0.05 %, maker 0.02 %) to the
-    # vault. Nothing created or destroyed.
+    # vault, less the stakers' share, which leaves. Nothing created or destroyed.
     open_fee, close_fee = D("30000"), D("33000")
     assert a.collateral == D("13000") - (open_fee + close_fee) * TAKER_FEE_RATE
     assert b.collateral == D("7000") - (open_fee + close_fee) * MAKER_FEE_RATE
-    assert a.collateral + b.collateral + ch.vault_collateral == D("20000")
-    assert ch.holder_balance == D("20000")
+    assert a.collateral + b.collateral + ch.vault_collateral + ch.staker_fees == D("20000")
+    assert ch.holder_balance == D("20000") - ch.staker_fees
 
 
 def test_net_size_is_zero_in_every_state(ch, seq):
@@ -207,12 +207,21 @@ def test_margin_mode_cannot_change_with_an_open_position(ch, seq):
 
 # ── fees and deposits ────────────────────────────────────────────────────
 
-def test_fees_move_to_the_vault(ch, seq):
+def test_fees_move_to_the_vault_less_the_stakers_share(ch, seq):
+    """In QRDX (the test session's perps asset) STAKER_FEE_SHARE_BPS of each fee leaves the
+    clearinghouse for the stakers (docs/CONSENSUS_ROADMAP.md 6)."""
+    from qrdx import constants
+
     for who in ("a", "b"):
         ch.deposit(who, D("100000"))
     _order(ch, seq, "b", "sell", 1, 30000)
     _order(ch, seq, "a", "buy", 1, 30000)
-    assert ch.vault_collateral == D("30000") * (MAKER_FEE_RATE + TAKER_FEE_RATE)
+    fees = D("30000") * (MAKER_FEE_RATE + TAKER_FEE_RATE)
+    share = D(constants.STAKER_FEE_SHARE_BPS) / 10_000
+    assert ch.staker_fees == fees * share
+    assert ch.vault_collateral == fees - ch.staker_fees
+    assert ch.holder_balance == D("200000") - ch.staker_fees
+    assert ch.take_staker_fees() == fees * share and ch.staker_fees == 0
     _sound(ch)
 
 
@@ -274,7 +283,7 @@ def test_invariants_hold_under_random_trading():
         except (ClearinghouseError, ValueError):
             pass
         _sound(ch)
-        assert ch.holder_balance == deposited - withdrawn
+        assert ch.holder_balance == deposited - withdrawn - ch.staker_fees
         assert ch.holder_balance >= 0
     assert any(p.size != 0 for a in ch.accounts.values() for p in a.positions.values())
 

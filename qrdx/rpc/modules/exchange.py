@@ -27,6 +27,10 @@ from the same views as the REST endpoints (qrdx/exchange/views.py), so all surfa
     perp_getMarkets()   perp_getMarket(id)   perp_getOrderBook(id, depth)
     perp_getAccount(address)   perp_getOpenOrders(address)   perp_getVault()
     perp_getTrades(id, limit)   perp_getEvents(market_id, address, types, since, limit)
+    perp_getTriggers(address)   perp_getTwaps(address)   perp_getFeeSchedule(address)
+    perp_getUserVaults(leader)   perp_getUserVault(vault, holder)
+    perp_getDeployer(address | dex)   (docs/HYPERLIQUID_PARITY.md: a deployer's bond and markets)
+    exchange_getAgents(address)   exchange_getSubaccounts(address)
 
     market_getMarkets(kind)   market_getTicker(market)   market_getOrderBook(market, depth, level)
     market_getTrades(market, limit, since)   market_getCandles(market, interval, limit, end)
@@ -94,11 +98,37 @@ class ExchangeModule(RPCModule):
         return (await suggested_prices(db))[1]
 
     @rpc_method
-    async def getNonce(self, address: str) -> int:
+    async def getNonce(self, address: str, signer: Optional[str] = None) -> int:
+        """The next nonce of ``address`` — or, with ``signer`` (an agent, a sub-account's
+        master, a vault's leader), of that signer's lane for it."""
         from ...exchange import views
 
         mgr = _manager()
-        return mgr.get_nonce(views.account_key(mgr.clearinghouse, address) or address)
+        key = views.account_key(mgr.clearinghouse, address) or address
+        if signer and signer != key:
+            key = f"{key}|{signer}"
+        return mgr.get_nonce(key)
+
+    @rpc_method
+    async def getProtocolAddresses(self) -> Dict[str, Any]:
+        """Every address the protocol holds balances at: pools, book escrows, the perps holder,
+        the backstop vault, vaults, the veto escrow, the bridge, the system wallets."""
+        from ...exchange import views
+
+        return views.protocol_addresses(_manager())
+
+    @rpc_method
+    async def getAgents(self, address: str) -> List[Dict[str, Any]]:
+        """The agent keys ``address`` approved to trade for it."""
+        from ...exchange import views
+
+        return views.agents(_manager(), address)
+
+    @rpc_method
+    async def getSubaccounts(self, address: str) -> List[Dict[str, Any]]:
+        from ...exchange import views
+
+        return views.subaccounts(_manager(), address)
 
     @rpc_method
     async def getTokenBalance(self, token_address: str, address: str) -> str:
@@ -326,6 +356,63 @@ class PerpModule(RPCModule):
         return views.open_orders(_manager(), address)
 
     @rpc_method
+    async def getTriggers(self, address: str) -> List[Dict[str, Any]]:
+        """An address's trigger orders waiting for their price, perps and spot."""
+        from ...exchange import views
+
+        return views.triggers(_manager(), address)
+
+    @rpc_method
+    async def getTwaps(self, address: str) -> List[Dict[str, Any]]:
+        from ...exchange import views
+
+        return views.twaps(_manager(), address)
+
+    @rpc_method
+    async def getFeeSchedule(self, address: Optional[str] = None) -> Dict[str, Any]:
+        from ...exchange import views
+
+        return views.fee_schedule(_manager(), address)
+
+    @rpc_method
+    async def getUserVaults(self, leader: Optional[str] = None) -> List[Dict[str, Any]]:
+        from ...exchange import views
+
+        return views.user_vaults(_manager(), leader)
+
+    @rpc_method
+    async def getUserVault(self, vault: str, holder: Optional[str] = None) -> Dict[str, Any]:
+        from ...exchange import views
+
+        found = views.user_vault(_manager(), vault, holder)
+        if found is None:
+            raise RPCError(RPCErrorCode.RESOURCE_NOT_FOUND, f"no vault {vault}")
+        return found
+
+    @rpc_method
+    async def getDeployer(self, who: str) -> Dict[str, Any]:
+        """A market deployer, by address or namespace: its bond, what it is unbonding and
+        when that unlocks, and the markets it runs."""
+        mgr = _manager()
+        address = who
+        found = mgr.trading.deployers.peek(who)
+        if found is None:
+            for addr, d in mgr.trading.deployers.peek_items():
+                if d.dex == who:
+                    address, found = addr, d
+                    break
+        if found is None:
+            raise RPCError(RPCErrorCode.RESOURCE_NOT_FOUND, f"no deployer {who}")
+        return {
+            "address": address,
+            "dex": found.dex,
+            "bond": str(found.bond),
+            "unbonding": str(found.unbonding),
+            "unlock": str(found.unlock) if found.unbonding > 0 else None,
+            "markets": mgr.deployer_markets(address),
+        }
+
+    @rpc_method
     async def getVault(self) -> Dict[str, Any]:
         from ...exchange import views
 
@@ -403,3 +490,80 @@ class MarketModule(RPCModule):
         except ValueError as e:
             raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e)) from e
         return self._found(found, market)
+
+
+class AccountModule(RPCModule):
+    """Who may sign for an address, and what an address may sign for (docs/ACCOUNT_CONTROL.md):
+    ``account_getAuthority(address)`` / ``account_getControlled(address)``."""
+
+    namespace = "account"
+
+    @rpc_method
+    async def getAuthority(self, address: str) -> Dict[str, Any]:
+        from ...exchange import views
+
+        try:
+            return views.authority(_manager(), address)
+        except ValueError as e:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e)) from e
+
+    @rpc_method
+    async def getControlled(self, address: str) -> Dict[str, Any]:
+        from ...exchange import views
+
+        try:
+            return views.controlled(_manager(), address)
+        except ValueError as e:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e)) from e
+
+
+class QnsModule(RPCModule):
+    """QNS, the QRDX Name Service (docs/QNS.md): ``qns_resolve(name)``, ``qns_reverse(address)``,
+    ``qns_getName(name)``, ``qns_namesOf(address)``, ``qns_price(years)``."""
+
+    namespace = "qns"
+
+    @staticmethod
+    def _now():
+        from decimal import Decimal
+
+        return Decimal(str(_manager()._block_clock()))
+
+    @rpc_method
+    async def resolve(self, name: str) -> Optional[str]:
+        from ...exchange.qns import QnsError, normalize
+
+        mgr = _manager()
+        try:
+            return mgr.qns.resolve(mgr.nfts, normalize(name), self._now())
+        except QnsError as e:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e)) from e
+
+    @rpc_method
+    async def reverse(self, address: str) -> Optional[str]:
+        mgr = _manager()
+        try:
+            return mgr.qns.reverse(mgr.nfts, address, self._now())
+        except ValueError as e:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e)) from e
+
+    @rpc_method
+    async def getName(self, name: str) -> Optional[Dict[str, Any]]:
+        from ...exchange.qns import QnsError, normalize, summary
+
+        mgr = _manager()
+        try:
+            return summary(mgr.qns, mgr.nfts, normalize(name), self._now())
+        except QnsError as e:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e)) from e
+
+    @rpc_method
+    async def namesOf(self, address: str) -> List[str]:
+        mgr = _manager()
+        return mgr.qns.names_of(mgr.nfts, address)
+
+    @rpc_method
+    async def price(self, years: int = 1) -> str:
+        from ... import constants
+
+        return str(constants.QNS_PRICE_PER_YEAR * int(years))

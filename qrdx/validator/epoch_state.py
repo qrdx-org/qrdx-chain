@@ -22,6 +22,13 @@ genesis set:
          and out;
       5. stake-floor ejection (with the liveness backstop).
 
+**Fee income** (docs/CONSENSUS_ROADMAP.md 6). The stakers' share of the protocol's QRDX fee
+income is held at ``STAKER_FEE_HOLDER`` as it is paid, and each block logs what it took in
+(``staker_fee_income``). An epoch's income — with any remainder carried from before — is shared
+like the minted rewards for the same target: among the validators whose vote is carried, by
+principal and pool, the validator keeping its commission on the pool's part, the rest compounding
+into the pool. Fee payouts are paid out of the holder, not minted (validator/withdrawals.py).
+
 Nothing else is read: not finality, not when a node happened to process an epoch, not a table
 another code path mutates. Stake operations come from the logs block application writes for
 operations that EXECUTED (``validator_deposits`` / ``validator_exits``, reversed on rollback):
@@ -46,6 +53,7 @@ stale state, and a state is computed once per epoch from the previous one.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import weakref
 from bisect import bisect_left
@@ -65,6 +73,9 @@ WEI = Decimal("1e-18")  # QRDX amounts are whole wei
 SECONDS_PER_YEAR = 31_557_600  # a Julian year
 SLASH_FRACTION = Decimal("0.50")  # double sign and surround / double vote alike
 MIN_ACTIVE_AFTER_EJECTION = 3  # never eject below this many active validators
+# Where the stakers' share of the protocol's fee income waits for its epoch's distribution (a
+# synthetic holder: no key signs for it).
+STAKER_FEE_HOLDER = "0xFEES" + hashlib.blake2b(b"staking:fee-holder", digest_size=18).hexdigest()
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS validator_epoch_states ("
@@ -180,6 +191,7 @@ class State(dict):
         self.payouts: List[Payout] = []
         self.last_block_epoch: int = -1  # the newest epoch with a block on this chain
         self.next_payout_id: int = 1
+        self.fee_carry: Decimal = Decimal(0)  # fee income not yet shared (rounding, no voters)
 
     def weight(self, address: str) -> Decimal:
         """A validator's stake as selection and finality weigh it: its own effective stake and
@@ -206,6 +218,7 @@ class EpochInputs:
     attesters: Iterable[str]  # validators whose vote for epoch − INCLUSION_EPOCHS is carried
     offenders: Iterable[str]  # validators a slashing proof in the epoch's blocks convicts
     has_blocks: bool = True  # whether the epoch has a block on this chain
+    fees: Decimal = Decimal(0)  # the stakers' fee income the epoch's blocks took in
 
 
 def genesis_state(genesis_validators: List[Dict[str, Any]]) -> State:
@@ -249,6 +262,7 @@ def transition(state: State, epoch: int, inputs: EpochInputs) -> State:
     from .ffg import INCLUSION_EPOCHS
 
     s = copy.deepcopy(state)
+    s.__dict__.pop("_stakes_memo", None)  # (the copy's stakes are its own, recomputed if asked)
     if not isinstance(s, State):  # a plain mapping (tests, an older cache)
         s = State(s)
     e = int(epoch)
@@ -354,6 +368,12 @@ def transition(state: State, epoch: int, inputs: EpochInputs) -> State:
                 v.earned += own + commission
                 s.payout(v.address, own + commission, e + 1, "reward")
 
+    # 3b. Fee income: the epoch's, and what was carried, shared among the same voters by
+    #     principal and pool — paid out of STAKER_FEE_HOLDER, never minted.
+    s.fee_carry = getattr(s, "fee_carry", ZERO) + Decimal(str(inputs.fees))
+    voters = [v for v in active if v.address in attesters] if target >= 1 else []
+    _share_fees(s, voters, e)
+
     # 4. Scheduled exits, then activations — while fewer than MAX_VALIDATORS propose, in the
     #    order they became due (then by address); the rest wait their turn. Delegations whose
     #    warm-up is over join their pool.
@@ -445,6 +465,35 @@ def transition(state: State, epoch: int, inputs: EpochInputs) -> State:
     return s
 
 
+def _share_fees(s: State, voters: List[ValidatorState], e: int) -> None:
+    """Share ``s.fee_carry`` among ``voters`` by principal and pool: a validator's part, and its
+    commission on its pool's, is paid to it ("fee"); the rest of its pool's part compounds into
+    the pool, leaving the holder too ("fee_pooled"). What rounding leaves stays carried."""
+    pot = s.fee_carry
+    weights = {
+        v.address: v.stake + (s.pools[v.address].value if v.address in s.pools else ZERO)
+        for v in voters
+    }
+    total = sum(weights.values(), ZERO)
+    if pot <= 0 or total <= 0:
+        return
+    shared = ZERO
+    for v in voters:
+        pool = s.pools.get(v.address)
+        own = (pot * v.stake / total).quantize(WEI, rounding=ROUND_DOWN)
+        pooled = (pot * pool.value / total).quantize(WEI, rounding=ROUND_DOWN) if pool else ZERO
+        commission = ZERO
+        if pooled > 0 and pool is not None:
+            commission = (pooled * pool.commission_bps / 10_000).quantize(WEI, rounding=ROUND_DOWN)
+            pool.value += pooled - commission
+            s.payout(STAKER_FEE_HOLDER, pooled - commission, e + 1, "fee_pooled")
+        if own + commission > 0:
+            v.earned += own + commission
+            s.payout(v.address, own + commission, e + 1, "fee")
+        shared += own + pooled
+    s.fee_carry = pot - shared
+
+
 def proposers(state: State) -> List[Tuple[str, Decimal]]:
     """(address, weight) of every validator selected from, in address order: its own
     effective stake and the QRDX delegated to it."""
@@ -466,6 +515,8 @@ def _dump(state: State) -> str:
             "payouts": [p.to_json() for p in st.payouts],
             "last_block_epoch": st.last_block_epoch,
             "next_payout_id": st.next_payout_id,
+            # (absent while nothing is carried: earlier states keep their hash)
+            **({"fee_carry": str(st.fee_carry)} if getattr(st, "fee_carry", ZERO) else {}),
         },
         sort_keys=True,
     )
@@ -480,6 +531,7 @@ def _load(blob: str) -> State:
     st.payouts = [Payout.from_json(d) for d in data.get("payouts", [])]
     st.last_block_epoch = int(data.get("last_block_epoch", -1))
     st.next_payout_id = int(data.get("next_payout_id", 1))
+    st.fee_carry = Decimal(data.get("fee_carry", "0"))
     return st
 
 
@@ -506,6 +558,7 @@ async def epoch_inputs(db: Any, epoch: int, up_to_height: int) -> EpochInputs:
     lo, hi = await cur.fetchone()
     ops: List[Tuple[str, str, Optional[str], Any]] = []
     offenders: List[str] = []
+    fees = ZERO
     if lo is not None:
         cur = await conn.execute(
             "SELECT block_height, id, address, public_key, stake FROM validator_deposits "
@@ -543,6 +596,11 @@ async def epoch_inputs(db: Any, epoch: int, up_to_height: int) -> EpochInputs:
             (lo, hi),
         )
         offenders = [r[0] for r in await cur.fetchall()]
+        cur = await conn.execute(
+            "SELECT amount FROM staker_fee_income WHERE block_height BETWEEN ? AND ?",
+            (lo, hi),
+        )
+        fees = sum((Decimal(str(a)) for (a,) in await cur.fetchall()), ZERO)
     target = int(epoch) - INCLUSION_EPOCHS
     attesters: List[str] = []
     if target >= 1:
@@ -552,7 +610,9 @@ async def epoch_inputs(db: Any, epoch: int, up_to_height: int) -> EpochInputs:
             (target, int(epoch), int(up_to_height)),
         )
         attesters = [r[0] for r in await cur.fetchall()]
-    return EpochInputs(ops=ops, attesters=attesters, offenders=offenders, has_blocks=lo is not None)
+    return EpochInputs(
+        ops=ops, attesters=attesters, offenders=offenders, has_blocks=lo is not None, fees=fees
+    )
 
 
 # ── S_E on the stored chain, cached per (epoch, checkpoint) ──────────────────────────────
@@ -715,6 +775,7 @@ async def _advance(db: Any, state: State, start: int, epoch: int, top: int) -> S
             spans.setdefault(ep, []).append(h)
     ops_by_epoch: Dict[int, List[Tuple[int, int, int, Tuple[str, str, Optional[str], Any]]]] = {}
     offenders_by_epoch: Dict[int, List[str]] = {}
+    fees_by_epoch: Dict[int, Decimal] = {}
     heights = [h for hs in spans.values() for h in hs]
     if heights:
         lo, hi = min(heights), max(heights)
@@ -759,6 +820,14 @@ async def _advance(db: Any, state: State, start: int, epoch: int, top: int) -> S
             ep = epoch_of.get(int(h))
             if ep is not None and start <= ep < epoch:
                 offenders_by_epoch.setdefault(ep, []).append(offender)
+        cur = await conn.execute(
+            "SELECT block_height, amount FROM staker_fee_income WHERE block_height BETWEEN ? AND ?",
+            (lo, hi),
+        )
+        for h, amount in await cur.fetchall():
+            ep = epoch_of.get(int(h))
+            if ep is not None and start <= ep < epoch:
+                fees_by_epoch[ep] = fees_by_epoch.get(ep, ZERO) + Decimal(str(amount))
     # Votes for the reward targets of these transitions, carried at or below the last one's
     # boundary: (target, validator, carry epoch, height).
     last_boundary = checkpoint(epoch)[0]
@@ -785,6 +854,7 @@ async def _advance(db: Any, state: State, start: int, epoch: int, top: int) -> S
             attesters=sorted(attesters),
             offenders=offenders_by_epoch.get(e, []),
             has_blocks=e in spans,
+            fees=fees_by_epoch.get(e, ZERO),
         )
         state = transition(state, e, inputs)
         if (e + 1) % STORE_EVERY == 0 or epoch - (e + 1) < STORE_EVERY:
@@ -810,6 +880,45 @@ async def _genesis_validators(db: Any) -> List[Dict[str, Any]]:
         for m in members or []
         if Decimal(str(m.get("stake", 0))) > 0
     ]
+
+
+def stakes(state: State) -> Dict[str, Decimal]:
+    """Each account's QRDX at stake in ``state``: a validator's own principal (active, pending
+    or exiting) and every delegator's pool shares at the pool's price — keyed by lower-cased
+    address. Memoized on the state (a state is never changed once computed)."""
+    memo = getattr(state, "_stakes_memo", None)
+    if memo is not None:
+        return memo
+    out: Dict[str, Decimal] = {}
+    for address, v in state.items():
+        if v.status in ("active", "pending", "exiting") and v.stake > 0:
+            key = address.lower()
+            out[key] = out.get(key, ZERO) + v.stake
+    for pool in getattr(state, "pools", {}).values():
+        price = pool.price()
+        for who, shares in pool.shares.items():
+            key = who.lower()
+            out[key] = out.get(key, ZERO) + (shares * price).quantize(WEI, rounding=ROUND_DOWN)
+    try:
+        state._stakes_memo = out  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    return out
+
+
+async def stakes_for_block(db: Any, height: int) -> Dict[str, Decimal]:
+    """``stakes`` of the validator set in force at block ``height``'s parent (as
+    ``committee_for_block``): what the block's staking fee discounts go by."""
+    from .. import chain_index
+    from ..constants import SLOTS_PER_EPOCH
+
+    parent = int(height) - 1
+    if parent < 0:
+        return {}
+    await chain_index.sync(db)
+    slot = await chain_index.slot_at(db, parent)
+    epoch = int(slot) // SLOTS_PER_EPOCH if slot is not None else 0
+    return stakes(await state_at(db, epoch, parent))
 
 
 async def committee_for_block(db: Any, height: int) -> Dict[str, Decimal]:

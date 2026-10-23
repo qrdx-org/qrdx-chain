@@ -353,11 +353,26 @@ async def compute_block_payouts(db, block_height: int, block_epoch: int) -> list
     return [p for p in getattr(state, "payouts", []) if p.due_epoch <= int(block_epoch)]
 
 
+def _payout_moves(address: str, amount: Decimal, kind: str) -> List[Tuple[str, Decimal]]:
+    """The balance moves a payout makes. Rewards, undelegations and refunds are credited (the
+    QRDX re-enters circulation); fee income is paid out of the holder it waited at
+    (validator/epoch_state.py): a "fee" moves it to the validator, a "fee_pooled" moves it into
+    the staking system, where the pool's shares carry it."""
+    from .epoch_state import STAKER_FEE_HOLDER
+
+    if kind == "fee":
+        return [(STAKER_FEE_HOLDER, -amount), (address, amount)]
+    if kind == "fee_pooled":
+        return [(STAKER_FEE_HOLDER, -amount)]
+    return [(address, amount)]
+
+
 async def apply_payouts(db, payouts: list, block_height: int) -> None:
     """Credit each payout and record it in the ledger (``staking_payouts``) the rollback and
     rebuild paths read. Does not commit."""
     for p in payouts:
-        await db.apply_account_balance_delta(p.address, p.amount)
+        for address, delta in _payout_moves(p.address, p.amount, p.kind):
+            await db.apply_account_balance_delta(address, delta)
         await db.connection.execute(
             "INSERT INTO staking_payouts (payout_id, address, amount, kind, block_height) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -394,9 +409,10 @@ async def reapply_withdrawal_ledger(db) -> int:
     )
     rows = [(a, Decimal(str(v))) for a, v in await cur.fetchall()]
     cur = await db.connection.execute(
-        "SELECT address, amount FROM staking_payouts ORDER BY block_height, payout_id"
+        "SELECT address, amount, kind FROM staking_payouts ORDER BY block_height, payout_id"
     )
-    rows += [(a, Decimal(str(v))) for a, v in await cur.fetchall()]
+    for a, v, kind in await cur.fetchall():
+        rows += _payout_moves(a, Decimal(str(v)), str(kind))
     rows = [(a, v) for a, v in rows if v != 0]  # forfeits credit nothing
     for address, amount in rows:
         await db.apply_account_balance_delta(address, amount)

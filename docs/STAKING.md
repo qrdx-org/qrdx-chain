@@ -102,6 +102,19 @@ shares grow and the rewards compound. A validator that misses its vote earns not
 neither does its pool for that epoch. Rewards are new QRDX: the staking rate is the network's
 issuance.
 
+## Fee income
+
+`STAKER_FEE_SHARE_BPS` (chain spec, 2,000 = 20 %) of the protocol's trading-fee income is real
+yield beside the minted rate (docs/CONSENSUS_ROADMAP.md 6), of spot and perps fees alike. It
+waits at the fee holder `0xFEES…` (an address no key signs for); a share paid in another asset is
+sold there for QRDX by the exchange's tick, at no less than 2 % under its pool's 10-minute TWAP.
+Each block logs the QRDX income it took in (`staker_fee_income`). An epoch's income — with
+any remainder carried from before — is shared among the same validators the minted rewards pay
+(those whose vote the chain carries), by principal and pool: the validator is paid its part and
+its commission on the pool's (`fee` payouts); the rest compounds into the pool (`fee_pooled`).
+Fee payouts are **paid out of the fee holder**, not minted, so supply is unchanged by them; what
+rounding leaves is carried (`fee_carry` in the state).
+
 ## Payouts
 
 Rewards, finished undelegations and refunds are owed by the state, each with a due epoch. The
@@ -122,6 +135,7 @@ paid without having to claim it.
 | Parameter | Kind | Standard |
 |---|---|---|
 | `STAKING_REWARD_RATE_BPS` | chain spec | 500 (5 % a year) |
+| `STAKER_FEE_SHARE_BPS` | chain spec | 2,000 (20 % of QRDX fee income) |
 | `ACTIVATION_DELAY_EPOCHS` | chain spec | 4 (warm-up, validators and delegations) |
 | `UNBONDING_PERIOD_EPOCHS` | chain spec | 40,320 (~3.7 days of 8 s epochs) |
 | `WITHDRAWAL_DELAY_EPOCHS` | chain spec | 2,048 (~4.6 hours) |

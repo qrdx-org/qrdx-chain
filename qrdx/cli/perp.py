@@ -87,6 +87,7 @@ def build_tx(
     nonce: int,
     gas_price: Optional[int] = None,
     chain_id: Optional[int] = None,
+    gas_limit: int = 1_000_000,
 ):
     from qrdx.exchange import ExchangeOpType, ExchangeTransaction
 
@@ -97,7 +98,7 @@ def build_tx(
         sender=signer.address,
         nonce=nonce,
         params=params,
-        gas_limit=1_000_000,
+        gas_limit=int(gas_limit),
         **price,
         **chain,
     )
@@ -138,6 +139,7 @@ def _send(
     wait: bool,
     yes: bool,
     group: str = "perp",
+    gas_limit: int = 1_000_000,
 ) -> Optional[Dict[str, Any]]:
     """Sign and submit one exchange transaction. ``params`` may be a function of the signer
     (for parameters that name the wallet itself)."""
@@ -150,7 +152,13 @@ def _send(
         return None
     nonce = int(rpc(node, "exchange_getNonce", [signer.address]))
     tx = build_tx(
-        signer, op_name, params, nonce, gas_price=_gas_price(node), chain_id=_chain_id(node)
+        signer,
+        op_name,
+        params,
+        nonce,
+        gas_price=_gas_price(node),
+        chain_id=_chain_id(node),
+        gas_limit=gas_limit,
     )
     tx_hash = rpc(node, "exchange_sendTransaction", [tx.to_dict()])
     click.echo(click.style("✓ Submitted", fg="green") + f"  tx {tx_hash}  (nonce {nonce})")
@@ -375,12 +383,34 @@ def leverage_cmd(wallet_file, market_id, leverage, isolated, node, wait, yes):
 @click.argument("price")
 @click.option("--reduce-only", is_flag=True, help="Only reduce an open position")
 @click.option("--ioc", is_flag=True, help="Immediate-or-cancel: never rest on the book")
+@click.option(
+    "--tif",
+    type=click.Choice(["gtc", "ioc", "fok", "alo"]),
+    default=None,
+    help="Time in force: gtc, ioc, fok (fill whole or not at all), alo (post-only)",
+)
+@click.option("--hidden", is_flag=True, help="Rest without showing in the book's depth")
+@click.option("--display-size", default=None, help="An iceberg: show this much at a time")
 @node_option
 @wait_option
 @yes_option
-def order_cmd(wallet_file, market_id, side, size, price, reduce_only, ioc, node, wait, yes):
+def order_cmd(
+    wallet_file,
+    market_id,
+    side,
+    size,
+    price,
+    reduce_only,
+    ioc,
+    tif,
+    hidden,
+    display_size,
+    node,
+    wait,
+    yes,
+):
     """Place a limit order. A "market" order is --ioc at an aggressive price."""
-    params = {
+    params: Dict[str, Any] = {
         "market_id": market_id,
         "side": side,
         "size": str(Decimal(size)),
@@ -388,9 +418,21 @@ def order_cmd(wallet_file, market_id, side, size, price, reduce_only, ioc, node,
     }
     if reduce_only:
         params["reduce_only"] = True
-    if ioc:
-        params["tif"] = "ioc"
-    flags = "".join((" reduce-only" if reduce_only else "", " IOC" if ioc else ""))
+    tif = "ioc" if ioc else tif
+    if tif:
+        params["tif"] = tif
+    if hidden:
+        params["hidden"] = True
+    if display_size:
+        params["display_size"] = str(Decimal(display_size))
+    flags = "".join(
+        (
+            " reduce-only" if reduce_only else "",
+            f" {tif.upper()}" if tif else "",
+            " hidden" if hidden else "",
+            f" iceberg {display_size}" if display_size else "",
+        )
+    )
     _send(
         node,
         wallet_file,
@@ -420,6 +462,179 @@ def cancel_cmd(wallet_file, market_id, order_id, node, wait, yes):
         wait,
         yes,
     )
+
+
+@perp.command("trigger")
+@click.argument("wallet_file", type=click.Path(exists=True))
+@click.argument("market_id")
+@click.argument("side", type=click.Choice(["buy", "sell"]))
+@click.argument("kind", type=click.Choice(["sl", "tp"]))
+@click.argument("trigger_price")
+@click.option("--size", default=None, help="Size (omit with --position)")
+@click.option("--limit", "limit_price", default=None, help="Limit price (default: market)")
+@click.option("--position", is_flag=True, help="The position's TP/SL: closes it whole")
+@click.option("--reduce-only", is_flag=True, help="Only reduce an open position")
+@click.option("--max-makers", default=20, show_default=True, help="Matching paid for up front")
+@node_option
+@wait_option
+@yes_option
+def trigger_cmd(
+    wallet_file,
+    market_id,
+    side,
+    kind,
+    trigger_price,
+    size,
+    limit_price,
+    position,
+    reduce_only,
+    max_makers,
+    node,
+    wait,
+    yes,
+):
+    """A stop-loss (sl) or take-profit (tp) that fires when the mark reaches TRIGGER_PRICE."""
+    params: Dict[str, Any] = {
+        "market_id": market_id,
+        "side": side,
+        "kind": kind,
+        "trigger_price": str(Decimal(trigger_price)),
+        "max_makers": int(max_makers),
+    }
+    if position:
+        params["position"] = True
+    elif size:
+        params["size"] = str(Decimal(size))
+    else:
+        raise click.UsageError("give --size, or --position for the position's TP/SL")
+    if limit_price:
+        params["limit_price"] = str(Decimal(limit_price))
+    if reduce_only:
+        params["reduce_only"] = True
+    _send(
+        node,
+        wallet_file,
+        "PERP_TRIGGER",
+        params,
+        f"{kind.upper()} {side.upper()} {'position' if position else size} {market_id} "
+        f"at mark {trigger_price}" + (f", limit {limit_price}" if limit_price else ", market"),
+        wait,
+        yes,
+        gas_limit=40_000 + int(max_makers) * 10_000,
+    )
+
+
+@perp.command("modify")
+@click.argument("wallet_file", type=click.Path(exists=True))
+@click.argument("market_id")
+@click.argument("order_id")
+@click.option("--size", default=None, help="What is left of it")
+@click.option("--price", default=None)
+@click.option("--trigger-price", default=None, help="A trigger order's")
+@click.option("--limit", "limit_price", default=None, help="A trigger order's limit")
+@node_option
+@wait_option
+@yes_option
+def modify_cmd(
+    wallet_file, market_id, order_id, size, price, trigger_price, limit_price, node, wait, yes
+):
+    """Change an open order (or trigger) in one step."""
+    params: Dict[str, Any] = {"market_id": market_id, "order_id": order_id}
+    for key, value in (
+        ("size", size),
+        ("price", price),
+        ("trigger_price", trigger_price),
+        ("limit_price", limit_price),
+    ):
+        if value is not None:
+            params[key] = str(Decimal(value))
+    _send(node, wallet_file, "PERP_MODIFY", params, f"Modify {order_id}", wait, yes)
+
+
+@perp.command("cancel-all")
+@click.argument("wallet_file", type=click.Path(exists=True))
+@click.option("--market", default=None, help="Only this market (a perp id or a spot pair)")
+@click.option("--scope", type=click.Choice(["all", "spot", "perps"]), default="all")
+@node_option
+@wait_option
+@yes_option
+def cancel_all_cmd(wallet_file, market, scope, node, wait, yes):
+    """Cancel every open order, trigger and TWAP."""
+    params: Dict[str, Any] = {"scope": scope}
+    if market:
+        params["market"] = market
+    _send(
+        node,
+        wallet_file,
+        "CANCEL_ALL",
+        params,
+        f"Cancel all ({scope}{', ' + market if market else ''})",
+        wait,
+        yes,
+        gas_limit=2_000_000,
+    )
+
+
+@perp.command("twap")
+@click.argument("wallet_file", type=click.Path(exists=True))
+@click.argument("market_id")
+@click.argument("side", type=click.Choice(["buy", "sell"]))
+@click.argument("size")
+@click.argument("duration", type=int)
+@click.option("--slices", type=int, default=None, help="Default: one every 30 s (at most 60)")
+@click.option("--max-slippage", default="0.03", show_default=True)
+@click.option("--max-makers", default=5, show_default=True, help="Per slice, paid up front")
+@click.option("--reduce-only", is_flag=True)
+@node_option
+@wait_option
+@yes_option
+def twap_cmd(
+    wallet_file,
+    market_id,
+    side,
+    size,
+    duration,
+    slices,
+    max_slippage,
+    max_makers,
+    reduce_only,
+    node,
+    wait,
+    yes,
+):
+    """Work SIZE into the market over DURATION seconds, in slices — unattended."""
+    count = slices or min(60, duration // 30)
+    params: Dict[str, Any] = {
+        "market_id": market_id,
+        "side": side,
+        "size": str(Decimal(size)),
+        "duration": int(duration),
+        "slices": int(count),
+        "max_slippage": str(Decimal(max_slippage)),
+        "max_makers": int(max_makers),
+    }
+    if reduce_only:
+        params["reduce_only"] = True
+    _send(
+        node,
+        wallet_file,
+        "TWAP_ORDER",
+        params,
+        f"TWAP {side.upper()} {size} {market_id} over {duration} s in {count} slices",
+        wait,
+        yes,
+        gas_limit=40_000 + count * (10_000 + int(max_makers) * 10_000),
+    )
+
+
+@perp.command("twap-cancel")
+@click.argument("wallet_file", type=click.Path(exists=True))
+@click.argument("twap_id")
+@node_option
+@wait_option
+@yes_option
+def twap_cancel_cmd(wallet_file, twap_id, node, wait, yes):
+    _send(node, wallet_file, "TWAP_CANCEL", {"twap_id": twap_id}, f"Stop TWAP {twap_id}", wait, yes)
 
 
 @perp.command("vault-deposit")

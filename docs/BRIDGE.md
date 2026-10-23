@@ -61,6 +61,35 @@ lists them in order. The lockbox's custodian releases each one with
 `release(withdrawalId, token, to, amount × 10^decimals)` once its block is final; the lockbox
 refuses an id twice.
 
+## Chain heads
+
+The same validators attest each source chain's **finalized head** — its height, block hash, state
+root and timestamp — so QRDX holds, as consensus state, a light client's view of the chains it
+bridges:
+
+- Each validator's watcher reads the source's finalized block (the one it scans deposits up to)
+  and its oracle vote carries it (`heads`, at most 8, one per chain) when it is higher than the
+  attested one.
+- A head becomes the chain's attested head when votes younger than an hour, carrying **exactly**
+  that head, hold more than two thirds of the committee's stake — and only if it is higher than
+  the current one: heads only move forward.
+- They are committed (`bridge.heads`, `bridge.head_votes`), so they are in the state root and
+  provable like any exchange entry (docs/STATE_PROOFS.md).
+- Contracts read them through **`getChainState`** at `0x…0200`: `chain_id` (4 bytes) → height (8)
+  · hash (32) · state root (32) · timestamp (8), or 80 zero bytes if none is attested. It answers
+  from the consensus state at that point of the block, so every node returns the same. (It used to
+  answer from a node-local table nothing filled; filled from a node's own view it would have split
+  the chain.)
+- Contracts prove a bridged chain's state through **`verifyExternalProof`** at `0x…0201`
+  (`qrdx/contracts/external_proof_evm.py`): chain id (4) · height of an attested head (8, one of
+  the last 64) · account address (20) · its Merkle-Patricia proof (node count 2, then each node:
+  length 4 · RLP), optionally · a storage slot (32) · its proof — exactly what `eth_getProof`
+  returns. Output `0x01` · nonce · balance · storage root · code hash (32 each) [· the slot's value
+  (32)], absence proven as zeros; or `0x00` if the proof does not hold against that head's state
+  root, the head is not attested, or the input is malformed. It never reverts. Gas 200,000 + 5,000
+  a node. A contract can read another chain's balance, a lockbox's record or an oracle's slot with
+  no trust beyond the validators' two-thirds attestation of the head.
+
 ## Trust
 
 - **Minting** needs validators holding more than two thirds of the stake to attest a deposit

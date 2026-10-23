@@ -558,6 +558,11 @@ class ValidatorNode:
                                     )
                                     or []
                                 )
+                                from .. import chain_spec
+                                from ..exchange.fair_ordering import FEATURE, fair_order
+
+                                if exchange_txs and chain_spec.is_active(FEATURE, next_height):
+                                    exchange_txs = fair_order(exchange_txs)
                             except Exception as e:
                                 logger.warning(f"Exchange tx selection failed: {e}")
                                 exchange_txs = []
@@ -629,14 +634,14 @@ class ValidatorNode:
                             try:
                                 from ..exchange.block_processor import (
                                     ensure_oracle_committee,
-                                    run_exchange_tick,
+                                    tick_and_flush,
                                 )
                                 from ..exchange.state_manager import ExchangeStateManager
 
                                 await ensure_oracle_committee(
                                     self.db, ExchangeStateManager.get_instance(), next_height
                                 )
-                                run_exchange_tick(next_height, float(block_timestamp))
+                                await tick_and_flush(self.db, next_height, float(block_timestamp))
                             except Exception as e:
                                 logger.error(f"Exchange tick failed for block #{next_height}: {e}")
 
@@ -1095,7 +1100,11 @@ class ValidatorNode:
                 if vote is None:
                     continue
                 # What the vote says: prices, and bridge deposits (a new one is voted at once).
-                content = (vote.params.get("prices"), vote.params.get("deposits"))
+                content = (
+                    vote.params.get("prices"),
+                    vote.params.get("deposits"),
+                    vote.params.get("freeze"),
+                )
                 now = time.monotonic()
                 if content == last_content and now - last_at < refresh:
                     continue
@@ -1130,7 +1139,7 @@ class ValidatorNode:
         from ..exchange.bridge import MAX_VOTE_DEPOSITS
         from ..exchange.state_manager import ExchangeStateManager
         from .epoch_state import committee_for_block
-        from .price_feed import PERP_SUFFIX, build_vote
+        from .price_feed import PERP_SUFFIX, build_vote, freeze_from_env
 
         mgr = ExchangeStateManager.get_instance()
         # Whether the next block would count this vote: read-only — the committee the exchange
@@ -1138,8 +1147,16 @@ class ValidatorNode:
         committee = await committee_for_block(self.db, int(await self.db.get_next_block_id()))
         if self.wallet.address.lower() not in committee:
             return None
+        from ..exchange.clearinghouse import Clearinghouse
+
+        now = mgr._block_clock()
+        # A deployer market's deployer prices it — the validators only while they freeze it.
         bases = sorted(
-            m.base for m in mgr.clearinghouse.markets.values() if m.quote == constants.PERP_QUOTE
+            m.base
+            for m in mgr.clearinghouse.markets.values()
+            if m.quote == constants.PERP_QUOTE
+            and m.settled_price <= 0
+            and (not m.deployer or Clearinghouse.frozen(m, now))
         )
         # The oracle price, and other venues' perp price where the feed has one (the mark's
         # third input).
@@ -1155,9 +1172,24 @@ class ValidatorNode:
             keys = (keys + keys)[start : start + limit]
         prices = {k: got[k] for k in keys}
         deposits = watcher.outstanding(mgr.bridge.done, MAX_VOTE_DEPOSITS) if watcher else []
-        if not prices and not deposits:
+        # Source chains' finalized heads the chain has not attested yet (docs/BRIDGE.md).
+        heads = [
+            h
+            for h in (watcher.heads() if watcher else [])
+            if (cur := mgr.bridge.head(int(h["chain"]))) is None or int(h["height"]) > cur.height
+        ]
+        # Deployer markets the operator votes to freeze (QRDX_ORACLE_FREEZE), while they run.
+        live = {
+            mid
+            for mid, m in mgr.clearinghouse.markets.items()
+            if m.deployer and m.settled_price <= 0
+        }
+        freeze = [mid for mid in freeze_from_env() if mid in live]
+        if not prices and not deposits and not heads and not freeze:
             return None
-        return build_vote(self.wallet, await self._get_current_slot(), prices, deposits)
+        return build_vote(
+            self.wallet, await self._get_current_slot(), prices, deposits, heads, freeze
+        )
 
     def set_exchange_tx_source(self, source) -> None:
         """
@@ -1212,7 +1244,32 @@ class ValidatorNode:
             token_root = await self.db.get_token_balances_root(height)
         except Exception:
             token_root = TOKEN_ZERO_ROOT
-        return unified_state_root(utxo_root or "0" * 64, account_root, exchange_root, token_root)
+        from .. import state_proofs
+
+        proof_root = xtree = None
+        if height is not None and state_proofs.scheduled():
+            # The exchange tree beside the database tree (qrdx/exchange/proofs.py), at the same
+            # point as the exchange root.
+            from ..exchange.state_manager import ExchangeStateManager
+
+            xroot = ExchangeStateManager.get_instance().exchange_proof_root(height)
+            xtree = xroot.hex()
+            proof_root = await state_proofs.proof_root(self.db, height, xroot)
+            await state_proofs.record_parts(
+                self.db,
+                height,
+                {
+                    "utxo": utxo_root or "0" * 64,
+                    "account": account_root,
+                    "exchange": exchange_root,
+                    "token": token_root,
+                    "proof": proof_root,
+                    "xtree": xtree,
+                },
+            )
+        return unified_state_root(
+            utxo_root or "0" * 64, account_root, exchange_root, token_root, proof_root
+        )
 
     def set_block_processing_lock(self, lock) -> None:
         """Share the node's block-processing lock, so block production never interleaves

@@ -39,6 +39,47 @@ BRIDGE_AUTHORITY = "0xBRDG" + hashlib.blake2b(b"bridge:authority", digest_size=1
 
 MAX_VOTE_DEPOSITS = 16  # deposits one vote may attest
 ATTESTATION_MAX_AGE = Decimal(24 * 3600)  # a deposit short of a quorum this long is dropped
+# Source chains' finalized heads, attested like deposits (docs/BRIDGE.md "Chain heads"): a vote
+# carries up to MAX_VOTE_HEADS; a validator's head vote counts while younger than HEAD_VOTE_MAX_AGE.
+MAX_VOTE_HEADS = 8
+HEAD_VOTE_MAX_AGE = Decimal(3600)
+HEAD_HISTORY = 64  # attested heads kept per chain, for proofs against a recent one
+
+
+@dataclass(frozen=True)
+class ChainHead:
+    """A source chain's finalized block as validators attest it."""
+
+    chain: int
+    height: int
+    hash: str  # 0x + 64 hex
+    state_root: str  # 0x + 64 hex
+    timestamp: int
+
+    def canonical(self) -> List[Any]:
+        return [self.height, self.hash, self.state_root, self.timestamp]
+
+
+_HASH = re.compile(r"0x[0-9a-f]{64}")
+
+
+def parse_head(raw: Any) -> ChainHead:
+    """A head as a vote carries it ({chain, height, hash, state_root, timestamp}); BridgeError
+    if it is not one (hashes are normalized to lowercase, so honest copies are identical)."""
+    if not isinstance(raw, dict):
+        raise BridgeError("a chain head is {chain, height, hash, state_root, timestamp}")
+    try:
+        chain, height, ts = int(raw["chain"]), int(raw["height"]), int(raw["timestamp"])
+        h, root = str(raw["hash"]).lower(), str(raw["state_root"]).lower()
+    except (KeyError, TypeError, ValueError):
+        raise BridgeError("a chain head is {chain, height, hash, state_root, timestamp}") from None
+    if not (0 < chain < 1 << 32 and 0 <= height < 1 << 64 and 0 <= ts < 1 << 64):
+        raise BridgeError("chain, height or timestamp out of range")
+    if not (_HASH.fullmatch(h) and _HASH.fullmatch(root)):
+        raise BridgeError("hash and state_root are 32-byte 0x hex")
+    return ChainHead(chain, height, h, root, ts)
+
+
 MAX_DECIMALS = 18
 
 _HEX20 = re.compile(r"^0x[0-9a-f]{40}$")
@@ -185,6 +226,12 @@ def _encode_withdrawal(_wid: Any, record: Any) -> Any:
     return record
 
 
+def _encode_tuple(_key: Any, value: Any) -> Any:
+    # (A module-level function: committed collections are pickled with their encoder, in the
+    # exchange checkpoints a restart resumes from — a lambda cannot be.)
+    return list(value)
+
+
 class Bridge:
     """Bridge state: deposits awaiting a quorum, deposits minted, withdrawals recorded. Pure
     and deterministic; the exchange state manager applies the token moves."""
@@ -193,6 +240,9 @@ class Bridge:
     pending = committed("bridge.pending", _encode_pending, mutable=False)
     done = committed("bridge.done", kind="set")
     withdrawals = committed("bridge.withdrawals", _encode_withdrawal, mutable=False)
+    heads = committed("bridge.heads", _encode_tuple, mutable=False)
+    head_votes = committed("bridge.head_votes", _encode_tuple, mutable=False)
+    head_history = committed("bridge.head_history", _encode_tuple, mutable=False)
 
     def __init__(self) -> None:
         # "<deposit id>|<digest>" → {"deposit": canonical, "voters": [...], "since": time}
@@ -200,6 +250,64 @@ class Bridge:
         self.done = set()  # deposit ids minted
         self.withdrawals = {}  # withdrawal id → record
         self.next_withdrawal: int = 1
+        self.heads = {}  # chain id → (height, hash, state_root, timestamp): the attested head
+        self.head_votes = {}  # "chain|validator" → (height, hash, state_root, timestamp, since)
+        self.head_history = {}  # "chain|height" → the head: the last HEAD_HISTORY per chain
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        for name in ("heads", "head_votes", "head_history"):
+            if name not in state:  # (pickled before chain heads)
+                setattr(self, name, {})
+
+    # ── chain heads ─────────────────────────────────────────────────────
+
+    def attest_head(
+        self, head: ChainHead, voter: str, now: Decimal, committee: Dict[str, Decimal]
+    ) -> bool:
+        """Record ``voter``'s view of a source chain's finalized head (replacing its previous
+        one). True when this head — exactly — now has more than two thirds of the committee's
+        stake among the votes younger than HEAD_VOTE_MAX_AGE, and is higher than the attested
+        one: it becomes the attested head."""
+        self.head_votes[f"{head.chain}|{voter}"] = (*head.canonical(), str(now))
+        current = self.heads.get(head.chain)
+        if current is not None and head.height <= int(current[0]):
+            return False
+        total = sum(committee.values(), Decimal(0))
+        weight = Decimal(0)
+        for v in sorted(committee):
+            vote = self.head_votes.peek(f"{head.chain}|{v}")
+            if (
+                vote is not None
+                and tuple(vote[:4]) == tuple(head.canonical())
+                and now - Decimal(vote[4]) <= HEAD_VOTE_MAX_AGE
+            ):
+                weight += committee[v]
+        if total <= 0 or weight * 3 <= total * 2:
+            return False
+        self.heads[head.chain] = tuple(head.canonical())
+        self.head_history[f"{head.chain}|{head.height}"] = tuple(head.canonical())
+        kept = sorted(
+            int(k.split("|", 1)[1])
+            for k in dict.keys(self.head_history)
+            if k.split("|", 1)[0] == str(head.chain)
+        )
+        for height in kept[:-HEAD_HISTORY]:
+            del self.head_history[f"{head.chain}|{height}"]
+        return True
+
+    def head_at(self, chain: int, height: int) -> Optional[ChainHead]:
+        """An attested head of ``chain`` at ``height`` (one of its last HEAD_HISTORY)."""
+        h = (
+            self.head_history.peek(f"{int(chain)}|{int(height)}")
+            if len(self.head_history)
+            else None
+        )
+        return ChainHead(int(chain), int(h[0]), h[1], h[2], int(h[3])) if h else None
+
+    def head(self, chain: int) -> Optional[ChainHead]:
+        h = self.heads.peek(int(chain)) if len(self.heads) else None
+        return ChainHead(int(chain), int(h[0]), h[1], h[2], int(h[3])) if h else None
 
     # ── deposits ────────────────────────────────────────────────────────
 
@@ -241,6 +349,14 @@ class Bridge:
         ]
         for key in stale:
             del self.pending[key]
+        if len(self.head_votes):
+            old = [
+                k
+                for k, v in sorted(self.head_votes.peek_items())
+                if now - Decimal(v[4]) > HEAD_VOTE_MAX_AGE
+            ]
+            for key in old:
+                del self.head_votes[key]
 
     def status(self, deposit_id: str) -> Dict[str, Any]:
         attestations = [
@@ -272,19 +388,27 @@ class Bridge:
 
     @property
     def touched(self) -> bool:
-        return bool(self.pending or self.done or self.withdrawals)
+        return bool(
+            self.pending or self.done or self.withdrawals or len(self.heads) or len(self.head_votes)
+        )
 
     def commitment(self) -> bytes:
-        return (
+        sec = (
             Section("bridge")
             .value([self.next_withdrawal])
             .raw(self.pending.commitment())
             .raw(self.done.commitment())
             .raw(self.withdrawals.commitment())
-            .digest()
         )
+        if len(self.heads) or len(self.head_votes):  # (absent until the first head vote)
+            sec.raw(self.heads.commitment()).raw(self.head_votes.commitment())
+            sec.raw(self.head_history.commitment())
+        return sec.digest()
 
     def verify_commitment(self) -> None:
         self.pending.verify()
         self.done.verify()
         self.withdrawals.verify()
+        self.heads.verify()
+        self.head_votes.verify()
+        self.head_history.verify()

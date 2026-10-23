@@ -7,7 +7,7 @@ Provides hash functions used throughout the blockchain:
 """
 
 import hashlib
-from typing import Union
+from typing import Optional, Union
 
 # Try to use pycryptodome's keccak for speed, fall back to pysha3
 try:
@@ -200,6 +200,7 @@ def unified_state_root(
     account_root: str,
     exchange_root: str,
     token_root: str = TOKEN_ZERO_ROOT,
+    proof_root: Optional[str] = None,
 ) -> str:
     """
     Combine the per-domain state roots into one block state root (Whitepaper §3.6).
@@ -219,9 +220,15 @@ def unified_state_root(
         account_root: hex digest of account/EVM state.
         exchange_root: hex digest of exchange state.
         token_root: hex digest of the QRC-20 token ledger.
+        proof_root: the root of the sparse Merkle tree over the database state, once the
+            ``provable_state`` feature is in force (qrdx/state_proofs.py) — a fifth input, so a
+            single entry can be proven against the signed root. None before: the payload is
+            unchanged.
 
     Returns:
         128-char hex BLAKE3-512 unified state root.
     """
-    payload = f"{utxo_root}|{account_root}|{exchange_root}|{token_root}".encode("utf-8")
-    return state_root_hex(payload)
+    payload = f"{utxo_root}|{account_root}|{exchange_root}|{token_root}"
+    if proof_root is not None:
+        payload += f"|{proof_root}"
+    return state_root_hex(payload.encode("utf-8"))

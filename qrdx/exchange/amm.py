@@ -922,30 +922,34 @@ class ConcentratedLiquidityPool:
         parts.append(f"seq{self._pos_sequence}")
         return hashlib.blake2b("|".join(parts).encode(), digest_size=32).digest()
 
+    def header(self) -> List[Any]:
+        """The pool's own fields (its ticks and positions are committed — and proven — as
+        collections of their own)."""
+        st = self.state
+        return [
+            st.id,
+            st.token0,
+            st.token1,
+            int(st.fee_tier),
+            int(st.pool_type),
+            st.creator,
+            str(st.stake_amount),
+            str(st.sqrt_price),
+            st.tick,
+            str(st.liquidity),
+            str(st.fee_growth_global_0),
+            str(st.fee_growth_global_1),
+            str(st.protocol_fees_0),
+            str(st.protocol_fees_1),
+            self._pos_sequence,
+            [[o.time, o.tick_cumulative] for o in st.observations],
+        ]
+
     def _incremental_digest(self) -> bytes:
         st = self.state
         return (
             Section("pool")
-            .value(
-                [
-                    st.id,
-                    st.token0,
-                    st.token1,
-                    int(st.fee_tier),
-                    int(st.pool_type),
-                    st.creator,
-                    str(st.stake_amount),
-                    str(st.sqrt_price),
-                    st.tick,
-                    str(st.liquidity),
-                    str(st.fee_growth_global_0),
-                    str(st.fee_growth_global_1),
-                    str(st.protocol_fees_0),
-                    str(st.protocol_fees_1),
-                    self._pos_sequence,
-                    [[o.time, o.tick_cumulative] for o in st.observations],
-                ]
-            )
+            .value(self.header())
             .raw(tracked(st.ticks).commitment())
             .raw(tracked(st.positions).commitment())
             .digest()

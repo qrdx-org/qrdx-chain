@@ -25,6 +25,9 @@ so the identity says the holder holds exactly what all the accounts are worth.
 from __future__ import annotations
 
 import bisect
+import contextlib
+import copy
+import dataclasses
 import functools
 import hashlib
 import heapq
@@ -35,12 +38,15 @@ from decimal import (
     ROUND_DOWN,
     ROUND_FLOOR,
     ROUND_HALF_EVEN,
+    ROUND_HALF_UP,
     Context,
     Decimal,
     localcontext,
 )
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from .. import constants
+from . import undo
 from .commitment import (
     Section,
     as_committed_dict,
@@ -58,6 +64,28 @@ DEFAULT_MAX_LEVERAGE = Decimal("20")
 DEFAULT_LEVERAGE = Decimal("10")  # until an account sets one; capped at the market max
 MAKER_FEE_RATE = Decimal("0.0002")  # 0.02 % of fill notional
 TAKER_FEE_RATE = Decimal("0.0005")  # 0.05 %
+# Fee tiers (docs/TRADING_FEATURES.md): an account's rates follow its perps volume (notional, in
+# QRDX, as buyer or seller) over the last FEE_VOLUME_DAYS days of block time — (volume at least,
+# taker rate, maker rate). A negative maker rate is a rebate, paid out of the fee the same
+# trade's taker pays: every taker rate is above every rebate, so no trade costs the vault.
+FEE_VOLUME_DAYS = 14
+FEE_TIERS: Tuple[Tuple[Decimal, Decimal, Decimal], ...] = (
+    (Decimal(0), TAKER_FEE_RATE, MAKER_FEE_RATE),
+    (Decimal(5_000_000), Decimal("0.00045"), Decimal("0.00016")),
+    (Decimal(25_000_000), Decimal("0.00040"), Decimal("0.00012")),
+    (Decimal(100_000_000), Decimal("0.00035"), Decimal("0.00008")),
+    (Decimal(500_000_000), Decimal("0.00030"), Decimal("0.00004")),
+    (Decimal(2_000_000_000), Decimal("0.00028"), Decimal(0)),
+    (Decimal(7_000_000_000), Decimal("0.00026"), Decimal("-0.00002")),
+)
+FEE_QUANTUM = Decimal("0.00000001")
+# Referrals: an account that joins a referrer's code pays REFEREE_DISCOUNT less on its first
+# REFERRAL_VOLUME_CAP of volume, and the referrer earns REFERRER_SHARE of the fees it pays
+# (out of the vault's). An account joins once, before REFERRAL_JOIN_MAX_VOLUME of volume.
+REFEREE_DISCOUNT = Decimal("0.04")
+REFERRER_SHARE = Decimal("0.10")
+REFERRAL_VOLUME_CAP = Decimal(25_000_000)
+REFERRAL_JOIN_MAX_VOLUME = Decimal(10_000)
 ENTRY_QUANTUM = Decimal("1e-18")  # entry prices are stored at this precision
 AMOUNT_QUANTUM = Decimal("1e-18")  # deposits/withdrawals: QRDX wei precision
 
@@ -105,10 +133,151 @@ IMPACT_NOTIONAL = Decimal("1000")  # QRDX
 EIGHT_HOURS = Decimal(8 * 3600)
 RATE_QUANTUM = Decimal("1e-18")
 
+# Trigger orders (stop-loss / take-profit, docs/TRADING_FEATURES.md). They wait off the book and
+# are judged on the mark price in every block's tick, where the crossed ones fire as ordinary
+# orders of their owner — risk-reducing ones first, then those the mark passed furthest, then
+# the first placed. A market trigger fills at most TRIGGER_SLIPPAGE through mark. The matching a
+# trigger may do when it fires is paid for when it is placed (``max_makers``); a block fires no
+# more than TRIGGER_FIRES_PER_BLOCK of them, visiting no more than TRIGGER_MAKERS_PER_BLOCK
+# resting orders between them — the rest fire in the next blocks.
+TRIGGER_SLIPPAGE = Decimal("0.10")
+TRIGGER_DEFAULT_MAKERS = 20
+TRIGGER_MAX_MAKERS = 100
+TRIGGERS_PER_ACCOUNT = 50  # in each market
+TRIGGER_FIRES_PER_BLOCK = 64
+TRIGGER_MAKERS_PER_BLOCK = 1000
+
+# User vaults (docs/TRADING_FEATURES.md): a margin account its leader trades and others join —
+# copy trading. Joining moves the joiner's free collateral in for shares at NAV (the vault
+# account's equity at mark); they unlock USER_VAULT_LOCKUP_SECONDS later. Leaving pays out the
+# shares at NAV, less the leader's ``profit_share`` of what they gained over what they cost.
+# The leader holds at least USER_VAULT_LEADER_MIN_SHARE of the shares while anyone else holds
+# any, and puts in at least USER_VAULT_MIN_DEPOSIT to create one.
+USER_VAULT_LOCKUP_SECONDS = Decimal(24 * 3600)
+USER_VAULT_LEADER_MIN_SHARE = Decimal("0.05")
+USER_VAULT_DEFAULT_PROFIT_SHARE = Decimal("0.10")
+USER_VAULT_MAX_PROFIT_SHARE = Decimal("0.50")
+USER_VAULT_MIN_DEPOSIT = Decimal(100)
+USER_VAULTS_PER_LEADER = 5
+# A vault's order may be no more than this much worse than the mark when it is placed (a buy
+# above, a sell below): a leader cannot hand a counterparty it controls the vault's equity in
+# one fill. (Within the band, depositors trust the leader — docs/TRADING_FEATURES.md.)
+USER_VAULT_ORDER_BAND = Decimal("0.10")
+
+# Portfolio margin (docs/TRADING_FEATURES.md): tokens deposited as margin beside the settlement
+# token, each valued at a perp market's oracle price less its haircut (``portfolio_assets``, a
+# chain-spec parameter — none by default). They count toward cross equity; an account liquidated
+# hands them to the backstop vault at that same value (its equity unchanged), and the vault sells
+# them back into the settlement token, a slice every VAULT_UNWIND_SECONDS, no more than
+# PORTFOLIO_UNWIND_SLIPPAGE under the oracle. A deposit is worth at least PORTFOLIO_MIN_DEPOSIT.
+PORTFOLIO_MIN_DEPOSIT = Decimal(100)
+PORTFOLIO_UNWIND_SLIPPAGE = Decimal("0.02")
+
+
+def portfolio_assets() -> Dict[str, Tuple[str, Decimal]]:
+    """token → (perp market pricing it, haircut), from PERP_PORTFOLIO_ASSETS."""
+    from .. import constants
+
+    out: Dict[str, Tuple[str, Decimal]] = {}
+    for entry in constants.PERP_PORTFOLIO_ASSETS:
+        token, market, haircut = str(entry).rsplit(":", 2)
+        cut = Decimal(haircut)
+        if not ZERO < cut < 1:
+            raise ValueError(f"PERP_PORTFOLIO_ASSETS {entry}: a haircut is between 0 and 1")
+        out[token.lower()] = (market, cut)
+    return out
+
+
+# Market liquidity (docs/TRADING_FEATURES.md §14). A perp market's creator puts liquidity into a
+# vault for it (CREATE_MARKET ``liquidity``, at least the chain-spec PERP_MARKET_MIN_LIQUIDITY),
+# and the protocol quotes that vault on the market's book: every MARKET_MAKER_REQUOTE_SECONDS
+# (or once the mark moves MARKET_MAKER_REQUOTE_MOVE), MARKET_MAKER_LEVELS post-only orders a
+# side, MARKET_MAKER_SPREAD from the mark and MARKET_MAKER_STEP apart, each side's quotes worth
+# MARKET_MAKER_DEPTH × the vault's equity in all — less on the side its position already leans
+# to, none once that position reaches MARKET_MAKER_MAX_INVENTORY × equity. Quotes are pulled
+# while the oracle is stale. It never takes: a level that would cross is skipped. Anyone may add
+# to the vault (at NAV, as any user vault); the creator's shares are locked for the chain-spec
+# PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS.
+MARKET_MAKER_LEVELS = 5
+MARKET_MAKER_SPREAD = Decimal("0.001")
+MARKET_MAKER_STEP = Decimal("0.001")
+MARKET_MAKER_DEPTH = Decimal(1)
+MARKET_MAKER_MAX_INVENTORY = Decimal(3)
+MARKET_MAKER_REQUOTE_SECONDS = Decimal(5)
+MARKET_MAKER_REQUOTE_MOVE = Decimal("0.0025")
+MARKET_MAKER_MARKETS_PER_BLOCK = 8
+
+
+# Risk limits (docs/CONSENSUS_ROADMAP.md 2, 3). The price band and the circuit breaker are
+# chain-spec (constants.PERP_PRICE_BAND_BPS, PERP_BREAKER_*; 0 turns one off):
+# * band — an order more than the band worse than the oracle (a buy above, a sell below) is
+#   refused: a fat finger, or a book pushed far from the index;
+# * breaker — the mark moving PERP_BREAKER_MOVE_BPS within PERP_BREAKER_WINDOW_SECONDS of block
+#   time holds the market to reduce-only orders for PERP_BREAKER_COOLDOWN_SECONDS.
+# Open-interest cap: a market with a liquidity vault holds at most OI_CAP_MULTIPLE × the vault's
+# equity of open interest (notional at mark), and every market at least the chain-spec
+# PERP_MIN_OI_CAP (0: no floor — a market without a vault and without a floor is uncapped).
+OI_CAP_MULTIPLE = Decimal(50)
+# Staking fee discounts (Hyperliquid's tiers): QRDX staked → the fraction of fees spared.
+STAKE_FEE_DISCOUNTS: Tuple[Tuple[Decimal, Decimal], ...] = (
+    (Decimal(10), Decimal("0.05")),
+    (Decimal(100), Decimal("0.10")),
+    (Decimal(1_000), Decimal("0.15")),
+    (Decimal(10_000), Decimal("0.20")),
+    (Decimal(100_000), Decimal("0.30")),
+    (Decimal(500_000), Decimal("0.40")),
+)
+# The order grid's price precision (Hyperliquid's): significant figures, and decimals a market
+# with sz_decimals 0 may use (one fewer for each size decimal).
+PRICE_SIG_FIGS = 5
+MAX_PRICE_DECIMALS = 6
+# Leverage tiers, marginal: the slice of a position's notional above each floor carries at most
+# max leverage / divisor (and at most the account's leverage), so its initial margin rises
+# continuously with size. Maintenance is unchanged: liquidation prices stay linear.
+LEVERAGE_TIERS: Tuple[Tuple[Decimal, int], ...] = (
+    (Decimal(0), 1),
+    (Decimal(1_000_000), 2),
+    (Decimal(10_000_000), 4),
+)
+
+
+def initial_margin(m: "Market", lev: Decimal, notional: Decimal) -> Decimal:
+    """Initial margin for a position worth ``notional`` at leverage ``lev``, tiered."""
+    total = ZERO
+    for i, (floor, divisor) in enumerate(LEVERAGE_TIERS):
+        if notional <= floor:
+            break
+        top = LEVERAGE_TIERS[i + 1][0] if i + 1 < len(LEVERAGE_TIERS) else notional
+        cap = max(Decimal(1), m.max_leverage / divisor)
+        total += (min(notional, top) - floor) / min(lev, cap)
+    return total
+
+
+def _bps(value: Any) -> Decimal:
+    return Decimal(int(value)) / 10_000
+
+
+def _staker_part(protocol_fee: Decimal) -> Decimal:
+    """The stakers' share (STAKER_FEE_SHARE_BPS) of a perps fee the protocol keeps
+    (docs/CONSENSUS_ROADMAP.md 6), in the perps collateral: QRDX is staker income at once, a
+    stablecoin is sold for QRDX by the exchange's tick (``convert_staker_fees``)."""
+    if protocol_fee <= 0:
+        return ZERO
+    share = min(Decimal(1), _bps(constants.STAKER_FEE_SHARE_BPS))
+    return _q_amount(protocol_fee * share) if share > 0 else ZERO
+
+
+def market_maker_address(market_id: str) -> str:
+    """A market's liquidity vault: a protocol form no key can sign for (``0xUVLT``)."""
+    return "0xUVLT" + hashlib.blake2b(f"mm:{market_id}".encode(), digest_size=18).hexdigest()
+
+
 # Reserved owners. Exchange senders are signature-verified PQ addresses, so no key can act as
 # either of these.
-VAULT = "@vault"  # the backstop vault's own margin account (collateral + positions)
-PROTOCOL = "@protocol"  # owner of vault shares that belong to the protocol (treasury seed)
+# Both are addresses (protocol forms no key signs for: qrdx/crypto/account_id.py), so their
+# balances can be looked up, indexed and proven like any account's (docs/CONSENSUS_ROADMAP.md A).
+VAULT = "0xHLPV" + hashlib.blake2b(b"perps:backstop-vault", digest_size=18).hexdigest()
+PROTOCOL = "0xPROT" + hashlib.blake2b(b"perps:protocol-shares", digest_size=18).hexdigest()
 
 
 # Pinned arithmetic context. The process-wide Decimal context is not a safe default: importing
@@ -121,6 +290,18 @@ def _pinned(method):
     def wrapper(*args, **kwargs):
         with localcontext(_CONTEXT):
             return method(*args, **kwargs)
+
+    return wrapper
+
+
+def _mutator(method):
+    """A public entry point that may change the clearinghouse: inside an undo scope
+    (qrdx/exchange/undo.py) its own fields and every market's are recorded first."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        self._keep_all()
+        return method(self, *args, **kwargs)
 
     return wrapper
 
@@ -177,6 +358,14 @@ class Position:
     def basis(self) -> Decimal:
         return self.size * self.entry_price
 
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "Position":
+        # Every field is an immutable value: a field-for-field copy is a deep one (and an undo
+        # scope copies positions on every operation that touches an account).
+        new = Position.__new__(Position)
+        new.__dict__.update(self.__dict__)
+        memo[id(self)] = new
+        return new
+
 
 @dataclass
 class Account:
@@ -184,6 +373,24 @@ class Account:
     positions: Dict[str, Position] = field(default_factory=dict)  # market_id → position
     leverage: Dict[str, Decimal] = field(default_factory=dict)  # market_id → leverage
     isolated: Dict[str, bool] = field(default_factory=dict)  # market_id → isolated mode
+    assets: Dict[str, Decimal] = field(default_factory=dict)  # token → amount (portfolio margin)
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "Account":
+        new = Account.__new__(Account)
+        new.__dict__.update(self.__dict__)
+        new.positions = {mid: copy.deepcopy(p, memo) for mid, p in self.positions.items()}
+        new.leverage = dict(self.leverage)
+        new.isolated = dict(self.isolated)
+        new.assets = dict(self.__dict__.get("assets", {}))
+        for name, value in self.__dict__.items():  # any field added later: copied properly
+            if name not in ("collateral", "positions", "leverage", "isolated", "assets"):
+                new.__dict__[name] = copy.deepcopy(value, memo)
+        memo[id(self)] = new
+        return new
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.__dict__.setdefault("assets", {})  # (pickled before portfolio margin)
 
 
 @dataclass
@@ -193,6 +400,108 @@ class OrderMeta:
     owner: str
     leverage: Decimal
     reduce_only: bool
+
+
+@dataclass(frozen=True)
+class Trigger:
+    """A stop or take-profit order waiting for the mark price (replaced, never changed)."""
+
+    owner: str
+    side: str  # "buy" or "sell"
+    kind: str  # "sl" (stop) or "tp" (take profit)
+    trigger_price: Decimal
+    size: Decimal  # ZERO for a position's TP/SL: the whole position when it fires
+    limit_price: Decimal  # ZERO: a market order, at most TRIGGER_SLIPPAGE through mark
+    reduce_only: bool
+    position: bool  # a position's TP/SL: closes it whole; cancelled once there is none to close
+    tif: str  # what the order is when it fires: "gtc" or "ioc" (a market trigger: "ioc")
+    max_makers: int  # the matching it paid for when placed
+    seq: int  # placement order across the clearinghouse
+    # One-cancels-the-other: when one trigger of a group fires, the rest are cancelled (an
+    # order's attached TP and SL are a group). ``parent``: the order they were attached to —
+    # cancelled with it if it is cancelled unfilled, and once it is done and there is no
+    # position left for them to reduce.
+    group: str = ""
+    parent: str = ""
+
+    @property
+    def reduces(self) -> bool:
+        return self.reduce_only or self.position
+
+    @property
+    def fires_above(self) -> bool:
+        """Fires once the mark rises to the trigger price (a buy stop, a sell take-profit);
+        otherwise once it falls to it."""
+        return (self.side == "buy") == (self.kind == "sl")
+
+    def crossed(self, mark: Decimal) -> bool:
+        return mark >= self.trigger_price if self.fires_above else mark <= self.trigger_price
+
+
+def _encode_trigger(_tid: str, t: Trigger) -> Any:
+    return [
+        t.owner,
+        t.side,
+        t.kind,
+        str(t.trigger_price),
+        str(t.size),
+        str(t.limit_price),
+        t.reduce_only,
+        t.position,
+        t.tif,
+        t.max_makers,
+        t.seq,
+    ] + ([t.group, t.parent] if t.group or t.parent else [])
+
+
+@dataclass(frozen=True)
+class UserVault:
+    leader: str
+    name: str
+    profit_share: Decimal
+    total_shares: Decimal
+    created: Decimal  # block time
+    # A market's liquidity vault (``MARKET_MAKER_*``): the market it makes, quoted by the
+    # protocol in every tick — no one signs for it, its leader included.
+    managed: str = ""
+
+
+@dataclass(frozen=True)
+class VaultHolding:
+    shares: Decimal
+    basis: Decimal  # what the shares held cost: deposits, less the part withdrawals took back
+    unlock: Decimal  # block time
+
+
+def _encode_user_vault(_vault: str, v: UserVault) -> Any:
+    out = [v.leader, v.name, str(v.profit_share), str(v.total_shares), str(v.created)]
+    return out + [v.managed] if v.managed else out
+
+
+def _encode_holding(_key: str, h: VaultHolding) -> Any:
+    return [str(h.shares), str(h.basis), str(h.unlock)]
+
+
+def user_vault_address(leader: str, seed: str) -> str:
+    """A user vault's address: a protocol form no key can sign for (``0xUVLT``,
+    qrdx/crypto/account_id.py); its leader signs for it."""
+    return (
+        "0xUVLT" + hashlib.blake2b(f"uvault:{leader}:{seed}".encode(), digest_size=18).hexdigest()
+    )
+
+
+@dataclass(frozen=True)
+class Referral:
+    referrer: str
+    volume: Decimal  # the referee's volume since it joined (its discount ends at the cap)
+
+
+def _encode_volume(_owner: str, days: tuple) -> Any:
+    return [[day, str(notional)] for day, notional in days]
+
+
+def _encode_referral(_owner: str, r: Referral) -> Any:
+    return [r.referrer, str(r.volume)]
 
 
 @dataclass
@@ -222,12 +531,44 @@ class Market:
     # Other venues' perp price, as the validators voted it (0 = none yet), and when it was set.
     external_price: Decimal = ZERO
     external_time: Decimal = ZERO
+    # Trigger orders waiting for the mark, by id (committed per trigger).
+    triggers: Dict[str, Trigger] = field(default_factory=dict)
+    # Its liquidity vault's last quotes: block time, and the mark they were quoted around.
+    mm_time: Decimal = ZERO
+    mm_mark: Decimal = ZERO
+    # Circuit breaker: the mark at the window's start, when it started, and until when the
+    # market accepts only reduce-only orders (block time).
+    breaker_mark: Decimal = ZERO
+    breaker_time: Decimal = ZERO
+    halted_until: Decimal = ZERO
+    # Delisted (docs/CONSENSUS_ROADMAP.md 4): settled at this price; it trades no more.
+    settled_price: Decimal = ZERO
+    # The order grid (Hyperliquid's szDecimals): sizes in this many decimals, prices in at most
+    # 5 significant figures and 6 − sz_decimals decimals. -1: no grid.
+    sz_decimals: int = -1
+    # A deployer market (docs/HYPERLIQUID_PARITY.md): its deployer, which sets its oracle and
+    # takes this share of the protocol's fees on it; and until when the validators hold it
+    # frozen (reduce-only, its oracle theirs).
+    deployer: str = ""
+    deployer_fee_share: Decimal = ZERO
+    frozen_until: Decimal = ZERO
 
     def __post_init__(self) -> None:
         # Resting orders' clearinghouse metadata, committed per order (never changed in place).
         self.orders = as_committed_dict(
             self.orders, "ch.market_orders", _encode_order_meta, mutable=False
         )
+        self.triggers = as_committed_dict(
+            self.triggers, "ch.market_triggers", _encode_trigger, mutable=False
+        )
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        # A market pickled before trigger orders existed (a persisted checkpoint).
+        self.__dict__.update(state)
+        if "triggers" not in state:
+            self.triggers = as_committed_dict(
+                {}, "ch.market_triggers", _encode_trigger, mutable=False
+            )
 
     @property
     def maintenance_rate(self) -> Decimal:
@@ -235,23 +576,33 @@ class Market:
         return Decimal(1) / (TWO * self.max_leverage)
 
 
+# A market's own fields — what an undo scope records of it (its book, orders and triggers keep
+# themselves).
+_MARKET_FIELDS = tuple(
+    f.name for f in dataclasses.fields(Market) if f.name not in ("book", "orders", "triggers")
+)
+
+
 def _encode_order_meta(_oid: str, meta: OrderMeta) -> Any:
     return [meta.owner, str(meta.leverage), meta.reduce_only]
 
 
 def _encode_account(_owner: str, a: Account) -> Any:
-    return {
+    out = {
         "collateral": str(a.collateral),
         "positions": {mid: p.encode() for mid, p in sorted(a.positions.items())},
         "leverage": {mid: str(v) for mid, v in sorted(a.leverage.items())},
         "isolated": dict(sorted(a.isolated.items())),
     }
+    if a.assets:  # (absent while none: every other account's encoding unchanged)
+        out["assets"] = {t: str(v) for t, v in sorted(a.assets.items())}
+    return out
 
 
 def _market_header(m: Market) -> Dict[str, Any]:
     """A market's own fields — everything the commitment covers but its orders and book."""
     d = str
-    header = {
+    header: Dict[str, Any] = {
         "base": m.base,
         "quote": m.quote,
         "max_lev": d(m.max_leverage),
@@ -265,6 +616,18 @@ def _market_header(m: Market) -> Dict[str, Any]:
     }
     if m.external_price > 0:  # absent until first voted (a root unchanged till then)
         header["ext"] = [d(m.external_price), d(m.external_time)]
+    if m.mm_time > 0:  # absent until its liquidity vault first quotes
+        header["mm"] = [d(m.mm_time), d(m.mm_mark)]
+    if m.breaker_time > 0 or m.halted_until > 0:  # absent until the breaker first runs
+        header["breaker"] = [d(m.breaker_mark), d(m.breaker_time), d(m.halted_until)]
+    if m.settled_price > 0:
+        header["settled"] = d(m.settled_price)
+    if m.sz_decimals >= 0:
+        header["sz"] = m.sz_decimals
+    if m.deployer:  # (absent on a validator-priced market)
+        header["dep"] = [m.deployer, d(m.deployer_fee_share)]
+    if m.frozen_until > 0:  # absent until the validators first freeze it
+        header["frozen"] = d(m.frozen_until)
     return header
 
 
@@ -327,11 +690,21 @@ class Clearinghouse:
     """Perp markets, their order books, and every trader's margin account."""
 
     last_makers_visited = 0  # (a clearinghouse restored from before it existed reads this)
+    trigger_seq = 0
 
     # Committed entry by entry (qrdx/exchange/commitment.py). Read-only scans use peek*.
     accounts = committed("ch.accounts", _encode_account)
     vault_shares = committed("ch.vault_shares", encode_value, mutable=False)
     vault_unlock = committed("ch.vault_unlock", encode_value, mutable=False)
+    user_vaults = committed("ch.user_vaults", _encode_user_vault, mutable=False)
+    vault_holdings = committed("ch.vault_holdings", _encode_holding, mutable=False)
+    volumes = committed("ch.volumes", _encode_volume, mutable=False)
+    # Portfolio margin: tokens held as margin, in total (the perps holder's ledger balance of
+    # them), and when the vault last sold each.
+    asset_holdings = committed("ch.asset_holdings", encode_value, mutable=False)
+    asset_unwind_time = committed("ch.asset_unwind_time", encode_value, mutable=False)
+    referral_codes = committed("ch.referral_codes", encode_value, mutable=False)
+    referrals = committed("ch.referrals", _encode_referral, mutable=False)
 
     def __init__(self) -> None:
         self.markets: Dict[str, Market] = {}
@@ -343,6 +716,9 @@ class Clearinghouse:
         self.vault_unlock = {}  # owner → block time its shares unlock
         # Mirror of the clearinghouse holder's real balance: deposits minus withdrawals.
         self.holder_balance: Decimal = ZERO
+        # The stakers' share of fee income withheld from the backstop vault this block, to
+        # leave the clearinghouse at the block's end (``take_staker_fees``): perps in QRDX only.
+        self.staker_fees: Decimal = ZERO
         # Per operation, not state: the positions it changed (their orders are re-checked), the
         # orders that cancelled, and the block time of the running tick.
         self._touched: set = set()
@@ -350,11 +726,63 @@ class Clearinghouse:
         self.last_cancelled: List[dict] = []
         self.last_makers_visited = 0  # resting orders the last placement visited (its gas)
         self._now: Decimal = ZERO
+        self.trigger_seq = 0  # triggers placed so far (committed once there is one)
+        self.user_vaults = {}  # vault address → UserVault
+        self.vault_holdings = {}  # "vault|holder" → VaultHolding
+        self.volumes = {}  # owner → ((day, notional), …): the last FEE_VOLUME_DAYS days traded
+        self.referral_codes = {}  # code → its referrer
+        self.referrals = {}  # referee → Referral
+        self.asset_holdings = {}  # token → amount held as margin, every account
+        self.asset_unwind_time = {}  # token → block time the vault last sold some
+
+    _LATER_FIELDS = (
+        "user_vaults",
+        "vault_holdings",
+        "volumes",
+        "referral_codes",
+        "referrals",
+        "asset_holdings",
+        "asset_unwind_time",
+    )
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        # A clearinghouse pickled before these existed (a persisted checkpoint).
+        self.__dict__.update(state)
+        for name in self._LATER_FIELDS:
+            if name not in state:
+                setattr(self, name, {})
 
     @property
     def vault_collateral(self) -> Decimal:
         vault = self.accounts.peek(VAULT)
         return vault.collateral if vault is not None else ZERO
+
+    def _keep_all(self) -> None:
+        """Inside an undo scope, once: the clearinghouse's scalars and every market's own fields
+        (few markets; their order metadata, books and the accounts keep themselves)."""
+        scope = undo.active()
+        if scope is None or not scope.first(self, "clearinghouse"):
+            return
+        markets = dict(self.markets)
+        headers = {mid: {f: getattr(m, f) for f in _MARKET_FIELDS} for mid, m in markets.items()}
+        scalars = {
+            "vault_total_shares": self.vault_total_shares,
+            "holder_balance": self.holder_balance,
+            "_now": self.__dict__.get("_now", ZERO),
+            "trigger_seq": self.trigger_seq,
+            "staker_fees": self.__dict__.get("staker_fees", ZERO),
+        }
+
+        def restore() -> None:
+            self.markets.clear()
+            self.markets.update(markets)
+            for mid, fields in headers.items():
+                for name, value in fields.items():
+                    setattr(markets[mid], name, value)
+            for name, value in scalars.items():
+                setattr(self, name, value)
+
+        scope.record(self, "clearinghouse", restore)
 
     # ------------------------------------------------------------------ markets
 
@@ -362,15 +790,27 @@ class Clearinghouse:
     def market_id(base: str, quote: str = "QRDX") -> str:
         return f"{base}-{quote}-PERP"
 
+    @_mutator
     @_pinned
     def create_market(
-        self, base: str, quote: str = "QRDX", max_leverage: Decimal = DEFAULT_MAX_LEVERAGE
+        self,
+        base: str,
+        quote: str = "QRDX",
+        max_leverage: Decimal = DEFAULT_MAX_LEVERAGE,
+        sz_decimals: int = -1,
+        deployer: str = "",
+        deployer_fee_share: Decimal = ZERO,
     ) -> Market:
         if not base:
             raise ClearinghouseError("base token required")
+        deployer_fee_share = Decimal(str(deployer_fee_share))
+        if not ZERO <= deployer_fee_share <= 1 or (deployer_fee_share and not deployer):
+            raise ClearinghouseError("a deployer's fee share is 0 to 1, on its own market")
         max_leverage = Decimal(str(max_leverage))
         if max_leverage < 1:
             raise ClearinghouseError("max leverage must be at least 1")
+        if isinstance(sz_decimals, bool) or not -1 <= int(sz_decimals) <= MAX_PRICE_DECIMALS:
+            raise ClearinghouseError(f"sz_decimals is 0 to {MAX_PRICE_DECIMALS} (-1: no grid)")
         mid = self.market_id(base, quote)
         if mid in self.markets:
             raise ClearinghouseError(f"market {mid} already exists")
@@ -380,9 +820,40 @@ class Clearinghouse:
             taker_fee_rate=TAKER_FEE_RATE,
             self_trade_action=SelfTradeAction.CANCEL_TAKER,
         )
-        market = Market(id=mid, base=base, quote=quote, max_leverage=max_leverage, book=book)
+        market = Market(
+            id=mid,
+            base=base,
+            quote=quote,
+            max_leverage=max_leverage,
+            book=book,
+            sz_decimals=int(sz_decimals),
+            deployer=deployer,
+            deployer_fee_share=deployer_fee_share,
+        )
         self.markets[mid] = market
         return market
+
+    @staticmethod
+    def _check_grid(m: Market, size: Any, price: Any, reduce_only: bool) -> None:
+        """An order a user places must fit the market's grid — a size in whole lots, a price of
+        at most 5 significant figures (an integer always fits) and 6 − sz_decimals decimals — and,
+        unless it only reduces, be worth PERP_MIN_ORDER_VALUE."""
+        size, price = Decimal(str(size)), Decimal(str(price))
+        if m.sz_decimals >= 0:
+            lot = Decimal(1).scaleb(-m.sz_decimals)
+            if size % lot != 0:
+                raise ClearinghouseError(f"{m.id} sizes are multiples of {lot}")
+            if price != price.to_integral_value():
+                t = price.normalize().as_tuple()
+                decimals = -int(t.exponent)
+                if len(t.digits) > PRICE_SIG_FIGS or decimals > MAX_PRICE_DECIMALS - m.sz_decimals:
+                    raise ClearinghouseError(
+                        f"{m.id} prices have at most {PRICE_SIG_FIGS} significant figures and "
+                        f"{MAX_PRICE_DECIMALS - m.sz_decimals} decimals"
+                    )
+        minimum = Decimal(int(constants.PERP_MIN_ORDER_VALUE))
+        if minimum > 0 and not reduce_only and size * price < minimum:
+            raise ClearinghouseError(f"an order is worth at least {minimum}")
 
     def market(self, market_id: str) -> Market:
         m = self.markets.get(market_id)
@@ -390,6 +861,7 @@ class Clearinghouse:
             raise ClearinghouseError(f"market {market_id} not found")
         return m
 
+    @_mutator
     @_pinned
     def set_oracle_price(self, market_id: str, price: Decimal, now=None) -> None:
         """Set the oracle (index) price — at block time ``now``, when known, for the staleness
@@ -404,6 +876,7 @@ class Clearinghouse:
             m.oracle_time = Decimal(str(now))
         self._refresh_mark(m, m.ema_time)
 
+    @_mutator
     def set_external_perp_price(self, market_id: str, price: Decimal, now=None) -> None:
         """Set other venues' perp price for the market (the validators' vote) — the mark's third
         input while fresh — and re-derive the mark, like ``set_oracle_price``."""
@@ -416,17 +889,23 @@ class Clearinghouse:
             m.external_time = Decimal(str(now))
         self._refresh_mark(m, m.ema_time)
 
+    @_mutator
     def new_block(self, now=None) -> None:
         for m in self.markets.values():
             m.book.new_block(now)
+        if now is not None:
+            self._now = Decimal(str(now))  # block time: the day a fill's volume counts in
 
+    @_mutator
     @_pinned
     def tick(self, now, funding_interval=None) -> List[dict]:
         """Per-block duties, run on EVERY block on every path (block_processor.run_exchange_tick):
         advance the mark-price EMAs to block time ``now``, sample the funding premium and pay
         funding at an interval boundary, then liquidate every account below maintenance at the
-        new marks, and let the vault unwind a slice of what it holds. Returns what happened, as
-        events: ``{"type": "funding", ...}`` for each settlement, ``{"type": "liquidation",
+        new marks, and let the vault unwind a slice of what it holds. Trigger orders the new
+        marks crossed fire first (``_fire_triggers``). Returns what happened, as
+        events: ``{"type": "funding", ...}`` for each settlement, ``{"type": "trigger_fired" /
+        "trigger_cancelled", ...}`` for each trigger that fired, ``{"type": "liquidation",
         ...}`` for each liquidation that acted, ``{"type": "vault_unwind", ...}`` for each
         unwind that filled and ``{"type": "order_cancelled", ...}`` for each resting order a
         position change left the account unqualified for (``_trim_orders``)."""
@@ -435,17 +914,24 @@ class Clearinghouse:
         events: List[dict] = []
         for mid in sorted(self.markets):
             m = self.markets[mid]
+            if m.settled_price > 0:  # delisted: no mark, no funding
+                continue
             dt = max(ZERO, now - m.ema_time) if m.ema_time > 0 else ZERO
             self._refresh_mark(m, now)
+            tripped = self._trip_breaker(m, now)
+            if tripped is not None:
+                events.append(tripped)
             self._sample_premium(m, dt)
             settled = self._settle_funding(m, now, interval)
             if settled is not None:
                 events.append(settled)
         self._now = now  # block time, for the liquidation slices' cooldowns
         self._touched, self._cancelled = set(), []
+        events += self._fire_triggers(now)
         events += self._liquidate_all()
         events += self._vault_unwind(now)
         self._trim_touched()
+        events += self._quote_markets(now)
         return events + self._cancelled
 
     # ------------------------------------------------------------------ funding
@@ -617,6 +1103,7 @@ class Clearinghouse:
             raise ClearinghouseError("amount has more than 18 decimal places")
         return amount
 
+    @_mutator
     @_pinned
     def deposit(self, owner: str, amount) -> Decimal:
         self._user(owner)
@@ -634,6 +1121,7 @@ class Clearinghouse:
         free = self.cross_equity(owner) - self.cross_requirement(owner)
         return max(ZERO, min(acct.collateral, free))
 
+    @_mutator
     @_pinned
     def withdraw(self, owner: str, amount) -> Decimal:
         self._user(owner)
@@ -648,6 +1136,7 @@ class Clearinghouse:
         self.holder_balance -= amount
         return amount
 
+    @_mutator
     @_pinned
     def set_leverage(self, owner: str, market_id: str, leverage, isolated: bool) -> None:
         self._user(owner)
@@ -679,6 +1168,145 @@ class Clearinghouse:
                     store[market_id] = value
             raise ClearinghouseError("insufficient margin for that leverage")
 
+    @_mutator
+    @_pinned
+    def pay_builder(self, owner: str, builder: str, amount: Decimal) -> None:
+        """A builder's fee on an order it routed: ``amount`` of ``owner``'s collateral to the
+        builder's margin account (an internal transfer), out of free margin only."""
+        amount = _q_amount(Decimal(str(amount)))
+        if amount <= 0:
+            return
+        if self.cross_equity(owner) - self.cross_requirement(owner) < amount:
+            raise ClearinghouseError(f"not enough free margin for the builder fee ({amount})")
+        self.account(owner).collateral -= amount
+        self.account(builder).collateral += amount
+
+    @_mutator
+    @_pinned
+    def adjust_isolated_margin(self, owner: str, market_id: str, delta) -> Decimal:
+        """Move ``delta`` of collateral into an isolated position's margin (``delta`` < 0: out of
+        it, back to the account's cross collateral) — Hyperliquid's ``updateIsolatedMargin``.
+        Adding takes free cross margin; removing leaves the position at least its initial margin
+        at mark, so it never raises the position's leverage past its setting. Returns the
+        position's isolated margin after."""
+        self._user(owner)
+        m = self.market(market_id)
+        delta = Decimal(str(delta))
+        if not delta.is_finite() or delta == 0 or delta != _q_amount(delta):
+            raise ClearinghouseError("the amount is a non-zero number of whole wei")
+        acct = self.account(owner)
+        pos = acct.positions.get(market_id)
+        if pos is None or pos.size == 0 or not acct.isolated.get(market_id, False):
+            raise ClearinghouseError(f"no isolated position in {market_id}")
+        if delta > 0:
+            if self.cross_equity(owner) - self.cross_requirement(owner) < delta:
+                raise ClearinghouseError("not enough free cross margin to add")
+        else:
+            need = initial_margin(m, self._leverage(acct, m), abs(pos.size) * m.mark_price)
+            if self._iso_equity(acct, market_id) + delta < need:
+                raise ClearinghouseError(
+                    f"the position must keep its initial margin ({need}) after the removal"
+                )
+        acct.collateral -= delta
+        pos.isolated_margin += delta
+        return pos.isolated_margin
+
+    @_mutator
+    @_pinned
+    def delist(self, market_id: str, price: Optional[Decimal] = None) -> Dict[str, Any]:
+        """Settle ``market_id`` for good, by governance (docs/CONSENSUS_ROADMAP.md 4). Every
+        order and trigger in it is cancelled and every position closed at one price — ``price``,
+        or the oracle's — which is zero-sum: the sizes net to zero. Its liquidity vault stops
+        quoting and its lockup ends. The market refuses every order after. An account the
+        settlement leaves in debt is resolved by the tick, as any debt is."""
+        m = self.market(market_id)
+        if m.settled_price > 0:
+            raise ClearinghouseError(f"{market_id} is already delisted")
+        settle = _q_entry(Decimal(str(price)) if price is not None else m.oracle_price)
+        if not settle.is_finite() or settle <= 0:
+            raise ClearinghouseError(f"{market_id} has no price to settle at")
+        owners = set(self._orders_by_owner(m)) | set(self._trigger_index(m)["owners"])
+        for owner in sorted(owners):
+            self._cancel_orders_of(owner, market_id)
+        holders = sorted(
+            owner
+            for owner, a in self.accounts.peek_items()
+            if a.positions.get(market_id) is not None and a.positions[market_id].size != 0
+        )
+        closed = []
+        for owner in holders:
+            acct = self.account(owner)
+            size = acct.positions[market_id].size
+            realized = self._trade_into(owner, m, -size, settle, self._leverage(acct, m), settle)
+            closed.append({"owner": owner, "size": str(size), "realized": str(realized)})
+        if m.open_interest != 0:
+            raise ClearinghouseError(f"{market_id}'s positions do not net to zero")
+        m.settled_price = settle
+        now = Decimal(str(self.__dict__.get("_now", ZERO)))
+        vault = market_maker_address(market_id)
+        v = self.user_vaults.peek(vault) if len(self.user_vaults) else None
+        if v is not None:
+            h = self._holding(vault, v.leader)
+            if h.unlock > now:
+                self._set_holding(vault, v.leader, dataclasses.replace(h, unlock=now))
+        return {"market_id": market_id, "settled_price": str(settle), "closed": closed}
+
+    def take_staker_fees(self) -> Decimal:
+        """The stakers' fee share withheld since the last call (already out of the holder's
+        balance here; the caller moves it on the ledger)."""
+        out = self.__dict__.get("staker_fees", ZERO)
+        if out:
+            self._keep_all()
+            self.staker_fees = ZERO
+        return out
+
+    def halted(self, m: Market) -> bool:
+        """The market's circuit breaker — or, a deployer market, the validators' freeze — holds
+        it to reduce-only orders now."""
+        now = Decimal(str(self.__dict__.get("_now", ZERO)))
+        return (m.halted_until > 0 and now < m.halted_until) or self.frozen(m, now)
+
+    @staticmethod
+    def frozen(m: Market, now: Any) -> bool:
+        """A deployer market the validators hold frozen at block time ``now``."""
+        return m.frozen_until > 0 and Decimal(str(now)) < m.frozen_until
+
+    @_mutator
+    def freeze(self, market_id: str, until: Decimal) -> None:
+        """The validators froze a deployer market until block time ``until``."""
+        m = self.market(market_id)
+        m.frozen_until = max(m.frozen_until, Decimal(str(until)))
+
+    def oi_cap(self, m: Market) -> Optional[Decimal]:
+        """The market's open-interest cap (notional at mark), None if uncapped."""
+        floor = Decimal(constants.PERP_MIN_OI_CAP)
+        vault = market_maker_address(m.id)
+        if vault in self.user_vaults:
+            return max(floor, self.cross_equity(vault) * OI_CAP_MULTIPLE)
+        return floor if floor > 0 else None
+
+    def _trip_breaker(self, m: Market, now: Decimal) -> Optional[dict]:
+        """Each tick, after the mark is refreshed: a move of PERP_BREAKER_MOVE within the
+        window halts the market's new exposure for the cooldown."""
+        move = _bps(constants.PERP_BREAKER_MOVE_BPS)
+        if m.mark_price <= 0 or move <= 0:
+            return None
+        if m.breaker_time <= 0 or now - m.breaker_time >= constants.PERP_BREAKER_WINDOW_SECONDS:
+            m.breaker_mark, m.breaker_time = m.mark_price, now
+            return None
+        if m.breaker_mark > 0 and abs(m.mark_price - m.breaker_mark) / m.breaker_mark >= move:
+            m.halted_until = now + constants.PERP_BREAKER_COOLDOWN_SECONDS
+            moved_from = m.breaker_mark
+            m.breaker_mark, m.breaker_time = m.mark_price, now
+            return {
+                "type": "circuit_breaker",
+                "market": m.id,
+                "from": str(moved_from),
+                "to": str(m.mark_price),
+                "halted_until": str(m.halted_until),
+            }
+        return None
+
     def _leverage(self, acct: Account, m: Market) -> Decimal:
         return acct.leverage.get(m.id, min(DEFAULT_LEVERAGE, m.max_leverage))
 
@@ -693,6 +1321,7 @@ class Clearinghouse:
         self.vault_shares[holder] = self.vault_shares.get(holder, ZERO) + shares
         self.vault_total_shares += shares
 
+    @_mutator
     @_pinned
     def vault_deposit(self, owner: str, amount, now, lockup, protocol: bool = False) -> Decimal:
         """Move ``amount`` of the owner's free collateral into the vault for shares at NAV;
@@ -730,6 +1359,7 @@ class Clearinghouse:
             self.vault_unlock[owner] = max(self.vault_unlock.get(owner, ZERO), now + lockup)
         return shares
 
+    @_mutator
     @_pinned
     def vault_withdraw(self, owner: str, shares, now) -> Decimal:
         """Redeem shares at NAV into the owner's collateral. Refused while locked, or beyond
@@ -764,6 +1394,285 @@ class Clearinghouse:
             self.vault_unlock.pop(owner, None)
         return value
 
+    # ------------------------------------------------------------------ user vaults
+
+    def user_vault(self, vault: str) -> UserVault:
+        v = self.user_vaults.peek(vault)
+        if v is None:
+            raise ClearinghouseError(f"no vault {vault}")
+        return v
+
+    def _holding(self, vault: str, holder: str) -> VaultHolding:
+        return self.vault_holdings.peek(f"{vault}|{holder}") or VaultHolding(ZERO, ZERO, ZERO)
+
+    def _set_holding(self, vault: str, holder: str, h: VaultHolding) -> None:
+        key = f"{vault}|{holder}"
+        if h.shares > 0:
+            self.vault_holdings[key] = h
+        elif key in self.vault_holdings:
+            del self.vault_holdings[key]
+
+    @_mutator
+    @_pinned
+    def create_user_vault(
+        self,
+        leader: str,
+        vault: str,
+        name: str,
+        amount,
+        profit_share,
+        now,
+        managed: str = "",
+        lockup=ZERO,
+    ) -> Decimal:
+        """A vault ``leader`` trades (as the vault's signer) with ``amount`` of its own free
+        collateral to start, one share per QRDX. ``managed``: a market's liquidity vault,
+        quoted by the protocol, the leader's shares locked for ``lockup`` seconds. Returns the
+        shares."""
+        self._user(leader)
+        amount, now = self._amount(amount), Decimal(str(now))
+        profit_share = Decimal(str(profit_share))
+        if vault in self.user_vaults or vault in self.accounts:
+            raise ClearinghouseError(f"{vault} exists")
+        if not ZERO <= profit_share <= USER_VAULT_MAX_PROFIT_SHARE:
+            raise ClearinghouseError(f"profit share must be 0 to {USER_VAULT_MAX_PROFIT_SHARE}")
+        if amount < USER_VAULT_MIN_DEPOSIT:
+            raise ClearinghouseError(f"a vault starts with at least {USER_VAULT_MIN_DEPOSIT}")
+        if not managed and sum(
+            1 for v in self.user_vaults.peek_values() if v.leader == leader and not v.managed
+        ) >= (USER_VAULTS_PER_LEADER):
+            raise ClearinghouseError(f"at most {USER_VAULTS_PER_LEADER} vaults per leader")
+        if amount > self.withdrawable(leader):
+            raise ClearinghouseError(
+                f"{amount} exceeds the withdrawable {self.withdrawable(leader)}"
+            )
+        self.accounts[leader].collateral -= amount
+        self.account(vault).collateral += amount
+        self.user_vaults[vault] = UserVault(
+            leader=leader,
+            name=str(name),
+            profit_share=profit_share,
+            total_shares=amount,
+            created=now,
+            managed=managed,
+        )
+        self._set_holding(vault, leader, VaultHolding(amount, amount, now + Decimal(str(lockup))))
+        return amount
+
+    @_mutator
+    @_pinned
+    def user_vault_deposit(self, owner: str, vault: str, amount, now) -> Decimal:
+        """Join a vault: ``amount`` of the owner's free collateral for shares at NAV, locked for
+        USER_VAULT_LOCKUP_SECONDS (the leader's are not). Returns the shares."""
+        self._user(owner)
+        amount, now = self._amount(amount), Decimal(str(now))
+        v = self.user_vault(vault)
+        if owner == vault:
+            raise ClearinghouseError("a vault does not join itself")
+        if amount > self.withdrawable(owner):
+            raise ClearinghouseError(
+                f"{amount} exceeds the withdrawable {self.withdrawable(owner)}"
+            )
+        nav = self.cross_equity(vault)
+        if v.total_shares <= 0 or nav <= 0:
+            raise ClearinghouseError("the vault has nothing left to join")
+        shares = (amount * v.total_shares / nav).quantize(SHARE_QUANTUM, rounding=ROUND_DOWN)
+        if shares <= 0:
+            raise ClearinghouseError("deposit too small for a share")
+        total = v.total_shares + shares
+        leader_shares = self._holding(vault, v.leader).shares + (shares if owner == v.leader else 0)
+        if leader_shares < total * USER_VAULT_LEADER_MIN_SHARE:
+            raise ClearinghouseError(
+                f"the leader must hold at least {USER_VAULT_LEADER_MIN_SHARE:%} of the vault"
+            )
+        h = self._holding(vault, owner)
+        unlock = (
+            max(h.unlock, now)
+            if owner == v.leader
+            else max(h.unlock, now + USER_VAULT_LOCKUP_SECONDS)
+        )
+        self.accounts[owner].collateral -= amount
+        self.account(vault).collateral += amount
+        self._set_holding(vault, owner, VaultHolding(h.shares + shares, h.basis + amount, unlock))
+        self.user_vaults[vault] = dataclasses.replace(v, total_shares=total)
+        return shares
+
+    @_mutator
+    @_pinned
+    def user_vault_withdraw(self, owner: str, vault: str, shares, now) -> Tuple[Decimal, Decimal]:
+        """Leave (part of) a vault: ``shares`` at NAV into the owner's collateral, less the
+        leader's profit share of what they gained over their cost. Refused while locked, beyond
+        what the vault can release without dropping below margin on its positions, or if the
+        leader would hold less than its minimum while others hold shares. Returns (paid,
+        profit share)."""
+        self._user(owner)
+        shares, now = Decimal(str(shares)), Decimal(str(now))
+        if shares <= 0 or shares != shares.quantize(SHARE_QUANTUM):
+            raise ClearinghouseError("shares must be positive with at most 18 decimal places")
+        v = self.user_vault(vault)
+        h = self._holding(vault, owner)
+        if shares > h.shares:
+            raise ClearinghouseError(f"only {h.shares} shares held")
+        if now < h.unlock:
+            raise ClearinghouseError(f"the shares are locked until block time {h.unlock}")
+        total = v.total_shares - shares
+        if owner == v.leader and total > 0:
+            if h.shares - shares < total * USER_VAULT_LEADER_MIN_SHARE:
+                raise ClearinghouseError(
+                    f"the leader must hold at least {USER_VAULT_LEADER_MIN_SHARE:%} of the vault"
+                )
+        nav = self.cross_equity(vault)
+        value = ZERO
+        if nav > 0:
+            value = (shares * nav / v.total_shares).quantize(AMOUNT_QUANTUM, rounding=ROUND_DOWN)
+        if value > self.withdrawable(vault):
+            raise ClearinghouseError("the vault cannot release that much while it holds positions")
+        cost = (h.basis * shares / h.shares).quantize(AMOUNT_QUANTUM, rounding=ROUND_DOWN)
+        fee = ZERO
+        if owner != v.leader and value > cost:
+            fee = ((value - cost) * v.profit_share).quantize(AMOUNT_QUANTUM, rounding=ROUND_DOWN)
+        self.accounts[vault].collateral -= value
+        self.account(owner).collateral += value - fee
+        if fee > 0:
+            self.account(v.leader).collateral += fee
+        self._set_holding(vault, owner, VaultHolding(h.shares - shares, h.basis - cost, h.unlock))
+        self.user_vaults[vault] = dataclasses.replace(v, total_shares=total)
+        return value - fee, fee
+
+    # ------------------------------------------------------------------ portfolio margin
+
+    def asset_price(self, token: str) -> Decimal:
+        """A margin token's value per unit, haircut applied (0 if it has no price)."""
+        spec = portfolio_assets().get(token.lower())
+        if spec is None:
+            return ZERO
+        m = self.markets.get(spec[0])
+        if m is None or m.oracle_price <= 0:
+            return ZERO
+        return m.oracle_price * (1 - spec[1])
+
+    def assets_value(self, acct: Account) -> Decimal:
+        return sum(
+            (amount * self.asset_price(token) for token, amount in sorted(acct.assets.items())),
+            ZERO,
+        )
+
+    @_mutator
+    @_pinned
+    def deposit_asset(self, owner: str, token: str, amount) -> Decimal:
+        """Hold ``amount`` of a portfolio-margin token as margin (the manager moves it into the
+        perps holder). Returns the account's holding."""
+        self._user(owner)
+        amount, token = self._amount(amount), str(token).lower()
+        price = self.asset_price(token)
+        if price <= 0:
+            raise ClearinghouseError(f"{token} is not accepted as margin")
+        if amount * price < PORTFOLIO_MIN_DEPOSIT:
+            raise ClearinghouseError(f"a margin deposit is worth at least {PORTFOLIO_MIN_DEPOSIT}")
+        acct = self.account(owner)
+        acct.assets[token] = acct.assets.get(token, ZERO) + amount
+        self.asset_holdings[token] = self.asset_holdings.get(token, ZERO) + amount
+        return acct.assets[token]
+
+    @_mutator
+    @_pinned
+    def withdraw_asset(self, owner: str, token: str, amount) -> Decimal:
+        """Release ``amount`` of a margin token (the manager moves it out of the perps holder):
+        refused if what is left would not carry the account — its positions and orders, and
+        what it owes in settlement token (its collateral below zero counts against it)."""
+        self._user(owner)
+        amount, token = self._amount(amount), str(token).lower()
+        acct = self.accounts.peek(owner)
+        held = acct.assets.get(token, ZERO) if acct is not None else ZERO
+        if amount > held:
+            raise ClearinghouseError(f"only {held} of {token} held as margin")
+        left = self.cross_equity(owner) - amount * self.asset_price(token)
+        if left < self.cross_requirement(owner):
+            raise ClearinghouseError("what is left would not carry the account's positions")
+        acct = self.accounts[owner]
+        acct.assets[token] = held - amount
+        if not acct.assets[token]:
+            del acct.assets[token]
+        self.asset_holdings[token] = self.asset_holdings[token] - amount
+        if not self.asset_holdings[token]:
+            del self.asset_holdings[token]
+        return amount
+
+    def _seize_assets(self, owner: str) -> None:
+        """A liquidated account's margin tokens go to the backstop vault at the value they
+        counted for (equity unchanged on both sides); the vault sells them (``unwind_assets``)."""
+        acct = self.accounts.peek(owner)
+        if acct is None or not acct.assets or owner == VAULT:
+            return
+        acct = self.accounts[owner]
+        vault = self.account(VAULT)
+        for token, amount in sorted(acct.assets.items()):
+            value = (amount * self.asset_price(token)).quantize(AMOUNT_QUANTUM, rounding=ROUND_DOWN)
+            acct.collateral += value
+            vault.collateral -= value
+            vault.assets[token] = vault.assets.get(token, ZERO) + amount
+        acct.assets.clear()
+
+    def unwind_assets_due(self, now: Decimal) -> List[Tuple[str, Decimal, Decimal]]:
+        """The vault's margin tokens due a sale now: (token, amount, the least it accepts —
+        the oracle less PORTFOLIO_UNWIND_SLIPPAGE)."""
+        vault = self.accounts.peek(VAULT)
+        if vault is None or not vault.assets:
+            return []
+        due = []
+        assets = portfolio_assets()
+        for token, amount in sorted(vault.assets.items()):
+            spec = assets.get(token)
+            m = self.markets.get(spec[0]) if spec is not None else None
+            last = Decimal(str(self.asset_unwind_time.get(token, ZERO)))
+            if m is None or m.oracle_price <= 0 or now - last < VAULT_UNWIND_SECONDS:
+                continue
+            value = amount * m.oracle_price
+            part = (
+                amount
+                if value <= LIQUIDATION_SLICE_NOTIONAL
+                else (amount * LIQUIDATION_SLICE_FRACTION).quantize(
+                    AMOUNT_QUANTUM, rounding=ROUND_FLOOR
+                )
+            )
+            floor = part * m.oracle_price * (1 - PORTFOLIO_UNWIND_SLIPPAGE)
+            due.append((token, part, floor))
+        return due
+
+    @_mutator
+    def record_asset_sale(self, token: str, sold: Decimal, proceeds: Decimal, now) -> None:
+        """The vault sold ``sold`` of a margin token for ``proceeds`` of settlement token (the
+        manager moved both on the ledger)."""
+        vault = self.accounts[VAULT]
+        vault.assets[token] = vault.assets[token] - sold
+        if not vault.assets[token]:
+            del vault.assets[token]
+        self.asset_holdings[token] = self.asset_holdings[token] - sold
+        if not self.asset_holdings[token]:
+            del self.asset_holdings[token]
+        vault.collateral += proceeds
+        self.holder_balance += proceeds
+        self.asset_unwind_time[token] = Decimal(str(now))
+
+    @_mutator
+    def mark_asset_unwind(self, token: str, now) -> None:
+        """A sale was due but found no buyer within its bound: try again next interval."""
+        self.asset_unwind_time[token] = Decimal(str(now))
+
+    @_pinned
+    def asset_gap(self) -> Dict[str, Decimal]:
+        """token → holdings − Σ accounts' (zero everywhere while the books are sound)."""
+        totals: Dict[str, Decimal] = {}
+        for a in self.accounts.peek_values():
+            for token, amount in a.assets.items():
+                totals[token] = totals.get(token, ZERO) + amount
+        tokens = set(totals) | set(dict.keys(self.asset_holdings))
+        return {
+            t: self.asset_holdings.get(t, ZERO) - totals.get(t, ZERO)
+            for t in sorted(tokens)
+            if self.asset_holdings.get(t, ZERO) != totals.get(t, ZERO)
+        }
+
     # ------------------------------------------------------------------ margin math
 
     @staticmethod
@@ -772,11 +1681,12 @@ class Clearinghouse:
 
     @_pinned
     def cross_equity(self, owner: str) -> Decimal:
-        """Cross collateral plus the unrealized PnL of every cross position, at mark."""
+        """Cross collateral plus the unrealized PnL of every cross position, at mark, plus the
+        portfolio-margin tokens held, at their haircut value."""
         acct = self.accounts.peek(owner)
         if acct is None:
             return ZERO
-        eq = acct.collateral
+        eq = acct.collateral + (self.assets_value(acct) if acct.assets else ZERO)
         for mid, pos in acct.positions.items():
             if pos.size != 0 and not acct.isolated.get(mid, False):
                 eq += self._upnl(self.markets[mid], pos)
@@ -862,7 +1772,7 @@ class Clearinghouse:
         for mid, pos in acct.positions.items():
             if pos.size != 0 and not acct.isolated.get(mid, False):
                 m = self.markets[mid]
-                req += abs(pos.size) * m.mark_price / self._leverage(acct, m)
+                req += initial_margin(m, self._leverage(acct, m), abs(pos.size) * m.mark_price)
         return req + self.open_order_margin(owner)
 
     @_pinned
@@ -879,6 +1789,7 @@ class Clearinghouse:
 
     # ------------------------------------------------------------------ trading
 
+    @_mutator
     @_pinned
     def place_order(
         self,
@@ -892,17 +1803,65 @@ class Clearinghouse:
         reduce_only: bool = False,
         ioc: bool = False,
         max_makers: Optional[int] = None,
+        tif: str = "gtc",
+        hidden: bool = False,
+        display_size=ZERO,
     ) -> List[dict]:
         """
-        Place a limit order. Matches against the book; any remainder rests (or is cancelled if
-        ``ioc``). Returns the fills. Refuses — changing nothing — if the account could not
-        carry the result at initial margin assuming a full fill at the worst price the limit
-        allows. ``max_makers``: how many resting orders it may visit (what its gas pays for,
+        Place a limit order. Matches against the book; any remainder rests. ``tif``: "gtc"
+        rests the remainder; "ioc" (or ``ioc``) cancels it; "fok" fills whole or refuses;
+        "alo" (post-only) refuses if it would match at all. ``hidden`` / ``display_size``: a
+        resting order that shows nothing, or a slice at a time (an iceberg), in the book.
+        Returns the fills. Refuses — changing nothing — if the account could not carry the
+        result at initial margin assuming a full fill at the worst price the limit allows.
+        ``max_makers``: how many resting orders it may visit (what its gas pays for,
         ``orderbook.MatchBudget``); the remainder is cancelled when they run out.
         """
         self._user(owner)
+        self._check_grid(self.market(market_id), size, price, bool(reduce_only))
         self._touched, self._cancelled, self.last_cancelled = set(), [], []
         self.last_makers_visited = 0
+        fills = self._place(
+            owner,
+            market_id,
+            order_id,
+            side,
+            size,
+            price,
+            nonce,
+            reduce_only=reduce_only,
+            tif="ioc" if ioc else tif,
+            hidden=hidden,
+            display_size=display_size,
+            max_makers=max_makers,
+        )
+        self._trim_touched()
+        self.last_cancelled = self._cancelled
+        return fills
+
+    def _place(
+        self,
+        owner: str,
+        market_id: str,
+        order_id: str,
+        side: str,
+        size,
+        price,
+        nonce: int,
+        *,
+        reduce_only: bool = False,
+        tif: str = "gtc",
+        hidden: bool = False,
+        display_size=ZERO,
+        max_makers: Optional[int] = None,
+        protocol: bool = False,
+    ) -> List[dict]:
+        """``place_order`` without its per-operation bookkeeping (a fired trigger, a batch's
+        orders and a modify place through it). ``protocol``: placed by the clearinghouse for
+        the owner (a trigger), so not counted against the owner's per-block order limit."""
+        tif = str(tif).lower()
+        if tif not in ("gtc", "ioc", "fok", "alo"):
+            raise ClearinghouseError(f"unknown time in force {tif!r} (gtc, ioc, fok, alo)")
         m = self.market(market_id)
         if m.mark_price <= 0:
             raise ClearinghouseError(f"market {market_id} has no price yet")
@@ -912,17 +1871,49 @@ class Clearinghouse:
         buy = str(side).lower() in ("buy", "long", "bid")
         if not buy and str(side).lower() not in ("sell", "short", "ask"):
             raise ClearinghouseError(f"unknown side {side!r}")
+        if owner in self.user_vaults and (
+            price > m.mark_price * (1 + USER_VAULT_ORDER_BAND)
+            if buy
+            else price < m.mark_price * (1 - USER_VAULT_ORDER_BAND)
+        ):
+            raise ClearinghouseError(
+                f"a vault's order may be at most {USER_VAULT_ORDER_BAND:%} worse than the mark"
+            )
+        if m.settled_price > 0:
+            raise ClearinghouseError(f"{market_id} is delisted")
+        band = _bps(constants.PERP_PRICE_BAND_BPS)
+        if (
+            band > 0
+            and m.oracle_price > 0
+            and (
+                price > m.oracle_price * (1 + band) if buy else price < m.oracle_price * (1 - band)
+            )
+        ):
+            raise ClearinghouseError(
+                f"an order may be at most {band:%} worse than the oracle ({m.oracle_price})"
+            )
+        if not reduce_only and self.halted(m):
+            if self.frozen(m, self.__dict__.get("_now", ZERO)):
+                raise ClearinghouseError(
+                    f"the validators have frozen {market_id}: reduce-only orders until "
+                    f"block time {m.frozen_until}"
+                )
+            raise ClearinghouseError(
+                f"{market_id}'s circuit breaker has tripped: reduce-only orders until "
+                f"block time {m.halted_until}"
+            )
         acct = self.account(owner)
         pos = acct.positions.get(market_id, Position())
         lev = self._leverage(acct, m)
         q = size if buy else -size
+        oi_before = m.open_interest
 
         if reduce_only:
             if pos.size == 0 or (pos.size > 0) == buy or size > abs(pos.size):
                 raise ClearinghouseError("reduce-only order would not reduce the position")
         else:
             self._check_initial_margin(owner, acct, m, pos, q, price, lev)
-        if not ioc:
+        if tif in ("gtc", "alo"):  # it may rest
             self._check_resting_margin(owner, m, order_id, buy, size, price, lev, reduce_only)
 
         order = Order(
@@ -934,20 +1925,38 @@ class Clearinghouse:
             amount=size,
             nonce=nonce,
             timestamp=0.0,
+            tif=tif,
+            hidden=bool(hidden),
+            display_size=Decimal(str(display_size)),
         )
         budget = MatchBudget(max_makers) if max_makers is not None else None
-        trades = self._match(m, order, budget=budget)
-        self.last_makers_visited = budget.visited if budget is not None else 0
-        m.orders[order_id] = OrderMeta(owner=owner, leverage=lev, reduce_only=bool(reduce_only))
-
-        fills = []
-        for tr in trades:
-            fills.append(self._apply_fill(m, tr, taker_limit=price))
-        if ioc and order.is_active:
+        capped = self.oi_cap(m) is not None
+        # A capped market checks open interest after the fills: they run in a scope of their own
+        # so a refusal undoes them whoever called (ClearinghouseError changes nothing).
+        with undo.atomic() if capped else contextlib.nullcontext():
+            if capped:
+                self._keep_all()
+            try:
+                trades = self._match(m, order, protocol=protocol, budget=budget)
+            finally:
+                # Read by the operation even when it fails (a fill-or-kill pays for its visits).
+                self.last_makers_visited = budget.visited if budget is not None else 0
+            m.orders[order_id] = OrderMeta(owner=owner, leverage=lev, reduce_only=bool(reduce_only))
+            fills = []
+            for tr in trades:
+                fills.append(self._apply_fill(m, tr, taker_limit=price))
+            cap = self.oi_cap(m) if capped else None
+            if (
+                cap is not None
+                and m.open_interest > oi_before
+                and m.open_interest * m.mark_price > cap
+            ):
+                raise ClearinghouseError(
+                    f"{market_id}'s open interest is capped at {cap} (its liquidity sets the cap)"
+                )
+        if tif in ("ioc", "fok") and order.is_active:
             m.book.cancel_order(order_id, caller=owner)
         self._prune_orders(m, self._match_ids(m, order_id, trades))
-        self._trim_touched()
-        self.last_cancelled = self._cancelled
         return fills
 
     def _match(
@@ -1038,6 +2047,31 @@ class Clearinghouse:
         for order, meta, opening in self._opening_amounts(owner, m):
             if meta.reduce_only and opening > 0:
                 cancel(order, "reduce_only")
+        position_triggers = [  # a position's TP/SL, and an order's once the order is done
+            tid
+            for tid in sorted(self._trigger_index(m)["owners"].get(owner, ()))
+            if tracked(m.triggers).peek(tid).position
+            or (
+                tracked(m.triggers).peek(tid).parent
+                and tracked(m.triggers).peek(tid).parent not in m.orders
+            )
+        ]
+        if position_triggers:
+            acct = self.accounts.peek(owner)
+            pos = acct.positions.get(mid) if acct is not None else None
+            held = pos.size if pos is not None else ZERO
+            for tid in position_triggers:
+                if held == 0 or (held > 0) == (tracked(m.triggers).peek(tid).side == "buy"):
+                    del m.triggers[tid]  # the position it was for is gone
+                    self._cancelled.append(
+                        {
+                            "type": "trigger_cancelled",
+                            "market": mid,
+                            "trigger_id": tid,
+                            "owner": owner,
+                            "reason": "position_closed",
+                        }
+                    )
         if self.cross_equity(owner) >= self.cross_requirement(owner):
             return
         opening_orders = [
@@ -1051,14 +2085,519 @@ class Clearinghouse:
                 break
             cancel(order, "margin")
 
+    @_mutator
     @_pinned
     def cancel_order(self, owner: str, market_id: str, order_id: str) -> None:
+        """Cancel a resting order or a trigger order."""
         m = self.market(market_id)
+        trigger = tracked(m.triggers).peek(order_id)
+        if trigger is not None and trigger.owner == owner:
+            del m.triggers[order_id]
+            return
         meta = m.orders.get(order_id)
         if meta is None or meta.owner != owner:
             raise ClearinghouseError(f"no open order {order_id} for this account")
+        cancelled = m.book.cancel_order(order_id, caller=owner)
+        self._prune_orders(m, [order_id])
+        if cancelled is not None and cancelled.filled == 0:
+            for tid in self._children_of(m, owner, order_id):  # its TP/SL protect nothing
+                del m.triggers[tid]
+
+    @_mutator
+    @_pinned
+    def cancel_all(self, owner: str, market_id: Optional[str] = None) -> int:
+        """Cancel every resting order and trigger of ``owner`` (in one market, or all).
+        Returns how many."""
+        if market_id is not None:
+            self.market(market_id)
+        count = 0
+        for mid in sorted(self.markets):
+            if market_id is not None and mid != market_id:
+                continue
+            m = self.markets[mid]
+            mine = sorted(self._orders_by_owner(m).get(owner, ()))
+            for oid in mine:
+                if tracked(m.orders).peek(oid) is not None:
+                    m.book.cancel_order(oid, caller=owner)
+                    count += 1
+            self._prune_orders(m, mine)
+            for tid in sorted(self._trigger_index(m)["owners"].get(owner, ())):
+                del m.triggers[tid]
+                count += 1
+        return count
+
+    @_mutator
+    @_pinned
+    def modify_order(
+        self,
+        owner: str,
+        market_id: str,
+        order_id: str,
+        new_id: str,
+        size=None,
+        price=None,
+        trigger_price=None,
+        limit_price=None,
+        max_makers: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Change an open order in one step: what is left of it (``size``) and its ``price``.
+        A smaller size at the same price keeps the order's place in the queue; any other change
+        replaces it with a new order ``new_id`` — the old one cancelled, the new one matched
+        and margined as any order, all or nothing. A trigger order changes its ``size``,
+        ``trigger_price`` and ``limit_price`` in place (and queues again). Returns
+        ``{"order_id", "fills", "resting"}``."""
+        self._touched, self._cancelled, self.last_cancelled = set(), [], []
+        self.last_makers_visited = 0
+        m = self.market(market_id)
+        trigger = tracked(m.triggers).peek(order_id)
+        if trigger is not None and trigger.owner == owner:
+            if price is not None:
+                raise ClearinghouseError("a trigger order changes trigger_price and limit_price")
+            for px in (trigger_price, limit_price):
+                if px is not None and Decimal(str(px)) > 0:
+                    self._check_grid(
+                        m, trigger.size if size is None else size, px, trigger.reduce_only
+                    )
+            changed = self._new_trigger(
+                m,
+                trigger,
+                size=trigger.size if size is None else size,
+                trigger_price=(trigger.trigger_price if trigger_price is None else trigger_price),
+                limit_price=trigger.limit_price if limit_price is None else limit_price,
+            )
+            m.triggers[order_id] = changed
+            return {"order_id": order_id, "fills": [], "resting": False}
+        if trigger_price is not None or limit_price is not None:
+            raise ClearinghouseError("only a trigger order has a trigger or limit price")
+        meta = m.orders.get(order_id)
+        order = m.book.get_order(order_id)
+        if meta is None or meta.owner != owner or order is None or not order.is_active:
+            raise ClearinghouseError(f"no open order {order_id} for this account")
+        size = order.remaining if size is None else Decimal(str(size))
+        price = order.price if price is None else Decimal(str(price))
+        if size <= 0 or price <= 0:
+            raise ClearinghouseError("size and price must be positive")
+        self._check_grid(m, size, price, meta.reduce_only)
+        if price == order.price and size < order.remaining:
+            m.book.reduce_order(order_id, order.filled + size, caller=owner)
+            return {"order_id": order_id, "fills": [], "resting": True}
         m.book.cancel_order(order_id, caller=owner)
         self._prune_orders(m, [order_id])
+        fills = self._place(
+            owner,
+            market_id,
+            new_id,
+            order.side.value,
+            size,
+            price,
+            0,
+            reduce_only=meta.reduce_only,
+            tif="alo" if order.tif == "alo" else "gtc",
+            hidden=order.hidden,
+            display_size=order.display_size if order.display_size < size else ZERO,
+            max_makers=max_makers,
+        )
+        self._trim_touched()
+        self.last_cancelled = self._cancelled
+        return {"order_id": new_id, "fills": fills, "resting": new_id in m.orders}
+
+    @_mutator
+    @_pinned
+    def protocol_ioc(
+        self,
+        owner: str,
+        market_id: str,
+        order_id: str,
+        side: str,
+        size,
+        price,
+        *,
+        reduce_only: bool,
+        max_makers: int,
+    ) -> Tuple[List[dict], List[dict]]:
+        """An immediate-or-cancel order the protocol places for ``owner`` outside any
+        transaction (a TWAP slice): margined and matched as the owner's own, within
+        ``max_makers``; all or nothing. Returns (fills, orders it cancelled); raises
+        ClearinghouseError / ValueError, changing nothing, if it is refused."""
+        self._touched, self._cancelled = set(), []
+        with undo.atomic():
+            self._keep_all()
+            fills = self._place(
+                owner,
+                market_id,
+                order_id,
+                side,
+                size,
+                price,
+                0,
+                reduce_only=reduce_only,
+                tif="ioc",
+                max_makers=max_makers,
+                protocol=True,
+            )
+            self._trim_touched()
+        return fills, list(self._cancelled)
+
+    # ------------------------------------------------------------------ market liquidity
+
+    def _quote_markets(self, now: Decimal) -> List[dict]:
+        """The block's re-quotes of markets' liquidity vaults (see MARKET_MAKER_*): those due —
+        the longest unquoted first — at most MARKET_MAKER_MARKETS_PER_BLOCK."""
+        if not len(self.user_vaults):
+            return []
+        due = []
+        for vault, v in sorted(self.user_vaults.peek_items()):
+            m = self.markets.get(v.managed) if v.managed else None
+            if m is None or m.settled_price > 0:
+                continue
+            moved = (
+                m.mm_mark > 0
+                and m.mark_price > 0
+                and abs(m.mark_price - m.mm_mark) / m.mm_mark >= MARKET_MAKER_REQUOTE_MOVE
+            )
+            if moved or now - m.mm_time >= MARKET_MAKER_REQUOTE_SECONDS:
+                due.append((m.mm_time, m.id, vault))
+        events = []
+        for _t, mid, vault in sorted(due)[:MARKET_MAKER_MARKETS_PER_BLOCK]:
+            events.append(self._quote(self.markets[mid], vault, now))
+        return events
+
+    def _quote(self, m: Market, vault: str, now: Decimal) -> dict:
+        """Cancel the vault's quotes on ``m`` and post the ladder for the mark now."""
+        from .. import constants
+
+        mine = sorted(self._orders_by_owner(m).get(vault, ()))
+        for oid in mine:
+            if tracked(m.orders).peek(oid) is not None:
+                m.book.cancel_order(oid, caller=vault)
+        self._prune_orders(m, mine)
+        m.mm_time, m.mm_mark = now, m.mark_price
+        stale = (
+            m.oracle_time > 0 and now - m.oracle_time > constants.PERP_ORACLE_STALE_SECONDS
+        ) or self.halted(m)
+        equity = self.cross_equity(vault)
+        event: Dict[str, Any] = {"type": "market_quotes", "market": m.id, "vault": vault}
+        if stale or m.mark_price <= 0 or equity <= 0:
+            return {**event, "levels": 0, "reason": "stale oracle" if stale else "no price"}
+        acct = self.accounts.peek(vault)
+        pos = acct.positions.get(m.id) if acct is not None else None
+        held = (pos.size if pos is not None else ZERO) * m.mark_price
+        limit = equity * MARKET_MAKER_MAX_INVENTORY
+        scale = {
+            "buy": max(ZERO, 1 - max(ZERO, held) / limit),
+            "sell": max(ZERO, 1 - max(ZERO, -held) / limit),
+        }
+        per_level = equity * MARKET_MAKER_DEPTH / MARKET_MAKER_LEVELS
+        placed = 0
+        for side in ("buy", "sell"):
+            for i in range(MARKET_MAKER_LEVELS):
+                offset = MARKET_MAKER_SPREAD + i * MARKET_MAKER_STEP
+                if side == "buy":
+                    price = (m.mark_price * (1 - offset)).quantize(
+                        ENTRY_QUANTUM, rounding=ROUND_FLOOR
+                    )
+                else:
+                    price = (m.mark_price * (1 + offset)).quantize(
+                        ENTRY_QUANTUM, rounding=ROUND_CEILING
+                    )
+                size = (per_level * scale[side] / price).quantize(
+                    AMOUNT_QUANTUM, rounding=ROUND_DOWN
+                )
+                if size <= m.book.min_order_size:
+                    continue
+                try:
+                    with undo.atomic():
+                        self._keep_all()
+                        self._place(
+                            vault,
+                            m.id,
+                            f"mm.{side[0]}{i}",
+                            side,
+                            size,
+                            price,
+                            0,
+                            tif="alo",
+                            max_makers=0,
+                            protocol=True,
+                        )
+                    placed += 1
+                except (ClearinghouseError, ValueError):
+                    continue  # it would cross, or the vault cannot carry more: skip the level
+        return {**event, "levels": placed, "equity": str(equity)}
+
+    # ------------------------------------------------------------------ trigger orders
+
+    @_mutator
+    @_pinned
+    def place_trigger(
+        self,
+        owner: str,
+        market_id: str,
+        trigger_id: str,
+        side: str,
+        kind: str,
+        trigger_price,
+        size=ZERO,
+        limit_price=ZERO,
+        reduce_only: bool = False,
+        position: bool = False,
+        tif: str = "gtc",
+        max_makers: int = TRIGGER_DEFAULT_MAKERS,
+        group: str = "",
+        parent: str = "",
+    ) -> Trigger:
+        """A stop (``kind`` "sl") or take-profit ("tp") order: when the mark reaches
+        ``trigger_price`` it is placed as a limit order at ``limit_price`` (``tif``), or as a
+        market order (no limit price: IOC at most TRIGGER_SLIPPAGE through mark). A buy stop
+        and a sell take-profit fire as the mark rises to the trigger, the others as it falls.
+        ``position``: the position's TP/SL — no size; it closes the whole position, whatever
+        it is then, and is cancelled once there is no position on that side to close.
+        Refused if the mark has already reached the trigger (place an order instead)."""
+        self._user(owner)
+        m = self.market(market_id)
+        if m.settled_price > 0:
+            raise ClearinghouseError(f"{market_id} is delisted")
+        if m.mark_price <= 0:
+            raise ClearinghouseError(f"market {market_id} has no price yet")
+        side = str(side).lower()
+        if side in ("long", "bid"):
+            side = "buy"
+        elif side in ("short", "ask"):
+            side = "sell"
+        if side not in ("buy", "sell"):
+            raise ClearinghouseError(f"unknown side {side!r}")
+        kind = {"stop": "sl", "stop_loss": "sl", "take_profit": "tp"}.get(str(kind), str(kind))
+        if kind not in ("sl", "tp"):
+            raise ClearinghouseError("a trigger is a stop (sl) or a take-profit (tp)")
+        if trigger_id in m.triggers or trigger_id in m.orders:
+            raise ClearinghouseError(f"duplicate order id {trigger_id}")
+        if not 1 <= int(max_makers) <= TRIGGER_MAX_MAKERS:
+            raise ClearinghouseError(f"max_makers must be 1 to {TRIGGER_MAX_MAKERS}")
+        if len(self._trigger_index(m)["owners"].get(owner, ())) >= TRIGGERS_PER_ACCOUNT:
+            raise ClearinghouseError(f"at most {TRIGGERS_PER_ACCOUNT} trigger orders per market")
+        if position:
+            if Decimal(str(size or 0)) != 0:
+                raise ClearinghouseError("a position's TP/SL has no size: it closes the position")
+            acct = self.accounts.peek(owner)
+            pos = acct.positions.get(market_id) if acct is not None else None
+            if pos is None or pos.size == 0 or (pos.size > 0) == (side == "buy"):
+                raise ClearinghouseError(f"no position for a {side} to close")
+        tif = str(tif).lower()
+        if tif not in ("gtc", "ioc"):
+            raise ClearinghouseError("a trigger order fires as gtc or ioc")
+        if m.sz_decimals >= 0 or constants.PERP_MIN_ORDER_VALUE:
+            for px in (trigger_price, limit_price):
+                if px is not None and Decimal(str(px)) > 0:
+                    self._check_grid(
+                        m,
+                        ZERO if position else (size or ZERO),
+                        px,
+                        True if position else bool(reduce_only),
+                    )
+        trigger = self._new_trigger(
+            m,
+            Trigger(
+                owner=owner,
+                side=side,
+                kind=kind,
+                trigger_price=ZERO,
+                size=ZERO,
+                limit_price=ZERO,
+                reduce_only=bool(reduce_only) or bool(position),
+                position=bool(position),
+                tif=tif,
+                max_makers=int(max_makers),
+                seq=0,
+                group=str(group),
+                parent=str(parent),
+            ),
+            size=size,
+            trigger_price=trigger_price,
+            limit_price=limit_price,
+        )
+        m.triggers[trigger_id] = trigger
+        return trigger
+
+    def _new_trigger(self, m: Market, t: Trigger, *, size, trigger_price, limit_price) -> Trigger:
+        """``t`` with these prices and size, checked; queued last (a new ``seq``)."""
+        size = Decimal(str(size or 0))
+        trigger_price = Decimal(str(trigger_price))
+        limit_price = Decimal(str(limit_price or 0))
+        if not trigger_price.is_finite() or trigger_price <= 0:
+            raise ClearinghouseError("trigger price must be positive")
+        if not limit_price.is_finite() or limit_price < 0:
+            raise ClearinghouseError("limit price must be positive (or none: a market order)")
+        if not size.is_finite() or (size <= 0 if not t.position else size != 0):
+            raise ClearinghouseError("size must be positive")
+        if trigger_price != t.trigger_price and dataclasses.replace(
+            t, trigger_price=trigger_price
+        ).crossed(m.mark_price):
+            raise ClearinghouseError(
+                f"the mark ({m.mark_price}) has already reached the trigger price"
+            )
+        self.trigger_seq += 1  # placed or changed: queued last
+        return dataclasses.replace(
+            t,
+            trigger_price=trigger_price,
+            size=size,
+            limit_price=limit_price,
+            seq=self.trigger_seq,
+        )
+
+    @staticmethod
+    def _trigger_index(m: Market) -> Dict[str, Any]:
+        """The market's triggers by owner and by trigger price — derived, never committed;
+        kept up to date from the ids marked since (as ``_orders_by_owner``). ``above``: those
+        that fire as the mark rises, ``below``: as it falls; each sorted by (price, seq, id)."""
+        triggers = tracked(m.triggers)
+        index = m.__dict__.get("_trigger_index")
+        if index is None or triggers.__dict__.get("_index_token") is not index["token"]:
+            index = {"token": [], "owners": {}, "keys": {}, "above": [], "below": []}
+            triggers.track_changes()
+            triggers.take_changes()
+            triggers.__dict__["_index_token"] = index["token"]
+            changed: Iterable[str] = list(dict.keys(triggers))
+            m.__dict__["_trigger_index"] = index
+        else:
+            changed = triggers.take_changes()
+        for tid in changed:
+            old = index["keys"].pop(tid, None)
+            if old is not None:
+                owner, above, key = old
+                lst = index["above" if above else "below"]
+                i = bisect.bisect_left(lst, key)
+                if i < len(lst) and lst[i] == key:
+                    del lst[i]
+                index["owners"][owner].discard(tid)
+            t = triggers.peek(tid)
+            if t is not None:
+                key = (t.trigger_price, t.seq, tid)
+                bisect.insort(index["above" if t.fires_above else "below"], key)
+                index["keys"][tid] = (t.owner, t.fires_above, key)
+                index["owners"].setdefault(t.owner, set()).add(tid)
+        return index
+
+    def _crossed_triggers(self, m: Market) -> List[str]:
+        index = self._trigger_index(m)
+        mark = m.mark_price
+        above, below = index["above"], index["below"]
+        hit = [tid for _p, _s, tid in above[: bisect.bisect_right(above, (mark, 1 << 62, "~"))]]
+        hit += [tid for _p, _s, tid in below[bisect.bisect_left(below, (mark, -1, "")) :]]
+        return hit
+
+    def _fire_triggers(self, now: Decimal) -> List[dict]:
+        """Fire the triggers the marks have reached, in priority order (see TRIGGER_SLIPPAGE)
+        and within the block's limits. While a market's oracle is stale only risk-reducing
+        triggers fire, as only reduce-only orders are accepted."""
+        from .. import constants
+
+        stale_after = Decimal(constants.PERP_ORACLE_STALE_SECONDS)
+        queue = []
+        for mid in sorted(self.markets):
+            m = self.markets[mid]
+            if m.mark_price <= 0:
+                continue
+            stale = (m.oracle_time > 0 and now - m.oracle_time > stale_after) or self.halted(m)
+            for tid in self._crossed_triggers(m):
+                t = tracked(m.triggers).peek(tid)
+                if t is None or (stale and not t.reduces):
+                    continue
+                passed = abs(m.mark_price - t.trigger_price) / m.mark_price
+                queue.append(((0 if t.reduces else 1, -passed, t.seq, mid, tid), mid, tid))
+        queue.sort()
+        events: List[dict] = []
+        fired = makers = 0
+        for _key, mid, tid in queue:
+            m = self.markets[mid]
+            t = tracked(m.triggers).peek(tid)
+            if t is None:
+                continue  # cancelled by an earlier one (its position closed)
+            if fired >= TRIGGER_FIRES_PER_BLOCK or makers + t.max_makers > TRIGGER_MAKERS_PER_BLOCK:
+                break
+            fired += 1
+            makers += t.max_makers
+            events.append(self._fire(m, tid, t))
+        return events
+
+    def _fire(self, m: Market, tid: str, t: Trigger) -> dict:
+        """Place a crossed trigger's order for its owner (all or nothing); it is gone either
+        way."""
+        del m.triggers[tid]
+        event: Dict[str, Any] = {"market": m.id, "trigger_id": tid, "owner": t.owner}
+        buy = t.side == "buy"
+        size = t.size
+        if t.reduces:
+            acct = self.accounts.peek(t.owner)
+            pos = acct.positions.get(m.id) if acct is not None else None
+            held = pos.size if pos is not None else ZERO
+            if held == 0 or (held > 0) == buy:
+                return {"type": "trigger_cancelled", **event, "reason": "no position to reduce"}
+            size = abs(held) if t.position else min(size, abs(held))
+        if t.limit_price > 0:
+            price, tif = t.limit_price, t.tif
+        else:
+            through = m.mark_price * (1 + TRIGGER_SLIPPAGE if buy else 1 - TRIGGER_SLIPPAGE)
+            price = through.quantize(ENTRY_QUANTUM, rounding=ROUND_FLOOR if buy else ROUND_CEILING)
+            tif = "ioc"
+        touched, cancelled = set(self._touched), len(self._cancelled)
+        try:
+            with undo.atomic():
+                self._keep_all()
+                fills = self._place(
+                    t.owner,
+                    m.id,
+                    tid,
+                    t.side,
+                    size,
+                    price,
+                    0,
+                    reduce_only=t.reduces,
+                    tif=tif,
+                    max_makers=t.max_makers,
+                    protocol=True,
+                )
+        except Exception as e:  # noqa: BLE001 — deterministic on every node; never fails the block
+            self._touched = touched
+            del self._cancelled[cancelled:]
+            return {"type": "trigger_cancelled", **event, "reason": str(e)}
+        for other in self._group_of(m, t, tid):  # one cancels the other
+            del m.triggers[other]
+            self._cancelled.append(
+                {
+                    "type": "trigger_cancelled",
+                    "market": m.id,
+                    "trigger_id": other,
+                    "owner": t.owner,
+                    "reason": "oco",
+                }
+            )
+        return {
+            "type": "trigger_fired",
+            **event,
+            "side": t.side,
+            "kind": t.kind,
+            "size": str(size),
+            "price": str(price),
+            "fills": fills,
+            "resting": tid in m.orders,
+        }
+
+    def _group_of(self, m: Market, t: Trigger, tid: str) -> List[str]:
+        """The other triggers of ``t``'s one-cancels-the-other group."""
+        if not t.group:
+            return []
+        return [
+            other
+            for other in sorted(self._trigger_index(m)["owners"].get(t.owner, ()))
+            if other != tid and tracked(m.triggers).peek(other).group == t.group
+        ]
+
+    def _children_of(self, m: Market, owner: str, parent: str) -> List[str]:
+        return [
+            tid
+            for tid in sorted(self._trigger_index(m)["owners"].get(owner, ()))
+            if tracked(m.triggers).peek(tid).parent == parent
+        ]
 
     def _prune_orders(self, m: Market, ids: Optional[Iterable[str]] = None) -> None:
         """Drop the metadata of orders no longer resting. ``ids``: the orders the operation
@@ -1122,15 +2661,17 @@ class Clearinghouse:
         free = self.cross_equity(owner) - self.cross_requirement(owner)
         if acct.isolated.get(m.id, False):
             # The new exposure's margin comes out of cross collateral at fill time.
-            need = increase * limit / lev + worst_fee
-            iso_equity = (
-                pos.isolated_margin + self._upnl(m, pos) + worst_pnl + increase * limit / lev
+            moved = initial_margin(m, lev, abs(size + q) * limit) - initial_margin(
+                m, lev, abs(size) * limit
             )
-            if free < need or iso_equity < abs(size + q) * m.mark_price / lev:
+            moved = max(ZERO, moved) if increase > 0 else ZERO
+            need = moved + worst_fee
+            iso_equity = pos.isolated_margin + self._upnl(m, pos) + worst_pnl + moved
+            if free < need or iso_equity < initial_margin(m, lev, abs(size + q) * m.mark_price):
                 raise ClearinghouseError("insufficient margin for the order")
             return
-        current = abs(size) * m.mark_price / lev
-        after = abs(size + q) * m.mark_price / lev
+        current = initial_margin(m, lev, abs(size) * m.mark_price)
+        after = initial_margin(m, lev, abs(size + q) * m.mark_price)
         if free + worst_pnl - worst_fee < after - current:
             raise ClearinghouseError("insufficient margin for the order")
 
@@ -1187,10 +2728,13 @@ class Clearinghouse:
             "buyer": tr.buyer,
             "seller": tr.seller,
             "maker": maker,
+            "maker_order_id": tr.maker_order_id,
+            "taker_order_id": tr.taker_order_id,
             "realized": {},
         }
+        notional = amount * price
         for owner, q in ((tr.buyer, amount), (tr.seller, -amount)):
-            fee = Decimal(str(tr.maker_fee if owner == maker else tr.taker_fee))
+            fee, reward, referrer = self._fee(owner, owner == maker, notional)
             lev = (
                 maker_meta.leverage
                 if owner == maker and maker_meta
@@ -1203,9 +2747,131 @@ class Clearinghouse:
             out["realized"][owner] = str(self._trade_into(owner, m, q, price, lev, margin_price))
             acct = self.accounts[owner]
             acct.collateral -= fee
-            self.account(VAULT).collateral += fee
+            staker = _staker_part(fee - reward)
+            kept = fee - reward - staker
+            if m.deployer and kept > 0 and m.deployer_fee_share > 0:
+                # A deployer market: its deployer's share of what the protocol keeps.
+                share = _q_amount(kept * m.deployer_fee_share)
+                self.account(m.deployer).collateral += share
+                kept -= share
+            self.account(VAULT).collateral += kept
+            if staker > 0:  # leaves the clearinghouse: its records and its holder alike
+                self.holder_balance -= staker
+                self.staker_fees = self.__dict__.get("staker_fees", ZERO) + staker
+            if reward > 0:
+                self.account(referrer).collateral += reward
+            out.setdefault("fees", {})[owner] = str(fee)
+        for owner in (tr.buyer, tr.seller):
+            self._record_volume(owner, notional)
         m.last_trade_price = price
         return out
+
+    # ------------------------------------------------------------------ fees
+
+    def _day(self) -> int:
+        return int(Decimal(str(self.__dict__.get("_now", ZERO))) // 86400)
+
+    @_pinned
+    def volume(self, owner: str) -> Decimal:
+        """``owner``'s perps volume over the last FEE_VOLUME_DAYS days of block time."""
+        first = self._day() - FEE_VOLUME_DAYS + 1
+        return sum((n for day, n in self.volumes.peek(owner, ()) if day >= first), ZERO)
+
+    def fee_rates(self, owner: str) -> Tuple[Decimal, Decimal]:
+        """(taker, maker) for ``owner``'s volume, less its staking discount (a rebate is kept
+        whole)."""
+        volume = self.volume(owner)
+        taker, maker = FEE_TIERS[0][1], FEE_TIERS[0][2]
+        for floor, t, mk in FEE_TIERS:
+            if volume >= floor:
+                taker, maker = t, mk
+        discount = self.stake_discount(owner)
+        if discount > 0:
+            taker = taker * (1 - discount)
+            maker = maker * (1 - discount) if maker > 0 else maker
+        return taker, maker
+
+    def set_stakes(self, staked: Dict[str, Decimal]) -> None:
+        """Each account's QRDX at stake for the block being processed (``stake_discount``)."""
+        self.__dict__["_staked"] = staked
+
+    def stake_discount(self, owner: str) -> Decimal:
+        """Hyperliquid's staking fee discount: the fraction of its fees an account staking QRDX
+        is spared (STAKE_FEE_DISCOUNTS), by its stake — its own validator principal and its
+        delegations' value — as the validator set of the block's parent has it (set each block
+        by the exchange, a function of the chain; never committed, like the oracle committee)."""
+        staked = self.__dict__.get("_staked") or {}
+        amount = staked.get(str(owner).lower(), ZERO)
+        discount = ZERO
+        for floor, d in STAKE_FEE_DISCOUNTS:
+            if amount >= floor:
+                discount = d
+        return discount
+
+    def _fee(self, owner: str, is_maker: bool, notional: Decimal) -> Tuple[Decimal, Decimal, str]:
+        """(fee, referral reward, referrer) for ``owner``'s side of a fill: its tier's rate (a
+        rebate is negative), less a referee's discount; the referrer's share of what is left."""
+        if owner in (VAULT, PROTOCOL):
+            return ZERO, ZERO, ""
+        taker, maker = self.fee_rates(owner)
+        fee = (notional * (maker if is_maker else taker)).quantize(
+            FEE_QUANTUM, rounding=ROUND_HALF_UP
+        )
+        ref = self.referrals.peek(owner)
+        if fee <= 0 or ref is None:
+            return fee, ZERO, ""
+        if ref.volume < REFERRAL_VOLUME_CAP:
+            fee = (fee * (1 - REFEREE_DISCOUNT)).quantize(FEE_QUANTUM, rounding=ROUND_HALF_UP)
+        reward = (fee * REFERRER_SHARE).quantize(FEE_QUANTUM, rounding=ROUND_DOWN)
+        return fee, reward, ref.referrer
+
+    def _record_volume(self, owner: str, notional: Decimal) -> None:
+        if owner in (VAULT, PROTOCOL):
+            return
+        day = self._day()
+        days = [(d, n) for d, n in self.volumes.peek(owner, ()) if d > day - FEE_VOLUME_DAYS]
+        if days and days[-1][0] == day:
+            days[-1] = (day, days[-1][1] + notional)
+        else:
+            days.append((day, notional))
+        self.volumes[owner] = tuple(days)
+        ref = self.referrals.peek(owner)
+        if ref is not None and ref.volume < REFERRAL_VOLUME_CAP:
+            self.referrals[owner] = dataclasses.replace(ref, volume=ref.volume + notional)
+
+    @_mutator
+    def register_referral_code(self, owner: str, code: str) -> None:
+        """``owner`` takes ``code`` (3-16 of a-z, 0-9, _), once, if no one has it."""
+        import re
+
+        self._user(owner)
+        if not re.fullmatch(r"[a-z0-9_]{3,16}", code or ""):
+            raise ClearinghouseError("a referral code is 3 to 16 of a-z, 0-9 and _")
+        if code in self.referral_codes:
+            raise ClearinghouseError(f"the code {code} is taken")
+        if any(o == owner for o in self.referral_codes.peek_values()):
+            raise ClearinghouseError("an account has one referral code")
+        self.referral_codes[code] = owner
+
+    @_mutator
+    @_pinned
+    def join_referral(self, owner: str, code: str) -> str:
+        """``owner`` joins ``code``'s referrer, once, before REFERRAL_JOIN_MAX_VOLUME of
+        volume. Returns the referrer."""
+        self._user(owner)
+        referrer = self.referral_codes.peek(code)
+        if referrer is None:
+            raise ClearinghouseError(f"no referral code {code}")
+        if referrer == owner:
+            raise ClearinghouseError("an account does not refer itself")
+        if owner in self.referrals:
+            raise ClearinghouseError("the account has already joined a referrer")
+        if self.volume(owner) >= REFERRAL_JOIN_MAX_VOLUME:
+            raise ClearinghouseError(
+                f"an account joins a referrer before {REFERRAL_JOIN_MAX_VOLUME} of volume"
+            )
+        self.referrals[owner] = Referral(referrer=referrer, volume=ZERO)
+        return referrer
 
     def _trade_into(
         self, owner: str, m: Market, q: Decimal, price: Decimal, lev: Decimal, margin_price: Decimal
@@ -1226,7 +2892,10 @@ class Clearinghouse:
             pos.size = new
             acct.collateral -= exact_basis - pos.basis  # rounding residual (≈1e-18)
             if isolated:
-                moved = _q_amount(abs(q) * margin_price / lev)
+                moved = _q_amount(
+                    initial_margin(m, lev, abs(new) * margin_price)
+                    - initial_margin(m, lev, abs(s) * margin_price)
+                )
                 acct.collateral -= moved
                 pos.isolated_margin += moved
         else:  # reduce, close, or flip
@@ -1251,7 +2920,7 @@ class Clearinghouse:
                 pos.size, pos.entry_price = new, _q_entry(price)
                 acct.collateral -= new * price - pos.basis  # residual (0 unless price unquantized)
                 if isolated:
-                    moved = _q_amount(abs(new) * margin_price / lev)
+                    moved = _q_amount(initial_margin(m, lev, abs(new) * margin_price))
                     acct.collateral -= moved
                     pos.isolated_margin += moved
 
@@ -1354,6 +3023,36 @@ class Clearinghouse:
         )
         if cross and self.cross_equity(owner) < self.cross_maintenance(owner):
             events.append(self._liquidate(owner, cross, isolated=False))
+        elif (
+            not cross
+            and owner != VAULT  # (the backstop itself: nothing behind it to take over)
+            and acct.assets
+            and acct.collateral < 0
+            and self.cross_equity(owner) < 0
+        ):
+            events.append(self._liquidate_debt(owner))
+
+    def _liquidate_debt(self, owner: str) -> dict:
+        """An account with no positions that owes more settlement token than its margin tokens
+        are worth after their haircut: the vault takes the tokens at that value and absorbs
+        what they do not cover (as it would in a backstop takeover)."""
+        eq0 = self.cross_equity(owner)
+        self._seize_assets(owner)
+        acct = self.accounts[owner]
+        if acct.collateral < 0:
+            self.account(VAULT).collateral += acct.collateral
+            acct.collateral = ZERO
+        return {
+            "type": "liquidation",
+            "owner": owner,
+            "markets": [],
+            "mode": "cross",
+            "stage": "assets",
+            "equity": str(eq0),
+            "maintenance": "0",
+            "filled": ZERO,
+            "fills": [],
+        }
 
     # ------------------------------------------------------------------ liquidation index
 
@@ -1393,6 +3092,10 @@ class Clearinghouse:
         """(the account's liquidation prices, whether it must be checked every pass)."""
         if acct is None:
             return [], False
+        if acct.assets and (
+            acct.collateral < 0 or any(p.size != 0 for p in acct.positions.values())
+        ):
+            return [], True  # its margin (or its debt's cover) moves with the tokens' prices
         out: List[Tuple[str, bool, Decimal]] = []
         cross: List[Tuple[str, Position]] = []
         for mid, pos in acct.positions.items():
@@ -1464,6 +3167,8 @@ class Clearinghouse:
             "fills": [],
         }
         self._cancel_orders_of(owner, mids[0] if isolated else None)
+        if not isolated:
+            self._seize_assets(owner)
         for mid in mids:
             fills = self._close_on_book(owner, mid, isolated)
             event["fills"].extend(fills)
@@ -1491,6 +3196,8 @@ class Clearinghouse:
                 if tracked(m.orders).peek(oid) is not None:
                     m.book.cancel_order(oid, caller=owner)
             self._prune_orders(m, mine)
+            for tid in sorted(self._trigger_index(m)["owners"].get(owner, ())):
+                del m.triggers[tid]
 
     def _close_on_book(self, owner: str, mid: str, isolated: bool) -> List[dict]:
         """A reduce-only IOC for the position, limited to the bankruptcy price — the price at
@@ -1752,6 +3459,11 @@ class Clearinghouse:
                 # time priority within each level, stop orders, nonces, last trade
                 "book": m.book.state_digest().hex(),
             }
+            if len(m.triggers):  # absent while there are none (a root unchanged till then)
+                markets[mid]["triggers"] = {
+                    tid: _encode_trigger(tid, t)
+                    for tid, t in sorted(tracked(m.triggers).peek_items())
+                }
         accounts = {}
         for owner in sorted(self.accounts):
             a = self.accounts[owner]
@@ -1760,18 +3472,41 @@ class Clearinghouse:
                 "positions": {mid: p.encode() for mid, p in sorted(a.positions.items())},
                 "leverage": {mid: d(v) for mid, v in sorted(a.leverage.items())},
                 "isolated": dict(sorted(a.isolated.items())),
+                **({"assets": {t: d(v) for t, v in sorted(a.assets.items())}} if a.assets else {}),
             }
         vault = {
             "shares": {o: d(v) for o, v in sorted(self.vault_shares.items())},
             "total_shares": d(self.vault_total_shares),
             "unlock": {o: d(t) for o, t in sorted(self.vault_unlock.items())},
         }
-        return {
+        out = {
             "markets": markets,
             "accounts": accounts,
             "vault": vault,
             "holder": d(self.holder_balance),
         }
+        if self.trigger_seq:
+            out["trigger_seq"] = self.trigger_seq
+        if len(self.user_vaults):
+            out["user_vaults"] = {
+                a: _encode_user_vault(a, v) for a, v in sorted(self.user_vaults.peek_items())
+            }
+            out["vault_holdings"] = {
+                k: _encode_holding(k, h) for k, h in sorted(self.vault_holdings.peek_items())
+            }
+        if len(self.volumes):
+            out["volumes"] = {o: _encode_volume(o, v) for o, v in sorted(self.volumes.peek_items())}
+        if len(self.asset_holdings) or len(self.asset_unwind_time):
+            out["asset_holdings"] = {t: str(v) for t, v in sorted(self.asset_holdings.peek_items())}
+            out["asset_unwind_time"] = {
+                t: str(v) for t, v in sorted(self.asset_unwind_time.peek_items())
+            }
+        if len(self.referral_codes):
+            out["referral_codes"] = dict(sorted(self.referral_codes.peek_items()))
+            out["referrals"] = {
+                o: _encode_referral(o, r) for o, r in sorted(self.referrals.peek_items())
+            }
+        return out
 
     def state_hash(self) -> bytes:
         blob = json.dumps(self.canonical(), sort_keys=True, separators=(",", ":"))
@@ -1787,17 +3522,40 @@ class Clearinghouse:
             sec.value([mid, _market_header(m)])
             sec.raw(tracked(m.orders).commitment())
             sec.raw(m.book.cached_digest())
+            if len(m.triggers):  # absent while there are none (a root unchanged till then)
+                sec.raw(tracked(m.triggers).commitment())
         sec.raw(self.accounts.commitment())
         sec.raw(self.vault_shares.commitment())
         sec.raw(self.vault_unlock.commitment())
         sec.value([str(self.vault_total_shares), str(self.holder_balance)])
+        if self.trigger_seq:
+            sec.value(["trigger_seq", self.trigger_seq])
+        if len(self.user_vaults):  # (nothing until the first user vault)
+            sec.raw(self.user_vaults.commitment())
+            sec.raw(self.vault_holdings.commitment())
+        if len(self.volumes):  # (nothing until the first fill)
+            sec.raw(self.volumes.commitment())
+        if len(self.asset_holdings) or len(self.asset_unwind_time):  # (none until first used)
+            sec.raw(self.asset_holdings.commitment())
+            sec.raw(self.asset_unwind_time.commitment())
+        if len(self.referral_codes):  # (nothing until the first referral code)
+            sec.raw(self.referral_codes.commitment())
+            sec.raw(self.referrals.commitment())
         return sec.digest()
 
     def verify_commitment(self) -> None:
         """Check every incremental part against a from-scratch recomputation."""
         for m in self.markets.values():
             tracked(m.orders).verify()
+            tracked(m.triggers).verify()
             m.book.verify_digest()
         self.accounts.verify()
         self.vault_shares.verify()
         self.vault_unlock.verify()
+        self.user_vaults.verify()
+        self.vault_holdings.verify()
+        self.volumes.verify()
+        self.asset_holdings.verify()
+        self.asset_unwind_time.verify()
+        self.referral_codes.verify()
+        self.referrals.verify()

@@ -60,7 +60,7 @@ def _quiet(ch, start, seconds):
     return start + seconds
 
 
-def test_a_thin_book_squeeze_moves_the_mark_gradually_and_never_past_the_band():
+def test_a_thin_book_squeeze_moves_the_mark_gradually_and_never_past_the_band(no_risk_limits):
     """Two colluding accounts clear the only ask and trade with each other at 45,000, leaving a
     45,000 ask resting: best ask and last trade are both 45,000, so the book median is too."""
     ch = _market_with_book("29990", "30010")
@@ -156,10 +156,17 @@ def test_every_path_ticks_blocks_without_exchange_transactions():
 
     main_src = inspect.getsource(node_main)
     assert main_src.count("_exchange_tick_on_import(") >= 3      # def + sync + REST
-    assert "run_exchange_tick(" in inspect.getsource(p2p)
-    assert "run_exchange_tick(next_height" in inspect.getsource(NI.ValidatorNode._block_production_loop)
-    assert "run_exchange_tick(height" in inspect.getsource(derived_state_rebuild._replay)
-    assert "run_exchange_tick(height" in inspect.getsource(BP.rebuild_exchange_state_from_chain)
+    assert "tick_and_flush(" in inspect.getsource(node_main._exchange_tick_on_import)
+    # Every path ticks through tick_and_flush: the tick, then its ledger moves flushed (a fired
+    # spot trigger or a TWAP slice settles real tokens in the tick).
+    assert "tick_and_flush(" in inspect.getsource(p2p)
+    assert "tick_and_flush(self.db, next_height" in inspect.getsource(
+        NI.ValidatorNode._block_production_loop)
+    assert "tick_and_flush(db, height" in inspect.getsource(derived_state_rebuild._replay)
+    assert "tick_and_flush(" in inspect.getsource(BP.rebuild_exchange_state_from_chain)
+    flush_src = inspect.getsource(BP.tick_and_flush)
+    assert "run_exchange_tick(" in flush_src and "flush_token_balance_deltas(" in flush_src
+    assert "flush_exchange_balance_deltas(" in flush_src
     assert "mgr.clearinghouse.tick(" in inspect.getsource(BP._execute_block_boundary_duties)
 
 

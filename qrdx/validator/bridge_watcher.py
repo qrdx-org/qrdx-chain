@@ -76,6 +76,7 @@ class EvmSource:
     def __init__(self, chain: int, rpc_url: str, lockbox: str, from_block: Optional[int] = None):
         self.chain, self.rpc_url, self.lockbox = int(chain), rpc_url, lockbox.lower()
         self.next_block = from_block
+        self.head: Optional[Dict[str, Any]] = None  # the last finalized block seen
         self._id = 0
 
     def _call(self, method: str, params: List[Any]) -> Any:
@@ -93,7 +94,20 @@ class EvmSource:
         return body.get("result")
 
     def poll(self, assets) -> List[Dict[str, Any]]:
-        finalized = int(self._call("eth_getBlockByNumber", ["finalized", False])["number"], 16)
+        block = self._call("eth_getBlockByNumber", ["finalized", False])
+        finalized = int(block["number"], 16)
+        # The finalized head, for the chain's attested heads (docs/BRIDGE.md "Chain heads") —
+        # never in the way of the deposits: a block without the fields reports no head.
+        try:
+            self.head = {
+                "chain": self.chain,
+                "height": finalized,
+                "hash": str(block["hash"]).lower(),
+                "state_root": str(block["stateRoot"]).lower(),
+                "timestamp": int(block["timestamp"], 16),
+            }
+        except (KeyError, TypeError, ValueError):
+            self.head = None
         if self.next_block is None:
             self.next_block = max(0, finalized - DEFAULT_LOOKBACK)
         out: List[Dict[str, Any]] = []
@@ -174,6 +188,10 @@ class BridgeWatcher:
         while True:
             self.poll_once()
             time.sleep(self.interval)
+
+    def heads(self) -> List[Dict[str, Any]]:
+        """Each source's last finalized block seen (sources that report one)."""
+        return [s.head for s in self.sources if getattr(s, "head", None)]
 
     def outstanding(self, minted, limit: int) -> List[Dict[str, Any]]:
         """Deposits seen and not yet minted (``minted``: the ids the chain has minted), oldest

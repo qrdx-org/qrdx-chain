@@ -92,16 +92,29 @@ async def verify_delegated_spend(
     except Exception:
         return True, ""  # malformed hex is the parser's business, not ours
     if not raw or raw[0] != PQ_TX_TYPE:
-        return True, ""  # legacy envelope cannot delegate
+        return True, ""  # legacy envelope cannot delegate (nor carry a policy: PQ-only)
 
     try:
         tx = decode_pq_tx(raw)
+        signer = tx.sender()
     except Exception:
         return True, ""  # structural failure is the parser's business
+
+    # Account control (docs/ACCOUNT_CONTROL.md): a key its account turned off signs nothing, and
+    # an account a controller is bound to may be spent from by that controller. The policies are
+    # exchange state, applied up to this block's exchange section on every path (each block's
+    # exchange section runs before its EVM section), so every node reaches the same verdict.
+    from ..exchange.state_manager import ExchangeStateManager
+
+    authority = ExchangeStateManager.get_instance().authority
+    if not authority.own_key_enabled(signer):
+        return False, f"{signer[:20]}'s key is turned off by its account policy"
     if not tx.is_delegated():
         return True, ""
 
-    source, signer = tx.spend_from(), tx.sender()
+    source = tx.spend_from()
+    if authority.may_control(source, signer):
+        return True, ""
     try:
         cur = await db.connection.execute(
             "SELECT controller_address FROM system_wallets WHERE LOWER(address) = LOWER(?)",

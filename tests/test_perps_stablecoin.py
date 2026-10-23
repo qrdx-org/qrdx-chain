@@ -150,11 +150,17 @@ async def test_perps_settle_in_the_stablecoin_and_conserve_it(chain):
                               bob.tx(ExchangeOpType.PERP_WITHDRAW, {"amount": str(b_out)})])
     assert all(r.success for r in results), [r.error for r in results]
 
-    # Alice won in USD exactly what Bob lost; the fees stay in the holder (the vault's).
+    # Alice won in USD exactly what Bob lost, less the fees: the vault's stay in the holder, the
+    # stakers' share went to the fee holder in USD (sold for QRDX by the tick, when due).
+    from qrdx.validator.epoch_state import STAKER_FEE_HOLDER
+
     a_gain = await db.get_token_balance(usd, alice.addr) - D(50000)
     b_loss = D(50000) - await db.get_token_balance(usd, bob.addr)
     assert a_gain > D(2900) and b_loss > D(3000)
-    assert b_loss - a_gain == await db.get_token_balance(usd, holder) == ch.vault_collateral
+    stakers = await db.get_token_balance(usd, STAKER_FEE_HOLDER)
+    assert stakers > 0
+    assert b_loss - a_gain == await db.get_token_balance(usd, holder) + stakers
+    assert await db.get_token_balance(usd, holder) == ch.vault_collateral
     assert await _token_total(db, usd) == supply, "the stablecoin was created or destroyed"
     assert await _qrdx_total(db) == qrdx, "perps must not touch native QRDX any more"
     assert ch.identity_gap() == 0

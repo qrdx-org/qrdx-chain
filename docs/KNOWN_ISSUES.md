@@ -195,6 +195,154 @@ replayable.
 
 **To close:** submit `eip155-762.json` and `eip155-7620.json` to ethereum-lists/chains.
 
+## OPEN — New trading features await review of their defaults and an audit
+
+**Severity: medium (process).** docs/TRADING_FEATURES.md, docs/ACCOUNT_CONTROL.md. Built and
+tested, but their economics and limits are starting values: the fee tiers and rebate (perps and
+spot), the referral terms, the trigger and TWAP per-block budgets, the vault profit-share bounds,
+the leader's minimum share and the vault order band, the market-liquidity minimum (10,000), its
+lockup (30 days) and the protocol's quoting (levels, spread, depth, inventory limit). Account
+control (controllers, the own key, multisig signing in exchange and EVM transactions) is
+security-critical and needs the audit first. Portfolio margin is **inert** until `PERP_PORTFOLIO_ASSETS` lists an asset, which needs a
+pricing market, spot liquidity for the vault to sell into and a haircut that covers the time it
+takes. A user-vault leader can still lose depositors' money to a counterparty it controls within
+the 10 % band (as with vaults anywhere). Hidden and iceberg orders hide only from the book's depth:
+their parameters are on the chain. All of it needs
+the soak and external audit the rest of the exchange does. New op types and state need a fresh
+genesis (or a fork that activates them).
+
+The consensus features of docs/CONSENSUS_ROADMAP.md add starting values too: the price band
+(20 %), the circuit breaker (10 % in 300 s, 60 s cooldown), the open-interest multiple (50 × the
+liquidity vault's equity) and floor (0), the leverage tiers (1M / 10M), the oracle's minimum
+voters (3), step bound (5 % a second) and outlier band (2 %), the stakers' fee share (20 %) and
+its conversion (once a minute a token, 2 % under a 10-minute TWAP), the guardian limits (7,
+recovery delay 1–30 days, default 7) and QNS's price (10 QRDX a year). Frequent batch auctions
+(fair ordering step 2) were skipped (decision of 2026-10-22). Social recovery and agent
+spending limits are account control: audit first.
+
+The Hyperliquid-parity features (docs/HYPERLIQUID_PARITY.md) add their own:
+- **Dead man's switch:** at least 5 s ahead, 10 fires per account per day, 50 accounts per block.
+- **Builder fees:** capped at 0.1 % perps and 1 % spot.
+- **Order grid:** 4 size decimals, 5 significant figures, a minimum order of 10.
+- **Staking fee discounts:** 5 % at 10 QRDX staked up to 40 % at 500,000.
+- **Contract actions:** 25,000 EVM gas each plus 1 per 10 exchange gas, at most 2,000,000
+  exchange gas, 256 run per block.
+- **Deployer markets:** a 100,000 QRDX bond, 14-day unbonding, 10 markets per deployer, a fee
+  share of at most 50 %, an oracle step of 1 % a second (10 s at most per update), a freeze at
+  more than 2/3 of stake for one vote window.
+
+Deployer markets put a deployer's oracle in charge of real positions. The bounds, the circuit
+breaker, the validators' freeze and the slashable bond limit the damage, and they need the
+audit too.
+
+## FIXED — Trading state outside the exchange root when only newer collections held entries
+
+The exchange root takes the trading state (`TradingState`) only once it is `touched`. That
+flag looked only at the trigger/TWAP counter, agents and sub-accounts. An account whose only
+trading state was a scheduled cancel, a builder approval or (now) a contract's queued action
+left all of it out of `exchange_state_root`.
+
+Its proof leaves were still in the proof root, which is part of the signed unified root, so no
+node could have held different state under one root. But the exchange root alone did not bind
+it.
+
+Found while building contract actions (docs/HYPERLIQUID_PARITY.md 7). `touched` now covers every
+collection the trading state commits, and the pre-incremental serialization covers them too.
+Test: `tests/test_evm_exchange.py` (a queued action changes the root).
+
+## FIXED — Blocks were judged by their slot where their height was meant
+
+A PoS block's signed `number` is its **slot** (the proposer sets `number=slot`), which runs ahead
+of its height after any skipped slot — by 24 within minutes on a 4-node testnet with one node
+restarted. Several importer checks read it as the height: the E-D4 unified-root check chose each
+domain's rules by it (`_verify_unified_state_root`), proposer eligibility judged the block on the
+chain ending at `number − 1` instead of its parent, and RANDAO selection's activation was decided
+by it — while the proposer decides by height. Every rule so far is a genesis feature, so nothing
+diverged yet; at a height-gated fork, importers would have switched rules up to (slot − height)
+blocks before the proposer and refused its blocks. It surfaced in a live run as state-proof roots
+filed under slot numbers on importers (`state_root_parts`). Every import path now passes the
+height it applies the block at; otherwise it is the parent's stored height + 1
+(`block_verification.block_height_of`). Tests: `tests/test_protocol_upgrade_activation.py`
+(`…by_its_height_never_its_slot`), `tests/test_sync_ed4_enforcement.py` (`…not_its_slot`). (The
+RANDAO *reveal* requirement is keyed by the slot on both sides — consistent, and a reveal is
+required whenever height-based selection needs one, since slot ≥ height.)
+
+## FIXED — A restarted node credited staker fee payouts from nothing
+
+Fee payouts are paid out of the fee holder (`withdrawals._payout_moves`), but the derived-state
+rebuild — a restart, a reorg's replay — re-applied every staking payout as a plain credit: the
+holder kept the income it had paid out, and a `fee_pooled` row (addressed to the holder) was even
+credited to it. A node restarted after its first epoch of fee income computed an account root no
+block carried, and stalled. Found in a live 4-node run (restart of one node); the rebuild now
+applies the same moves as the forward path. Tests: `tests/test_interleaved_rebuild_equivalence.py`
+(`test_fee_payouts_rebuild_like_forward`, and a sensitivity test showing the old replay diverges).
+
+## FIXED — An agent's orders were refused once its owner's nonce passed the agent's lane
+
+Exchange transactions are numbered per nonce lane (the account's own, and one per agent, master
+or leader signing for it), but a spot or perps order also carried its transaction's nonce into
+the book's own per-owner check, which wants it strictly increasing across all of the owner's
+orders. Once the owner had placed more orders than its agent (or the reverse), the other's next
+order failed "Nonce replay". An order signed in another lane now carries 0 into the book, which
+it does not check — the lane's nonce already refuses a replay. Test:
+`tests/test_recovery_and_agent_limits.py` (`…in_any_interleaving`, which fails on the old code).
+
+## FIXED — Each account-balance write scanned the account table
+
+`DatabaseSQLite.apply_account_balance_delta` finds the row with `WHERE LOWER(address) =
+LOWER(?)` (case-insensitive: genesis may store a checksummed address), which could not use the
+primary key: every balance write was a full scan of `account_state` — ~1.4 ms a write at 20,000
+accounts, growing with the state, in the block path. An index on `LOWER(address)` serves the
+same query: same rows, same semantics, a lookup. Test: `tests/test_state_proofs.py`
+(`…finds_its_row_by_index`).
+
+## FIXED — A block at an orphan's height could inherit the orphan's staker fee income
+
+Each block logs the stakers' fee income it took in (`staker_fee_income`), and the epoch
+transition shares it. The log was written only for blocks that took something in, and cut above
+the tip only after the reorg's rebuild (and only with the deposit-undo gate on): a block of the
+new branch at an orphan's height that took in nothing left the orphan's row in place, paying
+stakers fees that never happened. Every path now writes each block's row — removing it for
+nothing. Test: `tests/test_staker_fees.py` (`…clears_an_orphans_row…`).
+
+## FIXED — The state-proof tree missed rows written without its triggers
+
+The tree is kept from TEMP triggers on the node's own connection; a row written by another
+connection (a tool) never reached it, and that node's proof root — so its state root — would
+disagree with the network's. The LtHash accumulators already repaired themselves at startup in
+that case; now a domain they repair makes the tree rebuild itself from the rows (a deleted row's
+leaf included). Test: `tests/test_state_proofs.py` (`…without_the_triggers…`, which fails with
+the repair disabled).
+
+## FIXED — An order-book swap swept any number of resting orders for its base gas
+
+A `SWAP` routed through an order book visited every maker its size reached for SWAP's flat 65,000
+gas — the cost PLACE_ORDER and PERP_ORDER stopped paying when matching was metered
+(docs/BLOCK_LIMITS.md). Now the router quotes the book within what the gas limit pays for at
+`EXCHANGE_GAS_PER_MAKER` a resting order, executes on exactly that budget, and the swap pays for
+the visits. Likewise an order that fails after matching (fill-or-kill, a settlement it cannot
+cover) pays for what it visited, not only its base gas. Tests: `tests/test_trading_ops.py`.
+
+## FIXED — A perp order that could not rest kept its makers' fills without the trades
+
+A `PERP_ORDER` that matched and then could not rest its remainder (the account already rested
+the most a book allows) raised after the book had filled the makers: the makers lost their orders
+and got no position. Every exchange operation now runs in an undo scope (`qrdx/exchange/undo.py`)
+and changes nothing if it fails; the same mechanism made spot orders stop deep-copying their whole
+book before matching. Tests: `tests/test_undo_scopes.py` (random books, clearinghouses and nested
+scopes rolled back field for field, then behaving identically to a twin).
+
+## FIXED — The tick's ledger moves were dropped in blocks without exchange transactions
+
+New tick-time work settles real tokens (a fired spot trigger, a spot TWAP slice, the vault's
+sale of margin tokens). A block that carries exchange transactions flushes its section's deltas,
+the tick's included; one that carries none ticked through `run_exchange_tick` and flushed
+nothing, so those moves would have vanished at the next block. Every path now ticks such a block
+through `block_processor.tick_and_flush`. Test: `tests/test_trading_ops.py`
+(`…reaches_the_ledger`). Tick-time debits are covered by the protocol's own records (a book's
+escrow, a pool's reserves), never by a balance loaded for the block — the tick runs on blocks for
+which none is loaded, so a check of one would judge the same move differently on different paths.
+
 ## FIXED — A block's body was not signed, and its hash was taken as sent
 
 **Severity: critical (consensus).** The proposer signed only header fields: number, parent hash,
@@ -536,15 +684,16 @@ day. Going lower needs one of two choices:
 - **Produce no block for an empty slot.** Inclusion latency is unchanged, but votes, oracle
   updates and exchange ticks would have to ride the next block, or a periodic one.
 
-## OPEN — An EVM precompile reads a node-local table
+## FIXED — An EVM precompile read a node-local table
 
-**Severity: low (latent).** The QRDX fork's `getChainState` precompile (0x0200,
-`py-evm/eth/vm/forks/qrdx/precompiles.py`) answers from `_oracle_chain_states`, a module-level
-dictionary, and `oracle_set_chain_state` writes it. Nothing in the node writes it, only a test,
-so in production it answers zeros on every node, deterministically. Anything that ever filled it
-from a node's own observations would make contracts see different values on different nodes: a
-split. **To close:** answer from consensus state (the bridge's attested chain heads), or make the
-precompile revert.
+The QRDX fork's `getChainState` precompile (0x0200, `py-evm/eth/vm/forks/qrdx/precompiles.py`)
+answered from `_oracle_chain_states`, a module-level dictionary. Nothing in the node wrote it, so
+it answered zeros everywhere — but anything that ever filled it from a node's own observations
+would have made contracts see different values on different nodes: a split. Validators now attest
+each bridged chain's finalized head in their oracle votes (two thirds of the stake, heads only
+forward: docs/BRIDGE.md "Chain heads"), and the node's EVM answers 0x0200 from that consensus
+state, ahead of the fork's table (`evm_world.chain_state_precompile`). Test:
+`tests/test_chain_heads.py` (the table is filled with a node's own view, and ignored).
 
 ## ACCEPTED — Oracle reporters are trusted (development override only)
 

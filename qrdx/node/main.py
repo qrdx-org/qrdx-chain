@@ -1243,11 +1243,30 @@ rpc_server.register_module(perp_rpc_module)
 market_rpc_module = MarketModule()
 market_rpc_module.context = _ExchangeRPCContext()
 rpc_server.register_module(market_rpc_module)
+from qrdx.rpc.modules.exchange import AccountModule, QnsModule
+
+account_rpc_module = AccountModule()
+account_rpc_module.context = _ExchangeRPCContext()
+rpc_server.register_module(account_rpc_module)
+qns_rpc_module = QnsModule()
+qns_rpc_module.context = _ExchangeRPCContext()
+rpc_server.register_module(qns_rpc_module)
 from qrdx.rpc.modules.history import HistoryModule
 
 history_rpc_module = HistoryModule()
 history_rpc_module.context = _ExchangeRPCContext()
 rpc_server.register_module(history_rpc_module)
+from qrdx.rpc.modules.history import TradingHistoryModule
+
+trading_history_rpc_module = TradingHistoryModule()
+trading_history_rpc_module.context = _ExchangeRPCContext()
+rpc_server.register_module(trading_history_rpc_module)
+# State proofs against signed state roots (state_*, docs/STATE_PROOFS.md).
+from qrdx.rpc.modules.state import StateModule
+
+state_rpc_module = StateModule()
+state_rpc_module.context = _ExchangeRPCContext()
+rpc_server.register_module(state_rpc_module)
 # On-chain governance reads (governance_*); its writes are exchange transactions.
 from qrdx.rpc.modules.governance import GovernanceModule
 
@@ -1795,11 +1814,11 @@ async def _exchange_tick_on_import(block_height, block_timestamp) -> None:
     if not block_height or int(block_height) < 1:
         return
     try:
-        from ..exchange.block_processor import ensure_oracle_committee, run_exchange_tick
+        from ..exchange.block_processor import ensure_oracle_committee, tick_and_flush
         from ..exchange.state_manager import ExchangeStateManager
 
         await ensure_oracle_committee(db, ExchangeStateManager.get_instance(), int(block_height))
-        run_exchange_tick(int(block_height), float(block_timestamp or 0))
+        await tick_and_flush(db, int(block_height), float(block_timestamp or 0))
     except Exception as e:
         logger.error(f"exchange tick failed at block {block_height}: {e}")
 
@@ -2024,6 +2043,60 @@ async def _verify_trusted_checkpoints() -> None:
         )
 
 
+async def _eth_call(evm_executor, call_params: dict) -> str:
+    """eth_call against the latest state, in the latest block's context (its number and
+    timestamp, as geth does), with the call's ``value`` — a payable call is simulated as sent,
+    so the caller must hold it, as with geth — and its ``gas`` (at most the block gas limit).
+    Nothing is written. The value used to be dropped: every payable call ran as if it sent
+    nothing."""
+    from eth_utils import decode_hex, encode_hex, to_canonical_address
+
+    from ..contracts.evm_world import EvmWorld, run as run_evm
+    from ..contracts.native_token_evm import TokenWorld
+
+    def _quantity(raw, default):
+        if raw is None or raw == "":
+            return default
+        if isinstance(raw, int):
+            return raw
+        text = str(raw)
+        return int(text, 16) if text.lower().startswith("0x") else int(text)
+
+    sender_hex = call_params.get("from") or "0x" + "0" * 40
+    to_hex = call_params["to"]
+    data_hex = call_params.get("data", call_params.get("input", "0x")) or "0x"
+    sender = to_canonical_address(sender_hex)
+    to = to_canonical_address(to_hex)
+    data = decode_hex(data_hex)
+    value = _quantity(call_params.get("value"), 0)
+    gas = _quantity(call_params.get("gas"), None)
+    if value < 0 or (gas is not None and gas <= 0):
+        raise Exception("Call failed: value and gas must be positive quantities")
+
+    # The state is loaded on demand, native tokens included (their precompile answers ERC-20
+    # calls at the token's address).
+    tip = (await db.get_next_block_id()) - 1
+    tip_block = await db.get_block_by_id(tip) if tip >= 0 else None
+    world = EvmWorld(evm_executor.state_manager, tokens=TokenWorld(db))
+    result = await run_evm(
+        world,
+        lambda: evm_executor.call(
+            sender=sender,
+            to=to,
+            data=data,
+            value=value,
+            gas=gas,
+            block_number=max(tip, 1),
+            timestamp=_evm_block_timestamp((tip_block or {}).get("timestamp")),
+            world=world,
+        ),
+        preload=[sender, to],
+    )
+    if not result.success:
+        raise Exception(f"Call failed: {result.error}")
+    return encode_hex(result.output)
+
+
 def _warn_slow_crypto() -> None:
     """Without coincurve (a release dependency), eth-keys recovers each EVM transaction's sender
     in pure Python — ~15 ms instead of ~0.1 ms — and this node falls behind any block carrying
@@ -2106,7 +2179,7 @@ async def _verify_chain_rules(
 
 
 async def _verify_unified_state_root(
-    block_content, enforce: Optional[bool] = None
+    block_content, enforce: Optional[bool] = None, height: Optional[int] = None
 ) -> Tuple[bool, str]:
     """
     E-D4: recompute the post-block unified state root (UTXO + account + exchange)
@@ -2127,12 +2200,18 @@ async def _verify_unified_state_root(
     try:
         bc = _parse_block_content(block_content)
         declared = bc.get("state_root")
-        # Each domain's root is judged under the rule of this block's height.
-        height: Optional[int] = int(bc["number"]) if bc.get("number") is not None else None
     except Exception:
         return True, ""  # malformed content is the proposer-sig check's job
     if not declared:
         return True, ""
+    # Each domain's root is judged under the rule of this block's HEIGHT — given by the applying
+    # path, else its parent's + 1. Never its signed ``number``: that is its slot, ahead of the
+    # height after any skipped slot, so a height-gated fork would switch here before the
+    # proposer did (and the state-proof roots were filed under the wrong height).
+    if height is None:
+        from ..validator.block_verification import block_height_of
+
+        height = await block_height_of(db, bc)
 
     try:
         utxo_root = await db.get_unspent_outputs_hash(height)
@@ -2153,9 +2232,38 @@ async def _verify_unified_state_root(
     except Exception:
         token_root = "0" * 128
 
+    # The state-proof tree's root (qrdx/state_proofs.py), once its feature is in force.
+    from .. import state_proofs
+
+    proof_root = None
+    if height is not None and state_proofs.scheduled():
+        # The exchange tree beside the database tree (qrdx/exchange/proofs.py), at the same
+        # point as the exchange root.
+        try:
+            from ..exchange.state_manager import ExchangeStateManager
+
+            xroot = ExchangeStateManager.get_instance().exchange_proof_root(height)
+        except Exception as e:
+            logger.error(f"exchange proof tree failed at block {height}: {e}")
+            return False, f"exchange proof tree: {e}"
+        proof_root = await state_proofs.proof_root(db, height, xroot)
+        await state_proofs.record_parts(
+            db,
+            height,
+            {
+                "utxo": utxo_root or "0" * 64,
+                "account": account_root,
+                "exchange": exchange_root,
+                "token": token_root,
+                "proof": proof_root,
+                "xtree": xroot.hex(),
+            },
+        )
     # Token domain bound at the live token-ledger root — token state is now a
     # consensus object that converges across nodes (Phase E spot inc4/inc4b).
-    computed = unified_state_root(utxo_root or "0" * 64, account_root, exchange_root, token_root)
+    computed = unified_state_root(
+        utxo_root or "0" * 64, account_root, exchange_root, token_root, proof_root
+    )
     if computed != declared:
         msg = (
             f"unified state root mismatch: declared {str(declared)[:16]}..., "
@@ -3740,6 +3848,7 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
             db,
             block_content,
             enforce=_ENFORCE_PROPOSER_ELIGIBILITY,
+            height=int(block_height),
         )
         if not ok_elig:
             logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {elig_err}")
@@ -3840,7 +3949,7 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
                 final_h = await finalized_block_height(db)
                 at_finalized = final_h is not None and final_h >= 0 and block_height <= final_h
                 ok_ed4, verr_ed4 = await _verify_unified_state_root(
-                    block_content, enforce=_sync_ed4_enforced(at_finalized)
+                    block_content, enforce=_sync_ed4_enforced(at_finalized), height=block_height
                 )
                 if not ok_ed4:
                     logger.warning(f"[SYNC] Rejecting block {block_height}: E-D4 {verr_ed4}")
@@ -5402,6 +5511,25 @@ async def startup():
             logger.info("✅ Transaction indexer scheduled")
         except Exception as e:
             logger.warning(f"Could not start the transaction indexer: {e}")
+    # Trading history (qrdx/trading_history.py): the journal's trades, order events, funding and
+    # market samples, written to the database behind the tip. QRDX_TRADING_HISTORY=0: off (the
+    # journal then drops the oldest waiting blocks past its limit).
+    if os.getenv("QRDX_TRADING_HISTORY", "1").strip().lower() not in ("0", "false", "no", "off"):
+        try:
+            from qrdx.exchange import ExchangeStateManager
+            from qrdx.trading_history import history_poller
+
+            app.state.trading_history_task = asyncio.create_task(
+                history_poller(
+                    lambda: db,
+                    block_processing_lock,
+                    get_journal=lambda: ExchangeStateManager.get_instance().journal,
+                    interval=1.0,
+                )
+            )
+            logger.info("✅ Trading history indexer scheduled")
+        except Exception as e:
+            logger.warning(f"Could not start the trading history indexer: {e}")
 
     # ---- Wire module-level RPC server into app.state ----
     app.state.dht_rpc_module = dht_rpc_module
@@ -5498,47 +5626,11 @@ async def startup():
             # eth_sendRawTransaction — the one write path, through the mempool and a block.
 
             async def eth_call_handler(call_params, block_number="latest"):
-                """Read-only contract call. Takes the standard ``[transaction, block]`` params —
-                it used to accept the transaction alone, so every web3 client's eth_call (which
-                always sends the block tag) failed with an internal error. Calls run against
-                the latest state."""
-                from eth_utils import decode_hex, encode_hex, to_canonical_address
-
-                sender_hex = call_params.get("from", "0x" + "0" * 40)
-                to_hex = call_params["to"]
-                data_hex = call_params.get("data", "0x")
-
-                sender = to_canonical_address(sender_hex)
-                to = to_canonical_address(to_hex)
-                data = decode_hex(data_hex)
-
-                # "latest" semantics: the tip block's number and timestamp, as geth does. The
-                # state is loaded on demand, native tokens included (their precompile answers
-                # ERC-20 calls at the token's address); nothing is written.
-                from ..contracts.evm_world import EvmWorld, run as run_evm
-                from ..contracts.native_token_evm import TokenWorld
-
-                tip = (await db.get_next_block_id()) - 1
-                tip_block = await db.get_block_by_id(tip) if tip >= 0 else None
-                world = EvmWorld(evm_executor.state_manager, tokens=TokenWorld(db))
-                result = await run_evm(
-                    world,
-                    lambda: evm_executor.call(
-                        sender=sender,
-                        to=to,
-                        data=data,
-                        value=0,
-                        block_number=max(tip, 1),
-                        timestamp=_evm_block_timestamp((tip_block or {}).get("timestamp")),
-                        world=world,
-                    ),
-                    preload=[sender, to],
-                )
-
-                if not result.success:
-                    raise Exception(f"Call failed: {result.error}")
-
-                return encode_hex(result.output)
+                """Read-only contract call (``_eth_call``). Takes the standard
+                ``[transaction, block]`` params — it used to accept the transaction alone, so
+                every web3 client's eth_call (which always sends the block tag) failed with an
+                internal error."""
+                return await _eth_call(evm_executor, call_params)
 
             async def eth_sendRawTransaction_handler(raw_tx_hex, _propagated=False):
                 """
@@ -6373,7 +6465,18 @@ async def get_unified_state_root():
         account_root = await db.get_account_state_root(tip)
         exchange_root = ExchangeStateManager.get_instance().compute_state_root()
         token_root = await db.get_token_balances_root(tip)
-        root = unified_state_root(utxo_root, account_root, exchange_root, token_root)
+        from qrdx import state_proofs
+
+        cur = (
+            await db.connection.execute(
+                "SELECT proof FROM state_root_parts WHERE height = ?", (tip,)
+            )
+            if state_proofs.scheduled()
+            else None
+        )
+        row = await cur.fetchone() if cur is not None else None
+        proof_root = row[0] if row is not None else None
+        root = unified_state_root(utxo_root, account_root, exchange_root, token_root, proof_root)
         return {
             "ok": True,
             "result": {
@@ -6382,6 +6485,7 @@ async def get_unified_state_root():
                 "account_root": account_root,
                 "exchange_root": exchange_root,
                 "token_root": token_root,
+                "proof_root": proof_root,
                 "token_root_bound": True,
                 "enforced": False,
             },
@@ -6624,6 +6728,7 @@ async def submit_block(
                 db,
                 block_content,
                 enforce=_ENFORCE_PROPOSER_ELIGIBILITY,
+                height=int(block_no),
             )
             if not ok_elig:
                 await security.reputation_manager.record_violation(
@@ -6713,7 +6818,7 @@ async def submit_block(
                 await _apply_block_withdrawals_on_import(block_no, _efb(body))
 
                 # E-D4: verify the recomputed unified state root against the signed root.
-                ok_root, root_err = await _verify_unified_state_root(block_content)
+                ok_root, root_err = await _verify_unified_state_root(block_content, height=block_no)
                 if not ok_root:
                     await security.reputation_manager.record_violation(
                         verified_sender, "invalid_state_root", severity=8

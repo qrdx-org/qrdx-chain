@@ -42,6 +42,7 @@ from enum import Enum
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from ..crypto import lthash
+from . import undo
 from .commitment import CommittedDict, _apply, _vector, as_committed_dict, encode_value
 
 logger = logging.getLogger(__name__)
@@ -130,10 +131,37 @@ class Order:
     signature: bytes = b""  # Dilithium signature
     nonce: int = 0  # replay protection — must increase per owner
     expire_time: float = 0.0  # 0 = GTC; else unix timestamp
+    # Time in force: "gtc" rests what it does not fill; "ioc" cancels it; "fok" fills whole or
+    # not at all (the operation fails); "alo" (post-only) never takes — refused if it would match.
+    tif: str = "gtc"
+    # Hidden: matches like any order but shows nothing in the book's depth. Iceberg
+    # (``display_size``): shows a slice of ``display_size`` at a time (``shown`` is what is left
+    # of it); the rest is hidden. Neither is private: the order's parameters are on the chain.
+    hidden: bool = False
+    display_size: Decimal = ZERO
+    shown: Decimal = ZERO
 
     @property
     def remaining(self) -> Decimal:
         return self.amount - self.filled
+
+    @property
+    def is_iceberg(self) -> bool:
+        return self.display_size > 0
+
+    @property
+    def visible(self) -> Decimal:
+        """What the order shows: nothing if hidden, the slice left if an iceberg."""
+        if self.hidden:
+            return ZERO
+        if self.is_iceberg:
+            return min(self.shown, self.remaining)
+        return self.remaining
+
+    @property
+    def reserve(self) -> Decimal:
+        """What it holds back: all of a hidden order, an iceberg's undisplayed rest."""
+        return self.remaining - self.visible
 
     @property
     def is_active(self) -> bool:
@@ -142,6 +170,15 @@ class Order:
     def expired(self, now: Optional[float]) -> bool:
         """Past its expiry at block time ``now`` (None — no block yet — expires nothing)."""
         return self.expire_time > 0 and now is not None and now > self.expire_time
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "Order":
+        # Every field is an immutable value: a field-for-field copy is a deep one. Registered in
+        # ``memo`` so an order reached through its price level and through the book's index is
+        # copied once (undo scopes rely on it).
+        new = Order.__new__(Order)
+        new.__dict__.update(self.__dict__)
+        memo[id(self)] = new
+        return new
 
 
 @dataclass
@@ -175,7 +212,13 @@ class PriceLevel:
 
     @property
     def total_amount(self) -> Decimal:
+        """Everything resting at the level, hidden quantities included."""
         return sum((o.remaining for o in self.orders if o.is_active), ZERO)
+
+    @property
+    def visible_amount(self) -> Decimal:
+        """What the level shows: hidden orders and icebergs' reserves left out."""
+        return sum((o.visible for o in self.orders if o.is_active), ZERO)
 
     def add_order(self, order: Order) -> None:
         self.orders.append(order)
@@ -185,6 +228,13 @@ class PriceLevel:
             if o.id == order_id:
                 return self.orders.pop(i)
         return None
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "PriceLevel":
+        new = PriceLevel.__new__(PriceLevel)
+        new.__dict__.update(self.__dict__)
+        new.orders = [copy.deepcopy(o, memo) for o in self.orders]
+        memo[id(self)] = new
+        return new
 
 
 # ---------------------------------------------------------------------------
@@ -304,15 +354,28 @@ class OrderBook:
         return next((p for p, _amount in self.iter_levels(bids=False)), None)
 
     def iter_levels(self, bids: bool):
-        """(price, resting amount) of each live level, best first, lazily: a reader that needs
-        the top of the book stops there (every block's tick reads it; summing every level's
-        orders cost 4 ms at 4,000 resting orders)."""
+        """(price, displayed amount) of each level that shows something, best first, lazily: a
+        reader that needs the top of the book stops there (every block's tick reads it; summing
+        every level's orders cost 4 ms at 4,000 resting orders). Hidden orders and icebergs'
+        reserves are left out — the depth everyone sees, and what the mark and funding prices
+        read."""
         levels = self._bids if bids else self._asks
         for price in sorted(levels, reverse=bids):
             with localcontext(_CTX):  # a generator: pinned per step, whoever iterates it
-                amount = levels[price].total_amount
+                amount = levels[price].visible_amount
             if amount > 0:
                 yield price, amount
+
+    @staticmethod
+    def fill_queue(level: "PriceLevel") -> List[Tuple["Order", Decimal]]:
+        """The level's resting orders in matching priority, with what each offers: first every
+        displayed quantity in time order (an iceberg's current slice), then every hidden one in
+        time order (an iceberg's reserve, a hidden order). Read only — the router quotes with
+        it exactly as ``_match_at_level`` fills."""
+        orders = [o for o in level.orders if o.is_active]
+        queue = [(o, o.visible) for o in orders if o.visible > 0]
+        queue += [(o, o.reserve) for o in orders if o.reserve > 0]
+        return queue
 
     @property
     def spread(self) -> Optional[Decimal]:
@@ -331,11 +394,11 @@ class OrderBook:
 
     @property
     def bid_depth(self) -> int:
-        return len([p for p, lvl in self._bids.items() if lvl.total_amount > 0])
+        return len([p for p, lvl in self._bids.items() if lvl.visible_amount > 0])
 
     @property
     def ask_depth(self) -> int:
-        return len([p for p, lvl in self._asks.items() if lvl.total_amount > 0])
+        return len([p for p, lvl in self._asks.items() if lvl.visible_amount > 0])
 
     @property
     def is_paused(self) -> bool:
@@ -345,12 +408,14 @@ class OrderBook:
 
     def pause(self) -> None:
         """Emergency pause — blocks all new orders."""
+        self._keep_scalars()
         self._version += 1
         self._paused = True
         logger.warning("Order book %s PAUSED", self.pool_id)
 
     def unpause(self) -> None:
         """Resume trading after emergency pause."""
+        self._keep_scalars()
         self._version += 1
         self._paused = False
         logger.info("Order book %s resumed", self.pool_id)
@@ -359,6 +424,7 @@ class OrderBook:
     def new_block(self, now: Optional[float] = None) -> None:
         """Start a block: reset the per-block rate limits and drop the orders that have expired
         by ``now`` — the block's timestamp, never the wall clock."""
+        self._keep_scalars()
         self._block_order_count.clear()
         if now is not None:
             self._now = float(now)
@@ -379,41 +445,143 @@ class OrderBook:
         self._level_digests = None  # recomputed in full
         self._version += 1
 
+    # -- Undo (qrdx/exchange/undo.py): inside an atomic scope, the book records what it was
+    #    the first time the scope touches each part — never a copy of the whole book.
+
+    _SCALARS = (
+        "_trade_sequence",
+        "last_price",
+        "total_volume",
+        "total_trades",
+        "_paused",
+        "_now",
+        "_has_expiring",
+        "_block_order_count",
+        "_trades",
+    )
+
+    def _keep_scalars(self) -> None:
+        """The book's own fields and its display history, once per scope (cheap: no orders)."""
+        scope = undo.active()
+        if scope is None or not scope.first(self, "book"):
+            return
+        saved = {
+            "_trade_sequence": self._trade_sequence,
+            "last_price": self.last_price,
+            "total_volume": self.total_volume,
+            "total_trades": self.total_trades,
+            "_paused": self._paused,
+            "_now": self._now,
+            "_has_expiring": self.__dict__.get("_has_expiring", True),
+            "_block_order_count": dict(self._block_order_count),
+            "_trades": list(self._trades),
+        }
+
+        def restore() -> None:
+            for name, value in saved.items():
+                if name == "_trades":
+                    self._trades = deque(value, maxlen=MAX_RECENT_TRADES)
+                elif name == "_block_order_count":
+                    self._block_order_count = dict(value)
+                else:
+                    setattr(self, name, value)
+            self._version += 1
+            self._digest = None
+
+        scope.record(self, "book", restore)
+
+    def _keep_order(self, index: Dict[str, Order], oid: str) -> None:
+        """An entry of the order index or the stop-order index, before it changes (and, before
+        the first removal from the stop-order index, its order: stop orders trigger in the order
+        they were placed). The order index's and the price levels' own order is never read (the
+        levels are always sorted by price), so it is not kept."""
+        scope = undo.active()
+        if scope is None:
+            return
+        if oid in index and index is self._stop_orders:
+            undo.keep_order(index)  # stop orders trigger in the order they were placed
+        if not scope.first(index, ("order", oid)):
+            return
+        if oid in index:
+            old = scope.copy(index[oid])  # the same copy as in its captured price level
+
+            def restore() -> None:
+                index[oid] = old
+
+        else:
+
+            def restore() -> None:
+                index.pop(oid, None)
+
+        scope.record(index, ("order", oid), restore)
+
+    def _keep_count(self, counts: Dict[str, int], owner: str) -> None:
+        undo.keep_entry(counts, owner, mutable=False)
+
     def _touch(self, side: OrderSide, price: Decimal) -> None:
         """A resting level changed: an order added, filled, cancelled or removed, or the level
-        itself dropped. Its digest is redone at the next ``cached_digest``."""
+        itself dropped. Its digest is redone at the next ``cached_digest``. Inside an undo
+        scope the level is first recorded as it was."""
+        tag = "b" if side == OrderSide.BUY else "a"
         dirty = self.__dict__.get("_dirty_levels")
         if dirty is not None:
-            dirty.add(("b" if side == OrderSide.BUY else "a", price))
+            dirty.add((tag, price))
+        scope = undo.active()
+        if scope is None or not scope.first(self, ("level", tag, price)):
+            return
+        levels = self._bids if side == OrderSide.BUY else self._asks
+        old = scope.copy(levels[price]) if price in levels else None
+
+        def restore() -> None:
+            now = self._bids if tag == "b" else self._asks
+            if old is None:
+                now.pop(price, None)
+            else:
+                now[price] = old
+                # The order index must hold the restored orders themselves (a maker filled in
+                # part stayed indexed while it changed in place).
+                for o in old.orders:
+                    if o.is_active:
+                        self._orders[o.id] = o
+            marks = self.__dict__.get("_dirty_levels")
+            if marks is not None:
+                marks.add((tag, price))
+            self._version += 1
+            self._digest = None
+
+        scope.record(self, ("level", tag, price), restore)
 
     def _level_digest(self, tag: str, price: Decimal, level: PriceLevel) -> bytes:
+        return hashlib.blake2b(self._level_payload(tag, price, level), digest_size=32).digest()
+
+    @staticmethod
+    def level_key(tag: str, price: Any) -> bytes:
+        """A price level's key in the book's proof tree (docs/STATE_PROOFS.md)."""
+        from ..crypto import smt
+
+        return smt.key_of(b"\x21" + f"{tag}{price}".encode())
+
+    def _level_payload(self, tag: str, price: Decimal, level: PriceLevel) -> bytes:
+        """A level's canonical bytes: its orders in time priority (what its digest hashes)."""
         parts = [f"{tag}{price}"]
         for o in level.orders:  # time priority
-            parts.append(
+            entry = (
                 f"{o.id}:{o.owner}:{o.side.value}:{o.order_type.value}:"
                 f"{o.price}:{o.amount}:{o.filled}:{o.status.value}:{o.nonce}:"
                 f"{o.expire_time}"
             )
-        return hashlib.blake2b("|".join(parts).encode(), digest_size=32).digest()
+            if o.hidden:
+                entry += ":hidden"
+            elif o.is_iceberg:
+                entry += f":iceberg:{o.display_size}:{o.shown}"
+            parts.append(entry)
+        return "|".join(parts).encode()
 
     def _compose(self, levels: bytes, nonces: bytes) -> bytes:
         """The book digest from its parts: the header fields, the levels' LtHash, every parked
         stop order (few), the owners' nonces."""
-        parts = [
-            self.pool_id,
-            str(self._trade_sequence),
-            str(self.total_trades),
-            str(self.total_volume),
-            str(self.last_price),
-        ]
-        for oid in sorted(self._stop_orders):
-            o = self._stop_orders[oid]
-            parts.append(
-                f"s{o.id}:{o.owner}:{o.side.value}:{o.stop_price}:{o.amount}:"
-                f"{o.filled}:{o.status.value}:{o.nonce}:{o.expire_time}"
-            )
         h = hashlib.blake2b(digest_size=32)
-        h.update("|".join(parts).encode())
+        h.update("|".join(self.header()).encode())
         h.update(levels)
         h.update(nonces)
         return h.digest()
@@ -443,18 +611,26 @@ class OrderBook:
         to be re-digested whole — 6 ms at 4,000 resting orders — whenever a block touched it)."""
         if self._digest is not None and self._digest_version == self._version:
             return self._digest
-        digests = self.__dict__.get("_level_digests")
-        if digests is None:
-            digests, self._level_acc = {}, lthash.ZERO
+        from ..crypto import smt
+        from .commitment import trees_on
+
+        held = self.__dict__.get("_level_digests")
+        full = held is None
+        digests: Dict[Tuple[str, Decimal], bytes] = {} if held is None else held
+        if full:
+            self._level_acc = lthash.ZERO
             dirty = {("b", p) for p in self._bids} | {("a", p) for p in self._asks}
         else:
             dirty = self.__dict__.get("_dirty_levels") or set()
+        trees = trees_on()
         removed, added = lthash.Accumulator(), lthash.Accumulator()
+        tree_changes = []
         for key in dirty:
             tag, price = key
             old = digests.pop(key, None)
             level = (self._bids if tag == "b" else self._asks).get(price)
-            new = self._level_digest(tag, price, level) if level is not None else None
+            payload = self._level_payload(tag, price, level) if level is not None else None
+            new = hashlib.blake2b(payload, digest_size=32).digest() if payload else None
             if new is not None:
                 digests[key] = new
             if old != new:
@@ -462,18 +638,63 @@ class OrderBook:
                     removed.add(_vector("book.level", old))
                 if new is not None:
                     added.add(_vector("book.level", new))
+                if trees:
+                    tree_changes.append((self.level_key(tag, price), payload))
         self._level_acc = _apply(self._level_acc, removed, added)
         self._level_digests = digests
         self._dirty_levels = set()
+        # The levels' proof tree, from the same changes (rebuilt whole when the digests were).
+        if not trees:
+            self._level_tree, self._level_tree_on = None, False
+        elif full or not self.__dict__.get("_level_tree_on", False):
+            self._level_tree = smt.m_build(sorted(self._all_level_payloads()))
+            self._level_tree_on = True
+        elif tree_changes:
+            self._level_tree = smt.m_update(self.__dict__.get("_level_tree"), sorted(tree_changes))
         self._digest = self._compose(self._level_acc, self._nonces().commitment())
         self._digest_version = self._version
         return self._digest
 
+    def _all_level_payloads(self) -> List[Tuple[bytes, bytes]]:
+        out = []
+        for tag, levels in (("b", self._bids), ("a", self._asks)):
+            for price, level in levels.items():
+                out.append((self.level_key(tag, price), self._level_payload(tag, price, level)))
+        return out
+
+    @property
+    def level_tree(self):
+        """The resting levels' proof tree, up to date."""
+        self.cached_digest()
+        return self.__dict__.get("_level_tree")
+
+    def header(self) -> List[Any]:
+        """The book's own fields (its levels and nonces are proven by their trees)."""
+        parts: List[Any] = [
+            self.pool_id,
+            str(self._trade_sequence),
+            str(self.total_trades),
+            str(self.total_volume),
+            str(self.last_price),
+        ]
+        for oid in sorted(self._stop_orders):
+            o = self._stop_orders[oid]
+            parts.append(
+                f"s{o.id}:{o.owner}:{o.side.value}:{o.stop_price}:{o.amount}:"
+                f"{o.filled}:{o.status.value}:{o.nonce}:{o.expire_time}"
+            )
+        return parts
+
     def verify_digest(self) -> None:
-        from .commitment import CommitmentMismatch
+        from ..crypto import smt
+        from .commitment import CommitmentMismatch, trees_on
 
         if self.cached_digest() != self.state_digest():
             raise CommitmentMismatch(f"order book {self.pool_id}: cached digest is stale")
+        if trees_on():
+            full = smt.m_build(sorted(self._all_level_payloads()))
+            if smt.m_root(self.__dict__.get("_level_tree")) != smt.m_root(full):
+                raise CommitmentMismatch(f"order book {self.pool_id}: the level tree is stale")
 
     # -- Order placement ----------------------------------------------------
 
@@ -495,13 +716,26 @@ class OrderBook:
             List of trades generated (empty if fully resting)
 
         Raises:
-            ValueError: on invalid order parameters or security violations
+            ValueError: on invalid order parameters or security violations, and when a
+                fill-or-kill order cannot fill whole (the book is then as it was)
         """
+        if order.tif == "fok":
+            # Undone here, not only by the caller's operation: the book stays consistent
+            # whoever places it.
+            with undo.atomic():
+                return self._place(order, protocol, budget)
+        return self._place(order, protocol, budget)
+
+    def _place(self, order: Order, protocol: bool, budget: Optional[MatchBudget]) -> List[Trade]:
+        self._keep_scalars()
         self._version += 1  # everything below may change the book
         if self._paused:
             raise ValueError("Order book is paused — emergency mode")
 
         self._validate_order(order)
+        # Post-only: refused, changing nothing, if anything would fill it now.
+        if order.tif == "alo" and self._would_match(order):
+            raise ValueError("post-only order would match a resting order")
         if not protocol:
             self._check_rate_limit(order.owner)
             self._check_nonce(order)
@@ -512,10 +746,43 @@ class OrderBook:
 
         # Market order: match immediately, reject remainder
         if order.order_type == OrderType.MARKET:
-            return self._match_market(order, budget)
+            trades = self._match_market(order, budget)
+        else:
+            # Limit order: match what we can, rest goes on the book (unless IOC / FOK)
+            trades = self._match_limit(order, budget)
+        if order.tif == "fok" and order.remaining > 0:
+            raise ValueError("fill-or-kill order could not fill completely")
+        return trades
 
-        # Limit order: match what we can, rest goes on the book
-        return self._match_limit(order, budget)
+    def _would_match(self, order: Order) -> bool:
+        """Does a resting order cross ``order``'s limit (hidden ones included)?"""
+        buy = order.side == OrderSide.BUY
+        opposite = self._asks if buy else self._bids
+        crossing = [p for p in opposite if (p <= order.price if buy else p >= order.price)]
+        return any(opposite[p].total_amount > 0 for p in crossing)
+
+    @_pinned
+    def reduce_order(self, order_id: str, amount: Decimal, caller: str) -> Order:
+        """Lower a resting order's amount in place (still above what has filled): it keeps its
+        place in the queue, as a smaller order would have had it. Anything else about an
+        order changes by replacing it (and queuing again)."""
+        self._keep_scalars()
+        self._version += 1
+        order = self._orders.get(order_id)
+        if order is None or not order.is_active:
+            raise ValueError(f"no resting order {order_id}")
+        if order.owner != caller:
+            raise ValueError("Only order owner can modify")
+        amount = Decimal(str(amount))
+        if not order.filled < amount < order.amount:
+            raise ValueError("a reduced order must be smaller, and above what has filled")
+        if order.is_iceberg and order.display_size >= amount:
+            raise ValueError("an iceberg's display size must be below its amount")
+        self._touch(order.side, order.price)  # (records the level, this very order with it)
+        order.amount = amount
+        if order.is_iceberg:
+            order.shown = min(order.shown, order.remaining)
+        return order
 
     @_pinned
     def cancel_order(self, order_id: str, caller: str = "") -> Optional[Order]:
@@ -532,12 +799,14 @@ class OrderBook:
         Raises:
             ValueError: if caller is not the order owner
         """
+        self._keep_scalars()
         self._version += 1
         # Check stop orders first
         if order_id in self._stop_orders:
             order = self._stop_orders[order_id]
             if caller and order.owner != caller:
                 raise ValueError("Only order owner can cancel")
+            self._keep_order(self._stop_orders, order_id)
             del self._stop_orders[order_id]
             order.status = OrderStatus.CANCELLED
             self._decrement_owner_count(order.owner, is_stop=True)
@@ -554,10 +823,10 @@ class OrderBook:
         if not order.is_active:
             return None
 
-        order.status = OrderStatus.CANCELLED
-
-        # Remove from price level
+        # Remove from price level (recorded first: the level holds this very order)
         self._touch(order.side, order.price)
+        self._keep_order(self._orders, order_id)
+        order.status = OrderStatus.CANCELLED
         book = self._bids if order.side == OrderSide.BUY else self._asks
         level = book.get(order.price)
         if level:
@@ -624,10 +893,13 @@ class OrderBook:
                 del opposite[price]
 
         # Rest on the book if unfilled (never once self-trade prevention cancelled it, never
-        # once its budget ran out: the remainder could still cross the book)
+        # once its budget ran out: the remainder could still cross the book; never an IOC or
+        # FOK order)
         if taker.status == OrderStatus.CANCELLED:
             pass
-        elif taker.remaining > 0 and budget is not None and budget.exhausted:
+        elif taker.remaining > 0 and (
+            (budget is not None and budget.exhausted) or taker.tif in ("ioc", "fok")
+        ):
             taker.status = OrderStatus.FILLED if taker.filled > 0 else OrderStatus.CANCELLED
         elif taker.remaining > 0:
             taker.status = OrderStatus.OPEN if taker.filled == 0 else OrderStatus.PARTIALLY_FILLED
@@ -645,89 +917,125 @@ class OrderBook:
         price: Decimal,
         budget: Optional[MatchBudget] = None,
     ) -> List[Trade]:
-        """Match taker against all makers at a price level (time priority)."""
+        """Match taker against the makers at a price level, in ``fill_queue`` priority: every
+        displayed quantity in time order, then every hidden one. An iceberg whose slice runs
+        out shows a new one from the back of the queue once the taker is done here."""
         self._touch(OrderSide.SELL if taker.side == OrderSide.BUY else OrderSide.BUY, price)
         trades: List[Trade] = []
-        for maker in list(level.orders):
-            if taker.remaining <= 0:
-                break
-            if budget is not None and not budget.take():
-                break
-            if not maker.is_active:
-                continue
+        spent: List[Order] = []  # icebergs whose slice ran out
+        self._fill_from_level(taker, level, price, budget, trades, spent)
+        # A spent iceberg shows its next slice — at the back of the queue, like a new order —
+        # however the taker stopped (filled, out of budget, self-trade prevention).
+        for maker in spent:
+            if maker.is_active and maker.remaining > 0 and maker.shown <= 0:
+                maker.shown = min(maker.display_size, maker.remaining)
+                level.remove_order(maker.id)
+                level.add_order(maker)
+        return trades
 
-            # --- Self-trade prevention (STP) ---
-            if maker.owner == taker.owner:
-                if self.self_trade_action == SelfTradeAction.REJECT:
-                    continue  # skip this maker, try next
-                elif self.self_trade_action == SelfTradeAction.CANCEL_MAKER:
+    def _fill_from_level(
+        self,
+        taker: Order,
+        level: PriceLevel,
+        price: Decimal,
+        budget: Optional[MatchBudget],
+        trades: List[Trade],
+        spent: List[Order],
+    ) -> None:
+        for tier in ("shown", "reserve"):
+            for maker in list(level.orders):
+                if taker.remaining <= 0 or taker.status == OrderStatus.CANCELLED:
+                    break
+                if not maker.is_active:
+                    continue
+                available = maker.visible if tier == "shown" else maker.reserve
+                if available <= 0:
+                    continue
+                if budget is not None and not budget.take():
+                    break
+
+                # --- Self-trade prevention (STP) ---
+                if maker.owner == taker.owner:
+                    if self.self_trade_action == SelfTradeAction.REJECT:
+                        continue  # skip this maker, try next
+                    elif self.self_trade_action == SelfTradeAction.CANCEL_MAKER:
+                        self._keep_order(self._orders, maker.id)
+                        maker.status = OrderStatus.CANCELLED
+                        level.remove_order(maker.id)
+                        self._orders.pop(maker.id, None)
+                        self._decrement_owner_count(maker.owner)
+                        continue
+                    elif self.self_trade_action == SelfTradeAction.CANCEL_BOTH:
+                        self._keep_order(self._orders, maker.id)
+                        maker.status = OrderStatus.CANCELLED
+                        taker.status = OrderStatus.CANCELLED
+                        level.remove_order(maker.id)
+                        self._orders.pop(maker.id, None)
+                        self._decrement_owner_count(maker.owner)
+                        return
+                    elif self.self_trade_action == SelfTradeAction.CANCEL_TAKER:
+                        taker.status = OrderStatus.CANCELLED
+                        return
+
+                fill_amount = min(taker.remaining, available)
+                if self.maker_guard is not None and not self.maker_guard(maker, fill_amount):
+                    self._keep_order(self._orders, maker.id)
                     maker.status = OrderStatus.CANCELLED
                     level.remove_order(maker.id)
                     self._orders.pop(maker.id, None)
                     self._decrement_owner_count(maker.owner)
                     continue
-                elif self.self_trade_action == SelfTradeAction.CANCEL_BOTH:
-                    maker.status = OrderStatus.CANCELLED
-                    taker.status = OrderStatus.CANCELLED
+
+                maker_fee = (fill_amount * price * self.maker_fee_rate).quantize(
+                    Decimal("0.00000001"), rounding=ROUND_HALF_UP
+                )
+                taker_fee = (fill_amount * price * self.taker_fee_rate).quantize(
+                    Decimal("0.00000001"), rounding=ROUND_HALF_UP
+                )
+
+                # Determine buyer/seller
+                buyer = taker.owner if taker.side == OrderSide.BUY else maker.owner
+                seller = maker.owner if taker.side == OrderSide.BUY else taker.owner
+
+                self._trade_sequence += 1
+                trade = Trade(
+                    id=self._deterministic_trade_id(maker.id, taker.id, self._trade_sequence),
+                    maker_order_id=maker.id,
+                    taker_order_id=taker.id,
+                    price=price,
+                    amount=fill_amount,
+                    maker_fee=maker_fee,
+                    taker_fee=taker_fee,
+                    timestamp=time.time(),
+                    buyer=buyer,
+                    seller=seller,
+                    sequence=self._trade_sequence,
+                )
+                trades.append(trade)
+                self._trades.append(trade)
+                self.last_price = price
+                self.total_volume += fill_amount * price
+                self.total_trades += 1
+
+                maker.filled += fill_amount
+                taker.filled += fill_amount
+                if maker.is_iceberg and tier == "shown":
+                    maker.shown = max(ZERO, maker.shown - fill_amount)
+
+                if maker.remaining <= 0:
+                    self._keep_order(self._orders, maker.id)
+                    maker.status = OrderStatus.FILLED
                     level.remove_order(maker.id)
                     self._orders.pop(maker.id, None)
                     self._decrement_owner_count(maker.owner)
-                    return trades
-                elif self.self_trade_action == SelfTradeAction.CANCEL_TAKER:
-                    taker.status = OrderStatus.CANCELLED
-                    return trades
-
-            fill_amount = min(taker.remaining, maker.remaining)
-            if self.maker_guard is not None and not self.maker_guard(maker, fill_amount):
-                maker.status = OrderStatus.CANCELLED
-                level.remove_order(maker.id)
-                self._orders.pop(maker.id, None)
-                self._decrement_owner_count(maker.owner)
-                continue
-
-            maker_fee = (fill_amount * price * self.maker_fee_rate).quantize(
-                Decimal("0.00000001"), rounding=ROUND_HALF_UP
-            )
-            taker_fee = (fill_amount * price * self.taker_fee_rate).quantize(
-                Decimal("0.00000001"), rounding=ROUND_HALF_UP
-            )
-
-            # Determine buyer/seller
-            buyer = taker.owner if taker.side == OrderSide.BUY else maker.owner
-            seller = maker.owner if taker.side == OrderSide.BUY else taker.owner
-
-            self._trade_sequence += 1
-            trade = Trade(
-                id=self._deterministic_trade_id(maker.id, taker.id, self._trade_sequence),
-                maker_order_id=maker.id,
-                taker_order_id=taker.id,
-                price=price,
-                amount=fill_amount,
-                maker_fee=maker_fee,
-                taker_fee=taker_fee,
-                timestamp=time.time(),
-                buyer=buyer,
-                seller=seller,
-                sequence=self._trade_sequence,
-            )
-            trades.append(trade)
-            self._trades.append(trade)
-            self.last_price = price
-            self.total_volume += fill_amount * price
-            self.total_trades += 1
-
-            maker.filled += fill_amount
-            taker.filled += fill_amount
-
-            if maker.remaining <= 0:
-                maker.status = OrderStatus.FILLED
-                level.remove_order(maker.id)
-                self._orders.pop(maker.id, None)
-                self._decrement_owner_count(maker.owner)
-            else:
-                maker.status = OrderStatus.PARTIALLY_FILLED
-
-        return trades
+                else:
+                    maker.status = OrderStatus.PARTIALLY_FILLED
+                    if maker.is_iceberg and maker.shown <= 0 and maker not in spent:
+                        spent.append(maker)
+            if taker.remaining <= 0 or taker.status == OrderStatus.CANCELLED:
+                return
+            if budget is not None and budget.exhausted:
+                return
 
     # -- Stop-loss ----------------------------------------------------------
 
@@ -738,6 +1046,8 @@ class OrderBook:
         count = self._owner_stop_count.get(order.owner, 0)
         if count >= MAX_STOP_ORDERS_PER_ADDRESS:
             raise ValueError(f"Max stop orders per address reached ({MAX_STOP_ORDERS_PER_ADDRESS})")
+        self._keep_order(self._stop_orders, order.id)
+        self._keep_count(self._owner_stop_count, order.owner)
         self._stop_orders[order.id] = order
         self._owner_stop_count[order.owner] = count + 1
         return []
@@ -766,6 +1076,7 @@ class OrderBook:
             # could make a block's exchange section fail.
             if oid not in self._stop_orders:
                 continue
+            self._keep_order(self._stop_orders, oid)
             order = self._stop_orders.pop(oid)
             self._decrement_owner_count(order.owner, is_stop=True)
             order.order_type = OrderType.MARKET
@@ -787,13 +1098,17 @@ class OrderBook:
         if count >= self.max_orders_per_address:
             raise ValueError(f"Max orders per address reached ({self.max_orders_per_address})")
 
+        self._touch(order.side, order.price)  # (recorded before the level may be created)
         if order.price not in book:
             book[order.price] = PriceLevel(price=order.price)
 
-        self._touch(order.side, order.price)
         if order.expire_time:
             self._has_expiring = True
+        if order.is_iceberg:
+            order.shown = min(order.display_size, order.remaining)
         book[order.price].add_order(order)
+        self._keep_order(self._orders, order.id)
+        self._keep_count(self._owner_order_count, order.owner)
         self._orders[order.id] = order
         self._owner_order_count[order.owner] = count + 1
 
@@ -809,6 +1124,22 @@ class OrderBook:
             order.stop_price is None or order.stop_price <= 0
         ):
             raise ValueError("Stop-loss requires positive stop_price")
+        if order.tif not in ("gtc", "ioc", "fok", "alo"):
+            raise ValueError(f"unknown time in force {order.tif!r} (gtc, ioc, fok, alo)")
+        if order.tif == "alo" and order.order_type != OrderType.LIMIT:
+            raise ValueError("a post-only order must be a limit order")
+        if order.tif != "gtc" and order.order_type == OrderType.STOP_LOSS:
+            raise ValueError("a stop order is good till cancelled")
+        if order.hidden or order.is_iceberg:
+            if order.order_type != OrderType.LIMIT or order.tif not in ("gtc", "alo"):
+                raise ValueError("only a resting limit order (gtc or alo) can be hidden")
+        if order.display_size < 0:
+            raise ValueError("display size must not be negative")
+        if order.is_iceberg:
+            if order.hidden:
+                raise ValueError("an order is hidden or an iceberg, not both")
+            if order.display_size < self.min_order_size or order.display_size >= order.amount:
+                raise ValueError("an iceberg's display size must be below its amount")
         if not order.owner:
             raise ValueError("Order must have an owner address")
         if not order.id:
@@ -829,19 +1160,16 @@ class OrderBook:
             self._owner_nonces[order.owner] = order.nonce
 
     def _check_rate_limit(self, owner: str) -> None:
-        """Enforce per-block order rate limit."""
+        """Enforce per-block order rate limit. (Its counter is among the scalars a scope keeps.)"""
         count = self._block_order_count.get(owner, 0)
         if count >= MAX_ORDERS_PER_BLOCK_PER_ADDRESS:
             raise ValueError(f"Rate limit: max {MAX_ORDERS_PER_BLOCK_PER_ADDRESS} orders per block")
         self._block_order_count[owner] = count + 1
 
     def _decrement_owner_count(self, owner: str, is_stop: bool = False) -> None:
-        if is_stop:
-            c = self._owner_stop_count.get(owner, 0)
-            self._owner_stop_count[owner] = max(0, c - 1)
-        else:
-            c = self._owner_order_count.get(owner, 0)
-            self._owner_order_count[owner] = max(0, c - 1)
+        counts = self._owner_stop_count if is_stop else self._owner_order_count
+        self._keep_count(counts, owner)
+        counts[owner] = max(0, counts.get(owner, 0) - 1)
 
     def _cleanup_expired(self) -> None:
         """Remove expired orders during new_block. (No exchange operation sets an expiry today;

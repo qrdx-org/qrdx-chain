@@ -15,12 +15,23 @@ commitment slower but never wrong:
   out by any route — ``d[k]``, ``get``, ``setdefault``, iterating ``values()``/``items()`` —
   marks it, because the caller may change it in place.
 
+Insertion order is not part of the state: the commitment is order-free, every consensus reader
+iterates sorted or order-independently, and an undo scope that deletes and restores an entry
+may move it (qrdx/exchange/undo.py). Keep it that way.
+
 Read-only code that must not mark everything (the per-block liquidation scan, the invariant
 sums) uses ``peek``, ``peek_values`` and ``peek_items``, which return the same objects without
 marking them. Those are the only way to read a value unmarked, so a missed conversion costs
 time, not correctness. ``verify`` recomputes a collection from scratch; with
 ``QRDX_VERIFY_STATE_COMMITMENTS=1`` every exchange root is checked against it (the test suite
 runs that way).
+
+**Proofs** (docs/STATE_PROOFS.md). Where the chain spec schedules ``provable_state``, each
+collection also keeps a sparse Merkle tree of its entries (qrdx/crypto/smt.py, immutable nodes),
+updated in ``commitment`` from exactly the entries whose digest changed — so it is a function of
+the entries, travels with every copy and undo of the collection, and any entry can be proven.
+An entry's key is ``key_of(TREE_KEY | canonical(key))``, its payload ``canonical([key,
+encoded])`` (the bytes its digest hashes).
 """
 
 from __future__ import annotations
@@ -31,7 +42,11 @@ import json
 import os
 from typing import Any, Callable, Dict, Iterable, Optional, Set, Tuple
 
-from ..crypto import lthash
+from ..crypto import lthash, smt
+from .undo import (
+    active as _undo_active,
+    restore_into as _undo_restore_into,
+)
 
 Encoder = Callable[[Any, Any], Any]  # (key, value) → a JSON-serializable canonical form
 
@@ -46,9 +61,35 @@ def canonical_bytes(obj: Any) -> bytes:
 
 
 def _digest(encoded: Any) -> bytes:
-    return hashlib.blake2b(
-        canonical_bytes(encoded), digest_size=32, person=b"qrdx-exch-v1"
-    ).digest()
+    return _raw_digest(canonical_bytes(encoded))
+
+
+def _raw_digest(raw: bytes) -> bytes:
+    return hashlib.blake2b(raw, digest_size=32, person=b"qrdx-exch-v1").digest()
+
+
+TREE_KEY = b"\x20"  # an exchange entry's tree key: key_of(TREE_KEY | canonical(key))
+_TREES: Optional[bool] = None
+
+
+def trees_on() -> bool:
+    """Do collections keep proof trees on this network (``provable_state`` scheduled)?"""
+    global _TREES
+    if _TREES is None:
+        from ..state_proofs import scheduled
+
+        _TREES = scheduled()
+    return _TREES
+
+
+def reset_trees_flag() -> None:
+    """Re-read the chain spec (tests that switch networks)."""
+    global _TREES
+    _TREES = None
+
+
+def tree_key(key: Any) -> bytes:
+    return smt.key_of(TREE_KEY + canonical_bytes(key))
 
 
 def _vector(tag: str, digest: bytes) -> int:
@@ -93,6 +134,8 @@ class CommittedDict(dict):
         self._digests: Dict[Any, bytes] = {}
         self._dirty: Set[Any] = set(dict.keys(self))
         self._changes: Optional[Set[Any]] = None  # see track_changes
+        self._tree: Optional[smt.MNode] = None  # the entries' proof tree (see the module doc)
+        self._tree_on = False
 
     # ── changes, for derived indexes (the liquidation index) ─────────────
 
@@ -111,6 +154,34 @@ class CommittedDict(dict):
         out, self._changes = self._changes, set()
         return out
 
+    # ── undo (qrdx/exchange/undo.py) ──────────────────────────────────────
+
+    def _keep(self, key: Any) -> None:
+        """Inside an undo scope: record this entry as it is now, the first time the scope sees
+        it — before a write or delete, or before handing a mutable value out."""
+        scope = _undo_active()
+        if scope is None or not scope.first(self, key):
+            return
+        if dict.__contains__(self, key):
+            original = dict.__getitem__(self, key)
+            # A mutable value is restored INTO the original object, so whoever holds it (an
+            # outer operation, a caller) sees it as it was — not a stale object beside a copy.
+            saved = copy.deepcopy(original) if self._mutable else original
+
+            def restore() -> None:
+                value = _undo_restore_into(original, saved) if self._mutable else saved
+                dict.__setitem__(self, key, value)
+                self._mark(key)
+
+        else:
+
+            def restore() -> None:
+                if dict.__contains__(self, key):
+                    dict.__delitem__(self, key)
+                self._mark(key)
+
+        scope.record(self, key, restore)
+
     # ── marking writes ───────────────────────────────────────────────────
 
     def _mark(self, key: Any) -> None:
@@ -125,29 +196,37 @@ class CommittedDict(dict):
             self._changes.update(keys)
 
     def __setitem__(self, key: Any, value: Any) -> None:
+        self._keep(key)
         dict.__setitem__(self, key, value)
         self._mark(key)
 
     def __delitem__(self, key: Any) -> None:
+        self._keep(key)
         dict.__delitem__(self, key)
         self._mark(key)
 
     def pop(self, key: Any, *default: Any) -> Any:
         if dict.__contains__(self, key):
+            self._keep(key)
             self._mark(key)
         return dict.pop(self, key, *default)
 
     def popitem(self) -> Tuple[Any, Any]:
+        if dict.__len__(self):
+            self._keep(next(reversed(dict.keys(self))))
         key, value = dict.popitem(self)
         self._mark(key)
         return key, value
 
     def setdefault(self, key: Any, default: Any = None) -> Any:
+        self._keep(key)
         self._mark(key)
         return dict.setdefault(self, key, default)
 
     def update(self, *args: Any, **kwargs: Any) -> None:
         other = dict(*args, **kwargs)
+        for key in other:
+            self._keep(key)
         dict.update(self, other)
         self._mark_all(other)
 
@@ -156,12 +235,16 @@ class CommittedDict(dict):
         return self
 
     def clear(self) -> None:
+        for key in list(dict.keys(self)):
+            self._keep(key)
         self._mark_all(dict.keys(self))
         dict.clear(self)
 
     # ── reads (marking when values are mutable) ──────────────────────────
 
     def __getitem__(self, key: Any) -> Any:
+        if self._mutable and dict.__contains__(self, key):
+            self._keep(key)
         value = dict.__getitem__(self, key)
         if self._mutable:
             self._mark(key)
@@ -169,16 +252,21 @@ class CommittedDict(dict):
 
     def get(self, key: Any, default: Any = None) -> Any:
         if self._mutable and dict.__contains__(self, key):
+            self._keep(key)
             self._mark(key)
         return dict.get(self, key, default)
 
     def values(self):  # type: ignore[override]
         if self._mutable:
+            for key in list(dict.keys(self)):
+                self._keep(key)
             self._mark_all(dict.keys(self))
         return dict.values(self)
 
     def items(self):  # type: ignore[override]
         if self._mutable:
+            for key in list(dict.keys(self)):
+                self._keep(key)
             self._mark_all(dict.keys(self))
         return dict.items(self)
 
@@ -232,24 +320,50 @@ class CommittedDict(dict):
     def _entry_digest(self, key: Any, value: Any) -> bytes:
         return _digest([key, self._encode(key, value)])
 
+    def _entry_raw(self, key: Any, value: Any) -> bytes:
+        """The entry's canonical bytes: what its digest hashes and its proof leaf holds."""
+        return canonical_bytes([key, self._encode(key, value)])
+
     def commitment(self) -> bytes:
-        """The accumulator over every entry, after re-digesting the marked ones."""
+        """The accumulator over every entry, after re-digesting the marked ones (and the proof
+        tree, from the same changes)."""
+        trees = trees_on()
+        rebuilt = False
+        if trees and not self.__dict__.get("_tree_on", False):  # (a copy from before trees)
+            self._tree = smt.m_build(
+                sorted((tree_key(k), self._entry_raw(k, v)) for k, v in dict.items(self))
+            )
+            self._tree_on = rebuilt = True
+        elif not trees:
+            self._tree, self._tree_on = None, False
         if self._dirty:
             removed, added = lthash.Accumulator(), lthash.Accumulator()
+            tree_changes = []
             for key in self._dirty:
                 old = self._digests.pop(key, None)
-                new = None
+                new = raw = None
                 if dict.__contains__(self, key):
-                    new = self._entry_digest(key, dict.__getitem__(self, key))
+                    raw = self._entry_raw(key, dict.__getitem__(self, key))
+                    new = _raw_digest(raw)
                     self._digests[key] = new
                 if old != new:
                     if old is not None:
                         removed.add(_vector(self._tag, old))
                     if new is not None:
                         added.add(_vector(self._tag, new))
+                    if trees:
+                        tree_changes.append((tree_key(key), raw))
             self._acc = _apply(self._acc, removed, added)
             self._dirty.clear()
+            if tree_changes and not rebuilt:
+                self._tree = smt.m_update(self._tree, sorted(tree_changes))
         return self._acc
+
+    @property
+    def tree(self) -> Optional[smt.MNode]:
+        """The entries' proof tree, up to date (``commitment`` brings it there)."""
+        self.commitment()
+        return self.__dict__.get("_tree")
 
     def full_commitment(self) -> bytes:
         acc = lthash.Accumulator()
@@ -267,6 +381,12 @@ class CommittedDict(dict):
                 f"{self._tag}: incremental commitment is stale for {len(stale)} entr"
                 f"{'y' if len(stale) == 1 else 'ies'} (e.g. {stale[:3]!r})"
             )
+        if trees_on():
+            full = smt.m_build(
+                sorted((tree_key(k), self._entry_raw(k, v)) for k, v in dict.items(self))
+            )
+            if smt.m_root(self.__dict__.get("_tree")) != smt.m_root(full):
+                raise CommitmentMismatch(f"{self._tag}: the proof tree disagrees with the entries")
 
     @property
     def dirty_count(self) -> int:
@@ -286,47 +406,82 @@ class CommittedSet(set):
         self._acc = lthash.ZERO
         self._members: Set[Any] = set()  # what the accumulator holds
         self._dirty: Set[Any] = set(set.__iter__(self))
+        self._tree: Optional[smt.MNode] = None  # the members' proof tree
+        self._tree_on = False
+
+    def _keep(self, item: Any) -> None:
+        """Inside an undo scope: record whether ``item`` is a member now (qrdx/exchange/undo.py)."""
+        scope = _undo_active()
+        if scope is None or not scope.first(self, item):
+            return
+        was = set.__contains__(self, item)
+
+        def restore() -> None:
+            if was:
+                set.add(self, item)
+            else:
+                set.discard(self, item)
+            self._dirty.add(item)
+
+        scope.record(self, item, restore)
 
     def add(self, item: Any) -> None:
+        self._keep(item)
         set.add(self, item)
         self._dirty.add(item)
 
     def discard(self, item: Any) -> None:
+        self._keep(item)
         set.discard(self, item)
         self._dirty.add(item)
 
     def remove(self, item: Any) -> None:
+        self._keep(item)
         set.remove(self, item)
         self._dirty.add(item)
 
     def pop(self) -> Any:
+        if set.__len__(self):
+            self._keep(next(iter(set.__iter__(self))))
         item = set.pop(self)
         self._dirty.add(item)
         return item
 
     def clear(self) -> None:
+        for item in list(set.__iter__(self)):
+            self._keep(item)
         self._dirty.update(set.__iter__(self))
         set.clear(self)
 
     def update(self, *others: Iterable[Any]) -> None:
         for o in others:
             o = list(o)
+            for item in o:
+                self._keep(item)
             set.update(self, o)
             self._dirty.update(o)
 
     def difference_update(self, *others: Iterable[Any]) -> None:
         for o in others:
             o = list(o)
+            for item in o:
+                self._keep(item)
             set.difference_update(self, o)
             self._dirty.update(o)
 
     def intersection_update(self, *others: Iterable[Any]) -> None:
         before = set(set.__iter__(self))
+        keep = set(before)
+        keep.intersection_update(*others)
+        for item in before - keep:
+            self._keep(item)
         set.intersection_update(self, *others)
         self._dirty.update(before - set(set.__iter__(self)))
 
     def symmetric_difference_update(self, other: Iterable[Any]) -> None:
         other = list(other)
+        for item in other:
+            self._keep(item)
         set.symmetric_difference_update(self, other)
         self._dirty.update(other)
 
@@ -369,8 +524,18 @@ class CommittedSet(set):
         return _digest(item)
 
     def commitment(self) -> bytes:
+        trees = trees_on()
+        rebuilt = False
+        if trees and not self.__dict__.get("_tree_on", False):
+            self._tree = smt.m_build(
+                sorted((tree_key(i), canonical_bytes(i)) for i in set.__iter__(self))
+            )
+            self._tree_on = rebuilt = True
+        elif not trees:
+            self._tree, self._tree_on = None, False
         if self._dirty:
             removed, added = lthash.Accumulator(), lthash.Accumulator()
+            tree_changes = []
             for item in self._dirty:
                 had, has = item in self._members, set.__contains__(self, item)
                 if had == has:
@@ -382,9 +547,18 @@ class CommittedSet(set):
                 else:
                     removed.add(vec)
                     self._members.discard(item)
+                if trees:
+                    tree_changes.append((tree_key(item), canonical_bytes(item) if has else None))
             self._acc = _apply(self._acc, removed, added)
             self._dirty.clear()
+            if tree_changes and not rebuilt:
+                self._tree = smt.m_update(self._tree, sorted(tree_changes))
         return self._acc
+
+    @property
+    def tree(self) -> Optional[smt.MNode]:
+        self.commitment()
+        return self.__dict__.get("_tree")
 
     def full_commitment(self) -> bytes:
         acc = lthash.Accumulator()
@@ -395,6 +569,12 @@ class CommittedSet(set):
     def verify(self) -> None:
         if self.commitment() != self.full_commitment():
             raise CommitmentMismatch(f"{self._tag}: incremental set commitment is stale")
+        if trees_on():
+            full = smt.m_build(
+                sorted((tree_key(i), canonical_bytes(i)) for i in set.__iter__(self))
+            )
+            if smt.m_root(self.__dict__.get("_tree")) != smt.m_root(full):
+                raise CommitmentMismatch(f"{self._tag}: the proof tree disagrees with the members")
 
 
 def _rebuild_set(tag: str, items: list) -> CommittedSet:

@@ -76,3 +76,12 @@ async def test_observe_mode_only_logs(node_db, caplog):
     content = str({"state_root": "ab" * 64})
     assert await node_main._verify_unified_state_root(content, enforce=False) == (True, "")
     assert "[E-D4 observe]" in caplog.text
+
+
+async def test_the_check_runs_at_the_blocks_height_not_its_slot(node_db):
+    """A block's signed ``number`` is its slot. The check is made — and the block's proof roots
+    filed (qrdx/state_proofs.py) — at the height the importer applies it at."""
+    content = str({"state_root": "ab" * 64, "number": 999, "slot": 999})
+    await node_main._verify_unified_state_root(content, enforce=False, height=5)
+    cur = await node_db.connection.execute("SELECT height FROM state_root_parts")
+    assert [r[0] for r in await cur.fetchall()] == [5]

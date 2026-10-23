@@ -15,6 +15,12 @@ from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransact
 from qrdx.exchange import block_processor as BP
 from qrdx.exchange.tokens import NATIVE_ASSET
 
+
+@pytest.fixture(autouse=True)
+def _fee_free(no_trading_fees):
+    """Escrow and settlement mechanics, amounts exact: fees off (tests/test_spot_fees.py)."""
+
+
 D = Decimal
 LP, TRADER, MAKER = ("0xPQ" + c * 64 for c in "abc")
 _nonces = {}

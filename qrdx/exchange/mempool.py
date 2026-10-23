@@ -40,14 +40,22 @@ DEFAULT_MAX_MEMPOOL = 8192  # total admitted txs
 DEFAULT_MAX_PER_SENDER = 64  # queued txs per sender
 DEFAULT_MAX_NONCE_GAP = 64  # how far ahead of expected a nonce may be
 
-# address -> next expected nonce
+# nonce lane (``ExchangeTransaction.nonce_key``: the account, or account|signer) -> next nonce
 NonceProvider = Callable[[str], int]
+# why a transaction's signer may not act for its sender ("" if it may)
+SignerCheck = Callable[[ExchangeTransaction], str]
 
 
 def _default_nonce_provider(address: str) -> int:
     from .state_manager import ExchangeStateManager
 
     return ExchangeStateManager.get_instance().get_nonce(address)
+
+
+def _default_signer_check(tx: ExchangeTransaction) -> str:
+    from .state_manager import ExchangeStateManager
+
+    return ExchangeStateManager.get_instance().signer_error(tx)
 
 
 def _default_vote_seq_provider(address: str) -> int:
@@ -66,14 +74,18 @@ class ExchangeMempool:
         max_nonce_gap: int = DEFAULT_MAX_NONCE_GAP,
         nonce_provider: Optional[NonceProvider] = None,
         vote_seq_provider: Optional[NonceProvider] = None,
+        signer_check: Optional[SignerCheck] = None,
     ):
         self.max_size = max_size
         self.max_per_sender = max_per_sender
         self.max_nonce_gap = max_nonce_gap
         self._nonce_provider = nonce_provider or _default_nonce_provider
         self._vote_seq = vote_seq_provider or _default_vote_seq_provider
+        self._signer_check = signer_check or _default_signer_check
         self._txs: Dict[str, ExchangeTransaction] = {}  # tx_hash -> tx
-        self._by_sender: Dict[str, Set[str]] = {}  # sender -> {tx_hash}
+        # nonce lane -> {tx_hash}: the account's own transactions, and each agent's (or a
+        # sub-account master's) for it, are separate nonce sequences (``nonce_key``).
+        self._by_sender: Dict[str, Set[str]] = {}
         # Oracle votes: their own lane, the newest per voter. A vote's nonce is its own
         # sequence (state_manager: not the account nonce), so it neither waits in a sender's
         # nonce run nor moves the validator's exchange nonce.
@@ -110,6 +122,14 @@ class ExchangeMempool:
         if tx.op_type == ExchangeOpType.ORACLE_VOTE:
             return self._admit_vote(tx)
 
+        # 1c. A signer acting for the account must be one it authorized now, and a key the
+        #     account turned off signs nothing (execution checks again: either can change before
+        #     the transaction runs).
+        refused = self._signer_check(tx)
+        if refused:
+            return False, refused
+        lane = tx.nonce_key()
+
         # 2. Replay / dedup.
         if tx_hash in self._txs:
             return False, "duplicate: transaction already in mempool"
@@ -118,17 +138,17 @@ class ExchangeMempool:
         #    holds copies of transactions another validator has since included; those are
         #    stale once their nonce is consumed. Drop them before counting, or a busy sender
         #    (and eventually the whole pool) would be locked out by its own history.
-        self._prune_sender(tx.sender)
+        self._prune_sender(lane)
         if len(self._txs) >= self.max_size:
             self.prune_stale()
         if len(self._txs) >= self.max_size:
             return False, "mempool full"
-        sender_hashes = self._by_sender.get(tx.sender, set())
+        sender_hashes = self._by_sender.get(lane, set())
         if len(sender_hashes) >= self.max_per_sender:
             return False, "per-sender mempool limit reached"
 
         # 4. Nonce window.
-        expected = self._nonce_provider(tx.sender)
+        expected = self._nonce_provider(lane)
         if tx.nonce < expected:
             return False, f"nonce too low: {tx.nonce} < expected {expected} (stale/replay)"
         if tx.nonce > expected + self.max_nonce_gap:
@@ -143,7 +163,7 @@ class ExchangeMempool:
 
         # Admit.
         self._txs[tx_hash] = tx
-        self._by_sender.setdefault(tx.sender, set()).add(tx_hash)
+        self._by_sender.setdefault(lane, set()).add(tx_hash)
         return True, ""
 
     def admit_hex(self, hex_str: str) -> Tuple[bool, str, Optional[str]]:
@@ -170,7 +190,7 @@ class ExchangeMempool:
         return len(self._txs) + len(self._votes)
 
     def sender_txs(self, sender: str) -> List[ExchangeTransaction]:
-        """All queued txs for a sender, ordered by nonce."""
+        """All queued txs of a nonce lane (an account, or account|signer), ordered by nonce."""
         hashes = self._by_sender.get(sender, set())
         return sorted((self._txs[h] for h in hashes), key=lambda t: t.nonce)
 
@@ -252,11 +272,12 @@ class ExchangeMempool:
             if tx is None:
                 continue
             removed += 1
-            s = self._by_sender.get(tx.sender)
+            lane = tx.nonce_key()
+            s = self._by_sender.get(lane)
             if s is not None:
                 s.discard(h)
                 if not s:
-                    del self._by_sender[tx.sender]
+                    del self._by_sender[lane]
         return removed
 
     def _prune_sender(self, sender: str) -> int:
@@ -271,10 +292,15 @@ class ExchangeMempool:
         Drop txs whose nonce is now below the sender's expected nonce (e.g. a
         competing tx for that nonce was committed). Returns the number pruned.
         """
+        import time as _time
+
         to_remove: List[str] = []
+        now = _time.time()  # (local hygiene only: blocks judge expiry by their own time)
         for sender, hashes in list(self._by_sender.items()):
             expected = self._nonce_provider(sender)
             for h in hashes:
-                if self._txs[h].nonce < expected:
+                tx = self._txs[h]
+                expires = tx.expires_at() if hasattr(tx, "expires_at") else None
+                if tx.nonce < expected or (expires is not None and float(expires) < now):
                     to_remove.append(h)
         return self.remove(to_remove)

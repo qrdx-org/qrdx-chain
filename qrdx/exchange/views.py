@@ -343,7 +343,7 @@ def spot_order_book(mgr, pair: str, depth: int = 20) -> Optional[Dict[str, Any]]
 
 
 def spot_open_orders(mgr, address: str) -> List[Dict[str, Any]]:
-    """An address's resting spot orders, every pair."""
+    """An address's resting spot orders, every pair (its spot triggers: ``triggers``)."""
     out = []
     for key in sorted(mgr._order_books):
         book = mgr._order_books[key]
@@ -361,15 +361,25 @@ def spot_open_orders(mgr, address: str) -> List[Dict[str, Any]]:
                     "amount": str(o.amount),
                     "filled": str(o.filled),
                     "remaining": str(o.remaining),
+                    **_display(o),
                 }
             )
     return out
 
 
+def _display(o) -> Dict[str, Any]:
+    """How an owner's order shows in the book (only on the owner's own views)."""
+    if o.hidden:
+        return {"hidden": True}
+    if o.is_iceberg:
+        return {"display_size": str(o.display_size), "shown": str(o.visible)}
+    return {}
+
+
 # ── markets ────────────────────────────────────────────────────────────────
 
 
-def market_summary(m: Market) -> Dict[str, Any]:
+def market_summary(m: Market, ch=None) -> Dict[str, Any]:
     from .. import constants
 
     interval = Decimal(constants.PERP_FUNDING_INTERVAL_SECONDS)
@@ -394,17 +404,33 @@ def market_summary(m: Market) -> Dict[str, Any]:
         "next_funding_time": _s(m.funding_time + interval) if m.funding_time > 0 else None,
         "premium_sum": _s(m.premium_sum),
         "premium_time": _s(m.premium_time),
+        "liquidity_vault": _liquidity_vault(m, ch),
+        "sz_decimals": m.sz_decimals if m.sz_decimals >= 0 else None,
+        "settled_price": _s(m.settled_price) if m.settled_price > 0 else None,
+        # A deployer market (docs/HYPERLIQUID_PARITY.md): who runs it and its oracle, its share of
+        # the protocol's fees, and until when the validators hold it frozen.
+        "deployer": m.deployer or None,
+        "deployer_fee_share": _s(m.deployer_fee_share) if m.deployer else None,
+        "frozen_until": _s(m.frozen_until) if m.frozen_until > 0 else None,
     }
+
+
+def _liquidity_vault(m: Market, ch) -> Optional[str]:
+    """The market's liquidity vault, if it was listed with one (``perp_getUserVault``)."""
+    from .clearinghouse import market_maker_address
+
+    vault = market_maker_address(m.id)
+    return vault if ch is not None and vault in ch.user_vaults else None
 
 
 def markets(mgr) -> List[Dict[str, Any]]:
     ch = mgr.clearinghouse
-    return [market_summary(ch.markets[mid]) for mid in sorted(ch.markets)]
+    return [market_summary(ch.markets[mid], ch) for mid in sorted(ch.markets)]
 
 
 def market(mgr, market_id: str) -> Optional[Dict[str, Any]]:
     m = mgr.clearinghouse.markets.get(market_id)
-    return None if m is None else market_summary(m)
+    return None if m is None else market_summary(m, mgr.clearinghouse)
 
 
 def order_book(mgr, market_id: str, depth: int = 20) -> Optional[Dict[str, Any]]:
@@ -449,6 +475,7 @@ def open_orders(mgr, address: str) -> List[Dict[str, Any]]:
                     "remaining": str(o.remaining),
                     "reduce_only": meta.reduce_only,
                     "leverage": str(meta.leverage),
+                    **_display(o),
                 }
             )
     return out
@@ -517,6 +544,10 @@ def account(mgr, address: str) -> Dict[str, Any]:
         "positions": positions,
         "leverage": leverage,
         "orders": open_orders(mgr, owner),
+        "triggers": [t for t in triggers(mgr, owner) if t["kind_of"] == "perp"],
+        "twaps": [t for t in twaps(mgr, owner) if t["perp"]],
+        "assets": portfolio_assets(mgr, owner),
+        "fees": fee_schedule(mgr, owner),
         "vault_shares": str(ch.vault_shares.get(owner, 0)),
         "vault_unlock_time": str(ch.vault_unlock.get(owner, 0)),
         "holder_address": mgr.perps_holder_address(),
@@ -524,6 +555,217 @@ def account(mgr, address: str) -> Dict[str, Any]:
         "collateral_token": mgr.perp_collateral_token(),
         "vault": vault(mgr),
     }
+
+
+# ── trigger orders, TWAPs, portfolio margin, fees ──────────────────────────
+
+
+def triggers(mgr, address: str) -> List[Dict[str, Any]]:
+    """An address's trigger orders waiting for their price: perps (``kind_of`` "perp", on the
+    mark) and spot ("spot", on the pair's last trade)."""
+    ch = mgr.clearinghouse
+    key = account_key(ch, address) or address
+    out = []
+    for mid in sorted(ch.markets):
+        m = ch.markets[mid]
+        for tid in sorted(ch._trigger_index(m)["owners"].get(key, ())):
+            t = m.triggers.peek(tid)
+            out.append(
+                {
+                    "kind_of": "perp",
+                    "order_id": tid,
+                    "market": mid,
+                    "side": t.side,
+                    "kind": t.kind,
+                    "trigger_price": str(t.trigger_price),
+                    "size": "position" if t.position else str(t.size),
+                    "limit_price": str(t.limit_price) if t.limit_price > 0 else None,
+                    "reduce_only": t.reduces,
+                    "tif": t.tif,
+                    "max_makers": t.max_makers,
+                    "seq": t.seq,
+                }
+            )
+    for tid, t in sorted(mgr.trading.spot_triggers.peek_items()):
+        if _same(t.owner, address):
+            out.append(
+                {
+                    "kind_of": "spot",
+                    "order_id": tid,
+                    "market": t.pair,
+                    "side": t.side,
+                    "kind": t.kind,
+                    "trigger_price": str(t.trigger_price),
+                    "size": str(t.amount),
+                    "limit_price": str(t.limit_price) if t.limit_price > 0 else None,
+                    "escrowed": str(t.escrowed),
+                    "tif": t.tif,
+                    "max_makers": t.max_makers,
+                    "seq": t.seq,
+                }
+            )
+    return out
+
+
+def twaps(mgr, address: str) -> List[Dict[str, Any]]:
+    """An address's TWAPs in progress."""
+    out = []
+    for tid in mgr.trading.twaps_of(account_key(mgr.clearinghouse, address) or address):
+        t = mgr.trading.twaps.peek(tid)
+        out.append(
+            {
+                "twap_id": tid,
+                "perp": t.perp,
+                "market": t.market,
+                "side": t.side,
+                "token_in": t.token_in or None,
+                "token_out": t.token_out or None,
+                "total": str(t.total),
+                "done": str(t.done),
+                "received": str(t.received),
+                "slices": t.slices,
+                "slices_done": t.slices_done,
+                "interval": str(t.interval),
+                "next_time": str(t.next_time),
+                "reduce_only": t.reduce_only,
+                "max_slippage": str(t.max_slippage),
+            }
+        )
+    return out
+
+
+def portfolio_assets(mgr, address: str) -> Dict[str, Any]:
+    """The tokens an account holds as perps margin, and what each counts for."""
+    from .clearinghouse import portfolio_assets as accepted
+
+    ch = mgr.clearinghouse
+    acct = ch.accounts.peek(account_key(ch, address) or address)
+    held = acct.assets if acct is not None else {}
+    return {
+        token: {
+            "amount": str(held.get(token, 0)),
+            "value_each": str(ch.asset_price(token)),
+            "value": str(held.get(token, 0) * ch.asset_price(token)),
+            "market": market,
+            "haircut": str(haircut),
+        }
+        for token, (market, haircut) in sorted(accepted().items())
+        if token in held
+    }
+
+
+def fee_schedule(mgr, address: Optional[str] = None) -> Dict[str, Any]:
+    """The perps fee tiers, and an address's volume, rates and referral."""
+    from . import clearinghouse as CH
+
+    ch = mgr.clearinghouse
+    out: Dict[str, Any] = {
+        "volume_days": CH.FEE_VOLUME_DAYS,
+        "tiers": [
+            {"volume": str(v), "taker": str(t), "maker": str(mk)} for v, t, mk in CH.FEE_TIERS
+        ],
+        "referral": {
+            "referee_discount": str(CH.REFEREE_DISCOUNT),
+            "referrer_share": str(CH.REFERRER_SHARE),
+            "volume_cap": str(CH.REFERRAL_VOLUME_CAP),
+            "join_before_volume": str(CH.REFERRAL_JOIN_MAX_VOLUME),
+        },
+    }
+    if address:
+        key = account_key(ch, address) or address
+        taker, maker = ch.fee_rates(key)
+        ref = ch.referrals.peek(key)
+        out.update(
+            volume=str(ch.volume(key)),
+            taker=str(taker),
+            maker=str(maker),
+            referrer=ref.referrer if ref is not None else None,
+            referred_volume=str(ref.volume) if ref is not None else None,
+            referral_code=next((c for c, o in ch.referral_codes.peek_items() if o == key), None),
+        )
+    return out
+
+
+# ── acting for an account; user vaults ─────────────────────────────────────
+
+
+def agents(mgr, address: str) -> List[Dict[str, Any]]:
+    """The agent keys an account approved (expired ones included, with ``valid_until``), and
+    each limited one's daily limit and what it has placed today."""
+    out = []
+    day = int(Decimal(str(mgr._block_clock())) // 86400)
+    for g in mgr.trading.agents.peek(address, ()):
+        view = {"agent": g.agent, "name": g.name, "valid_until": str(g.valid_until)}
+        if g.max_notional_per_day > 0:
+            spent = mgr.trading.agent_spend.peek(f"{address}|{g.agent}")
+            view["max_notional_per_day"] = str(g.max_notional_per_day)
+            view["placed_today"] = str(spent[1] if spent and spent[0] == day else 0)
+        out.append(view)
+    return out
+
+
+def subaccounts(mgr, master: str) -> List[Dict[str, Any]]:
+    return [
+        {"subaccount": a, "index": sub.index, "name": sub.name}
+        for a, sub in sorted(mgr.trading.subaccounts.peek_items(), key=lambda x: x[1].index)
+        if sub.master == master
+    ]
+
+
+def user_vaults(mgr, leader: Optional[str] = None) -> List[Dict[str, Any]]:
+    ch = mgr.clearinghouse
+    out = []
+    for v, uv in sorted(ch.user_vaults.peek_items()):
+        found = user_vault(mgr, v) if leader is None or uv.leader == leader else None
+        if found is not None:
+            out.append(found)
+    return out
+
+
+def user_vault(mgr, vault_address: str, holder: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    from .clearinghouse import USER_VAULT_LOCKUP_SECONDS
+
+    ch = mgr.clearinghouse
+    v = ch.user_vaults.peek(vault_address)
+    if v is None:
+        return None
+    nav = ch.cross_equity(vault_address)
+    acct = ch.accounts.peek(vault_address)
+    out: Dict[str, Any] = {
+        "vault": vault_address,
+        "leader": v.leader,
+        "name": v.name,
+        "profit_share": str(v.profit_share),
+        "created": str(v.created),
+        "managed": v.managed or None,  # a market's liquidity vault: quoted by the protocol
+        "nav": str(nav),
+        "total_shares": str(v.total_shares),
+        "share_value": str(nav / v.total_shares) if v.total_shares > 0 else None,
+        "leader_shares": str(ch._holding(vault_address, v.leader).shares),
+        "holders": sum(
+            1 for k in dict.keys(ch.vault_holdings) if k.split("|", 1)[0] == vault_address
+        ),
+        "withdrawable": str(ch.withdrawable(vault_address)),
+        "lockup_seconds": str(USER_VAULT_LOCKUP_SECONDS),
+        "positions": (
+            {
+                mid: {"size": str(p.size), "entry_price": str(p.entry_price)}
+                for mid, p in sorted(acct.positions.items())
+                if p.size != 0
+            }
+            if acct is not None
+            else {}
+        ),
+    }
+    if holder:
+        h = ch._holding(vault_address, holder)
+        out["holding"] = {
+            "shares": str(h.shares),
+            "cost": str(h.basis),
+            "value": str(h.shares * nav / v.total_shares) if v.total_shares > 0 else "0",
+            "unlock": str(h.unlock),
+        }
+    return out
 
 
 # ── the backstop vault ─────────────────────────────────────────────────────
@@ -649,12 +891,14 @@ def _book_of(mgr, info: Dict[str, Any]):
 
 
 def _levels(levels, best_first_desc: bool, depth: int, l3: bool, owner_of) -> List[Dict[str, Any]]:
-    rows = [(p, lvl) for p, lvl in levels.items() if lvl.total_amount > 0]
+    """What the book displays: hidden orders and icebergs' reserves are left out (an iceberg
+    shows its current slice)."""
+    rows = [(p, lvl) for p, lvl in levels.items() if lvl.visible_amount > 0]
     rows.sort(key=lambda r: r[0], reverse=best_first_desc)
     out, total, notional = [], ZERO, ZERO
     for price, lvl in rows[:depth]:
-        live = [o for o in lvl.orders if o.is_active and o.remaining > 0]
-        amount = sum((o.remaining for o in live), ZERO)
+        live = [o for o in lvl.orders if o.is_active and o.visible > 0]
+        amount = sum((o.visible for o in live), ZERO)
         total += amount
         notional += amount * price
         row = {
@@ -669,8 +913,9 @@ def _levels(levels, best_first_desc: bool, depth: int, l3: bool, owner_of) -> Li
                 {
                     "order_id": o.id,
                     "owner": owner_of(o),
-                    "remaining": str(o.remaining),
-                    "amount": str(o.amount),
+                    "remaining": str(o.visible),
+                    # An iceberg's size is what it holds back.
+                    **({} if o.is_iceberg else {"amount": str(o.amount)}),
                 }
                 for o in live
             ]
@@ -831,3 +1076,109 @@ def market_candles(
 def address_trades(mgr, address: str, limit: int = 100) -> List[Dict[str, Any]]:
     """An address's recent trades, maker or taker, on every market."""
     return mgr.journal.market.trades_of(address, limit)
+
+
+# ── who controls an address (docs/ACCOUNT_CONTROL.md, docs/CONSENSUS_ROADMAP.md B) ─────
+
+
+def authority(mgr, address: str) -> Dict[str, Any]:
+    """Everyone who may sign for ``address``, and how: its policy's controllers (with their
+    members, if they are multisigs), its own key, its delay and waiting changes, the agents it
+    approved, its master (a sub-account), its leader (a vault), its members (a multisig)."""
+    from .authority import describe
+
+    auth = mgr.authority
+    out: Dict[str, Any] = {"address": address, **describe(auth.policy(address))}
+    out["controllers"] = [
+        {"address": c, "members": _members(auth, c)} for c in auth.policy(address).controllers
+    ]
+    out["pending_changes"] = [
+        {"change_id": cid, "action": c.action, "value": c.value, "due": str(c.due)}
+        for cid, c in auth.pending_of(address)
+    ]
+    out["agents"] = agents(mgr, address)
+    master = mgr.trading.master_of(address)
+    if master is not None:
+        out["subaccount_of"] = master
+    vault = mgr.clearinghouse.user_vaults.peek(address)
+    if vault is not None:
+        out["vault"] = {
+            "leader": None if vault.managed else vault.leader,
+            "creator": vault.leader,
+            "market_maker_for": vault.managed or None,
+        }
+    members = _members(auth, address)
+    if members is not None:
+        out["multisig"] = members
+    from ..crypto.account_id import is_synthetic_holder
+
+    out["protocol_holder"] = is_synthetic_holder(address)
+    return out
+
+
+def _members(auth, address: str) -> Optional[Dict[str, Any]]:
+    k = auth.members_of(address)
+    return None if k is None else {"threshold": k.threshold, "members": list(k.members)}
+
+
+def controlled(mgr, address: str) -> Dict[str, Any]:
+    """What ``address`` may sign for or holds a stake in: the accounts it controls, the
+    sub-accounts it masters, the vaults it leads, the accounts that approved it as an agent,
+    the multisigs it is a member of, the accounts it is a guardian of, the QNS names it owns."""
+    from ..crypto.account_id import to_account_id
+
+    auth = mgr.authority
+    key = to_account_id(address)
+    out: Dict[str, Any] = {
+        "address": address,
+        "controls": auth.controlled_by(address),
+        "subaccounts": [s["subaccount"] for s in subaccounts(mgr, address)],
+        "vaults_led": sorted(
+            v for v, uv in mgr.clearinghouse.user_vaults.peek_items() if uv.leader == address
+        ),
+        "agent_for": sorted(
+            account
+            for account, grants in mgr.trading.agents.peek_items()
+            if any(to_account_id(g.agent) == key for g in grants)
+        ),
+        "multisigs": auth.multisigs_of(address),
+        "guardian_of": auth.guardian_of(address),
+    }
+    qns = getattr(mgr, "qns", None)
+    if qns is not None:
+        out["names"] = qns.names_of(mgr.nfts, address)
+    return out
+
+
+def protocol_addresses(mgr) -> Dict[str, Any]:
+    """Every address the protocol holds balances at (docs/CONSENSUS_ROADMAP.md A)."""
+    from .. import constants
+    from .bridge import BRIDGE_AUTHORITY
+    from .clearinghouse import PROTOCOL, VAULT
+    from .governance import veto_escrow_address
+
+    out: Dict[str, Any] = {
+        "perps_holder": mgr.perps_holder_address(),
+        "backstop_vault": VAULT,
+        "protocol_vault_shares": PROTOCOL,
+        "veto_escrow": veto_escrow_address(),
+        "bridge_mint_authority": BRIDGE_AUTHORITY,
+        "system_wallets": dict(sorted(constants.SYSTEM_WALLET_ADDRESSES.items())),
+        "pools": [
+            {"pool_id": pid, "holder": mgr.pool_holder_address(pid)}
+            for pid in sorted(mgr.pool_manager._pools)
+        ],
+        "order_books": [
+            {"pair": pair, "escrow": mgr.orderbook_escrow_address(pair)}
+            for pair in sorted(mgr._order_books)
+        ],
+        "vaults": [
+            {"vault": v, "leader": uv.leader, "market_maker_for": uv.managed or None}
+            for v, uv in sorted(mgr.clearinghouse.user_vaults.peek_items())
+        ],
+    }
+    for name, fn in (("qns_mint_authority", "qns_authority"), ("staker_fees", "staker_fee_holder")):
+        resolve = getattr(mgr, fn, None)
+        if resolve is not None:
+            out[name] = resolve()
+    return out

@@ -5,7 +5,8 @@ Best execution for a swap across the pair's AMM pools (every fee tier) and its o
 
 The router PLANS: it quotes every venue exactly — each pool by simulating the swap on its own
 curve (``ConcentratedLiquidityPool.quote``), the order book by walking resting orders in
-price-time priority exactly as matching will (stopping at the trader's own order, as
+the priority matching uses (price, then displayed before hidden, then time) exactly as matching
+will (stopping at the trader's own order, as
 self-trade prevention does) — and returns the best ``Route``. Executing a route
 (``apply_route``) then does precisely what was quoted. The exchange manager checks slippage and
 balances on the plan BEFORE anything changes, and settles each venue with its real counterparty:
@@ -43,6 +44,7 @@ from qrdx.exchange.amm import (
 from qrdx.exchange.oracle import TWAPOracle
 from qrdx.exchange.orderbook import (
     MIN_ORDER_SIZE,
+    MatchBudget,
     Order,
     OrderBook,
     OrderSide,
@@ -80,6 +82,7 @@ class FillResult:
     trades: List[Trade]  # order book fills (if any)
     pool_id: Optional[str] = None
     order: Optional[Order] = None
+    makers_visited: int = 0  # resting orders an order-book fill visited (its matching gas)
 
 
 @dataclass
@@ -98,6 +101,7 @@ class Route:
     side: Optional[OrderSide] = None
     size: Decimal = ZERO  # base units
     limit_price: Decimal = ZERO
+    makers: int = 0  # resting orders the fill visits (an order-book route)
 
     @property
     def price(self) -> Decimal:
@@ -132,6 +136,9 @@ class UnifiedRouter:
         self._max_price_deviation = max_price_deviation
         self._paused: bool = False
         self._clob_sequence: int = 0  # deterministic order ID counter
+        # (sender, value received) → the taker's spot fee on one fill, as settlement charges it
+        # (the exchange manager sets it): a quote is net of it, fill by fill, exactly.
+        self.taker_fee: Optional[Callable[[str, Decimal], Decimal]] = None
         # Consensus clock for the swap deadline (the exchange manager points it at the block).
         self.clock: Callable[[], float] = time.time
 
@@ -198,9 +205,16 @@ class UnifiedRouter:
 
     @_pinned
     def clob_route(
-        self, token_in: str, token_out: str, amount_in: Decimal, sender: str = ""
+        self,
+        token_in: str,
+        token_out: str,
+        amount_in: Decimal,
+        sender: str = "",
+        max_makers: Optional[int] = None,
     ) -> Optional[Route]:
-        """Walk the book exactly as matching will. None if it cannot fill anything."""
+        """Walk the book exactly as matching will — visiting no more than ``max_makers``
+        resting orders, as matching on that budget would (``MatchBudget``). None if it cannot
+        fill anything."""
         pair = self._pair_key(token_in, token_out)
         book = self._order_books.get(pair)
         if book is None or amount_in <= 0:
@@ -210,29 +224,37 @@ class UnifiedRouter:
         side = OrderSide.SELL if selling else OrderSide.BUY
         levels = book._bids if selling else book._asks
         prices = sorted(levels, reverse=selling)
-        size = spent = out = ZERO
+        size = spent = out = fees = ZERO
         limit = ZERO
+        visited = 0
         done = False
+        fee_of = self.taker_fee
         for price in prices:
-            for order in levels[price].orders:
-                if not order.is_active:
-                    continue
+            # Displayed quantities first, then hidden ones — matching's priority.
+            for order, offered in book.fill_queue(levels[price]):
                 if order.owner == sender:  # self-trade prevention stops the taker here
                     done = True
                     break
+                if max_makers is not None and visited >= max_makers:
+                    done = True  # out of budget: matching stops here too
+                    break
+                visited += 1
                 if selling:
-                    take = min(order.remaining, amount_in - size)
-                    out += take * price
+                    take = min(offered, amount_in - size)
+                    received = take * price
                 else:
                     affordable = ((amount_in - spent) / price).quantize(
                         AMOUNT_QUANTUM, rounding=ROUND_DOWN
                     )
-                    take = min(order.remaining, affordable)
+                    take = min(offered, affordable)
                     spent += take * price
-                    out += take
+                    received = take
                 if take <= 0:
                     done = True
                     break
+                fee = fee_of(sender, received) if fee_of is not None else ZERO
+                out += received - fee
+                fees += fee
                 size += take
                 limit = price
                 if (selling and size >= amount_in) or (not selling and amount_in - spent <= 0):
@@ -249,11 +271,12 @@ class UnifiedRouter:
             token_out,
             used,
             out,
-            ZERO,
+            fees,
             pair=pair,
             side=side,
             size=size,
             limit_price=limit,
+            makers=visited,
         )
 
     def best_route(
@@ -264,14 +287,16 @@ class UnifiedRouter:
         sender: str = "",
         pool_id: Optional[str] = None,
         venue: str = "auto",
+        max_makers: Optional[int] = None,
     ) -> Optional[Route]:
-        """The route giving the most output (ties: the AMM, then the lowest pool id)."""
+        """The route giving the most output (ties: the AMM, then the lowest pool id). An
+        order-book route visits no more than ``max_makers`` resting orders."""
         amount_in = Decimal(str(amount_in))
         candidates: List[Route] = []
         if venue in ("auto", "amm"):
             candidates += self.amm_routes(token_in, token_out, amount_in, pool_id)
         if venue in ("auto", "clob") and not pool_id:
-            r = self.clob_route(token_in, token_out, amount_in, sender)
+            r = self.clob_route(token_in, token_out, amount_in, sender, max_makers)
             if r is not None:
                 candidates.append(r)
         if not candidates:
@@ -339,7 +364,8 @@ class UnifiedRouter:
             nonce=0,
             timestamp=0.0,
         )
-        trades = book.place_order(order, protocol=True)
+        budget = MatchBudget(route.makers)
+        trades = book.place_order(order, protocol=True, budget=budget)
         if order.is_active:
             book.cancel_order(order.id, caller=sender)  # immediate-or-cancel
         filled = sum((t.amount for t in trades), ZERO)
@@ -347,6 +373,7 @@ class UnifiedRouter:
             raise ValueError(f"order book fill {filled} differs from its quote {route.size}")
         fees = self._fee_parts(ZERO, ZERO)
         return FillResult(
+            makers_visited=budget.visited,
             source=FillSource.CLOB,
             amount_in=route.amount_in,
             amount_out=route.amount_out,

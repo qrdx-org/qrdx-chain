@@ -160,8 +160,20 @@ class PQTransaction:
 
     # -- Identity -----------------------------------------------------------
 
+    def is_multisig(self) -> bool:
+        """Signed by an m-of-n multisig (docs/ACCOUNT_CONTROL.md): ``public_key`` is its keyset
+        and ``signature`` the aggregate (qrdx/crypto/multisig_wire.py)."""
+        from ..crypto.multisig_wire import is_multisig_material
+
+        return is_multisig_material(self.public_key)
+
     def pq_address(self) -> str:
-        """The human-facing ``0xPQ…`` address of the signing key."""
+        """The human-facing address of the signer: its ``0xPQ…`` key, or its ``0xPQMS…``
+        multisig (derived from the keyset)."""
+        if self.is_multisig():
+            from ..crypto.multisig_wire import decode_keyset
+
+            return decode_keyset(self.public_key).address
         from ..crypto.pq.dilithium import PQPublicKey
 
         return PQPublicKey.from_bytes(self.public_key).to_address()
@@ -207,6 +219,13 @@ class PQTransaction:
         if not self.signature or not self.public_key:
             return False
         try:
+            if self.is_multisig():
+                from ..crypto import multisig_wire
+
+                return (
+                    multisig_wire.verify(self.public_key, self.signature, self.signing_hash())
+                    is not None
+                )
             from ..crypto.pq.dilithium import PQPublicKey, PQSignature, verify as pq_verify
 
             pub = PQPublicKey.from_bytes(self.public_key)
@@ -243,7 +262,10 @@ def intrinsic_gas_pq(
     envelope term a PQ transaction would impose ~250x a legacy transaction's
     bandwidth and verification cost at the same price.
     """
-    gas = PQ_TX_BASE_GAS + PQ_TX_VERIFY_GAS
+    from ..crypto.multisig_wire import signer_count
+
+    # One verification — or a multisig's one per partial signature.
+    gas = PQ_TX_BASE_GAS + PQ_TX_VERIFY_GAS * max(1, signer_count(signature or b""))
     if is_create:
         gas += PQ_TX_CREATE_GAS
     for byte in data or b"":
@@ -309,13 +331,20 @@ def decode_pq_tx(raw: bytes) -> PQTransaction:
 
     # Reject wrong-sized key/signature material up front: it is cheaper than
     # letting the verifier allocate, and it keeps the failure mode explicit.
+    from ..crypto.multisig_wire import MAX_KEYS, is_multisig_material
     from ..crypto.pq.dilithium import PUBLIC_KEY_SIZE, SIGNATURE_SIZE
 
-    if len(public_key) != PUBLIC_KEY_SIZE:
+    if is_multisig_material(public_key):
+        # A multisig: its keyset and aggregate, bounded by the number of keys a keyset may hold.
+        if len(public_key) > MAX_KEYS * (PUBLIC_KEY_SIZE * 2 + 16) + 64 or len(signature) > (
+            MAX_KEYS * ((PUBLIC_KEY_SIZE + SIGNATURE_SIZE) * 2 + 64) + 256
+        ):
+            raise InvalidPQTransaction("multisig key material is too large")
+    elif len(public_key) != PUBLIC_KEY_SIZE:
         raise InvalidPQTransaction(
             f"public key must be {PUBLIC_KEY_SIZE} bytes, got {len(public_key)}"
         )
-    if len(signature) != SIGNATURE_SIZE:
+    elif len(signature) != SIGNATURE_SIZE:
         raise InvalidPQTransaction(
             f"signature must be {SIGNATURE_SIZE} bytes, got {len(signature)}"
         )

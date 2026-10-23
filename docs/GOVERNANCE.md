@@ -16,13 +16,22 @@ Verified live (2026-10-09, 4-node testnet, S22 33/33):
 - **Fork approval:** approval was driven on chain in the upgrade rehearsal
   (docs/PROTOCOL_UPGRADES.md).
 
-It governs three things:
+It governs four things:
 
 | Action | Effect when executed |
 |---|---|
 | `system_spend` | moves QRDX from a system wallet (treasury, grants, …) to a recipient |
 | `freeze_master` | ends the genesis master controller's authority over the system wallets now |
 | `approve_fork` | authorises a fork scheduled in the chain spec to activate (docs/PROTOCOL_UPGRADES.md) |
+| `delist_market` | settles a perp market for good: `{market_id, price?}` — below |
+
+**Delisting** (docs/CONSENSUS_ROADMAP.md 4). Executing `delist_market` cancels every order,
+trigger and TWAP in the market and closes every position at one settlement price — the `price`
+given, or the oracle's at execution — zero-sum, since the sizes net to zero. The market's
+liquidity vault stops quoting and its creator's lockup ends; the market then refuses every order
+and trigger, and its tick does nothing. The market is checked at execution, not at proposal: an
+execution that cannot settle (no such market, already delisted, no price) fails and may be retried
+within the execution window. Tests: `tests/test_delisting.py`.
 
 ## 1. Who does what
 

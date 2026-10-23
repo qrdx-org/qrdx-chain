@@ -359,8 +359,9 @@ async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, An
         preload_sender_balances,
         preload_token_balances,
         process_exchange_transactions,
-        run_exchange_tick,
+        tick_and_flush,
     )
+    from .validator.withdrawals import _payout_moves
 
     # Withdrawals already paid, grouped by the block that paid them.
     cur = await db.connection.execute(
@@ -368,18 +369,22 @@ async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, An
         "WHERE block_height BETWEEN ? AND ? ORDER BY block_height, address",
         (start, end),
     )
-    paid = list(await cur.fetchall())
-    # …and staking payouts (rewards, undelegations, refunds), the same way.
+    paid = [(h, a, v, "withdrawal") for h, a, v in await cur.fetchall()]
+    # …and staking payouts (rewards, undelegations, refunds, fee income), the same way.
     cur = await db.connection.execute(
-        "SELECT block_height, address, amount FROM staking_payouts "
+        "SELECT block_height, address, amount, kind FROM staking_payouts "
         "WHERE block_height BETWEEN ? AND ? ORDER BY block_height, payout_id",
         (start, end),
     )
     paid += list(await cur.fetchall())
     paid_by_block: dict = {}
-    for height, address, amount in paid:
+    for height, address, amount, kind in paid:
         if Decimal(str(amount)) != 0:  # a forfeited exit is settled with a zero row
-            paid_by_block.setdefault(int(height), []).append((address, Decimal(str(amount))))
+            # The moves the forward path made (withdrawals._payout_moves): a fee payout comes
+            # out of the fee holder, it is not a credit from nothing.
+            paid_by_block.setdefault(int(height), []).extend(
+                _payout_moves(address, Decimal(str(amount)), str(kind))
+            )
 
     counts: Dict[str, Any] = {"blocks": 0, "exchange": 0, "evm": 0, "withdrawals": 0}
     if end < start:
@@ -444,7 +449,7 @@ async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, An
                 # No exchange transactions: the exchange still ticks, as on every forward path,
                 # judged by the committee forward judged it by.
                 await ensure_oracle_committee(db, mgr, height)
-                run_exchange_tick(height, float(raw_ts), mgr)
+                await tick_and_flush(db, height, float(raw_ts), mgr)
 
             # 2. EVM section — sees the exchange effects of this and every earlier block.
             try:

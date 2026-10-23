@@ -286,10 +286,29 @@ def reconstruct_signing_root(bc: Dict[str, Any]) -> bytes:
     return hashlib.sha256(data).digest()
 
 
+async def block_height_of(db: Any, bc: Dict[str, Any]) -> Optional[int]:
+    """A block's height: its parent's stored height + 1. (Its signed ``number`` is its SLOT —
+    the proposer sets ``number=slot`` — and runs ahead of the height once a slot is skipped, so
+    a rule gated by height must never be judged by it.) None if the parent is not stored."""
+    parent = str(bc.get("parent_hash") or "")
+    if not parent:
+        return None  # (content without a parent: nothing to judge by)
+    if set(parent) <= {"0"}:
+        return 0
+    try:
+        row = await db.get_block(parent)
+    except Exception:
+        return None
+    if not row or row.get("block_height") is None:
+        return None
+    return int(row["block_height"]) + 1
+
+
 async def verify_proposer_eligibility(
     db: Any,
     block_content: Any,
     enforce: bool = False,
+    height: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """
     Verify the block's proposer is the validator selected for its slot.
@@ -314,12 +333,17 @@ async def verify_proposer_eligibility(
         return True, ""
     try:
         slot = int(bc["slot"])
-        height = int(bc["number"])
         proposer = bc.get("proposer_address")
     except Exception:
         return True, ""
     if not proposer:
         return True, ""
+    # The block's HEIGHT (given by the applying path, else its parent's + 1): the chain it is
+    # judged on ends at its parent, and height-gated rules apply by height.
+    if height is None:
+        height = await block_height_of(db, bc)
+    if height is None:
+        return (False, "unknown parent: the block cannot be judged") if enforce else (True, "")
 
     from .epoch_state import proposers_for_slot
 

@@ -155,7 +155,9 @@ async def install(conn: Any) -> None:
     for kind in TABLES:
         for stmt in _trigger_sql(kind):
             await conn.execute(stmt)
-    await reconcile(conn)
+    # (Kept for qrdx/state_proofs.py: a repaired domain had rows written without the
+    # triggers, which the state-proof tree's own triggers missed too.)
+    conn.qrdx_lt_repaired = await reconcile(conn)
 
 
 async def full_accumulator(conn: Any, domain: str) -> bytes:

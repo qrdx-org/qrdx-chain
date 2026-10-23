@@ -324,12 +324,16 @@ async def test_a_historical_block_is_judged_against_its_own_epochs_set(chain):
     # A block of epoch 2 (height 3, on the parent chain ending at height 2), judged now.
     right = expected_proposer_for_slot(early_slot, early_set)
     wrong = next(a for a in G if a != right)
-    assert (await verify_proposer_eligibility(chain.db, content(early_slot, 3, right), True))[0]
-    assert not (await verify_proposer_eligibility(chain.db, content(early_slot, 3, wrong), True))[0]
+    # (A block's signed ``number`` is its slot; the importer gives its height.)
+    assert (await verify_proposer_eligibility(
+        chain.db, content(early_slot, early_slot, right), True, height=3))[0]
+    assert not (await verify_proposer_eligibility(
+        chain.db, content(early_slot, early_slot, wrong), True, height=3))[0]
     # The next block, on today's chain, is judged against today's set.
     tip = chain.height
     expected = expected_proposer_for_slot(late_slot, late_set)
-    ok, _ = await verify_proposer_eligibility(chain.db, content(late_slot, tip + 1, expected), True)
+    ok, _ = await verify_proposer_eligibility(
+        chain.db, content(late_slot, late_slot, expected), True, height=tip + 1)
     assert ok
 
 

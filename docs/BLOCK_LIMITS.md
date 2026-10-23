@@ -63,6 +63,19 @@ When the budget runs out the order stops matching, and its remainder is cancelle
 could still cross the book. A visit takes ~25 µs. An order used to sweep any number of makers for
 its base gas: 1,600 makers in one `PERP_ORDER` took 38 ms for 60,000 gas.
 
+The same holds for a `SWAP` routed through an order book (the router quotes the book within what
+the gas limit pays for, and execution runs on exactly that budget), and for an order that fails
+after matching — a fill-or-kill that cannot fill whole pays for the makers it visited.
+
+### Work the tick does is paid for when it is placed, and bounded per block
+
+Trigger orders and TWAP slices run in the tick at the end of a block, outside any transaction
+(docs/TRADING_FEATURES.md). Their matching is paid for when they are placed: a trigger prepays
+`max_makers` (1–100) resting-order visits, a TWAP each slice's work and `max_makers` (1–20) visits.
+A block fires at most 64 perps triggers and 64 spot triggers (1,000 visits each), runs at most 64
+TWAP slices (640 visits); the rest wait for the next blocks. A 60-slice TWAP costs 3.64M gas at 5
+makers a slice, so no TWAP can prepay more than a block's exchange gas.
+
 ### Precompiles priced for what they cost here
 
 py-evm runs bn128 in pure Python, where Ethereum clients run it natively. At Ethereum's prices

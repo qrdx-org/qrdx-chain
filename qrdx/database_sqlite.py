@@ -5,6 +5,7 @@ This is a simplified SQLite adapter for local testnet development.
 For production, use the full PostgreSQL database.py implementation.
 """
 
+import json
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -79,6 +80,10 @@ class DatabaseSQLite:
         from . import state_commitment, undo_journal
 
         await state_commitment.install(self.connection)
+        # The sparse Merkle tree over the same rows, for state proofs (qrdx/state_proofs.py).
+        from . import state_proofs
+
+        await state_proofs.install(self.connection)
         # Per-block undo journal for reorgs (qrdx/undo_journal.py). A database without one
         # covers no block until the next full rebuild resets it.
         await undo_journal.install(self.connection)
@@ -368,6 +373,13 @@ class DatabaseSQLite:
             value TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_staking_ops_height ON staking_ops(block_height);
+        -- The stakers' share of the protocol's QRDX fee income each block took in, held at
+        -- the fee holder until its epoch is shared out (qrdx/validator/epoch_state.py). One
+        -- row per block, written by every path alike; dropped above a rollback.
+        CREATE TABLE IF NOT EXISTS staker_fee_income (
+            block_height INTEGER PRIMARY KEY,
+            amount TEXT NOT NULL
+        );
         -- The ledger of staking payouts (rewards, finished undelegations, refunds) blocks have
         -- credited, like validator_withdrawals: undone above a rollback, re-credited after an
         -- account rebuild.
@@ -536,6 +548,87 @@ class DatabaseSQLite:
         CREATE INDEX IF NOT EXISTS idx_tx_index_hash ON tx_index(tx_hash);
         CREATE INDEX IF NOT EXISTS idx_tx_index_kind ON tx_index(kind, block_height);
 
+        -- Trading history (qrdx/trading_history.py): every trade, every order's life, funding
+        -- and per-minute market samples, from the exchange journal as blocks commit. Derived
+        -- and node-local (never hashed); cut back with the chain.
+        CREATE TABLE IF NOT EXISTS hist_trades (
+            block_height INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            block_time REAL,
+            market TEXT,
+            venue TEXT,
+            kind TEXT,
+            price TEXT,
+            amount TEXT,
+            side TEXT,
+            buyer TEXT,
+            seller TEXT,
+            maker TEXT,
+            taker TEXT,
+            maker_order_id TEXT,
+            taker_order_id TEXT,
+            tx_hash TEXT,
+            pool_id TEXT,
+            fees TEXT,
+            realized TEXT,
+            PRIMARY KEY (block_height, position)
+        );
+        CREATE INDEX IF NOT EXISTS idx_hist_trades_market ON hist_trades(market, block_height);
+        CREATE TABLE IF NOT EXISTS hist_trade_accounts (
+            account TEXT NOT NULL,
+            block_height INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            block_time REAL,
+            venue TEXT,
+            role TEXT,
+            side TEXT,
+            notional TEXT,
+            fee TEXT,
+            realized TEXT,
+            PRIMARY KEY (account, block_height, position)
+        );
+        CREATE INDEX IF NOT EXISTS idx_hist_trade_accounts_time
+            ON hist_trade_accounts(venue, block_time);
+        CREATE TABLE IF NOT EXISTS hist_orders (
+            block_height INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            block_time REAL,
+            account TEXT,
+            market TEXT,
+            order_id TEXT,
+            event TEXT,
+            tx_hash TEXT,
+            detail TEXT,
+            PRIMARY KEY (block_height, position)
+        );
+        CREATE INDEX IF NOT EXISTS idx_hist_orders_account ON hist_orders(account, block_height);
+        CREATE INDEX IF NOT EXISTS idx_hist_orders_id ON hist_orders(order_id);
+        CREATE TABLE IF NOT EXISTS hist_funding (
+            block_height INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            block_time REAL,
+            market TEXT,
+            rate TEXT,
+            premium TEXT,
+            oracle_price TEXT,
+            open_interest TEXT,
+            funding_time TEXT,
+            PRIMARY KEY (block_height, position)
+        );
+        CREATE INDEX IF NOT EXISTS idx_hist_funding_market ON hist_funding(market, block_height);
+        CREATE TABLE IF NOT EXISTS hist_samples (
+            block_height INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            block_time REAL,
+            market TEXT,
+            mark TEXT,
+            oracle TEXT,
+            open_interest TEXT,
+            funding_rate TEXT,
+            PRIMARY KEY (block_height, position)
+        );
+        CREATE INDEX IF NOT EXISTS idx_hist_samples_market ON hist_samples(market, block_time);
+
         -- Node-local chain records: the genesis summary, and the forks this node has passed
         -- (checked against the chain spec on every start — docs/PROTOCOL_UPGRADES.md).
         CREATE TABLE IF NOT EXISTS chain_metadata (
@@ -560,6 +653,9 @@ class DatabaseSQLite:
         CREATE INDEX IF NOT EXISTS idx_validator_withdrawals_height ON validator_withdrawals(block_height);
         CREATE INDEX IF NOT EXISTS idx_validator_deposits_address ON validator_deposits(address);
         CREATE INDEX IF NOT EXISTS idx_account_state_address ON account_state(address);
+        -- Balance writes find their row case-insensitively (genesis may store a checksummed
+        -- address): without this every write scanned the table (docs/KNOWN_ISSUES.md).
+        CREATE INDEX IF NOT EXISTS idx_account_state_lower ON account_state(LOWER(address));
         CREATE INDEX IF NOT EXISTS idx_account_state_is_contract ON account_state(is_contract);
         CREATE INDEX IF NOT EXISTS idx_contract_metadata_verified ON contract_metadata(verified);
         CREATE INDEX IF NOT EXISTS idx_contract_tx_block ON contract_transactions(block_number);
@@ -1811,6 +1907,20 @@ class DatabaseSQLite:
             (int(block_height), kind, sender, validator, None if value is None else str(value)),
         )
 
+    async def log_staker_fee_income(self, block_height: int, amount) -> None:
+        """Record the stakers' fee income block ``block_height`` took in. The row is the block's
+        own: written (or, for nothing, removed) by every path that applies the block, so a rebuild
+        writes the same and an orphaned block's row never outlives it. No commit."""
+        if amount and amount > 0:
+            await self.connection.execute(
+                "INSERT OR REPLACE INTO staker_fee_income (block_height, amount) VALUES (?, ?)",
+                (int(block_height), str(amount)),
+            )
+        else:
+            await self.connection.execute(
+                "DELETE FROM staker_fee_income WHERE block_height = ?", (int(block_height),)
+            )
+
     async def undo_validator_deposits_above(self, tip_height: int) -> dict:
         """Drop the deposit log of every block above ``tip_height`` (after a rollback). The
         validator set is computed from the chain and these logs (validator/epoch_state.py),
@@ -1822,7 +1932,14 @@ class DatabaseSQLite:
         cur = await self.connection.execute(
             "DELETE FROM staking_ops WHERE block_height > ?", (int(tip_height),)
         )
-        return {"reversed": n + (cur.rowcount if cur.rowcount is not None else 0)}
+        n += cur.rowcount if cur.rowcount is not None else 0
+        await self.connection.execute(
+            "DELETE FROM staker_fee_income WHERE block_height > ?", (int(tip_height),)
+        )
+        from . import state_proofs
+
+        await state_proofs.undo_above(self, tip_height)  # orphaned heights' proof roots
+        return {"reversed": n}
 
     async def get_genesis_validators(self) -> list:
         """The GENESIS validator set as [{address, public_key, stake}] for the reconstruction
@@ -2006,7 +2123,218 @@ class DatabaseSQLite:
             "DELETE FROM contract_transactions WHERE block_number >= ?", (start_id,)
         )
         await self._tx_index_cut(start_id)
+        await self._hist_cut(start_id)
         await self.connection.commit()
+
+    # ── trading history (qrdx/trading_history.py) ────────────────────────
+
+    _HIST_TABLES = (
+        "hist_trades",
+        "hist_trade_accounts",
+        "hist_orders",
+        "hist_funding",
+        "hist_samples",
+    )
+
+    async def _hist_cut(self, height: int) -> None:
+        for table in self._HIST_TABLES:
+            await self.connection.execute(
+                f"DELETE FROM {table} WHERE block_height >= ?", (int(height),)
+            )
+
+    async def hist_cut(self, height: int) -> None:
+        """Forget the trading history at or above ``height``."""
+        await self._hist_cut(height)
+        await self.connection.commit()
+
+    async def hist_write_block(self, height: int, block: dict) -> None:
+        """Replace a height's trading history with ``block``'s rows (the journal's outbox
+        entry: ``time``, ``trades``, ``orders``, ``funding``, ``samples``)."""
+        from .trading_history import trade_accounts
+        from .tx_index import account_key
+
+        height, when = int(height), block.get("time")
+        for table in self._HIST_TABLES:
+            await self.connection.execute(f"DELETE FROM {table} WHERE block_height = ?", (height,))
+        trade_cols = (
+            "market",
+            "venue",
+            "kind",
+            "price",
+            "amount",
+            "side",
+            "buyer",
+            "seller",
+            "maker",
+            "taker",
+            "maker_order_id",
+            "taker_order_id",
+            "tx_hash",
+            "pool_id",
+        )
+        trades, accounts = [], []
+        for pos, t in enumerate(block.get("trades") or []):
+            trades.append(
+                (height, pos, when)
+                + tuple(None if t.get(c) is None else str(t.get(c)) for c in trade_cols)
+                + (json.dumps(t.get("fees") or {}), json.dumps(t.get("realized") or {}))
+            )
+            for a in trade_accounts(t):
+                accounts.append(
+                    (a["account"], height, pos, when, t.get("venue"), a["role"], a["side"])
+                    + tuple(
+                        None if a[k] is None else str(a[k]) for k in ("notional", "fee", "realized")
+                    )
+                )
+        await self.connection.executemany(
+            f"INSERT INTO hist_trades (block_height, position, block_time, {', '.join(trade_cols)},"
+            f" fees, realized) VALUES ({', '.join('?' * (len(trade_cols) + 5))})",
+            trades,
+        )
+        await self.connection.executemany(
+            "INSERT OR REPLACE INTO hist_trade_accounts (account, block_height, position, "
+            "block_time, venue, role, side, notional, fee, realized) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            accounts,
+        )
+        await self.connection.executemany(
+            "INSERT INTO hist_orders (block_height, position, block_time, account, market, "
+            "order_id, event, tx_hash, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    height,
+                    pos,
+                    when,
+                    account_key(o.get("account")),
+                    o.get("market"),
+                    None if o.get("order_id") is None else str(o["order_id"]),
+                    o.get("event"),
+                    o.get("tx_hash"),
+                    json.dumps(o.get("detail") or {}, default=str),
+                )
+                for pos, o in enumerate(block.get("orders") or [])
+            ],
+        )
+        await self.connection.executemany(
+            "INSERT INTO hist_funding (block_height, position, block_time, market, rate, premium,"
+            " oracle_price, open_interest, funding_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (height, pos, when)
+                + tuple(
+                    f.get(k)
+                    for k in (
+                        "market",
+                        "rate",
+                        "premium",
+                        "oracle_price",
+                        "open_interest",
+                        "funding_time",
+                    )
+                )
+                for pos, f in enumerate(block.get("funding") or [])
+            ],
+        )
+        await self.connection.executemany(
+            "INSERT INTO hist_samples (block_height, position, block_time, market, mark, oracle,"
+            " open_interest, funding_rate) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (height, pos, when)
+                + tuple(
+                    x.get(k) for k in ("market", "mark", "oracle", "open_interest", "funding_rate")
+                )
+                for pos, x in enumerate(block.get("samples") or [])
+            ],
+        )
+        await self.connection.commit()
+
+    async def _hist_rows(self, sql: str, params: tuple) -> list:
+        cursor = await self.connection.execute(sql, params)
+        names = [d[0] for d in cursor.description]
+        return [dict(zip(names, tuple(r), strict=False)) for r in await cursor.fetchall()]
+
+    @staticmethod
+    def _hist_before(before, alias: str = "") -> tuple:
+        if before is None:
+            return "", ()
+        a = f"{alias}." if alias else ""
+        return (
+            f" AND ({a}block_height < ? OR ({a}block_height = ? AND {a}position < ?))",
+            (int(before[0]), int(before[0]), int(before[1])),
+        )
+
+    async def hist_trades(self, *, account=None, market=None, before=None, limit=100) -> list:
+        where, params = "1=1", []
+        if account is not None:
+            sql = (
+                "SELECT t.*, a.role AS role, a.side AS account_side, a.fee AS fee, "
+                "a.realized AS account_realized FROM hist_trade_accounts a JOIN hist_trades t "
+                "ON t.block_height = a.block_height AND t.position = a.position "
+                "WHERE a.account = ?"
+            )
+            params.append(account)
+            alias = "a"
+        else:
+            sql, alias = f"SELECT t.* FROM hist_trades t WHERE {where}", "t"
+        if market is not None:
+            sql += " AND t.market = ?"
+            params.append(market)
+        extra, more = self._hist_before(before, alias)
+        sql += extra + f" ORDER BY {alias}.block_height DESC, {alias}.position DESC LIMIT ?"
+        return await self._hist_rows(sql, tuple(params) + more + (int(limit),))
+
+    async def hist_orders(
+        self, *, account=None, market=None, order_id=None, before=None, limit=100
+    ) -> list:
+        sql, params = "SELECT * FROM hist_orders WHERE 1=1", []
+        for column, value in (("account", account), ("market", market), ("order_id", order_id)):
+            if value is not None:
+                sql += f" AND {column} = ?"
+                params.append(value)
+        extra, more = self._hist_before(before)
+        sql += extra + " ORDER BY block_height DESC, position DESC LIMIT ?"
+        return await self._hist_rows(sql, tuple(params) + more + (int(limit),))
+
+    async def hist_funding(self, market: str, *, before=None, limit=100) -> list:
+        extra, more = self._hist_before(before)
+        return await self._hist_rows(
+            "SELECT * FROM hist_funding WHERE market = ?"
+            + extra
+            + " ORDER BY block_height DESC, position DESC LIMIT ?",
+            (market,) + more + (int(limit),),
+        )
+
+    async def hist_samples(self, market: str, *, since=None, until=None, limit=500) -> list:
+        sql = "SELECT * FROM hist_samples WHERE market = ?"
+        params: list = [market]
+        if since is not None:
+            sql += " AND block_time >= ?"
+            params.append(float(since))
+        if until is not None:
+            sql += " AND block_time <= ?"
+            params.append(float(until))
+        sql += " ORDER BY block_time ASC, block_height ASC LIMIT ?"
+        return await self._hist_rows(sql, tuple(params) + (int(limit),))
+
+    async def hist_latest_time(self):
+        cursor = await self.connection.execute("SELECT MAX(block_time) FROM hist_trade_accounts")
+        row = await cursor.fetchone()
+        return None if row is None else row[0]
+
+    async def hist_leaderboard(self, *, since=None, metric="pnl", limit=50) -> list:
+        """Perps accounts by realized PnL less fees, or by volume (floats: a ranking)."""
+        order = "pnl" if metric == "pnl" else "volume"
+        sql = (
+            "SELECT account, SUM(CAST(COALESCE(realized, '0') AS REAL)) - "
+            "SUM(CAST(COALESCE(fee, '0') AS REAL)) AS pnl, "
+            "SUM(CAST(COALESCE(notional, '0') AS REAL)) AS volume, COUNT(*) AS trades "
+            "FROM hist_trade_accounts WHERE venue = 'perp'"
+        )
+        params: list = []
+        if since is not None:
+            sql += " AND block_time >= ?"
+            params.append(float(since))
+        sql += f" GROUP BY account ORDER BY {order} DESC, account ASC LIMIT ?"
+        return await self._hist_rows(sql, tuple(params) + (int(limit),))
 
     # ── transaction index (qrdx/tx_index.py) ─────────────────────────────
 

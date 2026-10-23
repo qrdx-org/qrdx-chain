@@ -319,14 +319,14 @@ def test_the_rest_import_path_applies_withdrawals_before_e_d4():
     src = source_of(main)
     rest = src[src.index("return {'ok': False, 'error': f'Invalid EVM section: {verr_evm}'}"):]
     assert _between(rest, "Invalid EVM section", "_apply_block_withdrawals_on_import(",
-                    "_verify_unified_state_root(block_content)")
+                    "_verify_unified_state_root(block_content, height=block_no)")
 
 
 def test_the_p2p_import_path_applies_withdrawals_before_e_d4():
     from qrdx.rpc.modules import p2p
     src = source_of(p2p)
     assert _between(src, "self._evm_apply_section(", "process_block_withdrawals(",
-                    "self._verify_unified_root(block_content)")
+                    "self._verify_unified_root(")
 
 
 def test_exits_are_logged_with_their_carrying_block():

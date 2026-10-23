@@ -178,16 +178,30 @@ def feed_from_env(spec: Optional[str] = None) -> Optional[PriceFeed]:
     return None
 
 
-def build_vote(wallet, nonce: int, prices: Dict[str, Decimal], deposits=None):
+def freeze_from_env() -> List[str]:
+    """The deployer markets this validator's operator votes to freeze (QRDX_ORACLE_FREEZE,
+    comma-separated market ids): a deployer running one dishonestly, until governance acts."""
+    raw = os.environ.get("QRDX_ORACLE_FREEZE", "")
+    return sorted({m.strip() for m in raw.split(",") if m.strip()})
+
+
+def build_vote(
+    wallet, nonce: int, prices: Dict[str, Decimal], deposits=None, heads=None, freeze=None
+):
     """An ORACLE_VOTE exchange transaction signed by the validator's PQ wallet. ``nonce`` is the
     vote's own sequence (the slot it was made in): it must exceed the voter's last applied one,
-    and does not touch the account's exchange nonce. ``deposits``: bridge deposits it attests
-    (docs/BRIDGE.md)."""
+    and does not touch the account's exchange nonce. ``deposits``: bridge deposits it attests;
+    ``heads``: source chains' finalized heads it attests (docs/BRIDGE.md); ``freeze``: deployer
+    markets it votes to freeze (docs/HYPERLIQUID_PARITY.md)."""
     from ..exchange import ExchangeOpType, ExchangeTransaction
 
     params: Dict[str, Any] = {"prices": {b: str(p) for b, p in sorted(prices.items())}}
     if deposits:
         params["deposits"] = list(deposits)
+    if heads:
+        params["heads"] = list(heads)
+    if freeze:
+        params["freeze"] = sorted(freeze)
     tx = ExchangeTransaction(
         op_type=ExchangeOpType.ORACLE_VOTE,
         sender=wallet.address,

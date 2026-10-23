@@ -361,3 +361,50 @@ async def test_the_real_rollback_hook_replays_in_forward_order():
     finally:
         await db.close()
         os.remove(path)
+
+
+# ── stakers' fee income (docs/CONSENSUS_ROADMAP.md 6) ───────────────────────
+
+async def _fee_payout_chain(db):
+    """The fee holder holds an epoch's income (genesis here); block 1 pays it out as a
+    validator's ``fee`` and its pool's ``fee_pooled`` — both out of the holder."""
+    from qrdx.validator.epoch_state import STAKER_FEE_HOLDER, Payout
+
+    v = "0x" + "ab" * 20
+    await _add_block(db, 0, genesis_alloc=[(STAKER_FEE_HOLDER, "0.04"), (v, "1")])
+    await _add_block(db, 1)
+    await _forward(db, 1)
+    await WD.apply_payouts(db, [Payout(1, v, Decimal("0.03"), 1, "fee"),
+                                Payout(2, STAKER_FEE_HOLDER, Decimal("0.01"), 1, "fee_pooled")], 1)
+    await db.connection.commit()
+    return v, STAKER_FEE_HOLDER
+
+
+async def test_fee_payouts_rebuild_like_forward():
+    """A restarted node replays payouts by block: a fee payout comes out of the fee holder there
+    too. (The replay used to credit every payout from nothing — the holder kept the income it
+    had paid out, and a ``fee_pooled`` row, addressed to the holder, was even credited to it: the
+    restarted node's account root disagreed with every block's.)"""
+    db, path = await _db()
+    try:
+        v, holder = await _fee_payout_chain(db)
+        assert await _balances(db, v, holder) == (Decimal("1.03"), Decimal(0))
+        fwd_root = await db.get_account_state_root()
+        assert await _interleaved(db) == fwd_root
+        assert await _balances(db, v, holder) == (Decimal("1.03"), Decimal(0))
+    finally:
+        await db.close()
+        os.remove(path)
+
+
+async def test_a_replay_crediting_fee_payouts_from_nothing_diverges(monkeypatch):
+    """Sensitivity: with the old replay (every payout a plain credit) the rebuild disagrees."""
+    db, path = await _db()
+    try:
+        await _fee_payout_chain(db)
+        fwd_root = await db.get_account_state_root()
+        monkeypatch.setattr(WD, "_payout_moves", lambda address, amount, kind: [(address, amount)])
+        assert await _interleaved(db) != fwd_root
+    finally:
+        await db.close()
+        os.remove(path)

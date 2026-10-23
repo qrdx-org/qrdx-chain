@@ -59,7 +59,13 @@ def _slot_where_the_rules_disagree():
 
 
 def _block(height, slot, proposer):
-    return {"number": height, "slot": slot, "proposer_address": proposer}
+    # (A block's signed ``number`` is its slot; its height comes from where it is applied.)
+    return {"number": slot, "slot": slot, "proposer_address": proposer}
+
+
+async def _eligible(db, height, slot, proposer):
+    return (await verify_proposer_eligibility(
+        db, _block(height, slot, proposer), enforce=True, height=height))[0]
 
 
 def test_the_rule_is_off_below_the_fork_and_on_from_it():
@@ -73,23 +79,28 @@ async def test_each_block_is_judged_under_the_rules_of_its_own_height():
     db = _DB()
     below, at = FORK_HEIGHT - 1, FORK_HEIGHT
 
-    ok, _ = await verify_proposer_eligibility(db, _block(below, slot, legacy), enforce=True)
-    assert ok, "below the fork the legacy proposer is the eligible one"
-    ok, _ = await verify_proposer_eligibility(db, _block(below, slot, randao_pick), enforce=True)
-    assert not ok, "below the fork RANDAO's pick is out of turn"
+    assert await _eligible(db, below, slot, legacy), "below the fork the legacy proposer is eligible"
+    assert not await _eligible(db, below, slot, randao_pick), "below the fork RANDAO's pick is out of turn"
+    assert await _eligible(db, at, slot, randao_pick), "from the fork RANDAO's pick is eligible"
+    assert not await _eligible(db, at, slot, legacy), "from the fork the legacy primary is not"
 
-    ok, _ = await verify_proposer_eligibility(db, _block(at, slot, randao_pick), enforce=True)
-    assert ok, "from the fork RANDAO's pick is eligible"
-    ok, _ = await verify_proposer_eligibility(db, _block(at, slot, legacy), enforce=True)
-    assert not ok, "from the fork the legacy primary is no longer eligible"
+
+async def test_a_block_is_judged_by_its_height_never_its_slot():
+    """A block's signed ``number`` is its slot, which runs ahead of the height once a slot is
+    skipped. Judged by it, an importer switched to a height-gated rule before the proposer did:
+    here the slot is past the fork while the height is not."""
+    slot, legacy, randao_pick = _slot_where_the_rules_disagree()
+    block = {"number": FORK_HEIGHT + 5, "slot": slot, "proposer_address": legacy}
+    ok, _ = await verify_proposer_eligibility(_DB(), block, enforce=True, height=FORK_HEIGHT - 1)
+    assert ok, "below the fork by height, whatever its slot"
 
 
 async def test_without_the_fork_nothing_changes():
     slot, legacy, randao_pick = _slot_where_the_rules_disagree()
     with cs.use_spec(cs.build_spec("qrdx-dev", 88888, {}, dev=True)):
         for height in (FORK_HEIGHT - 1, FORK_HEIGHT, 10 ** 6):
-            assert (await verify_proposer_eligibility(_DB(), _block(height, slot, legacy), enforce=True))[0]
-            assert not (await verify_proposer_eligibility(_DB(), _block(height, slot, randao_pick), enforce=True))[0]
+            assert await _eligible(_DB(), height, slot, legacy)
+            assert not await _eligible(_DB(), height, slot, randao_pick)
 
 
 def test_the_dev_override_still_forces_the_rule_on(monkeypatch):

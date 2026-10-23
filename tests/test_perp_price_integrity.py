@@ -59,7 +59,7 @@ def test_the_original_attack_is_refused(mgr):
     assert "retired" in opened.error and "retired" in closed.error
 
 
-def test_two_colluding_accounts_cannot_create_value_at_any_price(mgr):
+def test_two_colluding_accounts_cannot_create_value_at_any_price(mgr, no_risk_limits, no_staker_fees):
     """The strongest form: one person on both sides of a trade at an absurd price. The buyer
     must be able to carry the loss it is taking on — and if it can, the value just moves."""
     assert _oracle(mgr, REPORTER, 30000).success

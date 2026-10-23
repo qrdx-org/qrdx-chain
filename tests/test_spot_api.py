@@ -13,6 +13,12 @@ import pytest
 
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransaction, views
 
+
+@pytest.fixture(autouse=True)
+def _fee_free(no_trading_fees):
+    """Escrow and settlement mechanics, amounts exact: fees off (tests/test_spot_fees.py)."""
+
+
 D = Decimal
 ALICE, BOB, CAROL = ("0xPQ" + c * 64 for c in "abc")
 T0, T1 = "0x" + "11" * 20, "0x" + "22" * 20       # T0 < T1: token0, and the book's base
