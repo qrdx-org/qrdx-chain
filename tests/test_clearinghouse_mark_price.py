@@ -19,6 +19,8 @@ import pytest
 
 from qrdx.exchange.clearinghouse import Clearinghouse, MARK_ORACLE_BAND
 
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+
 D = Decimal
 BTC = "BTC-QRDX-PERP"
 T0 = D(1_700_000_000)

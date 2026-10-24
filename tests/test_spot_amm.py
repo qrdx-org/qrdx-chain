@@ -348,8 +348,9 @@ def test_the_pool_oracle_runs_on_block_time_and_replays_identically(monkeypatch)
 
     live, replay = run(2.0), run(0.0)
     assert live == replay
-    # one observation at the first liquidity, then one per swap block
-    assert live[2] == 7 and live[1] is not None and live[1] < 1
+    # a checkpoint at the first liquidity, and the newest observation moving with each swap
+    # block (checkpoints are OBSERVATION_SPACING apart: these blocks are all within it)
+    assert live[2] == 2 and live[1] is not None and live[1] < 1
 
 
 # ── the manager under random activity, failures included ───────────────────

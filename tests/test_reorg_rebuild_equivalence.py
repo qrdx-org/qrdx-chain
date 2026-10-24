@@ -24,6 +24,7 @@ from decimal import Decimal
 
 import pytest
 
+from qrdx import constants
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.crypto.pq.dilithium import PQPrivateKey
 from qrdx.exchange import (
@@ -31,6 +32,8 @@ from qrdx.exchange import (
 )
 from qrdx.exchange.amm import FeeTier, PoolType
 from qrdx.exchange import block_processor as BP
+
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
 
 
 # --- helpers ---------------------------------------------------------------
@@ -48,7 +51,8 @@ def _sign(tx, key):
 
 def _tx(op, sender, nonce, params):
     return ExchangeTransaction(op_type=op, sender=sender, nonce=nonce, params=params,
-                               gas_limit=2_000_000, gas_price=10**9)
+                               gas_limit=2_000_000,
+                              gas_price=constants.EXCHANGE_MIN_GAS_PRICE_WEI)
 
 
 async def _add_block(db, height, ex_section=None, genesis_alloc=None):

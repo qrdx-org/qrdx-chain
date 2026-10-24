@@ -15,6 +15,8 @@ import logging
 import os
 from decimal import Decimal
 
+import pytest
+
 from exchange_fees import fee_of
 
 from qrdx.crypto.pq.dilithium import PQPrivateKey
@@ -24,6 +26,8 @@ from qrdx.node import main as node_main
 
 from test_interleaved_rebuild_equivalence import _add_block, _db, _forward
 from test_reorg_rebuild_equivalence import _sign, _tx
+
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
 
 
 async def _chain_with_a_rejected_position(db, monkeypatch):

@@ -44,6 +44,7 @@ def _op(gas_limit, sender="0xPQ" + "a" * 64, nonce=0):
 def limits(monkeypatch):
     monkeypatch.setattr(constants, "BLOCK_GAS_LIMIT", 100_000)
     monkeypatch.setattr(constants, "BLOCK_EXCHANGE_GAS_LIMIT", 1_000_000)
+    monkeypatch.setattr(constants, "BIG_BLOCK_INTERVAL", 0)  # (big blocks: test_big_blocks.py)
 
 
 # ── the rule ─────────────────────────────────────────────────────────────────
@@ -101,7 +102,7 @@ async def test_every_import_path_refuses_an_oversized_block_before_anything_runs
 def test_the_evm_mempool_refuses_what_no_block_could_carry(limits):
     pool = EVMMempool(nonce_provider=lambda a: 0)
     ok, err, _ = pool.admit(_raw(1, gas=100_001))
-    assert not ok and "block gas limit" in err
+    assert not ok and "gas limit" in err
     assert pool.admit(_raw(1, gas=100_000))[0]
 
 
@@ -160,7 +161,10 @@ async def test_eth_call_runs_no_more_than_a_block_could_carry(tmp_path):
         world = EvmWorld(sm)
         r = await run(world, lambda: ex.call(bytes(20), target, b"", gas=10 ** 9, world=world),
                       preload=[target])
-        assert not r.success and r.gas_used == constants.BLOCK_GAS_LIMIT
+        # A call may use what the largest block carries (a big block's: estimating a deploy).
+        from qrdx.block_limits import max_evm_tx_gas
+
+        assert not r.success and r.gas_used == max_evm_tx_gas()
     finally:
         await db.close()
 

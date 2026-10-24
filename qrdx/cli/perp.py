@@ -121,9 +121,18 @@ def _chain_id(node: str) -> int:
         ) from exc
 
 
-def _gas_price(node: str) -> Optional[int]:
-    """The node's exchange gas price (wei per gas); None — the built-in floor — if it cannot
-    say (an older node)."""
+def _gas_price(node: str, op_name: str = "", address: str = "") -> Optional[int]:
+    """The exchange gas price to offer (wei per gas): 0 for a trading operation the account may
+    send free now (the free lane, docs/TOKENOMICS.md); otherwise the node's; None — the built-in
+    floor — if it cannot say (an older node)."""
+    from qrdx.exchange.transactions import AGENT_SCOPE, ExchangeOpType
+
+    if address and ExchangeOpType[op_name] in AGENT_SCOPE:
+        try:
+            if (rpc(node, "exchange_getFreeActions", [address]) or {}).get("free_now"):
+                return 0
+        except Exception:
+            pass
     try:
         return int(rpc(node, "exchange_gasPrice"))
     except Exception:
@@ -156,7 +165,7 @@ def _send(
         op_name,
         params,
         nonce,
-        gas_price=_gas_price(node),
+        gas_price=_gas_price(node, op_name, signer.address),
         chain_id=_chain_id(node),
         gas_limit=gas_limit,
     )
@@ -391,6 +400,15 @@ def leverage_cmd(wallet_file, market_id, leverage, isolated, node, wait, yes):
 )
 @click.option("--hidden", is_flag=True, help="Rest without showing in the book's depth")
 @click.option("--display-size", default=None, help="An iceberg: show this much at a time")
+@click.option(
+    "--leverage", default=None, help="This trade's leverage (the market's setting becomes it)"
+)
+@click.option(
+    "--margin-mode",
+    type=click.Choice(["cross", "isolated"]),
+    default=None,
+    help="This trade's margin mode (with no position or order in the market)",
+)
 @node_option
 @wait_option
 @yes_option
@@ -405,6 +423,8 @@ def order_cmd(
     tif,
     hidden,
     display_size,
+    leverage,
+    margin_mode,
     node,
     wait,
     yes,
@@ -425,12 +445,18 @@ def order_cmd(
         params["hidden"] = True
     if display_size:
         params["display_size"] = str(Decimal(display_size))
+    if leverage:
+        params["leverage"] = str(Decimal(leverage))
+    if margin_mode:
+        params["margin_mode"] = margin_mode
     flags = "".join(
         (
             " reduce-only" if reduce_only else "",
             f" {tif.upper()}" if tif else "",
             " hidden" if hidden else "",
             f" iceberg {display_size}" if display_size else "",
+            f" {Decimal(leverage)}x" if leverage else "",
+            f" {margin_mode}" if margin_mode else "",
         )
     )
     _send(
@@ -684,7 +710,10 @@ def vault_withdraw_cmd(wallet_file, shares, node, wait, yes):
 @yes_option
 def create_market_cmd(wallet_file, base, max_leverage, node, wait, yes):
     """Open a market for BASE, such as BTC. It trades once validators price it. Listing burns
-    the network's market listing fee (PERP_MARKET_LISTING_FEE QRDX)."""
+    the network's market listing fee (PERP_MARKET_LISTING_FEE QRDX). Only where the network
+    allows open listing (PERP_OPEN_LISTING, a dev network's setting): elsewhere validator-priced
+    markets are listed by governance (``list_market``), and a bonded deployer lists its own as
+    ``dex:ASSET`` (docs/HYPERLIQUID_PARITY.md)."""
     from ..constants import PERP_MARKET_LISTING_FEE
 
     params = {"base_token": base}

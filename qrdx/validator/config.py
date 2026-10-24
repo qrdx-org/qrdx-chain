@@ -251,6 +251,7 @@ from ..constants import (  # noqa: E402  (kept beside the explanation above)
     MIN_VALIDATOR_STAKE as _MIN_VALIDATOR_STAKE,
     SLOT_DURATION as _SLOT_DURATION,
     SLOTS_PER_EPOCH as _SLOTS_PER_EPOCH,
+    STAKE_MIN_DELEGATION as _STAKE_MIN_DELEGATION,
     UNBONDING_PERIOD_EPOCHS as _UNBONDING_PERIOD_EPOCHS,
 )
 
@@ -260,7 +261,7 @@ POS_CONSTANTS = {
     "SLOTS_PER_EPOCH": _SLOTS_PER_EPOCH,
     # Staking
     "MIN_VALIDATOR_STAKE": _MIN_VALIDATOR_STAKE,
-    "MIN_DELEGATION": Decimal("100"),  # 100 QRDX minimum delegation
+    "MIN_DELEGATION": _STAKE_MIN_DELEGATION,  # (one definition: qrdx/constants.py)
     "MAX_VALIDATORS": 150,  # Maximum active validators
     "UNBONDING_PERIOD_EPOCHS": _UNBONDING_PERIOD_EPOCHS,
     # Consensus

@@ -14,6 +14,8 @@ import pytest
 from qrdx.exchange.state_manager import ExchangeStateManager
 from qrdx.exchange.transactions import ExchangeOpType, ExchangeTransaction
 
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+
 
 
 def _create_market_tx(sender="0xPQaa", base="BTC", **extra):

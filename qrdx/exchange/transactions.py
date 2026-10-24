@@ -169,6 +169,7 @@ class ExchangeOpType(IntEnum):
     DEPLOYER_UNBOND = 80  # start unbonding some of it, or claim what has unbonded
     DEPLOYER_SET_ORACLE = 81  # the deployer's oracle price for one of its markets
     DEPLOYER_HALT = 82  # the deployer settles one of its markets at its oracle price
+    TICKER_CLAIM = 83  # a token's creator buys its symbol as the token's unique ticker
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +400,11 @@ class ExchangeTransaction:
         """The most it can pay, in QRDX: gas_limit × gas_price wei — reserved up front."""
         return Decimal(self.gas_limit) * Decimal(self.gas_price) / _wei_per_qrdx()
 
+    def free_eligible(self) -> bool:
+        """Sent in the free trading lane: a trading operation at gas price 0, where the network
+        runs one (EXCHANGE_FREE_TRADING; the account's budget is judged when it executes)."""
+        return self.gas_price == 0 and free_trading_op(self.op_type, self.params or {})
+
     def validate_fee(self, min_gas_price: Optional[int] = None) -> None:
         """Raises ValueError unless gas_price is a whole number of wei at or above the floor."""
         floor = _min_gas_price() if min_gas_price is None else int(min_gas_price)
@@ -438,8 +444,10 @@ class ExchangeTransaction:
             raise ValueError("Nonce must be non-negative")
         if self.gas_limit <= 0:
             raise ValueError("Gas limit must be positive")
-        if self.gas_price <= 0:
-            raise ValueError("Gas price must be positive")
+        if self.gas_price < 0 or (self.gas_price == 0 and not self.free_eligible()):
+            raise ValueError(
+                "Gas price must be positive (0 only for a trading operation in the free lane)"
+            )
         if self.op_type not in ExchangeOpType:
             raise ValueError(f"Unknown operation type: {self.op_type}")
         if self.signer and self.op_type == ExchangeOpType.ORACLE_VOTE:
@@ -449,6 +457,12 @@ class ExchangeTransaction:
 
         # Type-specific parameter validation
         self._validate_params()
+        if self.op_type in (
+            ExchangeOpType.PERP_ORDER,
+            ExchangeOpType.PERP_TRIGGER,
+            ExchangeOpType.TWAP_ORDER,
+        ):
+            _check_trade_leverage(self.params or {})
         return True
 
     def _validate_params(self) -> None:
@@ -624,6 +638,10 @@ class ExchangeTransaction:
         elif op == ExchangeOpType.DEPLOYER_HALT:
             if "market_id" not in p:
                 raise ValueError("DEPLOYER_HALT missing param: market_id")
+
+        elif op == ExchangeOpType.TICKER_CLAIM:
+            if not isinstance(p.get("token_address"), str):
+                raise ValueError("TICKER_CLAIM missing param: token_address")
 
         elif op == ExchangeOpType.ACCOUNT_RECOVER:
             if not isinstance(p.get("account"), str):
@@ -872,6 +890,60 @@ AGENT_SCOPE = frozenset(
 )
 
 
+CANCEL_OPS = frozenset(
+    {
+        ExchangeOpType.PERP_CANCEL,
+        ExchangeOpType.CANCEL_ORDER,
+        ExchangeOpType.CANCEL_ALL,
+        ExchangeOpType.TWAP_CANCEL,
+    }
+)
+
+
+def free_trading_op(op_type: "ExchangeOpType", params: Dict[str, Any]) -> bool:
+    """Whether the free trading lane takes this operation (docs/TOKENOMICS.md): the network runs
+    one, and it is a trading operation (``AGENT_SCOPE``: orders, cancels, modifies, triggers,
+    TWAPs, swaps, leverage; a batch only of those)."""
+    from .. import constants
+
+    if not constants.EXCHANGE_FREE_TRADING or op_type not in AGENT_SCOPE:
+        return False
+    if op_type == ExchangeOpType.BATCH:
+        try:
+            return all(op in AGENT_SCOPE for op, _ in batch_actions(params))
+        except ValueError:
+            return False
+    return True
+
+
+def trading_actions(op_type: "ExchangeOpType", params: Dict[str, Any]) -> Tuple[int, bool]:
+    """(how many actions it counts as, whether all of them cancel): a batch counts each of its
+    actions, as Hyperliquid counts a batch's orders."""
+    if op_type == ExchangeOpType.BATCH:
+        try:
+            ops = [op for op, _ in batch_actions(params)]
+        except ValueError:
+            return 1, False
+        return max(1, len(ops)), all(op in CANCEL_OPS for op in ops)
+    return 1, op_type in CANCEL_OPS
+
+
+def _check_trade_leverage(p: Dict[str, Any]) -> None:
+    """An order's, trigger's or TWAP's own ``leverage`` and ``margin_mode``, when it has them
+    (docs/HYPERLIQUID_PARITY.md 9): their form; the market's bounds are checked as it runs."""
+    raw = p.get("leverage")
+    if raw is not None:
+        try:
+            lev = Decimal(str(raw))
+        except ArithmeticError:
+            lev = Decimal(0)
+        if isinstance(raw, bool) or not lev.is_finite() or lev < 1:
+            raise ValueError("leverage is a number, at least 1")
+    mode = p.get("margin_mode")
+    if mode is not None and str(mode).lower() not in ("cross", "isolated"):
+        raise ValueError("margin_mode is cross or isolated")
+
+
 def batch_actions(params: Dict[str, Any]) -> List[Tuple["ExchangeOpType", Dict[str, Any]]]:
     """A BATCH's actions as (operation, params). Raises ValueError unless it is a list of 1 to
     BATCH_MAX_ACTIONS ``{"op": name or number, "params": {...}}``, each a batchable
@@ -991,6 +1063,7 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.DEPLOYER_UNBOND: 40_000,
     ExchangeOpType.DEPLOYER_SET_ORACLE: 25_000,
     ExchangeOpType.DEPLOYER_HALT: 200_000,  # + what settling the market's positions costs
+    ExchangeOpType.TICKER_CLAIM: 50_000,
 }
 
 _NFT_REQUIRED = {

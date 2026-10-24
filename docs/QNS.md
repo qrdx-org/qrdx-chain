@@ -8,7 +8,7 @@ and works in the EVM as an ERC-721, like any NFT.
 |---|---|
 | Code | `qrdx/exchange/qns.py`, the `QNS_*` operations in `qrdx/exchange/state_manager.py` |
 | Collection | `QNS_COLLECTION` (fixed address), symbol `QNS`; mint and update authority `QNS_AUTHORITY` (`0xQNSA…`, no key) |
-| Price | `QNS_PRICE_PER_YEAR` (chain-spec) — **10 QRDX a year** by default, paid to the treasury |
+| Price | `QNS_PRICE_PER_YEAR` (chain-spec) — **0.0125 QRDX a year** (~$5) by default for 5 or more characters; 32× for 4 characters, 128× for 3 (`qns.price_factor`); paid to the treasury |
 | Tests | `tests/test_qns.py` |
 
 ## Names

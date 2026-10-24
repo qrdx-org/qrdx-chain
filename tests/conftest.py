@@ -39,6 +39,16 @@ def no_risk_limits(monkeypatch):
 
 
 @pytest.fixture
+def open_listing(monkeypatch):
+    """Anyone may list a validator-priced perp market with CREATE_MARKET (PERP_OPEN_LISTING, a
+    dev network's setting), for tests that list markets as their setup. Production lists them by
+    governance (``list_market``): tests/test_perps_listing_and_leverage.py."""
+    from qrdx import constants
+
+    monkeypatch.setattr(constants, "PERP_OPEN_LISTING", 1)
+
+
+@pytest.fixture
 def no_staker_fees(monkeypatch):
     """The stakers' fee share off (STAKER_FEE_SHARE_BPS 0), for tests of the backstop vault's
     exact accounting that predate it. The share has its own tests (tests/test_staker_fees.py)."""

@@ -17,6 +17,8 @@ import pytest
 from qrdx import constants
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransaction
 
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+
 D = Decimal
 BTC = "BTC-QRDX-PERP"
 REPORTER, ATTACKER_A, ATTACKER_B, STRANGER = "0xPQrep", "0xPQaaa", "0xPQbbb", "0xPQzzz"

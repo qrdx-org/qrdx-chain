@@ -185,3 +185,23 @@ def test_the_queue_survives_a_checkpoint_and_older_ones_load():
     old.__setstate__(state)
     assert len(old.evm_actions) == 0
     ExchangeStateManager.reset_instance()
+
+
+def _delegator(target: bytes) -> bytes:
+    """DELEGATECALL ``target`` with the calldata, ignoring the result."""
+    return (bytes.fromhex("366000600037") + bytes.fromhex("6020600036600073") + target
+            + bytes.fromhex("5af450") + bytes.fromhex("60206000f3"))
+
+
+async def test_a_contract_cannot_send_actions_as_its_caller(chain):
+    """A DELEGATECALL keeps the caller's ``msg.sender``: through one, any contract a victim
+    called could trade or withdraw the victim's exchange account. Only a plain CALL acts — as
+    the calling contract — and no QRDX is taken."""
+    mgr = _mgr()
+    evil = await chain.deploy(_delegator(EXCHANGE_WRITE_ADDRESS))
+    r = await chain.tx(ALICE, evil, _action("PERP_WITHDRAW", amount="1"))
+    assert r.success                                     # the outer call ignores the revert
+    assert len(mgr.trading.evm_actions) == 0             # nothing was sent as Alice
+    r = await chain.tx(ALICE, EXCHANGE_WRITE_ADDRESS, _action("PERP_DEPOSIT", amount="1"),
+                       value=10 ** 18)
+    assert not r.success and len(mgr.trading.evm_actions) == 0

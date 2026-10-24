@@ -16,6 +16,12 @@ Without it a block's gas cost the same however full blocks were: a sender filled
 slowing the chain to what a node could execute, for the floor price — and EVM transactions had no
 floor at all (a gas price of 0 executed for free). Now a run of full blocks raises the price
 12.5% a block: 30 seconds of them at 250 ms slots multiply it ~1.4 million times.
+
+Big blocks (``BIG_BLOCK_INTERVAL``, docs/BLOCK_LIMITS.md) are priced on an EVM track of their own:
+a big block's EVM base fee is set by the big block before it, an ordinary block's by the ordinary
+block before it — so the two kinds never move each other's price — and a big block's moves up to
+1/2 per big block (``BIG_BLOCK_CHANGE_DENOMINATOR``): a big block comes once an interval, and a
+run of full ones must get expensive in minutes. Twenty full big blocks multiply it ~3,300 times.
 """
 
 from __future__ import annotations
@@ -33,14 +39,19 @@ ELASTICITY = 2  # the target is half the limit
 CHANGE_DENOMINATOR = 8  # at most 1/8 up or down per block
 
 
-def next_base_fee(parent_fee: int, parent_gas: int, limit: int, floor: int) -> int:
+BIG_BLOCK_CHANGE_DENOMINATOR = 2  # a big block's price: at most 1/2 up or down per big block
+
+
+def next_base_fee(
+    parent_fee: int, parent_gas: int, limit: int, floor: int, denominator: int = CHANGE_DENOMINATOR
+) -> int:
     """The base fee after a block that declared ``parent_gas`` of a domain's ``limit``."""
     target = max(1, int(limit) // ELASTICITY)
     fee, gas = int(parent_fee), int(parent_gas)
     if gas > target:
-        fee += max(1, fee * (gas - target) // target // CHANGE_DENOMINATOR)
+        fee += max(1, fee * (gas - target) // target // denominator)
     elif gas < target:
-        fee -= fee * (target - gas) // target // CHANGE_DENOMINATOR
+        fee -= fee * (target - gas) // target // denominator
     return max(int(floor), fee)
 
 
@@ -60,6 +71,23 @@ def _is_vote(item: Any) -> bool:
         return int(op) == int(ExchangeOpType.ORACLE_VOTE)
     except (TypeError, ValueError):
         return False
+
+
+def _in_free_lane(item: Any) -> bool:
+    """A trading operation sent at gas price 0 in the free lane (docs/TOKENOMICS.md)."""
+    from .exchange.transactions import ExchangeOpType, free_trading_op
+
+    if _price(item) != 0:
+        return False
+    op = item.get("op_type") if isinstance(item, dict) else getattr(item, "op_type", None)
+    params = item.get("params") if isinstance(item, dict) else getattr(item, "params", None)
+    if op is None:
+        return False
+    try:
+        op_type = ExchangeOpType[op] if isinstance(op, str) else ExchangeOpType(int(op))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return free_trading_op(op_type, params or {})
 
 
 def _price(item: Any) -> int:
@@ -90,42 +118,79 @@ def header_fees(block: Optional[dict]) -> Tuple[int, int]:
     )
 
 
-def child_fees(
-    parent: Optional[dict],
-    parent_exchange_section: Optional[Iterable[Any]],
-    parent_evm_section: Optional[Iterable[str]],
-) -> Tuple[int, int]:
-    """The base fees of the block whose parent is ``parent`` (its content), given the sections
-    the parent carried."""
-    from .constants import BLOCK_EXCHANGE_GAS_LIMIT, BLOCK_GAS_LIMIT
+async def _stored_block(db: Any, height: int):
+    """(header content, exchange section, EVM section) of the stored block at ``height``, or
+    None if there is none."""
+    from .validator.block_verification import _parse_block_content
 
-    evm_floor, exchange_floor = floors()
-    evm_fee, exchange_fee = header_fees(parent)
-    evm_gas, exchange_gas = fee_gas(parent_exchange_section, parent_evm_section)
+    block = await db.get_block_by_id(int(height))
+    if not block:
+        return None
+    try:
+        content = _parse_block_content(block.get("content") or block.get("block_content"))
+    except (ValueError, SyntaxError):
+        content = None  # no header to read: the floors (every node reads the same bytes)
+    block_hash = block.get("hash") or block.get("block_hash")
     return (
-        next_base_fee(evm_fee, evm_gas, BLOCK_GAS_LIMIT, evm_floor),
-        next_base_fee(exchange_fee, exchange_gas, BLOCK_EXCHANGE_GAS_LIMIT, exchange_floor),
+        content,
+        await db.get_block_exchange_txs(block_hash),
+        await db.get_block_evm_txs(block_hash),
     )
 
 
-async def base_fees_at(db: Any, height: int) -> Tuple[int, int]:
-    """The base fees of a block at ``height`` on the stored chain: set by its parent, the block
-    at ``height − 1`` (stored, with its sections, before anything is built on it)."""
-    from .validator.block_verification import _parse_block_content
+def _evm_track_parent(height: int) -> int:
+    """The block whose EVM gas sets this one's EVM base fee — the previous block of its kind
+    (docs/BLOCK_LIMITS.md, big blocks): a big block's is the big block an interval before it;
+    an ordinary block's, the ordinary block before it. Big blocks are priced apart, so one does
+    not move ordinary blocks' price, nor ordinary ones its. (No big blocks: the parent.)"""
+    from .block_limits import is_big_block
+    from .constants import BIG_BLOCK_INTERVAL
 
+    if is_big_block(height):
+        return int(height) - int(BIG_BLOCK_INTERVAL)
+    parent = int(height) - 1
+    return parent - 1 if is_big_block(parent) else parent
+
+
+async def base_fees_at(db: Any, height: int) -> Tuple[int, int]:
+    """The base fees of a block at ``height`` on the stored chain. The exchange's is set by its
+    parent, the block at ``height − 1``; the EVM's by the previous block of its kind
+    (``_evm_track_parent``) — the parent, unless big blocks are in play (each stored, with its
+    sections, before anything is built on it)."""
+    from .block_limits import evm_gas_limit_at, is_big_block
+    from .constants import BLOCK_EXCHANGE_GAS_LIMIT
+
+    evm_floor, exchange_floor = floors()
     if height <= 1:  # the parent is genesis: no fees, no sections
         return floors()
-    parent = await db.get_block_by_id(int(height) - 1)
-    if not parent:
+    parent = await _stored_block(db, int(height) - 1)
+    if parent is None:
         return floors()
-    try:
-        content = _parse_block_content(parent.get("content") or parent.get("block_content"))
-    except (ValueError, SyntaxError):
-        content = None  # no header to read: the floors (every node reads the same bytes)
-    parent_hash = parent.get("hash") or parent.get("block_hash")
-    exchange = await db.get_block_exchange_txs(parent_hash)
-    evm = await db.get_block_evm_txs(parent_hash)
-    return child_fees(content, exchange, evm)
+    content, exchange, evm = parent
+    exchange_fee = next_base_fee(
+        header_fees(content)[1],
+        fee_gas(exchange, ())[1],
+        BLOCK_EXCHANGE_GAS_LIMIT,
+        exchange_floor,
+    )
+    source_height = _evm_track_parent(int(height))
+    if source_height < 1:
+        return evm_floor, exchange_fee
+    if source_height != int(height) - 1:
+        source = await _stored_block(db, source_height)
+        if source is None:
+            return evm_floor, exchange_fee
+        content, _exchange, evm = source
+    evm_fee = next_base_fee(
+        header_fees(content)[0],
+        fee_gas((), evm)[0],
+        evm_gas_limit_at(source_height),
+        evm_floor,
+        # A big block comes once an interval: its price moves faster, so that filling every big
+        # block with slow work gets expensive within minutes, not hours.
+        denominator=BIG_BLOCK_CHANGE_DENOMINATOR if is_big_block(height) else CHANGE_DENOMINATOR,
+    )
+    return evm_fee, exchange_fee
 
 
 def block_fee_error(
@@ -151,8 +216,8 @@ def block_fee_error(
         if price < evm_fee:
             return f"evm tx {i} offers {price} wei of gas, under the base fee {evm_fee}"
     for i, item in enumerate(exchange_section or ()):
-        if _is_vote(item):
-            continue
+        if _is_vote(item) or _in_free_lane(item):
+            continue  # (a free operation's budget is judged when it executes)
         price = _price(item)
         if price < exchange_fee:
             return f"exchange op {i} offers {price} wei of gas, under the base fee {exchange_fee}"

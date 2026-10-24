@@ -16,7 +16,7 @@ Verified live (2026-10-09, 4-node testnet, S22 33/33):
 - **Fork approval:** approval was driven on chain in the upgrade rehearsal
   (docs/PROTOCOL_UPGRADES.md).
 
-It governs four things:
+It governs six things:
 
 | Action | Effect when executed |
 |---|---|
@@ -24,6 +24,8 @@ It governs four things:
 | `freeze_master` | ends the genesis master controller's authority over the system wallets now |
 | `approve_fork` | authorises a fork scheduled in the chain spec to activate (docs/PROTOCOL_UPGRADES.md) |
 | `delist_market` | settles a perp market for good: `{market_id, price?}` — below |
+| `list_market` | lists a perp market: validator-priced `{base_token, max_leverage?, sz_decimals?}` (docs/HYPERLIQUID_PARITY.md 10), or priced off a native token's own spot market with `spot_token` and `spot_pools` (13) |
+| `slash_deployer` | burns `bps` of a market deployer's bond and, with `halt`, settles its markets: `{deployer, bps, halt?}` (docs/HYPERLIQUID_PARITY.md 8) |
 
 **Delisting** (docs/CONSENSUS_ROADMAP.md 4). Executing `delist_market` cancels every order,
 trigger and TWAP in the market and closes every position at one settlement price — the `price`
@@ -74,7 +76,7 @@ GOV_PROPOSE ─► voting ──(yes ≥ 2/3 of snapshot)──► passed ──
 | `GOV_TIMELOCK_BLOCKS` (the veto window) | 86,400 (2 days) | 8 |
 | `GOV_EXECUTION_WINDOW_BLOCKS` | 302,400 (7 days) | 200 |
 | `GOV_APPROVAL_THRESHOLD_BPS` | 6,667 (2/3 of stake) | 6,667 |
-| `GOV_VETO_THRESHOLD_QRDX` | 10,000,000 (10% of genesis supply) | 500 |
+| `GOV_VETO_THRESHOLD_QRDX` | 1,000,000 (10% of genesis supply) | 500 |
 | `GOV_FORK_APPROVAL_LEAD_BLOCKS` | 256 (2 × the maximum reorg depth) | 5 |
 | `SYSTEM_WALLET_MASTER_SUNSET_HEIGHT` | 100,000 | 100,000 |
 

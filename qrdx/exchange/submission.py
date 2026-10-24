@@ -54,6 +54,12 @@ def parse_exchange_tx(tx: Any) -> ExchangeTransaction:
     return ExchangeTransaction.from_dict(data)
 
 
+def free_action_error(tx: ExchangeTransaction) -> str:
+    from .state_manager import ExchangeStateManager
+
+    return ExchangeStateManager.get_instance().free_action_error(tx)
+
+
 def signing_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     """The exact bytes a sender must sign for these fields, the hash the transaction will have,
     and the normalized unsigned transaction to submit once ``signature`` and ``public_key``
@@ -63,7 +69,13 @@ def signing_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     from .. import chain_spec, constants
 
     unsigned.setdefault("chain_id", chain_spec.active().chain_id)  # sign for this network
-    unsigned.setdefault("gas_price", str(constants.EXCHANGE_MIN_GAS_PRICE_WEI))  # wei per gas
+    if "gas_price" not in unsigned:
+        # A trading operation its account may send free now goes in the free lane; anything else
+        # offers the floor (wei per gas).
+        unsigned["gas_price"] = "0"
+        probe = parse_exchange_tx(unsigned)
+        if not probe.free_eligible() or free_action_error(probe):
+            unsigned["gas_price"] = str(constants.EXCHANGE_MIN_GAS_PRICE_WEI)
     tx = parse_exchange_tx(unsigned)
     body = tx.to_dict()
     for key in ("signature", "public_key", "timestamp", "tx_hash"):

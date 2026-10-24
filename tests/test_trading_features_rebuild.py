@@ -15,6 +15,8 @@ from decimal import Decimal as D
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+
 T0 = 1_700_000_000
 BTC = "BTC-QRDX-PERP"
 

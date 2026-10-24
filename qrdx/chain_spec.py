@@ -50,6 +50,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
@@ -111,6 +112,14 @@ def _parse_list(raw: str) -> List[str]:
     return [a.strip() for a in raw.split(",") if a.strip()]
 
 
+def _parse_decimal(raw: str) -> str:
+    """A decimal amount (a price in QRDX, say), kept as its exact string."""
+    value = Decimal(raw.strip())
+    if not value.is_finite():
+        raise ValueError("not a finite number")
+    return str(value)
+
+
 @dataclass(frozen=True)
 class Param:
     """One network parameter: its type, its dev default, and the environment variable a dev
@@ -118,7 +127,7 @@ class Param:
     through ``ChainSpec.param_at(name, height)``; only such a parameter may be changed by a fork
     (a fork changing one read as a module constant would be silently ignored by that code)."""
 
-    kind: str  # "int" | "str" | "list"
+    kind: str  # "int" | "str" | "list" | "decimal" (an exact string)
     default: Any
     env: str
     minimum: Optional[int] = None
@@ -181,8 +190,17 @@ PARAMS: Dict[str, Param] = {
     "PERP_FUNDING_INTERVAL_SECONDS": Param(
         "int", 3600, "QRDX_PERP_FUNDING_INTERVAL_SECONDS", minimum=1
     ),
+    # The highest maximum leverage a perp market may be listed with (its maintenance margin is
+    # half the initial margin at it: beyond this, liquidations come too late to close).
+    "PERP_MARKET_MAX_LEVERAGE": Param("int", 50, "QRDX_PERP_MARKET_MAX_LEVERAGE", minimum=1),
+    # Who lists a validator-priced perp market: 0 — governance only (a passed ``list_market``
+    # proposal); 1 — anyone, with CREATE_MARKET (a dev network's convenience: the first lister
+    # chooses the market's settings). Deployer markets (``dex:ASSET``) are listed by their
+    # deployer either way.
+    "PERP_OPEN_LISTING": Param("int", 0, "QRDX_PERP_OPEN_LISTING", minimum=0),
     # QRDX burned to list a perp market: every market costs every node work in every block.
-    "PERP_MARKET_LISTING_FEE": Param("int", 1_000, "QRDX_PERP_MARKET_LISTING_FEE", minimum=0),
+    # (docs/TOKENOMICS.md: QRDX amounts are sized for ~$400 a QRDX — 25 is ~$10,000.)
+    "PERP_MARKET_LISTING_FEE": Param("int", 25, "QRDX_PERP_MARKET_LISTING_FEE", minimum=0),
     # Liquidity a perp market's creator puts into the market's liquidity vault (the settlement
     # unit), which the protocol quotes on its book; locked this long (docs/TRADING_FEATURES.md).
     "PERP_MARKET_MIN_LIQUIDITY": Param("int", 10_000, "QRDX_PERP_MARKET_MIN_LIQUIDITY", minimum=0),
@@ -218,7 +236,7 @@ PARAMS: Dict[str, Param] = {
     # markets (slashable by governance, unbonding over DEPLOYER_UNBOND_SECONDS — longer than a
     # proposal's voting period and timelock), its markets at most, the largest share of their
     # protocol fees it may take (basis points), and how far its oracle may move a second.
-    "DEPLOYER_MIN_BOND": Param("int", 100_000, "QRDX_DEPLOYER_MIN_BOND", minimum=0),
+    "DEPLOYER_MIN_BOND": Param("int", 1_250, "QRDX_DEPLOYER_MIN_BOND", minimum=0),  # ~$500,000
     "DEPLOYER_UNBOND_SECONDS": Param(
         "int", 14 * 24 * 3600, "QRDX_DEPLOYER_UNBOND_SECONDS", minimum=0
     ),
@@ -227,17 +245,59 @@ PARAMS: Dict[str, Param] = {
     "DEPLOYER_ORACLE_MAX_STEP_BPS": Param(
         "int", 100, "QRDX_DEPLOYER_ORACLE_MAX_STEP_BPS", minimum=0
     ),
-    # QNS (docs/QNS.md): QRDX a name costs a year, paid to the treasury.
-    "QNS_PRICE_PER_YEAR": Param("int", 10, "QRDX_QNS_PRICE_PER_YEAR", minimum=0),
+    # Native-token perps (docs/HYPERLIQUID_PARITY.md 13): priced off the token's own spot market —
+    # the TWAP over SPOT_ORACLE_TWAP_SECONDS along pools governance pinned — with at most
+    # PERP_SPOT_MAX_LEVERAGE, no price while the pools' depth (in the settlement asset) is under
+    # SPOT_ORACLE_MIN_DEPTH, and open interest at most SPOT_OI_DEPTH_BPS of that depth.
+    "PERP_SPOT_MAX_LEVERAGE": Param("int", 10, "QRDX_PERP_SPOT_MAX_LEVERAGE", minimum=1),
+    "SPOT_ORACLE_TWAP_SECONDS": Param("int", 600, "QRDX_SPOT_ORACLE_TWAP_SECONDS", minimum=60),
+    "SPOT_ORACLE_MIN_DEPTH": Param("int", 10_000, "QRDX_SPOT_ORACLE_MIN_DEPTH", minimum=0),
+    "SPOT_OI_DEPTH_BPS": Param("int", 10_000, "QRDX_SPOT_OI_DEPTH_BPS", minimum=0),
+    # Big blocks (docs/BLOCK_LIMITS.md, HyperEVM's two block sizes): every BIG_BLOCK_INTERVAL-th
+    # block (by height; 0: none) may carry BIG_BLOCK_GAS_LIMIT of EVM gas — room for a contract
+    # deployment no ordinary block holds — priced on a fee track of its own.
+    "BIG_BLOCK_INTERVAL": Param("int", 240, "QRDX_BIG_BLOCK_INTERVAL", minimum=0),
+    "BIG_BLOCK_GAS_LIMIT": Param("int", 3_000_000, "QRDX_BIG_BLOCK_GAS_LIMIT", minimum=0),
+    # Tickers (docs/HYPERLIQUID_PARITY.md 11, Hyperliquid's HIP-1 deploy auction): a token's
+    # unique ticker is bought in a continuous Dutch auction, the price burned. The first sells at
+    # the opening price; each sale opens the next at twice its price, falling linearly to the
+    # floor over TICKER_AUCTION_SECONDS. QRDX.
+    "TICKER_OPENING_PRICE": Param("int", 250, "QRDX_TICKER_OPENING_PRICE", minimum=0),
+    "TICKER_MIN_PRICE": Param("int", 25, "QRDX_TICKER_MIN_PRICE", minimum=0),
+    "TICKER_AUCTION_SECONDS": Param("int", 31 * 3600, "QRDX_TICKER_AUCTION_SECONDS", minimum=1),
+    # QNS (docs/QNS.md): QRDX a name of 5 or more characters costs a year (~$5), paid to the
+    # treasury; a 4-character name 32 times that, a 3-character one 128 times (qns.price_factor).
+    "QNS_PRICE_PER_YEAR": Param("decimal", "0.0125", "QRDX_QNS_PRICE_PER_YEAR", minimum=0),
     "PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS": Param(
         "int", 30 * 24 * 3600, "QRDX_PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS", minimum=0
     ),
     # Tokens the consensus bridge carries (docs/BRIDGE.md): SYMBOL:CHAIN_ID:SOURCE_TOKEN:DECIMALS.
     "BRIDGE_ASSETS": Param("list", [], "QRDX_BRIDGE_ASSETS"),
-    "EXCHANGE_MIN_GAS_PRICE_WEI": Param("int", 10**9, "QRDX_EXCHANGE_MIN_GAS_PRICE_WEI", minimum=0),
+    # The exchange's gas price floor, 0.1 gwei: what every operation outside the free trading lane
+    # pays at least (below) — an order beyond its account's free actions ~$0.0024 at $400 a QRDX.
+    "EXCHANGE_MIN_GAS_PRICE_WEI": Param("int", 10**8, "QRDX_EXCHANGE_MIN_GAS_PRICE_WEI", minimum=0),
     # The EVM's floor under its base fee (qrdx/fee_market.py): EVM gas had no price floor at all
     # (a gas price of 0 executed for free).
     "EVM_MIN_GAS_PRICE_WEI": Param("int", 10**9, "QRDX_EVM_MIN_GAS_PRICE_WEI", minimum=0),
+    # Free trading (docs/TOKENOMICS.md, Hyperliquid's model): a trading operation sent at gas price
+    # 0 pays nothing, within its account's free actions — FREE_ACTIONS_INITIAL, plus
+    # FREE_ACTIONS_PER_VOLUME per unit of settlement-asset volume it has traded; past them, one
+    # every FREE_ACTION_REFILL_SECONDS (cancels: up to twice the budget). At most
+    # FREE_ACTIONS_PER_BLOCK of an account's in a block, only for an account holding
+    # FREE_ACTION_MIN_QRDX of QRDX or FREE_ACTION_MIN_EQUITY of perps equity, and only while the
+    # exchange base fee is at most FREE_TRADING_MAX_BASE_FEE_BPS of its floor: blocks running
+    # full raise it, and then everyone pays until they clear. Anything else pays gas.
+    # EXCHANGE_FREE_TRADING 0: every operation pays gas.
+    "EXCHANGE_FREE_TRADING": Param("int", 1, "QRDX_EXCHANGE_FREE_TRADING", minimum=0),
+    "FREE_ACTIONS_INITIAL": Param("int", 10_000, "QRDX_FREE_ACTIONS_INITIAL", minimum=0),
+    "FREE_ACTIONS_PER_VOLUME": Param("decimal", "1", "QRDX_FREE_ACTIONS_PER_VOLUME", minimum=0),
+    "FREE_ACTION_REFILL_SECONDS": Param("int", 10, "QRDX_FREE_ACTION_REFILL_SECONDS", minimum=1),
+    "FREE_ACTIONS_PER_BLOCK": Param("int", 64, "QRDX_FREE_ACTIONS_PER_BLOCK", minimum=1),
+    "FREE_ACTION_MIN_QRDX": Param("decimal", "0.025", "QRDX_FREE_ACTION_MIN_QRDX", minimum=0),
+    "FREE_ACTION_MIN_EQUITY": Param("int", 10, "QRDX_FREE_ACTION_MIN_EQUITY", minimum=0),
+    "FREE_TRADING_MAX_BASE_FEE_BPS": Param(
+        "int", 20_000, "QRDX_FREE_TRADING_MAX_BASE_FEE_BPS", minimum=10_000
+    ),
     # On-chain governance (qrdx/exchange/governance.py, docs/GOVERNANCE.md). Block counts, not
     # wall time: every node judges a deadline by the height of the block being applied.
     # At 250 ms slots (345,600 blocks a day): 7 days of voting, a 2-day timelock (the holders'
@@ -252,7 +312,7 @@ PARAMS: Dict[str, Param] = {
         "int", 6_667, "QRDX_GOV_APPROVAL_THRESHOLD_BPS", minimum=5_001
     ),
     # QRDX that holders must lock in vetoes to stop a passed proposal (10% of genesis supply).
-    "GOV_VETO_THRESHOLD_QRDX": Param("int", 10_000_000, "QRDX_GOV_VETO_THRESHOLD_QRDX", minimum=1),
+    "GOV_VETO_THRESHOLD_QRDX": Param("int", 1_000_000, "QRDX_GOV_VETO_THRESHOLD_QRDX", minimum=1),
     # A fork activates only if its approval executed at least this many blocks before its
     # height — deeper than any permitted reorg, so no reorg can flip whether it activates. A
     # depth, not a duration: fork resolution searches 256 blocks back, finality ~3 epochs.
@@ -271,6 +331,7 @@ _PARSERS: Dict[str, Callable[[str], Any]] = {
     "int": _parse_int,
     "str": _parse_str,
     "list": _parse_list,
+    "decimal": _parse_decimal,
 }
 
 
@@ -405,6 +466,16 @@ def _check_param_value(name: str, value: Any, where: str) -> Any:
         if not _is_int(value):
             raise ChainSpecError(f"{where}: {name} must be an integer, got {value!r}")
         if p.minimum is not None and value < p.minimum:
+            raise ChainSpecError(f"{where}: {name} must be >= {p.minimum}, got {value}")
+        return value
+    if p.kind == "decimal":
+        try:
+            amount = Decimal(value) if isinstance(value, str) else None
+        except ArithmeticError:
+            amount = None
+        if amount is None or not amount.is_finite() or value != value.strip():
+            raise ChainSpecError(f"{where}: {name} must be a decimal string, got {value!r}")
+        if p.minimum is not None and amount < p.minimum:
             raise ChainSpecError(f"{where}: {name} must be >= {p.minimum}, got {value}")
         return value
     if p.kind == "str":

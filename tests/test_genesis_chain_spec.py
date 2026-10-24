@@ -183,3 +183,19 @@ def test_mainnet_genesis_is_on_chain_762():
     with pytest.raises(ChainSpecError, match="762"):
         create_mainnet_genesis([], {}, int(time.time()) + 3600,
                                cs.build_spec("qrdx-testnet", 7620, {}))
+
+
+def test_a_mainnet_genesis_allocates_exactly_its_supply():
+    """10,000,000 QRDX (docs/TOKENOMICS.md): the prefunded accounts, the validators' stakes and
+    the system wallets must add up to it — a genesis whose recorded supply is not what exists is
+    refused on mainnet."""
+    from qrdx import constants as C
+
+    mainnet = cs.build_spec(cs.MAINNET_NETWORK_NAME, cs.MAINNET_CHAIN_ID, {})
+    stake = Decimal("100000")
+    rest = C.GENESIS_SUPPLY - C.TOTAL_SYSTEM_WALLET_ALLOCATION - stake
+    exact = _creator(spec=mainnet, accounts={ALICE: rest}).create_genesis()[0]
+    assert Decimal(exact.total_supply) == C.GENESIS_SUPPLY == Decimal("10000000")
+    with pytest.raises(ValueError, match="must be equal"):
+        _creator(spec=mainnet, accounts={ALICE: rest + 1}).create_genesis()
+    _genesis()                                                  # a test network is only warned

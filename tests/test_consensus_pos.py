@@ -1946,7 +1946,7 @@ class TestLifecycleManager:
     async def test_deposit_below_minimum(self):
         mgr = LifecycleManager()
         ok, msg = await mgr.submit_deposit(
-            "0xPQ01", "pk1", Decimal("1000"), "0xW01", "sig1",
+            "0xPQ01", "pk1", Decimal("999"), "0xW01", "sig1",
         )
         assert ok is False
         assert "Minimum" in msg

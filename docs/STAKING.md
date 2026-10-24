@@ -140,7 +140,7 @@ paid without having to claim it.
 | `UNBONDING_PERIOD_EPOCHS` | chain spec | 40,320 (~3.7 days of 8 s epochs) |
 | `WITHDRAWAL_DELAY_EPOCHS` | chain spec | 2,048 (~4.6 hours) |
 | `MAX_VALIDATORS` | chain spec | 150 (more wait in the activation queue) |
-| `MIN_VALIDATOR_STAKE` | constant | 100,000 QRDX |
+| `MIN_VALIDATOR_STAKE` | constant | 1,000 QRDX (~$400,000: docs/TOKENOMICS.md) |
 | `STAKING_DEFAULT_COMMISSION_BPS` | constant | 1,000 (10 %) |
 | `STAKE_MIN_DELEGATION` | constant | 1 QRDX |
 

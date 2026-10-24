@@ -31,17 +31,18 @@ This document describes the complete implementation of system wallets for the QR
 | Address | Name | Balance | Category | Purpose |
 |---------|------|---------|----------|---------|
 | `0x...0001` | Garbage Collector | 0 QRDX | System | Burns unclaimed tokens (burner wallet) |
-| `0x...0002` | Community Grants | 5M QRDX | Treasury | Community project funding |
-| `0x...0003` | Developer Fund | 10M QRDX | Treasury | Core development funding |
-| `0x...0004` | Ecosystem Fund | 8M QRDX | Treasury | Strategic investments |
-| `0x...0005` | Staking Rewards | 15M QRDX | System | Validator/delegator rewards |
-| `0x...0006` | Marketing | 3M QRDX | Treasury | Marketing and partnerships |
-| `0x...0007` | Liquidity Reserve | 7M QRDX | DeFi | DEX liquidity provision |
-| `0x...0008` | Treasury Multisig | 20M QRDX | Treasury | Main protocol treasury |
-| `0x...0009` | Bug Bounty | 1M QRDX | Security | Security researcher rewards |
-| `0x...000a` | Airdrop | 6M QRDX | Distribution | Community airdrops |
+| `0x...0002` | Community Grants | 625 QRDX (~$250k) | Treasury | Community project funding |
+| `0x...0003` | Developer Fund | 2,500 QRDX (~$1M) | Treasury | Core development funding |
+| `0x...0004` | Ecosystem Fund | 1,250 QRDX (~$500k) | Treasury | Strategic investments |
+| `0x...0005` | Staking Rewards | 2,500 QRDX (~$1M) | System | Validator/delegator rewards (rewards themselves are minted) |
+| `0x...0006` | Marketing | 250 QRDX (~$100k) | Treasury | Marketing and partnerships |
+| `0x...0007` | Liquidity Reserve | 2,500 QRDX (~$1M) | DeFi | DEX liquidity provision |
+| `0x...0008` | Treasury Multisig | 2,500 QRDX (~$1M) | Treasury | Main protocol treasury |
+| `0x...0009` | Bug Bounty | 625 QRDX (~$250k) | Security | Security researcher rewards |
+| `0x...000a` | Airdrop | 1,250 QRDX (~$500k) | Distribution | Community airdrops |
 
-**Total: 75,000,000 QRDX**
+**Total: 14,000 QRDX (~$5.6M at $400 a QRDX)** — operating budgets, sized in
+docs/TOKENOMICS.md; defined once, `qrdx/constants.py` `SYSTEM_WALLET_GENESIS_BALANCES`.
 
 ## Architecture
 

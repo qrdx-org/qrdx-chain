@@ -55,7 +55,7 @@ def test_deposit_below_the_minimum_is_refused_before_signing(monkeypatch, tmp_pa
     S, _wallet, sent = _wire(monkeypatch)
     w = tmp_path / "v.json"
     w.write_text("{}")
-    r = CliRunner().invoke(S.stake, ["deposit", str(w), "5000", "--yes"])
+    r = CliRunner().invoke(S.stake, ["deposit", str(w), "500", "--yes"])
     assert r.exit_code != 0 and "at least" in r.output and sent == []
 
 

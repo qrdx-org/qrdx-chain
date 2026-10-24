@@ -9,7 +9,8 @@ operations mint through it.
 * A name is ``label.qrdx``: a label of 3–59 of a-z, 0-9 and hyphen (no leading or trailing
   hyphen). Its NFT's token id is a hash of the name; the NFT's name is the name.
 * ``QNS_REGISTER`` mints it to the registrant for 1–QNS_MAX_YEARS years at the chain-spec
-  QNS_PRICE_PER_YEAR (default 10 QRDX a year), paid to the treasury. ``QNS_RENEW``: anyone may
+  QNS_PRICE_PER_YEAR a year (default 0.0125 QRDX, ~$5 at $400 a QRDX) times the name's length
+  factor — 128 for 3 characters, 32 for 4 (``price_factor``) — paid to the treasury. ``QNS_RENEW``: anyone may
   pay to extend it (to at most QNS_MAX_YEARS ahead).
 * Its owner — whoever holds the NFT, or an account it approved — sets its records: ``address``
   (what the name resolves to) and text records. ``QNS_SET_PRIMARY``: an account's reverse
@@ -43,6 +44,13 @@ MAX_KEY_LENGTH = 32
 MAX_VALUE_LENGTH = 256
 
 _LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{1,57}[a-z0-9])")
+
+
+def price_factor(name: str) -> int:
+    """How many base prices (QNS_PRICE_PER_YEAR) a year of ``name`` costs: short names are the
+    scarce ones — 128 for 3 characters, 32 for 4, 1 for 5 or more (ENS's ratios)."""
+    label = str(name).split(".", 1)[0]
+    return 128 if len(label) <= 3 else 32 if len(label) == 4 else 1
 
 
 class QnsError(ValueError):

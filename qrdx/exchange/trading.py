@@ -134,6 +134,14 @@ def _encode_deployer(_address: str, d: Deployer) -> Any:
     return [d.dex, str(d.bond), str(d.unbonding), str(d.unlock)]
 
 
+def _encode_sale(_key: str, sale: Tuple[Decimal, Decimal]) -> Any:
+    return [str(sale[0]), str(sale[1])]
+
+
+def _encode_budget(_account: str, budget: Tuple[int, Decimal]) -> Any:
+    return [budget[0], str(budget[1])]
+
+
 # Builder codes (Hyperliquid's): a front-end earns up to this fraction of the notional of the fills
 # an order it routed takes, when the account approved it (APPROVE_BUILDER_FEE).
 BUILDER_FEE_MAX_PERP = Decimal("0.001")
@@ -315,6 +323,12 @@ class TradingState:
     deployers = committed("tr.deployers", _encode_deployer, mutable=False)
     # "market|validator" → block time of its vote to freeze that deployer market (ORACLE_VOTE)
     freeze_votes = committed("tr.freeze_votes", encode_value, mutable=False)
+    # TICKER → the token it names (TICKER_CLAIM, and the bridge's own); "last" → (price, block
+    # time) of the ticker auction's last sale
+    tickers = committed("tr.tickers", encode_value, mutable=False)
+    ticker_auction = committed("tr.ticker_auction", _encode_sale, mutable=False)
+    # account → (free trading actions it has used, block time of its last free one)
+    action_budgets = committed("tr.action_budgets", _encode_budget, mutable=False)
 
     def __init__(self) -> None:
         self.spot_triggers = {}  # id → SpotTrigger
@@ -328,6 +342,9 @@ class TradingState:
         self.evm_actions = {}  # queued exchange actions of EVM contracts
         self.deployers = {}  # market deployers and their bonds
         self.freeze_votes = {}  # validators' votes to freeze deployer markets
+        self.tickers = {}  # unique tickers of native tokens
+        self.ticker_auction = {}  # the ticker auction's last sale
+        self.action_budgets = {}  # free trading actions used (docs/TOKENOMICS.md)
         self.seq = 0  # trigger and TWAP orders placed so far
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
@@ -343,6 +360,11 @@ class TradingState:
         if "deployers" not in state:  # (pickled before deployer markets)
             self.deployers = {}
             self.freeze_votes = {}
+        if "tickers" not in state:  # (pickled before the ticker auction)
+            self.tickers = {}
+            self.ticker_auction = {}
+        if "action_budgets" not in state:  # (pickled before free trading)
+            self.action_budgets = {}
 
     # ── scheduled cancels ───────────────────────────────────────────────
 
@@ -529,6 +551,9 @@ class TradingState:
                 self.evm_actions,
                 self.deployers,
                 self.freeze_votes,
+                self.tickers,
+                self.ticker_auction,
+                self.action_budgets,
             )
         )
 
@@ -554,6 +579,12 @@ class TradingState:
             sec.raw(self.deployers.commitment())
         if len(self.freeze_votes):  # (absent while no freeze vote is live)
             sec.raw(self.freeze_votes.commitment())
+        if len(self.tickers):  # (absent until the first ticker)
+            sec.raw(self.tickers.commitment())
+        if len(self.ticker_auction):  # (absent until the first ticker sale)
+            sec.raw(self.ticker_auction.commitment())
+        if len(self.action_budgets):  # (absent until the first free trading action)
+            sec.raw(self.action_budgets.commitment())
         return sec.digest()
 
     def state_hash(self) -> bytes:
@@ -619,6 +650,30 @@ class TradingState:
                     if len(self.freeze_votes)
                     else {}
                 ),
+                **(
+                    {"tickers": dict(sorted(self.tickers.peek_items()))}
+                    if len(self.tickers)
+                    else {}
+                ),
+                **(
+                    {
+                        "ticker_auction": {
+                            k: _encode_sale(k, v) for k, v in self.ticker_auction.peek_items()
+                        }
+                    }
+                    if len(self.ticker_auction)
+                    else {}
+                ),
+                **(
+                    {
+                        "action_budgets": {
+                            k: _encode_budget(k, v)
+                            for k, v in sorted(self.action_budgets.peek_items())
+                        }
+                    }
+                    if len(self.action_budgets)
+                    else {}
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -637,3 +692,6 @@ class TradingState:
         self.evm_actions.verify()
         self.deployers.verify()
         self.freeze_votes.verify()
+        self.tickers.verify()
+        self.ticker_auction.verify()
+        self.action_budgets.verify()

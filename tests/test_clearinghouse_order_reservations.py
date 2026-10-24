@@ -23,6 +23,8 @@ from qrdx import constants
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransaction
 from qrdx.exchange.clearinghouse import Clearinghouse, ClearinghouseError
 
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+
 D = Decimal
 BTC = "BTC-QRDX-PERP"
 

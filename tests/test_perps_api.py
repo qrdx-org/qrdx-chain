@@ -23,6 +23,8 @@ from qrdx.exchange import block_processor as BP
 from qrdx.exchange import views
 from qrdx.exchange.submission import ExchangeSubmitter, parse_exchange_tx, signing_payload
 
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+
 D = Decimal
 BTC = "BTC-QRDX-PERP"            # the test session quotes perps in QRDX (tests/conftest.py)
 T0 = 1_700_000_000 // 3600 * 3600

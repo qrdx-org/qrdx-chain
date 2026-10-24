@@ -21,6 +21,7 @@ from decimal import Decimal
 
 from exchange_fees import fee_of
 
+from qrdx import constants
 from qrdx.constants import MIN_VALIDATOR_STAKE
 from qrdx.crypto.pq.dilithium import PQPrivateKey
 from qrdx.database_sqlite import DatabaseSQLite
@@ -43,7 +44,8 @@ def _sign(tx, key):
 
 def _tx(op, sender, nonce, params):
     return ExchangeTransaction(op_type=op, sender=sender, nonce=nonce, params=params,
-                              gas_limit=2_000_000, gas_price=10**9)
+                              gas_limit=2_000_000,
+                              gas_price=constants.EXCHANGE_MIN_GAS_PRICE_WEI)
 
 
 async def _add_block(db, height, ex_section=None, genesis_alloc=None):
@@ -111,7 +113,7 @@ async def test_rebuild_matches_forward_with_staking_deposits():
         # `rich` can afford the stake; `poor` cannot (its deposit is canonical but
         # must be REJECTED on both paths).
         await _add_block(db, 0, genesis_alloc=[(rich_addr, "1000000"),
-                                               (poor_addr, "1000")])
+                                               (poor_addr, str(MIN_VALIDATOR_STAKE / 2))])
         await _add_block(db, 1, encode_exchange_txs([_sign(_tx(
             ExchangeOpType.STAKE_DEPOSIT, rich_addr, 0,
             {"validator_public_key": rich.public_key.to_hex(),
@@ -129,7 +131,8 @@ async def test_rebuild_matches_forward_with_staking_deposits():
         # executed, so both paid their gas.
         gas = fee_of(ExchangeOpType.STAKE_DEPOSIT)
         assert forward_rich == Decimal("1000000") - MIN_VALIDATOR_STAKE - gas
-        assert forward_poor == Decimal("1000") - gas, "a rejected deposit takes only its gas"
+        assert forward_poor == MIN_VALIDATOR_STAKE / 2 - gas, (
+            "a rejected deposit takes only its gas")
 
         rebuild_root = await _run_rebuild(db)
 

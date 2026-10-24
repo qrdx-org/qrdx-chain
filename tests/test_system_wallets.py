@@ -81,7 +81,10 @@ def test_system_wallet_creation():
         total_balance += wallet.genesis_balance
     
     print(f"\n  Total allocation: {total_balance:,} QRDX")
-    assert total_balance == Decimal("75000000"), "Total should be 75M QRDX"
+    from qrdx.constants import TOTAL_SYSTEM_WALLET_ALLOCATION
+
+    # Operating budgets of $100k–$1M each at ~$400 a QRDX (docs/TOKENOMICS.md)
+    assert total_balance == TOTAL_SYSTEM_WALLET_ALLOCATION == Decimal("14000")
     
     print("\n✓ System wallet creation tests passed!")
 

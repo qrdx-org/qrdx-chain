@@ -169,8 +169,9 @@ def test_two_thirds_of_the_stake_freeze_a_market_and_take_its_oracle(m):
 # ── unbonding, halting, slashing ────────────────────────────────────────────
 
 def test_a_deployer_with_markets_keeps_the_minimum_and_unbonds_with_a_delay(m):
-    assert _list_gold(m).success
-    r = _tx(m, DEP, Op.DEPLOYER_UNBOND, amount="60000")
+    assert _list_gold(m).success                                   # 150,000 bonded
+    keep = constants.DEPLOYER_MIN_BOND
+    r = _tx(m, DEP, Op.DEPLOYER_UNBOND, amount=str(150_000 - keep + 1))
     assert not r.success and "keeps" in r.error
     assert _tx(m, DEP, Op.DEPLOYER_UNBOND, amount="50000").success
     r = _tx(m, DEP, Op.DEPLOYER_UNBOND, claim=True)

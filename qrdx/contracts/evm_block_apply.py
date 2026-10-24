@@ -46,23 +46,23 @@ from .state import ContractStateManager
 logger = logging.getLogger(__name__)
 
 
-def section_gas_error(raw_txs: Optional[List[str]]) -> str:
+def section_gas_error(raw_txs: Optional[List[str]], height: Optional[int] = None) -> str:
     """Why an EVM section may not be in a block, or "" if it may: its transactions' declared gas
-    limits must sum to at most ``BLOCK_GAS_LIMIT`` (docs/BLOCK_LIMITS.md). Checked before any
-    of them runs, on every import path, so a block cannot make every node execute more than the
-    limit allows. Each transaction must authenticate (``parse_eth_raw_tx``) to be counted."""
-    from ..constants import BLOCK_GAS_LIMIT
+    limits must sum to at most the block's EVM gas limit — ``BLOCK_GAS_LIMIT``, or a big block's
+    at ``height`` (docs/BLOCK_LIMITS.md). Checked before any of them runs, on every import path,
+    so a block cannot make every node execute more than the limit allows. Each transaction must
+    authenticate (``parse_eth_raw_tx``) to be counted."""
+    from ..block_limits import evm_gas_limit_at
 
+    limit = evm_gas_limit_at(height)
     total = 0
     for i, raw in enumerate(raw_txs or ()):
         try:
             total += int(parse_eth_raw_tx(raw)["gas"])
         except Exception as e:
             return f"evm tx {i} failed verification: {e}"
-        if total > BLOCK_GAS_LIMIT:
-            return (
-                f"evm section exceeds the block gas limit ({total} > {BLOCK_GAS_LIMIT} at tx {i})"
-            )
+        if total > limit:
+            return f"evm section exceeds the block gas limit ({total} > {limit} at tx {i})"
     return ""
 
 
@@ -266,7 +266,7 @@ async def apply_block_evm_section(
     if not declared_state_root:
         return False, "evm section present but block declares no account_state_root"
 
-    gas_error = section_gas_error(raw_txs)
+    gas_error = section_gas_error(raw_txs, block_height)
     if gas_error:
         return False, f"block {block_height}: {gas_error}"
 

@@ -2161,7 +2161,7 @@ async def _verify_chain_rules(
             own_hash = block_hash or reconstruct_signing_root(bc).hex()
             wrong = checkpoints.checkpoint_error(int(block_height), own_hash, trusted)
         if not wrong:
-            wrong = block_resource_error(bc, exchange_section, evm_section)
+            wrong = block_resource_error(bc, exchange_section, evm_section, block_height)
         if not wrong:
             expected = await base_fees_at(db, int(block_height))
             wrong = block_fee_error(bc, exchange_section, evm_section, expected)
@@ -2333,7 +2333,8 @@ async def _apply_evm_section_on_import(
         return True, ""
     from ..contracts.evm_block_apply import section_gas_error
 
-    gas_error = section_gas_error(evm_section)  # a validity rule on every path (BLOCK_LIMITS.md)
+    # A validity rule on every path (BLOCK_LIMITS.md), at the block's height (big blocks).
+    gas_error = section_gas_error(evm_section, block_height)
     if gas_error:
         return False, f"block {block_height}: {gas_error}"
     if EVM_STATE_MANAGER is None:

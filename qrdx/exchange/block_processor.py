@@ -173,6 +173,16 @@ async def preload_sender_balances(
     mgr = state_manager or ExchangeStateManager.get_instance()
     mgr.clear_available_balances()
     await ensure_oracle_committee(db, mgr, height)
+    # The block's exchange base fee: whether the free trading lane is open in it (blocks running
+    # full close it — state_manager.free_lane_open). Read from the chain, as every path reads it.
+    mgr.exchange_base_fee = None
+    if height is not None and getattr(db, "connection", None) is not None:
+        try:
+            from ..fee_market import base_fees_at
+
+            mgr.exchange_base_fee = (await base_fees_at(db, int(height)))[1]
+        except Exception as e:  # noqa: BLE001 — every node reads the same stored chain
+            logger.warning("exchange base fee unread for block %s: %s", height, e)
     # The exchange actions EVM contracts sent run first (process_exchange_transactions).
     txs = mgr.evm_action_txs() + list(txs or [])
     seen = set()
@@ -981,7 +991,8 @@ def _execute_block_boundary_duties(
 
     mgr.apply_oracle_votes(Decimal(str(block_timestamp)))
     now = Decimal(str(block_timestamp))
-    events = mgr.apply_policy_changes(now)
+    spot = mgr.update_spot_oracles(now)  # native-token markets read their spot markets
+    events = spot + mgr.apply_policy_changes(now)
     events += mgr.run_scheduled_cancels(now)  # (first: a switch pulls orders before anything fires)
     events += mgr.fire_spot_triggers(now)
     perps = mgr.clearinghouse.tick(now, funding_interval=constants.PERP_FUNDING_INTERVAL_SECONDS)

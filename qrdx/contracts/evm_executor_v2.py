@@ -36,7 +36,8 @@ from eth_utils import (
     to_checksum_address,
 )
 
-from ..constants import BLOCK_GAS_LIMIT, CHAIN_ID
+from ..block_limits import evm_gas_limit_at, max_evm_tx_gas
+from ..constants import CHAIN_ID
 from ..fee_market import current_evm_base_fee
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ class QRDXEVMExecutor:
             block_number=BlockNumber(max(1, int(block_number))),
             difficulty=GENESIS_DIFFICULTY,
             mix_hash=Hash32(b"\x00" * 32),
-            gas_limit=BLOCK_GAS_LIMIT,  # GASLIMIT: what a block may carry
+            gas_limit=evm_gas_limit_at(block_number),  # GASLIMIT: what this block may carry
             prev_hashes=[Hash32(b"\x00" * 32)] * 256,
             chain_id=CHAIN_ID,  # the network's chain id (chain spec) — the CHAINID opcode
             base_fee_per_gas=current_evm_base_fee(),  # BASEFEE: the block's (fee_market.py)
@@ -333,7 +334,8 @@ class QRDXEVMExecutor:
         """Execute a read-only call (eth_call), in the context of ``block_number`` /
         ``timestamp`` (the caller passes the latest block's). Writes nothing. Never more gas
         than a block may carry (a node runs it on its own time, docs/BLOCK_LIMITS.md)."""
-        gas = BLOCK_GAS_LIMIT if gas is None else min(int(gas), BLOCK_GAS_LIMIT)
+        cap = max_evm_tx_gas()
+        gas = cap if gas is None else min(int(gas), cap)
         return self.execute(
             sender=sender,
             to=to,
@@ -357,7 +359,7 @@ class QRDXEVMExecutor:
     ) -> int:
         """Estimate gas by binary search for the least gas the call succeeds with (+10 %).
         Writes nothing."""
-        low, high = 21000, BLOCK_GAS_LIMIT  # no transaction may need more
+        low, high = 21000, max_evm_tx_gas()  # no transaction may need more (a big block's)
         while low < high:
             mid = (low + high) // 2
             result = self.execute(

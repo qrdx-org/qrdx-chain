@@ -647,13 +647,13 @@ class TestPoolManager:
         mgr = PoolManager()
         with pytest.raises(ValueError, match="staking"):
             mgr.create_pool("QRDX", "USDC", FeeTier.MEDIUM, PoolType.STANDARD,
-                            tick_to_sqrt_price(0), ADDR_A, Decimal("5000"))
+                            tick_to_sqrt_price(0), ADDR_A, Decimal("24"))
 
     def test_subsidized_insufficient_burn(self):
         mgr = PoolManager()
         with pytest.raises(ValueError, match="burning"):
             mgr.create_pool("QRDX", "BTC", FeeTier.HIGH, PoolType.SUBSIDIZED,
-                            tick_to_sqrt_price(0), ADDR_A, Decimal("1000"))
+                            tick_to_sqrt_price(0), ADDR_A, Decimal("9"))
 
     def test_duplicate_pool_rejected(self):
         mgr = PoolManager()
@@ -1241,10 +1241,11 @@ class TestExchangeConstants:
         assert EXCHANGE_ORDERBOOK_MAX_DEPTH == 500
 
     def test_pool_stakes(self):
-        assert EXCHANGE_POOL_STAKE_STANDARD == Decimal("10000")
-        assert EXCHANGE_POOL_STAKE_BOOTSTRAP == Decimal("25000")
-        assert EXCHANGE_POOL_BURN_SUBSIDIZED == Decimal("5000")
-        assert EXCHANGE_POOL_STAKE_INSTITUTIONAL == Decimal("100000")
+        # ~$10,000 / $20,000 / $4,000 / $100,000 at $400 a QRDX (docs/TOKENOMICS.md)
+        assert EXCHANGE_POOL_STAKE_STANDARD == Decimal("25")
+        assert EXCHANGE_POOL_STAKE_BOOTSTRAP == Decimal("50")
+        assert EXCHANGE_POOL_BURN_SUBSIDIZED == Decimal("10")
+        assert EXCHANGE_POOL_STAKE_INSTITUTIONAL == Decimal("250")
 
     def test_tick_bounds(self):
         assert EXCHANGE_MIN_TICK == -887272

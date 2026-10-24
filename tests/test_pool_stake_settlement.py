@@ -104,9 +104,9 @@ def test_enforce_below_minimum_stake_still_rejected_by_create():
     sender = "0xPQ" + "77" * 16
     mgr.enforce_pool_stake = True
     mgr.set_available_balance(sender, Decimal("1000000"))
-    # 500 < STANDARD's 10000 minimum → create_pool raises inside the op.
+    # 5 < STANDARD's minimum (25) → create_pool raises inside the op.
     try:
-        res = mgr._op_create_pool(_pool_tx(sender, stake="500"))
+        res = mgr._op_create_pool(_pool_tx(sender, stake="5"))
         assert not res.success
     except ValueError:
         pass  # create_pool raised on stake < required

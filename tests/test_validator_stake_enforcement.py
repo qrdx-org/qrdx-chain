@@ -118,13 +118,13 @@ async def test_zero_balance_account_cannot_register_a_forged_stake():
 
 async def test_underfunded_deposit_is_refused():
     staker = pq("underfunded")
-    db, mgr = await _node(funded="50000", holder=staker)
+    db, mgr = await _node(funded="500", holder=staker)
     try:
         res = await _run_deposit(db, mgr, _deposit_tx(staker, MIN_VALIDATOR_STAKE))
         assert not res.success and "insufficient balance" in res.error
         assert await db.get_validators() == []
         # Nothing was taken from a rejected deposit.
-        assert await db.get_address_balance(staker) == Decimal("50000")
+        assert await db.get_address_balance(staker) == Decimal("500")
     finally:
         await _close(db)
 
@@ -137,7 +137,7 @@ async def test_deposit_below_the_minimum_is_refused():
     staker = pq("dust-staker")
     db, mgr = await _node(funded="500000", holder=staker)
     try:
-        res = await _run_deposit(db, mgr, _deposit_tx(staker, "1000"))
+        res = await _run_deposit(db, mgr, _deposit_tx(staker, "999"))
         assert not res.success and "below minimum" in res.error
         assert await db.get_validators() == []
         assert await db.get_address_balance(staker) == Decimal("500000")

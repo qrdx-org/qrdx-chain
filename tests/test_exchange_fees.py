@@ -17,9 +17,19 @@ from qrdx.crypto.pq.dilithium import PQPrivateKey
 from qrdx.exchange import ExchangeMempool, ExchangeOpType, ExchangeStateManager, ExchangeTransaction
 from qrdx.exchange import block_processor as BP
 
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+
 D = Decimal
 GWEI = 10 ** 9
 ALICE, BOB = "0xPQ" + "a" * 64, "0xPQ" + "b" * 64
+
+
+@pytest.fixture(autouse=True)
+def _one_gwei_floor(monkeypatch):
+    """The fee mechanics, at a 1 gwei floor and a 1,000 QRDX listing fee (this module's
+    numbers). The defaults are the chain spec's (docs/TOKENOMICS.md)."""
+    monkeypatch.setattr(constants, "EXCHANGE_MIN_GAS_PRICE_WEI", GWEI)
+    monkeypatch.setattr(constants, "PERP_MARKET_LISTING_FEE", 1000)
 
 
 @pytest.fixture

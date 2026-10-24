@@ -58,6 +58,12 @@ def _default_signer_check(tx: ExchangeTransaction) -> str:
     return ExchangeStateManager.get_instance().signer_error(tx)
 
 
+def _default_free_check(tx: ExchangeTransaction) -> str:
+    from .state_manager import ExchangeStateManager
+
+    return ExchangeStateManager.get_instance().free_action_error(tx)
+
+
 def _default_vote_seq_provider(address: str) -> int:
     from .state_manager import ExchangeStateManager
 
@@ -82,6 +88,8 @@ class ExchangeMempool:
         self._nonce_provider = nonce_provider or _default_nonce_provider
         self._vote_seq = vote_seq_provider or _default_vote_seq_provider
         self._signer_check = signer_check or _default_signer_check
+        # Whether a free-lane operation may go free now (its account's budget, the lane open).
+        self._free_check = _default_free_check
         self._txs: Dict[str, ExchangeTransaction] = {}  # tx_hash -> tx
         # nonce lane -> {tx_hash}: the account's own transactions, and each agent's (or a
         # sub-account master's) for it, are separate nonce sequences (``nonce_key``).
@@ -102,11 +110,18 @@ class ExchangeMempool:
         ok, err = verify_exchange_tx(tx)
         if not ok:
             return False, err
-        # 1b. A gas price of at least the floor (whole wei) — execution refuses anything less.
-        try:
-            tx.validate_fee()
-        except ValueError as e:
-            return False, str(e)
+        # 1b. A gas price of at least the floor (whole wei) — execution refuses anything less —
+        #     or a trading operation in the free lane its account may send free now (no budget,
+        #     no free admission: spam never reaches a block).
+        if tx.free_eligible():
+            refused = self._free_check(tx)
+            if refused:
+                return False, refused
+        else:
+            try:
+                tx.validate_fee()
+            except ValueError as e:
+                return False, str(e)
 
         # More gas than a block may carry: it could never be included (docs/BLOCK_LIMITS.md).
         from ..constants import BLOCK_EXCHANGE_GAS_LIMIT
@@ -249,8 +264,10 @@ class ExchangeMempool:
             while n in by_nonce and len(selected) < limit:
                 if gas + int(by_nonce[n].gas_limit) > gas_limit:
                     break
-                if int(by_nonce[n].gas_price) < min_price:
-                    break
+                if int(by_nonce[n].gas_price) < min_price and not (
+                    by_nonce[n].free_eligible() and not self._free_check(by_nonce[n])
+                ):
+                    break  # (a free-lane operation its account may still send free goes in)
                 selected.append(by_nonce[n])
                 gas += int(by_nonce[n].gas_limit)
                 n += 1

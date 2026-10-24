@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from ..crypto.system_wallets import SystemWalletManager
+
 from datetime import datetime, timezone
 
 from .. import chain_spec as chain_spec_mod
@@ -27,6 +28,7 @@ from ..chain_spec import ChainSpec, ChainSpecError
 from ..constants import (
     GENESIS_EPOCH,
     GENESIS_SLOT,
+    GENESIS_SUPPLY,
     MAX_VALIDATORS,
     MIN_VALIDATOR_STAKE,
     SLOTS_PER_EPOCH,
@@ -112,8 +114,8 @@ class GenesisConfig:
     min_validator_stake: Decimal = MIN_VALIDATOR_STAKE
     max_validators: int = MAX_VALIDATORS
 
-    # Initial supply
-    initial_supply: Decimal = Decimal("100000000")  # 100M QRDX
+    # Initial supply: what the genesis allocates, all of it (qrdx/constants.py GENESIS_SUPPLY)
+    initial_supply: Decimal = GENESIS_SUPPLY
 
     # Pre-allocations (address -> balance)
     pre_allocations: Dict[str, Decimal] = field(default_factory=dict)
@@ -510,6 +512,25 @@ class GenesisCreator:
             logger.info(f"Added {len(state.system_wallets)} system wallets")
             logger.info(f"Total system wallet balance: {total_system_wallet_balance}")
 
+        # Every QRDX at genesis is allocated: the prefunded accounts, the validators' stakes and
+        # the system wallets add up to the supply exactly (mainnet's genesis is refused otherwise
+        # — a supply that is not what exists would misstate the token; a test network is warned).
+        allocated = (
+            total_staked
+            + sum((a.balance for a in self._accounts.values()), Decimal(0))
+            + total_system_wallet_balance
+        )
+        if allocated != self.config.initial_supply:
+            if self.spec.chain_id == chain_spec_mod.MAINNET_CHAIN_ID:
+                raise ValueError(
+                    f"the genesis allocates {allocated} QRDX; its supply is "
+                    f"{self.config.initial_supply}: they must be equal"
+                )
+            logger.warning(
+                f"genesis allocates {allocated} QRDX against a supply of "
+                f"{self.config.initial_supply}"
+            )
+
         # Compute roots
         validators_root = self._compute_validators_root(self._validators)
         state.genesis_validators_root = validators_root.hex()
@@ -669,7 +690,7 @@ def create_mainnet_genesis(
         chain_spec=chain_spec,
         genesis_time=genesis_time,
         min_genesis_validators=MIN_GENESIS_VALIDATORS,
-        initial_supply=Decimal("100000000"),  # 100M QRDX
+        initial_supply=GENESIS_SUPPLY,  # every QRDX the genesis allocates
         pre_allocations=pre_allocations,
     )
 

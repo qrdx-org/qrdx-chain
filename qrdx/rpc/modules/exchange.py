@@ -31,6 +31,8 @@ from the same views as the REST endpoints (qrdx/exchange/views.py), so all surfa
     perp_getUserVaults(leader)   perp_getUserVault(vault, holder)
     perp_getDeployer(address | dex)   (docs/HYPERLIQUID_PARITY.md: a deployer's bond and markets)
     exchange_getAgents(address)   exchange_getSubaccounts(address)
+    exchange_getTicker(ticker)   exchange_getTickerAuction()   (unique tickers: HIP-1's auction)
+    exchange_getFreeActions(address)   (the free trading lane: docs/TOKENOMICS.md)
 
     market_getMarkets(kind)   market_getTicker(market)   market_getOrderBook(market, depth, level)
     market_getTrades(market, limit, since)   market_getCandles(market, interval, limit, end)
@@ -96,6 +98,37 @@ class ExchangeModule(RPCModule):
         if db is None:
             return constants.EXCHANGE_MIN_GAS_PRICE_WEI
         return (await suggested_prices(db))[1]
+
+    @rpc_method
+    async def getFreeActions(self, address: str) -> Dict[str, Any]:
+        """``address``'s free trading actions (docs/TOKENOMICS.md): its budget, how many it has
+        used, how many are left, and whether a trading operation of its would go free now (and
+        why not, if not)."""
+        from ...exchange import ExchangeOpType, ExchangeTransaction
+
+        mgr = _manager()
+        used, last = mgr.trading.action_budgets.peek(address, (0, 0))
+        budget = mgr.free_action_budget(address)
+        probe = ExchangeTransaction(
+            op_type=ExchangeOpType.PERP_ORDER,
+            sender=address,
+            nonce=0,
+            params={"market_id": "", "side": "buy", "size": "0", "price": "0"},
+            gas_limit=1,
+            gas_price=0,
+            timestamp=1.0,
+        )
+        why = mgr.free_action_error(probe) if probe.free_eligible() else "no free lane here"
+        return {
+            "address": address,
+            "budget": budget,
+            "used": int(used),
+            "remaining": max(0, budget - int(used)),
+            "last_free_action": str(last),
+            "lane_open": mgr.free_lane_open(),
+            "free_now": why == "",
+            "why_not": why or None,
+        }
 
     @rpc_method
     async def getNonce(self, address: str, signer: Optional[str] = None) -> int:
@@ -166,6 +199,23 @@ class ExchangeModule(RPCModule):
         if found is None:
             raise RPCError(RPCErrorCode.RESOURCE_NOT_FOUND, f"token {token_address} not found")
         return found
+
+    @rpc_method
+    async def getTicker(self, ticker: str) -> Dict[str, Any]:
+        """The token a unique ticker names (docs/HYPERLIQUID_PARITY.md 11)."""
+        from ...exchange import views
+
+        found = views.ticker(_manager(), ticker)
+        if found is None:
+            raise RPCError(RPCErrorCode.RESOURCE_NOT_FOUND, f"no ticker {ticker}")
+        return found
+
+    @rpc_method
+    async def getTickerAuction(self) -> Dict[str, Any]:
+        """The ticker auction's price now, its floor and its last sale."""
+        from ...exchange import views
+
+        return views.ticker_auction(_manager())
 
     @rpc_method
     async def getAllowance(self, token_address: str, owner: str, spender: str) -> Dict[str, Any]:

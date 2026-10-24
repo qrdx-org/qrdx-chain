@@ -128,6 +128,8 @@ def exchange_read_precompile(computation):
 
     data = bytes(computation.msg.data_as_bytes)
     computation.consume_gas(READ_GAS, reason="exchange read")
+    if computation.msg.value:
+        _fail(computation, "the exchange precompile does not accept QRDX")
     entry = _READS.get(data[:4])
     if entry is None:
         _fail(computation, "unknown exchange read")
@@ -212,11 +214,21 @@ def parse_action(raw: str) -> Tuple[str, Dict[str, Any], int]:
 
 
 def exchange_write_precompile(computation):
-    data = bytes(computation.msg.data_as_bytes)
+    msg = computation.msg
+    data = bytes(msg.data_as_bytes)
+    if msg.storage_address != msg.code_address:
+        # A DELEGATECALL runs with the delegating frame's caller as ``msg.sender``: a contract
+        # anyone calls could otherwise send actions as whoever called it (as a CALLCODE could as
+        # itself, by surprise). Only a plain CALL acts — as the calling contract.
+        computation.consume_gas(WRITE_GAS, reason="exchange write")
+        _fail(computation, "the exchange cannot be called with DELEGATECALL or CALLCODE")
+    if msg.value:
+        computation.consume_gas(WRITE_GAS, reason="exchange write")
+        _fail(computation, "the exchange precompile does not accept QRDX")
     if data[:4] != SEND_ACTION:
         computation.consume_gas(WRITE_GAS, reason="exchange write")
         _fail(computation, "unknown exchange write")
-    if computation.msg.is_static:
+    if msg.is_static:
         computation.consume_gas(WRITE_GAS, reason="exchange write")
         _fail(computation, "an exchange action cannot be sent in a static call")
     try:

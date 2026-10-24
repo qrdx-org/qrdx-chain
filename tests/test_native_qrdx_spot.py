@@ -146,7 +146,10 @@ def test_a_pool_that_cannot_pay_qrdx_out_refuses_the_swap(mgr):
     assert pool.state_digest() == digest
 
 
-def test_a_trader_cannot_swap_its_gas_money(mgr):
+def test_a_trader_cannot_swap_its_gas_money(mgr, monkeypatch):
+    from qrdx import constants
+
+    monkeypatch.setattr(constants, "EXCHANGE_MIN_GAS_PRICE_WEI", 10 ** 9)  # (this test's floor)
     _setup(mgr)
     tok = next(iter(mgr.tokens.tokens))
     mgr.set_available_balance(TRADER, D("100.0005"))             # 100 + less than the reservation

@@ -23,9 +23,12 @@ Atomicity. ``quote`` simulates a swap without touching the pool and returns its 
 ``apply`` executes a plan. A caller checks slippage, balances and solvency on the plan first, so
 a swap that fails a check changes nothing — and a quote is exactly what executes.
 
-Oracle. Each pool records Uniswap-style tick-cumulative observations on block time (at most one
-per block, written before the block's first change), so its time-weighted price cannot be moved
-within a block and replays to the same value on every node.
+Oracle. Each pool records Uniswap-style tick-cumulative observations on block time, written
+before the block's first change, so its time-weighted price cannot be moved within a block and
+replays to the same value on every node. Checkpoints are kept OBSERVATION_SPACING seconds apart;
+the newest observation moves forward with each block that changes the pool. A TWAP runs from the
+newest checkpoint at or before its window's start — exact over that span, at most
+OBSERVATION_SPACING longer than the window.
 """
 
 from __future__ import annotations
@@ -48,6 +51,7 @@ from decimal import (
 from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple
 
+from .. import constants as _constants
 from .commitment import CommitmentMismatch, Section, as_committed_dict, tracked
 
 # Q96 arithmetic requires high precision. (Kept for modules that relied on importing this one to
@@ -63,7 +67,12 @@ MIN_TICK = -887272
 MAX_TICK = 887272
 TICK_BASE = Decimal("1.0001")
 AMOUNT_QUANTUM = Decimal("1e-18")  # token amounts: 18 decimals
-MAX_OBSERVATIONS = 64
+# The oracle keeps checkpoints at least OBSERVATION_SPACING seconds of block time apart, and the
+# newest observation moves with every block that changes the pool: 128 of them hold ~32 minutes
+# of history however busy the pool. (One a block kept 64 — 16 seconds at 250 ms slots, so a
+# 10-minute TWAP of an active pool had no history to read.)
+MAX_OBSERVATIONS = 128
+OBSERVATION_SPACING = 15
 
 _PREC = 78
 _CTX = Context(prec=_PREC, rounding=ROUND_HALF_EVEN)
@@ -108,17 +117,17 @@ _TICK_SPACINGS = {100: 1, 500: 10, 3000: 60, 10000: 200}
 class PoolType(IntEnum):
     """Pool creation types with different stake requirements (§7.3)."""
 
-    STANDARD = 0  # 10 000 QRDX staked
-    BOOTSTRAP = 1  # 25 000 QRDX staked (30-day incentive)
-    SUBSIDIZED = 2  # 5 000 QRDX burned (permanent, community-owned)
-    INSTITUTIONAL = 3  # 100 000 QRDX staked (higher depth, lower fees)
+    STANDARD = 0  # QRDX staked (constants.EXCHANGE_POOL_STAKE_STANDARD)
+    BOOTSTRAP = 1  # more staked (30-day incentive)
+    SUBSIDIZED = 2  # QRDX burned (permanent, community-owned)
+    INSTITUTIONAL = 3  # most staked (higher depth, lower fees)
 
 
-POOL_STAKE_REQUIREMENTS: Dict[int, Decimal] = {
-    PoolType.STANDARD: Decimal("10000"),
-    PoolType.BOOTSTRAP: Decimal("25000"),
-    PoolType.SUBSIDIZED: Decimal("5000"),
-    PoolType.INSTITUTIONAL: Decimal("100000"),
+POOL_STAKE_REQUIREMENTS: Dict[int, Decimal] = {  # (defined once: qrdx/constants.py)
+    PoolType.STANDARD: _constants.EXCHANGE_POOL_STAKE_STANDARD,
+    PoolType.BOOTSTRAP: _constants.EXCHANGE_POOL_STAKE_BOOTSTRAP,
+    PoolType.SUBSIDIZED: _constants.EXCHANGE_POOL_BURN_SUBSIDIZED,
+    PoolType.INSTITUTIONAL: _constants.EXCHANGE_POOL_STAKE_INSTITUTIONAL,
 }
 
 # Fee distribution (§7.6): liquidity providers in range get FEE_LP_SHARE; the rest is the
@@ -561,11 +570,13 @@ class ConcentratedLiquidityPool:
         last = obs[-1]
         if now <= last.time:
             return
-        obs.append(
-            Observation(
-                time=now, tick_cumulative=last.tick_cumulative + self.state.tick * (now - last.time)
-            )
+        head = Observation(
+            time=now, tick_cumulative=last.tick_cumulative + self.state.tick * (now - last.time)
         )
+        if len(obs) >= 2 and last.time - obs[-2].time < OBSERVATION_SPACING:
+            obs[-1] = head  # the newest moves forward: obs[-2] is the last checkpoint
+        else:
+            obs.append(head)
         if len(obs) > MAX_OBSERVATIONS:
             del obs[: len(obs) - MAX_OBSERVATIONS]
 
@@ -586,16 +597,23 @@ class ConcentratedLiquidityPool:
 
     @_pinned
     def twap_price(self, window: int, now: int) -> Optional[Decimal]:
-        """Time-weighted average price (token1 per token0) over the ``window`` seconds of block
-        time up to ``now`` — the geometric mean, from tick cumulatives. None without enough
-        history."""
+        """Time-weighted average price (token1 per token0) over at least the ``window`` seconds
+        of block time up to ``now`` — the geometric mean, from tick cumulatives, from the newest
+        checkpoint at or before ``now − window`` (so exact over that span). None without that
+        much history."""
         window, now = int(window), int(now)
         if window <= 0:
             return None
-        end, start = self._cumulative_at(now), self._cumulative_at(now - window)
-        if end is None or start is None:
+        obs = self.state.observations
+        end = self._cumulative_at(now)
+        times = [o.time for o in obs]
+        i = bisect.bisect_right(times, now - window) - 1
+        if end is None or i < 0:
             return None
-        return TICK_BASE ** ((end - start) // window)
+        start = obs[i]
+        if now <= start.time:
+            return None
+        return TICK_BASE ** ((end - start.tick_cumulative) // (now - start.time))
 
     # -- Swap ---------------------------------------------------------------
 

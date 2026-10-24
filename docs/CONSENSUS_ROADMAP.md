@@ -92,7 +92,8 @@ and appear in the EVM (ERC-721) like any NFT. The protocol is their only minter.
 - **A name:** `label.qrdx`. Labels are 3–59 of a-z, 0-9 and hyphen, with no leading or trailing
   hyphen. Its token id is a hash of the name.
 - **`QNS_REGISTER {name, years, target?}`:** mints it to the sender for `years` (1–10) at
-  `QNS_PRICE_PER_YEAR` (chain-spec; default **10 QRDX a year**), paid to the treasury.
+  `QNS_PRICE_PER_YEAR` (chain-spec; default **0.0125 QRDX a year**, ~$5, more for 3- and 4-character
+  names), paid to the treasury.
 - **`QNS_RENEW {name, years}`:** anyone may pay.
 - **`QNS_SET_RECORD {name, key, value}`:** the owner (or an approved operator) sets `address`
   (where the name resolves) or text records.

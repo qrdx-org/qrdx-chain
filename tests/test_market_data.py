@@ -20,6 +20,8 @@ from qrdx.exchange import views
 from qrdx.exchange.market_data import MAX_TRADES, MarketData
 from qrdx.exchange.tokens import NATIVE_ASSET
 
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+
 D = Decimal
 LP, TRADER, MAKER, MAKER2 = ("0xPQ" + c * 64 for c in "abcd")
 T0 = 1_700_000_000 // 86400 * 86400

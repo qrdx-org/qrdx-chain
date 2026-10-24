@@ -410,10 +410,15 @@ class EVMMempool:
 
         # More gas than a block may carry, or a price under the floor: it could never be included
         # (docs/BLOCK_LIMITS.md). (Above the floor it waits for the base fee to come down to it.)
-        from ..constants import BLOCK_GAS_LIMIT, EVM_MIN_GAS_PRICE_WEI
+        from ..block_limits import max_evm_tx_gas
+        from ..constants import EVM_MIN_GAS_PRICE_WEI
 
-        if int(parsed["gas"]) > BLOCK_GAS_LIMIT:
-            return False, f"gas {parsed['gas']} exceeds the block gas limit {BLOCK_GAS_LIMIT}", None
+        if int(parsed["gas"]) > max_evm_tx_gas():
+            return (
+                False,
+                f"gas {parsed['gas']} exceeds the largest block's gas limit {max_evm_tx_gas()}",
+                None,
+            )
         if int(parsed["gas_price"]) < EVM_MIN_GAS_PRICE_WEI:
             return (
                 False,

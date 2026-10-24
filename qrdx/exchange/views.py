@@ -38,9 +38,11 @@ def account_key(ch, address: str) -> Optional[str]:
 
 
 def tokens(mgr) -> List[Dict[str, Any]]:
-    """Every native token: supply, decimals, authorities (qrdx/exchange/tokens.py)."""
+    """Every native token: supply, decimals, authorities (qrdx/exchange/tokens.py), and the
+    unique ticker it holds, if any (docs/HYPERLIQUID_PARITY.md 11)."""
     reg = mgr.tokens
-    return [reg.tokens[a].summary() for a in sorted(reg.tokens)]
+    held = {address: ticker for ticker, address in mgr.trading.tickers.peek_items()}
+    return [{**reg.tokens[a].summary(), "ticker": held.get(a)} for a in sorted(reg.tokens)]
 
 
 def token(mgr, token_address: str) -> Optional[Dict[str, Any]]:
@@ -48,6 +50,7 @@ def token(mgr, token_address: str) -> Optional[Dict[str, Any]]:
     if t is None:
         return None
     out = t.summary()
+    out["ticker"] = mgr.ticker_of(t.address)
     out["frozen_accounts"] = sum(1 for tok, _ in mgr.tokens.frozen if tok == t.address)
     return out
 
@@ -729,7 +732,7 @@ def user_vault(mgr, vault_address: str, holder: Optional[str] = None) -> Optiona
     v = ch.user_vaults.peek(vault_address)
     if v is None:
         return None
-    nav = ch.cross_equity(vault_address)
+    nav = ch.total_equity(vault_address)
     acct = ch.accounts.peek(vault_address)
     out: Dict[str, Any] = {
         "vault": vault_address,
@@ -881,7 +884,14 @@ def _asset_info(mgr, asset: str) -> Dict[str, Any]:
     t = mgr.tokens.get(asset)
     if t is None:
         return {"symbol": None, "name": None, "decimals": None}
-    return {"symbol": t.symbol, "name": t.name, "decimals": t.decimals}
+    # ``ticker``: the token's unique ticker, if it holds one — a symbol alone proves nothing
+    # (anyone can deploy a token called USDC).
+    return {
+        "symbol": t.symbol,
+        "name": t.name,
+        "decimals": t.decimals,
+        "ticker": mgr.ticker_of(t.address),
+    }
 
 
 def _book_of(mgr, info: Dict[str, Any]):
@@ -1182,3 +1192,36 @@ def protocol_addresses(mgr) -> Dict[str, Any]:
         if resolve is not None:
             out[name] = resolve()
     return out
+
+
+# ── tickers (docs/HYPERLIQUID_PARITY.md 11) ─────────────────────────────────
+
+
+def ticker(mgr, name: str) -> Optional[Dict[str, Any]]:
+    """The token a ticker names."""
+    address = mgr.trading.tickers.peek(str(name).upper())
+    if address is None:
+        return None
+    t = mgr.tokens.get(address)
+    return {
+        "ticker": str(name).upper(),
+        "token_address": address,
+        "symbol": t.symbol if t is not None else None,
+        "name": t.name if t is not None else None,
+    }
+
+
+def ticker_auction(mgr) -> Dict[str, Any]:
+    """The ticker auction now: its price at the current block time, and its last sale."""
+    from .. import constants
+
+    last = mgr.trading.ticker_auction.peek("last")
+    return {
+        "price": str(mgr.ticker_price()),
+        "floor": str(constants.TICKER_MIN_PRICE),
+        "opening_price": str(constants.TICKER_OPENING_PRICE),
+        "auction_seconds": int(constants.TICKER_AUCTION_SECONDS),
+        "last_sale": None if last is None else {"price": str(last[0]), "time": str(last[1])},
+        "tickers": len(mgr.trading.tickers),
+        "reserved": sorted(mgr.reserved_tickers()),
+    }

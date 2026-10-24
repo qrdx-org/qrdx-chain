@@ -653,8 +653,13 @@ class ValidatorNode:
                             and self._evm_section_producer is not None
                         ):
                             try:
+                                from ..block_limits import evm_gas_limit_at
+
                                 evm_raws = (
-                                    self._evm_tx_source.select_for_block(min_price=base_fees[0])
+                                    self._evm_tx_source.select_for_block(
+                                        min_price=base_fees[0],
+                                        gas_limit=evm_gas_limit_at(next_height),
+                                    )
                                     or []
                                 )
                             except Exception as e:
@@ -1156,7 +1161,7 @@ class ValidatorNode:
             for m in mgr.clearinghouse.markets.values()
             if m.quote == constants.PERP_QUOTE
             and m.settled_price <= 0
-            and (not m.deployer or Clearinghouse.frozen(m, now))
+            and (not Clearinghouse.contained(m) or Clearinghouse.frozen(m, now))
         )
         # The oracle price, and other venues' perp price where the feed has one (the mark's
         # third input).
@@ -1182,7 +1187,7 @@ class ValidatorNode:
         live = {
             mid
             for mid, m in mgr.clearinghouse.markets.items()
-            if m.deployer and m.settled_price <= 0
+            if Clearinghouse.contained(m) and m.settled_price <= 0
         }
         freeze = [mid for mid in freeze_from_env() if mid in live]
         if not prices and not deposits and not heads and not freeze:

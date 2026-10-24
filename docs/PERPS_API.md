@@ -36,11 +36,11 @@ post-quantum (Dilithium / ML-DSA-65) key. A traditional `0x` key cannot sign one
 | `PERP_DEPOSIT` | 18 | `amount` — collateral (the stablecoin) moved from the wallet into the clearinghouse |
 | `PERP_WITHDRAW` | 19 | `amount` — at most `withdrawable` |
 | `PERP_SET_LEVERAGE` | 20 | `market_id`, `leverage`, `mode` (`cross` \| `isolated`) |
-| `PERP_ORDER` | 21 | `market_id`, `side` (`buy` \| `sell`), `size`, `price`, optional `reduce_only` (bool), `tif` (`gtc` default \| `ioc` \| `fok` \| `alo`), `hidden` (bool), `display_size` (an iceberg) |
+| `PERP_ORDER` | 21 | `market_id`, `side` (`buy` \| `sell`), `size`, `price`, optional `reduce_only` (bool), `tif` (`gtc` default \| `ioc` \| `fok` \| `alo`), `hidden` (bool), `display_size` (an iceberg), `leverage` and `margin_mode` (`cross` \| `isolated`): this trade's, set for the market with it (HYPERLIQUID_PARITY.md §9) |
 | `PERP_CANCEL` | 22 | `market_id`, `order_id` |
 | `VAULT_DEPOSIT` | 23 | `amount` — free collateral into the backstop vault, for shares |
 | `VAULT_WITHDRAW` | 24 | `shares` |
-| `CREATE_MARKET` | 12 | `base_token` (e.g. `BTC`), optional `max_leverage` (default 20), `liquidity` (at least `PERP_MARKET_MIN_LIQUIDITY` of perps collateral for the market's liquidity vault — TRADING_FEATURES.md §14), `sz_decimals` (the order grid); a deployer market (`dex:ASSET`) also takes `oracle_price` and `fee_share_bps` |
+| `CREATE_MARKET` | 12 | a deployer market: `base_token` (`dex:ASSET`), `oracle_price`, `fee_share_bps`, `liquidity` (at least `PERP_MARKET_MIN_LIQUIDITY` of perps collateral for the market's liquidity vault — TRADING_FEATURES.md §14), optional `max_leverage` (default 20, at most 50), `sz_decimals` (the order grid). A validator-priced market (`BTC`) is listed by governance (`list_market`), or with this op where the chain spec allows open listing |
 | `PERP_ISOLATED_MARGIN` | 76 | `market_id`, `amount` — into an isolated position's margin (negative: out of it) |
 | `SCHEDULE_CANCEL` | 77 | optional `time` — every order cancelled at that block time (none: cleared) |
 | `APPROVE_BUILDER_FEE` | 78 | `builder`, `max_fee_rate` — an order then carries `builder: {b, f}` |
@@ -66,9 +66,18 @@ and the trading history are in [TRADING_FEATURES.md](TRADING_FEATURES.md).
 executes consumes its nonce whether it succeeds or fails (e.g. an order refused for margin); one
 rejected before execution (bad signature, wrong nonce, under-priced, unaffordable gas) does not.
 
+**Free trading.** A trading operation (an order, cancel, modify, trigger, TWAP, leverage change,
+or a batch of them) may be sent with `gas_price` 0 and pays nothing, within its account's free
+actions: 10,000, plus 1 per unit of volume traded; past them, one every 10 seconds. The account
+needs a holding (0.025 QRDX or 10 of perps equity), and at most 64 free actions of an account fit
+in a block. While blocks run full, only cancels go free. `exchange_getFreeActions(address)`
+shows an account's budget, and the signing payload and the CLI pick 0 when it would go free
+(docs/TOKENOMICS.md). Anything else pays gas, as below.
+
 **Fees.** Gas is priced in wei (1 QRDX = 10^18 wei), at least the floor `exchange_gasPrice`
-returns (1 gwei). Every executed transaction — success or failure — pays its operation's gas ×
-`gas_price` in QRDX, burned (about 0.00004–0.00015 QRDX); the sender needs QRDX for
+returns (0.1 gwei by default). Every executed transaction outside the free lane — success or
+failure — pays its operation's gas × `gas_price` in QRDX, burned (about 0.000004–0.000015 QRDX at
+the floor); the sender needs QRDX for
 `gas_limit × gas_price`, reserved while it runs. The receipt reports `fee` and `gas_price`.
 
 **Signing bytes** — what the signature covers, concatenated:

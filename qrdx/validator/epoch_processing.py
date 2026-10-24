@@ -23,6 +23,7 @@ from ..constants import (
     ATTESTATION_THRESHOLD,
     BASE_REWARD_FACTOR,
     INACTIVITY_PENALTY_QUOTIENT,
+    MAX_EFFECTIVE_STAKE as _MAX_EFFECTIVE_STAKE,
     MAX_VALIDATORS,
     MIN_VALIDATOR_STAKE,
     PROPOSER_REWARD_QUOTIENT,
@@ -36,8 +37,8 @@ logger = get_logger(__name__)
 
 
 # Effective balance constants
-EFFECTIVE_BALANCE_INCREMENT = Decimal("1000")  # 1000 QRDX granularity
-MAX_EFFECTIVE_BALANCE = Decimal("1000000")  # 1M QRDX cap
+EFFECTIVE_BALANCE_INCREMENT = Decimal("1")  # 1 QRDX granularity (~$400: docs/TOKENOMICS.md)
+MAX_EFFECTIVE_BALANCE = _MAX_EFFECTIVE_STAKE  # one definition (qrdx/constants.py)
 
 
 @dataclass

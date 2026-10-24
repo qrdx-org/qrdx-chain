@@ -68,7 +68,6 @@ SMALLEST = 1000000  # Smallest unit divisor
 START_DIFFICULTY = Decimal("6.0")
 BLOCK_TIME = 180  # 180 seconds / 3 minute block time
 BLOCKS_PER_ADJUSTMENT = 512  # Difficulty adjustment every 512 blocks
-MAX_SUPPLY = 33_554_432  # Maximum coin supply (2^25)
 MAX_BLOCK_SIZE_HEX = 4096 * 1024  # 4MB in HEX format, 2MB in raw bytes
 
 
@@ -139,22 +138,28 @@ SYSTEM_WALLET_ADDRESSES = {
     "AIRDROP": "0x000000000000000000000000000000000000000a",
 }
 
-# System wallet genesis balances (in QRDX)
+# The genesis supply: every QRDX that exists at genesis — prefunded accounts, validators' stakes
+# and system wallets together (a mainnet genesis must allocate exactly this: validator/genesis.py).
+# ~$4B at the targeted ~$400 a QRDX (docs/TOKENOMICS.md). Staking rewards are minted after it.
+GENESIS_SUPPLY = Decimal("10000000")
+
+# System wallet genesis balances (in QRDX): each $25,000–$1,000,000 at ~$400 a QRDX
+# (docs/TOKENOMICS.md) — the system wallets are operating budgets, not the supply's owners.
 SYSTEM_WALLET_GENESIS_BALANCES = {
     "GARBAGE_COLLECTOR": Decimal("0"),  # Burner wallet, starts empty
-    "COMMUNITY_GRANTS": Decimal("5000000"),  # 5M QRDX
-    "DEVELOPER_FUND": Decimal("10000000"),  # 10M QRDX
-    "ECOSYSTEM_FUND": Decimal("8000000"),  # 8M QRDX
-    "STAKING_REWARDS": Decimal("15000000"),  # 15M QRDX
-    "MARKETING": Decimal("3000000"),  # 3M QRDX
-    "LIQUIDITY_RESERVE": Decimal("7000000"),  # 7M QRDX
-    "TREASURY_MULTISIG": Decimal("20000000"),  # 20M QRDX
-    "BUG_BOUNTY": Decimal("1000000"),  # 1M QRDX
-    "AIRDROP": Decimal("6000000"),  # 6M QRDX
+    "COMMUNITY_GRANTS": Decimal("625"),  # ~$250,000
+    "DEVELOPER_FUND": Decimal("2500"),  # ~$1,000,000
+    "ECOSYSTEM_FUND": Decimal("1250"),  # ~$500,000
+    "STAKING_REWARDS": Decimal("2500"),  # ~$1,000,000 (rewards themselves are minted)
+    "MARKETING": Decimal("250"),  # ~$100,000
+    "LIQUIDITY_RESERVE": Decimal("2500"),  # ~$1,000,000
+    "TREASURY_MULTISIG": Decimal("2500"),  # ~$1,000,000
+    "BUG_BOUNTY": Decimal("625"),  # ~$250,000
+    "AIRDROP": Decimal("1250"),  # ~$500,000
 }
 
 # Total system wallet allocation
-TOTAL_SYSTEM_WALLET_ALLOCATION = Decimal("75000000")  # 75M QRDX
+TOTAL_SYSTEM_WALLET_ALLOCATION = sum(SYSTEM_WALLET_GENESIS_BALANCES.values())  # 14,000 QRDX
 
 # System wallet metadata
 SYSTEM_WALLET_METADATA = {
@@ -581,8 +586,9 @@ MIN_VALIDATORS = _NETWORK_PARAMS["MIN_VALIDATORS"]  # Chain-spec parameter (main
 # Validators proposing and voting at once; more wait in the activation queue
 # (validator/epoch_state.py). Chain-spec parameter.
 MAX_VALIDATORS = _NETWORK_PARAMS["MAX_VALIDATORS"]
-MIN_VALIDATOR_STAKE = Decimal("100000")  # 100,000 QRDX minimum stake to ACTIVATE
-MAX_EFFECTIVE_STAKE = Decimal("1000000")  # 1,000,000 QRDX max effective stake
+# QRDX amounts are sized for ~$400 a QRDX (docs/TOKENOMICS.md).
+MIN_VALIDATOR_STAKE = Decimal("1000")  # 1,000 QRDX (~$400,000) minimum stake to ACTIVATE
+MAX_EFFECTIVE_STAKE = Decimal("100000")  # 100,000 QRDX (1 % of genesis supply) max weight
 
 # Stake at which an ACTIVE validator is ejected — deliberately well BELOW the activation
 # threshold, mirroring Ethereum's 16 ETH ejection vs 32 ETH activation.
@@ -594,14 +600,12 @@ MAX_EFFECTIVE_STAKE = Decimal("1000000")  # 1,000,000 QRDX max effective stake
 # proposers, and in the worst case emptying the set and halting the chain. Requiring a
 # validator to have lost HALF its stake before it loses its slot means only sustained
 # inactivity (or slashing, which ejects on its own) removes it.
-VALIDATOR_EJECTION_STAKE = MIN_VALIDATOR_STAKE / 2  # 50,000 QRDX
+VALIDATOR_EJECTION_STAKE = MIN_VALIDATOR_STAKE / 2  # 500 QRDX
 
 # --- Staking Parameters ---
 # Chain-spec parameter (test networks shorten it so a soak observes the full exiting→exited
 # unbonding completion); standard 40,320 epochs, ~3.7 days of 8 s epochs.
 UNBONDING_PERIOD_EPOCHS = _NETWORK_PARAMS["UNBONDING_PERIOD_EPOCHS"]
-MIN_DEPOSIT = Decimal("10000")  # Minimum deposit amount
-MAX_DEPOSIT = Decimal("10000000")  # Maximum single deposit
 ACTIVATION_DELAY_EPOCHS = _NETWORK_PARAMS[
     "ACTIVATION_DELAY_EPOCHS"
 ]  # Epochs until deposit becomes active
@@ -619,7 +623,7 @@ WITHDRAWAL_DELAY_EPOCHS = _NETWORK_PARAMS["WITHDRAWAL_DELAY_EPOCHS"]
 # commission on the pool's, and the rest compounds into the pool. A chain-spec parameter.
 STAKING_REWARD_RATE_BPS = _NETWORK_PARAMS["STAKING_REWARD_RATE_BPS"]
 STAKING_DEFAULT_COMMISSION_BPS = 1_000  # a pool's commission until its validator sets one
-STAKE_MIN_DELEGATION = Decimal("1")  # QRDX: smaller delegations are refused (dust)
+STAKE_MIN_DELEGATION = Decimal("0.01")  # QRDX (~$4): smaller delegations are refused (dust)
 
 # Addresses allowed to submit UPDATE_ORACLE. Oracle prices drive perp execution, margin,
 # PnL and liquidations — all settled into real balances — so an unrestricted update let any
@@ -664,10 +668,17 @@ PERP_FUNDING_INTERVAL_SECONDS = _NETWORK_PARAMS["PERP_FUNDING_INTERVAL_SECONDS"]
 # parameters.
 BLOCK_GAS_LIMIT = _NETWORK_PARAMS["BLOCK_GAS_LIMIT"]
 BLOCK_EXCHANGE_GAS_LIMIT = _NETWORK_PARAMS["BLOCK_EXCHANGE_GAS_LIMIT"]
+# Every BIG_BLOCK_INTERVAL-th block may carry BIG_BLOCK_GAS_LIMIT of EVM gas (qrdx/block_limits.py).
+BIG_BLOCK_INTERVAL = _NETWORK_PARAMS["BIG_BLOCK_INTERVAL"]
+BIG_BLOCK_GAS_LIMIT = _NETWORK_PARAMS["BIG_BLOCK_GAS_LIMIT"]
 # QRDX burned by CREATE_MARKET (with the fee gate on). Every market costs every node work in
 # every block (its mark, funding and liquidation duties) and a place in the validators' price
 # votes, so listing one must not be nearly free. A chain-spec parameter.
 PERP_MARKET_LISTING_FEE = _NETWORK_PARAMS["PERP_MARKET_LISTING_FEE"]
+# A perp market's maximum leverage at most; whether anyone may list a validator-priced market
+# (else governance: ``list_market``). Chain-spec.
+PERP_MARKET_MAX_LEVERAGE = _NETWORK_PARAMS["PERP_MARKET_MAX_LEVERAGE"]
+PERP_OPEN_LISTING = _NETWORK_PARAMS["PERP_OPEN_LISTING"]
 # A perp market's creator seeds the market's liquidity vault with at least this much of its perps
 # collateral, locked for the lockup (qrdx/exchange/clearinghouse.py MARKET_MAKER_*). Chain-spec.
 PERP_MARKET_MIN_LIQUIDITY = _NETWORK_PARAMS["PERP_MARKET_MIN_LIQUIDITY"]
@@ -693,8 +704,27 @@ DEPLOYER_UNBOND_SECONDS = _NETWORK_PARAMS["DEPLOYER_UNBOND_SECONDS"]
 DEPLOYER_MAX_MARKETS = _NETWORK_PARAMS["DEPLOYER_MAX_MARKETS"]
 DEPLOYER_MAX_FEE_SHARE_BPS = _NETWORK_PARAMS["DEPLOYER_MAX_FEE_SHARE_BPS"]
 DEPLOYER_ORACLE_MAX_STEP_BPS = _NETWORK_PARAMS["DEPLOYER_ORACLE_MAX_STEP_BPS"]
+# Native-token perps, priced off the token's own spot market (docs/HYPERLIQUID_PARITY.md 13).
+PERP_SPOT_MAX_LEVERAGE = _NETWORK_PARAMS["PERP_SPOT_MAX_LEVERAGE"]
+SPOT_ORACLE_TWAP_SECONDS = _NETWORK_PARAMS["SPOT_ORACLE_TWAP_SECONDS"]
+SPOT_ORACLE_MIN_DEPTH = _NETWORK_PARAMS["SPOT_ORACLE_MIN_DEPTH"]
+SPOT_OI_DEPTH_BPS = _NETWORK_PARAMS["SPOT_OI_DEPTH_BPS"]
+# Ticker auction (docs/HYPERLIQUID_PARITY.md 11). Chain-spec.
+TICKER_OPENING_PRICE = _NETWORK_PARAMS["TICKER_OPENING_PRICE"]
+TICKER_MIN_PRICE = _NETWORK_PARAMS["TICKER_MIN_PRICE"]
+TICKER_AUCTION_SECONDS = _NETWORK_PARAMS["TICKER_AUCTION_SECONDS"]
+# Free trading and its anti-spam budget (qrdx/exchange/state_manager.py ``free_action_error``,
+# docs/TOKENOMICS.md). Chain-spec.
+EXCHANGE_FREE_TRADING = _NETWORK_PARAMS["EXCHANGE_FREE_TRADING"]
+FREE_ACTIONS_INITIAL = _NETWORK_PARAMS["FREE_ACTIONS_INITIAL"]
+FREE_ACTIONS_PER_VOLUME = Decimal(_NETWORK_PARAMS["FREE_ACTIONS_PER_VOLUME"])
+FREE_ACTION_REFILL_SECONDS = _NETWORK_PARAMS["FREE_ACTION_REFILL_SECONDS"]
+FREE_ACTIONS_PER_BLOCK = _NETWORK_PARAMS["FREE_ACTIONS_PER_BLOCK"]
+FREE_ACTION_MIN_QRDX = Decimal(_NETWORK_PARAMS["FREE_ACTION_MIN_QRDX"])
+FREE_ACTION_MIN_EQUITY = _NETWORK_PARAMS["FREE_ACTION_MIN_EQUITY"]
+FREE_TRADING_MAX_BASE_FEE_BPS = _NETWORK_PARAMS["FREE_TRADING_MAX_BASE_FEE_BPS"]
 # QNS: QRDX a name costs a year (docs/QNS.md). Chain-spec.
-QNS_PRICE_PER_YEAR = _NETWORK_PARAMS["QNS_PRICE_PER_YEAR"]
+QNS_PRICE_PER_YEAR = Decimal(_NETWORK_PARAMS["QNS_PRICE_PER_YEAR"])
 PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS = _NETWORK_PARAMS["PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS"]
 # Tokens the consensus bridge carries from other chains (docs/BRIDGE.md), each
 # "SYMBOL:CHAIN_ID:SOURCE_TOKEN:DECIMALS". Validators attest deposits into the lockbox there; a
@@ -791,8 +821,6 @@ POS_CONSTANTS = {
     "MAX_EFFECTIVE_STAKE": MAX_EFFECTIVE_STAKE,
     # Staking
     "UNBONDING_PERIOD_EPOCHS": UNBONDING_PERIOD_EPOCHS,
-    "MIN_DEPOSIT": MIN_DEPOSIT,
-    "MAX_DEPOSIT": MAX_DEPOSIT,
     "ACTIVATION_DELAY_EPOCHS": ACTIVATION_DELAY_EPOCHS,
     "WITHDRAWAL_DELAY_EPOCHS": WITHDRAWAL_DELAY_EPOCHS,
     # Finality
@@ -968,11 +996,13 @@ EXCHANGE_ORDERBOOK_MAKER_FEE = Decimal("0.0002")  # 0.02 %
 EXCHANGE_ORDERBOOK_TAKER_FEE = Decimal("0.0005")  # 0.05 %
 EXCHANGE_ORDERBOOK_MAX_DEPTH = 500  # price levels per side
 
-# --- Pool Types & Stake Requirements (§7.3) ---
-EXCHANGE_POOL_STAKE_STANDARD = Decimal("10000")
-EXCHANGE_POOL_STAKE_BOOTSTRAP = Decimal("25000")
-EXCHANGE_POOL_BURN_SUBSIDIZED = Decimal("5000")
-EXCHANGE_POOL_STAKE_INSTITUTIONAL = Decimal("100000")
+# --- Pool Types & Stake Requirements (§7.3) --- (qrdx/exchange/amm.py POOL_STAKE_REQUIREMENTS)
+# QRDX staked (burned, for a subsidized pool) to create an AMM pool: ~$10,000 / $20,000 / $4,000 /
+# $100,000 at $400 a QRDX (docs/TOKENOMICS.md).
+EXCHANGE_POOL_STAKE_STANDARD = Decimal("25")
+EXCHANGE_POOL_STAKE_BOOTSTRAP = Decimal("50")
+EXCHANGE_POOL_BURN_SUBSIDIZED = Decimal("10")
+EXCHANGE_POOL_STAKE_INSTITUTIONAL = Decimal("250")
 
 # --- Tick Math Bounds ---
 EXCHANGE_MIN_TICK = -887272
@@ -1005,19 +1035,22 @@ EXCHANGE_GAS_CREATE_POOL = 150_000
 # Format: {address: (balance, label)}
 # The treasury and foundation addresses receive their allocations at network launch.
 
+# The rest of the genesis supply beyond the system wallets, in the old 10 : 5 : 3 : 2 shares.
+# Placeholder holders: a launch names the real ones (and funds genesis validators' stakes out of
+# the validator incentive fund), so that everything sums to GENESIS_SUPPLY.
 GENESIS_PREFUNDED_ACCOUNTS = {
     # Treasury - ecosystem development, grants, partnerships
-    "Qrdx_treasury_00000000000000000000000000000001": (Decimal("10000000"), "Treasury"),
+    "Qrdx_treasury_00000000000000000000000000000001": (Decimal("4993000"), "Treasury"),
     # Foundation - long-term development and maintenance
-    "Qrdx_foundation_000000000000000000000000000001": (Decimal("5000000"), "Foundation"),
-    # Validator incentive fund - bootstrapping initial validators
+    "Qrdx_foundation_000000000000000000000000000001": (Decimal("2496500"), "Foundation"),
+    # Validator incentive fund - bootstrapping initial validators (their genesis stakes)
     "Qrdx_validator_incentive_0000000000000000001": (
-        Decimal("2000000"),
+        Decimal("998600"),
         "Validator Incentive Fund",
     ),
     # Community fund - airdrops, community initiatives
-    "Qrdx_community_fund_00000000000000000000001": (Decimal("3000000"), "Community Fund"),
+    "Qrdx_community_fund_00000000000000000000001": (Decimal("1497900"), "Community Fund"),
 }
 
-# Total genesis allocation (20M QRDX)
+# Total genesis allocation (with the system wallets: GENESIS_SUPPLY)
 GENESIS_TOTAL_PREFUNDED = sum(amount for amount, _ in GENESIS_PREFUNDED_ACCOUNTS.values())

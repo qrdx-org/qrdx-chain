@@ -34,6 +34,7 @@ from exchange_fees import fee_of
 
 from eth_account import Account as EthAccount
 
+from qrdx import constants
 from qrdx.constants import MIN_VALIDATOR_STAKE
 from qrdx.contracts.evm_block_apply import (
     produce_block_evm_section, rebuild_account_state_from_chain,
@@ -92,7 +93,7 @@ def _stake_deposit(key, nonce=0):
         op_type=ExchangeOpType.STAKE_DEPOSIT, sender=addr, nonce=nonce,
         params={"validator_public_key": key.public_key.to_hex(),
                 "stake_amount": str(MIN_VALIDATOR_STAKE)},
-        gas_limit=2_000_000, gas_price=10**9)
+        gas_limit=2_000_000, gas_price=constants.EXCHANGE_MIN_GAS_PRICE_WEI)
     tx.public_key = key.public_key.to_bytes()
     tx.signature = key.sign(tx.signing_bytes()).to_bytes()
     return encode_exchange_txs([tx])
@@ -192,25 +193,26 @@ async def _balances(db, *addrs):
 # ── chains ────────────────────────────────────────────────────────────────
 
 STAKE_GAS = fee_of(ExchangeOpType.STAKE_DEPOSIT)
+S = MIN_VALIDATOR_STAKE  # the chains' amounts are multiples of the minimum stake
 
 
 async def _stake_then_spend_chain(db):
-    """Genesis 150k; block 1 stakes 100k; block 2 tries to EVM-spend 120k."""
+    """Genesis 1.5 S; block 1 stakes S; block 2 tries to EVM-spend 1.2 S."""
     key = PQPrivateKey.generate()
     addr = key.public_key.to_address()
-    await _add_block(db, 0, genesis_alloc=[(addr, "150000")])
+    await _add_block(db, 0, genesis_alloc=[(addr, str(S * 3 / 2))])
     await _add_block(db, 1, ex_section=_stake_deposit(key))
-    await _add_block(db, 2, evm_section=[_pq_spend(key, 120_000)])
+    await _add_block(db, 2, evm_section=[_pq_spend(key, int(S * 6 / 5))])
     return addr
 
 
 async def _withdrawal_then_spend_chain(db):
-    """Genesis 1k; block 1 pays a 100k withdrawal; block 2 EVM-spends 50k of it."""
+    """Genesis S / 100; block 1 pays an S withdrawal; block 2 EVM-spends S / 2 of it."""
     key = PQPrivateKey.generate()
     addr = key.public_key.to_address()
-    await _add_block(db, 0, genesis_alloc=[(addr, "1000")])
+    await _add_block(db, 0, genesis_alloc=[(addr, str(S / 100))])
     await _add_block(db, 1)
-    await _add_block(db, 2, evm_section=[_pq_spend(key, 50_000)])
+    await _add_block(db, 2, evm_section=[_pq_spend(key, int(S / 2))])
     return addr, {1: [(addr, 3, MIN_VALIDATOR_STAKE)]}
 
 
@@ -220,9 +222,9 @@ async def test_stake_debit_then_evm_spend_rebuilds_like_forward():
         addr = await _stake_then_spend_chain(db)
         fwd_root = await _forward(db, 2)
         fwd = await _balances(db, addr, RECIPIENT)
-        # Forward semantics: the stake is locked (and its gas paid), so the 120k spend
+        # Forward semantics: the stake is locked (and its gas paid), so the 1.2 S spend
         # cannot be covered.
-        assert fwd == (Decimal("50000") - STAKE_GAS, Decimal("0")), fwd
+        assert fwd == (S / 2 - STAKE_GAS, Decimal("0")), fwd
 
         assert await _interleaved(db) == fwd_root, "interleaved rebuild diverges from forward"
         assert await _balances(db, addr, RECIPIENT) == fwd
@@ -238,7 +240,7 @@ async def test_withdrawal_then_evm_spend_rebuilds_like_forward():
         fwd_root = await _forward(db, 2, withdrawals_at=paid)
         fwd = await _balances(db, addr, RECIPIENT)
         # Forward semantics: the withdrawal funds the spend.
-        assert fwd == (Decimal("51000"), Decimal("50000")), fwd
+        assert fwd == (S * 51 / 100, S / 2), fwd
 
         assert await _interleaved(db) == fwd_root, "interleaved rebuild diverges from forward"
         assert await _balances(db, addr, RECIPIENT) == fwd
@@ -297,11 +299,11 @@ async def test_interleaved_rebuild_without_evm_orders_exchange_and_withdrawals()
     try:
         key = PQPrivateKey.generate()
         addr = key.public_key.to_address()
-        await _add_block(db, 0, genesis_alloc=[(addr, "10000")])
+        await _add_block(db, 0, genesis_alloc=[(addr, str(S / 10))])
         await _add_block(db, 1)
         await _add_block(db, 2, ex_section=_stake_deposit(key))
         fwd_root = await _forward(db, 2, withdrawals_at={1: [(addr, 3, MIN_VALIDATOR_STAKE)]})
-        assert await db.get_address_balance(addr) == Decimal("10000") - STAKE_GAS, (
+        assert await db.get_address_balance(addr) == S / 10 - STAKE_GAS, (
             "forward: the withdrawal funds the deposit, which then locks it again")
 
         res = await rebuild_derived_state_interleaved(db)
@@ -335,13 +337,13 @@ async def test_the_real_rollback_hook_replays_in_forward_order():
     try:
         key = PQPrivateKey.generate()
         addr = key.public_key.to_address()
-        await _add_block(db, 0, genesis_alloc=[(addr, "10000")])
+        await _add_block(db, 0, genesis_alloc=[(addr, str(S / 10))])
         await _add_block(db, 1)
         await _add_block(db, 2, ex_section=_stake_deposit(key))
         await _add_block(db, 3)
-        paid = {1: [(addr, 3, MIN_VALIDATOR_STAKE)], 3: [(addr, 4, Decimal("5000"))]}
+        paid = {1: [(addr, 3, MIN_VALIDATOR_STAKE)], 3: [(addr, 4, S / 20)]}
         await _forward(db, 3, withdrawals_at=paid)
-        assert await db.get_address_balance(addr) == Decimal("15000") - STAKE_GAS
+        assert await db.get_address_balance(addr) == S * 15 / 100 - STAKE_GAS
 
         await db.remove_blocks(3)
         await db.connection.commit()
@@ -357,7 +359,7 @@ async def test_the_real_rollback_hook_replays_in_forward_order():
             "SELECT block_height FROM validator_withdrawals ORDER BY block_height")
         assert [r[0] for r in await cur.fetchall()] == [1], "orphaned withdrawal survived"
         # 10k genesis + 100k withdrawal − 100k stake − its gas: the deposit was accepted again.
-        assert await db.get_address_balance(addr) == Decimal("10000") - STAKE_GAS
+        assert await db.get_address_balance(addr) == S / 10 - STAKE_GAS
     finally:
         await db.close()
         os.remove(path)

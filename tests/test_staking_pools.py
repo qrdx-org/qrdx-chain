@@ -207,7 +207,7 @@ async def test_the_exchange_operations_reach_the_pool(chain):
         sender=A, nonce=1, params={"validator": G[0], "amount": "3000"}))
     assert not too_much.success and "insufficient" in too_much.error
     dust = mgr._op_stake_delegate(SimpleNamespace(
-        sender=A, nonce=1, params={"validator": G[0], "amount": "0.5"}))
+        sender=A, nonce=1, params={"validator": G[0], "amount": "0.005"}))
     assert not dust.success and "at least" in dust.error
     assert not mgr._op_stake_set_commission(SimpleNamespace(
         sender=G[0], nonce=0, params={"commission_bps": 10_001})).success

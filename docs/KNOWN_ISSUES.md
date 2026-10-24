@@ -216,7 +216,7 @@ The consensus features of docs/CONSENSUS_ROADMAP.md add starting values too: the
 liquidity vault's equity) and floor (0), the leverage tiers (1M / 10M), the oracle's minimum
 voters (3), step bound (5 % a second) and outlier band (2 %), the stakers' fee share (20 %) and
 its conversion (once a minute a token, 2 % under a 10-minute TWAP), the guardian limits (7,
-recovery delay 1–30 days, default 7) and QNS's price (10 QRDX a year). Frequent batch auctions
+recovery delay 1–30 days, default 7) and QNS's price (now 0.0125 QRDX a year, ~$5). Frequent batch auctions
 (fair ordering step 2) were skipped (decision of 2026-10-22). Social recovery and agent
 spending limits are account control: audit first.
 
@@ -227,13 +227,99 @@ The Hyperliquid-parity features (docs/HYPERLIQUID_PARITY.md) add their own:
 - **Staking fee discounts:** 5 % at 10 QRDX staked up to 40 % at 500,000.
 - **Contract actions:** 25,000 EVM gas each plus 1 per 10 exchange gas, at most 2,000,000
   exchange gas, 256 run per block.
-- **Deployer markets:** a 100,000 QRDX bond, 14-day unbonding, 10 markets per deployer, a fee
+- **Tickers:** opening price 250 QRDX, floor 25, 31 h auctions.
+- **Native-token perps:** at most 10× leverage, a 600 s TWAP, a minimum depth of 10,000 of the
+  settlement asset, open interest at most 1× the depth (rising at most 2× per window).
+- **Token economics at ~$400 a QRDX:** every QRDX amount in docs/TOKENOMICS.md — a 10M supply,
+  system wallets of $100k–$1M each, the free trading lane's budget (10,000 actions, 1 per unit
+  traded, one per 10 s past it, 64 an account a block, a $10 holding, closed above 2× the base
+  fee floor).
+- **Big blocks:** every 240th block, 3,000,000 EVM gas, a fee track moving up to 1/2 per big
+  block.
+- **Perps listing:** maximum leverage at most 50 (`PERP_MARKET_MAX_LEVERAGE`); validator-priced
+  markets listed by governance (`PERP_OPEN_LISTING` off).
+- **Deployer markets:** a 1,250 QRDX (~$500,000) bond, 14-day unbonding, 10 markets per deployer, a fee
   share of at most 50 %, an oracle step of 1 % a second (10 s at most per update), a freeze at
   more than 2/3 of stake for one vote window.
 
 Deployer markets put a deployer's oracle in charge of real positions. The bounds, the circuit
 breaker, the validators' freeze and the slashable bond limit the damage, and they need the
 audit too.
+
+## FIXED — Isolated orders crossing the spread were refused; pool TWAPs had 16 s of history
+
+Found building native-token perps (2026-10-23):
+- **Every isolated order filling a tick worse than mark was refused.** The pre-check required
+  the position's equity at mark after the fill to cover its full initial margin. But its margin
+  is sized at the fill price, so crossing the spread was always short by the spread: an
+  isolated taker could not buy above mark or sell below it, on any market. It now must not open
+  already liquidatable (equity at mark above maintenance), as on Hyperliquid.
+  Test: `test_perps_listing_and_leverage.py::test_an_isolated_order_may_cross_the_spread_but_not_open_liquidatable`.
+- **An AMM pool kept 64 observations, one per block that changed it**: 16 seconds at 250 ms
+  slots. A TWAP longer than that had no history to read on an active pool. The stakers' fee
+  conversion (a 10-minute TWAP bound) silently skipped busy pools. Pools now keep checkpoints
+  15 seconds apart, the newest moving with each change: 128 hold about 32 minutes. A TWAP runs
+  from the newest checkpoint at or before its window's start, exact over that span.
+
+## FIXED — Funding on a deployer's untrusted price; a ticker's token renamed
+
+Found by playing out a malicious deployer block by block (`tests/test_deployer_adversarial.py`,
+2026-10-23):
+- **Funding kept running on a frozen or abandoned deployer market's price.** The funding
+  premium (book against oracle) was sampled every block, frozen or not. The validators' freeze
+  stopped the deployer's oracle, but not funding at up to 4 % an hour on the price it left
+  behind. The same held for an oracle its deployer stopped updating. Neither samples a premium
+  now: such an interval pays the interest rate alone.
+- **A ticker's token could change its symbol** (its metadata authority). It would then show one
+  asset's symbol under another's ticker. A token holding a ticker now keeps its symbol.
+
+## OPEN — A deployer can extract funding until the validators freeze its market
+
+**Severity: medium (design, bounded).** docs/HYPERLIQUID_PARITY.md 8. A deployer that holds its
+oracle away from the book collects funding from the other side, at most 4 % of open interest an
+hour, until the validators freeze the market (`QRDX_ORACLE_FREEZE`) and governance slashes the
+bond. It can also walk the oracle 1 % a second to liquidate that side. Only that market's
+isolated positions are reachable. The bond (1,250 QRDX, ~$500,000) should exceed what a deployer market's
+open interest could yield in the time the validators take to react: review the bond and the
+open-interest caps together. Monitoring deployer markets for an oracle off the book is
+operators' work.
+
+## FIXED — Perps settings an outside actor could choose, and paths around the perps rules
+
+**Severity: critical (the first) to high.** Found in a perps audit on 2026-10-23
+(docs/HYPERLIQUID_PARITY.md 10). None was ever committed; a fresh genesis carries the fixes.
+
+- **A contract could send exchange actions as whoever called it.** The exchange write
+  precompile (`0x…0401`, from the day before) took `msg.sender` as the account, and a
+  DELEGATECALL keeps its caller's. Any contract a victim called could trade or withdraw the
+  victim's exchange account. It now refuses DELEGATECALL and CALLCODE, as the native token and
+  NFT precompiles always had, and refuses QRDX sent to it.
+  Test: `test_evm_exchange.py::test_a_contract_cannot_send_actions_as_its_caller`.
+- **A market's maximum leverage had no upper bound.** Its maintenance margin is half its initial
+  margin at maximum leverage. A market listed at 10,000× liquidates far too late, and the shared
+  backstop vault pays. Now at most `PERP_MARKET_MAX_LEVERAGE` (50).
+  The constant this was first added as, `PERP_MAX_LEVERAGE`, was silently replaced by the
+  retired engine's constant of the same name later in `constants.py`
+  (tests/test_constants_single_definition.py caught it).
+- **Whoever listed a validator-priced market first chose its settings.** That included its
+  maximum leverage and grid, and it took the canonical name for good. These markets are now
+  listed by governance (`list_market`). `CREATE_MARKET` lists deployer markets only, unless the
+  chain spec sets `PERP_OPEN_LISTING` (a dev network's setting).
+- **A deployer's oracle could reach accounts outside its market.**
+  - Cross margin mixed a deployer market with an account's other positions.
+  - The shared backstop vault took over its liquidations.
+  - A portfolio-margin asset could be priced by it.
+  - A configured reporter could set its price.
+
+  Now it is isolated-margin only, auto-deleveraged within itself, never a collateral price
+  source, and closed to reporters. Reporters also walk at the validators' step bound now.
+- **Vault shares were priced at cross equity only.** A leader could move a vault's margin into
+  an isolated position, join at the depressed price, and take value from the other holders when
+  the margin came back. A test reproduced 518 of 10,000 taken. Shares, liquidity-vault quotes and
+  open-interest caps now use `Clearinghouse.total_equity`.
+- **A live order id could be reused** (it would need a hash collision). Now refused.
+
+Tests: `tests/test_perps_listing_and_leverage.py`, `tests/test_evm_exchange.py`.
 
 ## FIXED — Trading state outside the exchange root when only newer collections held entries
 

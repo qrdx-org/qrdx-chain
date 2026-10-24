@@ -662,7 +662,7 @@ class EthModule(RPCModule):
     ) -> Dict:
         """Base fee per gas of each block in the range and of the next one, and the share of its
         gas limit each block's EVM transactions declared (qrdx/fee_market.py)."""
-        from ...constants import BLOCK_GAS_LIMIT
+        from ...block_limits import evm_gas_limit_at
         from ...fee_market import base_fees_at, fee_gas, header_fees
         from ...validator.block_verification import _parse_block_content
 
@@ -685,7 +685,7 @@ class EthModule(RPCModule):
                     content = None
             base_fees.append(_to_hex(header_fees(content)[0]))
             evm = await db.get_block_evm_txs(block.get("hash")) if block else []
-            gas_used_ratios.append(fee_gas([], evm)[0] / BLOCK_GAS_LIMIT)
+            gas_used_ratios.append(fee_gas([], evm)[0] / evm_gas_limit_at(height))
         base_fees.append(_to_hex((await base_fees_at(db, newest + 1))[0]))
 
         result: Dict[str, Any] = {

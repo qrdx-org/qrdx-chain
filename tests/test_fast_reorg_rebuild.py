@@ -34,6 +34,8 @@ from qrdx.exchange import (
 from qrdx.exchange import block_processor as BP
 from qrdx.exchange.amm import FeeTier, PoolType
 
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+
 TS0 = 1_700_000_000
 SPACING = max(1, S // 3)  # slots between blocks: an epoch every ~3 blocks
 

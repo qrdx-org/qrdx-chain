@@ -440,11 +440,14 @@ def generate_system_wallet_address(index: int) -> str:
 
 def create_default_system_wallets() -> List[SystemWallet]:
     """
-    Create the default set of system wallets.
+    Create the default set of system wallets. Their genesis balances are defined once:
+    qrdx/constants.py SYSTEM_WALLET_GENESIS_BALANCES (docs/TOKENOMICS.md).
 
     Returns:
         List of SystemWallet instances
     """
+    from ..constants import SYSTEM_WALLET_GENESIS_BALANCES as _GENESIS
+
     return [
         SystemWallet(
             address="0x0000000000000000000000000000000000000001",
@@ -460,7 +463,7 @@ def create_default_system_wallets() -> List[SystemWallet]:
             name="Community Grant Wallet",
             description="Distributes grants to community projects and ecosystem development initiatives",
             wallet_type=SystemWalletType.COMMUNITY_GRANTS,
-            genesis_balance=Decimal("5000000"),  # 5M QRDX
+            genesis_balance=_GENESIS["COMMUNITY_GRANTS"],
             category="treasury",
         ),
         SystemWallet(
@@ -468,7 +471,7 @@ def create_default_system_wallets() -> List[SystemWallet]:
             name="Developer Fund",
             description="Core development team funding wallet for protocol maintenance and improvements",
             wallet_type=SystemWalletType.DEVELOPER_FUND,
-            genesis_balance=Decimal("10000000"),  # 10M QRDX
+            genesis_balance=_GENESIS["DEVELOPER_FUND"],
             category="treasury",
         ),
         SystemWallet(
@@ -476,7 +479,7 @@ def create_default_system_wallets() -> List[SystemWallet]:
             name="Ecosystem Fund",
             description="Strategic investments in projects building on the QRDX network",
             wallet_type=SystemWalletType.ECOSYSTEM_FUND,
-            genesis_balance=Decimal("8000000"),  # 8M QRDX
+            genesis_balance=_GENESIS["ECOSYSTEM_FUND"],
             category="treasury",
         ),
         SystemWallet(
@@ -484,7 +487,7 @@ def create_default_system_wallets() -> List[SystemWallet]:
             name="Staking Rewards Pool",
             description="Distributes staking rewards to network validators and delegators",
             wallet_type=SystemWalletType.STAKING_REWARDS,
-            genesis_balance=Decimal("15000000"),  # 15M QRDX
+            genesis_balance=_GENESIS["STAKING_REWARDS"],
             category="system",
         ),
         SystemWallet(
@@ -492,7 +495,7 @@ def create_default_system_wallets() -> List[SystemWallet]:
             name="Marketing & Partnerships",
             description="Funds marketing initiatives, partnerships, and ecosystem growth campaigns",
             wallet_type=SystemWalletType.MARKETING,
-            genesis_balance=Decimal("3000000"),  # 3M QRDX
+            genesis_balance=_GENESIS["MARKETING"],
             category="treasury",
         ),
         SystemWallet(
@@ -500,7 +503,7 @@ def create_default_system_wallets() -> List[SystemWallet]:
             name="Liquidity Pool Reserve",
             description="Reserve funds for maintaining liquidity across DEX pools",
             wallet_type=SystemWalletType.LIQUIDITY_RESERVE,
-            genesis_balance=Decimal("7000000"),  # 7M QRDX
+            genesis_balance=_GENESIS["LIQUIDITY_RESERVE"],
             category="defi",
         ),
         SystemWallet(
@@ -508,7 +511,7 @@ def create_default_system_wallets() -> List[SystemWallet]:
             name="Treasury Multisig",
             description="Main protocol treasury controlled by multi-signature governance",
             wallet_type=SystemWalletType.TREASURY_MULTISIG,
-            genesis_balance=Decimal("20000000"),  # 20M QRDX
+            genesis_balance=_GENESIS["TREASURY_MULTISIG"],
             category="treasury",
         ),
         SystemWallet(
@@ -516,7 +519,7 @@ def create_default_system_wallets() -> List[SystemWallet]:
             name="Bug Bounty Program",
             description="Rewards security researchers for finding and reporting vulnerabilities",
             wallet_type=SystemWalletType.BUG_BOUNTY,
-            genesis_balance=Decimal("1000000"),  # 1M QRDX
+            genesis_balance=_GENESIS["BUG_BOUNTY"],
             category="security",
         ),
         SystemWallet(
@@ -524,7 +527,7 @@ def create_default_system_wallets() -> List[SystemWallet]:
             name="Airdrop Distribution",
             description="Manages community airdrops and token distribution campaigns",
             wallet_type=SystemWalletType.AIRDROP,
-            genesis_balance=Decimal("6000000"),  # 6M QRDX
+            genesis_balance=_GENESIS["AIRDROP"],
             category="distribution",
         ),
     ]

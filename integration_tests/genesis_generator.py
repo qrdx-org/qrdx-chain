@@ -82,6 +82,10 @@ def testnet_chain_spec(wallets: Dict[str, dict]):
         # fixed in advance by the issuer's first nonce.
         "PERP_COLLATERAL_TOKEN": stablecoin_address(wallets),
         "PERP_QUOTE": "USD",
+        # S13 lists its market with CREATE_MARKET, without seeding a liquidity vault (production:
+        # validator-priced markets are listed by governance, docs/HYPERLIQUID_PARITY.md).
+        "PERP_OPEN_LISTING": 1,
+        "PERP_MARKET_MIN_LIQUIDITY": 0,
         # One bridged asset, from the scripted source chain S23 deposits into.
         "BRIDGE_ASSETS": [BRIDGE_TEST_ASSET],
         # Governance on testnet time (standard: a week of voting, a 2-day timelock, a

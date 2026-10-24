@@ -571,7 +571,7 @@ class TestGenesisCreator:
         result = creator.add_validator(
             address='qrdx_low_stake',
             public_key=pubkey,
-            stake=Decimal('1000'),  # Below minimum
+            stake=Decimal('999'),  # Below minimum
         )
         
         assert result is False

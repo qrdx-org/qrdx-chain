@@ -15,6 +15,8 @@ from qrdx.exchange.clearinghouse import (
     VAULT, Clearinghouse, FUNDING_CAP_PER_HOUR, FUNDING_INTEREST_8H, FUNDING_PREMIUM_CLAMP,
 )
 
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+
 D = Decimal
 BTC = "BTC-QRDX-PERP"
 HOUR = D(3600)

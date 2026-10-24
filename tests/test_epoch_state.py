@@ -87,6 +87,14 @@ class Chain:
         self.height = to_height
 
 
+
+def _uncap(monkeypatch):
+    """These stakes (100,000) sit at the effective-stake cap (MAX_EFFECTIVE_STAKE, 1 % of the
+    genesis supply): lift it, so a reward shows."""
+    from qrdx.validator import epoch_processing
+
+    monkeypatch.setattr(epoch_processing, "MAX_EFFECTIVE_BALANCE", D(10_000_000))
+
 @pytest.fixture
 async def chain():
     fd, path = tempfile.mkstemp(suffix=".db")
@@ -123,7 +131,8 @@ def test_a_deposit_is_pending_and_does_not_propose_until_it_activates():
     assert s[J].status == "active" and dict(ES.proposers(s))[J] == D(200_000)
 
 
-def test_rewards_wait_for_the_inclusion_window_and_count_only_votes_in_it():
+def test_rewards_wait_for_the_inclusion_window_and_count_only_votes_in_it(monkeypatch):
+    _uncap(monkeypatch)
     s = genesis_state([{"address": a, "stake": 100_000} for a in G])
     t = 3
     s = transition(s, t + INCLUSION_EPOCHS, _inputs(attesters=[G[0], G[1]]))
@@ -177,9 +186,9 @@ def test_a_slashing_proof_halves_and_ejects_once():
 
 def test_ejection_keeps_the_liveness_backstop():
     four = G + [J]
-    s = genesis_state([{"address": a, "stake": 100_000} for a in four])
-    s[G[0]].effective_stake = D(40_000)
-    s[G[1]].effective_stake = D(30_000)
+    s = genesis_state([{"address": a, "stake": 1_000} for a in four])
+    s[G[0]].effective_stake = D(400)                       # the floor is 500 (half of 1,000)
+    s[G[1]].effective_stake = D(300)
     s = transition(s, 1, _inputs())
     # Two below the floor, but only one may go: three must stay active. The lowest goes.
     assert s[G[1]].status == "exiting" and s[G[0]].status == "active"
@@ -246,7 +255,8 @@ async def test_a_deposit_on_the_chain_activates_after_the_delay(chain):
     assert state[J].status == "active" and dict(ES.proposers(state))[J] == D(150_000)
 
 
-async def test_rewards_follow_the_votes_the_chain_carries(chain):
+async def test_rewards_follow_the_votes_the_chain_carries(chain, monkeypatch):
+    _uncap(monkeypatch)
     await chain.epoch(1)
     await chain.epoch(2, voters=G[:2])                       # G[2] misses its vote for 1
     for e in range(3, 6):
@@ -393,7 +403,7 @@ async def test_the_display_table_is_the_state_at_the_tip(chain):
 
 def _with_stakes(stakes, status="active"):
     addrs = [f"0xPQ{i:064x}" for i in range(len(stakes))]
-    s = genesis_state([{"address": a, "stake": 100_000} for a in addrs])
+    s = genesis_state([{"address": a, "stake": 1_000} for a in addrs])
     for a, eff in zip(addrs, stakes):
         s[a].effective_stake = D(eff)
     return s, addrs
@@ -404,9 +414,9 @@ def test_the_ejection_floor_is_below_the_activation_floor():
 
 
 @pytest.mark.parametrize("effective, ejected", [
-    ("99999.99", False), ("50000", False), ("49999.99", True), ("0", True)])
+    ("999.99", False), ("500", False), ("499.99", True), ("0", True)])
 def test_only_a_stake_below_the_ejection_floor_is_ejected(effective, ejected):
-    s, addrs = _with_stakes([effective, 100_000, 100_000, 100_000])
+    s, addrs = _with_stakes([effective, 1_000, 1_000, 1_000])
     s = transition(s, 1, _inputs())          # (epoch 1: no reward target to move stakes)
     assert (s[addrs[0]].status == "exiting") == ejected
     if ejected:      # it leaves through unbonding, still proposing meanwhile

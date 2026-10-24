@@ -19,6 +19,8 @@ from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransaction
 from qrdx.exchange import block_processor as BP
 
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+
 D = Decimal
 BTC = "BTC-QRDX-PERP"
 T0 = 1_700_000_000.0

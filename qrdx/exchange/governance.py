@@ -49,7 +49,14 @@ from .commitment import Section, committed
 ZERO = Decimal(0)
 BPS = 10_000
 
-ACTIONS = ("system_spend", "freeze_master", "approve_fork", "delist_market", "slash_deployer")
+ACTIONS = (
+    "system_spend",
+    "freeze_master",
+    "approve_fork",
+    "delist_market",
+    "slash_deployer",
+    "list_market",
+)
 
 VOTING, PASSED, REJECTED, VETOED, EXECUTED, EXPIRED = (
     "voting",
@@ -67,6 +74,7 @@ MAX_MEMO = 280
 
 _FORK_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 _MARKET_ID = re.compile(r"^[A-Za-z0-9._:-]{1,96}$")
+_BASE_SYMBOL = re.compile(r"^[A-Za-z0-9._-]{1,32}$")  # (no ":": deployers' namespaces)
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -323,6 +331,34 @@ class Governance:
                 except ValueError as e:
                     raise GovernanceError(f"settlement price: {e}") from None
             return body
+        if action == "list_market":
+            # A validator-priced perp market (docs/HYPERLIQUID_PARITY.md): its settings are the
+            # proposal's — checked again when it executes (the clearinghouse's bounds).
+            base = str(params.get("base_token", "")).strip()
+            if not _BASE_SYMBOL.match(base):
+                raise GovernanceError(f"invalid base symbol {base!r}")
+            listing: Dict[str, Any] = {"base_token": base}
+            if params.get("max_leverage") not in (None, ""):
+                lev = params["max_leverage"]
+                if isinstance(lev, bool) or not isinstance(lev, int) or lev < 1:
+                    raise GovernanceError("max_leverage is a whole number, at least 1")
+                listing["max_leverage"] = lev
+            if params.get("sz_decimals") not in (None, ""):
+                sz = params["sz_decimals"]
+                if isinstance(sz, bool) or not isinstance(sz, int) or not -1 <= sz <= 6:
+                    raise GovernanceError("sz_decimals is -1 to 6")
+                listing["sz_decimals"] = sz
+            if params.get("spot_token") not in (None, ""):
+                # A native-token market (docs/HYPERLIQUID_PARITY.md 13): priced off the token's
+                # own spot market along these pools — checked against the chain when it executes.
+                pools = params.get("spot_pools")
+                if not isinstance(pools, list) or not 1 <= len(pools) <= 2:
+                    raise GovernanceError(
+                        "spot_pools: the 1 or 2 pools from the token to the " "settlement asset"
+                    )
+                listing["spot_token"] = str(params["spot_token"]).lower()
+                listing["spot_pools"] = [str(p) for p in pools]
+            return listing
         if action == "slash_deployer":
             # A market deployer that ran a market dishonestly (docs/HYPERLIQUID_PARITY.md): burn
             # ``bps`` of its bond — what is unbonding too — and, with ``halt``, settle every
@@ -466,6 +502,9 @@ class Governance:
         elif p.action == "delist_market":
             # Settled by the caller (the exchange's clearinghouse): see the manager's GOV_EXECUTE.
             result.update(market_id=p.params["market_id"], price=p.params.get("price"))
+        elif p.action == "list_market":
+            # Listed by the caller (the exchange's clearinghouse): the manager's GOV_EXECUTE.
+            result.update(p.params)
         elif p.action == "slash_deployer":
             # Carried out by the caller (the exchange holds the bond): the manager's GOV_EXECUTE.
             result.update(deployer=p.params["deployer"], bps=p.params["bps"], halt=p.params["halt"])

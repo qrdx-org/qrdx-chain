@@ -250,3 +250,10 @@ read on every node natively and through `ownerOf`).
   controls — as mint authority. It is minted when validators holding two thirds of the stake
   attest a lockbox deposit and burned by `BRIDGE_WITHDRAW` ([BRIDGE.md](BRIDGE.md)). Mainnet perps
   settle in one ([PERPS_CLEARINGHOUSE.md](PERPS_CLEARINGHOUSE.md)).
+
+## Tickers
+
+A token's symbol is not unique: anyone may deploy one called USDC. A **ticker** is: one token
+holds it, for good, bought by its creator in a continuous Dutch auction (`TICKER_CLAIM`). The
+bridged assets' tickers are reserved for the bridge's tokens. A token holding a ticker keeps its
+symbol. See docs/HYPERLIQUID_PARITY.md 11.

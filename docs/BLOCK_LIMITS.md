@@ -21,6 +21,7 @@ A block is refused, before anything in it is verified or executed, if it carries
 | What | Limit | Parameter |
 |---|---|---|
 | EVM gas: its transactions' declared gas limits, summed | 1,000,000 | `BLOCK_GAS_LIMIT` (chain spec) |
+| EVM gas in a big block (every 240th, by height) | 3,000,000 | `BIG_BLOCK_GAS_LIMIT`, `BIG_BLOCK_INTERVAL` |
 | Exchange gas: its operations' declared gas limits, summed | 20,000,000 | `BLOCK_EXCHANGE_GAS_LIMIT` (chain spec) |
 | Votes, each a Dilithium signature to verify | 128 | `MAX_ATTESTATIONS_PER_BLOCK` |
 | Slashing proofs, each two signatures | 16 | `MAX_SLASHING_EVIDENCE_PER_BLOCK` |
@@ -88,6 +89,17 @@ ecrecover needs `coincurve`, which is in the release lock. Without it, eth-keys 
 signatures in pure Python, at 0.2 Mgas/s, and recovering every EVM transaction's sender costs
 ~15 ms. A node without it logs an error at startup.
 
+### Big blocks
+
+A contract deployment typically needs 0.6–1.2M gas, so the larger ones fit no ordinary block.
+Every `BIG_BLOCK_INTERVAL`-th block (by height: 240, once a minute) may carry
+`BIG_BLOCK_GAS_LIMIT` (3,000,000) of EVM gas. This is HyperEVM's big block. Unlike HyperEVM's,
+it runs inline with the slot clock: a big block of the slowest work takes ~1.8 s. It is priced
+on an EVM fee track of its own that moves up to 1/2 per big block (below). A transaction may
+declare up to the big limit; one above the ordinary limit waits for a big block.
+`BIG_BLOCK_INTERVAL` 0 turns them off. Code: `qrdx/block_limits.py` (`evm_gas_limit_at`).
+Tests: `tests/test_big_blocks.py`.
+
 ## Loading state is linear
 
 The EVM loads the accounts and storage it reads on demand. It used to start the transaction
@@ -114,10 +126,22 @@ these fees, and every transaction in it must offer at least them. Validators' or
 exempt, so a burst of traffic can never stall the prices the exchange runs on. All of it is
 burned, as before.
 
+Trading operations in the free lane are exempt too (`gas_price` 0, docs/TOKENOMICS.md): they
+pay nothing within their account's budget. Their gas still counts toward the block's exchange
+limit and toward the base fee, so a flood of them raises it. Above twice its floor
+(`FREE_TRADING_MAX_BASE_FEE_BPS`) only cancels go free, and everyone else pays until the blocks
+clear.
+
 Before this, gas cost the floor however full blocks were, and EVM transactions had no floor at
 all: a gas price of 0 executed for free. Now a run of full blocks raises the price 12.5% a
 block. Thirty seconds of them at 250 ms slots multiply it about 1.4 million times, and it comes
 back down as fast.
+
+With big blocks, the EVM fee runs on two tracks. A big block's EVM base fee is set by the big
+block before it, an ordinary block's by the ordinary block before it, so neither kind moves the
+other's price. The big track moves up to 1/2 per big block (`BIG_BLOCK_CHANGE_DENOMINATOR`), not
+1/8, because big blocks come once an interval: twenty full ones multiply its price about 3,300
+times. The exchange fee is always set by the parent.
 
 `eth_gasPrice` and `exchange_gasPrice` return the next block's base fee plus one block's worth
 of headroom. `exchange_getSigningPayload` fills that in when no price is given. `eth_feeHistory`

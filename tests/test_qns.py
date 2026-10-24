@@ -50,8 +50,9 @@ def _at(m, t):
 def test_a_name_is_an_nft_paid_for_by_the_year(m):
     r = _tx(m, ALICE, Op.QNS_REGISTER, name="Alice", years=2)
     assert r.success, r.error
-    assert r.data["name"] == "alice.qrdx" and D(r.data["paid"]) == 20
-    assert m.balance_deltas()[ALICE] == -20 and m.balance_deltas()[TREASURY] == 20
+    price = 2 * constants.QNS_PRICE_PER_YEAR                       # 5 characters: the base price
+    assert r.data["name"] == "alice.qrdx" and D(r.data["paid"]) == price
+    assert m.balance_deltas()[ALICE] == -price and m.balance_deltas()[TREASURY] == price
     nft = m.nfts.items.peek((QNS_COLLECTION, name_token_id("alice.qrdx")))
     assert nft.owner == ALICE and nft.name == "alice.qrdx"
     assert m.nfts.get(QNS_COLLECTION).mint_authority.startswith("0xQNSA")
@@ -115,9 +116,9 @@ def test_what_is_not_a_name_is_refused(name):
 
 
 def test_registering_needs_the_price_and_the_years_are_bounded(m):
-    m.set_available_balance(ALICE, D(5))
+    m.set_available_balance(ALICE, constants.QNS_PRICE_PER_YEAR / 2)
     r = _tx(m, ALICE, Op.QNS_REGISTER, name="alice")
-    assert not r.success and "costs 10" in r.error
+    assert not r.success and f"costs {constants.QNS_PRICE_PER_YEAR}" in r.error
     r = _tx(m, BOB, Op.QNS_REGISTER, name="bob", years=11)
     assert not r.success and "years" in r.error
     assert _tx(m, BOB, Op.QNS_REGISTER, name="bob", years=10).success
@@ -167,3 +168,14 @@ def test_who_controls_an_address_both_ways(m):
     assert views.controlled(m, keyset.address)["controls"] == [to_account_id(ALICE)]
     member = members[0].public_key.to_address()
     assert views.controlled(m, member)["multisigs"] == [keyset.address.lower()]
+
+
+def test_short_names_cost_more(m):
+    """ENS's ratios: a 3-character name 128 base prices a year, a 4-character one 32."""
+    from qrdx.exchange.qns import price_factor
+
+    assert [price_factor(n) for n in ("abc.qrdx", "abcd.qrdx", "abcde.qrdx", "x" * 40)] == [
+        128, 32, 1, 1]
+    m.set_available_balance(ALICE, D(1_000))
+    r = _tx(m, ALICE, Op.QNS_REGISTER, name="abc")
+    assert r.success and D(r.data["paid"]) == 128 * constants.QNS_PRICE_PER_YEAR

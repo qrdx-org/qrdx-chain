@@ -480,7 +480,7 @@ async def test_a_system_spend_debits_the_wallet_in_the_ledger_and_conserves_valu
             system_wallet_controller=controller, enable_system_wallets=True)
         fund = C.SYSTEM_WALLET_ADDRESSES["DEVELOPER_FUND"]
         start = await db.get_address_balance(fund)
-        assert start == D(10_000_000)
+        assert start == C.SYSTEM_WALLET_GENESIS_BALANCES["DEVELOPER_FUND"]  # (2,500: TOKENOMICS)
         cur = await db.connection.execute(
             "SELECT balance FROM account_state WHERE LOWER(address) = LOWER(?)", (fund,))
         assert await cur.fetchone(), "a system wallet's genesis balance lives in account_state"

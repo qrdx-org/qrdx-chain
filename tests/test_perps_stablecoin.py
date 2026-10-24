@@ -21,6 +21,8 @@ from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransact
 from qrdx.exchange import block_processor as BP
 from qrdx.exchange import encode_exchange_txs
 
+pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+
 D = Decimal
 BTC = "BTC-USD-PERP"
 T0 = 1_700_000_000

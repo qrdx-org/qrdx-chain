@@ -129,7 +129,7 @@ DEFAULT_FUNDING_INTERVAL = Decimal(3600)
 FUNDING_INTEREST_8H = Decimal("0.0001")  # 0.01 % per 8 hours
 FUNDING_PREMIUM_CLAMP = Decimal("0.0005")
 FUNDING_CAP_PER_HOUR = Decimal("0.04")
-IMPACT_NOTIONAL = Decimal("1000")  # QRDX
+IMPACT_NOTIONAL = Decimal("1000")  # in the settlement asset (production: USD)
 EIGHT_HOURS = Decimal(8 * 3600)
 RATE_QUANTUM = Decimal("1e-18")
 
@@ -219,13 +219,13 @@ MARKET_MAKER_MARKETS_PER_BLOCK = 8
 # PERP_MIN_OI_CAP (0: no floor — a market without a vault and without a floor is uncapped).
 OI_CAP_MULTIPLE = Decimal(50)
 # Staking fee discounts (Hyperliquid's tiers): QRDX staked → the fraction of fees spared.
-STAKE_FEE_DISCOUNTS: Tuple[Tuple[Decimal, Decimal], ...] = (
-    (Decimal(10), Decimal("0.05")),
-    (Decimal(100), Decimal("0.10")),
-    (Decimal(1_000), Decimal("0.15")),
-    (Decimal(10_000), Decimal("0.20")),
-    (Decimal(100_000), Decimal("0.30")),
-    (Decimal(500_000), Decimal("0.40")),
+STAKE_FEE_DISCOUNTS: Tuple[Tuple[Decimal, Decimal], ...] = (  # ~$400 a QRDX: docs/TOKENOMICS.md
+    (Decimal(1), Decimal("0.05")),  # ~$400
+    (Decimal(10), Decimal("0.10")),  # ~$4,000
+    (Decimal(100), Decimal("0.15")),  # ~$40,000
+    (Decimal(1_000), Decimal("0.20")),  # ~$400,000
+    (Decimal(10_000), Decimal("0.30")),  # ~$4M
+    (Decimal(50_000), Decimal("0.40")),  # ~$20M
 )
 # The order grid's price precision (Hyperliquid's): significant figures, and decimals a market
 # with sz_decimals 0 may use (one fewer for each size decimal).
@@ -552,6 +552,13 @@ class Market:
     deployer: str = ""
     deployer_fee_share: Decimal = ZERO
     frozen_until: Decimal = ZERO
+    # A native-token market (docs/HYPERLIQUID_PARITY.md 13): priced from this native token's own
+    # spot market — the TWAP along these pools to the settlement asset — with no oracle votes;
+    # its open interest is capped by their depth (in the settlement asset, rising slowly).
+    spot_token: str = ""
+    spot_pools: Tuple[str, ...] = ()
+    spot_depth: Decimal = ZERO
+    spot_time: Decimal = ZERO  # block time of its last reading
 
     def __post_init__(self) -> None:
         # Resting orders' clearinghouse metadata, committed per order (never changed in place).
@@ -626,6 +633,8 @@ def _market_header(m: Market) -> Dict[str, Any]:
         header["sz"] = m.sz_decimals
     if m.deployer:  # (absent on a validator-priced market)
         header["dep"] = [m.deployer, d(m.deployer_fee_share)]
+    if m.spot_token:  # (absent unless a native-token market)
+        header["spot"] = [m.spot_token, list(m.spot_pools), d(m.spot_depth), d(m.spot_time)]
     if m.frozen_until > 0:  # absent until the validators first freeze it
         header["frozen"] = d(m.frozen_until)
     return header
@@ -705,6 +714,9 @@ class Clearinghouse:
     asset_unwind_time = committed("ch.asset_unwind_time", encode_value, mutable=False)
     referral_codes = committed("ch.referral_codes", encode_value, mutable=False)
     referrals = committed("ch.referrals", _encode_referral, mutable=False)
+    # owner → the settlement-asset notional it has ever traded (perps and spot): what earns it
+    # free actions (docs/TOKENOMICS.md, the free trading lane)
+    lifetime_volume = committed("ch.lifetime_volume", encode_value, mutable=False)
 
     def __init__(self) -> None:
         self.markets: Dict[str, Market] = {}
@@ -734,8 +746,10 @@ class Clearinghouse:
         self.referrals = {}  # referee → Referral
         self.asset_holdings = {}  # token → amount held as margin, every account
         self.asset_unwind_time = {}  # token → block time the vault last sold some
+        self.lifetime_volume = {}  # owner → notional ever traded
 
     _LATER_FIELDS = (
+        "lifetime_volume",
         "user_vaults",
         "vault_holdings",
         "volumes",
@@ -800,6 +814,8 @@ class Clearinghouse:
         sz_decimals: int = -1,
         deployer: str = "",
         deployer_fee_share: Decimal = ZERO,
+        spot_token: str = "",
+        spot_pools: Tuple[str, ...] = (),
     ) -> Market:
         if not base:
             raise ClearinghouseError("base token required")
@@ -807,8 +823,13 @@ class Clearinghouse:
         if not ZERO <= deployer_fee_share <= 1 or (deployer_fee_share and not deployer):
             raise ClearinghouseError("a deployer's fee share is 0 to 1, on its own market")
         max_leverage = Decimal(str(max_leverage))
-        if max_leverage < 1:
+        if not max_leverage.is_finite() or max_leverage < 1:
             raise ClearinghouseError("max leverage must be at least 1")
+        cap = Decimal(int(constants.PERP_MARKET_MAX_LEVERAGE))
+        if max_leverage > cap:
+            # A market's maintenance margin is half its initial at maximum leverage: far beyond
+            # this, positions are liquidated too late to close before they are bankrupt.
+            raise ClearinghouseError(f"a market's maximum leverage is at most {cap}")
         if isinstance(sz_decimals, bool) or not -1 <= int(sz_decimals) <= MAX_PRICE_DECIMALS:
             raise ClearinghouseError(f"sz_decimals is 0 to {MAX_PRICE_DECIMALS} (-1: no grid)")
         mid = self.market_id(base, quote)
@@ -829,6 +850,8 @@ class Clearinghouse:
             sz_decimals=int(sz_decimals),
             deployer=deployer,
             deployer_fee_share=deployer_fee_share,
+            spot_token=str(spot_token),
+            spot_pools=tuple(str(p) for p in spot_pools),
         )
         self.markets[mid] = market
         return market
@@ -921,7 +944,8 @@ class Clearinghouse:
             tripped = self._trip_breaker(m, now)
             if tripped is not None:
                 events.append(tripped)
-            self._sample_premium(m, dt)
+            if not self._untrusted_oracle(m, now):
+                self._sample_premium(m, dt)
             settled = self._settle_funding(m, now, interval)
             if settled is not None:
                 events.append(settled)
@@ -949,6 +973,18 @@ class Clearinghouse:
             cost += price * amount
             size += amount
         return None
+
+    def _untrusted_oracle(self, m: Market, now: Decimal) -> bool:
+        """A deployer market whose oracle no one stands behind now: frozen by the validators, or
+        left stale by its deployer. Its premium is not sampled meanwhile — funding at the cap
+        could otherwise run on a price the deployer left behind (an interval of none pays the
+        interest rate alone). Validator-priced markets keep sampling."""
+        if not self.contained(m):
+            return False
+        if self.frozen(m, now):
+            return True
+        stale = Decimal(constants.PERP_ORACLE_STALE_SECONDS)
+        return m.oracle_time > 0 and now - m.oracle_time > stale
 
     def _sample_premium(self, m: Market, dt: Decimal) -> None:
         """Hyperliquid's premium: (max(0, impact bid − oracle) − max(0, oracle − impact ask)) /
@@ -1138,21 +1174,40 @@ class Clearinghouse:
 
     @_mutator
     @_pinned
-    def set_leverage(self, owner: str, market_id: str, leverage, isolated: bool) -> None:
+    def set_leverage(self, owner: str, market_id: str, leverage, isolated: bool) -> Decimal:
+        """The account's leverage and margin mode in one market — each market's position has
+        its own. The mode changes only with no position or order there. An open isolated
+        position may change leverage too: a lower one needs the position to hold its initial
+        margin at it, and what it lacks is moved in from free cross margin (refused if there is
+        not enough); a higher one leaves the margin where it is (PERP_ISOLATED_MARGIN takes it
+        out). A deployer market is isolated-margin only. Returns the margin moved in."""
         self._user(owner)
         m = self.market(market_id)
         leverage = Decimal(str(leverage))
-        if leverage < 1 or leverage > m.max_leverage:
+        if not leverage.is_finite() or leverage < 1 or leverage > m.max_leverage:
             raise ClearinghouseError(f"leverage must be between 1 and {m.max_leverage}")
+        if self.contained(m) and not isolated:
+            raise ClearinghouseError(f"{market_id} is {self._kind(m)}: isolated margin only")
         acct = self.account(owner)
         pos = acct.positions.get(market_id)
-        busy = (pos is not None and pos.size != 0) or any(
-            o.owner == owner for o in m.orders.values()
-        )
+        open_position = pos is not None and pos.size != 0
+        busy = open_position or bool(self._orders_by_owner(m).get(owner))
         if busy and bool(isolated) != acct.isolated.get(market_id, False):
             raise ClearinghouseError("cannot change margin mode with an open position or orders")
-        if busy and pos is not None and pos.size != 0 and acct.isolated.get(market_id, False):
-            raise ClearinghouseError("cannot change an isolated position's leverage while open")
+        topped = ZERO
+        if open_position and pos is not None and acct.isolated.get(market_id, False):
+            lacking = initial_margin(m, leverage, abs(pos.size) * m.mark_price) - self._iso_equity(
+                acct, market_id
+            )
+            if lacking > 0:
+                topped = lacking.quantize(AMOUNT_QUANTUM, rounding=ROUND_CEILING)
+                if self.cross_equity(owner) - self.cross_requirement(owner) < topped:
+                    raise ClearinghouseError(
+                        f"lowering the leverage of the isolated position needs {topped} more "
+                        "margin than the account has free"
+                    )
+                acct.collateral -= topped
+                pos.isolated_margin += topped
         before = (acct.leverage.get(market_id), acct.isolated.get(market_id))
         acct.leverage[market_id] = leverage
         acct.isolated[market_id] = bool(isolated)
@@ -1166,7 +1221,11 @@ class Clearinghouse:
                     store.pop(market_id, None)
                 else:
                     store[market_id] = value
+            if topped and pos is not None:
+                acct.collateral += topped
+                pos.isolated_margin -= topped
             raise ClearinghouseError("insufficient margin for that leverage")
+        return topped
 
     @_mutator
     @_pinned
@@ -1267,6 +1326,31 @@ class Clearinghouse:
         return (m.halted_until > 0 and now < m.halted_until) or self.frozen(m, now)
 
     @staticmethod
+    def contained(m: Market) -> bool:
+        """A market whose price no validator vote sets — a deployer's, or a native token's off
+        its own spot market: isolated margin only, never backstopped by the shared vault, never
+        a price for anyone's margin. Its risk stays in it."""
+        return bool(m.deployer or m.spot_token)
+
+    @staticmethod
+    def _kind(m: Market) -> str:
+        return "a deployer market" if m.deployer else "a native-token market"
+
+    @_mutator
+    def set_spot_reading(
+        self, market_id: str, price: Optional[Decimal], depth: Decimal, now: Decimal
+    ) -> None:
+        """A native-token market's reading of its spot market this block: its depth, and its
+        oracle price when there was one to read."""
+        m = self.market(market_id)
+        m.spot_depth = Decimal(str(depth))
+        m.spot_time = Decimal(str(now))
+        if price is not None:
+            m.oracle_price = Decimal(str(price))
+            m.oracle_time = Decimal(str(now))
+            self._refresh_mark(m, m.ema_time)
+
+    @staticmethod
     def frozen(m: Market, now: Any) -> bool:
         """A deployer market the validators hold frozen at block time ``now``."""
         return m.frozen_until > 0 and Decimal(str(now)) < m.frozen_until
@@ -1278,12 +1362,20 @@ class Clearinghouse:
         m.frozen_until = max(m.frozen_until, Decimal(str(until)))
 
     def oi_cap(self, m: Market) -> Optional[Decimal]:
-        """The market's open-interest cap (notional at mark), None if uncapped."""
+        """The market's open-interest cap (notional at mark), None if uncapped. A native-token
+        market's is at most its spot market's depth × SPOT_OI_DEPTH_BPS: moving the price that
+        sets it must cost about what the open interest could gain from the move."""
         floor = Decimal(constants.PERP_MIN_OI_CAP)
         vault = market_maker_address(m.id)
+        cap: Optional[Decimal] = None
         if vault in self.user_vaults:
-            return max(floor, self.cross_equity(vault) * OI_CAP_MULTIPLE)
-        return floor if floor > 0 else None
+            cap = max(floor, self.total_equity(vault) * OI_CAP_MULTIPLE)
+        elif floor > 0:
+            cap = floor
+        if m.spot_token:
+            depth_cap = m.spot_depth * Decimal(int(constants.SPOT_OI_DEPTH_BPS)) / 10_000
+            cap = depth_cap if cap is None else min(cap, depth_cap)
+        return cap
 
     def _trip_breaker(self, m: Market, now: Decimal) -> Optional[dict]:
         """Each tick, after the mark is refreshed: a move of PERP_BREAKER_MOVE within the
@@ -1315,7 +1407,24 @@ class Clearinghouse:
     @_pinned
     def vault_nav(self) -> Decimal:
         """What the vault is worth: its collateral plus its positions' PnL at mark."""
-        return self.cross_equity(VAULT)
+        return self.total_equity(VAULT)
+
+    @_pinned
+    def total_equity(self, owner: str) -> Decimal:
+        """Everything an account is worth at mark: its cross equity and each isolated position's
+        (its margin and unrealized PnL). What a vault's shares are priced at — its cross equity
+        alone left out what a leader moved into isolated positions, so moving margin in and out
+        of one moved the share price, at the other holders' expense."""
+        acct = self.accounts.peek(owner)
+        if acct is None:
+            return ZERO
+        eq = self.cross_equity(owner)
+        for mid, pos in acct.positions.items():
+            if acct.isolated.get(mid, False):
+                eq += pos.isolated_margin
+                if pos.size != 0:
+                    eq += self._upnl(self.markets[mid], pos)
+        return eq
 
     def _mint_shares(self, holder: str, shares: Decimal) -> None:
         self.vault_shares[holder] = self.vault_shares.get(holder, ZERO) + shares
@@ -1473,7 +1582,7 @@ class Clearinghouse:
             raise ClearinghouseError(
                 f"{amount} exceeds the withdrawable {self.withdrawable(owner)}"
             )
-        nav = self.cross_equity(vault)
+        nav = self.total_equity(vault)
         if v.total_shares <= 0 or nav <= 0:
             raise ClearinghouseError("the vault has nothing left to join")
         shares = (amount * v.total_shares / nav).quantize(SHARE_QUANTUM, rounding=ROUND_DOWN)
@@ -1521,7 +1630,7 @@ class Clearinghouse:
                 raise ClearinghouseError(
                     f"the leader must hold at least {USER_VAULT_LEADER_MIN_SHARE:%} of the vault"
                 )
-        nav = self.cross_equity(vault)
+        nav = self.total_equity(vault)
         value = ZERO
         if nav > 0:
             value = (shares * nav / v.total_shares).quantize(AMOUNT_QUANTUM, rounding=ROUND_DOWN)
@@ -1547,7 +1656,8 @@ class Clearinghouse:
         if spec is None:
             return ZERO
         m = self.markets.get(spec[0])
-        if m is None or m.oracle_price <= 0:
+        if m is None or m.oracle_price <= 0 or self.contained(m):
+            # (A deployer's or a native token's market never values anyone's margin.)
             return ZERO
         return m.oracle_price * (1 - spec[1])
 
@@ -1855,14 +1965,20 @@ class Clearinghouse:
         display_size=ZERO,
         max_makers: Optional[int] = None,
         protocol: bool = False,
+        leverage: Optional[Decimal] = None,
     ) -> List[dict]:
         """``place_order`` without its per-operation bookkeeping (a fired trigger, a batch's
         orders and a modify place through it). ``protocol``: placed by the clearinghouse for
-        the owner (a trigger), so not counted against the owner's per-block order limit."""
+        the owner (a trigger), so not counted against the owner's per-block order limit.
+        ``leverage``: the order's own (a modified order keeps the one it was placed at); by
+        default the account's in the market."""
         tif = str(tif).lower()
         if tif not in ("gtc", "ioc", "fok", "alo"):
             raise ClearinghouseError(f"unknown time in force {tif!r} (gtc, ioc, fok, alo)")
         m = self.market(market_id)
+        if tracked(m.orders).peek(order_id) is not None or tracked(m.triggers).peek(order_id):
+            # (Ids are transaction hashes: two live orders sharing one would share metadata.)
+            raise ClearinghouseError(f"duplicate order id {order_id}")
         if m.mark_price <= 0:
             raise ClearinghouseError(f"market {market_id} has no price yet")
         size, price = Decimal(str(size)), Decimal(str(price))
@@ -1903,8 +2019,18 @@ class Clearinghouse:
                 f"block time {m.halted_until}"
             )
         acct = self.account(owner)
+        if self.contained(m) and not acct.isolated.get(market_id, False):
+            # A deployer's or a native token's market is isolated-margin only: a price its
+            # deployer sets, or a thin spot market moves, reaches no account's cross margin. The
+            # first order there makes the account's position isolated.
+            held = acct.positions.get(market_id)
+            if (held is not None and held.size != 0) or self._orders_by_owner(m).get(owner):
+                raise ClearinghouseError(f"{market_id} is {self._kind(m)}: isolated margin only")
+            acct.isolated[market_id] = True
         pos = acct.positions.get(market_id, Position())
-        lev = self._leverage(acct, m)
+        lev = self._leverage(acct, m) if leverage is None else Decimal(str(leverage))
+        if not lev.is_finite() or not 1 <= lev <= m.max_leverage:
+            raise ClearinghouseError(f"leverage must be between 1 and {m.max_leverage}")
         q = size if buy else -size
         oi_before = m.open_interest
 
@@ -2196,6 +2322,7 @@ class Clearinghouse:
             hidden=order.hidden,
             display_size=order.display_size if order.display_size < size else ZERO,
             max_makers=max_makers,
+            leverage=min(meta.leverage, m.max_leverage),  # it keeps its own
         )
         self._trim_touched()
         self.last_cancelled = self._cancelled
@@ -2275,7 +2402,7 @@ class Clearinghouse:
         stale = (
             m.oracle_time > 0 and now - m.oracle_time > constants.PERP_ORACLE_STALE_SECONDS
         ) or self.halted(m)
-        equity = self.cross_equity(vault)
+        equity = self.total_equity(vault)
         event: Dict[str, Any] = {"type": "market_quotes", "market": m.id, "vault": vault}
         if stale or m.mark_price <= 0 or equity <= 0:
             return {**event, "levels": 0, "reason": "stale oracle" if stale else "no price"}
@@ -2667,7 +2794,12 @@ class Clearinghouse:
             moved = max(ZERO, moved) if increase > 0 else ZERO
             need = moved + worst_fee
             iso_equity = pos.isolated_margin + self._upnl(m, pos) + worst_pnl + moved
-            if free < need or iso_equity < initial_margin(m, lev, abs(size + q) * m.mark_price):
+            # The position must not open already liquidatable: its equity at mark above its
+            # maintenance. (It used to need its full initial margin at mark, so an isolated order
+            # crossing the spread — filling a tick worse than mark — was always refused: its
+            # margin is sized at the fill price, as Hyperliquid's is, and the tick is a loss.)
+            maintenance = abs(size + q) * m.mark_price * m.maintenance_rate
+            if free < need or iso_equity <= maintenance:
                 raise ClearinghouseError("insufficient margin for the order")
             return
         current = initial_margin(m, lev, abs(size) * m.mark_price)
@@ -2835,6 +2967,7 @@ class Clearinghouse:
         else:
             days.append((day, notional))
         self.volumes[owner] = tuple(days)
+        self.lifetime_volume[owner] = self.lifetime_volume.peek(owner, ZERO) + notional
         ref = self.referrals.peek(owner)
         if ref is not None and ref.volume < REFERRAL_VOLUME_CAP:
             self.referrals[owner] = dataclasses.replace(ref, volume=ref.volume + notional)
@@ -3178,7 +3311,10 @@ class Clearinghouse:
             return event  # healthy again, or the book may refill: next block decides
         if not still_open and eq >= 0:
             return event  # closed on the book, solvent
-        if owner != VAULT and self.vault_nav() + eq >= 0:
+        # The backstop vault is everyone's: it never takes over a deployer market's positions
+        # (their risk is their market's — its book, then auto-deleveraging there).
+        contained = any(self.contained(self.markets[mid]) for mid in mids)
+        if owner != VAULT and not contained and self.vault_nav() + eq >= 0:
             self._backstop(owner, mids, isolated)
             event["stage"] = "backstop"
         elif still_open and eq < 0:
@@ -3496,6 +3632,10 @@ class Clearinghouse:
             }
         if len(self.volumes):
             out["volumes"] = {o: _encode_volume(o, v) for o, v in sorted(self.volumes.peek_items())}
+        if len(self.lifetime_volume):
+            out["lifetime_volume"] = {
+                o: str(v) for o, v in sorted(self.lifetime_volume.peek_items())
+            }
         if len(self.asset_holdings) or len(self.asset_unwind_time):
             out["asset_holdings"] = {t: str(v) for t, v in sorted(self.asset_holdings.peek_items())}
             out["asset_unwind_time"] = {
@@ -3541,6 +3681,8 @@ class Clearinghouse:
         if len(self.referral_codes):  # (nothing until the first referral code)
             sec.raw(self.referral_codes.commitment())
             sec.raw(self.referrals.commitment())
+        if len(self.lifetime_volume):  # (nothing until the first fill)
+            sec.raw(self.lifetime_volume.commitment())
         return sec.digest()
 
     def verify_commitment(self) -> None:
@@ -3553,6 +3695,7 @@ class Clearinghouse:
         self.vault_shares.verify()
         self.vault_unlock.verify()
         self.user_vaults.verify()
+        self.lifetime_volume.verify()
         self.vault_holdings.verify()
         self.volumes.verify()
         self.asset_holdings.verify()

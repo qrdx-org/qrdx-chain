@@ -455,6 +455,11 @@ class ExchangeStateManager:
         # --- Block-level tracking ---
         self._current_block_height: int = 0
         self._current_block_timestamp: float = 0.0
+        # Per block, not state: free trading actions each account has taken in it, and the
+        # block's exchange base fee (set with the block's balances, block_processor; None
+        # outside a block: the free lane is judged open).
+        self._block_free_actions: Dict[str, int] = {}
+        self.exchange_base_fee: Optional[int] = None
         self._block_exchange_txs: List[ExchangeTransaction] = []
         self._block_results: List[ExchangeExecResult] = []
         self._block_fees: Decimal = ZERO
@@ -605,6 +610,7 @@ class ExchangeStateManager:
         self._block_staker_fees = ZERO
         self._block_tick_events = []  # journal: this block's liquidations + funding
         self._block_journaled = False
+        self._block_free_actions = {}  # free trading actions taken in this block, by account
 
         # Reset per-block rate limits on all order books; expiry is judged by block time
         for book in self._order_books.values():
@@ -766,11 +772,20 @@ class ExchangeStateManager:
                 error=f"Gas limit too low: need {base_gas}, got {tx.gas_limit}",
             )
 
+        # 3a. The free trading lane (docs/TOKENOMICS.md): a trading operation sent at gas price 0
+        #     pays nothing while its account has free actions and blocks are not running full;
+        #     otherwise it is refused here — not includable, consuming nothing — and must pay.
+        free = tx.free_eligible()
+        if free:
+            refused = self.free_action_error(tx)
+            if refused:
+                return ExchangeExecResult(success=False, gas_used=0, error=refused)
+
         # 3b. Fees: a price of at least the floor, and QRDX for the whole gas limit at that
         #     price, reserved before the operation runs (so the operation cannot spend it).
         #     Refused here, an operation is not includable and consumes nothing.
         reserved = ZERO
-        if self.enforce_fees:
+        if self.enforce_fees and not free:
             try:
                 tx.validate_fee()
             except ValueError as e:
@@ -814,6 +829,8 @@ class ExchangeStateManager:
             self.oracle_vote_seqs[tx.sender.lower()] = tx.nonce
         else:
             self._nonces[tx.nonce_key()] = tx.nonce + 1
+        if free:
+            self._spend_free_action(tx)
         # A multisig that signed an executed transaction: its members become public record
         # (``account_getAuthority``), once.
         if tx.public_key[:1] == b"{":
@@ -830,8 +847,8 @@ class ExchangeStateManager:
         else:
             result.gas_used = min(int(tx.gas_limit), result.gas_used + tx.signature_gas())
         tx.gas_used = result.gas_used
-        fee = tx.fee()
-        if self.enforce_fees:
+        fee = tx.fee()  # (0 in the free lane: its price is 0)
+        if self.enforce_fees and not free:
             self._record_balance_delta(payer, reserved - fee)
             result.fee = fee
         self._block_fees += fee
@@ -845,6 +862,83 @@ class ExchangeStateManager:
         self._block_results.append(result)
 
         return result
+
+    # ── the free trading lane (docs/TOKENOMICS.md) ──
+
+    def free_action_budget(self, account: str) -> int:
+        """The free trading actions ``account`` has: FREE_ACTIONS_INITIAL, plus
+        FREE_ACTIONS_PER_VOLUME for each unit of settlement-asset volume it has ever traded."""
+        from .. import constants
+
+        volume = self.clearinghouse.lifetime_volume.peek(account, ZERO)
+        earned = int((volume * constants.FREE_ACTIONS_PER_VOLUME).to_integral_value(ROUND_DOWN))
+        return int(constants.FREE_ACTIONS_INITIAL) + earned
+
+    def free_lane_open(self) -> bool:
+        """Blocks are not running full: the block's exchange base fee is within
+        FREE_TRADING_MAX_BASE_FEE_BPS of its floor (free operations' gas counts toward it too, so
+        a flood of them closes the lane until blocks clear)."""
+        from .. import constants
+
+        fee, floor = self.exchange_base_fee, int(constants.EXCHANGE_MIN_GAS_PRICE_WEI)
+        if fee is None or floor <= 0:
+            return True
+        return int(fee) * 10_000 <= floor * int(constants.FREE_TRADING_MAX_BASE_FEE_BPS)
+
+    def free_action_error(self, tx: ExchangeTransaction) -> str:
+        """Why ``tx`` may not go free — "" if it may (read only). An account needs a holding
+        (FREE_ACTION_MIN_QRDX of QRDX or FREE_ACTION_MIN_EQUITY of perps equity), at most
+        FREE_ACTIONS_PER_BLOCK of its free actions are in one block, and it spends from its
+        budget (cancels: up to twice it); past the budget, one free action every
+        FREE_ACTION_REFILL_SECONDS. While blocks run full, only cancels go free."""
+        from .. import constants
+        from .transactions import trading_actions
+
+        account = tx.sender
+        count, cancels = trading_actions(tx.op_type, tx.params or {})
+        if not cancels and not self.free_lane_open():
+            return (
+                "blocks are running full: the free trading lane is paused — pay gas "
+                f"(at least the exchange base fee, {self.exchange_base_fee} wei)"
+            )
+        held = self.available_balance(account) or ZERO
+        equity = (
+            self.clearinghouse.total_equity(account)
+            if self.clearinghouse.accounts.peek(account) is not None
+            else ZERO
+        )
+        if held < constants.FREE_ACTION_MIN_QRDX and equity < constants.FREE_ACTION_MIN_EQUITY:
+            return (
+                f"free trading needs a holding: {constants.FREE_ACTION_MIN_QRDX} QRDX or "
+                f"{constants.FREE_ACTION_MIN_EQUITY} of perps equity — or pay gas"
+            )
+        if self._block_free_actions.get(account, 0) + count > constants.FREE_ACTIONS_PER_BLOCK:
+            return (
+                f"at most {constants.FREE_ACTIONS_PER_BLOCK} free actions of an account a block "
+                "— pay gas, or wait a block"
+            )
+        used, last = self.trading.action_budgets.peek(account, (0, ZERO))
+        budget = self.free_action_budget(account)
+        if used + count <= (budget * 2 if cancels else budget):
+            return ""
+        now = Decimal(str(self._block_clock()))
+        if count == 1 and now - last >= constants.FREE_ACTION_REFILL_SECONDS:
+            return ""  # past the budget: one every FREE_ACTION_REFILL_SECONDS after the last
+        return (
+            f"{account[:16]}… has used its {budget} free actions (trading earns more): pay gas, "
+            f"or wait {constants.FREE_ACTION_REFILL_SECONDS}s for the next"
+        )
+
+    def _spend_free_action(self, tx: ExchangeTransaction) -> None:
+        """An executed free operation — success or failure — spends its actions."""
+        from .transactions import trading_actions
+
+        account = tx.sender
+        count, cancels = trading_actions(tx.op_type, tx.params or {})
+        used, _last = self.trading.action_budgets.peek(account, (0, ZERO))
+        # (Its last free action's block time: past the budget, the next waits from here.)
+        self.trading.action_budgets[account] = (used + count, Decimal(str(self._block_clock())))
+        self._block_free_actions[account] = self._block_free_actions.get(account, 0) + count
 
     def signer_error(self, tx: ExchangeTransaction) -> str:
         """Why ``tx.signer`` may not act for ``tx.sender`` ("" if it may, or signs for itself).
@@ -1134,6 +1228,7 @@ class ExchangeStateManager:
             ExchangeOpType.DEPLOYER_UNBOND: self._op_deployer_unbond,
             ExchangeOpType.DEPLOYER_SET_ORACLE: self._op_deployer_set_oracle,
             ExchangeOpType.DEPLOYER_HALT: self._op_deployer_halt,
+            ExchangeOpType.TICKER_CLAIM: self._op_ticker_claim,
         }
         handler = handlers.get(tx.op_type)
         if handler is None:
@@ -2587,6 +2682,7 @@ class ExchangeStateManager:
                     raise ValueError(f"unknown side {p['side']!r}")
                 total = Decimal(str(p["size"]))
                 token_in = token_out = ""
+                self._trade_leverage(tx.sender, market, p)  # its slices trade at it
             else:
                 token_in = self.canonical_asset(p["token_in"])
                 token_out = self.canonical_asset(p["token_out"])
@@ -2925,6 +3021,13 @@ class ExchangeStateManager:
             liquidity = Decimal(str(p.get("liquidity", "0")))
             if not liquidity.is_finite() or liquidity < 0:
                 raise ValueError("liquidity must be a positive amount")
+            if ":" not in base and not constants.PERP_OPEN_LISTING:
+                # Whoever lists a validator-priced market chooses its settings (its maximum
+                # leverage, its grid) and takes its name for good: governance lists them.
+                raise ValueError(
+                    "a validator-priced market is listed by governance (list_market); a "
+                    "bonded deployer lists its own as dex:ASSET"
+                )
             if ":" in base:
                 # A deployer market (docs/HYPERLIQUID_PARITY.md): ``dex:ASSET``, listed only by
                 # that namespace's bonded deployer, which runs its oracle. (The namespace keeps
@@ -3333,6 +3436,15 @@ class ExchangeStateManager:
         """The metadata authority edits the token's name, symbol, uri and extra fields."""
         p = tx.params
         try:
+            ticker = self.ticker_of(str(p.get("token_address", "")))
+            if (
+                ticker is not None
+                and p.get("symbol") not in (None, "")
+                and str(p["symbol"]).strip().upper() != ticker
+            ):
+                # A ticker's token keeps its symbol: renamed, it would show one asset's symbol
+                # under another's ticker (docs/HYPERLIQUID_PARITY.md 11).
+                raise TokenError(f"the token holds the ticker {ticker}: its symbol stays")
             t = self.tokens.update_metadata(str(p["token_address"]), tx.sender, p)
         except (TokenError, KeyError) as e:
             return ExchangeExecResult(success=False, error=f"TOKEN_UPDATE_METADATA: {e}")
@@ -3868,6 +3980,8 @@ class ExchangeStateManager:
                 self._record_balance_delta(address, delta)
             if result.get("executed") and result.get("action") == "delist_market":
                 result.update(self._delist_market(result["market_id"], result.get("price")))
+            if result.get("executed") and result.get("action") == "list_market":
+                result.update(self._list_market(result))
             if result.get("executed") and result.get("action") == "slash_deployer":
                 result.update(
                     self._slash_deployer(result["deployer"], result["bps"], result["halt"])
@@ -4056,11 +4170,13 @@ class ExchangeStateManager:
 
         return QNS_AUTHORITY
 
-    def _qns_pay(self, payer: str, years: int) -> Decimal:
-        """Take ``years`` × QNS_PRICE_PER_YEAR QRDX from ``payer`` for the treasury."""
+    def _qns_pay(self, payer: str, years: int, name: str = "") -> Decimal:
+        """Take a name's price for ``years`` from ``payer`` for the treasury: QNS_PRICE_PER_YEAR
+        a year, times the name's length factor (qns.price_factor)."""
         from .. import constants
+        from .qns import price_factor
 
-        price = Decimal(constants.QNS_PRICE_PER_YEAR) * years
+        price = Decimal(constants.QNS_PRICE_PER_YEAR) * years * price_factor(name)
         if price <= 0:
             return ZERO
         avail = self.available_balance(payer)  # less this transaction's gas reservation
@@ -4105,7 +4221,7 @@ class ExchangeStateManager:
             svc, nfts = self.qns, self.nfts
             if not svc.available(nfts, name, now):
                 raise QnsError(f"{name} is registered")
-            paid = self._qns_pay(tx.sender, years)
+            paid = self._qns_pay(tx.sender, years, name)
             if nfts.get(QNS_COLLECTION) is None:
                 nfts.create(
                     QNS_COLLECTION,
@@ -4165,7 +4281,7 @@ class ExchangeStateManager:
             expires = r.expires + years * YEAR_SECONDS
             if expires > now + QNS_MAX_YEARS * YEAR_SECONDS:
                 raise QnsError(f"a name is held at most {QNS_MAX_YEARS} years ahead")
-            paid = self._qns_pay(tx.sender, years)
+            paid = self._qns_pay(tx.sender, years, name)
             self.qns.names[name] = replace(r, expires=expires)
         except (ValueError, KeyError) as e:
             return ExchangeExecResult(success=False, error=str(e))
@@ -4503,13 +4619,128 @@ class ExchangeStateManager:
         if mode not in ("cross", "isolated"):
             return ExchangeExecResult(success=False, error=f"unknown margin mode {mode!r}")
         try:
-            self.clearinghouse.set_leverage(
+            moved = self.clearinghouse.set_leverage(
                 tx.sender, str(p["market_id"]), Decimal(str(p["leverage"])), mode == "isolated"
             )
-        except ClearinghouseError as e:
+        except (ClearinghouseError, ArithmeticError) as e:
             return ExchangeExecResult(success=False, error=str(e))
         return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_SET_LEVERAGE]
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_SET_LEVERAGE],
+            data={"margin_moved": str(moved)} if moved else {},
+        )
+
+    def _trade_leverage(self, owner: str, market_id: str, p: Dict[str, Any]) -> None:
+        """An order's, trigger's or TWAP's own ``leverage`` (and ``margin_mode``): the market's
+        setting for the account becomes it, as PERP_SET_LEVERAGE would make it, inside the
+        operation — so it is all or nothing with the order. Absent: the setting stays."""
+        if p.get("leverage") is None and p.get("margin_mode") is None:
+            return
+        from .clearinghouse import DEFAULT_LEVERAGE
+
+        ch = self.clearinghouse
+        m = ch.market(market_id)
+        acct = ch.accounts.peek(owner)
+        mode = p.get("margin_mode")
+        if mode is None:
+            isolated = Clearinghouse.contained(m) or (
+                acct is not None and acct.isolated.get(market_id, False)
+            )
+        else:
+            mode = str(mode).lower()
+            if mode not in ("cross", "isolated"):
+                raise ValueError(f"unknown margin mode {mode!r}")
+            isolated = mode == "isolated"
+        raw = p.get("leverage")
+        if raw is None:
+            leverage = (
+                ch._leverage(acct, m) if acct is not None else min(DEFAULT_LEVERAGE, m.max_leverage)
+            )
+        else:
+            if isinstance(raw, bool):
+                raise ValueError("leverage is a number")
+            leverage = Decimal(str(raw))
+        ch.set_leverage(owner, market_id, leverage, isolated)
+
+    # ── tickers (docs/HYPERLIQUID_PARITY.md 11, Hyperliquid's HIP-1 deploy auction) ──
+
+    @staticmethod
+    def reserved_tickers() -> Set[str]:
+        """Tickers no one buys: the native asset's, the perps quote's, and every bridged
+        asset's — bound to the bridge's own token when it is created (``_mint_deposit``)."""
+        from .. import constants
+
+        out = {"QRDX", str(constants.PERP_QUOTE).upper()}
+        for entry in constants.BRIDGE_ASSETS:
+            out.add(str(entry).split(":", 1)[0].upper())
+        return out
+
+    def ticker_price(self, now: Optional[Decimal] = None) -> Decimal:
+        """The ticker auction's price at block time ``now``: the opening price until the first
+        sale; then twice the last sale's price, falling linearly to the floor over
+        TICKER_AUCTION_SECONDS after it."""
+        from .. import constants
+
+        now = Decimal(str(self._block_clock() if now is None else now))
+        floor = Decimal(constants.TICKER_MIN_PRICE)
+        last = self.trading.ticker_auction.peek("last")
+        if last is None:
+            return max(Decimal(constants.TICKER_OPENING_PRICE), floor)
+        price, at = last
+        start = max(price * 2, floor)
+        span = Decimal(int(constants.TICKER_AUCTION_SECONDS))
+        left = max(ZERO, span - max(ZERO, now - at)) / span
+        return (floor + (start - floor) * left).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
+
+    def ticker_of(self, token: str) -> Optional[str]:
+        """The ticker a token holds, if any."""
+        token = str(token).lower()
+        for ticker, address in self.trading.tickers.peek_items():
+            if address == token:
+                return ticker
+        return None
+
+    def _op_ticker_claim(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """A token's creator buys its symbol, upper-cased, as the token's ticker — one token per
+        ticker, for good — at the ticker auction's price, burned. ``max_price``: the most the
+        sender pays (the price moves with block time)."""
+        from ..crypto.account_id import same_account
+
+        p = tx.params
+        now = Decimal(str(self._block_clock()))
+        try:
+            t = self.tokens.get(str(p["token_address"]))
+            if t is None:
+                raise ValueError(f"no token {p['token_address']}")
+            if not same_account(t.creator, tx.sender):
+                raise ValueError("only the token's creator claims its ticker")
+            ticker = t.symbol.upper()
+            if not re.fullmatch(r"[A-Z0-9]{1,12}", ticker):
+                raise ValueError("a ticker is 1 to 12 letters and digits: this symbol is not one")
+            if ticker in self.reserved_tickers():
+                raise ValueError(f"{ticker} is reserved")
+            if self.trading.tickers.peek(ticker) is not None:
+                raise ValueError(f"the ticker {ticker} is taken")
+            if self.ticker_of(t.address) is not None:
+                raise ValueError(f"{t.address} already holds {self.ticker_of(t.address)}")
+            price = self.ticker_price(now)
+            if p.get("max_price") is not None:
+                cap = Decimal(str(p["max_price"]))
+                if not cap.is_finite() or price > cap:
+                    raise ValueError(f"the ticker auction is at {price}, above max_price {cap}")
+            avail = self.available_balance(tx.sender)
+            if price > 0 and (avail is None or avail < price):
+                raise ValueError(f"a ticker costs {price} QRDX now; available {avail}")
+        except (ValueError, ArithmeticError, KeyError) as e:
+            return ExchangeExecResult(success=False, error=str(e))
+        if price > 0:
+            self._record_balance_delta(tx.sender, -price)  # burned
+        self.trading.tickers[ticker] = t.address
+        self.trading.ticker_auction["last"] = (price, now)
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TICKER_CLAIM],
+            data={"ticker": ticker, "token_address": t.address, "price": str(price)},
         )
 
     # ── deployer markets (docs/HYPERLIQUID_PARITY.md, Hyperliquid's HIP-3) ──
@@ -4675,6 +4906,160 @@ class ExchangeStateManager:
             success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.DEPLOYER_HALT], data=settled
         )
 
+    def _list_market(self, listing: Dict[str, Any]) -> Dict[str, Any]:
+        """A passed ``list_market``: a validator-priced market with the settings the proposal
+        named. A refusal (the market exists, a setting out of bounds) fails the execution."""
+        from .. import constants
+
+        try:
+            spot_token, spot_pools = str(listing.get("spot_token") or ""), ()
+            if spot_token.upper() == "QRDX":
+                spot_token = "QRDX"  # (the native asset, as pools name it)
+            max_leverage = Decimal(str(listing.get("max_leverage", "20")))
+            if spot_token:
+                spot_pools = tuple(listing.get("spot_pools") or ())
+                self._check_spot_listing(str(listing["base_token"]), spot_token, spot_pools)
+                cap = Decimal(int(constants.PERP_SPOT_MAX_LEVERAGE))
+                if "max_leverage" not in listing:
+                    max_leverage = min(max_leverage, cap)
+                if max_leverage > cap:
+                    raise ValueError(f"a native-token market's maximum leverage is at most {cap}")
+            m = self.clearinghouse.create_market(
+                str(listing["base_token"]),
+                constants.PERP_QUOTE,
+                max_leverage=max_leverage,
+                sz_decimals=int(listing.get("sz_decimals", constants.PERP_DEFAULT_SZ_DECIMALS)),
+                spot_token=spot_token,
+                spot_pools=spot_pools,
+            )
+        except (ClearinghouseError, ValueError, ArithmeticError) as e:
+            raise GovernanceError(str(e)) from None
+        return {"market_id": m.id}
+
+    # ── native-token perps (docs/HYPERLIQUID_PARITY.md 13) ──
+
+    def _check_spot_listing(self, base: str, token: str, pools: Tuple[str, ...]) -> None:
+        """A native-token market's listing: the token holds ``base`` as its unique ticker (its
+        name cannot be anyone else's), and ``pools`` lead from it to the settlement asset. QRDX
+        itself may be one — ``spot_token`` "QRDX", listed as QRDX — priced off its pools to a
+        stablecoin settlement asset."""
+        settlement = self._settlement_asset()
+        if str(token).upper() == "QRDX":
+            if base.upper() != "QRDX":
+                raise ValueError("QRDX's market is listed as QRDX")
+            if settlement == "QRDX":
+                raise ValueError("perps settle in QRDX here: QRDX has no price in itself")
+            start = "QRDX"
+        else:
+            t = self.tokens.get(token)
+            if t is None:
+                raise ValueError(f"no native token {token}")
+            if self.ticker_of(t.address) != base.upper():
+                raise ValueError(f"{base} is not {t.address}'s ticker: list it by its ticker")
+            start = t.address
+        if self._spot_path_end(start, pools) != settlement:
+            raise ValueError("the spot pools must lead from the token to the settlement asset")
+
+    def _settlement_asset(self) -> str:
+        """The perps settlement asset as spot pools name it ("QRDX", or a token address)."""
+        token = self.perp_collateral_token()
+        return "QRDX" if token.upper() == "QRDX" else self.canonical_asset(token)
+
+    def _spot_path_end(self, start: str, pools: Tuple[str, ...]) -> Optional[str]:
+        """Where ``pools`` lead from ``start`` (None if a pool is missing or not on the way)."""
+        current = start
+        for pid in pools:
+            pool = self.pool_manager.get_pool(pid)
+            if pool is None or current not in (pool.state.token0, pool.state.token1):
+                return None
+            current = pool.state.token1 if pool.state.token0 == current else pool.state.token0
+        return current
+
+    def _spot_reading(self, m, now: Decimal) -> Tuple[Optional[Decimal], Decimal]:
+        """(price, depth) of a native-token market's spot market now, in the settlement asset:
+        the price the TWAP over SPOT_ORACLE_TWAP_SECONDS along its pools (None without that much
+        history), the depth the smallest of the pools' virtual reserves on the way out, each in
+        the settlement asset."""
+        from .. import constants
+        from .amm import Q96
+
+        window, at = int(constants.SPOT_ORACLE_TWAP_SECONDS), int(now)
+        current, prices, reserves = m.spot_token, [], []
+        for pid in m.spot_pools:
+            pool = self.pool_manager.get_pool(pid)
+            if pool is None or current not in (pool.state.token0, pool.state.token1):
+                return None, ZERO
+            st = pool.state
+            forward = st.token0 == current
+            twap = pool.twap_price(window, at)
+            prices.append(None if not twap or twap <= 0 else (twap if forward else 1 / twap))
+            root = st.sqrt_price / Q96
+            if root <= 0 or st.liquidity <= 0:
+                reserves.append(ZERO)
+            else:  # virtual reserves: token0 L/√P, token1 L·√P — the side the path leaves by
+                reserves.append(st.liquidity * root if forward else st.liquidity / root)
+            current = st.token1 if forward else st.token0
+        if current != self._settlement_asset():
+            return None, ZERO
+        depth: Optional[Decimal] = None
+        for i, reserve in enumerate(reserves):
+            onward = Decimal(1)
+            for p in prices[i + 1 :]:
+                if p is None:
+                    onward = ZERO
+                    break
+                onward *= p
+            value = reserve * onward
+            depth = value if depth is None else min(depth, value)
+        price: Optional[Decimal] = Decimal(1)
+        for p in prices:
+            if p is None:
+                price = None
+                break
+            price = price * p if price is not None else None
+        return price, (depth or ZERO).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
+
+    @_pinned
+    def update_spot_oracles(self, now: Decimal) -> List[Dict[str, Any]]:
+        """Each block, before the clearinghouse's tick: every live native-token market reads its
+        spot market. Its depth at most doubles over SPOT_ORACLE_TWAP_SECONDS (falls at once), so
+        liquidity added for a block raises no cap. Its oracle is the TWAP, moved at most ORACLE_MAX_STEP_BPS a second — only while
+        the depth is at least SPOT_ORACLE_MIN_DEPTH; otherwise it goes stale, and the market
+        takes only reduce-only orders. Not while the validators hold the market frozen."""
+        from .. import constants
+
+        now = Decimal(str(now))
+        ch = self.clearinghouse
+        window = Decimal(int(constants.SPOT_ORACLE_TWAP_SECONDS))
+        step = Decimal(int(constants.ORACLE_MAX_STEP_BPS)) / 10_000
+        events: List[Dict[str, Any]] = []
+        for mid in sorted(ch.markets):
+            m = ch.markets[mid]
+            if not m.spot_token or m.settled_price > 0 or Clearinghouse.frozen(m, now):
+                continue
+            price, depth = self._spot_reading(m, now)
+            if depth > m.spot_depth:
+                # Up at most doubling over SPOT_ORACLE_TWAP_SECONDS (from SPOT_ORACLE_MIN_DEPTH
+                # at the first reading), down at once: liquidity added for a moment, however
+                # much, raises the cap by a sliver — only liquidity that stays raises it.
+                dt = max(ZERO, now - m.spot_time) if m.spot_time > 0 else ZERO
+                base = max(m.spot_depth, Decimal(int(constants.SPOT_ORACLE_MIN_DEPTH)))
+                allowed = base * (1 + min(Decimal(1), dt / window))
+                depth = min(depth, allowed).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
+            if price is not None and depth < Decimal(int(constants.SPOT_ORACLE_MIN_DEPTH)):
+                price = None
+            if price is not None and step > 0 and m.oracle_price > 0 and m.oracle_time > 0:
+                bound = step * max(ZERO, now - m.oracle_time)
+                lo = m.oracle_price * (1 - min(bound, Decimal("0.99")))
+                hi = m.oracle_price * (1 + bound)
+                price = min(max(price, lo), hi)
+            if price is not None:
+                price = price.quantize(Decimal(1).scaleb(-18))
+            ch.set_spot_reading(mid, price, depth, now)
+            if price is None:
+                events.append({"type": "spot_oracle_waiting", "market": mid, "depth": str(depth)})
+        return events
+
     def _slash_deployer(self, deployer: str, bps: int, halt: bool) -> Dict[str, Any]:
         """A passed ``slash_deployer``: ``bps`` of the deployer's bond — what is unbonding too —
         burned, and with ``halt`` every market it runs settled at its oracle price (a frozen
@@ -4799,6 +5184,7 @@ class ExchangeStateManager:
                 and legs_gas > int(gas_limit) - EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_ORDER]
             ):
                 raise ValueError(f"the attached TP/SL need {legs_gas} gas beyond the order's")
+            self._trade_leverage(tx.sender, str(p["market_id"]), p)
             fills = self.clearinghouse.place_order(
                 tx.sender,
                 str(p["market_id"]),
@@ -4916,6 +5302,7 @@ class ExchangeStateManager:
                     f"({gas})"
                 )
             trigger_id = tx.tx_hash()[:16]
+            self._trade_leverage(tx.sender, str(p["market_id"]), p)
             self.clearinghouse.place_trigger(
                 tx.sender,
                 str(p["market_id"]),
@@ -5256,8 +5643,25 @@ class ExchangeStateManager:
             return ExchangeExecResult(
                 success=False, error="sender is not an authorized oracle reporter"
             )
-        if price <= 0:
+        if not price.is_finite() or price <= 0:
             return ExchangeExecResult(success=False, error="oracle price must be positive")
+        base, _, quote = pair.partition(":")
+        market_id = Clearinghouse.market_id(base, quote or constants.PERP_QUOTE)
+        m = self.clearinghouse.markets.get(market_id)
+        if m is not None and Clearinghouse.contained(m):
+            return ExchangeExecResult(
+                success=False, error=f"{market_id} is not priced by reporters or votes"
+            )
+        if m is not None:
+            # As the validators' oracle walks (``_aggregate_votes``): at most ORACLE_MAX_STEP_BPS
+            # a second of block time from the last price — a reporter cannot jump it either.
+            step = Decimal(int(constants.ORACLE_MAX_STEP_BPS)) / 10_000
+            now = Decimal(str(self._block_clock()))
+            prev, prev_time = m.oracle_price, m.oracle_time
+            if step > 0 and prev > 0 and prev_time > 0 and now > prev_time:
+                bound = step * (now - prev_time)
+                lo, hi = prev * (1 - min(bound, Decimal("0.99"))), prev * (1 + bound)
+                price = min(max(price, lo), hi).quantize(Decimal(1).scaleb(-18))
 
         oracle = self._oracles.get(pair)
         if oracle is None:
@@ -5269,9 +5673,7 @@ class ExchangeStateManager:
         oracle.record(price, timestamp=self._current_block_timestamp)
 
         # Price the perp market that tracks this pair: "BTC:USD" → BTC-USD-PERP.
-        base, _, quote = pair.partition(":")
-        market_id = Clearinghouse.market_id(base, quote or constants.PERP_QUOTE)
-        if market_id in self.clearinghouse.markets:
+        if m is not None:
             self.clearinghouse.set_oracle_price(market_id, price, self._block_clock())
 
         return ExchangeExecResult(
@@ -5378,7 +5780,7 @@ class ExchangeStateManager:
             if not price.is_finite() or price <= 0:
                 return ExchangeExecResult(success=False, error=f"invalid price for {base}")
             m = self.clearinghouse.markets[market_id]
-            if m.deployer and not Clearinghouse.frozen(m, self._block_clock()):
+            if Clearinghouse.contained(m) and not Clearinghouse.frozen(m, self._block_clock()):
                 # Its deployer prices it until the validators freeze it. Skipped, not refused: a
                 # freeze can lapse between a vote and its block, and the rest of the vote stands.
                 ignored.append(str(key))
@@ -5387,7 +5789,7 @@ class ExchangeStateManager:
         freezes = []
         for raw in freeze_raw:
             target = self.clearinghouse.markets.get(str(raw))
-            if target is None or not target.deployer or target.settled_price > 0:
+            if target is None or not Clearinghouse.contained(target) or target.settled_price > 0:
                 ignored.append(f"freeze:{raw}")  # (settled since the vote, say)
                 continue
             freezes.append(target.id)
@@ -5447,6 +5849,12 @@ class ExchangeStateManager:
                 initial_supply=0,
                 mint_authority=BRIDGE_AUTHORITY,
             )
+            # Its symbol is a reserved ticker: the bridge's token holds it (no one buys it).
+            ticker = asset.symbol.upper()
+            if self.trading.tickers.peek(ticker) is None and re.fullmatch(
+                r"[A-Z0-9]{1,12}", ticker
+            ):
+                self.trading.tickers[ticker] = str(asset.address).lower()
         minted = self.tokens.mint(asset.address, BRIDGE_AUTHORITY, d.amount)
         self._record_token_delta(d.to, asset.address, minted)
 
@@ -5585,8 +5993,8 @@ class ExchangeStateManager:
             if market_id not in self.clearinghouse.markets or len(votes) < max(1, min_voters):
                 continue
             m = self.clearinghouse.markets[market_id]
-            if m.deployer and not Clearinghouse.frozen(m, now):
-                continue  # its deployer prices it, until the validators freeze it
+            if Clearinghouse.contained(m) and not Clearinghouse.frozen(m, now):
+                continue  # its deployer or its spot market prices it, until a freeze
             weighted = sorted((price, committee[v]) for v, (price, _t) in votes.items())
             weight = sum((w for _p, w in weighted), ZERO)
             if weight * 2 <= total:
