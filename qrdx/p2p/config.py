@@ -58,10 +58,10 @@ class SecurityConfig:
     post_quantum_enabled: bool = True
 
     # Post-quantum KEM algorithm
-    pq_kem_algorithm: str = "Kyber768"
+    pq_kem_algorithm: str = "ML-KEM-768"
 
     # Post-quantum signature algorithm
-    pq_sig_algorithm: str = "Dilithium3"
+    pq_sig_algorithm: str = "ML-DSA-65"
 
     # Require PQ-capable peers (reject others)
     pq_required: bool = True

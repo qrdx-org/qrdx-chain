@@ -15,7 +15,7 @@ from qrdx.exchange.clearinghouse import (
     VAULT, Clearinghouse, FUNDING_CAP_PER_HOUR, FUNDING_INTEREST_8H, FUNDING_PREMIUM_CLAMP,
 )
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+pytestmark = pytest.mark.usefixtures("genesis_btc")  # BTC from the first block
 
 D = Decimal
 BTC = "BTC-QRDX-PERP"
@@ -86,9 +86,20 @@ def test_a_shallow_book_is_no_impact_price():
     """Less than the impact notional resting: that side contributes no premium."""
     ch = _ch()
     ch.deposit("mm", D(1_000_000))
-    ch.place_order("mm", BTC, "bid", "buy", D("0.01"), D(36000), 0)   # 360 QRDX < 1,000
+    ch.place_order("mm", BTC, "bid", "buy", D("0.5"), D(36000), 0)   # 18,000 < BTC's 20,000
     _run_hour(ch)
     assert ch.markets[BTC].funding_rate == FUNDING_INTEREST_8H / 8
+
+
+def test_the_impact_notional_is_hyperliquids():
+    """20,000 for BTC and ETH, 6,000 for every other market (and a token perp)."""
+    from qrdx.exchange.clearinghouse import Clearinghouse
+
+    ch = Clearinghouse()
+    for base, notional in (("BTC", 20000), ("ETH", 20000), ("SOL", 6000), ("AVAX", 6000)):
+        assert ch.impact_notional(ch.create_market(base)) == notional
+    token = "0x" + "5" * 40
+    assert ch.impact_notional(ch.create_market(token, spot_token=token)) == 6000
 
 
 def test_the_rate_is_capped_per_hour(no_risk_limits):
@@ -171,7 +182,7 @@ def test_payments_sum_to_exactly_zero_with_rounding_dust_to_the_vault():
 
 # ── the chain: forward ≡ rebuild across several settlements ──────────────
 
-async def test_forward_and_rebuild_pay_the_same_funding(monkeypatch):
+async def test_forward_and_rebuild_pay_the_same_funding(monkeypatch, oracle_committee):
     import json
     import os
     import tempfile
@@ -185,7 +196,6 @@ async def test_forward_and_rebuild_pay_the_same_funding(monkeypatch):
 
     keys = [PQPrivateKey.generate() for _ in range(3)]
     rep, alice, bob = (k.public_key.to_address() for k in keys)
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (rep,))
     monkeypatch.setattr(constants, "PERP_FUNDING_INTERVAL_SECONDS", 60)
     nonces = {a: 0 for a in (rep, alice, bob)}
 
@@ -202,7 +212,8 @@ async def test_forward_and_rebuild_pay_the_same_funding(monkeypatch):
     try:
         async def add(h, txs=None, alloc=None):
             bh = f"{h:064x}"
-            await db.add_block(block_hash=bh, block_height=h, block_content="",
+            await db.add_block(block_hash=bh, block_height=h,
+                               block_content=oracle_committee.genesis if h == 0 else "",
                                validator_address="0xPQ" + "00" * 32, timestamp=int(T0) + 7 * h)
             for i, (r, a) in enumerate(alloc or []):
                 await db.add_transaction(tx_hash=f"a{h}{i}", block_hash=bh, tx_hex=json.dumps(
@@ -210,9 +221,9 @@ async def test_forward_and_rebuild_pay_the_same_funding(monkeypatch):
             if txs:
                 await db.add_block_exchange_txs(bh, encode_exchange_txs(txs))
 
-        await add(0, alloc=[(alice, "100000"), (bob, "100000"), (rep, "5000")])  # rep pays gas and the listing fee
-        await add(1, [tx(0, ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"}),
-                      tx(0, ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": "30000"}),
+        # The genesis validator votes BTC's price (and pays its gas).
+        await add(0, alloc=[(alice, "100000"), (bob, "100000"), (oracle_committee.address, "5000")])
+        await add(1, [oracle_committee.vote({"BTC": "30000"}),
                       tx(1, ExchangeOpType.PERP_DEPOSIT, {"amount": "50000"}),
                       tx(2, ExchangeOpType.PERP_DEPOSIT, {"amount": "50000"})])
         await add(2, [tx(2, ExchangeOpType.PERP_ORDER, {"market_id": BTC, "side": "sell",
@@ -234,6 +245,7 @@ async def test_forward_and_rebuild_pay_the_same_funding(monkeypatch):
         for h in range(1, tip + 1):
             section = await db.get_block_exchange_txs(f"{h:064x}")
             ts = float(int(T0) + 7 * h)
+            await BP.ensure_oracle_committee(db, mgr, h)     # as every path does
             if section:
                 txs = BP.decode_exchange_txs(section)
                 await BP.preload_sender_balances(db, txs, mgr)

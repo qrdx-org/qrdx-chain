@@ -5,7 +5,7 @@
 > consensus-integrated for production**. This document is the concrete, code-
 > grounded list of everything required to run it securely across nodes, plus the
 > security properties and certification gates.
-> **Date:** June 2026 · **Related:** `docs/EVM_STATE_CONSENSUS_INTEGRATION.md`, `PRODUCTION_DEPLOYMENT.md`
+> **Date:** June 2026 · **Related:** `docs/archive/EVM_STATE_CONSENSUS_INTEGRATION.md`, `PRODUCTION_DEPLOYMENT.md`
 
 ---
 

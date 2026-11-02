@@ -1149,6 +1149,10 @@ class DatabaseSQLite:
                 d = _json.loads(tx_hex)
             except Exception:
                 continue
+            if isinstance(d, dict) and d.get("type") == "genesis_contract":
+                await self.seed_genesis_contract(d)  # a predeploy (qrdx/predeploys.py)
+                seeded += 1
+                continue
             # Prefunded accounts and system wallets: both are genesis balances in account_state.
             if d.get("type") not in ("genesis_allocation", "genesis_system_wallet") or not d.get(
                 "recipient"
@@ -1163,6 +1167,39 @@ class DatabaseSQLite:
             )
             seeded += 1
         return seeded
+
+    async def seed_genesis_contract(self, record: Dict[str, Any]) -> None:
+        """A predeployed contract (a block-0 ``genesis_contract`` record, qrdx/predeploys.py):
+        its account (nonce 1, as a deployed contract's), its code and its starting storage —
+        the rows the EVM's state writes for a contract it deploys. Leaves a balance or nonce the
+        chain has since given it, and a slot it has since written. Does not commit."""
+        from eth_utils import keccak
+
+        from .crypto.account_id import to_account_id
+
+        code = bytes.fromhex(str(record["code"]))
+        code_hash = keccak(code).hex()
+        if code_hash != str(record.get("code_hash", code_hash)):
+            raise ValueError(f"genesis contract {record['address']}: code hash mismatch")
+        address = to_account_id(str(record["address"]))
+        await self.connection.execute(
+            "INSERT INTO account_state (address, balance, nonce, code_hash, storage_root, "
+            "created_at, updated_at, is_contract) VALUES (?, '0', 1, ?, NULL, 0, 0, 1) "
+            "ON CONFLICT(address) DO UPDATE SET code_hash = excluded.code_hash, is_contract = 1",
+            (address, code_hash),
+        )
+        await self.connection.execute(
+            "INSERT OR IGNORE INTO contract_code (code_hash, bytecode, deployed_at, deployer, size) "
+            "VALUES (?, ?, 0, 'genesis', ?)",
+            (code_hash, code, len(code)),
+        )
+        for key, value in sorted(dict(record.get("storage") or {}).items()):
+            await self.connection.execute(
+                "INSERT INTO contract_storage (contract_address, storage_key, storage_value, "
+                "block_number) VALUES (?, ?, ?, 0) "
+                "ON CONFLICT (contract_address, storage_key) DO NOTHING",
+                (address, str(key), str(value)),
+            )
 
     async def apply_token_balance_delta(
         self, token_address: str, holder_address: str, delta
@@ -2579,8 +2616,9 @@ class DatabaseSQLite:
         same account therefore read the SAME balance (see
         ``qrdx.crypto.account_id``).
 
-        Checks account_state first (the unified ledger), then falls back to the
-        UTXO unspent_outputs table (vestigial — empty from genesis onward).
+        Reads ``account_state``, the one ledger. (It used to fall back to the legacy UTXO
+        table, which nothing writes: the fallback once hid a value-creation bug, and the last
+        writer was the refused proof-of-work path — docs/KNOWN_ISSUES.md.)
         Returns balance in QRDX (not micro-QRDX, not wei).
         """
         from decimal import Decimal
@@ -2590,9 +2628,7 @@ class DatabaseSQLite:
         try:
             addr_lower = to_account_id(address)
         except ValueError:
-            # Unkeyable address: no account can exist for it. The UTXO fallback
-            # below still gets a chance on the literal string (legacy reads).
-            addr_lower = address.lower()
+            return Decimal(0)  # unkeyable: no account can exist for it
 
         # 1. Check account_state (ETH/EVM accounts — balance stored as wei string)
         try:
@@ -2605,20 +2641,6 @@ class DatabaseSQLite:
                 bal_wei = int(row[0])
                 if bal_wei > 0:
                     return Decimal(bal_wei) / Decimal(10**18)
-        except Exception:
-            pass
-
-        # 2. Fallback: sum unspent_outputs (stored as micro-QRDX). Keyed by the
-        #    LITERAL address — the legacy UTXO ledger predates account ids.
-        try:
-            cursor = await self.connection.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM unspent_outputs WHERE LOWER(address) = ?",
-                (address.lower(),),
-            )
-            row = await cursor.fetchone()
-            micro = int(row[0]) if row and row[0] else 0
-            if micro > 0:
-                return Decimal(micro) / Decimal(10**6)
         except Exception:
             pass
 

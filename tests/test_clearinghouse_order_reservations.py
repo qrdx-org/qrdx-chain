@@ -15,15 +15,12 @@ What the static rule assumed can stop being true when the position changes, so:
 Placing an order checks both worst cases: a full fill now, and resting whole.
 """
 from decimal import Decimal
-from types import SimpleNamespace
 
 import pytest
 
-from qrdx import constants
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransaction
 from qrdx.exchange.clearinghouse import Clearinghouse, ClearinghouseError
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
 
 D = Decimal
 BTC = "BTC-QRDX-PERP"
@@ -164,13 +161,13 @@ def test_a_maker_opening_without_reserved_margin_is_cancelled_at_match_time():
 # ── through the state manager: the receipt reports the cancellations ─────
 
 def test_the_order_receipt_lists_the_orders_it_cancelled(monkeypatch):
-    rep, alice, carol = "0xPQrep", "0xPQaaa", "0xPQccc"
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (rep,))
+    alice, carol = "0xPQaaa", "0xPQccc"
     ExchangeStateManager.reset_instance()
     mgr = ExchangeStateManager.get_instance()
     try:
         mgr.begin_block(1, 1_700_000_000.0)
-        assert mgr._op_create_market(SimpleNamespace(params={"base_token": "BTC"})).success
+        mgr.clearinghouse.create_market("BTC")
+        mgr.clearinghouse.set_oracle_price(BTC, D(30000), now=1_700_000_000)
 
         def tx(op, sender, params):
             return mgr.process_transaction(ExchangeTransaction(
@@ -181,7 +178,6 @@ def test_the_order_receipt_lists_the_orders_it_cancelled(monkeypatch):
             return tx(ExchangeOpType.PERP_ORDER, sender, {
                 "market_id": BTC, "side": side, "size": str(size), "price": str(price), **extra})
 
-        assert tx(ExchangeOpType.UPDATE_ORACLE, rep, {"pair": "BTC:QRDX", "price": "30000"}).success
         for who, amount in ((alice, "3100"), (carol, "10000000")):
             assert tx(ExchangeOpType.PERP_DEPOSIT, who, {"amount": amount}).success
         assert order(carol, "sell", 1, 30000).success

@@ -85,10 +85,10 @@ dns_networks = []
 post_quantum_enabled = true
 
 # Post-quantum algorithm for key encapsulation
-pq_kem_algorithm = "Kyber768"
+pq_kem_algorithm = "ML-KEM-768"
 
 # Post-quantum algorithm for signatures
-pq_sig_algorithm = "Dilithium3"
+pq_sig_algorithm = "ML-DSA-65"
 
 # Require post-quantum capable peers (reject non-PQ peers)
 pq_required = false

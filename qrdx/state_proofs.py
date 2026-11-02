@@ -66,7 +66,8 @@ SCHEMA = (
     # needs to reach the signed root; written where the root is computed or checked).
     # (dtree / xtree: the database tree's and the exchange tree's roots; proof combines them)
     "CREATE TABLE IF NOT EXISTS state_root_parts (height INTEGER PRIMARY KEY, utxo TEXT,"
-    " account TEXT, exchange TEXT, token TEXT, proof TEXT, dtree TEXT, xtree TEXT)",
+    " account TEXT, exchange TEXT, token TEXT, proof TEXT, dtree TEXT, xtree TEXT,"
+    " validators TEXT)",
 )
 
 # kind → (table, the identity columns, the payload columns)
@@ -235,6 +236,9 @@ async def install(conn: Any) -> None:
         return
     for sql in SCHEMA:
         await conn.execute(sql)
+    cur = await conn.execute("PRAGMA table_info(state_root_parts)")
+    if "validators" not in {r[1] for r in await cur.fetchall()}:  # (a database from before)
+        await conn.execute("ALTER TABLE state_root_parts ADD COLUMN validators TEXT")
     for kind in TABLES:
         for sql in _trigger_sql(kind):
             await conn.execute(sql)
@@ -417,8 +421,8 @@ async def record_parts(db: Any, height: int, parts: Dict[str, Optional[str]]) ->
         return
     await db.connection.execute(
         "INSERT OR REPLACE INTO state_root_parts "
-        "(height, utxo, account, exchange, token, proof, dtree, xtree) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(height, utxo, account, exchange, token, proof, dtree, xtree, validators) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             int(height),
             parts.get("utxo"),
@@ -428,13 +432,14 @@ async def record_parts(db: Any, height: int, parts: Dict[str, Optional[str]]) ->
             parts.get("proof"),
             await database_root(db, height),
             parts.get("xtree"),
+            parts.get("validators"),
         ),
     )
 
 
 async def recorded(db: Any, height: Optional[int] = None) -> Dict[str, Any]:
     """The roots recorded for ``height`` (default: the newest provable one): the four domain
-    roots, the two trees' and the proof root."""
+    roots (and the validator root, once committed), the two trees' and the proof root."""
     conn = db.connection
     if height is None:
         cur = await conn.execute(
@@ -445,8 +450,8 @@ async def recorded(db: Any, height: Optional[int] = None) -> Dict[str, Any]:
             raise ValueError("no provable height recorded yet")
         height = int(row[0])
     cur = await conn.execute(
-        "SELECT r.root, p.utxo, p.account, p.exchange, p.token, p.proof, p.dtree, p.xtree "
-        "FROM smt_roots r JOIN state_root_parts p USING (height) WHERE height = ?",
+        "SELECT r.root, p.utxo, p.account, p.exchange, p.token, p.proof, p.dtree, p.xtree, "
+        "p.validators FROM smt_roots r JOIN state_root_parts p USING (height) WHERE height = ?",
         (int(height),),
     )
     row = await cur.fetchone()
@@ -454,10 +459,13 @@ async def recorded(db: Any, height: Optional[int] = None) -> Dict[str, Any]:
         raise ValueError(
             f"no proof root recorded for height {height} (pruned, or not computed here)"
         )
+    roots = {"utxo": row[1], "account": row[2], "exchange": row[3], "token": row[4]}
+    if row[8]:
+        roots["validators"] = row[8]
     return {
         "height": int(height),
         "ref": smt.Ref.decode(bytes(row[0]))[0],
-        "roots": {"utxo": row[1], "account": row[2], "exchange": row[3], "token": row[4]},
+        "roots": roots,
         "proof_root": row[5],
         "database_tree_root": row[6],
         "exchange_tree_root": row[7] or smt.EMPTY.hex(),
@@ -558,7 +566,12 @@ def verify_against(state_root: str, proof: Dict[str, Any]) -> bool:
         return False
     r = proof["roots"]
     unified = unified_state_root(
-        r["utxo"] or "0" * 64, r["account"], r["exchange"], r["token"], proof_root
+        r["utxo"] or "0" * 64,
+        r["account"],
+        r["exchange"],
+        r["token"],
+        proof_root,
+        r.get("validators"),
     )
     return unified == state_root
 

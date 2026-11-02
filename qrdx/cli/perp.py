@@ -703,21 +703,25 @@ def vault_withdraw_cmd(wallet_file, shares, node, wait, yes):
 
 @perp.command("create-market")
 @click.argument("wallet_file", type=click.Path(exists=True))
-@click.argument("base")
-@click.option("--max-leverage", default=None, help="Default 20")
+@click.argument("token")
+@click.option("--liquidity", required=True, help="Seed for the market's liquidity vault")
+@click.option("--max-leverage", default=None, help="Default and most: PERP_SPOT_MAX_LEVERAGE")
+@click.option("--sz-decimals", default=None, type=int, help="Size decimals of the order grid")
 @node_option
 @wait_option
 @yes_option
-def create_market_cmd(wallet_file, base, max_leverage, node, wait, yes):
-    """Open a market for BASE, such as BTC. It trades once validators price it. Listing burns
-    the network's market listing fee (PERP_MARKET_LISTING_FEE QRDX). Only where the network
-    allows open listing (PERP_OPEN_LISTING, a dev network's setting): elsewhere validator-priced
-    markets are listed by governance (``list_market``), and a bonded deployer lists its own as
-    ``dex:ASSET`` (docs/HYPERLIQUID_PARITY.md)."""
+def create_market_cmd(wallet_file, token, liquidity, max_leverage, sz_decimals, node, wait, yes):
+    """List the perp of the on-chain TOKEN, by its address (docs/HYPERLIQUID_PARITY.md 13). It is
+    priced off the token's own spot market, so the token needs pools to the settlement asset with
+    enough history and depth. Listing burns PERP_MARKET_LISTING_FEE QRDX and seeds the market's
+    liquidity vault with LIQUIDITY of your perps collateral. Perps priced by the validators
+    (BTC, ETH, ...) are listed at genesis or by governance (``list_market``), never here."""
     from ..constants import PERP_MARKET_LISTING_FEE
 
-    params = {"base_token": base}
+    params = {"token": token, "liquidity": str(Decimal(liquidity))}
     if max_leverage:
         params["max_leverage"] = str(Decimal(max_leverage))
-    what = f"Create the {base} perp market (burns {PERP_MARKET_LISTING_FEE} QRDX)"
+    if sz_decimals is not None:
+        params["sz_decimals"] = sz_decimals
+    what = f"List the perp of {token} (burns {PERP_MARKET_LISTING_FEE} QRDX)"
     _send(node, wallet_file, "CREATE_MARKET", params, what, wait, yes)

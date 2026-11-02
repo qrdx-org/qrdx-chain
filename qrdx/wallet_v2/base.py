@@ -18,7 +18,7 @@ class WalletType(Enum):
     """Wallet type enumeration."""
 
     TRADITIONAL = "traditional"  # secp256k1 ECDSA
-    POST_QUANTUM = "pq"  # Dilithium3
+    POST_QUANTUM = "pq"  # ML-DSA-65
     UNIFIED = "unified"  # Contains both types
 
 
@@ -296,62 +296,64 @@ def derive_key_from_password(password: str, salt: bytes, iterations: int = 10000
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=32)
 
 
-def encrypt_key(key_bytes: bytes, password: str) -> Dict[str, Any]:
-    """
-    Encrypt key bytes with password.
+# The keystore cipher. A key is encrypted with AES-256-GCM under a key derived from the password
+# by scrypt, and the ciphertext is bound to what the keystore says it holds (``aad``: for a PQ
+# wallet its address and public key), so a file whose public key was swapped does not decrypt.
+# AES-256 keeps 128-bit security against Grover's algorithm; the older "fernet" cipher (AES-128
+# under PBKDF2) is still read, never written. The scrypt cost is the EIP-2335 keystore's: about
+# 256 MiB and a second per attempt.
+KEYSTORE_CIPHER = "aes-256-gcm"
+KEYSTORE_KDF = "scrypt"
+SCRYPT_N = 2**18
+SCRYPT_R = 8
+SCRYPT_P = 1
+# What a keystore may ask of the machine that opens it: bounded so a crafted file cannot make
+# loading it take unbounded memory or time, and floored so it cannot ask for a trivial KDF.
+_SCRYPT_N_RANGE = (2**14, 2**20)
+_SCRYPT_RP_MAX = 64
 
-    Uses AES-256-GCM via Fernet-style encryption.
+
+def _scrypt(password: str, salt: bytes, n: int, r: int, p: int) -> bytes:
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+    return Scrypt(salt=salt, length=32, n=n, r=r, p=p).derive(password.encode("utf-8"))
+
+
+def encrypt_key(key_bytes: bytes, password: str, aad: bytes = b"") -> Dict[str, Any]:
+    """
+    Encrypt key bytes with a password: AES-256-GCM under a scrypt-derived key.
 
     Args:
         key_bytes: Key to encrypt
         password: Encryption password
+        aad: What the ciphertext is bound to; decrypting needs the same bytes
 
     Returns:
         Dictionary with encrypted data and parameters
     """
-    try:
-        import base64
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-        from cryptography.fernet import Fernet
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-
-        salt = os.urandom(16)
-        iterations = 100000
-
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=iterations,
-        )
-        derived_key = kdf.derive(password.encode())
-        fernet_key = base64.urlsafe_b64encode(derived_key)
-
-        f = Fernet(fernet_key)
-        encrypted = f.encrypt(key_bytes)
-
-        return {
-            "ciphertext": base64.b64encode(encrypted).decode("ascii"),
-            "salt": salt.hex(),
-            "iterations": iterations,
-            "kdf": "pbkdf2-sha256",
-            "cipher": "fernet",
-        }
-    except ImportError as exc:
-        raise ImportError(
-            "The 'cryptography' package is required for wallet encryption. "
-            "Install with: pip install cryptography"
-        ) from exc
+    if not password:
+        raise WalletError("a keystore needs a password")
+    salt, nonce = os.urandom(32), os.urandom(12)
+    key = _scrypt(password, salt, SCRYPT_N, SCRYPT_R, SCRYPT_P)
+    return {
+        "cipher": KEYSTORE_CIPHER,
+        "ciphertext": AESGCM(key).encrypt(nonce, key_bytes, aad).hex(),
+        "nonce": nonce.hex(),
+        "kdf": KEYSTORE_KDF,
+        "kdfparams": {"n": SCRYPT_N, "r": SCRYPT_R, "p": SCRYPT_P, "salt": salt.hex()},
+    }
 
 
-def decrypt_key(encrypted: Dict[str, Any], password: str) -> bytes:
+def decrypt_key(encrypted: Dict[str, Any], password: str, aad: bytes = b"") -> bytes:
     """
-    Decrypt key bytes with password.
+    Decrypt key bytes with a password.
 
     Args:
         encrypted: Dictionary from encrypt_key()
         password: Decryption password
+        aad: The bytes the ciphertext was bound to (``aes-256-gcm`` only)
 
     Returns:
         Decrypted key bytes
@@ -360,9 +362,33 @@ def decrypt_key(encrypted: Dict[str, Any], password: str) -> bytes:
         WalletDecryptionError: If decryption fails
     """
     try:
-        salt = bytes.fromhex(encrypted["salt"])
+        cipher = encrypted.get("cipher")
+        if cipher == KEYSTORE_CIPHER:
+            from cryptography.exceptions import InvalidTag
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-        if encrypted["cipher"] == "fernet":
+            if encrypted.get("kdf") != KEYSTORE_KDF:
+                raise WalletDecryptionError(f"Unknown key derivation: {encrypted.get('kdf')}")
+            params = encrypted["kdfparams"]
+            n, r, p = int(params["n"]), int(params["r"]), int(params["p"])
+            if not (_SCRYPT_N_RANGE[0] <= n <= _SCRYPT_N_RANGE[1]) or n & (n - 1):
+                raise WalletDecryptionError(f"scrypt n={n} is outside what a keystore may use")
+            if not (1 <= r <= _SCRYPT_RP_MAX and 1 <= p <= _SCRYPT_RP_MAX):
+                raise WalletDecryptionError(
+                    f"scrypt r={r} p={p} is outside what a keystore may use"
+                )
+            key = _scrypt(password, bytes.fromhex(params["salt"]), n, r, p)
+            try:
+                return AESGCM(key).decrypt(
+                    bytes.fromhex(encrypted["nonce"]), bytes.fromhex(encrypted["ciphertext"]), aad
+                )
+            except InvalidTag as exc:
+                raise WalletDecryptionError(
+                    "Invalid password, or the keystore was altered"
+                ) from exc
+
+        if cipher == "fernet":
+            # Legacy keystores (AES-128 under PBKDF2-SHA256): read so they can be re-encrypted.
             import base64
 
             from cryptography.fernet import Fernet, InvalidToken
@@ -372,29 +398,23 @@ def decrypt_key(encrypted: Dict[str, Any], password: str) -> bytes:
             kdf = PBKDF2HMAC(
                 algorithm=hashes.SHA256(),
                 length=32,
-                salt=salt,
+                salt=bytes.fromhex(encrypted["salt"]),
                 iterations=encrypted["iterations"],
             )
-            derived_key = kdf.derive(password.encode())
-            fernet_key = base64.urlsafe_b64encode(derived_key)
-
-            f = Fernet(fernet_key)
-            ciphertext = base64.b64decode(encrypted["ciphertext"])
-
+            fernet_key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
             try:
-                return f.decrypt(ciphertext)
+                return Fernet(fernet_key).decrypt(base64.b64decode(encrypted["ciphertext"]))
             except InvalidToken as exc:
                 raise WalletDecryptionError("Invalid password") from exc
 
-        elif encrypted["cipher"] == "xor-fallback":
+        if cipher == "xor-fallback":
             raise WalletDecryptionError(
                 "This wallet was encrypted with the insecure XOR-fallback cipher "
                 "which is no longer supported.  Re-create the wallet with the "
                 "'cryptography' package installed: pip install cryptography"
             )
 
-        else:
-            raise WalletDecryptionError(f"Unknown cipher: {encrypted['cipher']}")
+        raise WalletDecryptionError(f"Unknown cipher: {cipher}")
 
     except WalletDecryptionError:
         raise

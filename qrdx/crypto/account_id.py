@@ -101,7 +101,6 @@ SYNTHETIC_HOLDER_PREFIXES = (
     "0xPROT",
     "0xQNSA",
     "0xFEES",
-    "0xDBND",
 )
 
 # 0xPERP is the perps clearinghouse holder (docs/PERPS_CLEARINGHOUSE.md): all perp collateral.
@@ -113,7 +112,6 @@ SYNTHETIC_HOLDER_PREFIXES = (
 # 0xHLPV is the perps backstop vault, 0xPROT the owner of the protocol's own vault shares.
 # 0xQNSA is QNS's mint authority: no key can mint a name (docs/CONSENSUS_ROADMAP.md C).
 # 0xFEES holds the stakers' share of trading fees until an epoch distributes it.
-# 0xDBND holds market deployers' QRDX bonds (docs/HYPERLIQUID_PARITY.md).
 # Every synthetic form is <prefix> + blake2b(digest_size=18).hexdigest() = 36 hex chars.
 # Validated, so a malformed one raises like any other bad address rather than being
 # hashed into some arbitrary account.
@@ -124,6 +122,15 @@ def _derive(tag: bytes, payload: bytes) -> str:
     """Domain-separated truncated keccak → lowercase 0x account id."""
     digest = keccak256(ACCOUNT_ID_DOMAIN + b":" + tag + b":" + payload)
     return "0x" + digest[-ACCOUNT_ID_LENGTH:].hex()
+
+
+def holds_pooled_funds(value: object) -> bool:
+    """A protocol holder of many accounts' funds together — a pool's reserves, a book's
+    escrow, the perps holder, a vault, a fee or veto escrow: every synthetic holder but a
+    sub-account (one account's own). A token's issuer may not freeze one or move tokens out
+    of it, and a paused token may still go back from one to its owners: otherwise one token's
+    issuer could lock everyone's other funds in a shared pool (docs/KNOWN_ISSUES.md)."""
+    return is_synthetic_holder(value) and str(value)[:6].upper() != "0XSUBA"
 
 
 def is_synthetic_holder(value: object) -> bool:

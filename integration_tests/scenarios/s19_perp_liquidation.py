@@ -7,7 +7,8 @@ the book; the validators' price feed then moves 10 % down and their votes carry 
 book to close into, so the vault takes it over at mark with the margin that was left. Every
 node must agree on the result; the depositor then redeems shares worth more than they paid
 (fees plus the liquidated margin); and the stablecoin perps settle in (qUSD) is conserved across
-everyone involved and the clearinghouse holder.
+everyone involved, the clearinghouse holder and the stakers' fee holder (their share of the fees:
+docs/CONSENSUS_ROADMAP.md 6).
 """
 
 import asyncio
@@ -53,9 +54,12 @@ class S19PerpLiquidation(S13PerpCollateral):
                                 f"Pay {label} {amount} qUSD"):
                 return
 
+        from qrdx.validator.epoch_state import STAKER_FEE_HOLDER
+
         holder = (await self._account(target, alice["address"]) or {}).get("holder_address")
         people = [alice["address"], bob["address"], rep["address"], lp["address"]]
-        start = {a: await self._usd(target, a) for a in people + [holder]}
+        holders = [holder, STAKER_FEE_HOLDER]
+        start = {a: await self._usd(target, a) for a in people + holders}
         if not self.check(all(v is not None for v in start.values()),
                           f"Starting qUSD balances readable: {start}"):
             return
@@ -150,11 +154,11 @@ class S19PerpLiquidation(S13PerpCollateral):
                    f"Funding has been paid at block-time boundaries ({funding})")
 
         async def balances(url):
-            vals = [await self._usd(url, a) for a in people + [holder]]
+            vals = [await self._usd(url, a) for a in people + holders]
             return None if any(v is None for v in vals) else tuple(str(v) for v in vals)
         final = await self._converged(node_urls, balances, "Final balances")
         if final is None:
             return
-        moved = sum(Decimal(f) - Decimal(str(start[a])) for f, a in zip(final, people + [holder]))
-        self.check(moved == 0, f"qUSD conserved across the traders, vault depositors and holder "
-                               f"(net {moved})")
+        moved = sum(Decimal(f) - Decimal(str(start[a])) for f, a in zip(final, people + holders))
+        self.check(moved == 0, f"qUSD conserved across the traders, vault depositors, the holder "
+                               f"and the stakers (net {moved})")

@@ -121,7 +121,7 @@ def sample_toml_content():
 
         [p2p.security]
         post_quantum_enabled = true
-        pq_kem_algorithm = "Kyber768"
+        pq_kem_algorithm = "ML-KEM-768"
 
         [rpc]
         enabled = true
@@ -1547,6 +1547,7 @@ class TestDockerConfigs:
         assert "HighRPCErrorRate" in content
         assert "ValidatorInactive" in content
         assert "FinalityStall" in content
+        # (tests/test_alert_rules.py checks every expression reads an exported metric)
 
     def test_dockerfile_exists(self):
         path = Path(__file__).parent.parent / "docker" / "Dockerfile"

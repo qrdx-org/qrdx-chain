@@ -7,7 +7,7 @@ Comprehensive test coverage for all PoS consensus sub-systems:
   3.3  Stake Management            (StakeStatus, Deposits, Withdrawals)
   3.4  RANDAO Selection            (ValidatorSelector, committees)
   3.5  Attestations                (Attestation, AttestationPool)
-  3.6  Slashing                    (SlashingExecutor, SlashingProtectionDB)
+  3.6  Slashing                    (SlashingExecutor, SlashingProtection)
   3.7  Finality (LMD-GHOST + FFG) (ForkChoiceStore, ForkChoice)
   3.8  Rewards & Inflation         (RewardsCalculator, InflationSchedule)
   3.9  Sync Committee              (SyncCommitteeManager)
@@ -90,8 +90,8 @@ from qrdx.validator.slashing import (
     DoubleSignEvidence,
     SurroundVoteEvidence,
     SlashingExecutor,
-    SlashingProtectionDB,
 )
+from qrdx.validator.slashing_protection import SlashingProtection
 
 # ---------------------------------------------------------------------------
 # 3.7 — Fork Choice
@@ -1152,63 +1152,48 @@ class TestSlashingExecutor:
 
 
 @pytest.mark.asyncio
-class TestSlashingProtectionDB:
-    """SlashingProtectionDB tests with temp SQLite file."""
+class TestSlashingProtection:
+    """SlashingProtection with a temp SQLite file (more in tests/test_slashing_protection.py)."""
 
-    async def test_block_signing_protection(self):
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-            db_path = f.name
+    async def _open(self, tmp_path):
+        return await SlashingProtection.open(str(tmp_path / "sp.sqlite"), "00" * 32)
+
+    async def test_block_signing_protection(self, tmp_path):
+        db = await self._open(tmp_path)
         try:
-            db = SlashingProtectionDB(db_path)
-            await db.initialize()
-
-            assert await db.can_sign_block("0xPQ01", 10) is True
-            await db.record_block_signature("0xPQ01", 10, "block_hash_a")
-            assert await db.can_sign_block("0xPQ01", 10) is False
+            assert await db.may_sign_block("0xPQ01", 10) is True
+            assert await db.record_block("0xPQ01", 10, "aa" * 32)
+            assert await db.may_sign_block("0xPQ01", 10) is False
             # Different slot is fine
-            assert await db.can_sign_block("0xPQ01", 11) is True
-
-            await db.close()
+            assert await db.may_sign_block("0xPQ01", 11) is True
         finally:
-            os.unlink(db_path)
+            await db.close()
 
-    async def test_attestation_signing_protection(self):
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-            db_path = f.name
+    async def test_attestation_signing_protection(self, tmp_path):
+        db = await self._open(tmp_path)
         try:
-            db = SlashingProtectionDB(db_path)
-            await db.initialize()
-
-            assert await db.can_sign_attestation("0xPQ01", 1, 5) is True
-            await db.record_attestation_signature("0xPQ01", 1, 5)
+            assert await db.may_vote("0xPQ01", 1, 5) is True
+            assert await db.record_vote("0xPQ01", 1, 5, "aa" * 32)
             # Same target epoch → blocked
-            assert await db.can_sign_attestation("0xPQ01", 1, 5) is False
+            assert await db.may_vote("0xPQ01", 1, 5) is False
             # Surround vote → blocked
-            assert await db.can_sign_attestation("0xPQ01", 0, 10) is False
-
-            await db.close()
+            assert await db.may_vote("0xPQ01", 0, 10) is False
         finally:
-            os.unlink(db_path)
+            await db.close()
 
-    async def test_surround_vote_both_directions(self):
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-            db_path = f.name
+    async def test_surround_vote_both_directions(self, tmp_path):
+        db = await self._open(tmp_path)
         try:
-            db = SlashingProtectionDB(db_path)
-            await db.initialize()
-
             # Record (source=2, target=8)
-            await db.record_attestation_signature("0xPQ01", 2, 8)
+            assert await db.record_vote("0xPQ01", 2, 8, "aa" * 32)
             # Surrounded by: (source=1, target=10) → source<2 and 8<10
-            assert await db.can_sign_attestation("0xPQ01", 1, 10) is False
+            assert await db.may_vote("0xPQ01", 1, 10) is False
             # Surrounds existing: (source=3, target=6) → 2<3 and 6<8
-            assert await db.can_sign_attestation("0xPQ01", 3, 6) is False
+            assert await db.may_vote("0xPQ01", 3, 6) is False
             # Non-overlapping is fine: (source=9, target=12)
-            assert await db.can_sign_attestation("0xPQ01", 9, 12) is True
-
-            await db.close()
+            assert await db.may_vote("0xPQ01", 9, 12) is True
         finally:
-            os.unlink(db_path)
+            await db.close()
 
 
 # ============================================================================

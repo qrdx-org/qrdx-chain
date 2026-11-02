@@ -34,7 +34,7 @@ from qrdx.exchange import (
 from qrdx.exchange import block_processor as BP
 from qrdx.exchange.amm import FeeTier, PoolType
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+pytestmark = pytest.mark.usefixtures("genesis_btc")  # BTC from the first block
 
 TS0 = 1_700_000_000
 SPACING = max(1, S // 3)  # slots between blocks: an epoch every ~3 blocks
@@ -55,6 +55,10 @@ class Workload:
         self.k1, self.k2 = PQPrivateKey.generate(), PQPrivateKey.generate()
         self.t1, self.t2 = self.k1.public_key.to_address(), self.k2.public_key.to_address()
         self.nonce = {self.t1: 0, self.t2: 0}
+        # The genesis validator, which votes BTC's price (a vote's own sequence, not a nonce).
+        self.kv = PQPrivateKey.generate()
+        self.tv = self.kv.public_key.to_address()
+        self.vote_seq = 0
         self.tokenA = ExchangeStateManager.derive_token_address(self.t1, 0, "AAA")
         self.tokenB = ExchangeStateManager.derive_token_address(self.t1, 5, "BBB")
 
@@ -65,6 +69,12 @@ class Workload:
         return _sign(ExchangeTransaction(op_type=op, sender=sender, nonce=n, params=params,
                                          gas_limit=2_000_000, gas_price=10**9), key)
 
+    def vote(self, prices):
+        self.vote_seq += 1
+        return _sign(ExchangeTransaction(op_type=ExchangeOpType.ORACLE_VOTE, sender=self.tv,
+                                         nonce=self.vote_seq, params={"prices": prices},
+                                         gas_limit=100_000, gas_price=10**9), self.kv)
+
     def script(self):
         k1, k2, t1, t2 = self.k1, self.k2, self.t1, self.t2
         sqrtp = "79228162514264337593543950336"
@@ -73,9 +83,7 @@ class Workload:
                      total_supply="1000000", decimals=18)],
             [self.tx(k1, ExchangeOpType.TOKEN_TRANSFER, token_address=self.tokenA, to=t2,
                      amount="100000")],
-            [self.tx(k1, ExchangeOpType.CREATE_MARKET, base_token="BTC", max_leverage="10",
-                     initial_margin_rate="0.1", maintenance_margin_rate="0.05"),
-             self.tx(k2, ExchangeOpType.UPDATE_ORACLE, pair="BTC:QRDX", price="30000")],
+            [self.vote({"BTC": "30000"})],
             [self.tx(k1, ExchangeOpType.PERP_DEPOSIT, amount="10000"),
              self.tx(k2, ExchangeOpType.PERP_DEPOSIT, amount="10000"),
              self.tx(k2, ExchangeOpType.PERP_ORDER, market_id="BTC-QRDX-PERP", side="sell",
@@ -91,6 +99,12 @@ class Workload:
                      token1=self.tokenB, amount="1000", tick_lower="-887220",
                      tick_upper="887220")],
         ]
+
+    def resync(self):
+        """After a reorg: the next nonces are the chain's, as a wallet reads them (a block may
+        carry only transactions that run — ``exchange_inclusion``)."""
+        mgr = ExchangeStateManager.get_instance()
+        self.nonce = {a: mgr.get_nonce(a) for a in self.nonce}
 
     def transfer(self):
         """A random token transfer between the two accounts (or a quiet block)."""
@@ -115,7 +129,10 @@ class Node:
         from qrdx import derived_state_rebuild as D
 
         D._LAST_EPOCH.clear()
-        bh = await n._store(0, 0, [], tag="g", alloc=[(w.t1, "1000000"), (w.t2, "1000000")])
+        await n.db.record_genesis_validators([{"address": w.tv, "public_key": "",
+                                               "stake": "1000"}])
+        bh = await n._store(0, 0, [], tag="g", alloc=[(w.t1, "1000000"), (w.t2, "1000000"),
+                                                      (w.tv, "1000")])
         async with undo_journal.recording(n.db, 0):
             await n.db.seed_genesis_account_state()
         await n.db.connection.commit()
@@ -152,6 +169,7 @@ class Node:
         # The live instance, as every node path uses (a full rebuild replaces it).
         self.mgr = ExchangeStateManager.get_instance()
         async with await before_block(self.db, height, slot // S):
+            await BP.ensure_oracle_committee(self.db, self.mgr, height)  # as every path does
             if txs:
                 await BP.preload_sender_balances(self.db, txs, self.mgr)
                 await BP.preload_token_balances(self.db, txs, self.mgr)
@@ -219,6 +237,8 @@ async def test_the_fast_path_equals_the_full_rebuild_across_reorgs(seed):
     try:
         for txs in w.script():
             await node.apply(txs)
+        ch = ExchangeStateManager.get_instance().clearinghouse   # the trade landed (voted price)
+        assert ch.accounts[w.t1].positions["BTC-QRDX-PERP"].size == 1
         for _ in range(10):
             await node.apply(w.transfer())
         for round_ in range(3):
@@ -228,6 +248,7 @@ async def test_the_fast_path_equals_the_full_rebuild_across_reorgs(seed):
             assert "base" in res, f"round {round_}: the fast path did not run"
             fast = await node.state()
             assert fast == await _full(node), f"seed {seed} round {round_}"
+            w.resync()
             # a different branch on top, then the next round reorgs it away again
             for _ in range(w.rng.randint(3, 8)):
                 await node.apply(w.transfer(), tag="bcd"[round_])

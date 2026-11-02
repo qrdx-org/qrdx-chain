@@ -52,6 +52,7 @@ from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple
 
 from .. import constants as _constants
+from . import undo
 from .commitment import CommitmentMismatch, Section, as_committed_dict, tracked
 
 # Q96 arithmetic requires high precision. (Kept for modules that relied on importing this one to
@@ -259,6 +260,26 @@ def _next_sqrt_from_input(
         return s + amount / liquidity
 
 
+def _next_sqrt_from_output(
+    s: Decimal, liquidity: Decimal, amount: Decimal, zero_for_one: bool
+) -> Decimal:
+    """The √price after taking ``amount`` of the output token out, rounded so the pool keeps the
+    better side: down when token1 leaves (price falls), up when token0 leaves (price rises) —
+    the curve then gives at least ``amount`` between the two."""
+    if zero_for_one:
+        with localcontext(_UP):
+            step = amount / liquidity
+        with localcontext(_DOWN):
+            return s - step
+    with localcontext(_UP):
+        numerator = liquidity * s
+        product = amount * s
+    with localcontext(_DOWN):
+        denominator = liquidity - product
+    with localcontext(_UP):
+        return numerator / denominator
+
+
 def _swap_step(
     s: Decimal,
     s_target: Decimal,
@@ -266,8 +287,12 @@ def _swap_step(
     remaining: Decimal,
     fee_rate: Decimal,
     zero_for_one: bool,
+    exact_out: bool = False,
 ) -> Tuple[Decimal, Decimal, Decimal, Decimal]:
-    """One exact-input step toward ``s_target``: (√price after, input, output, fee)."""
+    """One step toward ``s_target``: (√price after, input, output, fee). ``remaining`` is the
+    input left (fee included), or with ``exact_out`` the output still wanted."""
+    if exact_out:
+        return _swap_step_out(s, s_target, liquidity, remaining, fee_rate, zero_for_one)
     with localcontext(_DOWN):
         remaining_less_fee = _q_down(remaining * (ONE - fee_rate))
     if zero_for_one:
@@ -292,6 +317,42 @@ def _swap_step(
             fee = _q_up(amount_in * fee_rate / (ONE - fee_rate))
     else:
         fee = ZERO
+    return s_next, amount_in, amount_out, fee
+
+
+def _swap_step_out(
+    s: Decimal,
+    s_target: Decimal,
+    liquidity: Decimal,
+    remaining: Decimal,
+    fee_rate: Decimal,
+    zero_for_one: bool,
+) -> Tuple[Decimal, Decimal, Decimal, Decimal]:
+    """One exact-output step toward ``s_target`` (Uniswap V3's ``computeSwapStep``): the output
+    is capped at what is wanted, the √price rounded so the curve gives at least that."""
+    if zero_for_one:
+        to_target = amount1_delta(s_target, s, liquidity, round_up=False)
+    else:
+        to_target = amount0_delta(s, s_target, liquidity, round_up=False)
+    reached = True
+    s_next = s_target
+    if liquidity > 0 and remaining < to_target:
+        s_next = _next_sqrt_from_output(s, liquidity, remaining, zero_for_one)
+        reached = False
+        if (s_next <= s_target) if zero_for_one else (s_next >= s_target):
+            s_next, reached = s_target, True  # (rounding reached the target after all)
+    if zero_for_one:
+        amount_in = amount0_delta(s_next, s, liquidity, round_up=True)
+        amount_out = amount1_delta(s_next, s, liquidity, round_up=False)
+    else:
+        amount_in = amount1_delta(s, s_next, liquidity, round_up=True)
+        amount_out = amount0_delta(s, s_next, liquidity, round_up=False)
+    if not reached or amount_out > remaining:
+        amount_out = remaining
+    fee = ZERO
+    if amount_in > 0:
+        with localcontext(_UP):
+            fee = _q_up(amount_in * fee_rate / (ONE - fee_rate))
     return s_next, amount_in, amount_out, fee
 
 
@@ -426,11 +487,28 @@ class SwapPlan:
     liquidity: Decimal
     fee_growth_global: Decimal  # the input token's, after
     crossings: List[Tuple[int, Decimal, Decimal]] = field(default_factory=list)  # tick, fg0, fg1
+    exhausted: bool = False  # it stopped at the end of the pool's liquidity
 
     @property
     def price(self) -> Decimal:
         """Average execution price: input per unit of output."""
         return self.amount_in / self.amount_out if self.amount_out > 0 else ZERO
+
+    def then(self, nxt: "SwapPlan") -> "SwapPlan":
+        """This plan followed by ``nxt`` (quoted with ``start=self``): one plan doing both."""
+        return SwapPlan(
+            zero_for_one=self.zero_for_one,
+            amount_in=self.amount_in + nxt.amount_in,
+            amount_out=self.amount_out + nxt.amount_out,
+            fee=self.fee + nxt.fee,
+            protocol_fee=self.protocol_fee + nxt.protocol_fee,
+            sqrt_price=nxt.sqrt_price,
+            tick=nxt.tick,
+            liquidity=nxt.liquidity,
+            fee_growth_global=nxt.fee_growth_global,
+            crossings=self.crossings + nxt.crossings,
+            exhausted=nxt.exhausted,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -618,40 +696,75 @@ class ConcentratedLiquidityPool:
     # -- Swap ---------------------------------------------------------------
 
     @_pinned
-    def quote(self, amount_in: Decimal, zero_for_one: bool) -> SwapPlan:
-        """Simulate an exact-input swap without changing the pool. Raises if the pool cannot
-        absorb the whole input (no liquidity left in that direction)."""
+    def quote(
+        self,
+        amount_in: Decimal,
+        zero_for_one: bool,
+        *,
+        sqrt_limit: Optional[Decimal] = None,
+        exact_out: bool = False,
+        start: Optional[SwapPlan] = None,
+    ) -> SwapPlan:
+        """Simulate a swap without changing the pool: ``amount_in`` of the input (fee included),
+        or with ``exact_out`` that much of the output.
+
+        Without ``sqrt_limit`` the whole amount must go through: raises if the pool's liquidity
+        runs out first, or if the swap would buy nothing. With ``sqrt_limit`` (a plain √price,
+        not Q96) it stops there, or where the pool's liquidity ends (``exhausted``), and the
+        plan may do less than asked, or nothing.
+
+        ``start``: continue a plan of this walk (same direction) from where it left the pool;
+        ``start.then(plan)`` then does both."""
         if self._paused:
             raise ValueError("Pool is paused — emergency mode")
-        amount_in = Decimal(str(amount_in))
-        if amount_in <= 0:
+        amount = Decimal(str(amount_in))
+        if amount <= 0:
             raise ValueError("Swap amount must be positive")
-        if amount_in != amount_in.quantize(AMOUNT_QUANTUM):
+        if amount != amount.quantize(AMOUNT_QUANTUM):
             raise ValueError("Swap amount has more than 18 decimal places")
+        partial = sqrt_limit is not None
+        limit = sqrt_limit if sqrt_limit is not None else ZERO
         st = self.state
-        if st.liquidity <= 0 and self._next_tick(st.tick, zero_for_one) is None:
+        if start is not None:
+            if start.zero_for_one != zero_for_one:
+                raise ValueError("a plan continues in its own direction")
+            s, tick, liquidity = start.sqrt_price / Q96, start.tick, start.liquidity
+            fg = start.fee_growth_global
+        else:
+            s, tick, liquidity = st.sqrt_price / Q96, st.tick, st.liquidity
+            fg = st.fee_growth_global_0 if zero_for_one else st.fee_growth_global_1
+        if not partial and liquidity <= 0 and self._next_tick(tick, zero_for_one) is None:
             raise ValueError("No liquidity in pool")
         fee_rate = st.fee_tier.rate
-        s = st.sqrt_price / Q96
-        tick, liquidity = st.tick, st.liquidity
-        fg = st.fee_growth_global_0 if zero_for_one else st.fee_growth_global_1
         other = st.fee_growth_global_1 if zero_for_one else st.fee_growth_global_0
         ticks = st.ticks
-        remaining, out, fee_total, protocol = amount_in, ZERO, ZERO, ZERO
+        remaining, got_in, out, fee_total, protocol = amount, ZERO, ZERO, ZERO, ZERO
         crossings: List[Tuple[int, Decimal, Decimal]] = []
+        exhausted = False
         cursor = tick
         while remaining > 0:
+            if partial and ((s <= limit) if zero_for_one else (s >= limit)):
+                break
             nxt = self._next_tick(cursor, zero_for_one)
-            boundary = nxt is None
+            if partial and nxt is None and liquidity <= 0:
+                exhausted = True  # nothing beyond: the price stays where liquidity ended
+                break
             target_tick = nxt if nxt is not None else (MIN_TICK if zero_for_one else MAX_TICK)
-            s_target = _sqrt_ratio(target_tick)
-            if (zero_for_one and s_target >= s) or (not zero_for_one and s_target <= s):
-                if boundary:
+            s_tick = _sqrt_ratio(target_tick)
+            if (zero_for_one and s_tick >= s) or (not zero_for_one and s_tick <= s):
+                if nxt is None:
+                    if partial:
+                        exhausted = True
+                        break
                     raise ValueError("Insufficient liquidity for this swap")
+            s_target = s_tick
+            if partial and ((limit > s_tick) if zero_for_one else (limit < s_tick)):
+                s_target = limit
             s_next, step_in, step_out, step_fee = _swap_step(
-                s, s_target, liquidity, remaining, fee_rate, zero_for_one
+                s, s_target, liquidity, remaining, fee_rate, zero_for_one, exact_out
             )
-            remaining -= step_in + step_fee
+            remaining -= step_out if exact_out else step_in + step_fee
+            got_in += step_in + step_fee
             out += step_out
             fee_total += step_fee
             if liquidity > 0 and step_fee > 0:
@@ -662,10 +775,12 @@ class ConcentratedLiquidityPool:
             else:
                 protocol += step_fee
             s = s_next
-            if s_next == s_target:
+            if s_next == s_tick:
                 if nxt is None:  # the boundary
                     if remaining > 0:
-                        raise ValueError("Insufficient liquidity for this swap")
+                        if not partial:
+                            raise ValueError("Insufficient liquidity for this swap")
+                        exhausted = True
                     tick = target_tick
                     break
                 net = ticks[nxt].liquidity_net
@@ -676,14 +791,14 @@ class ConcentratedLiquidityPool:
                     raise ValueError("pool liquidity accounting broke")  # cannot happen
                 tick = nxt - 1 if zero_for_one else nxt
                 cursor = tick
-            else:
+            else:  # the input ran out, the output is all there, or the limit came first
                 tick = _tick_at(s)
                 break
-        if out <= 0:
+        if out <= 0 and not partial:
             raise ValueError("Swap too small: no output")
         return SwapPlan(
             zero_for_one=zero_for_one,
-            amount_in=amount_in,
+            amount_in=amount if not exact_out and (not partial or remaining <= 0) else got_in,
             amount_out=out,
             fee=fee_total,
             protocol_fee=protocol,
@@ -692,7 +807,33 @@ class ConcentratedLiquidityPool:
             liquidity=liquidity,
             fee_growth_global=fg,
             crossings=crossings,
+            exhausted=exhausted,
         )
+
+    @_pinned
+    def liquid_sqrt(
+        self, zero_for_one: bool, start: Optional[SwapPlan] = None
+    ) -> Optional[Decimal]:
+        """The plain √price where a swap in this direction (from ``start``'s end, or the pool's
+        price) first meets liquidity: the price itself if it has some, else the nearest range
+        that does. None if there is none that way."""
+        st = self.state
+        if start is not None:
+            s, tick, liquidity = start.sqrt_price / Q96, start.tick, start.liquidity
+        else:
+            s, tick, liquidity = st.sqrt_price / Q96, st.tick, st.liquidity
+        if liquidity > 0:
+            return s
+        cursor = tick
+        while True:
+            nxt = self._next_tick(cursor, zero_for_one)
+            if nxt is None:
+                return None
+            net = st.ticks[nxt].liquidity_net
+            liquidity = liquidity - net if zero_for_one else liquidity + net
+            if liquidity > 0:
+                return _sqrt_ratio(nxt)
+            cursor = nxt - 1 if zero_for_one else nxt
 
     @_pinned
     def apply(self, plan: SwapPlan, now: Optional[int] = None) -> SwapPlan:
@@ -744,6 +885,41 @@ class ConcentratedLiquidityPool:
             if before > 0
             else ZERO
         )
+
+    @_pinned
+    def band_depth(self, band: Decimal) -> Tuple[Decimal, Decimal]:
+        """What moving the price by ``band`` (a fraction) either way takes now, walking the
+        liquidity in between: (token1 in to raise it, token0 in to lower it), before fees.
+        Read-only. Liquidity in a narrow range near the price counts as the tokens it holds
+        within the band — not, as the active liquidity's virtual reserves would, as if it
+        spread across every price — so depth costs real capital to show."""
+        st = self.state
+        start = st.sqrt_price / Q96
+        if start <= 0 or not ZERO < band < ONE:
+            return ZERO, ZERO
+        out: List[Decimal] = []
+        for up in (True, False):
+            with localcontext(_CTX):
+                target = start * ((ONE + band) if up else (ONE - band)).sqrt()
+            s, liquidity, cursor, total = start, st.liquidity, st.tick, ZERO
+            while (s < target) if up else (s > target):
+                nxt = self._next_tick(cursor, not up)
+                edge = _sqrt_ratio(nxt) if nxt is not None else None
+                step = target
+                if edge is not None and not (edge > target if up else edge < target):
+                    step = edge
+                if up:
+                    total += amount1_delta(s, step, liquidity, False)
+                else:
+                    total += amount0_delta(step, s, liquidity, False)
+                s = step
+                if nxt is None or step != edge:
+                    break
+                net = st.ticks[nxt].liquidity_net
+                liquidity = liquidity + net if up else liquidity - net
+                cursor = nxt if up else nxt - 1
+            out.append(total)
+        return out[0], out[1]
 
     # -- Liquidity ----------------------------------------------------------
 
@@ -1043,8 +1219,12 @@ class PoolManager:
         if not (MIN_SQRT_RATIO <= initial_sqrt_price < MAX_SQRT_RATIO):
             raise ValueError("Initial sqrt price out of range")
 
+        # (Undone with a failed operation: the registry is not a committed collection.)
+        undo.keep(self, ("_pool_sequence",), "pools")
+        undo.keep_entry(self._pair_index, pair_key)
         self._pool_sequence += 1
         pool_id = self._deterministic_pool_id(token0, token1, fee_tier, self._pool_sequence)
+        undo.keep_entry(self._pools, pool_id, mutable=False)
         state = PoolState(
             id=pool_id,
             token0=token0,
@@ -1071,10 +1251,12 @@ class PoolManager:
 
     def remove_pool(self, pool_id: str) -> Optional[ConcentratedLiquidityPool]:
         """Remove a pool (REMOVE_POOL); returns it so the caller can refund the stake."""
-        pool = self._pools.pop(pool_id, None)
-        if pool is None:
+        if pool_id not in self._pools:
             return None
+        undo.keep_entry(self._pools, pool_id, mutable=False)
+        pool = self._pools.pop(pool_id)
         pair_key = f"{pool.state.token0}:{pool.state.token1}"
+        undo.keep_entry(self._pair_index, pair_key)
         ids = self._pair_index.get(pair_key)
         if ids and pool_id in ids:
             ids.remove(pool_id)

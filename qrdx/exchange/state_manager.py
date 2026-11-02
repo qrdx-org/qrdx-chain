@@ -6,7 +6,7 @@ Every node maintains an identical exchange state by processing the same
 sequence of ExchangeTransactions deterministically during block validation.
 
 Responsibilities:
-  - Owns all exchange engine instances (pools, books, oracles, perps)
+  - Owns all exchange engine instances (pools, books, perps)
   - Processes ExchangeTransactions deterministically
   - Computes exchange state root for block commitment
   - Serializes / deserializes state for persistence
@@ -60,7 +60,6 @@ from .clearinghouse import Clearinghouse, ClearinghouseError
 from .commitment import Section, committed, encode_value, tracked, verifying
 from .governance import Governance, GovernanceError, veto_escrow_address
 from .nfts import NftError, NftRegistry, token_id as nft_token_id
-from .oracle import TWAPOracle
 from .orderbook import (
     MatchBudget,
     Order,
@@ -70,7 +69,6 @@ from .orderbook import (
     SelfTradeAction,
     _pinned,
 )
-from .perpetual import PerpEngine
 from .qns import NameService
 from .router import FillSource, UnifiedRouter
 from .tokens import (
@@ -169,9 +167,6 @@ STAKER_FEE_CONVERT_SLIPPAGE = Decimal("0.02")
 STAKER_FEE_TWAP_SECONDS = 600
 STAKER_FEE_CONVERT_MAKERS = 20
 
-# The most deployer markets one ORACLE_VOTE may vote to freeze (``freeze``).
-MAX_VOTE_FREEZES = 16
-
 # The most hops one SWAP may take (``path``).
 MAX_SWAP_HOPS = 4
 
@@ -257,6 +252,8 @@ def _describe_policy(policy) -> Dict[str, Any]:
 
 def _policy_value(action: str, p: Dict[str, Any]) -> Any:
     """The ACCOUNT_POLICY action's value, checked for its type."""
+    if action == "recover":
+        raise ValueError("a recovery is the guardians' (ACCOUNT_RECOVER), never signed")
     if action in ("add_controller", "remove_controller"):
         return str(p["controller"])
     if action == "own_key":
@@ -410,9 +407,7 @@ class ExchangeStateManager:
     def __init__(self) -> None:
         # --- Engine instances (consensus-critical state) ---
         self.pool_manager = PoolManager()
-        # Legacy: no consensus path reaches PerpEngine any more (its positions had no
-        # counterparty). Perps trade through the clearinghouse (docs/PERPS_CLEARINGHOUSE.md).
-        self.perp_engine = PerpEngine()
+        # Perps trade through the clearinghouse (docs/PERPS_CLEARINGHOUSE.md).
         self.clearinghouse = Clearinghouse()
         # Validator price oracle (docs/PERPS_CLEARINGHOUSE.md §8). The committee — address →
         # stake — starts from the genesis block's validator set (loaded before the first block
@@ -441,13 +436,10 @@ class ExchangeStateManager:
         # Funding cadence, oracle staleness and swap deadlines are judged by the block being
         # processed (begin_block sets it), so every node — and every rebuild or catching-up
         # sync — decides them identically. They used to read the wall clock.
-        self.perp_engine.clock = self._block_clock
         self.router.clock = self._block_clock
 
         # Order books: pair_key → OrderBook
         self._order_books: Dict[str, OrderBook] = {}
-        # Oracles: pair_key → TWAPOracle
-        self._oracles: Dict[str, TWAPOracle] = {}
         # Per-sender nonces for replay protection
         self._nonces = {}  # sender → next nonce (committed: see the class attribute)
         self.fee_tokens = {}  # token → (amount, next attempt) (committed: the class attribute)
@@ -524,6 +516,8 @@ class ExchangeStateManager:
         self._validator_lifecycle_ops: List[Dict[str, Any]] = []
         # The stakers' share of QRDX fee income this block (docs/CONSENSUS_ROADMAP.md 6).
         self._block_staker_fees: Decimal = ZERO
+        # The pairs whose book holds an order that can expire (derived: ``_expiring_book_pairs``).
+        self._expiring_pairs: Optional[Set[str]] = None
         # Spot settlement enforcement gate (set by the node when enforcing): when
         # True, a transfer/swap rejects if the holder lacks sufficient balance.
         self.enforce_spot_settlement: bool = False
@@ -612,11 +606,31 @@ class ExchangeStateManager:
         self._block_journaled = False
         self._block_free_actions = {}  # free trading actions taken in this block, by account
 
-        # Reset per-block rate limits on all order books; expiry is judged by block time
-        for book in self._order_books.values():
-            book.new_block(block_timestamp)
+        # Each order book starts the block when the block first uses it (its per-block rate
+        # limits reset, its time set: ``OrderBook.enter_block``). Only a book holding orders that
+        # can expire starts here, so expiry is judged every block. (Starting every book cost 15
+        # ms a block at 10,000 pairs: docs/EXCHANGE_AUDIT.md 8.)
+        for pair in self._expiring_book_pairs():
+            self._order_books[pair].enter_block(block_height, block_timestamp)
 
         self.clearinghouse.new_block(block_timestamp)
+
+    def _expiring_book_pairs(self) -> List[str]:
+        """The pairs whose book holds an order that can expire, sorted: derived from the books
+        (rebuilt after a restore) and kept as orders are placed."""
+        pairs = self.__dict__.get("_expiring_pairs")
+        if pairs is None:
+            pairs = {
+                p for p, b in self._order_books.items() if b.__dict__.get("_has_expiring", True)
+            }
+            self._expiring_pairs = pairs
+        return sorted(p for p in pairs if p in self._order_books)
+
+    def _note_expiring(self, pair: str) -> None:
+        """``pair``'s book now holds an order that can expire: it starts every block."""
+        self._expiring_book_pairs()
+        if self._expiring_pairs is not None:
+            self._expiring_pairs.add(pair)
 
     def finalize_block(self) -> str:
         """
@@ -707,7 +721,12 @@ class ExchangeStateManager:
     # =====================================================================
 
     @_pinned
-    def process_transaction(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+    def process_transaction(
+        self,
+        tx: ExchangeTransaction,
+        prepaid: Optional[Tuple[str, Decimal]] = None,
+        checked: bool = False,
+    ) -> ExchangeExecResult:
         """
         Execute a single exchange transaction deterministically.
 
@@ -716,90 +735,102 @@ class ExchangeStateManager:
 
         Args:
             tx: The exchange transaction to execute
+            prepaid: (payer, QRDX) of its gas, reserved by the block up front
+                (``reserve_section_fees``)
+            checked: the block's transactions were judged together before any ran
+                (``section_errors``, chain-spec feature ``exchange_inclusion``). Such a
+                transaction always executes: one whose signer an earlier transaction in the
+                block took the right to act from fails, paying for its gas and consuming its
+                nonce like any failed operation.
 
         Returns:
             ExchangeExecResult with success/failure and gas used
         """
-        # 1. Basic structural validation
-        try:
-            tx.validate_basic()
-        except ValueError as e:
-            return ExchangeExecResult(success=False, gas_used=0, error=str(e))
+        denied = ""
+        if checked:
+            # Its form, expiry, gas limit and free-lane standing were judged with the block's;
+            # only who may sign for its account can have changed since (an approval revoked,
+            # a key turned off, earlier in the block).
+            denied = self.signer_error(tx)
+        else:
+            # 1. Basic structural validation
+            try:
+                tx.validate_basic()
+            except ValueError as e:
+                return ExchangeExecResult(success=False, gas_used=0, error=str(e))
 
-        # 1b. Acting for an account: an agent it approved, or a sub-account's master. One the
-        #     account never authorized is refused before anything — no nonce, no gas: the
-        #     account did not sign it.
-        unauthorized = self.signer_error(tx)
-        if unauthorized:
-            return ExchangeExecResult(success=False, gas_used=0, error=unauthorized)
+            # 1b. Acting for an account: an agent it approved, or a sub-account's master. One
+            #     the account never authorized is refused before anything — no nonce, no gas:
+            #     the account did not sign it.
+            unauthorized = self.signer_error(tx)
+            if unauthorized:
+                return ExchangeExecResult(success=False, gas_used=0, error=unauthorized)
 
-        # 1c. An action signed to expire (``params.expires_at``) is not includable after that
-        #     block time: refused before its nonce or any gas, as if never sent.
-        expires = tx.expires_at()
-        if expires is not None and Decimal(str(self._block_clock())) > expires:
-            return ExchangeExecResult(
-                success=False, gas_used=0, error=f"expired at block time {expires}"
-            )
+            # 1c. An action signed to expire (``params.expires_at``) is not includable after
+            #     that block time: refused before its nonce or any gas, as if never sent.
+            expires = tx.expires_at()
+            if expires is not None and Decimal(str(self._block_clock())) > expires:
+                return ExchangeExecResult(
+                    success=False, gas_used=0, error=f"expired at block time {expires}"
+                )
 
         # 2. Nonce check (replay protection). An oracle vote carries its own sequence instead:
         #    it must be newer than the voter's last applied vote, and never moves the account's
         #    exchange nonce — which used to advance with every vote, so a validator's own
         #    transactions signed elsewhere with a predicted nonce went stale.
         is_vote = tx.op_type == ExchangeOpType.ORACLE_VOTE
+        stale = ""
         if is_vote:
             last = self.oracle_vote_seq(tx.sender)
             if tx.nonce <= last:
-                return ExchangeExecResult(
-                    success=False,
-                    gas_used=0,
-                    error=f"Stale oracle vote: sequence {tx.nonce} is not after {last}",
-                )
+                stale = f"Stale oracle vote: sequence {tx.nonce} is not after {last}"
         else:
             expected_nonce = self._nonces.get(tx.nonce_key(), 0)
             if tx.nonce != expected_nonce:
-                return ExchangeExecResult(
-                    success=False,
-                    gas_used=0,
-                    error=f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}",
-                )
+                stale = f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
 
         # 3. Gas limit check (a multisig's every partial signature costs a verification too)
         base_gas = EXCHANGE_GAS_COSTS.get(tx.op_type, 100_000) + tx.signature_gas()
-        if tx.gas_limit < base_gas:
-            return ExchangeExecResult(
-                success=False,
-                gas_used=0,
-                error=f"Gas limit too low: need {base_gas}, got {tx.gas_limit}",
-            )
+        if not stale and tx.gas_limit < base_gas:
+            stale = f"Gas limit too low: need {base_gas}, got {tx.gas_limit}"
+        if stale:
+            if checked:  # (judged with its block: only a bug gets here — the block is refused)
+                raise RuntimeError(f"a transaction judged includable was refused: {stale}")
+            return ExchangeExecResult(success=False, gas_used=0, error=stale)
 
         # 3a. The free trading lane (docs/TOKENOMICS.md): a trading operation sent at gas price 0
         #     pays nothing while its account has free actions and blocks are not running full;
         #     otherwise it is refused here — not includable, consuming nothing — and must pay.
+        #     (A judged block's free operations were checked against its start, in its order.)
         free = tx.free_eligible()
-        if free:
+        if free and not checked:
             refused = self.free_action_error(tx)
             if refused:
                 return ExchangeExecResult(success=False, gas_used=0, error=refused)
 
         # 3b. Fees: a price of at least the floor, and QRDX for the whole gas limit at that
         #     price, reserved before the operation runs (so the operation cannot spend it).
-        #     Refused here, an operation is not includable and consumes nothing.
+        #     Refused here, an operation is not includable and consumes nothing. A judged block
+        #     reserved every transaction's before any ran (``reserve_section_fees``).
         reserved = ZERO
         if self.enforce_fees and not free:
-            try:
-                tx.validate_fee()
-            except ValueError as e:
-                return ExchangeExecResult(success=False, gas_used=0, error=str(e))
-            reserved = tx.max_fee()
-            payer = self.fee_payer(tx)
-            avail = self.available_balance(payer)
-            if avail is None or avail < reserved:
-                return ExchangeExecResult(
-                    success=False,
-                    gas_used=0,
-                    error=f"insufficient QRDX for gas: need {reserved}, available {avail}",
-                )
-            self._record_balance_delta(payer, -reserved)
+            if prepaid is not None:
+                payer, reserved = prepaid
+            else:
+                try:
+                    tx.validate_fee()
+                except ValueError as e:
+                    return ExchangeExecResult(success=False, gas_used=0, error=str(e))
+                reserved = tx.max_fee()
+                payer = self.fee_payer(tx)
+                avail = self.available_balance(payer)
+                if avail is None or avail < reserved:
+                    return ExchangeExecResult(
+                        success=False,
+                        gas_used=0,
+                        error=f"insufficient QRDX for gas: need {reserved}, available {avail}",
+                    )
+                self._record_balance_delta(payer, -reserved)
 
         # 4. Execute the operation — all or nothing (qrdx/exchange/undo.py): an operation that
         #    raises or fails changes nothing; it only pays for its gas and consumes its nonce
@@ -808,6 +839,8 @@ class ExchangeStateManager:
         #    book without the trades — a maker lost its order and got no position.
         try:
             with self.atomic():
+                if denied:
+                    raise _OperationFailed(ExchangeExecResult(success=False, error=denied))
                 limited = self._charge_agent(tx)
                 if limited:
                     raise _OperationFailed(ExchangeExecResult(success=False, error=limited))
@@ -824,7 +857,8 @@ class ExchangeStateManager:
         #    to advance only on success, so a failing operation could be re-submitted and
         #    re-included indefinitely at the same nonce: one signed transaction, unlimited
         #    block space. Transactions rejected before execution (malformed, wrong nonce,
-        #    under-gassed — steps 1-3) are not includable and consume nothing.
+        #    under-gassed — steps 1-3) are not includable and consume nothing — and, under
+        #    ``exchange_inclusion``, a block carrying one is invalid (``section_errors``).
         if is_vote:
             self.oracle_vote_seqs[tx.sender.lower()] = tx.nonce
         else:
@@ -863,6 +897,143 @@ class ExchangeStateManager:
 
         return result
 
+    # ── which transactions a block may carry (chain-spec feature ``exchange_inclusion``) ──
+
+    def section_errors(
+        self,
+        txs: List[ExchangeTransaction],
+        block_height: int,
+        block_timestamp: float,
+        balance_of: Optional[Any] = None,
+        base_fee: Any = "block",
+    ) -> Dict[int, str]:
+        """Why each of a block's exchange transactions may not be in it, by index — empty: the
+        block may carry them all. Judged together, as of the block's start, before any runs:
+
+        * each must pass what ``process_transaction`` checks before executing — its form, its
+          signer, its expiry, its gas limit, the free lane (in the block's order: per-block and
+          budget counts include the block's earlier free operations);
+        * each nonce lane's transactions continue its nonce in sequence (an oracle voter's
+          votes, its sequence);
+        * each payer holds QRDX for the maximum fees of all its transactions in the block, which
+          the block reserves before anything runs (``reserve_section_fees``).
+
+        A transaction that fails takes nothing from the block, so the rest of its lane fails on
+        its nonce. Read only. The block's own height and time are the clock. ``balance_of``
+        (default: the pre-loaded balances) and ``base_fee`` (default: the block's, as pre-loaded)
+        are how a proposer judges its selection before pre-loading anything — the balances every
+        importer will pre-load."""
+        balance = balance_of or self.available_balance
+        nonces: Dict[str, int] = {}
+        votes: Dict[str, int] = {}
+        owed: Dict[str, Decimal] = {}
+        free_in_block: Dict[str, int] = {}
+        free_spent: Dict[str, Tuple[int, Decimal]] = {}
+        errors: Dict[int, str] = {}
+        saved = (self._current_block_height, self._current_block_timestamp, self.exchange_base_fee)
+        self._current_block_height, self._current_block_timestamp = block_height, block_timestamp
+        if base_fee != "block":
+            self.exchange_base_fee = base_fee
+        try:
+            for i, tx in enumerate(txs):
+                err = self._inclusion_error(
+                    tx, balance, nonces, votes, owed, free_in_block, free_spent
+                )
+                if err:
+                    errors[i] = err
+        finally:
+            (
+                self._current_block_height,
+                self._current_block_timestamp,
+                self.exchange_base_fee,
+            ) = saved
+        return errors
+
+    def _inclusion_error(self, tx, balance, nonces, votes, owed, free_in_block, free_spent) -> str:
+        """``section_errors`` for one transaction, after the block's earlier ones: what it would
+        take from the block is recorded in the last five arguments only if it may be in it."""
+        from .transactions import trading_actions
+
+        try:
+            tx.validate_basic()
+        except ValueError as e:
+            return str(e)
+        refused = self.signer_error(tx)
+        if refused:
+            return refused
+        expires = tx.expires_at()
+        if expires is not None and Decimal(str(self._block_clock())) > expires:
+            return f"expired at block time {expires}"
+        is_vote = tx.op_type == ExchangeOpType.ORACLE_VOTE
+        voter, lane = tx.sender.lower(), tx.nonce_key()
+        if is_vote:
+            last = votes.get(voter, self.oracle_vote_seq(tx.sender))
+            if tx.nonce <= last:
+                return f"stale oracle vote: sequence {tx.nonce} is not after {last}"
+        else:
+            expected = nonces.get(lane, self._nonces.get(lane, 0))
+            if tx.nonce != expected:
+                return f"nonce {tx.nonce} out of sequence: expected {expected}"
+        base_gas = EXCHANGE_GAS_COSTS.get(tx.op_type, 100_000) + tx.signature_gas()
+        if tx.gas_limit < base_gas:
+            return f"gas limit too low: need {base_gas}, got {tx.gas_limit}"
+        free = tx.free_eligible()
+        account = tx.sender
+        if free:
+            refused = self.free_action_error(
+                tx,
+                held=balance(account) or ZERO,
+                in_block=free_in_block.get(account, 0),
+                spent=free_spent.get(account),
+            )
+            if refused:
+                return refused
+        elif self.enforce_fees:
+            try:
+                tx.validate_fee()
+            except ValueError as e:
+                return str(e)
+            payer = self.fee_payer(tx)
+            need = owed.get(payer, ZERO) + tx.max_fee()
+            avail = balance(payer)
+            if avail is None or avail < need:
+                return (
+                    f"insufficient QRDX for gas: {payer[:16]}… holds {avail}, and its "
+                    f"transactions in the block may cost {need} (gas_limit × gas_price)"
+                )
+            owed[payer] = need
+        # It may be in the block: what it takes from it.
+        if is_vote:
+            votes[voter] = tx.nonce
+        else:
+            nonces[lane] = tx.nonce + 1
+        if free:
+            count, _cancels = trading_actions(tx.op_type, tx.params or {})
+            free_in_block[account] = free_in_block.get(account, 0) + count
+            used, _last = free_spent.get(account) or self.trading.action_budgets.peek(
+                account, (0, ZERO)
+            )
+            free_spent[account] = (used + count, Decimal(str(self._block_clock())))
+        return ""
+
+    def reserve_section_fees(
+        self, txs: List[ExchangeTransaction]
+    ) -> List[Optional[Tuple[str, Decimal]]]:
+        """Reserve each transaction's maximum fee from its payer before anything in the block
+        runs (``exchange_inclusion``), so no earlier operation can spend what a later
+        transaction's gas needs; ``section_errors`` checked that every payer holds it. Each
+        gets back what its gas did not use once it has run. Returns each transaction's
+        (payer, reserved), None where it pays nothing (the free lane, or fees not enforced)."""
+        out: List[Optional[Tuple[str, Decimal]]] = []
+        for tx in txs:
+            if not self.enforce_fees or tx.free_eligible():
+                out.append(None)
+                continue
+            payer, fee = self.fee_payer(tx), tx.max_fee()
+            self._record_balance_delta(payer, -fee)
+            out.append((payer, fee))
+        return out
+
     # ── the free trading lane (docs/TOKENOMICS.md) ──
 
     def free_action_budget(self, account: str) -> int:
@@ -885,12 +1056,22 @@ class ExchangeStateManager:
             return True
         return int(fee) * 10_000 <= floor * int(constants.FREE_TRADING_MAX_BASE_FEE_BPS)
 
-    def free_action_error(self, tx: ExchangeTransaction) -> str:
+    def free_action_error(
+        self,
+        tx: ExchangeTransaction,
+        held: Optional[Decimal] = None,
+        in_block: Optional[int] = None,
+        spent: Optional[Tuple[int, Decimal]] = None,
+    ) -> str:
         """Why ``tx`` may not go free — "" if it may (read only). An account needs a holding
         (FREE_ACTION_MIN_QRDX of QRDX or FREE_ACTION_MIN_EQUITY of perps equity), at most
         FREE_ACTIONS_PER_BLOCK of its free actions are in one block, and it spends from its
         budget (cancels: up to twice it); past the budget, one free action every
-        FREE_ACTION_REFILL_SECONDS. While blocks run full, only cancels go free."""
+        FREE_ACTION_REFILL_SECONDS. While blocks run full, only cancels go free.
+
+        ``held``, ``in_block`` and ``spent`` stand in for the account's QRDX, its free actions
+        in this block and its budget use (used, last) — for judging a block's transactions
+        before any runs (``section_errors``)."""
         from .. import constants
         from .transactions import trading_actions
 
@@ -901,7 +1082,8 @@ class ExchangeStateManager:
                 "blocks are running full: the free trading lane is paused — pay gas "
                 f"(at least the exchange base fee, {self.exchange_base_fee} wei)"
             )
-        held = self.available_balance(account) or ZERO
+        if held is None:
+            held = self.available_balance(account) or ZERO
         equity = (
             self.clearinghouse.total_equity(account)
             if self.clearinghouse.accounts.peek(account) is not None
@@ -912,12 +1094,14 @@ class ExchangeStateManager:
                 f"free trading needs a holding: {constants.FREE_ACTION_MIN_QRDX} QRDX or "
                 f"{constants.FREE_ACTION_MIN_EQUITY} of perps equity — or pay gas"
             )
-        if self._block_free_actions.get(account, 0) + count > constants.FREE_ACTIONS_PER_BLOCK:
+        if in_block is None:
+            in_block = self._block_free_actions.get(account, 0)
+        if in_block + count > constants.FREE_ACTIONS_PER_BLOCK:
             return (
                 f"at most {constants.FREE_ACTIONS_PER_BLOCK} free actions of an account a block "
                 "— pay gas, or wait a block"
             )
-        used, last = self.trading.action_budgets.peek(account, (0, ZERO))
+        used, last = spent or self.trading.action_budgets.peek(account, (0, ZERO))
         budget = self.free_action_budget(account)
         if used + count <= (budget * 2 if cancels else budget):
             return ""
@@ -939,6 +1123,16 @@ class ExchangeStateManager:
         # (Its last free action's block time: past the budget, the next waits from here.)
         self.trading.action_budgets[account] = (used + count, Decimal(str(self._block_clock())))
         self._block_free_actions[account] = self._block_free_actions.get(account, 0) + count
+
+    def _signed_by_delegate(self, tx: ExchangeTransaction) -> bool:
+        """Signed for the account by a trading-only delegate — an agent, or a vault's leader —
+        rather than by the account, one of its controllers or its sub-account's master."""
+        signer = tx.signer
+        if not signer:
+            return False
+        if self.authority.may_control(tx.sender, signer):
+            return False
+        return self.trading.master_of(tx.sender) != signer
 
     def signer_error(self, tx: ExchangeTransaction) -> str:
         """Why ``tx.signer`` may not act for ``tx.sender`` ("" if it may, or signs for itself).
@@ -1165,7 +1359,6 @@ class ExchangeStateManager:
             ExchangeOpType.VAULT_DEPOSIT: self._op_vault_deposit,
             ExchangeOpType.VAULT_WITHDRAW: self._op_vault_withdraw,
             ExchangeOpType.ORACLE_VOTE: self._op_oracle_vote,
-            ExchangeOpType.UPDATE_ORACLE: self._op_update_oracle,
             ExchangeOpType.CREATE_MARKET: self._op_create_market,
             ExchangeOpType.TOKEN_DEPLOY: self._op_token_deploy,
             ExchangeOpType.TOKEN_TRANSFER: self._op_token_transfer,
@@ -1198,6 +1391,9 @@ class ExchangeStateManager:
             ExchangeOpType.GOV_VETO: self._op_gov_veto,
             ExchangeOpType.GOV_EXECUTE: self._op_gov_execute,
             ExchangeOpType.BRIDGE_WITHDRAW: self._op_bridge_withdraw,
+            ExchangeOpType.BRIDGE_PROVE_DEPOSIT: self._op_bridge_prove_deposit,
+            ExchangeOpType.MIGRATION_CLAIM: self._op_migration_claim,
+            ExchangeOpType.DOOMSDAY_PROVE: self._op_doomsday_prove,
             ExchangeOpType.STAKE_DELEGATE: self._op_stake_delegate,
             ExchangeOpType.STAKE_UNDELEGATE: self._op_stake_undelegate,
             ExchangeOpType.STAKE_SET_COMMISSION: self._op_stake_set_commission,
@@ -1224,10 +1420,6 @@ class ExchangeStateManager:
             ExchangeOpType.PERP_ISOLATED_MARGIN: self._op_perp_isolated_margin,
             ExchangeOpType.SCHEDULE_CANCEL: self._op_schedule_cancel,
             ExchangeOpType.APPROVE_BUILDER_FEE: self._op_approve_builder_fee,
-            ExchangeOpType.DEPLOYER_BOND: self._op_deployer_bond,
-            ExchangeOpType.DEPLOYER_UNBOND: self._op_deployer_unbond,
-            ExchangeOpType.DEPLOYER_SET_ORACLE: self._op_deployer_set_oracle,
-            ExchangeOpType.DEPLOYER_HALT: self._op_deployer_halt,
             ExchangeOpType.TICKER_CLAIM: self._op_ticker_claim,
         }
         handler = handlers.get(tx.op_type)
@@ -1306,8 +1498,9 @@ class ExchangeStateManager:
         if self.enforce_pool_stake and stake > ZERO:
             self._record_balance_delta(tx.sender, -stake)
 
-        # Create matching orderbook and oracle
+        # Create the pair's order book (its registry entries undone with a failure)
         pair_key = f"{pool.state.token0}:{pool.state.token1}"
+        self._keep_pair_registries(pair_key)
         if pair_key not in self._order_books:
             book = OrderBook(
                 pool_id=pair_key,
@@ -1316,17 +1509,18 @@ class ExchangeStateManager:
             self._order_books[pair_key] = book
             self.router.register_order_book(pair_key, book)
 
-        if pair_key not in self._oracles:
-            oracle = TWAPOracle(pool_id=pair_key)
-            self._oracles[pair_key] = oracle
-            self.router.register_oracle(pair_key, oracle)
-
         self._total_pools += 1
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.CREATE_POOL],
             data={"pool_id": pool.state.id, "pair": pair_key},
         )
+
+    def _keep_pair_registries(self, pair_key: str) -> None:
+        """A pair's order-book entries — the manager's and the router's — as they are, for an
+        undo scope to put back (they are plain registries, not committed ones)."""
+        for registry in (self._order_books, self.router._order_books):
+            undo.keep_entry(registry, pair_key, mutable=False)
 
     def _op_remove_pool(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Remove a pool the sender created and REFUND its staked QRDX (the mirror of the
@@ -1369,14 +1563,14 @@ class ExchangeStateManager:
             return ExchangeExecResult(success=False, error=str(e))
 
         self.pool_manager.remove_pool(pool.state.id)
-        # The order book and reporter oracle are per PAIR; keep them while another pool of the
-        # pair remains (removing them would strand that book's resting orders).
+        self._keep_pair_registries(pair_key)
+        # The order book is per PAIR; keep it while another pool of the pair remains (removing
+        # it would strand that book's resting orders).
         if not self.pool_manager.get_pools_for_pair(pool.state.token0, pool.state.token1):
             book = self._order_books.get(pair_key)
             if book is not None and not book._orders:
                 self._order_books.pop(pair_key, None)
                 self.router.unregister_order_book(pair_key)
-            self._oracles.pop(pair_key, None)
 
         refunded = ZERO
         if self.enforce_pool_stake and pool_type != PoolType.SUBSIDIZED and stake > ZERO:
@@ -1434,6 +1628,8 @@ class ExchangeStateManager:
             )
             self._settle_token_move(tx.sender, holder, pool.state.token0, amt0)
             self._settle_token_move(tx.sender, holder, pool.state.token1, amt1)
+        # Liquidity at a price past resting orders: they fill from it at the tick.
+        self.trading.uncross[f"{pool.state.token0}:{pool.state.token1}"] = 1
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ADD_LIQUIDITY],
@@ -1471,8 +1667,8 @@ class ExchangeStateManager:
                 out0, out1 = pool.remove_liquidity(
                     position.id, amount, owner=tx.sender, now=int(self._block_clock())
                 )
-                self._settle_token_move(holder, tx.sender, pool.state.token0, out0)
-                self._settle_token_move(holder, tx.sender, pool.state.token1, out1)
+                self._settle_token_move(holder, tx.sender, pool.state.token0, out0, release=True)
+                self._settle_token_move(holder, tx.sender, pool.state.token1, out1, release=True)
         except ValueError as e:
             return ExchangeExecResult(success=False, error=str(e))
         return ExchangeExecResult(
@@ -1526,58 +1722,182 @@ class ExchangeStateManager:
         turns the exception into a failed result — and a failed operation must change
         nothing, or a swap that misses its own slippage limit could still move a pool's price
         for free.) Order books and committed state undo themselves; an AMM pool is still
-        snapshotted. A spot order used to deep-copy its whole book (every resting order)."""
-        with self.atomic():
-            saved = [
-                (e, e.snapshot() if hasattr(e, "snapshot") else copy.deepcopy(e.__dict__))
-                for e in engines
-                if not isinstance(e, OrderBook)
-            ]
-            try:
-                yield
-            except Exception:
-                for engine, snap in saved:
+        snapshotted. A spot order used to deep-copy its whole book (every resting order).
+
+        The snapshot is recorded with the operation's undo scope, so a failure AFTER this
+        block — a multi-hop swap short of its ``min_amount_out``, an order whose book step
+        fails after its pool fills — puts the pool back too (it used to stay moved)."""
+        with self.atomic() as scope:
+            for e in engines:
+                if isinstance(e, OrderBook) or not scope.first(e, "engine"):
+                    continue
+                snap = e.snapshot() if hasattr(e, "snapshot") else copy.deepcopy(e.__dict__)
+
+                def restore(engine=e, snap=snap) -> None:
                     if hasattr(engine, "restore"):
                         engine.restore(snap)
                     else:
                         engine.__dict__.clear()
                         engine.__dict__.update(snap)
-                raise
+
+                scope.record(e, "engine", restore)
+            yield
+
+    # ── spot swaps: the best path, each hop through its pair's combined market ──────────
+    #    (docs/UNIFIED_SPOT_LIQUIDITY.md 2)
+
+    def routing_hubs(self) -> List[str]:
+        """The tokens a swap may route through when that pays more: QRDX, and the perps
+        settlement asset (where liquidity gathers)."""
+        hubs = ["QRDX"]
+        if self.perp_collateral_token():
+            settlement = self._settlement_asset()
+            if settlement not in hubs:
+                hubs.append(settlement)
+        return hubs
+
+    def swap_paths(self, token_in: str, token_out: str) -> List[List[str]]:
+        """The paths a swap from ``token_in`` to ``token_out`` chooses among: the pair itself,
+        then two hops through each routing hub."""
+        paths = [[token_in, token_out]]
+        for hub in self.routing_hubs():
+            if hub not in (token_in, token_out):
+                paths.append([token_in, hub, token_out])
+        return paths
+
+    @staticmethod
+    def _route_gas(route) -> int:
+        """What a hop's walk costs beyond SWAP's base gas: each resting order it visits, and
+        each pool it uses beyond the first."""
+        pools = sum(1 for leg in route.legs if leg.source == FillSource.AMM)
+        return (route.makers + max(0, pools - 1)) * EXCHANGE_GAS_PER_MAKER
+
+    def plan_swap(
+        self,
+        sender: str,
+        path: List[str],
+        amount_in: Decimal,
+        *,
+        pool_id: Optional[str] = None,
+        venue: str = "auto",
+        gas_limit: Optional[int] = None,
+    ) -> Tuple[Optional[List[Any]], str]:
+        """Plan a swap along ``path`` on the current state, hop by hop, each on its pair's
+        combined market within what the gas limit pays for (read only). (routes, "") or
+        (None, why not)."""
+        hops = len(path) - 1
+        gas = EXCHANGE_GAS_COSTS[ExchangeOpType.SWAP] * hops
+        if gas_limit is not None and gas > gas_limit:
+            return None, f"a {hops}-hop swap needs at least {gas} gas"
+        routes: List[Any] = []
+        amount = amount_in
+        for i in range(hops):
+            makers = (
+                None if gas_limit is None else max(0, (gas_limit - gas) // EXCHANGE_GAS_PER_MAKER)
+            )
+            route = self.router.best_route(
+                path[i],
+                path[i + 1],
+                amount,
+                sender,
+                pool_id=pool_id if hops == 1 else None,
+                venue=venue,
+                max_makers=makers,
+            )
+            if route is None or route.amount_out <= 0:
+                error = "No liquidity available for this pair"
+                return None, error if hops == 1 else f"hop {i}: {error}"
+            gas += self._route_gas(route)
+            routes.append(route)
+            amount = route.amount_out
+        return routes, ""
+
+    def choose_swap_path(
+        self,
+        sender: str,
+        token_in: str,
+        token_out: str,
+        amount_in: Decimal,
+        *,
+        path: Optional[List[str]] = None,
+        pool_id: Optional[str] = None,
+        venue: str = "auto",
+        gas_limit: Optional[int] = None,
+    ) -> Tuple[Optional[List[str]], Optional[List[Any]], str]:
+        """The path a swap takes: ``path`` if given; else the pair itself, or two hops through a
+        routing hub when that pays more (a ``pool_id`` or a ``venue`` keeps it on the pair).
+        Ties: the pair, then the hubs in order. (path, its planned routes, "") or
+        (None, None, why not)."""
+        if path is not None:
+            candidates = [path]
+        elif pool_id or venue != "auto":
+            candidates = [[token_in, token_out]]
+        else:
+            candidates = self.swap_paths(token_in, token_out)
+        best: Tuple[Optional[List[str]], Optional[List[Any]], str] = (None, None, "")
+        for candidate in candidates:
+            routes, error = self.plan_swap(
+                sender, candidate, amount_in, pool_id=pool_id, venue=venue, gas_limit=gas_limit
+            )
+            if routes is None:
+                if best[0] is None and not best[2]:
+                    best = (None, None, error)  # (the first candidate's reason: the pair's)
+                continue
+            if best[1] is None or routes[-1].amount_out > best[1][-1].amount_out:
+                best = (candidate, routes, "")
+        return best
 
     def _op_swap(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """Exact-input swap through the best venue — any of the pair's AMM pools or its order
-        book (``pool_id`` pins a pool; ``venue`` = auto | amm | clob). Every check runs on the
-        router's exact quote before anything changes, and the fill settles with its real
-        counterparty: the pool's holder, or the matched makers' escrow.
+        """Exact-input swap on the best path, each hop through its pair's combined market — the
+        order book and every pool, best prices first, split between pools at the same price
+        (docs/UNIFIED_SPOT_LIQUIDITY.md). Without ``path`` it goes through a routing hub
+        (``routing_hubs``) when that pays more. ``pool_id`` keeps it to that pool, ``venue``
+        "clob" to the book, "amm" to the pools — but no swap trades through a resting order:
+        resting orders at better prices fill first.
 
-        ``path`` [A, B, C, …] (instead of ``token_in``/``token_out``): a multi-hop swap, up to
-        MAX_SWAP_HOPS hops, each through its pair's best venue and each spending exactly what
-        the one before it bought; ``min_amount_out`` bounds the last. All or nothing.
+        ``path`` [A, B, C, …] (instead of ``token_in``/``token_out``): exactly that path, up to
+        MAX_SWAP_HOPS hops, each spending exactly what the one before it bought;
+        ``min_amount_out`` bounds the last. All or nothing.
 
         Gas: SWAP's base gas for each hop, and EXCHANGE_GAS_PER_MAKER for each resting order
-        an order-book fill visits — no more than the gas limit pays for (an order-book route
-        is quoted within that budget)."""
+        visited and for each pool used beyond a hop's first — no more than the gas limit pays
+        for (each hop is planned within that budget)."""
         p = tx.params
+        if (p.get("pool_id") or str(p.get("venue", "auto")).lower() != "auto") and (
+            self._signed_by_delegate(tx)
+        ):
+            # An agent or a vault's leader trades for the account: its swap takes the best route
+            # — it may not steer the account's funds into a pool or venue of its choosing
+            # (docs/EXCHANGE_AUDIT.md 9).
+            return ExchangeExecResult(
+                success=False,
+                error="a swap signed for an account by its agent takes the best route: "
+                "no pool_id or venue",
+            )
+        explicit = None
         if p.get("path") is not None:
-            path = p["path"]
+            raw = p["path"]
             if (
-                not isinstance(path, list)
-                or not 2 <= len(path) <= MAX_SWAP_HOPS + 1
-                or not all(isinstance(t, str) and t for t in path)
+                not isinstance(raw, list)
+                or not 2 <= len(raw) <= MAX_SWAP_HOPS + 1
+                or not all(isinstance(t, str) and t for t in raw)
             ):
                 return ExchangeExecResult(
                     success=False,
                     error=f"path is a list of 2 to {MAX_SWAP_HOPS + 1} tokens",
                 )
-            path = [self.canonical_asset(t) for t in path]
+            explicit = [self.canonical_asset(t) for t in raw]
+            ends = explicit[0], explicit[-1]
         else:
-            path = [self.canonical_asset(p["token_in"]), self.canonical_asset(p["token_out"])]
-        if len(set(path)) != len(path):
+            ends = self.canonical_asset(p["token_in"]), self.canonical_asset(p["token_out"])
+        if explicit is not None and len(set(explicit)) != len(explicit):
+            return ExchangeExecResult(success=False, error="a swap path visits each token once")
+        if ends[0] == ends[1]:
             return ExchangeExecResult(success=False, error="a swap path visits each token once")
         amount_in = Decimal(str(p["amount_in"]))
         min_out = Decimal(str(p.get("min_amount_out", "0") or "0"))
         deadline = float(p.get("deadline", 0) or 0)
-        token_in = path[0]
+        token_in = ends[0]
         if amount_in <= 0:
             return ExchangeExecResult(success=False, error="amount_in must be positive")
         if deadline > 0 and self._block_clock() > deadline:
@@ -1596,13 +1916,34 @@ class ExchangeStateManager:
                 avail,
             )
 
+        gas_limit = getattr(tx, "gas_limit", None)  # (None: built in process, never in a block)
+        venue = str(p.get("venue", "auto")).lower()
+        path, planned, error = self.choose_swap_path(
+            tx.sender,
+            ends[0],
+            ends[1],
+            amount_in,
+            path=explicit,
+            pool_id=p.get("pool_id"),
+            venue=venue,
+            gas_limit=None if gas_limit is None else int(gas_limit),
+        )
+        if path is None or planned is None:
+            hops = len(explicit) - 1 if explicit is not None else 1
+            return ExchangeExecResult(
+                success=False,
+                gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.SWAP] * hops,
+                error=error,
+            )
+        if min_out > 0 and planned[-1].amount_out < min_out:
+            return ExchangeExecResult(
+                success=False,
+                error=f"Slippage exceeded: got {planned[-1].amount_out}, minimum {min_out}",
+            )
+        # Execute hop by hop, each planned again on what the one before actually bought (a fee
+        # tier the first hop's volume crossed can change the next one's fees).
         hops = len(path) - 1
         gas = EXCHANGE_GAS_COSTS[ExchangeOpType.SWAP] * hops
-        gas_limit = getattr(tx, "gas_limit", None)  # (None: built in process, never in a block)
-        if gas_limit is not None and gas > gas_limit:
-            return ExchangeExecResult(
-                success=False, error=f"a {hops}-hop swap needs at least {gas} gas"
-            )
         amount, spent_in = amount_in, ZERO
         routes, fills = [], []
         for i in range(hops):
@@ -1617,7 +1958,7 @@ class ExchangeStateManager:
                 amount,
                 tx.sender,
                 pool_id=p.get("pool_id") if hops == 1 else None,
-                venue=str(p.get("venue", "auto")).lower(),
+                venue=venue,
                 max_makers=makers,
             )
             if route is None:
@@ -1625,21 +1966,16 @@ class ExchangeStateManager:
                 return ExchangeExecResult(
                     success=False, gas_used=gas, error=error if hops == 1 else f"hop {i}: {error}"
                 )
-            if hops == 1 and min_out > 0 and route.amount_out < min_out:
-                return ExchangeExecResult(
-                    success=False,
-                    error=f"Slippage exceeded: got {route.amount_out}, minimum {min_out}",
-                )
             try:
                 visited, hop_fills = self._swap_hop(tx.sender, route)
             except ValueError as e:
                 return ExchangeExecResult(success=False, gas_used=gas, error=str(e))
-            gas += visited * EXCHANGE_GAS_PER_MAKER
+            gas += self._route_gas(route)
             spent_in = route.amount_in if i == 0 else spent_in
             amount = route.amount_out
             routes.append(route)
             fills += hop_fills
-        if min_out > 0 and amount < min_out:  # (a multi-hop swap: undone whole)
+        if min_out > 0 and amount < min_out:  # (undone whole: pools, books and balances)
             return ExchangeExecResult(
                 success=False,
                 gas_used=gas,
@@ -1675,34 +2011,120 @@ class ExchangeStateManager:
     def _swap_hop(
         self, sender: str, route, payer: Optional[str] = None
     ) -> Tuple[int, List[Dict[str, Any]]]:
-        """Execute one quoted swap route and settle it; returns the resting orders it visited
-        and its fills. Raises ValueError (its changes undone) if it cannot settle. ``payer``:
-        the protocol holder its input comes out of instead of ``sender`` (a TWAP slice's
-        escrow, in the block's tick: every debit covered by protocol records)."""
-        engine: Any
-        if route.source == FillSource.AMM:
-            engine = self.pool_manager.get_pool(route.amm()[0])
-        else:
-            engine = self._order_books[route.clob()[0]]
+        """Execute one planned hop — every leg: the order book's, each pool's — and settle each
+        with its real counterparty; returns the resting orders it visited and its fills. Raises
+        ValueError (its changes undone) if it cannot settle. ``payer``: the protocol holder its
+        input comes out of instead of ``sender`` (a TWAP slice's escrow, in the block's tick:
+        every debit covered by protocol records)."""
         covered = payer is not None
-        with self._atomic(engine):
-            result = self.router.apply_route(route, sender, now=int(self._block_clock()))
-            if route.source == FillSource.AMM:
-                holder = self.pool_holder_address(route.amm()[0])
-                self._settle_token_move(
-                    payer or sender, holder, route.token_in, route.amount_in, covered=covered
+        pair = route.pair or self._canonical_pair(f"{route.token_in}:{route.token_out}")
+        base, quote = pair.split(":", 1)
+        legs = route.legs
+        engines: List[Any] = [
+            self.pool_manager.get_pool(leg.pool_id) for leg in legs if leg.source == FillSource.AMM
+        ]
+        visited = 0
+        fills: List[Dict[str, Any]] = []
+        with self._atomic(*[e for e in engines if e is not None]):
+            for leg in legs:
+                trades, order, leg_visited = self.router.apply_leg(
+                    route, leg, sender, now=int(self._block_clock())
                 )
-                self._settle_token_move(
-                    holder, sender, route.token_out, route.amount_out, covered=covered
-                )
-            else:
-                pair = route.clob()[0]
-                base, quote = pair.split(":", 1)
-                self._settle_orderbook(result.order, result.trades, base, quote, pair, payer)
-        if route.source == FillSource.AMM:
-            return 0, [self._amm_fill(route, sender)]
-        pair, side = route.clob()
-        return result.makers_visited, self._clob_fills(pair, result.trades, sender, side)
+                if leg.source == FillSource.AMM:
+                    holder = self.pool_holder_address(leg.pool_id)
+                    self._settle_token_move(
+                        payer or sender, holder, route.token_in, leg.amount_in, covered=covered
+                    )
+                    self._settle_token_move(
+                        holder, sender, route.token_out, leg.amount_out, covered=covered
+                    )
+                    fills.append(self._amm_fill(route, sender, leg))
+                else:
+                    self._settle_orderbook(order, trades, base, quote, pair, payer)
+                    fills += self._clob_fills(pair, trades, sender, route.side)
+                    visited += leg_visited
+            self._record_spot_prices(pair, route)
+            self._flag_self_pass(pair, route)
+        return visited, fills
+
+    def _flag_self_pass(self, pair: str, route) -> None:
+        """A taker the book closed to at its own resting order (self-trade prevention) may have
+        moved a pool past that order: the tick fills it from the pool (``uncross_spot_books``),
+        so no arbitrageur can trade against it there."""
+        if (
+            route is not None
+            and route.stopped == "self"
+            and any(leg.source == FillSource.AMM for leg in route.legs)
+        ):
+            self.trading.uncross[pair] = 1
+
+    def pair_price(self, pair: str) -> Optional[Decimal]:
+        """A spot pair's price: its last trade, a pool's included; a pair that never traded,
+        its deepest pool's (most active liquidity, then the lowest id)."""
+        book = self._order_books.get(pair)
+        if book is not None and book.last_price:
+            return Decimal(str(book.last_price))
+        base, quote = pair.split(":", 1) if ":" in pair else (pair, "")
+        pools = [
+            p for p in self.pool_manager.get_pools_for_pair(base, quote) if p.state.sqrt_price > 0
+        ]
+        if not pools:
+            return None
+        pool = max(pools, key=lambda p: (p.state.liquidity, [-ord(c) for c in p.state.id]))
+        return pool.state.price
+
+    def pair_quotes(self, pair: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """A spot pair's best bid and ask now, fees included: the book's displayed top, and
+        what each pool pays a seller or charges a buyer at the margin (where its liquidity
+        starts). (None, None) sides when nothing quotes."""
+        book = self._order_books.get(pair)
+        bids = [book.best_bid] if book is not None and book.best_bid is not None else []
+        asks = [book.best_ask] if book is not None and book.best_ask is not None else []
+        base, quote = pair.split(":", 1)
+        for pool in self.pool_manager.get_pools_for_pair(base, quote):
+            if pool.is_paused:
+                continue
+            f = pool.state.fee_tier.rate
+            down, up = pool.liquid_sqrt(True), pool.liquid_sqrt(False)
+            if down is not None:
+                bids.append(down * down * (1 - f))
+            if up is not None:
+                asks.append(up * up / (1 - f))
+        return (max(bids) if bids else None), (min(asks) if asks else None)
+
+    def _record_spot_prices(
+        self,
+        pair: str,
+        route=None,
+        prices: Iterable[Decimal] = (),
+        buy: Optional[bool] = None,
+    ) -> None:
+        """A taker's fills on ``pair`` (a route's legs, and ``prices``: order-book trades): the
+        pair's last price is the worst it reached (the highest for a buy), and every spot
+        trigger a fill reached is marked so — it fires at the tick even if the price goes back
+        (docs/UNIFIED_SPOT_LIQUIDITY.md 5)."""
+        seen = [Decimal(str(x)) for x in prices if x]
+        if route is not None:
+            seen += [leg.price for leg in route.legs if leg.price > 0]
+            if buy is None:
+                buy = route.side == OrderSide.BUY
+        if not seen:
+            return
+        lo, hi = min(seen), max(seen)
+        book = self._order_books.get(pair)
+        if book is not None and route is not None:  # (the book's own trades set it already)
+            book.record_price(hi if buy else lo)
+        if not len(self.trading.spot_triggers):
+            return
+        from dataclasses import replace
+
+        for tid in dict.fromkeys(self.trading.crossed(pair, lo) + self.trading.crossed(pair, hi)):
+            t = self.trading.spot_triggers.peek(tid)
+            if t is None or t.reached or t.amount <= 0:  # (an empty bracket protects nothing yet)
+                continue
+            leg = t.crossed_leg(lo) or t.crossed_leg(hi)
+            if leg is not None:
+                self.trading.spot_triggers[tid] = replace(t, reached=leg[0])
 
     # A spot trade as the market-data feed sees it (journal.py → market_data.py): the pair in
     # canonical "base:quote" order, the price in quote per base, the base amount, and the
@@ -1734,20 +2156,22 @@ class ExchangeStateManager:
             for t in trades
         ]
 
-    def _amm_fill(self, route, taker: str) -> Dict[str, Any]:
+    def _amm_fill(self, route, taker: str, leg=None) -> Dict[str, Any]:
+        """One pool's fill (``leg``; none: the route's only one)."""
+        leg = leg if leg is not None else route.legs[0]
         pair = self._canonical_pair(f"{route.token_in}:{route.token_out}")
         base = pair.split(":", 1)[0]
-        holder = self.pool_holder_address(route.pool_id)
+        holder = self.pool_holder_address(leg.pool_id)
         if route.token_in == base:  # selling base into the pool
-            amount, quote_amount, side = route.amount_in, route.amount_out, "sell"
+            amount, quote_amount, side = leg.amount_in, leg.amount_out, "sell"
             buyer, seller = holder, taker
         else:
-            amount, quote_amount, side = route.amount_out, route.amount_in, "buy"
+            amount, quote_amount, side = leg.amount_out, leg.amount_in, "buy"
             buyer, seller = taker, holder
         return {
             "market": pair,
             "venue": "amm",
-            "pool_id": route.pool_id,
+            "pool_id": leg.pool_id,
             "price": str(quote_amount / amount) if amount > 0 else "0",
             "amount": str(amount),
             "quote_amount": str(quote_amount),
@@ -1884,12 +2308,50 @@ class ExchangeStateManager:
             ExchangeOpType.PLACE_ORDER, None if gas_limit is None else gas_limit - bracket_gas
         )
         budget = MatchBudget(makers) if makers is not None else None
+        # The pair's combined market (docs/UNIFIED_SPOT_LIQUIDITY.md 3): the pools fill what
+        # they price better than the book, within the limit; the book takes the rest, and what
+        # is left rests.
+        route = self.router.plan_fill(
+            pair,
+            side == OrderSide.BUY,
+            order.amount,
+            exact_in=False,
+            limit=order.price if order_type is OrderType.LIMIT else None,
+            sender=tx.sender,
+            max_makers=makers,
+        )
+        pooled = self._pool_part(route)
+        self._flag_self_pass(pair, route)
+        if pooled is not None and order.tif == "alo":
+            return ExchangeExecResult(success=False, error="post-only order would take from a pool")
+        pool_fills: List[Dict[str, Any]] = []
         try:
-            with self._atomic(book):
+            with self._atomic(book, *self._pools_of(pooled)):
+                if pooled is not None:
+                    filled, _paid, pool_fills, received = self._fill_from_pools(
+                        pair,
+                        pooled,
+                        tx.sender,
+                        tx.sender,
+                        covered=False,
+                        bracket=bracket_id if bracket_gas else None,
+                    )
+                    order.filled += filled
+                book.enter_block(self._current_block_height, self._block_clock())
                 trades = book.place_order(order, budget=budget)
+                if book.__dict__.get("_has_expiring"):  # (it now starts every block)
+                    self._note_expiring(pair)
                 if self.enforce_orderbook_settlement:
                     self._settle_orderbook(order, trades, base, quote, pair)
-                builder_fee = self._pay_spot_builder(tx.sender, builder, trades, base, quote)
+                builder_fee = self._pay_spot_builder(
+                    tx.sender, builder, trades, base, quote, received if pooled else ()
+                )
+                self._record_spot_prices(
+                    pair,
+                    pooled,
+                    prices=[tr.price for tr in trades],
+                    buy=side == OrderSide.BUY,
+                )
         except ValueError as e:
             # It pays for the resting orders it visited before failing (a fill-or-kill that
             # could not fill whole), as it would have had it succeeded.
@@ -1901,9 +2363,9 @@ class ExchangeStateManager:
             )
         data: Dict[str, Any] = {
             "order_id": order.id,
-            "trades": len(trades),
+            "trades": len(trades) + len(pool_fills),
             "filled": str(order.filled),
-            "fills": self._clob_fills(pair, trades, tx.sender, side),
+            "fills": pool_fills + self._clob_fills(pair, trades, tx.sender, side),
         }
         if builder is not None:
             data["builder_fee"] = {"builder": builder[0], **builder_fee}
@@ -1919,28 +2381,107 @@ class ExchangeStateManager:
         return ExchangeExecResult(
             success=True,
             gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PLACE_ORDER]
-            + (budget.visited if budget is not None else 0) * EXCHANGE_GAS_PER_MAKER
+            + ((budget.visited if budget is not None else 0) + len(pool_fills))
+            * EXCHANGE_GAS_PER_MAKER
             + (bracket_gas if "attached" in data else 0),
             data=data,
         )
 
+    # ── the pools' part of a spot order (docs/UNIFIED_SPOT_LIQUIDITY.md 3–4) ──────────────
+
+    @staticmethod
+    def _pool_part(route):
+        """A combined route's pool legs alone (None: it has none) — what an order takes from
+        the pools before the book matches the rest."""
+        if route is None:
+            return None
+        legs = [leg for leg in route.legs if leg.source == FillSource.AMM]
+        if not legs:
+            return None
+        from dataclasses import replace as _replace
+
+        last = (
+            max(leg.price for leg in legs)
+            if route.side == OrderSide.BUY
+            else min(leg.price for leg in legs)
+        )
+        return _replace(
+            route,
+            parts=legs,
+            amount_in=sum((leg.amount_in for leg in legs), ZERO),
+            amount_out=sum((leg.amount_out for leg in legs), ZERO),
+            size=sum((leg.base for leg in legs), ZERO),
+            makers=0,
+            last_price=last,
+        )
+
+    def _pools_of(self, route) -> List[Any]:
+        if route is None:
+            return []
+        return [
+            pool
+            for pool in (self.pool_manager.get_pool(leg.pool_id) for leg in route.legs)
+            if pool is not None
+        ]
+
+    def _fill_from_pools(
+        self,
+        pair: str,
+        route,
+        owner: str,
+        payer: str,
+        *,
+        covered: bool,
+        bracket: Optional[str] = None,
+    ) -> Tuple[Decimal, Decimal, List[Dict[str, Any]], List[Tuple[str, Decimal]]]:
+        """Execute a route's pool legs for ``owner`` and settle each with its pool: what it pays
+        out of ``payer``, what it buys to ``owner`` — or, for a buy with an attached TP/SL
+        (``bracket``), into the bracket's escrow. Returns (base traded, paid in, fills,
+        (token, amount) received)."""
+        escrow = self.orderbook_escrow_address(pair)
+        now = int(self._block_clock())
+        base = paid = ZERO
+        fills: List[Dict[str, Any]] = []
+        received: List[Tuple[str, Decimal]] = []
+        for leg in route.legs:
+            self.router.apply_leg(route, leg, owner, now=now)
+            holder = self.pool_holder_address(leg.pool_id)
+            self._settle_token_move(payer, holder, route.token_in, leg.amount_in, covered=covered)
+            to = escrow if bracket else owner
+            self._settle_token_move(holder, to, route.token_out, leg.amount_out, covered=covered)
+            if bracket:
+                self._fill_bracket(bracket, leg.amount_out)
+            base += leg.base
+            paid += leg.amount_in
+            fills.append(self._amm_fill(route, owner, leg))
+            received.append((route.token_out, leg.amount_out))
+        return base, paid, fills, received
+
     def _pay_spot_builder(
-        self, taker: str, builder: Optional[Tuple[str, Decimal]], trades, base: str, quote: str
+        self,
+        taker: str,
+        builder: Optional[Tuple[str, Decimal]],
+        trades,
+        base: str,
+        quote: str,
+        pooled: Iterable[Tuple[str, Decimal]] = (),
     ) -> Dict[str, str]:
         """A builder's fee on the fills a spot order took: its rate of what the taker received in
-        each (base for a buy, quote for a sell), out of it, to the builder. Returns the amounts
-        by asset."""
+        each (base for a buy, quote for a sell) — a pool's fills (``pooled``: (token, amount)
+        received) included — out of it, to the builder. Returns the amounts by asset."""
         paid: Dict[str, Decimal] = {}
         if builder is None:
             return {}
+        received = [(token, Decimal(str(value))) for token, value in pooled]
         for tr in trades:
             if taker not in (tr.buyer, tr.seller) or tr.maker_order_id is None:
                 continue
-            token, value = (
+            received.append(
                 (base, Decimal(str(tr.amount)))
                 if tr.buyer == taker
                 else (quote, Decimal(str(tr.amount)) * Decimal(str(tr.price)))
             )
+        for token, value in received:
             fee = (value * builder[1]).quantize(SPOT_FEE_QUANTUM, rounding=ROUND_DOWN)
             if fee > 0:
                 self._settle_token_move(taker, builder[0], token, fee)
@@ -2022,7 +2563,8 @@ class ExchangeStateManager:
         if not len(self.fee_tokens):
             return []
         events: List[Dict[str, Any]] = []
-        for token, (pending, next_time) in sorted(self.fee_tokens.peek_items()):
+        for token in self._due_fee_tokens(now):
+            pending, next_time = self.fee_tokens.peek(token)
             if pending <= 0 or now < next_time:
                 continue
             retry = (pending, now + STAKER_FEE_CONVERT_SECONDS)
@@ -2055,6 +2597,38 @@ class ExchangeStateManager:
                 }
             )
         return events
+
+    def _due_fee_tokens(self, now: Decimal) -> List[str]:
+        """The fee tokens whose conversion attempt is due by ``now``, in token order — from a
+        derived index by due time, never committed, kept up to date from the entries changed
+        since (as ``TradingState.due_cancels``). A token with no QRDX pool waits there for good:
+        visiting every one each block cost 1.9 ms at 10,000 (docs/EXCHANGE_AUDIT.md 9)."""
+        import bisect
+
+        entries = tracked(self.fee_tokens)
+        index = self.__dict__.get("_fee_index")
+        if index is None or entries.__dict__.get("_index_token") is not index["token"]:
+            index = {"token": [], "keys": {}, "due": []}
+            entries.track_changes()
+            entries.take_changes()
+            entries.__dict__["_index_token"] = index["token"]
+            changed: Iterable[str] = list(dict.keys(entries))
+            self.__dict__["_fee_index"] = index
+        else:
+            changed = entries.take_changes()
+        for token in changed:
+            old = index["keys"].pop(token, None)
+            if old is not None:
+                i = bisect.bisect_left(index["due"], old)
+                if i < len(index["due"]) and index["due"][i] == old:
+                    del index["due"][i]
+            v = entries.peek(token)
+            if v is not None:
+                key = (Decimal(v[1]), token)
+                bisect.insort(index["due"], key)
+                index["keys"][token] = key
+        due = index["due"]
+        return sorted(t for _at, t in due[: bisect.bisect_right(due, (now, "\U0010ffff"))])
 
     def _qrdx_twap(self, token: str, now: int) -> Optional[Decimal]:
         """QRDX per ``token`` over STAKER_FEE_TWAP_SECONDS, from its deepest QRDX pool (most
@@ -2351,8 +2925,8 @@ class ExchangeStateManager:
             tp_limit=tp[1],
             parent=parent,
         )
-        last = book.last_price
-        if last and trigger.crossed(Decimal(str(last))):
+        last = self.pair_price(pair)
+        if last and trigger.crossed(last):
             raise ValueError(f"the last price ({last}) has already reached a trigger price")
         return replace(trigger, escrowed=amount * trigger.price if side == "buy" else amount)
 
@@ -2365,6 +2939,18 @@ class ExchangeStateManager:
         self._refund_trigger(t, t.escrowed)
         return True
 
+    @staticmethod
+    def _fired_leg(t, last: Optional[Decimal]):
+        """The leg of a spot trigger that fires: the one a trade reached (``reached``), else the
+        one the pair's last price is past; None if neither."""
+        if t is None:
+            return None
+        if t.reached:
+            for leg in t.legs():
+                if leg[0] == t.reached:
+                    return leg
+        return t.crossed_leg(last) if last else None
+
     def _refund_trigger(self, t, amount: Decimal) -> None:
         if self.enforce_orderbook_settlement and amount > ZERO:
             base, quote = t.pair.split(":", 1)
@@ -2374,32 +2960,49 @@ class ExchangeStateManager:
                 quote if t.side == "buy" else base,
                 amount,
                 covered=True,
+                release=True,
             )
 
     @_pinned
     def fire_spot_triggers(self, now: Decimal) -> List[Dict[str, Any]]:
-        """The block's tick for spot triggers: those the pairs' last prices reached fire, the
-        price passed furthest first, then the first placed, within the block's limits. A pair
-        whose token is paused fires nothing (its triggers wait)."""
+        """The block's tick for spot triggers: those a trade reached since they were placed
+        (``reached``: even within a block, even if the price went back — a pool's trades
+        included), and those the pair's last price is past, fire — the price passed furthest
+        first, then the first placed, within the block's limits. A pair whose token is paused
+        fires nothing (its triggers wait)."""
         from .trading import SPOT_TRIGGER_FIRES_PER_BLOCK, SPOT_TRIGGER_MAKERS_PER_BLOCK
 
         if not len(self.trading.spot_triggers):
             return []
         queue = []
-        for pair in sorted(self._order_books):
-            last = self._order_books[pair].last_price
-            if not last or any(
+        # Only the pairs that hold triggers (walking every book cost 47 ms a block at 10,000
+        # pairs, with one trigger anywhere).
+        for pair in self.trading.trigger_pairs():
+            if pair not in self._order_books:
+                continue
+            raw = self._order_books[pair].last_price
+            reached = self.trading.reached(pair)
+            if (not raw and not reached) or any(
                 (t := self.tokens.get(tok)) is not None and t.paused for tok in pair.split(":", 1)
             ):
                 continue
-            last = Decimal(str(last))
-            for tid in self.trading.crossed(pair, last):
+            last = Decimal(str(raw)) if raw else None
+            hits = reached + (self.trading.crossed(pair, last) if last else [])
+            quotes = None  # (the pair's best bid and ask: once a pair, if a trigger waits)
+            for tid in dict.fromkeys(hits):
                 t = self.trading.spot_triggers.peek(tid)
-                leg = t.crossed_leg(last)
+                leg = self._fired_leg(t, last)
                 if leg is None or t.amount <= 0:  # (an attached TP/SL before its order fills)
                     continue
-                passed = abs(last - leg[1]) / last
-                queue.append(((-passed, t.seq, tid), pair, tid))
+                if t.waiting:  # fired, not filled whole: again once the market is in its band
+                    band = t.leg_price(leg[1], leg[2])
+                    if quotes is None:
+                        quotes = self.pair_quotes(pair)
+                    best = quotes[1] if t.side == "buy" else quotes[0]
+                    if best is None or (best > band if t.side == "buy" else best < band):
+                        continue
+                passed = abs(last - leg[1]) / last if last else ZERO
+                queue.append(((int(t.waiting), -passed, t.seq, tid), pair, tid))
         queue.sort()
         events: List[Dict[str, Any]] = []
         fired = makers = 0
@@ -2417,15 +3020,121 @@ class ExchangeStateManager:
             events.append(self._fire_spot_trigger(pair, tid, t))
         return events
 
+    @_pinned
+    def uncross_spot_books(self, now: Decimal) -> List[Dict[str, Any]]:
+        """The block's tick for resting spot orders a pool's price is past (liquidity added this
+        block at a price beyond them: docs/UNIFIED_SPOT_LIQUIDITY.md 4): each, best first, takes
+        from the pools up to its limit as a taker would — paying the pools' price out of its
+        own escrow, the difference back to its owner. At most SPOT_UNCROSS_ORDERS_PER_BLOCK a
+        block; the rest wait for the next."""
+        from .trading import SPOT_UNCROSS_ORDERS_PER_BLOCK
+
+        if not len(self.trading.uncross):
+            return []
+        events: List[Dict[str, Any]] = []
+        done = 0
+        for pair in sorted(k for k, _v in self.trading.uncross.peek_items()):
+            book = self._order_books.get(pair)
+            if book is None:
+                del self.trading.uncross[pair]
+                continue
+            if book.is_paused or any(
+                (t := self.tokens.get(tok)) is not None and t.paused for tok in pair.split(":", 1)
+            ):
+                continue  # (it waits)
+            finished = True
+            for buy in (True, False):
+                while True:
+                    if done >= SPOT_UNCROSS_ORDERS_PER_BLOCK:
+                        finished = False  # the rest wait for the next block
+                        break
+                    order = self._best_resting(book, buy)
+                    if order is None:
+                        break
+                    event = self._uncross_order(pair, book, order, buy)
+                    if event is None:
+                        break  # not crossed: neither is anything behind it
+                    done += 1
+                    events.append(event)
+                    if order.is_active:
+                        break  # the pools are at its limit now
+            if finished:
+                del self.trading.uncross[pair]
+        return events
+
+    @staticmethod
+    def _best_resting(book: OrderBook, bids: bool) -> Optional[Order]:
+        """The first resting order on one side in matching priority (best price, displayed
+        before hidden, then time)."""
+        levels = book._bids if bids else book._asks
+        for price in sorted(levels, reverse=bids):
+            queue = book.fill_queue(levels[price])
+            if queue:
+                return queue[0][0]
+        return None
+
+    def _uncross_order(self, pair: str, book: OrderBook, order: Order, buy: bool):
+        """Fill one resting order from the pools up to its limit; its event, or None if no pool
+        prices it (or the fill could not settle: it stays as it is)."""
+        pooled = self._pool_part(
+            self.router.plan_fill(
+                pair,
+                buy,
+                order.remaining,
+                exact_in=False,
+                limit=order.price,
+                sender=order.owner,
+                book=False,
+            )
+        )
+        if pooled is None:
+            return None
+        escrow = self.orderbook_escrow_address(pair)
+        quote = pair.split(":", 1)[1]
+        bracket = (
+            self.trading.bracket_of(order.id) if buy and len(self.trading.spot_triggers) else None
+        )
+        try:
+            with self._atomic(book, *self._pools_of(pooled)):
+                filled, paid, fills, _received = self._fill_from_pools(
+                    pair, pooled, order.owner, escrow, covered=True, bracket=bracket
+                )
+                book.fill_resting(order.id, filled)
+                if buy and self.enforce_orderbook_settlement:
+                    # Its escrow held its limit price for what filled; it paid the pools' price.
+                    refund = filled * order.price - paid
+                    if refund > 0:
+                        self._settle_token_move(escrow, order.owner, quote, refund, covered=True)
+                self._record_spot_prices(pair, pooled)
+        except Exception as e:  # noqa: BLE001 — deterministic on every node; never fails the block
+            if not isinstance(e, (ValueError, ArithmeticError)):
+                logger.error("uncrossing spot order %s failed unexpectedly: %r", order.id, e)
+            return None
+        return {
+            "type": "spot_uncross",
+            "pair": pair,
+            "order_id": order.id,
+            "owner": order.owner,
+            "side": "buy" if buy else "sell",
+            "amount": str(filled),
+            "paid": str(paid),
+            "fills": fills,
+            "resting": order.is_active,
+        }
+
     def _fire_spot_trigger(self, pair: str, tid: str, t) -> Dict[str, Any]:
-        """Place a reached trigger's order for its owner, settled out of its escrow; it is gone
-        either way, and what it did not use goes back to its owner."""
+        """Place a reached trigger's order for its owner, settled out of its escrow. A limit
+        trigger is gone after it (what it did not use goes back to its owner). A market trigger
+        that could not fill whole within its band keeps the rest waiting (``waiting``), its
+        escrow with it: it fires again at each tick the pair's price is back within the band —
+        a stop never disappears unfilled."""
         book = self._order_books[pair]
         base, quote = pair.split(":", 1)
         escrow = self.orderbook_escrow_address(pair)
         buy = t.side == "buy"
         event: Dict[str, Any] = {"pair": pair, "trigger_id": tid, "owner": t.owner}
-        leg = t.crossed_leg(Decimal(str(book.last_price))) or t.legs()[0]
+        last = Decimal(str(book.last_price)) if book.last_price else None
+        leg = self._fired_leg(t, last) or t.legs()[0]
         price = t.leg_price(leg[1], leg[2])
         order = Order(
             id=tid,
@@ -2438,11 +3147,28 @@ class ExchangeStateManager:
             timestamp=0.0,
             tif=t.tif if leg[2] > 0 else "ioc",
         )
+        # The pair's combined market: the pools fill what they price better than the book.
+        route = self.router.plan_fill(
+            pair,
+            buy,
+            t.amount,
+            exact_in=False,
+            limit=price,
+            sender=t.owner,
+            max_makers=t.max_makers,
+        )
+        pooled = self._pool_part(route)
+        pool_fills: List[Dict[str, Any]] = []
         try:
-            with undo.atomic():
+            with self._atomic(*self._pools_of(pooled)):
                 del self.trading.spot_triggers[tid]
-                trades = book.place_order(order, protocol=True, budget=MatchBudget(t.max_makers))
                 used = ZERO
+                if pooled is not None:
+                    filled, used, pool_fills, _received = self._fill_from_pools(
+                        pair, pooled, t.owner, escrow, covered=True
+                    )
+                    order.filled += filled
+                trades = book.place_order(order, protocol=True, budget=MatchBudget(t.max_makers))
                 settle = self.enforce_orderbook_settlement
                 for tr in trades:
                     f = Decimal(str(tr.amount))
@@ -2466,7 +3192,21 @@ class ExchangeStateManager:
                     self._record_spot_volume(trades, quote)
                 if order.is_active:  # resting: it keeps what its remainder escrows
                     used += order.remaining * order.price if buy else order.remaining
-                self._refund_trigger(t, t.escrowed - used)
+                waiting = leg[2] <= 0 and order.remaining >= book.min_order_size
+                if waiting:  # the rest waits, its escrow with it
+                    from dataclasses import replace
+
+                    self.trading.spot_triggers[tid] = replace(
+                        t,
+                        amount=order.remaining,
+                        escrowed=t.escrowed - used,
+                        reached=leg[0],
+                        waiting=True,
+                    )
+                else:
+                    self._refund_trigger(t, t.escrowed - used)
+                self._record_spot_prices(pair, pooled, prices=[tr.price for tr in trades], buy=buy)
+                self._flag_self_pass(pair, route)
         except Exception as e:  # noqa: BLE001 — deterministic on every node; never fails the block
             if not isinstance(e, (ValueError, ArithmeticError)):
                 logger.error("spot trigger %s failed unexpectedly: %r", tid, e)
@@ -2484,7 +3224,9 @@ class ExchangeStateManager:
             "kind": leg[0],
             "amount": str(t.amount),
             "price": str(price),
-            "fills": self._clob_fills(pair, trades, t.owner, t.side),
+            "filled": str(order.filled),
+            "waiting": waiting,
+            "fills": pool_fills + self._clob_fills(pair, trades, t.owner, t.side),
             "resting": order.is_active,
         }
 
@@ -2749,6 +3491,7 @@ class ExchangeStateManager:
                 t.token_in,
                 t.remaining,
                 covered=True,
+                release=True,
             )
         return True
 
@@ -2911,10 +3654,17 @@ class ExchangeStateManager:
         escrow = self.orderbook_escrow_address(pair)
         if order.side == OrderSide.BUY:
             self._settle_token_move(
-                escrow, order.owner, quote, amount * Decimal(str(order.price)), covered=covered
+                escrow,
+                order.owner,
+                quote,
+                amount * Decimal(str(order.price)),
+                covered=covered,
+                release=True,
             )
         else:
-            self._settle_token_move(escrow, order.owner, base, amount, covered=covered)
+            self._settle_token_move(
+                escrow, order.owner, base, amount, covered=covered, release=True
+            )
 
     def _op_modify_order(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Change a resting spot order in one step: what is left of it (``amount``) and its
@@ -2996,65 +3746,53 @@ class ExchangeStateManager:
         return placed
 
     def _op_create_market(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """Create a perp market — an order book in the clearinghouse (consensus path).
+        """List a token perp (docs/HYPERLIQUID_PARITY.md 13): a perp on an on-chain token, named
+        by its address (``token``; "QRDX" for QRDX itself), priced off the token's own spot
+        market and nothing else — no vote, no key sets its price. Anyone may list one, once per
+        token, while the token has a spot market to read: a path of pools to the settlement
+        asset with SPOT_ORACLE_TWAP_SECONDS of price history and SPOT_ORACLE_MIN_DEPTH of depth
+        (``spot_reading``). A market priced by the validators is listed at genesis
+        (PERP_GENESIS_MARKETS) or by governance (``list_market``), never here.
 
-        Maintenance margin is half the initial margin at ``max_leverage``; the old
-        ``initial_margin_rate`` / ``maintenance_margin_rate`` params are no longer read.
-        A duplicate market is a non-critical failure, not a block-breaking error. With the fee
-        gate on, the creator burns PERP_MARKET_LISTING_FEE QRDX: a market costs every node work
-        in every block, so listing one must not be nearly free.
-
-        ``liquidity`` (at least PERP_MARKET_MIN_LIQUIDITY of the creator's perps collateral)
-        seeds the market's liquidity vault, which the protocol quotes on its book from its first
-        tick with a price (``Clearinghouse._quote``); ``liquidity_profit_share`` (default 10 %)
-        is the creator's cut of others' gains in it. The creator's shares are locked for
-        PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS.
+        ``max_leverage`` is at most (and defaults to) PERP_SPOT_MAX_LEVERAGE; ``sz_decimals``
+        sets the order grid. With the fee gate on, the lister burns PERP_MARKET_LISTING_FEE QRDX:
+        a market costs every node work in every block. ``liquidity`` (at least
+        PERP_MARKET_MIN_LIQUIDITY of the lister's perps collateral) seeds the market's liquidity
+        vault, which the protocol quotes on its book; ``liquidity_profit_share`` (default 10 %)
+        is the lister's cut of others' gains in it. The lister's shares are locked for
+        PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS. A refusal is a non-critical failure.
         """
         from .. import constants
         from .clearinghouse import USER_VAULT_DEFAULT_PROFIT_SHARE, market_maker_address
 
         p = tx.params
-        base = str(p["base_token"])
-        quote = str(p.get("quote_token", constants.PERP_QUOTE))
-        deployer, fee_share, oracle_price = "", ZERO, ZERO
         try:
             liquidity = Decimal(str(p.get("liquidity", "0")))
             if not liquidity.is_finite() or liquidity < 0:
                 raise ValueError("liquidity must be a positive amount")
-            if ":" not in base and not constants.PERP_OPEN_LISTING:
-                # Whoever lists a validator-priced market chooses its settings (its maximum
-                # leverage, its grid) and takes its name for good: governance lists them.
+            token = self._token_perp_asset(str(p["token"]))
+            cap = Decimal(int(constants.PERP_SPOT_MAX_LEVERAGE))
+            max_leverage = Decimal(str(p.get("max_leverage", cap)))
+            if not max_leverage.is_finite() or max_leverage > cap:
+                raise ValueError(f"a token perp's maximum leverage is at most {cap}")
+            sz = p.get("sz_decimals", constants.PERP_DEFAULT_SZ_DECIMALS)
+            if isinstance(sz, bool) or not isinstance(sz, int):
+                raise ValueError("sz_decimals is a whole number")
+            mid = Clearinghouse.market_id(token, constants.PERP_QUOTE)
+            if mid in self.clearinghouse.markets:
+                raise ValueError(f"{token} already has its perp, {mid}")
+            now = Decimal(str(self._block_clock()))
+            price, depth, _path = self.spot_reading(token, now)
+            floor = Decimal(int(constants.SPOT_ORACLE_MIN_DEPTH))
+            if price is None or depth < floor:
                 raise ValueError(
-                    "a validator-priced market is listed by governance (list_market); a "
-                    "bonded deployer lists its own as dex:ASSET"
+                    f"{token} has no spot market to price a perp: it needs pools to the "
+                    f"settlement asset with {constants.SPOT_ORACLE_TWAP_SECONDS} seconds of "
+                    f"price history and {floor} of depth (within "
+                    f"{Decimal(int(constants.SPOT_ORACLE_DEPTH_BAND_BPS)) / 100}% of the price); "
+                    f"it has {depth}"
                 )
-            if ":" in base:
-                # A deployer market (docs/HYPERLIQUID_PARITY.md): ``dex:ASSET``, listed only by
-                # that namespace's bonded deployer, which runs its oracle. (The namespace keeps
-                # deployers' markets apart from the validator-priced ones.)
-                dex, _, asset = base.partition(":")
-                d = self.trading.deployers.peek(tx.sender)
-                if d is None or d.dex != dex or not asset or ":" in asset:
-                    raise ValueError(
-                        f"a market named {base} is listed by the deployer of the namespace {dex}"
-                    )
-                if d.bond < constants.DEPLOYER_MIN_BOND:
-                    raise ValueError(
-                        f"a deployer lists markets with {constants.DEPLOYER_MIN_BOND} QRDX bonded"
-                    )
-                if len(self.deployer_markets(tx.sender)) >= constants.DEPLOYER_MAX_MARKETS:
-                    raise ValueError(
-                        f"a deployer runs at most {constants.DEPLOYER_MAX_MARKETS} markets"
-                    )
-                bps = p.get("fee_share_bps", 0)
-                cap = min(int(constants.DEPLOYER_MAX_FEE_SHARE_BPS), 10_000)
-                if isinstance(bps, bool) or not isinstance(bps, int) or not 0 <= bps <= cap:
-                    raise ValueError(f"fee_share_bps is 0 to {cap}")
-                oracle_price = Decimal(str(p.get("oracle_price", "0")))
-                if not oracle_price.is_finite() or oracle_price <= 0:
-                    raise ValueError("a deployer market starts at its deployer's oracle_price")
-                deployer, fee_share = tx.sender, Decimal(bps) / 10_000
-        except (ValueError, ArithmeticError) as e:
+        except (KeyError, ValueError, ArithmeticError) as e:
             return ExchangeExecResult(success=False, error=str(e))
         if liquidity < constants.PERP_MARKET_MIN_LIQUIDITY:
             return ExchangeExecResult(
@@ -3072,28 +3810,16 @@ class ExchangeStateManager:
                     f"available {avail}",
                 )
         try:
-            # The order grid: sizes in ``sz_decimals`` decimals (docs/HYPERLIQUID_PARITY.md).
-            sz = p.get("sz_decimals", constants.PERP_DEFAULT_SZ_DECIMALS)
-            if isinstance(sz, bool) or not isinstance(sz, int):
-                raise ValueError("sz_decimals is a whole number")
-            extra: Dict[str, Any] = {}
-            if "max_leverage" in p:
-                extra["max_leverage"] = Decimal(str(p["max_leverage"]))
             market = self.clearinghouse.create_market(
-                base,
-                quote,
+                token,
+                constants.PERP_QUOTE,
+                max_leverage=max_leverage,
                 sz_decimals=sz,
-                deployer=deployer,
-                deployer_fee_share=fee_share,
-                **extra,
+                spot_token=token,
             )
-            if deployer:
-                self.clearinghouse.set_oracle_price(market.id, oracle_price, self._block_clock())
         except (ClearinghouseError, ValueError, ArithmeticError) as e:
             return ExchangeExecResult(success=False, error=str(e))
-        data: Dict[str, Any] = {"market_id": market.id}
-        if deployer:
-            data["deployer"] = deployer
+        data: Dict[str, Any] = {"market_id": market.id, "token": token}
         if liquidity > 0:
             vault = market_maker_address(market.id)
             try:
@@ -3140,7 +3866,14 @@ class ExchangeStateManager:
         return "0xCLOB" + hashlib.blake2b(f"book:{pair}".encode(), digest_size=18).hexdigest()
 
     def _settle_token_move(
-        self, frm: str, to: str, token: str, amount: Decimal, *, covered: bool = False
+        self,
+        frm: str,
+        to: str,
+        token: str,
+        amount: Decimal,
+        *,
+        covered: bool = False,
+        release: bool = False,
     ) -> None:
         """Phase E spot: record a token move frm→to as paired deltas (no-op for 0). Raises if
         ``frm`` — a trader, a pool's holder or a book's escrow — cannot cover it, so the
@@ -3151,13 +3884,17 @@ class ExchangeStateManager:
         — a book's escrow what an order escrowed there, a pool's holder its reserves — in the
         block's tick (a fired trigger, a TWAP slice). That record is its cover, not a balance
         loaded for the block: the tick runs on blocks for which no balance is loaded, so a check
-        of one would judge the same move differently on different paths."""
+        of one would judge the same move differently on different paths.
+
+        ``release``: funds a protocol holder of many accounts' funds hands back to their owner (a
+        liquidity withdrawal, an escrow's refund). A paused token still goes back — a pause stops
+        trading, not exits; otherwise one token's issuer could lock a pool's other token."""
         if amount and amount > ZERO:
             if not is_native_asset(token):
                 if self.tokens.is_frozen(token, frm):
                     raise ValueError(f"{frm[:16]}…'s {token[:12]}… balance is frozen")
                 t = self.tokens.get(token)
-                if t is not None and t.paused:
+                if t is not None and t.paused and not release:
                     raise ValueError(f"{t.symbol} is paused")
             avail = None if covered else self.available_token_balance(frm, token)
             if covered:
@@ -3264,9 +4001,28 @@ class ExchangeStateManager:
 
     def _op_token_transfer(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Move tokens from the sender to ``to`` in the token ledger (less any transfer fee),
-        with an optional ``memo``."""
+        with an optional ``memo``. ``token_address`` "QRDX" moves native QRDX: how an account
+        whose own key is off (or an ECDSA account after the Doomsday Protocol) moves its QRDX,
+        signed by its controller."""
         p = tx.params
         to = str(p["to"])
+        if is_native_asset(p["token_address"]):
+            try:
+                note = token_memo(p.get("memo"))
+                v = token_amount(p["amount"])
+                token_account(to)
+                avail = self.available_token_balance(tx.sender, "QRDX")
+                if avail is None or avail < v:
+                    raise ValueError(f"insufficient QRDX: need {v}, available {avail}")
+                self._settle_token_move(tx.sender, to, "QRDX", v)
+            except (TokenError, ValueError, ArithmeticError) as e:
+                return ExchangeExecResult(success=False, error=f"TOKEN_TRANSFER: {e}")
+            data = {"token_address": "QRDX", "to": to, "amount": str(v)}
+            if note:
+                data["memo"] = note
+            return ExchangeExecResult(
+                success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER], data=data
+            )
         try:
             note = token_memo(p.get("memo"))
             t, v, fee = self._token_move(
@@ -3286,7 +4042,13 @@ class ExchangeStateManager:
 
     def _spend_authority(self, t, owner: str, spender: str, v: Decimal) -> str:
         """How ``spender`` may move ``owner``'s tokens: as the permanent delegate, as an
-        operator (ERC-777), or within an allowance. Raises TokenError if none."""
+        operator (ERC-777), or within an allowance. Raises TokenError if none — and always for
+        a protocol holder of many accounts' funds (``holds_pooled_funds``): no one moves those
+        but the protocol."""
+        from ..crypto.account_id import holds_pooled_funds
+
+        if holds_pooled_funds(owner):
+            raise TokenError("tokens the protocol holds for many accounts move only by its rules")
         if self.tokens.is_permanent_delegate(t.address, spender):
             return "permanent_delegate"
         if self.tokens.is_operator(t.address, owner, spender):
@@ -3355,6 +4117,12 @@ class ExchangeStateManager:
             t = self.tokens.require(str(p["token_address"]))
             v = token_amount(p["amount"])
             via = "holder"
+            from ..crypto.account_id import holds_pooled_funds
+
+            if holds_pooled_funds(holder):
+                raise TokenError(
+                    "tokens the protocol holds for many accounts move only by its rules"
+                )
             if token_account(holder) != token_account(tx.sender):
                 if self.tokens.is_permanent_delegate(t.address, tx.sender):
                     via = "permanent_delegate"
@@ -3982,9 +4750,11 @@ class ExchangeStateManager:
                 result.update(self._delist_market(result["market_id"], result.get("price")))
             if result.get("executed") and result.get("action") == "list_market":
                 result.update(self._list_market(result))
-            if result.get("executed") and result.get("action") == "slash_deployer":
-                result.update(
-                    self._slash_deployer(result["deployer"], result["bps"], result["halt"])
+            if result.get("executed") and result.get("action") == "bridge_mint_pause":
+                self.bridge.set_mint_paused(result["paused"], self._current_block_height)
+            if result.get("executed") and result.get("action") == "declare_quantum_emergency":
+                result["doomsday"] = self._trigger_doomsday(
+                    f"governance proposal {p.id}: {result['reason']}"
                 )
             self._release_vetoes(refunds)
             return {"proposal_id": p.id, "status": p.status, **result}
@@ -4246,7 +5016,7 @@ class ExchangeStateManager:
                 name=name,
                 tid=tid,
             )
-            record = NameRecord(expires=now + years * YEAR_SECONDS, target=target)
+            record = NameRecord(expires=now + years * YEAR_SECONDS, target=target, holder=tx.sender)
             svc.names[name] = record  # (a reclaimed name's old records go with it)
         except (ValueError, KeyError, NftError, TokenError) as e:
             return ExchangeExecResult(success=False, error=str(e))
@@ -4310,8 +5080,9 @@ class ExchangeStateManager:
         now = Decimal(str(self._block_clock()))
         try:
             name = normalize(p["name"])
-            r = self.qns.record(name)
-            if r is None or self.qns.owner(self.nfts, name) is None or now >= r.expires:
+            # As its present owner holds them: an earlier owner's are cleared (qns.current).
+            r = self.qns.current(self.nfts, name)
+            if r is None or now >= r.expires:
                 raise QnsError(f"{name} is not registered (or has expired)")
             if not self.nfts.may_spend(QNS_COLLECTION, name_token_id(name), tx.sender):
                 raise QnsError(f"only {name}'s owner (or an account it approved) sets its records")
@@ -4666,11 +5437,14 @@ class ExchangeStateManager:
 
     @staticmethod
     def reserved_tickers() -> Set[str]:
-        """Tickers no one buys: the native asset's, the perps quote's, and every bridged
+        """Tickers no one buys: the native asset's, the perps quote's, the genesis perp markets'
+        (a token named BTC would pass for the BTC the validators price), and every bridged
         asset's — bound to the bridge's own token when it is created (``_mint_deposit``)."""
         from .. import constants
 
         out = {"QRDX", str(constants.PERP_QUOTE).upper()}
+        for entry in constants.PERP_GENESIS_MARKETS:
+            out.add(str(entry).split(":", 1)[0].upper())
         for entry in constants.BRIDGE_ASSETS:
             out.add(str(entry).split(":", 1)[0].upper())
         return out
@@ -4743,289 +5517,151 @@ class ExchangeStateManager:
             data={"ticker": ticker, "token_address": t.address, "price": str(price)},
         )
 
-    # ── deployer markets (docs/HYPERLIQUID_PARITY.md, Hyperliquid's HIP-3) ──
-
-    @staticmethod
-    def deployer_bond_address() -> str:
-        """The protocol holder of market deployers' QRDX bonds (a synthetic holder, like 0xVETO)."""
-        return "0xDBND" + hashlib.blake2b(b"deployers:bond-holder", digest_size=18).hexdigest()
-
-    def deployer_markets(self, deployer: str) -> List[str]:
-        """The markets ``deployer`` runs: listed by it, not settled."""
-        return sorted(
-            mid
-            for mid, m in self.clearinghouse.markets.items()
-            if m.deployer == deployer and m.settled_price <= 0
-        )
-
-    @staticmethod
-    def _qrdx_amount(raw: Any) -> Decimal:
-        amount = Decimal(str(raw))
-        if not amount.is_finite() or amount <= 0:
-            raise ValueError("amount must be a positive amount of QRDX")
-        return amount.quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
-
-    def _op_deployer_bond(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """Bond ``amount`` QRDX as a market deployer. The first bond names the deployer's
-        namespace (``dex``: 1 to 8 lowercase letters and digits, a letter first), which its
-        markets are listed under (``dex:ASSET``) and which stays its own for good."""
-        from dataclasses import replace
-
-        from .trading import Deployer
-
-        p = tx.params
-        try:
-            amount = self._qrdx_amount(p["amount"])
-            d = self.trading.deployers.peek(tx.sender)
-            if d is None:
-                dex = str(p.get("dex", ""))
-                if not re.fullmatch(r"[a-z][a-z0-9]{0,7}", dex):
-                    raise ValueError(
-                        "a deployer's first bond names its namespace (dex): 1 to 8 lowercase "
-                        "letters and digits, a letter first"
-                    )
-                if any(other.dex == dex for _a, other in self.trading.deployers.peek_items()):
-                    raise ValueError(f"the namespace {dex} is taken")
-                d = Deployer(dex=dex, bond=ZERO)
-            elif p.get("dex") not in (None, d.dex):
-                raise ValueError(f"this deployer's namespace is {d.dex}")
-            avail = self.available_balance(tx.sender)
-            if avail is None or avail < amount:
-                raise ValueError(f"insufficient QRDX to bond: need {amount}, available {avail}")
-        except (ValueError, ArithmeticError) as e:
-            return ExchangeExecResult(success=False, error=str(e))
-        self._record_balance_delta(tx.sender, -amount)
-        self._record_balance_delta(self.deployer_bond_address(), amount)
-        self.trading.deployers[tx.sender] = replace(d, bond=d.bond + amount)
-        return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.DEPLOYER_BOND],
-            data={"dex": d.dex, "bond": str(d.bond + amount)},
-        )
-
-    def _op_deployer_unbond(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """Start unbonding ``amount`` (claimable DEPLOYER_UNBOND_SECONDS after the latest start,
-        and slashable until then), or ``claim`` what has unbonded. A deployer that runs markets
-        keeps at least DEPLOYER_MIN_BOND bonded."""
-        from dataclasses import replace
-
-        from .. import constants
-
-        p = tx.params
-        now = Decimal(str(self._block_clock()))
-        d = self.trading.deployers.peek(tx.sender)
-        try:
-            if d is None:
-                raise ValueError("not a market deployer")
-            if p.get("claim"):
-                if d.unbonding <= 0 or now < d.unlock:
-                    raise ValueError(
-                        "nothing has unbonded yet"
-                        + (f" (claimable at block time {d.unlock})" if d.unbonding > 0 else "")
-                    )
-                claimed = d.unbonding
-                self._record_balance_delta(self.deployer_bond_address(), -claimed)
-                self._record_balance_delta(tx.sender, claimed)
-                self.trading.deployers[tx.sender] = replace(d, unbonding=ZERO, unlock=ZERO)
-                data: Dict[str, Any] = {"claimed": str(claimed)}
-            else:
-                amount = self._qrdx_amount(p["amount"])
-                if amount > d.bond:
-                    raise ValueError(f"only {d.bond} is bonded")
-                left = d.bond - amount
-                if self.deployer_markets(tx.sender) and left < constants.DEPLOYER_MIN_BOND:
-                    raise ValueError(
-                        f"a deployer running markets keeps {constants.DEPLOYER_MIN_BOND} bonded"
-                    )
-                unlock = now + Decimal(constants.DEPLOYER_UNBOND_SECONDS)
-                self.trading.deployers[tx.sender] = replace(
-                    d, bond=left, unbonding=d.unbonding + amount, unlock=unlock
-                )
-                data = {"unbonding": str(d.unbonding + amount), "unlock": str(unlock)}
-        except (ValueError, ArithmeticError) as e:
-            return ExchangeExecResult(success=False, error=str(e))
-        return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.DEPLOYER_UNBOND], data=data
-        )
-
-    def _deployer_market(self, tx: ExchangeTransaction) -> Tuple[str, Any]:
-        """The live, unfrozen market of the sender's that ``tx`` names (ValueError otherwise)."""
-        mid = str(tx.params["market_id"])
-        m = self.clearinghouse.markets.get(mid)
-        if m is None or not m.deployer or m.deployer != tx.sender:
-            raise ValueError(f"{mid} is not a market this account deployed")
-        if m.settled_price > 0:
-            raise ValueError(f"{mid} is settled")
-        if Clearinghouse.frozen(m, self._block_clock()):
-            raise ValueError(
-                f"the validators have frozen {mid} (until block time {m.frozen_until}): its "
-                "oracle is theirs, and only governance settles it"
-            )
-        return mid, m
-
-    def _op_deployer_set_oracle(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """The deployer's oracle price for one of its markets: once a block time, moved at most
-        DEPLOYER_ORACLE_MAX_STEP_BPS a second since the last (counting at most 10 seconds) —
-        a price further away is applied at the bound. The market's price band, circuit breaker
-        and the validators' freeze watch it as any market."""
-        from .. import constants
-
-        now = Decimal(str(self._block_clock()))
-        try:
-            mid, m = self._deployer_market(tx)
-            price = Decimal(str(tx.params["price"]))
-            if not price.is_finite() or price <= 0:
-                raise ValueError("the oracle price must be positive")
-            if m.oracle_time >= now:
-                raise ValueError(f"{mid}'s oracle is set at most once a block time")
-            step = Decimal(int(constants.DEPLOYER_ORACLE_MAX_STEP_BPS)) / 10_000
-            prev, prev_time = m.oracle_price, m.oracle_time
-            if step > 0 and prev > 0 and prev_time > 0:
-                bound = step * min(now - prev_time, Decimal(10))
-                lo, hi = prev * (1 - min(bound, Decimal("0.99"))), prev * (1 + bound)
-                price = min(max(price, lo), hi)
-            price = price.quantize(Decimal(1).scaleb(-18))
-            self.clearinghouse.set_oracle_price(mid, price, now)
-        except (ValueError, ArithmeticError, ClearinghouseError) as e:
-            return ExchangeExecResult(success=False, error=str(e))
-        return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.DEPLOYER_SET_ORACLE],
-            data={"market_id": mid, "price": str(price)},
-        )
-
-    def _op_deployer_halt(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        """The deployer settles one of its markets for good, at its oracle price (as a passed
-        ``delist_market`` does). Not while the validators hold it frozen."""
-        try:
-            mid, _m = self._deployer_market(tx)
-            settled = self._delist_market(mid, None)
-        except (ValueError, GovernanceError) as e:
-            return ExchangeExecResult(success=False, error=str(e))
-        return ExchangeExecResult(
-            success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.DEPLOYER_HALT], data=settled
-        )
-
     def _list_market(self, listing: Dict[str, Any]) -> Dict[str, Any]:
-        """A passed ``list_market``: a validator-priced market with the settings the proposal
-        named. A refusal (the market exists, a setting out of bounds) fails the execution."""
+        """A passed ``list_market``: a market the validators price (an off-chain asset, by its
+        symbol), with the settings the proposal named. A refusal (the market exists, a setting
+        out of bounds) fails the execution."""
         from .. import constants
 
         try:
-            spot_token, spot_pools = str(listing.get("spot_token") or ""), ()
-            if spot_token.upper() == "QRDX":
-                spot_token = "QRDX"  # (the native asset, as pools name it)
-            max_leverage = Decimal(str(listing.get("max_leverage", "20")))
-            if spot_token:
-                spot_pools = tuple(listing.get("spot_pools") or ())
-                self._check_spot_listing(str(listing["base_token"]), spot_token, spot_pools)
-                cap = Decimal(int(constants.PERP_SPOT_MAX_LEVERAGE))
-                if "max_leverage" not in listing:
-                    max_leverage = min(max_leverage, cap)
-                if max_leverage > cap:
-                    raise ValueError(f"a native-token market's maximum leverage is at most {cap}")
             m = self.clearinghouse.create_market(
                 str(listing["base_token"]),
                 constants.PERP_QUOTE,
-                max_leverage=max_leverage,
+                max_leverage=Decimal(str(listing.get("max_leverage", "20"))),
                 sz_decimals=int(listing.get("sz_decimals", constants.PERP_DEFAULT_SZ_DECIMALS)),
-                spot_token=spot_token,
-                spot_pools=spot_pools,
             )
         except (ClearinghouseError, ValueError, ArithmeticError) as e:
             raise GovernanceError(str(e)) from None
         return {"market_id": m.id}
 
-    # ── native-token perps (docs/HYPERLIQUID_PARITY.md 13) ──
+    @_pinned
+    def create_genesis_markets(self) -> List[str]:
+        """The markets every network starts with (PERP_GENESIS_MARKETS), priced by the
+        validators: created by the first block every path processes, so a rebuild from genesis
+        creates them where the network did. A market already there is left as it is (a market is
+        never removed — a delisted one stays settled). Returns those created."""
+        from .. import chain_spec, constants
 
-    def _check_spot_listing(self, base: str, token: str, pools: Tuple[str, ...]) -> None:
-        """A native-token market's listing: the token holds ``base`` as its unique ticker (its
-        name cannot be anyone else's), and ``pools`` lead from it to the settlement asset. QRDX
-        itself may be one — ``spot_token`` "QRDX", listed as QRDX — priced off its pools to a
-        stablecoin settlement asset."""
-        settlement = self._settlement_asset()
-        if str(token).upper() == "QRDX":
-            if base.upper() != "QRDX":
-                raise ValueError("QRDX's market is listed as QRDX")
-            if settlement == "QRDX":
-                raise ValueError("perps settle in QRDX here: QRDX has no price in itself")
-            start = "QRDX"
+        created = []
+        for entry in constants.PERP_GENESIS_MARKETS:
+            base, leverage, sz = chain_spec.parse_genesis_market(entry)
+            if Clearinghouse.market_id(base, constants.PERP_QUOTE) in self.clearinghouse.markets:
+                continue
+            m = self.clearinghouse.create_market(
+                base, constants.PERP_QUOTE, max_leverage=Decimal(leverage), sz_decimals=sz
+            )
+            created.append(m.id)
+        return created
+
+    # ── token perps (docs/HYPERLIQUID_PARITY.md 13) ──
+
+    def _token_perp_asset(self, raw: str) -> str:
+        """The on-chain asset ``raw`` names, as spot pools name it: a native token's address
+        (canonical), or "QRDX" — by address only, never by symbol, and never the settlement
+        asset itself (it has no price in itself)."""
+        if raw.strip().upper() == "QRDX":
+            asset = "QRDX"
         else:
-            t = self.tokens.get(token)
+            t = self.tokens.get(raw.strip())
             if t is None:
-                raise ValueError(f"no native token {token}")
-            if self.ticker_of(t.address) != base.upper():
-                raise ValueError(f"{base} is not {t.address}'s ticker: list it by its ticker")
-            start = t.address
-        if self._spot_path_end(start, pools) != settlement:
-            raise ValueError("the spot pools must lead from the token to the settlement asset")
+                raise ValueError(
+                    f"no on-chain token at {raw}: a token perp names its token by address"
+                )
+            asset = t.address
+        if asset == self._settlement_asset():
+            raise ValueError("perps settle in this asset: it has no price in itself")
+        return asset
 
     def _settlement_asset(self) -> str:
         """The perps settlement asset as spot pools name it ("QRDX", or a token address)."""
         token = self.perp_collateral_token()
         return "QRDX" if token.upper() == "QRDX" else self.canonical_asset(token)
 
-    def _spot_path_end(self, start: str, pools: Tuple[str, ...]) -> Optional[str]:
-        """Where ``pools`` lead from ``start`` (None if a pool is missing or not on the way)."""
-        current = start
-        for pid in pools:
-            pool = self.pool_manager.get_pool(pid)
-            if pool is None or current not in (pool.state.token0, pool.state.token1):
-                return None
-            current = pool.state.token1 if pool.state.token0 == current else pool.state.token0
-        return current
+    def _spot_paths(self, start: str) -> List[Tuple[str, ...]]:
+        """Every path of pools from ``start`` to the settlement asset: a pool between the two,
+        or two through QRDX (QRDX's pools are where liquidity gathers). Sorted."""
+        settlement = self._settlement_asset()
+        pm = self.pool_manager
+        paths: List[Tuple[str, ...]] = [
+            (pool.state.id,) for pool in pm.get_pools_for_pair(start, settlement)
+        ]
+        if "QRDX" not in (start, settlement):
+            for a in pm.get_pools_for_pair(start, "QRDX"):
+                for b in pm.get_pools_for_pair("QRDX", settlement):
+                    paths.append((a.state.id, b.state.id))
+        return sorted(paths)
 
-    def _spot_reading(self, m, now: Decimal) -> Tuple[Optional[Decimal], Decimal]:
-        """(price, depth) of a native-token market's spot market now, in the settlement asset:
-        the price the TWAP over SPOT_ORACLE_TWAP_SECONDS along its pools (None without that much
-        history), the depth the smallest of the pools' virtual reserves on the way out, each in
-        the settlement asset."""
+    def _path_reading(
+        self, start: str, path: Tuple[str, ...], now: Decimal
+    ) -> Tuple[Optional[Decimal], Decimal]:
+        """(price, depth) along ``path`` from ``start``, in the settlement asset: the price the
+        product of each pool's TWAP over SPOT_ORACLE_TWAP_SECONDS (None if a pool has not that
+        much history, or is paused), the depth the least of the pools' — each pool's the smaller
+        of what moving its price SPOT_ORACLE_DEPTH_BAND_BPS up or down takes (``band_depth``),
+        valued onward at the TWAPs."""
         from .. import constants
-        from .amm import Q96
 
         window, at = int(constants.SPOT_ORACLE_TWAP_SECONDS), int(now)
-        current, prices, reserves = m.spot_token, [], []
-        for pid in m.spot_pools:
+        band = Decimal(int(constants.SPOT_ORACLE_DEPTH_BAND_BPS)) / 10_000
+        current, prices, depths = start, [], []
+        for pid in path:
             pool = self.pool_manager.get_pool(pid)
-            if pool is None or current not in (pool.state.token0, pool.state.token1):
+            if (
+                pool is None
+                or pool.is_paused
+                or current
+                not in (
+                    pool.state.token0,
+                    pool.state.token1,
+                )
+            ):
                 return None, ZERO
             st = pool.state
             forward = st.token0 == current
             twap = pool.twap_price(window, at)
-            prices.append(None if not twap or twap <= 0 else (twap if forward else 1 / twap))
-            root = st.sqrt_price / Q96
-            if root <= 0 or st.liquidity <= 0:
-                reserves.append(ZERO)
-            else:  # virtual reserves: token0 L/√P, token1 L·√P — the side the path leaves by
-                reserves.append(st.liquidity * root if forward else st.liquidity / root)
+            if not twap or twap <= 0:
+                return None, ZERO
+            up1, down0 = pool.band_depth(band)
+            depth1 = min(up1, down0 * twap)  # in token1
+            prices.append(twap if forward else 1 / twap)
+            depths.append(depth1 if forward else depth1 / twap)  # in the token it leaves by
             current = st.token1 if forward else st.token0
-        if current != self._settlement_asset():
+        if current != self._settlement_asset() or not path:
             return None, ZERO
         depth: Optional[Decimal] = None
-        for i, reserve in enumerate(reserves):
-            onward = Decimal(1)
-            for p in prices[i + 1 :]:
-                if p is None:
-                    onward = ZERO
-                    break
-                onward *= p
-            value = reserve * onward
-            depth = value if depth is None else min(depth, value)
-        price: Optional[Decimal] = Decimal(1)
-        for p in prices:
-            if p is None:
-                price = None
-                break
-            price = price * p if price is not None else None
+        for i, d in enumerate(depths):
+            for onward in prices[i + 1 :]:
+                d *= onward
+            depth = d if depth is None else min(depth, d)
+        price = Decimal(1)
+        for x in prices:
+            price *= x
         return price, (depth or ZERO).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
+
+    def spot_reading(
+        self, token: str, now: Decimal
+    ) -> Tuple[Optional[Decimal], Decimal, Tuple[str, ...]]:
+        """A token's spot market now, as its perp reads it: (price, depth, path) along the
+        deepest path of pools to the settlement asset that has a price (``_path_reading``; ties:
+        the first path in order). Whatever pool is deepest when read: no one's choice of pools
+        to list on, so a perp listed while the token traded thinly follows it to deeper pools.
+        A new pool counts only once it has a TWAP's history, and outweighing the others takes
+        real capital held near the price: it is what pricing the perp costs."""
+        best: Tuple[Optional[Decimal], Decimal, Tuple[str, ...]] = (None, ZERO, ())
+        for path in self._spot_paths(token):
+            price, depth = self._path_reading(token, path, now)
+            if price is not None and (best[0] is None or depth > best[1]):
+                best = (price, depth, path)
+        return best
 
     @_pinned
     def update_spot_oracles(self, now: Decimal) -> List[Dict[str, Any]]:
-        """Each block, before the clearinghouse's tick: every live native-token market reads its
-        spot market. Its depth at most doubles over SPOT_ORACLE_TWAP_SECONDS (falls at once), so
-        liquidity added for a block raises no cap. Its oracle is the TWAP, moved at most ORACLE_MAX_STEP_BPS a second — only while
-        the depth is at least SPOT_ORACLE_MIN_DEPTH; otherwise it goes stale, and the market
-        takes only reduce-only orders. Not while the validators hold the market frozen."""
+        """Each block, before the clearinghouse's tick: every live token perp reads its spot
+        market (``spot_reading``). Its depth at most doubles over SPOT_ORACLE_TWAP_SECONDS (falls
+        at once), so liquidity added for a block raises no cap. Its oracle is the TWAP, moved at
+        most ORACLE_MAX_STEP_BPS a second — only while the depth is at least
+        SPOT_ORACLE_MIN_DEPTH; otherwise it goes stale, and the market takes only reduce-only
+        orders."""
         from .. import constants
 
         now = Decimal(str(now))
@@ -5035,9 +5671,9 @@ class ExchangeStateManager:
         events: List[Dict[str, Any]] = []
         for mid in sorted(ch.markets):
             m = ch.markets[mid]
-            if not m.spot_token or m.settled_price > 0 or Clearinghouse.frozen(m, now):
+            if not m.spot_token or m.settled_price > 0:
                 continue
-            price, depth = self._spot_reading(m, now)
+            price, depth, path = self.spot_reading(m.spot_token, now)
             if depth > m.spot_depth:
                 # Up at most doubling over SPOT_ORACLE_TWAP_SECONDS (from SPOT_ORACLE_MIN_DEPTH
                 # at the first reading), down at once: liquidity added for a moment, however
@@ -5055,35 +5691,10 @@ class ExchangeStateManager:
                 price = min(max(price, lo), hi)
             if price is not None:
                 price = price.quantize(Decimal(1).scaleb(-18))
-            ch.set_spot_reading(mid, price, depth, now)
+            ch.set_spot_reading(mid, price, depth, now, path)
             if price is None:
                 events.append({"type": "spot_oracle_waiting", "market": mid, "depth": str(depth)})
         return events
-
-    def _slash_deployer(self, deployer: str, bps: int, halt: bool) -> Dict[str, Any]:
-        """A passed ``slash_deployer``: ``bps`` of the deployer's bond — what is unbonding too —
-        burned, and with ``halt`` every market it runs settled at its oracle price (a frozen
-        market's oracle is the validators')."""
-        from dataclasses import replace
-
-        d = self.trading.deployers.peek(deployer)
-        if d is None:
-            raise GovernanceError(f"{deployer} is not a market deployer")
-        share = Decimal(int(bps)) / 10_000
-        cut_bond = (d.bond * share).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
-        cut_unbonding = (d.unbonding * share).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
-        burned = cut_bond + cut_unbonding
-        self.trading.deployers[deployer] = replace(
-            d, bond=d.bond - cut_bond, unbonding=d.unbonding - cut_unbonding
-        )
-        if burned > 0:
-            self._record_balance_delta(self.deployer_bond_address(), -burned)  # burned
-        settled = []
-        if halt:
-            for mid in self.deployer_markets(deployer):
-                self._delist_market(mid, None)
-                settled.append(mid)
-        return {"burned": str(burned), "settled": settled}
 
     def _op_approve_builder_fee(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Let ``builder`` (a front-end) charge up to ``max_fee_rate`` of the notional of the fills
@@ -5263,8 +5874,6 @@ class ExchangeStateManager:
 
     def _reduce_only_reason(self, m) -> str:
         """Why ``m`` takes only reduce-only orders now (``_perp_oracle_stale``)."""
-        if Clearinghouse.frozen(m, self._block_clock()):
-            return f"the validators have frozen {m.id}: only reduce-only orders are accepted"
         if self.clearinghouse.halted(m):
             return f"{m.id}'s circuit breaker has tripped: only reduce-only orders are accepted"
         return f"the oracle for {m.id} is stale; only reduce-only orders are accepted"
@@ -5630,58 +6239,6 @@ class ExchangeStateManager:
             success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.PERP_CANCEL]
         )
 
-    def _op_update_oracle(self, tx: ExchangeTransaction) -> ExchangeExecResult:
-        p = tx.params
-        pair = p["pair"]
-        price = Decimal(str(p["price"]))
-        # The oracle price is what perps execute, settle and liquidate at — so only an
-        # authorized reporter may set it (constants.ORACLE_REPORTERS). Unrestricted, any
-        # user could move the price their own position closes at.
-        from .. import constants
-
-        if tx.sender.lower() not in {a.lower() for a in constants.ORACLE_REPORTERS}:
-            return ExchangeExecResult(
-                success=False, error="sender is not an authorized oracle reporter"
-            )
-        if not price.is_finite() or price <= 0:
-            return ExchangeExecResult(success=False, error="oracle price must be positive")
-        base, _, quote = pair.partition(":")
-        market_id = Clearinghouse.market_id(base, quote or constants.PERP_QUOTE)
-        m = self.clearinghouse.markets.get(market_id)
-        if m is not None and Clearinghouse.contained(m):
-            return ExchangeExecResult(
-                success=False, error=f"{market_id} is not priced by reporters or votes"
-            )
-        if m is not None:
-            # As the validators' oracle walks (``_aggregate_votes``): at most ORACLE_MAX_STEP_BPS
-            # a second of block time from the last price — a reporter cannot jump it either.
-            step = Decimal(int(constants.ORACLE_MAX_STEP_BPS)) / 10_000
-            now = Decimal(str(self._block_clock()))
-            prev, prev_time = m.oracle_price, m.oracle_time
-            if step > 0 and prev > 0 and prev_time > 0 and now > prev_time:
-                bound = step * (now - prev_time)
-                lo, hi = prev * (1 - min(bound, Decimal("0.99"))), prev * (1 + bound)
-                price = min(max(price, lo), hi).quantize(Decimal(1).scaleb(-18))
-
-        oracle = self._oracles.get(pair)
-        if oracle is None:
-            # Auto-create oracle for new pairs
-            oracle = TWAPOracle(pool_id=pair)
-            self._oracles[pair] = oracle
-            self.router.register_oracle(pair, oracle)
-
-        oracle.record(price, timestamp=self._current_block_timestamp)
-
-        # Price the perp market that tracks this pair: "BTC:USD" → BTC-USD-PERP.
-        if m is not None:
-            self.clearinghouse.set_oracle_price(market_id, price, self._block_clock())
-
-        return ExchangeExecResult(
-            success=True,
-            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.UPDATE_ORACLE],
-            data={"pair": pair, "price": str(price)},
-        )
-
     # =====================================================================
     #  Validator price oracle (docs/PERPS_CLEARINGHOUSE.md §8)
     # =====================================================================
@@ -5726,11 +6283,6 @@ class ExchangeStateManager:
         prices = tx.params.get("prices", {})
         deposits_raw = tx.params.get("deposits", [])
         heads_raw = tx.params.get("heads", [])
-        freeze_raw = tx.params.get("freeze", [])
-        if not isinstance(freeze_raw, list) or len(freeze_raw) > MAX_VOTE_FREEZES:
-            return ExchangeExecResult(
-                success=False, error=f"a vote freezes at most {MAX_VOTE_FREEZES} markets"
-            )
         if not isinstance(deposits_raw, list) or len(deposits_raw) > MAX_VOTE_DEPOSITS:
             return ExchangeExecResult(
                 success=False, error=f"a vote attests at most {MAX_VOTE_DEPOSITS} deposits"
@@ -5742,7 +6294,7 @@ class ExchangeStateManager:
         if (
             not isinstance(prices, dict)
             or len(prices) > self.MAX_VOTE_PRICES
-            or not (prices or deposits_raw or heads_raw or freeze_raw)
+            or not (prices or deposits_raw or heads_raw)
         ):
             return ExchangeExecResult(
                 success=False,
@@ -5780,56 +6332,65 @@ class ExchangeStateManager:
             if not price.is_finite() or price <= 0:
                 return ExchangeExecResult(success=False, error=f"invalid price for {base}")
             m = self.clearinghouse.markets[market_id]
-            if Clearinghouse.contained(m) and not Clearinghouse.frozen(m, self._block_clock()):
-                # Its deployer prices it until the validators freeze it. Skipped, not refused: a
-                # freeze can lapse between a vote and its block, and the rest of the vote stands.
+            if Clearinghouse.contained(m):
+                # A token perp: its spot market prices it, never votes. Skipped, not refused —
+                # the rest of the vote stands.
                 ignored.append(str(key))
                 continue
             (perp if is_perp else parsed)[market_id] = price
-        freezes = []
-        for raw in freeze_raw:
-            target = self.clearinghouse.markets.get(str(raw))
-            if target is None or not Clearinghouse.contained(target) or target.settled_price > 0:
-                ignored.append(f"freeze:{raw}")  # (settled since the vote, say)
-                continue
-            freezes.append(target.id)
         now = Decimal(str(self._block_clock()))
         voter = tx.sender.lower()
-        for market_id in sorted(set(freezes)):
-            self.trading.freeze_votes[f"{market_id}|{voter}"] = str(now)
+        # (Plain registries, applied at the tick: each entry kept for a rollback.)
         for market_id, price in parsed.items():
+            undo.keep_entry(self.oracle_votes, market_id)
             self.oracle_votes.setdefault(market_id, {})[voter] = (price, now)
         for market_id, price in perp.items():
+            undo.keep_entry(self.perp_votes, market_id)
             self.perp_votes.setdefault(market_id, {})[voter] = (price, now)
         data: Dict[str, Any] = {"markets": sorted(parsed)}
         if perp:
             data["perp_prices"] = sorted(perp)
-        if freezes:
-            data["freeze"] = sorted(set(freezes))
         if ignored:
             data["ignored"] = ignored
         if heads:
+            # Only the chains the network bridges: a head of any other chain is skipped (the rest
+            # of the vote stands) — each one voted would sit in the state for an hour.
+            bridged = {a.chain for a in configured_assets().values()}
+            skipped = [h.chain for h in heads if h.chain not in bridged]
+            heads = [h for h in heads if h.chain in bridged]
             data["heads"] = [h.chain for h in heads]
+            if skipped:
+                data["ignored_heads"] = skipped
             attested = [h.chain for h in heads if self.bridge.attest_head(h, voter, now, committee)]
             if attested:
                 data["attested_heads"] = attested
         if deposits:
+            from .. import chain_spec as _chain_spec
+
             data["deposits"] = [d.id for d in deposits]
-            minted = []
+            minted: List[str] = []
+            refused: Dict[str, str] = {}
+            queued: Dict[str, str] = {}
+            dev = _chain_spec.active().dev
             for d in deposits:
+                # Past its window a deposit never counts again: what makes refunding it safe.
+                why = self.bridge.refusal(d, now)
+                if why:
+                    refused[d.id] = why
+                    continue
                 if not self.bridge.attest(d, voter, now, committee):
                     continue
-                try:
-                    self._mint_deposit(d)
-                except TokenError as e:  # left pending: a later attestation retries
-                    logger.warning(
-                        "bridge deposit %s reached a quorum but cannot mint: %s", d.id, e
-                    )
+                why = self._bridge_mint(d, now, dev)
+                if why:  # stays attested: a later vote mints it when the guardrail allows
+                    queued[d.id] = why
                     continue
-                self.bridge.complete(d)
                 minted.append(d.id)
             if minted:
                 data["minted"] = minted
+            if refused:
+                data["refused_deposits"] = refused
+            if queued:
+                data["queued_deposits"] = queued
         return ExchangeExecResult(
             success=True, gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.ORACLE_VOTE], data=data
         )
@@ -5858,10 +6419,189 @@ class ExchangeStateManager:
         minted = self.tokens.mint(asset.address, BRIDGE_AUTHORITY, d.amount)
         self._record_token_delta(d.to, asset.address, minted)
 
+    def _bridge_mint(self, d: Deposit, now: Decimal, dev: bool) -> Optional[str]:
+        """Mint a deposit whose attestation or proof is in hand, within the guardrails; None once
+        minted, else why not (it is left as it was). The one place either path mints."""
+        asset = configured_assets()[(d.chain, d.token)]
+        token = self.tokens.get(asset.address)
+        supply = token.supply if token is not None else Decimal(0)
+        why = self.bridge.mint_refusal(asset, d.amount, supply, now, dev)
+        if why:
+            return why
+        try:
+            self._mint_deposit(d)
+        except TokenError as e:
+            logger.warning("bridge deposit %s cannot mint: %s", d.id, e)
+            return f"cannot mint: {e}"
+        self.bridge.record_mint(asset, d.amount, now)
+        self.bridge.complete(d)
+        return None
+
+    def _op_bridge_prove_deposit(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Mint a deposit on a storage proof (docs/BRIDGE.md "Proving a deposit"): the source
+        chain's lockbox (``BRIDGE_LOCKBOXES``) records exactly this deposit in
+        ``deposits[id]`` at a finalized head of that chain the validators attested (one of the
+        last 64). Anyone may send it. The validators vouch for one state root, not for each
+        deposit; the deposit window, the guardrails and the minted set apply as to an attested
+        deposit, which has the same id, so a deposit mints once whichever way it arrives."""
+        from .. import chain_spec as _chain_spec
+        from .bridge import configured_lockboxes, verify_deposit_proof
+
+        p = tx.params
+        try:
+            d = parse_deposit(p["deposit"], configured_assets())
+            height = int(p["height"])
+            if d.id in self.bridge.done:
+                raise BridgeError(f"deposit {d.id} is already minted")
+            now = Decimal(str(self._block_clock()))
+            why = self.bridge.refusal(d, now)
+            if why:
+                raise BridgeError(why)
+            asset = configured_assets()[(d.chain, d.token)]
+            why = verify_deposit_proof(
+                d,
+                asset,
+                self.bridge.head_at(d.chain, height),
+                configured_lockboxes().get(d.chain),
+                p["account_proof"],
+                p["storage_proof"],
+            )
+            if why:
+                raise BridgeError(why)
+        except (BridgeError, KeyError, TypeError, ValueError) as e:
+            return ExchangeExecResult(success=False, error=f"BRIDGE_PROVE_DEPOSIT: {e}")
+        why = self._bridge_mint(d, now, _chain_spec.active().dev)
+        if why:
+            return ExchangeExecResult(
+                success=False, error=f"BRIDGE_PROVE_DEPOSIT: proven, not minted: {why}"
+            )
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.BRIDGE_PROVE_DEPOSIT],
+            data={"deposit": d.id, "minted": str(d.amount), "to": d.to, "head": height},
+        )
+
+    def _op_migration_claim(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Bind a 0x account's post-quantum successor, committed on another chain
+        (docs/QUANTUM_MIGRATION.md): the chain's QRDXMigrationRegistry (``MIGRATION_REGISTRIES``)
+        holds the commitment at a finalized head the validators attested. Anyone may send it.
+        The successor becomes a controller of the account (account control). An account binds
+        once; a commitment made after the Doomsday Protocol triggered proves nothing."""
+        from .authority import account_id
+        from .migration import MigrationError, configured_registries, parse_claim, verify_claim
+
+        p = tx.params
+        try:
+            claim = parse_claim(p)
+            key = account_id(claim.account)
+            bound = self.authority.migrations.get(key) if len(self.authority.migrations) else None
+            if bound is not None:
+                if str(bound[0]).lower() == claim.successor.lower():
+                    return ExchangeExecResult(
+                        success=True,
+                        gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.MIGRATION_CLAIM],
+                        data={"account": claim.account, "successor": bound[0], "already": True},
+                    )
+                raise MigrationError("the account is already bound to another successor")
+            cutoff = self.doomsday_cutoff()
+            if cutoff is not None and claim.time >= cutoff:
+                raise MigrationError(
+                    "registered after the Doomsday Protocol triggered: it proves nothing"
+                )
+            why = verify_claim(
+                claim,
+                self.bridge.head_at(claim.chain, int(p["height"])),
+                configured_registries().get(claim.chain),
+                p["account_proof"],
+                p["successor_proof"],
+                p["time_proof"],
+            )
+            if why:
+                raise MigrationError(why)
+            policy = self.authority.policy(claim.account)
+            if account_id(claim.successor) not in policy.controller_ids():
+                policy = _apply_policy(policy, "add_controller", claim.successor, claim.account)
+        except (MigrationError, KeyError, TypeError, ValueError) as e:
+            return ExchangeExecResult(success=False, error=f"MIGRATION_CLAIM: {e}")
+        self.authority.set_policy(claim.account, policy)
+        self.authority.migrations[key] = [claim.successor, claim.chain, claim.time]
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.MIGRATION_CLAIM],
+            data={"account": claim.account, "successor": claim.successor, "chain": claim.chain},
+        )
+
+    def doomsday_cutoff(self) -> Optional[int]:
+        """The time from which ECDSA is not trusted (the Doomsday Protocol triggered), or None."""
+        state = self.bridge.doomsday
+        return int(state["time"]) if state else None
+
+    def _trigger_doomsday(self, cause: str, since: Optional[int] = None) -> Dict[str, Any]:
+        """Trigger the Doomsday Protocol at this block (qrdx/exchange/doomsday.py), once: record
+        it, and revoke every agent a ``0x`` account approved — an approval its ECDSA key may
+        have signed for someone who broke it. (A ``0x`` account approves again only through a
+        post-quantum root: its controller, or a contract a post-quantum transaction drives.)
+
+        Its time — from which no migration commitment counts — is this block's, or ``since``
+        when earlier: a canary proven spent at a source chain's head was spent by then. A later
+        proof against an earlier head moves it earlier; nothing moves it later."""
+        from .doomsday import is_ecdsa_account
+
+        now = int(Decimal(str(self._block_clock())))
+        at = now if since is None else min(now, int(since))
+        state = self.bridge.doomsday
+        if state is not None and at < int(state["time"]):
+            self.bridge.set_doomsday(at, int(state["height"]), str(state["cause"]))
+        if state is None:
+            self.bridge.set_doomsday(at, self._current_block_height, cause)
+            if len(self.trading.agents):
+                for account, grants in sorted(self.trading.agents.peek_items()):
+                    if is_ecdsa_account(account):
+                        del self.trading.agents[account]
+                        for g in grants:
+                            self.trading.forget_spend(account, g.agent)
+            logger.critical(
+                "Doomsday Protocol triggered at block %s: %s", self._current_block_height, cause
+            )
+        return dict(self.bridge.doomsday or {})
+
+    def _op_doomsday_prove(self, tx: ExchangeTransaction) -> ExchangeExecResult:
+        """Trigger the Doomsday Protocol on proof that a canary signed: its account's nonce,
+        against a finalized head of its chain the validators attested, is above 0. Anyone may
+        send it. Triggered already, it can only move the trigger's time earlier (an earlier
+        head)."""
+        from .doomsday import DoomsdayError, configured_canaries, verify_canary_spent
+
+        p = tx.params
+        try:
+            chain = int(p["chain"])
+            canary = configured_canaries().get(chain)
+            head = self.bridge.head_at(chain, int(p["height"]))
+            why = verify_canary_spent(chain, head, canary, p["account_proof"])
+            if why:
+                raise DoomsdayError(why)
+        except (DoomsdayError, KeyError, TypeError, ValueError) as e:
+            return ExchangeExecResult(success=False, error=f"DOOMSDAY_PROVE: {e}")
+        assert head is not None
+        state = self._trigger_doomsday(
+            f"the canary {canary} on chain {chain} signed (by its block {head.height})",
+            since=head.timestamp,
+        )
+        return ExchangeExecResult(
+            success=True,
+            gas_used=EXCHANGE_GAS_COSTS[ExchangeOpType.DOOMSDAY_PROVE],
+            data={"doomsday": state},
+        )
+
     def _op_bridge_withdraw(self, tx: ExchangeTransaction) -> ExchangeExecResult:
         """Burn ``amount`` of a bridged token and record the withdrawal to ``to`` on its source
         chain, for the lockbox's custodian to release (docs/BRIDGE.md)."""
         p = tx.params
+        if self.bridge.doomsday:
+            return ExchangeExecResult(
+                success=False,
+                error="BRIDGE_WITHDRAW: the Doomsday Protocol stopped withdrawals to classical chains",
+            )
         asset = asset_by_token(str(p["token_address"]))
         if asset is None:
             return ExchangeExecResult(success=False, error="BRIDGE_WITHDRAW: not a bridged token")
@@ -5919,7 +6659,6 @@ class ExchangeStateManager:
         committee = self._oracle_members()
         if not committee:
             return
-        self._apply_freeze_votes(committee, now)
         self.oracle_votes = self._aggregate_votes(
             self.oracle_votes,
             committee,
@@ -5934,35 +6673,6 @@ class ExchangeStateManager:
             self.clearinghouse.set_external_perp_price,
             lambda m: (m.external_price, m.external_time),
         )
-
-    def _apply_freeze_votes(self, committee: Dict[str, Decimal], now: Decimal) -> None:
-        """Validators' votes to freeze a deployer market (ORACLE_VOTE ``freeze``): while fresh
-        votes carry more than two thirds of the committee's stake, the market is held to
-        reduce-only orders and its oracle is the validators' — until a vote window after the
-        last block they did. Stale votes, non-members' and settled markets' are dropped."""
-        from .. import constants
-
-        votes = self.trading.freeze_votes
-        if not len(votes):
-            return
-        max_age = Decimal(constants.PERP_ORACLE_VOTE_MAX_AGE)
-        weight: Dict[str, Decimal] = {}
-        for key, when in sorted(votes.peek_items()):
-            market_id, voter = key.rsplit("|", 1)
-            m = self.clearinghouse.markets.get(market_id)
-            if (
-                voter not in committee
-                or now - Decimal(when) > max_age
-                or m is None
-                or m.settled_price > 0
-            ):
-                del votes[key]
-                continue
-            weight[market_id] = weight.get(market_id, ZERO) + committee[voter]
-        total = sum(committee.values(), ZERO)
-        for market_id, w in sorted(weight.items()):
-            if w * 3 > total * 2:
-                self.clearinghouse.freeze(market_id, now + max_age)
 
     def _aggregate_votes(
         self, all_votes, committee, now: Decimal, apply, current
@@ -5993,8 +6703,8 @@ class ExchangeStateManager:
             if market_id not in self.clearinghouse.markets or len(votes) < max(1, min_voters):
                 continue
             m = self.clearinghouse.markets[market_id]
-            if Clearinghouse.contained(m) and not Clearinghouse.frozen(m, now):
-                continue  # its deployer or its spot market prices it, until a freeze
+            if Clearinghouse.contained(m):
+                continue  # a token perp: its spot market prices it
             weighted = sorted((price, committee[v]) for v, (price, _t) in votes.items())
             weight = sum((w for _p, w in weighted), ZERO)
             if weight * 2 <= total:
@@ -6079,7 +6789,7 @@ class ExchangeStateManager:
         """Every section of the sequential root, each from its incremental commitment: the
         pools and books that changed are re-digested (and within a pool only the ticks and
         positions touched); accounts, nonces, tokens, NFTs and proposals by the entries that
-        changed. The small parts (each market's own fields, the oracles, the votes) are
+        changed. The small parts (each market's own fields, the votes) are
         recomputed. QRDX_VERIFY_STATE_COMMITMENTS=1 checks every part from scratch."""
         import blake3
 
@@ -6091,28 +6801,13 @@ class ExchangeStateManager:
         books = Section("books")
         for pair_key in sorted(self._order_books):
             books.value(pair_key).raw(self._order_books[pair_key].cached_digest())
-        oracles = Section("oracles")
-        for pair_key in sorted(self._oracles):
-            o = self._oracles[pair_key]
-            oracles.value([pair_key, str(o.latest_price or ZERO), o.observation_count])
+        # The retired PerpEngine's section, always empty: its digest stays in the formula so
+        # the root is unchanged now that the engine is gone.
         perps = Section("perp_engine")
-        for market_id in sorted(self.perp_engine._markets):
-            m = self.perp_engine._markets[market_id]
-            perps.value(
-                [
-                    market_id,
-                    str(m.index_price),
-                    str(m.mark_price),
-                    str(m.open_interest_long),
-                    str(m.open_interest_short),
-                    str(m.insurance_fund),
-                ]
-            )
         hasher = blake3.blake3(b"QRDX-EXCHANGE-ROOT-v2\x00")
         for part in (
             pools.digest(),
             books.digest(),
-            oracles.digest(),
             perps.digest(),
             self.clearinghouse.commitment(),
             self.oracle_state_hash(),
@@ -6176,30 +6871,6 @@ class ExchangeStateManager:
             hasher.update(pair_key.encode())
             hasher.update(self._order_books[pair_key].state_digest())
 
-        # 3. Oracle state hashes
-        for pair_key in sorted(self._oracles.keys()):
-            oracle = self._oracles[pair_key]
-            price = oracle.latest_price or ZERO
-            count = oracle.observation_count
-            oracle_hash = hashlib.blake2b(
-                f"{pair_key}:{price}:{count}".encode(),
-                digest_size=16,
-            ).digest()
-            hasher.update(oracle_hash)
-
-        # 4. Perp market state hashes
-        for market_id in sorted(self.perp_engine._markets.keys()):
-            market = self.perp_engine._markets[market_id]
-            market_hash = hashlib.blake2b(
-                (
-                    f"{market_id}:{market.index_price}:{market.mark_price}:"
-                    f"{market.open_interest_long}:{market.open_interest_short}:"
-                    f"{market.insurance_fund}"
-                ).encode(),
-                digest_size=16,
-            ).digest()
-            hasher.update(market_hash)
-
         # 4b. Perps clearinghouse: books, accounts, positions, vault, holder mirror.
         hasher.update(self.clearinghouse.state_hash())
 
@@ -6240,7 +6911,7 @@ class ExchangeStateManager:
         """
         Capture a COMPLETE deep copy of all consensus-critical state so that
         revert_block() restores the exact pre-block state — including entities
-        CREATED during the block (new pools, order books, oracles, perp markets
+        CREATED during the block (new pools, order books, perp markets
         and positions), which a field-level snapshot cannot remove. Correctness
         over speed: a rejected block must leave local state byte-identical.
         """
@@ -6266,12 +6937,6 @@ class ExchangeStateManager:
             "pair_index": copy.deepcopy(self.pool_manager._pair_index),
             "pool_sequence": self.pool_manager._pool_sequence,
             "order_books": copy.deepcopy(self._order_books),
-            "oracles": copy.deepcopy(self._oracles),
-            "perp_markets": copy.deepcopy(self.perp_engine._markets),
-            "perp_positions": copy.deepcopy(self.perp_engine._positions),
-            "perp_owner_positions": copy.deepcopy(self.perp_engine._owner_positions),
-            "perp_pos_sequence": self.perp_engine._pos_sequence,
-            "perp_paused": self.perp_engine._paused,
             "clearinghouse": copy.deepcopy(self.clearinghouse),
             "oracle_committee": copy.deepcopy(self.oracle_committee),
             "oracle_votes": copy.deepcopy(self.oracle_votes),
@@ -6323,22 +6988,9 @@ class ExchangeStateManager:
         self._order_books.update(restored_books)
         self.router._order_books.clear()
         self.router._order_books.update(restored_books)
-
-        restored_oracles = copy.deepcopy(snapshot["oracles"])
-        self._oracles.clear()
-        self._oracles.update(restored_oracles)
-        self.router._oracles.clear()
-        self.router._oracles.update(restored_oracles)
+        self._expiring_pairs = None  # (derived from the books: rebuilt on next use)
 
         # Perp engine.
-        self.perp_engine._markets.clear()
-        self.perp_engine._markets.update(copy.deepcopy(snapshot["perp_markets"]))
-        self.perp_engine._positions.clear()
-        self.perp_engine._positions.update(copy.deepcopy(snapshot["perp_positions"]))
-        self.perp_engine._owner_positions.clear()
-        self.perp_engine._owner_positions.update(copy.deepcopy(snapshot["perp_owner_positions"]))
-        self.perp_engine._pos_sequence = snapshot["perp_pos_sequence"]
-        self.perp_engine._paused = snapshot["perp_paused"]
         self.clearinghouse = copy.deepcopy(snapshot["clearinghouse"])
         self.oracle_committee = copy.deepcopy(snapshot.get("oracle_committee"))
         self.oracle_votes = copy.deepcopy(snapshot.get("oracle_votes", {}))
@@ -6366,12 +7018,6 @@ class ExchangeStateManager:
 
     def get_order_book(self, pair: str) -> Optional[OrderBook]:
         return self._order_books.get(pair)
-
-    def get_oracle(self, pair: str) -> Optional[TWAPOracle]:
-        return self._oracles.get(pair)
-
-    def get_perp_market(self, market_id: str):
-        return self.perp_engine.get_market(market_id)
 
     def get_nonce(self, address: str) -> int:
         return self._nonces.get(address, 0)
@@ -6465,7 +7111,7 @@ class ExchangeStateManager:
         return {
             "pools": self.pool_count,
             "pairs": self.pair_count,
-            "perp_markets": self.perp_engine.market_count,
+            "perp_markets": len(self.clearinghouse.markets),
             "total_swaps": self._total_swaps,
             "total_orders": self._total_orders,
             "total_positions": self._total_positions,

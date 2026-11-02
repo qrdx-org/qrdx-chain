@@ -121,7 +121,7 @@ VAULT_UNWIND_SECONDS = Decimal("30")
 VAULT_UNWIND_SLIPPAGE = Decimal("0.005")
 SHARE_QUANTUM = Decimal("1e-18")
 # Funding (Phase 4), Hyperliquid's formula. Each block samples the premium of the book's impact
-# prices (the average price to trade IMPACT_NOTIONAL) over the oracle; at every interval boundary
+# prices (the average price to trade ``impact_notional``) over the oracle; at every interval boundary
 # of block time, F = average premium + clamp(interest − premium, ±FUNDING_PREMIUM_CLAMP) is the
 # 8-hour rate, of which the interval's share is paid — capped at FUNDING_CAP_PER_HOUR. Payment =
 # size × oracle × rate, longs to shorts when positive: zero-sum, peer to peer.
@@ -129,7 +129,11 @@ DEFAULT_FUNDING_INTERVAL = Decimal(3600)
 FUNDING_INTEREST_8H = Decimal("0.0001")  # 0.01 % per 8 hours
 FUNDING_PREMIUM_CLAMP = Decimal("0.0005")
 FUNDING_CAP_PER_HOUR = Decimal("0.04")
-IMPACT_NOTIONAL = Decimal("1000")  # in the settlement asset (production: USD)
+# Hyperliquid's impact notionals, in the settlement asset (production: USD): 20,000 for BTC and
+# ETH, 6,000 for every other market. (It was 1,000 everywhere: a premium a small order could set.)
+IMPACT_NOTIONAL = Decimal("6000")
+IMPACT_NOTIONAL_MAJORS = Decimal("20000")
+IMPACT_MAJORS = frozenset({"BTC", "ETH"})
 EIGHT_HOURS = Decimal(8 * 3600)
 RATE_QUANTUM = Decimal("1e-18")
 
@@ -423,6 +427,10 @@ class Trigger:
     # position left for them to reduce.
     group: str = ""
     parent: str = ""
+    # A market trigger that fired but could not fill whole within TRIGGER_SLIPPAGE of the mark:
+    # the rest waits, and fires again at each tick the mark is still past it (it never
+    # disappears unfilled); it queues behind triggers firing for the first time.
+    waiting: bool = False
 
     @property
     def reduces(self) -> bool:
@@ -439,19 +447,23 @@ class Trigger:
 
 
 def _encode_trigger(_tid: str, t: Trigger) -> Any:
-    return [
-        t.owner,
-        t.side,
-        t.kind,
-        str(t.trigger_price),
-        str(t.size),
-        str(t.limit_price),
-        t.reduce_only,
-        t.position,
-        t.tif,
-        t.max_makers,
-        t.seq,
-    ] + ([t.group, t.parent] if t.group or t.parent else [])
+    return (
+        [
+            t.owner,
+            t.side,
+            t.kind,
+            str(t.trigger_price),
+            str(t.size),
+            str(t.limit_price),
+            t.reduce_only,
+            t.position,
+            t.tif,
+            t.max_makers,
+            t.seq,
+        ]
+        + ([t.group, t.parent] if t.group or t.parent else [])
+        + (["waiting"] if t.waiting else [])
+    )
 
 
 @dataclass(frozen=True)
@@ -546,15 +558,10 @@ class Market:
     # The order grid (Hyperliquid's szDecimals): sizes in this many decimals, prices in at most
     # 5 significant figures and 6 − sz_decimals decimals. -1: no grid.
     sz_decimals: int = -1
-    # A deployer market (docs/HYPERLIQUID_PARITY.md): its deployer, which sets its oracle and
-    # takes this share of the protocol's fees on it; and until when the validators hold it
-    # frozen (reduce-only, its oracle theirs).
-    deployer: str = ""
-    deployer_fee_share: Decimal = ZERO
-    frozen_until: Decimal = ZERO
-    # A native-token market (docs/HYPERLIQUID_PARITY.md 13): priced from this native token's own
-    # spot market — the TWAP along these pools to the settlement asset — with no oracle votes;
-    # its open interest is capped by their depth (in the settlement asset, rising slowly).
+    # A token perp (docs/HYPERLIQUID_PARITY.md 13): a perp on this on-chain token, by its
+    # address, priced from its own spot market — the TWAP along the deepest path of pools to the
+    # settlement asset (the path last read: ``spot_pools``) — with no oracle votes; its open
+    # interest is capped by that market's depth (in the settlement asset, rising slowly).
     spot_token: str = ""
     spot_pools: Tuple[str, ...] = ()
     spot_depth: Decimal = ZERO
@@ -631,12 +638,8 @@ def _market_header(m: Market) -> Dict[str, Any]:
         header["settled"] = d(m.settled_price)
     if m.sz_decimals >= 0:
         header["sz"] = m.sz_decimals
-    if m.deployer:  # (absent on a validator-priced market)
-        header["dep"] = [m.deployer, d(m.deployer_fee_share)]
-    if m.spot_token:  # (absent unless a native-token market)
+    if m.spot_token:  # (absent unless a token perp)
         header["spot"] = [m.spot_token, list(m.spot_pools), d(m.spot_depth), d(m.spot_time)]
-    if m.frozen_until > 0:  # absent until the validators first freeze it
-        header["frozen"] = d(m.frozen_until)
     return header
 
 
@@ -812,16 +815,11 @@ class Clearinghouse:
         quote: str = "QRDX",
         max_leverage: Decimal = DEFAULT_MAX_LEVERAGE,
         sz_decimals: int = -1,
-        deployer: str = "",
-        deployer_fee_share: Decimal = ZERO,
         spot_token: str = "",
         spot_pools: Tuple[str, ...] = (),
     ) -> Market:
         if not base:
             raise ClearinghouseError("base token required")
-        deployer_fee_share = Decimal(str(deployer_fee_share))
-        if not ZERO <= deployer_fee_share <= 1 or (deployer_fee_share and not deployer):
-            raise ClearinghouseError("a deployer's fee share is 0 to 1, on its own market")
         max_leverage = Decimal(str(max_leverage))
         if not max_leverage.is_finite() or max_leverage < 1:
             raise ClearinghouseError("max leverage must be at least 1")
@@ -848,8 +846,6 @@ class Clearinghouse:
             max_leverage=max_leverage,
             book=book,
             sz_decimals=int(sz_decimals),
-            deployer=deployer,
-            deployer_fee_share=deployer_fee_share,
             spot_token=str(spot_token),
             spot_pools=tuple(str(p) for p in spot_pools),
         )
@@ -960,29 +956,36 @@ class Clearinghouse:
 
     # ------------------------------------------------------------------ funding
 
+    @staticmethod
+    def impact_notional(m: Market) -> Decimal:
+        """The notional a market's impact prices trade (Hyperliquid's): more for the majors the
+        validators price, whose books are deepest."""
+        if not m.spot_token and m.base.upper() in IMPACT_MAJORS:
+            return IMPACT_NOTIONAL_MAJORS
+        return IMPACT_NOTIONAL
+
     def _impact_price(self, m: Market, bids: bool) -> Optional[Decimal]:
-        """Average price to sell (``bids``) or buy IMPACT_NOTIONAL on the book; None if the
+        """Average price to sell (``bids``) or buy ``impact_notional`` on the book; None if the
         book is not that deep."""
         levels = m.book.iter_levels(bids=bids)  # best first, read only as deep as needed
+        notional = self.impact_notional(m)
         cost = size = ZERO
         for price, amount in levels:
             price, amount = Decimal(str(price)), Decimal(str(amount))
-            if cost + price * amount >= IMPACT_NOTIONAL:
-                size += (IMPACT_NOTIONAL - cost) / price
-                return IMPACT_NOTIONAL / size
+            if cost + price * amount >= notional:
+                size += (notional - cost) / price
+                return notional / size
             cost += price * amount
             size += amount
         return None
 
     def _untrusted_oracle(self, m: Market, now: Decimal) -> bool:
-        """A deployer market whose oracle no one stands behind now: frozen by the validators, or
-        left stale by its deployer. Its premium is not sampled meanwhile — funding at the cap
-        could otherwise run on a price the deployer left behind (an interval of none pays the
-        interest rate alone). Validator-priced markets keep sampling."""
+        """A token perp whose oracle has gone stale — its spot market too shallow to read. Its
+        premium is not sampled meanwhile — funding at the cap could otherwise run on a price left
+        behind (an interval of none pays the interest rate alone). Validator-priced markets keep
+        sampling."""
         if not self.contained(m):
             return False
-        if self.frozen(m, now):
-            return True
         stale = Decimal(constants.PERP_ORACLE_STALE_SECONDS)
         return m.oracle_time > 0 and now - m.oracle_time > stale
 
@@ -1180,7 +1183,7 @@ class Clearinghouse:
         position may change leverage too: a lower one needs the position to hold its initial
         margin at it, and what it lacks is moved in from free cross margin (refused if there is
         not enough); a higher one leaves the margin where it is (PERP_ISOLATED_MARGIN takes it
-        out). A deployer market is isolated-margin only. Returns the margin moved in."""
+        out). A token perp is isolated-margin only. Returns the margin moved in."""
         self._user(owner)
         m = self.market(market_id)
         leverage = Decimal(str(leverage))
@@ -1320,50 +1323,46 @@ class Clearinghouse:
         return out
 
     def halted(self, m: Market) -> bool:
-        """The market's circuit breaker — or, a deployer market, the validators' freeze — holds
-        it to reduce-only orders now."""
+        """The market's circuit breaker holds it to reduce-only orders now."""
         now = Decimal(str(self.__dict__.get("_now", ZERO)))
-        return (m.halted_until > 0 and now < m.halted_until) or self.frozen(m, now)
+        return m.halted_until > 0 and now < m.halted_until
 
     @staticmethod
     def contained(m: Market) -> bool:
-        """A market whose price no validator vote sets — a deployer's, or a native token's off
-        its own spot market: isolated margin only, never backstopped by the shared vault, never
-        a price for anyone's margin. Its risk stays in it."""
-        return bool(m.deployer or m.spot_token)
+        """A token perp — priced off an on-chain token's own spot market, not the validators'
+        votes: isolated margin only, never backstopped by the shared vault, never a price for
+        anyone's margin. Its risk stays in it."""
+        return bool(m.spot_token)
 
     @staticmethod
     def _kind(m: Market) -> str:
-        return "a deployer market" if m.deployer else "a native-token market"
+        return "a token perp"
 
     @_mutator
     def set_spot_reading(
-        self, market_id: str, price: Optional[Decimal], depth: Decimal, now: Decimal
+        self,
+        market_id: str,
+        price: Optional[Decimal],
+        depth: Decimal,
+        now: Decimal,
+        path: Tuple[str, ...] = (),
     ) -> None:
-        """A native-token market's reading of its spot market this block: its depth, and its
-        oracle price when there was one to read."""
+        """A token perp's reading of its spot market this block: its depth, the path of pools
+        read (kept from the last reading when there was none), and its oracle price when there
+        was one to read."""
         m = self.market(market_id)
         m.spot_depth = Decimal(str(depth))
         m.spot_time = Decimal(str(now))
+        if path:
+            m.spot_pools = tuple(path)
         if price is not None:
             m.oracle_price = Decimal(str(price))
             m.oracle_time = Decimal(str(now))
             self._refresh_mark(m, m.ema_time)
 
-    @staticmethod
-    def frozen(m: Market, now: Any) -> bool:
-        """A deployer market the validators hold frozen at block time ``now``."""
-        return m.frozen_until > 0 and Decimal(str(now)) < m.frozen_until
-
-    @_mutator
-    def freeze(self, market_id: str, until: Decimal) -> None:
-        """The validators froze a deployer market until block time ``until``."""
-        m = self.market(market_id)
-        m.frozen_until = max(m.frozen_until, Decimal(str(until)))
-
     def oi_cap(self, m: Market) -> Optional[Decimal]:
         """The market's open-interest cap (notional at mark), None if uncapped. A native-token
-        market's is at most its spot market's depth × SPOT_OI_DEPTH_BPS: moving the price that
+        perp's is at most its spot market's depth × SPOT_OI_DEPTH_BPS: moving the price that
         sets it must cost about what the open interest could gain from the move."""
         floor = Decimal(constants.PERP_MIN_OI_CAP)
         vault = market_maker_address(m.id)
@@ -1657,7 +1656,7 @@ class Clearinghouse:
             return ZERO
         m = self.markets.get(spec[0])
         if m is None or m.oracle_price <= 0 or self.contained(m):
-            # (A deployer's or a native token's market never values anyone's margin.)
+            # (A token perp never values anyone's margin.)
             return ZERO
         return m.oracle_price * (1 - spec[1])
 
@@ -2009,20 +2008,15 @@ class Clearinghouse:
                 f"an order may be at most {band:%} worse than the oracle ({m.oracle_price})"
             )
         if not reduce_only and self.halted(m):
-            if self.frozen(m, self.__dict__.get("_now", ZERO)):
-                raise ClearinghouseError(
-                    f"the validators have frozen {market_id}: reduce-only orders until "
-                    f"block time {m.frozen_until}"
-                )
             raise ClearinghouseError(
                 f"{market_id}'s circuit breaker has tripped: reduce-only orders until "
                 f"block time {m.halted_until}"
             )
         acct = self.account(owner)
         if self.contained(m) and not acct.isolated.get(market_id, False):
-            # A deployer's or a native token's market is isolated-margin only: a price its
-            # deployer sets, or a thin spot market moves, reaches no account's cross margin. The
-            # first order there makes the account's position isolated.
+            # A token perp is isolated-margin only: a price a thin spot market moves reaches no
+            # account's cross margin. The first order there makes the account's position
+            # isolated.
             held = acct.positions.get(market_id)
             if (held is not None and held.size != 0) or self._orders_by_owner(m).get(owner):
                 raise ClearinghouseError(f"{market_id} is {self._kind(m)}: isolated margin only")
@@ -2630,7 +2624,8 @@ class Clearinghouse:
                 if t is None or (stale and not t.reduces):
                     continue
                 passed = abs(m.mark_price - t.trigger_price) / m.mark_price
-                queue.append(((0 if t.reduces else 1, -passed, t.seq, mid, tid), mid, tid))
+                key = (int(t.waiting), 0 if t.reduces else 1, -passed, t.seq, mid, tid)
+                queue.append((key, mid, tid))
         queue.sort()
         events: List[dict] = []
         fired = makers = 0
@@ -2647,8 +2642,10 @@ class Clearinghouse:
         return events
 
     def _fire(self, m: Market, tid: str, t: Trigger) -> dict:
-        """Place a crossed trigger's order for its owner (all or nothing); it is gone either
-        way."""
+        """Place a crossed trigger's order for its owner (all or nothing). A limit trigger is
+        gone either way. A market trigger that could not fill whole within TRIGGER_SLIPPAGE of
+        the mark keeps the rest waiting (``waiting``): it fires again at the next tick, and its
+        group stays until part of it fills."""
         del m.triggers[tid]
         event: Dict[str, Any] = {"market": m.id, "trigger_id": tid, "owner": t.owner}
         buy = t.side == "buy"
@@ -2664,6 +2661,13 @@ class Clearinghouse:
             price, tif = t.limit_price, t.tif
         else:
             through = m.mark_price * (1 + TRIGGER_SLIPPAGE if buy else 1 - TRIGGER_SLIPPAGE)
+            if t.waiting and not t.reduces:
+                # An order that opens a position and waited for the book: never more than
+                # TRIGGER_SLIPPAGE past its own trigger — a breakout entry the price gapped past
+                # must not fill far beyond what was asked. (A stop that reduces still gets out
+                # within the band of the mark: getting out is the point.)
+                bound = t.trigger_price * (1 + TRIGGER_SLIPPAGE if buy else 1 - TRIGGER_SLIPPAGE)
+                through = min(through, bound) if buy else max(through, bound)
             price = through.quantize(ENTRY_QUANTUM, rounding=ROUND_FLOOR if buy else ROUND_CEILING)
             tif = "ioc"
         touched, cancelled = set(self._touched), len(self._cancelled)
@@ -2687,6 +2691,25 @@ class Clearinghouse:
             self._touched = touched
             del self._cancelled[cancelled:]
             return {"type": "trigger_cancelled", **event, "reason": str(e)}
+        filled = sum(
+            (Decimal(str(f["amount"])) for f in fills if f.get("taker_order_id") == tid), ZERO
+        )
+        left = size - filled
+        waiting = t.limit_price <= 0 and left > 0
+        if waiting:  # the rest waits for the book (a position's TP/SL: still the whole position)
+            m.triggers[tid] = dataclasses.replace(
+                t, size=t.size if t.position else left, waiting=True
+            )
+        if waiting and filled <= 0:  # (its group stays: nothing of it filled)
+            return {
+                "type": "trigger_waiting",
+                **event,
+                "side": t.side,
+                "kind": t.kind,
+                "size": str(size),
+                "price": str(price),
+                "reason": "nothing within TRIGGER_SLIPPAGE of the mark",
+            }
         for other in self._group_of(m, t, tid):  # one cancels the other
             del m.triggers[other]
             self._cancelled.append(
@@ -2705,6 +2728,8 @@ class Clearinghouse:
             "kind": t.kind,
             "size": str(size),
             "price": str(price),
+            "filled": str(filled),
+            "waiting": waiting,
             "fills": fills,
             "resting": tid in m.orders,
         }
@@ -2881,11 +2906,6 @@ class Clearinghouse:
             acct.collateral -= fee
             staker = _staker_part(fee - reward)
             kept = fee - reward - staker
-            if m.deployer and kept > 0 and m.deployer_fee_share > 0:
-                # A deployer market: its deployer's share of what the protocol keeps.
-                share = _q_amount(kept * m.deployer_fee_share)
-                self.account(m.deployer).collateral += share
-                kept -= share
             self.account(VAULT).collateral += kept
             if staker > 0:  # leaves the clearinghouse: its records and its holder alike
                 self.holder_balance -= staker
@@ -3311,8 +3331,8 @@ class Clearinghouse:
             return event  # healthy again, or the book may refill: next block decides
         if not still_open and eq >= 0:
             return event  # closed on the book, solvent
-        # The backstop vault is everyone's: it never takes over a deployer market's positions
-        # (their risk is their market's — its book, then auto-deleveraging there).
+        # The backstop vault is everyone's: it never takes over a token perp's positions (their
+        # risk is their market's — its book, then auto-deleveraging there).
         contained = any(self.contained(self.markets[mid]) for mid in mids)
         if owner != VAULT and not contained and self.vault_nav() + eq >= 0:
             self._backstop(owner, mids, isolated)

@@ -24,6 +24,7 @@ T0 = 1_700_000_000
 OWNER = "0xPQ" + "a" * 64
 MID = "BTC-QRDX-PERP"
 PARTS = {"utxo": "1" * 64, "account": "2" * 128, "exchange": "3" * 128, "token": "4" * 128}
+VALIDATORS = "5" * 128  # the validator root (validator_state_root is a genesis feature)
 
 
 def _tx(m, who, op, **params):
@@ -67,9 +68,11 @@ async def _seal(db, mgr, height):
     mgr.compute_state_root()
     xroot = mgr.exchange_proof_root(height)
     root = await state_proofs.proof_root(db, height, xroot)
-    await state_proofs.record_parts(db, height, {**PARTS, "proof": root, "xtree": xroot.hex()})
+    await state_proofs.record_parts(
+        db, height, {**PARTS, "proof": root, "xtree": xroot.hex(), "validators": VALIDATORS}
+    )
     await db.connection.commit()
-    return unified_state_root(*PARTS.values(), root)
+    return unified_state_root(*PARTS.values(), root, VALIDATORS)
 
 
 async def test_exchange_entries_parts_and_levels_are_proven(db, m):

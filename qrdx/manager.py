@@ -11,7 +11,7 @@ from decimal import Decimal
 from io import BytesIO
 from math import ceil, floor, log
 from types import SimpleNamespace
-from typing import List, Optional, Tuple, Union, cast
+from typing import List, Optional, Tuple, Union
 
 from . import Database
 from .consensus import CONSENSUS_ENGINE, get_consensus_info, get_median_time_past
@@ -506,78 +506,15 @@ async def check_block(
 async def create_block(
     block_content: str, transactions: List[Transaction], last_block: Optional[dict] = None
 ) -> bool:
-    """
-    Create and commit a new block with version-appropriate validation.
-    """
-    await Manager.invalidate_difficulty()
-    difficulty, last_block_from_db = await calculate_difficulty()
-    mining_info = (difficulty, last_block_from_db)
-
-    if not await check_block(block_content, transactions, mining_info=mining_info):
-        return False
-
-    regular_transactions = [
-        tx
-        for tx in transactions
-        if isinstance(tx, Transaction) and not isinstance(tx, CoinbaseTransaction)
-    ]
-
-    database = Database.instance
-    block_no = last_block_from_db.get("id", 0) + 1
-    block_hash = sha256(block_content)
-
-    previous_hash, address, merkle_tree, content_time, content_difficulty, random = (
-        split_block_content(block_content)
-    )
-
-    # Set by verification, which every transaction here has passed.
-    fees = sum(cast(Decimal, tx.fees) for tx in regular_transactions)
-    block_reward = get_block_reward(block_no)
-
-    coinbase_transaction = CoinbaseTransaction(block_hash, address, block_reward + fees)
-
-    if not coinbase_transaction.outputs[0].verify():
-        return False
-
-    try:
-        await database.add_block(
-            block_no,
-            block_hash,
-            block_content,
-            address,
-            random,
-            content_difficulty,
-            block_reward + fees,
-            content_time,
-        )
-        await database.add_transaction(coinbase_transaction, block_hash)
-
-        if regular_transactions:
-            await database.add_transactions(regular_transactions, block_hash)
-
-        await database.add_unspent_transactions_outputs(
-            regular_transactions + [coinbase_transaction]
-        )
-
-        if regular_transactions:
-            await database.remove_pending_transactions_by_hash(
-                [tx.hash() for tx in regular_transactions]
-            )
-            await database.remove_unspent_outputs(regular_transactions)
-            await database.remove_pending_spent_outputs(regular_transactions)
-
-    except Exception as e:
-        logger.error(f"Could not commit block {block_no} to database. " f"Rolling back. Error: {e}")
-        await database.delete_block(block_no)
-        return False
-
-    if LOG_INCLUDE_BLOCK_SYNC_MESSAGES:
-        logger.info(
-            f"Added block {block_no} with {len(regular_transactions)} transactions. Reward: {block_reward}, Fees: {fees}"
-        )
-
-    await Manager.invalidate_difficulty()
-    return True
+    """Refuse a proof-of-work block, always. QRDX is proof of stake: a block carries its
+    proposer's ML-DSA-65 signature, its sections and its state roots, and is imported through
+    ``process_and_create_block``'s checks (node/main.py). This was the inherited miner path:
+    it judged none of that, and every 512 blocks it expected difficulty 1.0 — a hash in about
+    sixteen tries — so a block mined against the tip passed every check it made, to be
+    appended at the tip with a coinbase paid to its miner. Only a type error writing it to
+    the database stopped it (docs/KNOWN_ISSUES.md)."""
+    logger.warning("Refused a proof-of-work block: QRDX is proof of stake")
+    return False
 
 
 # ============================================================================

@@ -21,10 +21,8 @@ from ..wallet_v2 import PQWallet, WalletType
 from .attestation import Attestation, AttestationPool
 from .config import POS_CONSTANTS, ValidatorConfig
 from .selection import ValidatorSelector
-from .slashing import (
-    SlashingExecutor,
-    SlashingProtectionDB,
-)
+from .slashing import SlashingExecutor
+from .slashing_protection import SlashingProtection, network_key
 from .stake import StakeManager
 from .types import (
     AlreadyAttestedError,
@@ -204,8 +202,9 @@ class ValidatorManager:
         )
         self.slashing_executor = slashing_executor or SlashingExecutor()
 
-        # Slashing protection database
-        self.slashing_protection: Optional[SlashingProtectionDB] = None
+        # Slashing protection: every block and vote is recorded before it is signed
+        # (qrdx/validator/slashing_protection.py). The live validator always sets it.
+        self.slashing_protection: Optional[SlashingProtection] = None
 
         # State
         self._validator: Optional[Validator] = None
@@ -258,8 +257,9 @@ class ValidatorManager:
 
         # Initialize slashing protection
         if config.slashing_protection.enabled:
-            manager.slashing_protection = SlashingProtectionDB(config.slashing_protection.db_path)
-            await manager.slashing_protection.initialize()
+            manager.slashing_protection = await SlashingProtection.open(
+                config.slashing_protection.db_path, network_key()
+            )
 
         return manager
 
@@ -576,9 +576,10 @@ class ValidatorManager:
 
         logger.info(f"🎯 Selected as proposer for slot {slot}!")
 
-        # Slashing protection check
+        # Slashing protection: a cheap check before building a block (recording it, below,
+        # is what decides).
         if self.slashing_protection:
-            if not await self.slashing_protection.can_sign_block(self.wallet.address, slot):
+            if not await self.slashing_protection.may_sign_block(self.wallet.address, slot):
                 raise AlreadyProposedError(slot)
 
         # Calculate epoch
@@ -664,15 +665,13 @@ class ValidatorManager:
 
         block.base_fee, block.exchange_base_fee = base_fees or floors()
         block.commit_body(exchange_section, evm_section)
+        # Recorded (durably) before it is signed: a crash in between loses this slot, never
+        # the record of having signed it.
+        if self.slashing_protection and not await self.slashing_protection.record_block(
+            self.wallet.address, slot, block.signing_root
+        ):
+            raise AlreadyProposedError(slot)
         block.proposer_signature = self._sign_message(block.signing_root)
-
-        # Record in slashing protection
-        if self.slashing_protection:
-            await self.slashing_protection.record_block_signature(
-                self.wallet.address,
-                slot,
-                block.hash,
-            )
 
         # Check for double-signing (should not happen with protection)
         await self.slashing_executor.check_double_sign(
@@ -999,15 +998,6 @@ class ValidatorManager:
         source = source_epoch if source_epoch is not None else max(0, epoch - 1)
         target = target_epoch if target_epoch is not None else epoch
 
-        # Slashing protection check
-        if self.slashing_protection:
-            if not await self.slashing_protection.can_sign_attestation(
-                self.wallet.address,
-                source,
-                target,
-            ):
-                raise AlreadyAttestedError(slot)
-
         # Create attestation
         attestation = Attestation(
             slot=slot,
@@ -1022,16 +1012,14 @@ class ValidatorManager:
             target_root=target_root,
         )
 
-        # Sign attestation
+        # Recorded (durably) before it is signed. The record compares the whole signed
+        # attestation, slot and head included: re-signing the same checkpoints at another
+        # slot is a double vote to every importer (slashing_block.attestation_equivocation).
+        if self.slashing_protection and not await self.slashing_protection.record_vote(
+            self.wallet.address, source, target, attestation.signing_root
+        ):
+            raise AlreadyAttestedError(slot)
         attestation.signature = self._sign_message(attestation.signing_root)
-
-        # Record in slashing protection
-        if self.slashing_protection:
-            await self.slashing_protection.record_attestation_signature(
-                self.wallet.address,
-                source,
-                target,
-            )
 
         # Check for surround votes
         await self.slashing_executor.check_surround_vote(

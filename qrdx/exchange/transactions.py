@@ -19,7 +19,6 @@ Transaction Types:
   - CLOSE_POSITION:    Close a perpetual position
   - PARTIAL_CLOSE:     Partially close a perpetual position
   - ADD_MARGIN:        Add margin to a perpetual position
-  - UPDATE_ORACLE:     Submit an oracle price update (validator duty)
 
 Security:
   - All operations are signed by the sender's PQ key (Dilithium)
@@ -83,7 +82,8 @@ class ExchangeOpType(IntEnum):
     CLOSE_POSITION = 8
     PARTIAL_CLOSE = 9
     ADD_MARGIN = 10
-    UPDATE_ORACLE = 11
+    # 11 is retired: UPDATE_ORACLE, a price one authorized key set. No single key prices a
+    # market: the validators' stake-weighted votes do (ORACLE_VOTE), or a token's own spot market.
     CREATE_MARKET = 12
     TOKEN_DEPLOY = 13
     TOKEN_TRANSFER = 14
@@ -163,13 +163,11 @@ class ExchangeOpType(IntEnum):
     PERP_ISOLATED_MARGIN = 76  # add margin to (or remove it from) an isolated position
     SCHEDULE_CANCEL = 77  # the dead man's switch: cancel every order at a block time
     APPROVE_BUILDER_FEE = 78  # let a front-end (builder) charge up to a fee rate on orders
-    # Deployer markets (docs/HYPERLIQUID_PARITY.md, Hyperliquid's HIP-3): perp markets a bonded
-    # deployer lists under its own namespace and runs the oracle of.
-    DEPLOYER_BOND = 79  # bond QRDX as a market deployer (the first bond names its namespace)
-    DEPLOYER_UNBOND = 80  # start unbonding some of it, or claim what has unbonded
-    DEPLOYER_SET_ORACLE = 81  # the deployer's oracle price for one of its markets
-    DEPLOYER_HALT = 82  # the deployer settles one of its markets at its oracle price
+    # 79–82 are retired: deployer markets, whose deployer set their oracle price.
     TICKER_CLAIM = 83  # a token's creator buys its symbol as the token's unique ticker
+    BRIDGE_PROVE_DEPOSIT = 84  # mint a deposit on a storage proof against an attested head
+    MIGRATION_CLAIM = 85  # bind a 0x account's post-quantum successor, proven from another chain
+    DOOMSDAY_PROVE = 86  # trigger the Doomsday Protocol: a canary's key has signed
 
 
 # ---------------------------------------------------------------------------
@@ -620,25 +618,6 @@ class ExchangeTransaction:
                 if key not in p:
                     raise ValueError(f"APPROVE_BUILDER_FEE missing param: {key}")
 
-        elif op == ExchangeOpType.DEPLOYER_BOND:
-            if "amount" not in p:
-                raise ValueError("DEPLOYER_BOND missing param: amount")
-            if "dex" in p and not isinstance(p["dex"], str):
-                raise ValueError("DEPLOYER_BOND dex is a name")
-
-        elif op == ExchangeOpType.DEPLOYER_UNBOND:
-            if ("amount" in p) == bool(p.get("claim")):
-                raise ValueError("DEPLOYER_UNBOND takes an amount, or claim: true")
-
-        elif op == ExchangeOpType.DEPLOYER_SET_ORACLE:
-            for key in ("market_id", "price"):
-                if key not in p:
-                    raise ValueError(f"DEPLOYER_SET_ORACLE missing param: {key}")
-
-        elif op == ExchangeOpType.DEPLOYER_HALT:
-            if "market_id" not in p:
-                raise ValueError("DEPLOYER_HALT missing param: market_id")
-
         elif op == ExchangeOpType.TICKER_CLAIM:
             if not isinstance(p.get("token_address"), str):
                 raise ValueError("TICKER_CLAIM missing param: token_address")
@@ -707,6 +686,30 @@ class ExchangeTransaction:
                 if key not in p:
                     raise ValueError(f"BRIDGE_WITHDRAW missing param: {key}")
 
+        elif op == ExchangeOpType.DOOMSDAY_PROVE:
+            for key in ("chain", "height", "account_proof"):
+                if key not in p:
+                    raise ValueError(f"DOOMSDAY_PROVE missing param: {key}")
+
+        elif op == ExchangeOpType.MIGRATION_CLAIM:
+            for key in (
+                "chain",
+                "account",
+                "successor",
+                "time",
+                "height",
+                "account_proof",
+                "successor_proof",
+                "time_proof",
+            ):
+                if key not in p:
+                    raise ValueError(f"MIGRATION_CLAIM missing param: {key}")
+
+        elif op == ExchangeOpType.BRIDGE_PROVE_DEPOSIT:
+            for key in ("deposit", "height", "account_proof", "storage_proof"):
+                if key not in p:
+                    raise ValueError(f"BRIDGE_PROVE_DEPOSIT missing param: {key}")
+
         elif op == ExchangeOpType.GOV_PROPOSE:
             if not isinstance(p.get("action"), str):
                 raise ValueError("GOV_PROPOSE missing param: action")
@@ -719,14 +722,11 @@ class ExchangeTransaction:
             if op == ExchangeOpType.GOV_VETO and "amount" not in p:
                 raise ValueError("GOV_VETO missing param: amount")
 
-        elif op == ExchangeOpType.UPDATE_ORACLE:
-            for key in ("pair", "price"):
-                if key not in p:
-                    raise ValueError(f"UPDATE_ORACLE missing param: {key}")
-
         elif op == ExchangeOpType.CREATE_MARKET:
-            if "base_token" not in p:
-                raise ValueError("CREATE_MARKET missing param: base_token")
+            # A token perp, by the token's address (docs/HYPERLIQUID_PARITY.md 13): a market
+            # priced by the validators is listed at genesis or by governance, never here.
+            if not isinstance(p.get("token"), str) or not p["token"]:
+                raise ValueError("CREATE_MARKET missing param: token (the token's address)")
 
         elif op == ExchangeOpType.TOKEN_DEPLOY:
             for key in ("name", "symbol"):
@@ -884,7 +884,6 @@ AGENT_SCOPE = frozenset(
         ExchangeOpType.TWAP_CANCEL,
         ExchangeOpType.PERP_ISOLATED_MARGIN,  # (moves value only within the account)
         ExchangeOpType.SCHEDULE_CANCEL,
-        ExchangeOpType.DEPLOYER_SET_ORACLE,  # (a deployer's oracle bot signs with an agent key)
         ExchangeOpType.BATCH,  # (if every action is in scope)
     }
 )
@@ -991,7 +990,6 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.CLOSE_POSITION: 60_000,
     ExchangeOpType.PARTIAL_CLOSE: 60_000,
     ExchangeOpType.ADD_MARGIN: 30_000,
-    ExchangeOpType.UPDATE_ORACLE: 20_000,
     ExchangeOpType.CREATE_MARKET: 100_000,
     ExchangeOpType.TOKEN_DEPLOY: 120_000,
     ExchangeOpType.TOKEN_TRANSFER: 40_000,
@@ -1033,6 +1031,11 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.GOV_VETO: 50_000,
     ExchangeOpType.GOV_EXECUTE: 80_000,
     ExchangeOpType.BRIDGE_WITHDRAW: 60_000,
+    # Verifying two Merkle-Patricia proofs (~20 nodes, a keccak each) and minting.
+    ExchangeOpType.BRIDGE_PROVE_DEPOSIT: 300_000,
+    # Three Merkle-Patricia proofs (the registry's account, two of its slots).
+    ExchangeOpType.MIGRATION_CLAIM: 300_000,
+    ExchangeOpType.DOOMSDAY_PROVE: 200_000,
     ExchangeOpType.STAKE_DELEGATE: 60_000,
     ExchangeOpType.STAKE_UNDELEGATE: 40_000,
     ExchangeOpType.STAKE_SET_COMMISSION: 25_000,
@@ -1059,10 +1062,6 @@ EXCHANGE_GAS_COSTS: Dict[ExchangeOpType, int] = {
     ExchangeOpType.PERP_ISOLATED_MARGIN: 30_000,
     ExchangeOpType.SCHEDULE_CANCEL: 20_000,
     ExchangeOpType.APPROVE_BUILDER_FEE: 25_000,
-    ExchangeOpType.DEPLOYER_BOND: 40_000,
-    ExchangeOpType.DEPLOYER_UNBOND: 40_000,
-    ExchangeOpType.DEPLOYER_SET_ORACLE: 25_000,
-    ExchangeOpType.DEPLOYER_HALT: 200_000,  # + what settling the market's positions costs
     ExchangeOpType.TICKER_CLAIM: 50_000,
 }
 

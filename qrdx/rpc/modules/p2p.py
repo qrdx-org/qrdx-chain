@@ -77,7 +77,11 @@ async def blocks_for_transfer(db: Any, offset: int, limit: int) -> List[Dict[str
     """Blocks ``offset``.. (at most ``limit``) as peers exchange them: each block row with its
     transactions and its protocol sections, so a node applying it reconstructs the exchange and
     EVM/account state exactly as forward application did (E-D3b). Used to serve sync and,
-    locally, to keep a node's own branch while it tries a competing one (fork choice)."""
+    locally, to keep a node's own branch while it tries a competing one (fork choice). Raises
+    HistoryPruned for blocks below this node's pruning point (qrdx/history_pruning.py)."""
+    from ...history_pruning import require_history
+
+    await require_history(db, offset, "serving these blocks")
     structured = []
     for block in await db.get_blocks(offset, limit):
         block_hash = block.get("hash") or block.get("block_hash")
@@ -813,6 +817,13 @@ class P2PModule(RPCModule):
                 response["finalized_epoch"] = state.finalized[0]
         except Exception:
             pass
+        # The snapshot this node publishes for checkpoint sync, if any (QRDX_SNAPSHOT_DIR):
+        # its manifest and where it is served. Never trusted by the node that fetches it.
+        from ...snapshot_publisher import advertised
+
+        snapshot = advertised()
+        if snapshot is not None:
+            response["snapshot"] = snapshot
 
         return response
 
@@ -877,8 +888,14 @@ class P2PModule(RPCModule):
         Returns:
             ``{"ok": True, "result": [{block, transactions}, ...]}``
         """
+        from ...history_pruning import HistoryPruned
+
         self._require_db()
-        return {"ok": True, "result": await blocks_for_transfer(self._db, offset, min(limit, 512))}
+        try:
+            blocks = await blocks_for_transfer(self._db, offset, min(limit, 512))
+        except HistoryPruned as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "result": blocks}
 
     # =====================================================================
     # TRANSACTION ENDPOINTS

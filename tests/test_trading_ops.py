@@ -203,6 +203,66 @@ def test_a_fired_trigger_that_fails_changes_nothing_but_is_gone():
     ch.verify_commitment()
 
 
+def test_a_stop_with_nothing_within_its_band_waits_and_fills_later():
+    """A market trigger used to be gone once it fired, filled or not: a stop that found no bid
+    within 10 % of the mark never executed. It now waits and fires again each tick."""
+    ch = _house()
+    _long(ch)
+    ch.place_trigger("taker", MID, "sl", "sell", "sl", D(95), position=True)
+    ch.place_trigger("taker", MID, "tp", "sell", "tp", D(110), position=True)
+    events = _price(ch, 94, T0 + 1)                       # no bid at all
+    assert [e["type"] for e in events] == ["trigger_waiting"]
+    assert ch.markets[MID].triggers["sl"].waiting and "tp" in ch.markets[MID].triggers  # group
+    assert ch.accounts["taker"].positions[MID].size == 5
+    assert [e["type"] for e in _price(ch, 94, T0 + 2)] == ["trigger_waiting"]
+    ch.place_order("other", MID, "bid", "buy", D(10), D(90), 0)   # within 10 % of 94
+    events = _price(ch, 94, T0 + 3)
+    assert [e["type"] for e in events if e["type"].startswith("trigger_")] == [
+        "trigger_fired", "trigger_cancelled"]             # the stop, then its take-profit
+    assert MID not in ch.accounts["taker"].positions and not ch.markets[MID].triggers
+    ch.verify_commitment()
+    assert ch.identity_gap() == 0 and ch.net_size(MID) == 0
+
+
+def test_what_a_stop_fills_in_part_leaves_the_rest_waiting():
+    ch = _house()
+    _long(ch)
+    ch.place_trigger("taker", MID, "sl", "sell", "sl", D(95), size=D(5), reduce_only=True)
+    ch.place_order("other", MID, "bid", "buy", D(2), D(90), 0)
+    (fired,) = _price(ch, 94, T0 + 1)
+    assert fired["type"] == "trigger_fired" and fired["filled"] == "2" and fired["waiting"]
+    assert ch.markets[MID].triggers["sl"].size == 3
+    ch.place_order("other", MID, "bid2", "buy", D(3), D(90), 0)
+    _price(ch, 94, T0 + 2)
+    assert MID not in ch.accounts["taker"].positions and not ch.markets[MID].triggers
+
+
+def test_a_waiting_entry_stop_never_fills_far_past_its_trigger():
+    """A buy stop at 103 that opens a position, the price gapped to 130 with nothing to buy
+    within 10 %: it waits — and fills only within 10 % of 103, not of wherever the mark is."""
+    ch = _house()
+    ch.place_trigger("taker", MID, "entry", "buy", "sl", D(103), size=D(1))
+    assert [e["type"] for e in _price(ch, 130, T0 + 1)] == ["trigger_waiting"]
+    ch.place_order("maker", MID, "ask-high", "sell", D(1), D(129), 0)    # near the mark, far
+    assert [e["type"] for e in _price(ch, 130, T0 + 2)] == ["trigger_waiting"]  # past 113.3
+    assert MID not in ch.accounts["taker"].positions
+    ch.place_order("maker", MID, "ask-ok", "sell", D(1), D(112), 0)       # within its band
+    _price(ch, 130, T0 + 3)
+    assert ch.accounts["taker"].positions[MID].size == 1 and "entry" not in ch.markets[MID].triggers
+
+
+def test_a_waiting_trigger_queues_behind_one_firing_for_the_first_time(monkeypatch):
+    monkeypatch.setattr(CH, "TRIGGER_FIRES_PER_BLOCK", 1)
+    ch = _house()
+    ch.place_trigger("taker", MID, "first", "sell", "sl", D(95), size=D(1))
+    assert [e["type"] for e in _price(ch, 94, T0 + 1)] == ["trigger_waiting"]
+    ch.place_trigger("other", MID, "fresh", "sell", "sl", D(93), size=D(1))
+    ch.place_order("maker", MID, "bid", "buy", D(1), D(90), 0)
+    (event,) = _price(ch, 92, T0 + 2)                     # the fresh one passed less far…
+    assert event["trigger_id"] == "fresh"                 # …but goes first
+    assert ch.markets[MID].triggers["first"].waiting
+
+
 def test_triggers_are_committed():
     ch = _house()
     root = ch.commitment()
@@ -576,16 +636,29 @@ def test_a_spot_buy_stop_limit_rests_what_it_does_not_fill_with_exactly_its_escr
     s.conserved()
 
 
-def test_a_spot_market_trigger_goes_no_further_than_its_slippage_bound():
+def test_a_spot_market_trigger_goes_no_further_than_its_slippage_bound_and_the_rest_waits():
+    """It used to be gone once it fired, whatever it filled: a stop the price gapped past
+    never executed. What it could not fill within its band now waits, its escrow with it, and
+    fills once the market is back within the band (docs/UNIFIED_SPOT_LIQUIDITY.md 5)."""
     s = Spot()
     assert s.order("0xPQb", "sell", "109", 1).success
     assert s.order("0xPQb", "sell", "111", 5).success              # beyond 100 × 1.1
     r = s.trigger("0xPQa", "buy", "stop_loss", 100, 3)
+    tid = r.data["order_id"]
     assert s.held("0xPQa", QUOTE) == -330                          # 3 × 110
     assert s.order("0xPQc", "sell", "100", 1).success and s.order("0xPQd", "buy", "100", 1).success
     events = s.block()
     assert sum(D(f["amount"]) for f in events[0]["fills"]) == 1 and not events[0]["resting"]
-    assert s.held("0xPQa", QUOTE) == -109 and s.book.get_order(r.data["order_id"]) is None
+    assert events[0]["waiting"] and s.book.get_order(tid) is None
+    t = s.m.trading.spot_triggers.peek(tid)
+    assert t.waiting and t.amount == 2 and t.escrowed == 330 - 109
+    assert s.held("0xPQa", QUOTE) == -330                          # its escrow waits with it
+    events = s.block()                                             # nothing within 110 yet
+    assert not any(e.get("fills") for e in events) and s.m.trading.spot_triggers.peek(tid)
+    assert s.order("0xPQc", "sell", "110", 2).success               # back within the band
+    s.block()
+    assert tid not in s.m.trading.spot_triggers
+    assert s.held("0xPQa", QUOTE) == -109 - 220 and D("2.99") < s.held("0xPQa", BASE) < 3  # (fees)
     s.conserved()
 
 

@@ -3,7 +3,10 @@ Submitting an exchange transaction — the one write path shared by the REST end
 ``exchange_sendTransaction`` JSON-RPC method and the CLI wallet.
 
 Admission (PQ signature + sender binding, nonce window, dedup, capacity) is the mempool's. This
-adds the wire handling — a transaction may arrive as a JSON object or its string form
+adds the fee payer's balance: a transaction that pays gas is admitted only if its payer holds
+``gas_limit × gas_price`` now (a block may carry only what its payer can pay for — chain-spec
+feature ``exchange_inclusion``; the proposer judges the payer's whole share of a block again).
+And the wire handling — a transaction may arrive as a JSON object or its string form
 (``ExchangeTransaction.to_hex()`` is JSON) — and **gossip**: a newly admitted transaction is
 forwarded to every peer, which admits and forwards it in turn, so whichever validator proposes
 next can include it. Echoes stop at the first node that already holds the transaction
@@ -19,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from decimal import Decimal
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional, Tuple
 
 from .transactions import ExchangeOpType, ExchangeTransaction
@@ -91,10 +95,13 @@ class ExchangeSubmitter:
         get_mempool: Callable[[], Any],
         get_peer_urls: Callable[[], Iterable[str]],
         forward: Callable[[str, Dict[str, Any]], Awaitable[Any]],
+        get_balance: Optional[Callable[[str], Awaitable[Any]]] = None,
     ):
         self._get_mempool = get_mempool
         self._get_peer_urls = get_peer_urls
         self._forward = forward
+        # An account's QRDX now (account_state); None: the payer's balance is not checked.
+        self._get_balance = get_balance
 
     async def submit(self, tx: Any, propagated: bool = False) -> Tuple[bool, str, Optional[str]]:
         """Returns (ok, error, tx_hash). Re-submitting a transaction the mempool already holds
@@ -104,13 +111,36 @@ class ExchangeSubmitter:
         except Exception as e:
             return False, f"malformed exchange tx: {e}", None
         tx_hash = tx.tx_hash()
-        ok, err = self._get_mempool().admit(tx)
+        mempool = self._get_mempool()
+        if mempool.contains(tx_hash):
+            return True, "", tx_hash  # (a peer's echo: nothing to read or forward)
+        short = await self._unaffordable(tx)
+        if short:
+            return False, short, None
+        ok, err = mempool.admit(tx)
         if not ok:
             if err.startswith("duplicate"):
                 return True, "", tx_hash
             return False, err, None
         asyncio.ensure_future(self._gossip(tx.to_dict(), origin="peer" if propagated else "local"))
         return True, "", tx_hash
+
+    async def _unaffordable(self, tx: ExchangeTransaction) -> str:
+        """Why the transaction's payer cannot pay for its gas now ("" if it can, it pays none
+        — the free lane, judged by the mempool — or balances are not checked)."""
+        if self._get_balance is None or tx.free_eligible():
+            return ""
+        from .state_manager import ExchangeStateManager
+
+        payer = ExchangeStateManager.get_instance().fee_payer(tx)
+        need = tx.max_fee()
+        held = Decimal(await self._get_balance(payer))
+        if held < need:
+            return (
+                f"insufficient QRDX for gas: {payer[:16]}… holds {held}; the transaction may "
+                f"cost {need} (gas_limit × gas_price)"
+            )
+        return ""
 
     async def _gossip(self, tx_dict: Dict[str, Any], origin: str) -> None:
         try:

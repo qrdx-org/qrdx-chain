@@ -110,7 +110,13 @@ def test_a_spot_brackets_escrow_holds_exactly_what_its_order_bought(no_trading_f
     assert s.order("0xPQc", "sell", "3.9", 1).success and s.order("0xPQd", "buy", "3.9", 1).success
     events = s.block()                                                     # last price 3.9 ≤ 4
     fired = [e for e in events if e["type"] == "spot_trigger_fired"]
-    assert fired and fired[0]["kind"] == "sl" and _bracket(s, oid) is None
+    assert fired and fired[0]["kind"] == "sl"
+    # No bid within its band (3.6): the stop waits, holding all 7, instead of vanishing.
+    waiting = _bracket(s, oid)
+    assert waiting.waiting and waiting.reached == "sl" and waiting.amount == 7
+    assert s.order("0xPQd", "buy", "3.8", 7).success                      # a bid within it
+    s.block()
+    assert _bracket(s, oid) is None and s.held(s.escrow, BASE) == 0
     s.conserved()
 
 

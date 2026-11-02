@@ -104,16 +104,26 @@ class P2PSecurityConfig:
     """[p2p.security]."""
 
     post_quantum_enabled: bool = True
-    pq_kem_algorithm: str = "Kyber768"
-    pq_sig_algorithm: str = "Dilithium3"
+    pq_kem_algorithm: str = "ML-KEM-768"
+    pq_sig_algorithm: str = "ML-DSA-65"
     pq_required: bool = False
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "P2PSecurityConfig":
+        from ..crypto.pq.algorithms import KEM_ALGORITHM, SIG_ALGORITHM
+
+        kem = data.get("pq_kem_algorithm", KEM_ALGORITHM)
+        sig = data.get("pq_sig_algorithm", SIG_ALGORITHM)
+        # The algorithms are the protocol's, not a node's choice: another one cannot talk to
+        # the network (qrdx/crypto/pq/algorithms.py). Refuse rather than ignore the setting.
+        if (kem, sig) != (KEM_ALGORITHM, SIG_ALGORITHM):
+            raise ValueError(
+                f"[p2p.security] names {kem}/{sig}; QRDX runs only {KEM_ALGORITHM}/{SIG_ALGORITHM}"
+            )
         return cls(
             post_quantum_enabled=data.get("post_quantum_enabled", True),
-            pq_kem_algorithm=data.get("pq_kem_algorithm", "Kyber768"),
-            pq_sig_algorithm=data.get("pq_sig_algorithm", "Dilithium3"),
+            pq_kem_algorithm=kem,
+            pq_sig_algorithm=sig,
             pq_required=data.get("pq_required", False),
         )
 

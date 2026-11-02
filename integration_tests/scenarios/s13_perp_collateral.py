@@ -7,9 +7,9 @@ PQ traders. They deposit it into the perps clearinghouse; one rests a sell, the 
 so their positions are equal and opposite. The validators' price feed moves the market (each
 validator votes what it reads; the oracle is their stake-weighted median), both close on the
 book, and both withdraw. Every node must agree on the positions and the balances, and the
-stablecoin must be conserved: what one trader gained the other lost, and the clearinghouse holder
-keeps exactly the trading fees. (Perps used to trade against nobody, which minted QRDX on every
-win and burned it on every loss.)
+stablecoin must be conserved: what one trader gained the other lost, and the trading fees went to
+the clearinghouse holder and the stakers' fee holder (their share: docs/CONSENSUS_ROADMAP.md 6).
+(Perps used to trade against nobody, which minted QRDX on every win and burned it on every loss.)
 """
 
 import asyncio
@@ -194,14 +194,18 @@ class S13PerpCollateral(Scenario):
 
         holder = (await self._account(target, alice["address"]) or {}).get("holder_address")
         self.check_not_none(holder, "Clearinghouse holder address readable")
-        start = {a: await self._usd(target, a) for a in (alice["address"], bob["address"], holder)}
+        from qrdx.validator.epoch_state import STAKER_FEE_HOLDER
+
+        start = {a: await self._usd(target, a)
+                 for a in (alice["address"], bob["address"], holder, STAKER_FEE_HOLDER)}
         if not self.check(all(v is not None for v in start.values()) and
                           start[alice["address"]] >= 100000,
                           f"Starting qUSD balances readable (incl. the holder): {start}"):
             return
 
-        if not await submit(alice, ExchangeOpType.CREATE_MARKET, {"base_token": "qBTC"},
-                            "CREATE_MARKET"):
+        # The market is a genesis market (the testnet spec lists qBTC): validator-priced.
+        market = await self._get(target, "/get_perp_market", {"market_id": MARKET})
+        if not self.check(bool(market), f"{MARKET} is listed from genesis"):
             return
         if not await self._set_price(node_urls, "qBTC", 30000, "Validators price qBTC at 30,000"):
             return
@@ -293,16 +297,20 @@ class S13PerpCollateral(Scenario):
                                 f"{label} PERP_WITHDRAW {amount}"):
                 return
 
+        who = (alice["address"], bob["address"], holder, STAKER_FEE_HOLDER)
+
         async def balances(url):
-            vals = [await self._usd(url, a) for a in (alice["address"], bob["address"], holder)]
+            vals = [await self._usd(url, a) for a in who]
             return None if any(v is None for v in vals) else tuple(str(v) for v in vals)
         final = await self._converged(node_urls, balances, "Final balances")
         if final is None:
             return
-        d_alice, d_bob, d_holder = (Decimal(f) - Decimal(str(start[a]))
-                                    for f, a in zip(final, (alice["address"], bob["address"], holder)))
-        self._log.info("Alice %+.6f, Bob %+.6f, holder (fees) %+.6f", d_alice, d_bob, d_holder)
+        d_alice, d_bob, d_holder, d_stakers = (Decimal(f) - Decimal(str(start[a]))
+                                               for f, a in zip(final, who))
+        self._log.info("Alice %+.6f, Bob %+.6f, holder %+.6f, stakers %+.6f",
+                       d_alice, d_bob, d_holder, d_stakers)
         self.check(d_alice > Decimal("2900"), f"Alice won ~3,000 minus fees ({d_alice})")
         self.check(d_bob < Decimal("-3000"), f"Bob lost 3,000 plus fees ({d_bob})")
-        self.check(d_alice + d_bob + d_holder == 0,
-                   f"qUSD conserved: winner + loser + holder = {d_alice + d_bob + d_holder}")
+        self.check(d_stakers > 0, f"The stakers took their share of the fees ({d_stakers})")
+        total = d_alice + d_bob + d_holder + d_stakers
+        self.check(total == 0, f"qUSD conserved: traders + holder + stakers = {total}")

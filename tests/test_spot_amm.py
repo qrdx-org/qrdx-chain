@@ -251,16 +251,22 @@ def test_swaps_work_in_both_directions(mgr):
 
 def test_a_swap_settles_with_the_pool_it_executed_on(mgr):
     """Several fee tiers for one pair: the router used the deepest pool, but settlement
-    debited the first pool found."""
+    debited the first pool found. Now a swap splits between them (the cheaper fee first, then
+    both to one marginal price: docs/UNIFIED_SPOT_LIQUIDITY.md 1), and each pool settles
+    exactly its own part."""
     shallow, _, shallow_holder = _make_pool(mgr, tier=500, lo=-60000, hi=60000, liquidity="1000")
     deep, _, deep_holder = _make_pool(mgr, tier=3000, liquidity="10000000")
-    before = (_net(mgr, shallow_holder), _net(mgr, deep_holder))
+    before = {shallow: _net(mgr, shallow_holder), deep: _net(mgr, deep_holder)}
     r = mgr.process_transaction(_tx(BOB, ExchangeOpType.SWAP,
                                     {"token_in": T0, "token_out": T1, "amount_in": "100"}))
-    assert r.success and r.data["pool_id"] == deep
-    assert _net(mgr, shallow_holder) == before[0]
-    d0, d1 = _net(mgr, deep_holder)
-    assert d0 - before[1][0] == D(100) and d1 < before[1][1]
+    assert r.success, r.error
+    fills = {f["pool_id"]: f for f in r.data["fills"]}
+    assert set(fills) == {shallow, deep}
+    for pid, holder in ((shallow, shallow_holder), (deep, deep_holder)):
+        d0, d1 = _net(mgr, holder)
+        assert d0 - before[pid][0] == D(fills[pid]["amount"])         # the T0 it took …
+        assert before[pid][1] - d1 == D(fills[pid]["quote_amount"])   # … the T1 it paid
+    assert sum(D(f["amount"]) for f in fills.values()) == 100
 
 
 def test_an_order_book_route_pays_the_maker(mgr):
@@ -270,16 +276,16 @@ def test_an_order_book_route_pays_the_maker(mgr):
     pair = f"{T0}:{T1}"
     escrow = mgr.orderbook_escrow_address(pair)
     o = mgr.process_transaction(_tx(CAROL, ExchangeOpType.PLACE_ORDER, {
-        "pair": pair, "side": "buy", "order_type": "limit", "price": "0.99", "amount": "50"}))
-    assert o.success, o.error                                       # Carol bids 0.99 for T0
+        "pair": pair, "side": "buy", "order_type": "limit", "price": "1.002", "amount": "50"}))
+    assert o.success, o.error            # Carol bids 1.002 for T0 (the pool buys at 1 less 0.3 %)
     before = (_net(mgr, BOB), _net(mgr, CAROL), _net(mgr, escrow))
     r = mgr.process_transaction(_tx(BOB, ExchangeOpType.SWAP, {
         "token_in": T0, "token_out": T1, "amount_in": "10"}))     # Bob sells 10 T0
     assert r.success and r.data["source"] == "clob", r.data
     bob, carol, esc = _net(mgr, BOB), _net(mgr, CAROL), _net(mgr, escrow)
-    assert bob[0] - before[0][0] == -10 and bob[1] - before[0][1] == D("9.9")
+    assert bob[0] - before[0][0] == -10 and bob[1] - before[0][1] == D("10.02")
     assert carol[0] - before[1][0] == 10                            # Carol got her T0 …
-    assert esc[1] - before[2][1] == D("-9.9")                       # … paid from her escrow
+    assert esc[1] - before[2][1] == D("-10.02")                     # … paid from her escrow
     book = mgr._order_books[pair]
     assert sum(o.remaining for o in book._orders.values()) == 40
 

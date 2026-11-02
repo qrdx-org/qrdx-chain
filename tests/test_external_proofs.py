@@ -4,9 +4,10 @@ slot of it — on a bridged EVM chain, proven inside a QRDX contract call agains
 the validators attested (docs/BRIDGE.md "Chain heads"). Real Merkle-Patricia proofs, as
 ``eth_getProof`` returns them; forged or unattested ones prove nothing.
 """
+import pytest
 import rlp
 from eth_utils import keccak
-from test_bridge import CHAIN, Key, _genesis
+from test_bridge import ASSET, CHAIN, Key, _genesis
 from test_evm_world import ALICE, Chain, chain  # noqa: F401  (fixture)
 from trie import HexaryTrie
 
@@ -16,6 +17,14 @@ from qrdx.exchange import ExchangeOpType, ExchangeStateManager
 
 LOCKBOX = bytes.fromhex("10" * 20)
 SLOT = (7).to_bytes(32, "big")
+
+
+@pytest.fixture(autouse=True)
+def _bridged(monkeypatch):
+    """Heads are attested only for the chains the network bridges (docs/EXCHANGE_AUDIT.md 10)."""
+    from qrdx import constants
+
+    monkeypatch.setattr(constants, "BRIDGE_ASSETS", (ASSET,))
 
 
 def _world():

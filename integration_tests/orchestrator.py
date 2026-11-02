@@ -37,6 +37,28 @@ from integration_tests.wallet_factory import generate_all_wallets
 from integration_tests.genesis_generator import create_genesis
 from integration_tests.rpc_client import NodeRPCClient, MultiNodeClient
 
+
+def _validator_keystore(wallet_path: str, password: str) -> str:
+    """The encrypted keystore a validator node signs with (a network that is not a dev one
+    refuses a plaintext key: docs/VALIDATOR_KEYS.md), beside the plaintext wallet the scenarios
+    sign with. Mode 0600; rewritten when the wallet was regenerated."""
+    from qrdx.crypto.pq.dilithium import PQPrivateKey
+    from qrdx.wallet_v2.pq_wallet import PQWallet
+
+    out = wallet_path[: -len(".json")] + ".keystore.json"
+    data = json.loads(Path(wallet_path).read_text())
+    if os.path.exists(out):
+        if json.loads(Path(out).read_text()).get("address") == data.get("address"):
+            return out
+        os.remove(out)
+    key = PQPrivateKey.from_hex(data["private_key"], public_key_hex=data["public_key"])
+    keystore = PQWallet(private_key=key).to_keystore(password)
+    keystore["kind"] = "qrdx-validator"
+    fd = os.open(out, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(keystore, f, indent=2)
+    return out
+
 logger = logging.getLogger(__name__)
 
 
@@ -290,9 +312,10 @@ class TestnetOrchestrator:
             if wallet:
                 safe_name = validator_label.lower().replace(" ", "_")
                 wallet_path = str(WALLETS_DIR / f"{safe_name}.json")
+                password = f"testnet_validator_{spec.validator_index}"
                 env["QRDX_VALIDATOR_ENABLED"] = "true"
-                env["QRDX_VALIDATOR_WALLET"] = wallet_path
-                env["QRDX_VALIDATOR_PASSWORD"] = f"testnet_validator_{spec.validator_index}"
+                env["QRDX_VALIDATOR_WALLET"] = _validator_keystore(wallet_path, password)
+                env["QRDX_VALIDATOR_PASSWORD"] = password
             else:
                 env["QRDX_VALIDATOR_ENABLED"] = "false"
         else:

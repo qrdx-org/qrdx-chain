@@ -18,6 +18,7 @@ from typing import Optional, Tuple
 import blake3
 import oqs
 
+from ..crypto.pq.algorithms import SIG_ALGORITHM, require as require_pq_algorithms
 from ..logger import get_logger
 
 logger = get_logger(__name__)
@@ -27,18 +28,8 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-# Resolve algorithm name at import time (ML-DSA-65 preferred, Dilithium3 legacy)
-def _resolve_sig_algorithm() -> str:
-    for name in ("ML-DSA-65", "Dilithium3"):
-        try:
-            oqs.Signature(name)
-            return name
-        except Exception:
-            continue
-    raise RuntimeError("No supported PQ signature algorithm found in liboqs")
-
-
-PQ_SIG_ALGORITHM = _resolve_sig_algorithm()
+PQ_SIG_ALGORITHM = SIG_ALGORITHM  # ML-DSA-65 only (qrdx/crypto/pq/algorithms.py)
+require_pq_algorithms()
 NODE_ID_HEX_LEN = 40  # 20 bytes = 160 bits, expressed as 40 hex chars
 NODE_ID_PREFIX = "qx"
 NODE_ID_FULL_LEN = len(NODE_ID_PREFIX) + NODE_ID_HEX_LEN  # 42

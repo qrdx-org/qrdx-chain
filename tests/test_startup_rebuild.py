@@ -27,29 +27,25 @@ from qrdx.node import main as node_main
 from test_interleaved_rebuild_equivalence import _add_block, _db, _forward
 from test_reorg_rebuild_equivalence import _sign, _tx
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+pytestmark = pytest.mark.usefixtures("genesis_btc")  # BTC from the first block
 
 
 async def _chain_with_a_rejected_position(db, monkeypatch):
-    """t1 opens a perp market and, as its configured oracle reporter, prices it; poor t2 then
+    """t1, the genesis validator, prices BTC (a genesis market) with its vote; poor t2 then
     tries to deposit 3,000 QRDX of perp collateral holding 10. Forward application rejects
     that (enforced, balances pre-loaded); an unenforced replay would accept it."""
-    from qrdx import constants
     k1, k2 = PQPrivateKey.generate(), PQPrivateKey.generate()
     t1, t2 = k1.public_key.to_address(), k2.public_key.to_address()
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (t1,))
+    await db.record_genesis_validators([{"address": t1, "public_key": "", "stake": "1000"}])
     await _add_block(db, 0, genesis_alloc=[(t1, "1000000"), (t2, "10")])
-    await _add_block(db, 1, encode_exchange_txs([
-        _sign(_tx(ExchangeOpType.CREATE_MARKET, t1, 0,
-                  {"base_token": "BTC", "max_leverage": "10", "initial_margin_rate": "0.1",
-                   "maintenance_margin_rate": "0.05"}), k1),
-        _sign(_tx(ExchangeOpType.UPDATE_ORACLE, t1, 1,
-                  {"pair": "BTC:QRDX", "price": "30000"}), k1)]))
+    await _add_block(db, 1, encode_exchange_txs([   # (a vote's own sequence, not a nonce)
+        _sign(_tx(ExchangeOpType.ORACLE_VOTE, t1, 1, {"prices": {"BTC": "30000"}}), k1),
+        _sign(_tx(ExchangeOpType.CANCEL_ALL, t1, 0, {}), k1)]))
     await _add_block(db, 2, encode_exchange_txs([_sign(_tx(
         ExchangeOpType.PERP_DEPOSIT, t2, 0, {"amount": "3000"}), k2)]))
     # An affordable deposit too, so the clearinghouse carries real state on both paths.
     await _add_block(db, 3, encode_exchange_txs([_sign(_tx(
-        ExchangeOpType.PERP_DEPOSIT, t1, 2, {"amount": "10000"}), k1)]))
+        ExchangeOpType.PERP_DEPOSIT, t1, 1, {"amount": "10000"}), k1)]))
     return t1, t2
 
 

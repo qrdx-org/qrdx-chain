@@ -33,7 +33,7 @@ from qrdx.exchange import (
 from qrdx.exchange.amm import FeeTier, PoolType
 from qrdx.exchange import block_processor as BP
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+pytestmark = pytest.mark.usefixtures("genesis_btc")  # BTC from the first block
 
 
 # --- helpers ---------------------------------------------------------------
@@ -55,9 +55,9 @@ def _tx(op, sender, nonce, params):
                               gas_price=constants.EXCHANGE_MIN_GAS_PRICE_WEI)
 
 
-async def _add_block(db, height, ex_section=None, genesis_alloc=None):
+async def _add_block(db, height, ex_section=None, genesis_alloc=None, content=""):
     bh = f"{height:064x}"
-    await db.add_block(block_hash=bh, block_height=height, block_content="",
+    await db.add_block(block_hash=bh, block_height=height, block_content=content,
                        validator_address="0xPQ" + "00" * 32, timestamp=1_700_000_000 + height)
     if genesis_alloc:
         for i, (recipient, amount) in enumerate(genesis_alloc):
@@ -82,25 +82,25 @@ async def _build_chain(db, k1, k2):
     pair = ":".join(sorted([tokenA, tokenB]))
     sqrtp = "79228162514264337593543950336"  # 1.0 in Q96
 
-    await _add_block(db, 0, genesis_alloc=[(t1, "1000000"), (t2, "1000000")])
+    # t2 is the genesis validator: it votes BTC's price (a perp market cannot trade until it has
+    # an oracle price).
+    genesis = json.dumps({"type": "genesis", "validators": 1,
+                          "validator_set": [{"address": t2, "stake": "1000"}]})
+    await _add_block(db, 0, genesis_alloc=[(t1, "1000000"), (t2, "1000000")], content=genesis)
     await _add_block(db, 1, encode_exchange_txs([_sign(_tx(
         ExchangeOpType.TOKEN_DEPLOY, t1, 0,
         {"name": "A", "symbol": "AAA", "total_supply": "1000000", "decimals": 18}), k1)]))
     await _add_block(db, 2, encode_exchange_txs([_sign(_tx(
         ExchangeOpType.TOKEN_TRANSFER, t1, 1,
         {"token_address": tokenA, "to": t2, "amount": "100000"}), k1)]))
-    # t2 is the configured oracle reporter (see _equivalence): a perp market cannot trade
-    # until it has an oracle price.
+    # (BTC is a genesis market; a vote carries its own sequence, not the account's nonce.)
     await _add_block(db, 3, encode_exchange_txs([
-        _sign(_tx(ExchangeOpType.CREATE_MARKET, t1, 2,
-                  {"base_token": "BTC", "max_leverage": "10", "initial_margin_rate": "0.1",
-                   "maintenance_margin_rate": "0.05"}), k1),
-        _sign(_tx(ExchangeOpType.UPDATE_ORACLE, t2, 0,
-                  {"pair": "BTC:QRDX", "price": "30000"}), k2)]))
+        _sign(_tx(ExchangeOpType.ORACLE_VOTE, t2, 1, {"prices": {"BTC": "30000"}}), k2),
+        _sign(_tx(ExchangeOpType.CANCEL_ALL, t1, 2, {}), k1)]))
     await _add_block(db, 4, encode_exchange_txs([
         _sign(_tx(ExchangeOpType.PERP_DEPOSIT, t1, 3, {"amount": "10000"}), k1),
-        _sign(_tx(ExchangeOpType.PERP_DEPOSIT, t2, 1, {"amount": "10000"}), k2),
-        _sign(_tx(ExchangeOpType.PERP_ORDER, t2, 2,
+        _sign(_tx(ExchangeOpType.PERP_DEPOSIT, t2, 0, {"amount": "10000"}), k2),
+        _sign(_tx(ExchangeOpType.PERP_ORDER, t2, 1,
                   {"market_id": "BTC-QRDX-PERP", "side": "sell", "size": "1",
                    "price": "30000"}), k2),
         _sign(_tx(ExchangeOpType.PERP_ORDER, t1, 4,
@@ -213,8 +213,6 @@ async def _equivalence(monkeypatch, pool_stake: bool):
     db, path = await _db()
     try:
         k1, k2 = PQPrivateKey.generate(), PQPrivateKey.generate()
-        from qrdx import constants
-        monkeypatch.setattr(constants, "ORACLE_REPORTERS", (k2.public_key.to_address(),))
         tip = await _build_chain(db, k1, k2)
 
         fwd_acct, fwd_tok = await _run_forward(db, tip)
@@ -386,6 +384,108 @@ async def test_rebuild_equivalence_native_token_ops(monkeypatch):
         assert fwd[2] == rb[2], f"registry mirror diverges: {fwd[2]} vs {rb[2]}"
         assert dict(zip(("token_address", "name", "symbol", "decimals", "total_supply"),
                         fwd[2][0][:5]))["total_supply"] == "1401"
+    finally:
+        await db.close()
+        os.remove(path)
+
+
+async def test_rebuild_equivalence_unified_spot(monkeypatch):
+    """Unified spot liquidity (docs/UNIFIED_SPOT_LIQUIDITY.md) on both paths: a swap routed
+    through QRDX, a limit order filled by a pool, a resting bid that new liquidity crossed
+    filled at the tick, and a stop-loss a pool trade reached, fired. Forward and rebuild must
+    agree on every root — and the chain must have done each of those things."""
+    db, path = await _db()
+    try:
+        k1, k2 = PQPrivateKey.generate(), PQPrivateKey.generate()
+        t1, t2 = k1.public_key.to_address(), k2.public_key.to_address()
+        a = ExchangeStateManager.derive_token_address(t1, 0, "AAA")
+        b = ExchangeStateManager.derive_token_address(t1, 1, "BBB")
+        base, quote = sorted([a, b])
+        pair = f"{base}:{quote}"
+        nonce = {t1: 0, t2: 0}
+
+        def tx(key, sender, op, **params):
+            n = nonce[sender]
+            nonce[sender] += 1
+            return _sign(_tx(op, sender, n, params), key)
+
+        def pool(t0, t1_, price):
+            return tx(k1, t1, ExchangeOpType.CREATE_POOL, token0=t0, token1=t1_,
+                      fee_tier=int(FeeTier.MEDIUM), pool_type=int(PoolType.STANDARD),
+                      initial_price=str(price), stake_amount="10000")
+
+        def liquidity(t0, t1_):
+            return tx(k1, t1, ExchangeOpType.ADD_LIQUIDITY, token0=t0, token1=t1_,
+                      fee_tier=int(FeeTier.MEDIUM), amount="100000",
+                      tick_lower="-60000", tick_upper="60000")
+
+        await _add_block(db, 0, genesis_alloc=[(t1, "1000000"), (t2, "1000000")])
+        blocks = [
+            [tx(k1, t1, ExchangeOpType.TOKEN_DEPLOY, name="A", symbol="AAA",
+                total_supply="1000000", decimals=18),
+             tx(k1, t1, ExchangeOpType.TOKEN_DEPLOY, name="B", symbol="BBB",
+                total_supply="1000000", decimals=18)],
+            [tx(k1, t1, ExchangeOpType.TOKEN_TRANSFER, token_address=a, to=t2, amount="100000"),
+             tx(k1, t1, ExchangeOpType.TOKEN_TRANSFER, token_address=b, to=t2, amount="100000")],
+            # The pair's own pool opens at 0.5 (no liquidity yet); the hubs' pools price the
+            # base at 2 QRDX and the quote at 1.
+            [pool(base, quote, "0.5"), pool(base, "QRDX", 2), pool(quote, "QRDX", 1)],
+            [liquidity(base, "QRDX"), liquidity(quote, "QRDX"),
+             tx(k2, t2, ExchangeOpType.PLACE_ORDER, pair=pair, side="buy",
+                order_type="limit", price="0.9", amount="10")],
+            # Liquidity at 0.5 under t2's bid at 0.9: the tick fills the bid from the pool.
+            [liquidity(base, quote)],
+            [tx(k1, t1, ExchangeOpType.SWAP, token_in=base, token_out=quote, amount_in="100"),
+             tx(k1, t1, ExchangeOpType.PLACE_ORDER, pair=pair, side="buy", order_type="limit",
+                price="1.5", amount="5"),
+             tx(k2, t2, ExchangeOpType.PLACE_ORDER, pair=pair, side="sell",
+                order_type="stop_loss", trigger_price="0.4", amount="5")],
+            # The push gaps the price past the stop's 10 % band: it fires and waits…
+            [tx(k1, t1, ExchangeOpType.SWAP, token_in=base, token_out=quote, amount_in="60000",
+                venue="amm")],
+            # …until the market is back within its band: then it sells.
+            [tx(k1, t1, ExchangeOpType.SWAP, token_in=quote, token_out=base, amount_in="30000",
+                venue="amm")],
+        ]
+        for h, txs in enumerate(blocks, start=1):
+            await _add_block(db, h, encode_exchange_txs(txs))
+        tip = len(blocks)
+
+        await db.seed_genesis_account_state(); await db.connection.commit()
+        ExchangeStateManager.reset_instance()
+        mgr = ExchangeStateManager.get_instance(); _set_flags(mgr)
+        results, events = {}, []
+        for h in range(0, tip + 1):
+            section = await db.get_block_exchange_txs(f"{h:064x}")
+            if not section:
+                continue
+            txs = BP.decode_exchange_txs(section)
+            await BP.preload_sender_balances(db, txs, mgr)
+            await BP.preload_token_balances(db, txs, mgr)
+            ok, err, root = BP.process_exchange_transactions(h, float(1_700_000_000 + h), txs, mgr)
+            assert ok, err
+            for i, r in enumerate(mgr._block_results):
+                results[(h, i)] = r
+            events += mgr._block_tick_events
+            mgr.commit_block()
+            await BP.flush_exchange_balance_deltas(db, mgr, enforce=BP.ENFORCE_EXCHANGE_COLLATERAL)
+            await BP.flush_token_balance_deltas(db, mgr)
+        await db.connection.commit()
+
+        # The chain did what it says.
+        assert all(r.success for r in results.values()), {
+            k: r.error for k, r in results.items() if not r.success}
+        assert [e["type"] for e in events if e["type"] == "spot_uncross"] == ["spot_uncross"]
+        assert results[(6, 0)].data["path"] == [base, "QRDX", quote]        # through the hub
+        assert {f["venue"] for f in results[(6, 1)].data["fills"]} >= {"amm"}  # the pool filled
+        fired = [e for e in events if e["type"] == "spot_trigger_fired"]
+        assert [e["waiting"] for e in fired] == [True, False]              # it waited, then sold
+        assert not mgr.trading.spot_triggers and not mgr.trading.uncross
+        fwd = (await db.get_account_state_root(), await db.get_token_balances_root(), root)
+
+        rb_acct, rb_tok = await _run_rebuild(db)
+        rb_root = ExchangeStateManager.get_instance().compute_state_root()
+        assert (rb_acct, rb_tok, rb_root) == fwd
     finally:
         await db.close()
         os.remove(path)

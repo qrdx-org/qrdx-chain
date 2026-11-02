@@ -511,6 +511,56 @@ def _future_tolerance_slots() -> int:
     return max(1, int(1.0 // float(SLOT_DURATION)) + 1)
 
 
+def slot_timestamp(genesis_time: float, slot: int) -> int:
+    """A slot's start time in whole seconds: genesis time + slot × slot duration, rounded down.
+    Exact (integer milliseconds), so every node computes the same second."""
+    from ..constants import SLOT_DURATION_MS
+
+    genesis_ms = int(round(float(genesis_time) * 1000))
+    return (genesis_ms + int(slot) * int(SLOT_DURATION_MS)) // 1000
+
+
+async def genesis_time(db: Any) -> Optional[float]:
+    """The genesis block's time (seconds), read once per database: the slot clock's origin."""
+    cached = getattr(db, "_qrdx_genesis_time", None)
+    if cached is not None:
+        return cached
+    from .node_integration import parse_block_timestamp
+
+    genesis = await db.get_block_by_id(0)
+    parsed = parse_block_timestamp(genesis.get("timestamp") if genesis else None)
+    if parsed is None:
+        return None
+    try:
+        db._qrdx_genesis_time = parsed.timestamp()
+    except AttributeError:
+        pass
+    return parsed.timestamp()
+
+
+async def verify_block_timestamp(db: Any, block_content: Any, height: int) -> Tuple[bool, str]:
+    """With ``slot_timestamps`` active, a block's timestamp must be its slot's start time
+    (``slot_timestamp``). It is the exchange's only clock: without this rule a proposer chose
+    it, and could run funding, oracle staleness, TWAPs, lockups and the bridge's deposit window
+    forwards or backwards."""
+    from .. import chain_spec
+
+    if height < 1 or not chain_spec.is_active("slot_timestamps", int(height)):
+        return True, ""
+    try:
+        bc = _parse_block_content(block_content)
+        slot, stamp = int(bc["slot"]), int(bc["timestamp"])
+    except Exception:
+        return False, "block has no readable slot and timestamp"
+    origin = await genesis_time(db)
+    if origin is None:
+        return False, "no genesis block to take the slot clock from"
+    expected = slot_timestamp(origin, slot)
+    if stamp != expected:
+        return False, f"timestamp {stamp} is not slot {slot}'s start time ({expected})"
+    return True, ""
+
+
 async def verify_slot_progression(
     db: Any, block_content: Any, height: int, current_slot: Optional[int]
 ) -> Tuple[bool, str]:

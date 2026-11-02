@@ -20,6 +20,7 @@ from qrdx.database_sqlite import DatabaseSQLite
 D = Decimal
 TOKEN = "0x" + "70" * 20
 PARTS = {"utxo": "1" * 64, "account": "2" * 128, "exchange": "3" * 128, "token": "4" * 128}
+VALIDATORS = "5" * 128  # the validator root (validator_state_root is a genesis feature)
 
 
 @pytest.fixture
@@ -37,9 +38,9 @@ async def db():
 async def _seal(db, height):
     """What the proposer does at a block: the proof root, the parts, the signed root."""
     root = await state_proofs.proof_root(db, height)
-    await state_proofs.record_parts(db, height, {**PARTS, "proof": root})
+    await state_proofs.record_parts(db, height, {**PARTS, "proof": root, "validators": VALIDATORS})
     await db.connection.commit()
-    return unified_state_root(*PARTS.values(), root)
+    return unified_state_root(*PARTS.values(), root, VALIDATORS)
 
 
 async def _rows(db):

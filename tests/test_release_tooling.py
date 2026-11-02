@@ -188,8 +188,8 @@ def test_the_manifest_records_source_build_inputs_and_networks(repo, tmp_path):
     assert m["version"] == "v2.0.1" and m["node_version"] == "2.0.1"
     assert m["source"]["commit"] == R.resolve("v2.0.1")
     assert set(m["source"]["submodules"]) == {"py-evm"}
-    assert m["build"]["liboqs"] == {"version": "0.15.0",
-                                    "commit": "97f6b86b1b6d109cfd43cf276ae39c2e776aed80"}
+    assert m["build"]["liboqs"] == {"version": "0.16.0",
+                                    "commit": "5a1a854b0dc9f2141bdc771c555ee60c37950183"}
     assert m["build"]["base_image"].startswith("python:3.11.17-slim-bookworm@sha256:")
     assert "randao_selection" in m["features"]
     net = m["networks"]["qrdx-testnet"]

@@ -16,7 +16,8 @@ finalized on both sides (seen at 250 ms slots: a permanent network split). What 
     reorg;
   * import accepts a block only if every carried vote is valid for its chain
     (verify_block_votes); the honest validator never signs a double or surround vote
-    (SigningRecord); the proposer includes only votes valid for, and not yet on, its chain.
+    (slashing protection: tests/test_slashing_protection.py); the proposer includes only votes
+    valid for, and not yet on, its chain.
 """
 import hashlib
 import os
@@ -319,22 +320,6 @@ async def test_a_deposited_validators_key_comes_from_its_deposit(keys):
 
 
 # ── the honest validator and the proposer ────────────────────────────────────────────────
-
-
-async def test_the_signing_record_refuses_double_and_surround_votes(keys):
-    c = await Chain.create(keys)
-    try:
-        rec, v = ffg.SigningRecord(c.db), _addr(keys[0])
-        first = (1, "aa" * 32, 3, "bb" * 32)
-        assert await rec.may_sign(v, first)
-        await rec.record(v, first)
-        assert await rec.may_sign(v, first)                           # the same vote again
-        assert not await rec.may_sign(v, (1, "aa" * 32, 3, "cc" * 32))  # double
-        assert not await rec.may_sign(v, (0, "aa" * 32, 4, "dd" * 32))  # surrounds it
-        assert await rec.may_sign(v, (3, "bb" * 32, 4, "dd" * 32))     # the next honest vote
-        assert not await ffg.SigningRecord(c.db).may_sign(v, (1, "aa" * 32, 3, "ee" * 32))
-    finally:
-        await c.close()
 
 
 async def test_the_proposer_includes_only_votes_valid_for_and_missing_from_its_chain(keys):

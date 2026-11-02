@@ -132,10 +132,6 @@ def parts(mgr, cache: Dict[str, Tuple[bytes, bytes]]) -> Dict[str, bytes]:
         "governance": [mgr.governance.next_id, mgr.governance.master_frozen_at],
         "trading": [mgr.trading.seq],
         "authority": [mgr.authority.seq],
-        "spot_oracles": {
-            pair: [str(o.latest_price or 0), o.observation_count]
-            for pair, o in sorted(mgr._oracles.items())
-        },
         "oracle": mgr.oracle_state(),
     }
     for name, value in scalars.items():

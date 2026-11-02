@@ -78,16 +78,19 @@ class S21InterfacesNfts(S20NativeTokens):
             "token0": tok, "token1": "QRDX", "tick_lower": centre - 600,
             "tick_upper": centre + 600, "amount": "100000"}, "Add liquidity (QRDX + qMKT)")
         market = f"{tok}:QRDX"
+        # The book and the pool are one market (docs/UNIFIED_SPOT_LIQUIDITY.md): an ask rests only
+        # within the pool's fee band around its price (below it the pool would buy it at once),
+        # and a buyer takes it first there (2.0 plus the 0.05 % taker fee, the pool 2.006).
         ask = await self._ok(target, maker, Op.PLACE_ORDER, {
-            "pair": f"QRDX:{tok}", "side": "sell", "order_type": "limit", "price": "2.5",
-            "amount": "10"}, "The maker rests an ask: 10 qMKT at 2.5 QRDX")
+            "pair": f"QRDX:{tok}", "side": "sell", "order_type": "limit", "price": "2",
+            "amount": "10"}, "The maker rests an ask: 10 qMKT at 2 QRDX")
         lift = await self._ok(target, taker, Op.PLACE_ORDER, {
             "pair": market, "side": "buy", "order_type": "limit", "price": "2.5",
             "amount": "4"}, "The taker lifts 4 of it")
         self.check(bool(lift) and lift["data"].get("trades") == 1, "The taker's order filled")
         await self._ok(target, taker, Op.SWAP, {
-            "token_in": "QRDX", "token_out": tok, "amount_in": "5", "venue": "amm"},
-            "The taker swaps 5 QRDX through the pool")
+            "token_in": tok, "token_out": "QRDX", "amount_in": "2", "venue": "amm"},
+            "The taker sells 2 qMKT to the pool (no bid on the book)")
 
         # ── market data, identical on every node ──────────────────────────
         async def trades(url):
@@ -95,21 +98,25 @@ class S21InterfacesNfts(S20NativeTokens):
             return None if t is None else [(x["venue"], x["side"], x["price"], x["amount"],
                                              x["tx_hash"]) for x in t["trades"]]
         got = await self._agree(nodes, trades, label="Nodes serve the same trades")
-        self.check(bool(got) and len(got) == 2 and got[0][:4] == ("clob", "buy", "2.5", "4")
-                   and got[1][0] == "amm", f"A book fill then a pool swap ({got})")
+        self.check(bool(got) and len(got) == 2 and got[0][:2] == ("clob", "buy")
+                   and Decimal(got[0][2]) == 2 and Decimal(got[0][3]) == 4
+                   and got[1][:2] == ("amm", "sell"), f"A book fill then a pool swap ({got})")
 
         async def book(url):
             b = await self._get(url, "/get_orderbook", market=market, level=3)
             return None if b is None else (
-                [(r["price"], r["amount"], r["total"]) for r in b["asks"]],
+                [tuple(Decimal(r[k]).normalize() for k in ("price", "amount", "total"))
+                 for r in b["asks"]],
                 [o["owner"] for r in b["asks"] for o in r["orders"]], len(b["amm"]))
-        await self._agree(nodes, book, want=([("2.5", "6", "6")], [maker["address"]], 1),
-                          label="Nodes serve the L3 book: 6 left at 2.5, the maker's")
+        await self._agree(nodes, book,
+                          want=([(Decimal(2), Decimal(6), Decimal(6))], [maker["address"]], 1),
+                          label="Nodes serve the L3 book: 6 left at 2, the maker's")
 
         async def ticker(url):
             t = await self._get(url, "/get_ticker", market=market)
-            return None if t is None else (t["best_ask"], t["trades_24h"], t["pools"])
-        await self._agree(nodes, ticker, want=("2.5", 2, 1), label="Nodes serve the ticker")
+            return None if t is None or t["best_ask"] is None else (
+                Decimal(t["best_ask"]).normalize(), t["trades_24h"], t["pools"])
+        await self._agree(nodes, ticker, want=(Decimal(2), 2, 1), label="Nodes serve the ticker")
         candles = await self._get(target, "/get_candles", market=market, interval="1m")
         self.check(bool(candles and candles["candles"]), "Candles are served")
         markets = await self._get(target, "/get_markets", kind="spot")

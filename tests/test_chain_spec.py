@@ -49,10 +49,10 @@ def test_dev_spec_reproduces_the_historical_defaults():
 
 
 def test_dev_spec_takes_parameters_from_the_environment():
-    spec = cs.dev_spec(env={"QRDX_SLOTS_PER_EPOCH": "8", "QRDX_ORACLE_REPORTERS": "a, b,",
+    spec = cs.dev_spec(env={"QRDX_SLOTS_PER_EPOCH": "8", "QRDX_PERP_VAULT_SEEDERS": "a, b,",
                             "QRDX_PERP_QUOTE": "  ", "QRDX_CHAIN_ID": "777"})
     assert spec.params["SLOTS_PER_EPOCH"] == 8
-    assert spec.params["ORACLE_REPORTERS"] == ["a", "b"]
+    assert spec.params["PERP_VAULT_SEEDERS"] == ["a", "b"]
     assert spec.params["PERP_QUOTE"] == "USD"           # blank means the default, as before
     assert spec.chain_id == 777
 
@@ -77,8 +77,16 @@ def test_dev_spec_rejects_a_malformed_environment_value():
     (lambda r: r["params"].update(SLOT_DURATION_MS=True), "integer"),
     (lambda r: r["params"].update(SLOT_DURATION_MS=250.0), "integer"),
     (lambda r: r["params"].update(PERP_QUOTE=" USD"), "whitespace"),
-    (lambda r: r["params"].update(ORACLE_REPORTERS=["a", "a"]), "twice"),
-    (lambda r: r["params"].update(ORACLE_REPORTERS=["a,b"]), "list"),
+    (lambda r: r["params"].update(PERP_VAULT_SEEDERS=["a", "a"]), "twice"),
+    (lambda r: r["params"].update(PERP_VAULT_SEEDERS=["a,b"]), "list"),
+    # Genesis perp markets: BASE:MAX_LEVERAGE:SZ_DECIMALS, an off-chain asset's symbol each.
+    (lambda r: r["params"].update(PERP_GENESIS_MARKETS=["BTC:40"]), "BASE:MAX_LEVERAGE"),
+    (lambda r: r["params"].update(PERP_GENESIS_MARKETS=["BTC:x:5"]), "whole numbers"),
+    (lambda r: r["params"].update(PERP_GENESIS_MARKETS=["BTC:0:5"]), "leverage at least 1"),
+    (lambda r: r["params"].update(PERP_GENESIS_MARKETS=["BTC:40:9"]), "sz decimals"),
+    (lambda r: r["params"].update(PERP_GENESIS_MARKETS=["QRDX:10:2"]), "on chain"),
+    (lambda r: r["params"].update(PERP_GENESIS_MARKETS=["0xabc:10:2"]), "on chain"),
+    (lambda r: r["params"].update(PERP_GENESIS_MARKETS=["BTC:40:5", "btc:20:5"]), "twice"),
     (lambda r: r.update(features=["no_such_rule"]), "unknown feature"),
 ])
 def test_strict_validation(mutate, message):
@@ -146,7 +154,7 @@ def test_genesis_hash_is_stable_and_covers_everything_but_the_schedule(extra_fea
     # Anything else is a different network.
     for other in (_spec(SLOTS_PER_EPOCH=8), _spec(chain_id=4243), _spec(network="qrdx-other"),
                   _spec(features=["test_rule_a"]), _spec(dev=True),
-                  _spec(ORACLE_REPORTERS=["0xabc"])):
+                  _spec(PERP_VAULT_SEEDERS=["0xabc"])):
         assert other.genesis_hash() != base.genesis_hash()
 
 

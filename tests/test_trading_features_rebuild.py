@@ -5,8 +5,10 @@ The new trading features through the node's own block paths, end to end: forward
 
 The chain exercises what runs in the tick of blocks that carry no exchange transactions: a spot
 TWAP (its funds escrowed, then swapped slice by slice into a resting bid — real token moves in the
-tick) and a perps buy stop placed by an agent key, fired once the mark drifts up to it. Plus a
-batch, an agent approval and an agent-signed transaction (its own nonce lane).
+tick) and a perps buy stop placed by an agent key, fired once the mark drifts up to it; and a
+token perp listed with liquidity, its oracle read off its token's pool and its vault quoting in
+every tick. Plus a batch, an agent approval and an agent-signed transaction (its own nonce lane).
+BTC is a genesis market, priced by the genesis validator's vote.
 """
 import json
 import os
@@ -15,7 +17,7 @@ from decimal import Decimal as D
 
 import pytest
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+pytestmark = pytest.mark.usefixtures("genesis_btc")  # BTC from the first block
 
 T0 = 1_700_000_000
 BTC = "BTC-QRDX-PERP"
@@ -37,9 +39,18 @@ async def test_trading_features_forward_equal_the_rebuild(monkeypatch, keys):
     from qrdx.exchange import block_processor as BP
 
     addr = {n: k.public_key.to_address() for n, k in keys.items()}
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (addr["rep"],))
     monkeypatch.setattr(constants, "PERP_COLLATERAL_TOKEN", "QRDX")
+    # A short spot TWAP and a low depth floor: the token perp's pool is small and young.
+    monkeypatch.setattr(constants, "SPOT_ORACLE_TWAP_SECONDS", 60)
+    monkeypatch.setattr(constants, "SPOT_ORACLE_MIN_DEPTH", 100)
     nonces = {}
+
+    def vote(prices):
+        t = ExchangeTransaction(op_type=Op.ORACLE_VOTE, sender=addr["rep"], nonce=1,
+                                params={"prices": prices}, gas_limit=100_000, gas_price=10**9)
+        t.public_key = keys["rep"].public_key.to_bytes()
+        t.signature = keys["rep"].sign(t.signing_bytes()).to_bytes()
+        return t
 
     def tx(who, op, params, signer=None):
         sender = addr[who]
@@ -60,7 +71,9 @@ async def test_trading_features_forward_equal_the_rebuild(monkeypatch, keys):
     try:
         async def add(h, txs=None, alloc=None):
             bh = f"{h:064x}"
-            await db.add_block(block_hash=bh, block_height=h, block_content="",
+            await db.add_block(block_hash=bh, block_height=h, block_content=json.dumps(
+                {"type": "genesis", "validators": 1,              # rep: the genesis validator
+                 "validator_set": [{"address": addr["rep"], "stake": "1000"}]}) if h == 0 else "",
                                validator_address="0xPQ" + "00" * 32, timestamp=T0 + 6 * h)
             for i, (r, a) in enumerate(alloc or []):
                 await db.add_transaction(tx_hash=f"a{h}{i}", block_hash=bh, tx_hex=json.dumps(
@@ -71,12 +84,10 @@ async def test_trading_features_forward_equal_the_rebuild(monkeypatch, keys):
         await add(0, alloc=[(addr["mm"], "10000000"), (addr["rep"], "10000"),
                             (addr["tr"], "1000000")])
         await add(1, [
+            vote({"BTC": "30000"}),
             tx("mm", Op.TOKEN_DEPLOY, {"name": "Token", "symbol": "TOK", "decimals": 6,
                                        "total_supply": "1000000"}),
             tx("rep", Op.PERP_DEPOSIT, {"amount": "3000"}),
-            # Listed with liquidity: the protocol quotes its vault through the quiet blocks.
-            tx("rep", Op.CREATE_MARKET, {"base_token": "BTC", "liquidity": "2000"}),
-            tx("rep", Op.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": "30000"}),
             tx("mm", Op.PERP_DEPOSIT, {"amount": "1000000"}),
             tx("tr", Op.PERP_DEPOSIT, {"amount": "200000"}),
         ])
@@ -108,7 +119,23 @@ async def test_trading_features_forward_equal_the_rebuild(monkeypatch, keys):
             {"op": "PERP_ORDER", "params": {"market_id": BTC, "side": "buy", "size": "0.1",
                                             "price": "20001"}},
         ]})])
-        for h in range(5, 60):                        # quiet blocks: no exchange transactions
+        for h in range(5, 30):                        # quiet blocks: no exchange transactions
+            await add(h)
+        # A second token and its pool, then (a TWAP's history later) its perp, listed with
+        # liquidity: the protocol quotes its vault through the quiet blocks after.
+        tk2 = ExchangeStateManager.derive_token_address(addr["mm"], nonces[addr["mm"]], "TK2")
+        await add(30, [tx("mm", Op.TOKEN_DEPLOY, {"name": "Two", "symbol": "TK2",
+                                                  "total_supply": "1000000"})])
+        await add(31, [tx("mm", Op.CREATE_POOL, {"token0": tk2, "token1": "QRDX",
+                                                 "fee_tier": 3000, "pool_type": "STANDARD",
+                                                 "initial_price": "1", "stake_amount": "25"})])
+        await add(32, [tx("mm", Op.ADD_LIQUIDITY, {"pool_id": "", "token0": tk2,
+                                                   "token1": "QRDX", "amount": "100000",
+                                                   "tick_lower": -60000, "tick_upper": 60000})])
+        for h in range(33, 45):
+            await add(h)
+        await add(45, [tx("rep", Op.CREATE_MARKET, {"token": tk2, "liquidity": "2000"})])
+        for h in range(46, 60):
             await add(h)
         tip = 59
 
@@ -142,10 +169,11 @@ async def test_trading_features_forward_equal_the_rebuild(monkeypatch, keys):
 
         from qrdx.exchange.clearinghouse import market_maker_address
 
-        # The vault quoted (and, once the oracle went stale near the end, pulled its quotes).
-        assert mgr.clearinghouse.markets[BTC].mm_time > 0
-        assert not any(o.owner == market_maker_address(BTC)
-                       for o in mgr.clearinghouse.markets[BTC].orders.values())
+        # The token perp's oracle follows its pool, and its vault quotes on its book.
+        tp = mgr.clearinghouse.markets[f"{tk2}-QRDX-PERP"]
+        assert abs(tp.oracle_price - 1) < D("0.01") and tp.spot_depth >= 100
+        assert tp.mm_time > 0 and any(o.owner == market_maker_address(tp.id)
+                                      for o in tp.orders.values())
         slices = [h for h, kind in events if kind == "twap_slice"]
         fired = [h for h, kind in events if kind == "trigger_fired"]
         assert len(slices) == 4 and all(h >= 5 for h in slices[1:]), events

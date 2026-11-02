@@ -23,7 +23,6 @@ from qrdx.crypto.pq.dilithium import PQPrivateKey
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransaction
 from qrdx.exchange import block_processor as BP
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
 
 D = Decimal
 BTC = "BTC-QRDX-PERP"            # the test session quotes perps in QRDX (tests/conftest.py)
@@ -65,13 +64,12 @@ def _genesis(stakes):
 
 @pytest.fixture
 def setup(monkeypatch):
-    v1, v2, v3, rep = Key(), Key(), Key(), Key()
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (rep.addr,))
+    v1, v2, v3, rep = Key(), Key(), Key(), Key()       # (rep: an account outside the committee)
     ExchangeStateManager.reset_instance()
     mgr = ExchangeStateManager.get_instance()
     mgr.load_oracle_committee(_genesis([(v1.addr, 100), (v2.addr, 100), (v3.addr, 300)]))
     mgr.begin_block(1, float(T0))
-    assert mgr.process_transaction(rep.tx(ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"})).success
+    mgr.clearinghouse.create_market("BTC")
     yield mgr, v1, v2, v3, rep
     ExchangeStateManager.reset_instance()
 
@@ -330,7 +328,7 @@ def test_price_feeds(tmp_path):
 
 # ── the chain: votes in blocks, forward ≡ rebuild ─────────────────────────
 
-async def test_forward_and_rebuild_agree_on_voted_prices(monkeypatch):
+async def test_forward_and_rebuild_agree_on_voted_prices(monkeypatch, genesis_btc):
     """Votes ride in blocks; quiet blocks aggregate them. A rebuild — whose manager loads the
     committee at height 0, where the forward one loaded it at its first section — reaches the
     same oracle and the same root."""
@@ -340,7 +338,6 @@ async def test_forward_and_rebuild_agree_on_voted_prices(monkeypatch):
     from qrdx.validator.price_feed import build_vote
 
     v1, v2, v3, rep = Key(), Key(), Key(), Key()
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (rep.addr,))
     db = await DatabaseSQLite.create(db_path=tempfile.mktemp(suffix=".db"))
     try:
         async def add(h, txs=(), content=""):
@@ -356,7 +353,7 @@ async def test_forward_and_rebuild_agree_on_voted_prices(monkeypatch):
                 {"type": "genesis_allocation", "recipient": who.addr, "amount": "5000"}))
         for h in range(1, 4):                              # quiet blocks before anything
             await add(h)
-        await add(4, [rep.tx(ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"})])
+        await add(4, [rep.tx(ExchangeOpType.CANCEL_ALL, {})])   # (BTC: a genesis market)
         await add(5, [build_vote(v.wallet, 0, {"BTC": D(p)})
                       for v, p in ((v1, 29900), (v2, 30100), (v3, 30000))])
         for h in range(6, 12):
@@ -565,7 +562,7 @@ async def test_a_validators_vote_carries_perp_prices_and_rotates_past_the_cap(se
     from qrdx.validator.price_feed import StaticPriceFeed
 
     mgr, v1, _v2, _v3, rep = setup
-    assert mgr.process_transaction(rep.tx(ExchangeOpType.CREATE_MARKET, {"base_token": "ETH"})).success
+    mgr.clearinghouse.create_market("ETH")
 
     from qrdx.validator import epoch_state
 

@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import secrets
+import time
 from collections import Counter
 from decimal import Decimal
 
@@ -51,10 +52,12 @@ class S23Bridge(S20NativeTokens):
         self.check(all(a and a[0]["token_address"] == token for a in listed),
                    f"Every node lists the bridged asset at {token}")
 
-        deposit = {"chain": BRIDGE_TEST_CHAIN, "token": BRIDGE_TEST_TOKEN,
-                   "tx": "0x" + secrets.token_hex(32), "log": 0, "to": user["address"],
-                   "amount": "1234.5"}
-        deposit_id = f"{BRIDGE_TEST_CHAIN}:{deposit['tx']}:0"
+        # As the lockbox records it (contracts/bridge/QRDXLockbox.sol): its own deposit id, the
+        # depositor, the recipient on QRDX, the source block's time.
+        deposit = {"chain": BRIDGE_TEST_CHAIN, "id": secrets.randbelow(1 << 40) + 1,
+                   "token": BRIDGE_TEST_TOKEN, "from": "0x" + "d0" * 20, "to": user["address"],
+                   "amount": "1234.5", "time": int(time.time())}
+        deposit_id = f"{BRIDGE_TEST_CHAIN}:{deposit['id']}"
         tmp = BRIDGE_SOURCE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps([deposit]))
         os.replace(tmp, BRIDGE_SOURCE_FILE)

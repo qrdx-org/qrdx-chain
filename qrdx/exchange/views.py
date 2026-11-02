@@ -42,7 +42,14 @@ def tokens(mgr) -> List[Dict[str, Any]]:
     unique ticker it holds, if any (docs/HYPERLIQUID_PARITY.md 11)."""
     reg = mgr.tokens
     held = {address: ticker for ticker, address in mgr.trading.tickers.peek_items()}
-    return [{**reg.tokens[a].summary(), "ticker": held.get(a)} for a in sorted(reg.tokens)]
+    return [
+        {
+            **reg.tokens[a].summary(),
+            "ticker": held.get(a),
+            "issuer_powers": reg.tokens[a].issuer_powers(),
+        }
+        for a in sorted(reg.tokens)
+    ]
 
 
 def token(mgr, token_address: str) -> Optional[Dict[str, Any]]:
@@ -51,6 +58,8 @@ def token(mgr, token_address: str) -> Optional[Dict[str, Any]]:
         return None
     out = t.summary()
     out["ticker"] = mgr.ticker_of(t.address)
+    # What its issuer can still do to holders, in plain terms (docs/EXCHANGE_AUDIT.md 9).
+    out["issuer_powers"] = t.issuer_powers()
     out["frozen_accounts"] = sum(1 for tok, _ in mgr.tokens.frozen if tok == t.address)
     return out
 
@@ -278,37 +287,63 @@ def quote(
     pool_id: Optional[str] = None,
     venue: str = "auto",
 ) -> Optional[Dict[str, Any]]:
-    """The exact fill a SWAP would get against the current state (the router's own quote, so a
-    swap in the next block gets exactly this unless something trades first). None when nothing
-    can fill it."""
+    """The fill a SWAP would get against the current state: the path it would take and each
+    hop's legs on its pair's combined market (the exchange's own plan, so a swap in the next
+    block gets this unless something trades first). None when nothing can fill it."""
     from .router import FillSource
 
     amount = Decimal(str(amount_in))
     if amount <= 0:
         raise ValueError("amount_in must be positive")
-    route = mgr.router.best_route(
-        token_in, token_out, amount, sender, pool_id=pool_id, venue=str(venue or "auto").lower()
-    )
-    if route is None:
+    a, b = mgr.canonical_asset(token_in), mgr.canonical_asset(token_out)
+    if a == b:
         return None
-    out = {
-        "source": route.source.value,
-        "pool_id": route.pool_id,
-        "pair": route.pair,
+    path, routes, _error = mgr.choose_swap_path(
+        sender, a, b, amount, pool_id=pool_id, venue=str(venue or "auto").lower()
+    )
+    if path is None or not routes:
+        return None
+    first, last = routes[0], routes[-1]
+    out: Dict[str, Any] = {
+        "source": first.source.value,
+        "pool_id": first.pool_id,
+        "pair": first.pair,
         "token_in": token_in,
         "token_out": token_out,
-        "amount_in": str(route.amount_in),
-        "amount_out": str(route.amount_out),
-        "unfilled_in": str(amount - route.amount_in),
-        "fee": str(route.fee_total),
-        "execution_price": str(route.price),  # token_in paid per token_out received
+        "amount_in": str(first.amount_in),
+        "amount_out": str(last.amount_out),
+        "unfilled_in": str(amount - first.amount_in),
+        "fee": str(sum((r.fee_total for r in routes), ZERO)),
+        "execution_price": str(first.amount_in / last.amount_out) if last.amount_out > 0 else "0",
+        "path": path,
+        "hops": [
+            {
+                "pair": r.pair,
+                "token_in": r.token_in,
+                "token_out": r.token_out,
+                "amount_in": str(r.amount_in),
+                "amount_out": str(r.amount_out),
+                "legs": [
+                    {
+                        "venue": leg.source.value,
+                        "pool_id": leg.pool_id,
+                        "amount_in": str(leg.amount_in),
+                        "amount_out": str(leg.amount_out),
+                        "fee": str(leg.fee),
+                        "price_after": str(leg.price),
+                    }
+                    for leg in r.legs
+                ],
+            }
+            for r in routes
+        ],
     }
-    if route.source == FillSource.AMM and route.plan is not None:
+    if len(routes) == 1 and first.source == FillSource.AMM and first.plan is not None:
         from .amm import sqrt_price_to_price
 
-        p = mgr.pool_manager.get_pool(route.pool_id)
+        p = mgr.pool_manager.get_pool(first.pool_id)
         before = p.state.price
-        after = sqrt_price_to_price(route.plan.sqrt_price)
+        after = sqrt_price_to_price(first.plan.sqrt_price)
         out["price_before"] = str(before)
         out["price_after"] = str(after)
         out["price_impact"] = (
@@ -410,11 +445,12 @@ def market_summary(m: Market, ch=None) -> Dict[str, Any]:
         "liquidity_vault": _liquidity_vault(m, ch),
         "sz_decimals": m.sz_decimals if m.sz_decimals >= 0 else None,
         "settled_price": _s(m.settled_price) if m.settled_price > 0 else None,
-        # A deployer market (docs/HYPERLIQUID_PARITY.md): who runs it and its oracle, its share of
-        # the protocol's fees, and until when the validators hold it frozen.
-        "deployer": m.deployer or None,
-        "deployer_fee_share": _s(m.deployer_fee_share) if m.deployer else None,
-        "frozen_until": _s(m.frozen_until) if m.frozen_until > 0 else None,
+        # What prices it (docs/HYPERLIQUID_PARITY.md): "validators" (their votes), or "spot" — a
+        # token perp, off its token's spot market, with the path of pools last read and depth.
+        "oracle_source": "spot" if m.spot_token else "validators",
+        "token": m.spot_token or None,
+        "spot_pools": list(m.spot_pools) if m.spot_token else None,
+        "spot_depth": _s(m.spot_depth) if m.spot_token else None,
     }
 
 
@@ -426,14 +462,25 @@ def _liquidity_vault(m: Market, ch) -> Optional[str]:
     return vault if ch is not None and vault in ch.user_vaults else None
 
 
+def _with_ticker(mgr, m: Market, out: Dict[str, Any]) -> Dict[str, Any]:
+    """A token perp's display name: its token's unique ticker, if it holds one (the market is
+    named by the token's address — a symbol alone proves nothing)."""
+    if m.spot_token:
+        out["ticker"] = "QRDX" if m.spot_token == "QRDX" else mgr.ticker_of(m.spot_token)
+    return out
+
+
 def markets(mgr) -> List[Dict[str, Any]]:
     ch = mgr.clearinghouse
-    return [market_summary(ch.markets[mid], ch) for mid in sorted(ch.markets)]
+    return [
+        _with_ticker(mgr, ch.markets[mid], market_summary(ch.markets[mid], ch))
+        for mid in sorted(ch.markets)
+    ]
 
 
 def market(mgr, market_id: str) -> Optional[Dict[str, Any]]:
     m = mgr.clearinghouse.markets.get(market_id)
-    return None if m is None else market_summary(m, mgr.clearinghouse)
+    return None if m is None else _with_ticker(mgr, m, market_summary(m, mgr.clearinghouse))
 
 
 def order_book(mgr, market_id: str, depth: int = 20) -> Optional[Dict[str, Any]]:
@@ -1121,7 +1168,11 @@ def authority(mgr, address: str) -> Dict[str, Any]:
     if members is not None:
         out["multisig"] = members
     from ..crypto.account_id import is_synthetic_holder
+    from .authority import account_id
 
+    bound = auth.migrations.peek(account_id(address)) if len(auth.migrations) else None
+    if bound is not None:  # a successor proven from another chain (docs/QUANTUM_MIGRATION.md)
+        out["migration"] = {"successor": bound[0], "chain": bound[1], "registered_at": bound[2]}
     out["protocol_holder"] = is_synthetic_holder(address)
     return out
 

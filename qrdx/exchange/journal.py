@@ -143,7 +143,11 @@ class ExchangeJournal:
                 self._record_fills(
                     "PLACE_ORDER", {"fills": fills}, when, None, ev.get("owner"), kind="trigger"
                 )
-            elif ev.get("type") in ("spot_trigger_cancelled", "spot_trigger_waiting"):
+            elif ev.get("type") in (
+                "spot_trigger_cancelled",
+                "spot_trigger_waiting",
+                "trigger_waiting",
+            ):
                 self._event(ev["type"], when, **{k: v for k, v in ev.items() if k != "type"})
             elif ev.get("type") == "twap_slice":
                 fills = ev.pop("fills", [])
@@ -377,7 +381,10 @@ class ExchangeJournal:
             "order_cancelled": "cancelled",
             "twap_finished": "finished",
             "liquidation": "liquidated",
+            "trigger_waiting": "waiting",
         }
+        if kind in orders and ev.get("waiting"):  # fired, and part of it waits for liquidity
+            kind = "trigger_waiting"
         if kind in orders:
             self._history_order(
                 account=ev.get("owner"),

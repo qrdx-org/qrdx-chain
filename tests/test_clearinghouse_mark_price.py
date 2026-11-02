@@ -19,7 +19,7 @@ import pytest
 
 from qrdx.exchange.clearinghouse import Clearinghouse, MARK_ORACLE_BAND
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+pytestmark = pytest.mark.usefixtures("genesis_btc")  # BTC from the first block
 
 D = Decimal
 BTC = "BTC-QRDX-PERP"
@@ -172,11 +172,10 @@ def test_every_path_ticks_blocks_without_exchange_transactions():
     assert "mgr.clearinghouse.tick(" in inspect.getsource(BP._execute_block_boundary_duties)
 
 
-async def test_forward_with_ticks_equals_the_rebuild(monkeypatch):
+async def test_forward_with_ticks_equals_the_rebuild(monkeypatch, oracle_committee):
     """A chain whose quiet blocks still move the mark (a resting book over the oracle): forward
     application that ticks every block must equal the interleaved rebuild — and a replay that
     skips the quiet blocks, as every path used to, must NOT."""
-    from qrdx import constants
     from qrdx.crypto.pq.dilithium import PQPrivateKey
     from qrdx.database_sqlite import DatabaseSQLite
     from qrdx.derived_state_rebuild import rebuild_derived_state_interleaved
@@ -186,7 +185,6 @@ async def test_forward_with_ticks_equals_the_rebuild(monkeypatch):
 
     keys = [PQPrivateKey.generate() for _ in range(2)]
     rep, mm = (k.public_key.to_address() for k in keys)
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (rep,))
     nonces = {rep: 0, mm: 0}
 
     def tx(key, op, params):
@@ -202,7 +200,8 @@ async def test_forward_with_ticks_equals_the_rebuild(monkeypatch):
     try:
         async def add(h, txs=None, alloc=None):
             bh = f"{h:064x}"
-            await db.add_block(block_hash=bh, block_height=h, block_content="",
+            await db.add_block(block_hash=bh, block_height=h,
+                               block_content=oracle_committee.genesis if h == 0 else "",
                                validator_address="0xPQ" + "00" * 32, timestamp=int(T0) + 6 * h)
             for i, (r, a) in enumerate(alloc or []):
                 await db.add_transaction(tx_hash=f"a{h}{i}", block_hash=bh, tx_hex=json.dumps(
@@ -210,10 +209,8 @@ async def test_forward_with_ticks_equals_the_rebuild(monkeypatch):
             if txs:
                 await db.add_block_exchange_txs(bh, encode_exchange_txs(txs))
 
-        await add(0, alloc=[(mm, "10000000"), (keys[0].public_key.to_address(), "5000")])
-        await add(1, [tx(keys[0], ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"}),
-                      tx(keys[0], ExchangeOpType.UPDATE_ORACLE,
-                         {"pair": "BTC:QRDX", "price": "30000"}),
+        await add(0, alloc=[(mm, "10000000"), (oracle_committee.address, "5000")])
+        await add(1, [oracle_committee.vote({"BTC": "30000"}),     # the genesis validator's
                       tx(keys[1], ExchangeOpType.PERP_DEPOSIT, {"amount": "1000000"})])
         await add(2, [tx(keys[1], ExchangeOpType.PERP_ORDER,
                          {"market_id": BTC, "side": "buy", "size": "1", "price": "30500"}),
@@ -233,6 +230,7 @@ async def test_forward_with_ticks_equals_the_rebuild(monkeypatch):
             for h in range(1, tip + 1):
                 section = await db.get_block_exchange_txs(f"{h:064x}")
                 ts = float(int(T0) + 6 * h)
+                await BP.ensure_oracle_committee(db, mgr, h)  # as every path does
                 if section:
                     txs = BP.decode_exchange_txs(section)
                     await BP.preload_sender_balances(db, txs, mgr)

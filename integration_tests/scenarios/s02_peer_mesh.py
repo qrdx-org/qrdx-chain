@@ -60,7 +60,12 @@ class S02PeerMesh(Scenario):
             )
 
             # ── 2. Block heights should be in sync ──
-            heights = await clients.get_block_heights()
+            # (Genesis time is set a little ahead of the nodes' start: wait for the first block.)
+            for _ in range(60):
+                heights = await clients.get_block_heights()
+                if heights and min(heights) >= 1:
+                    break
+                await asyncio.sleep(1)
             self._log.info("Block heights: %s", heights)
 
             for i, h in enumerate(heights):

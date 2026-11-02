@@ -14,11 +14,9 @@ Covers:
   - Validator duties (oracle updates, fee share)
 """
 
-import hashlib
-import json
 import time
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -32,7 +30,6 @@ from qrdx.exchange.state_manager import (
     ExchangeStateManager,
 )
 from qrdx.exchange.block_processor import (
-    build_oracle_update_tx,
     extract_exchange_transactions,
     get_validator_fee_share,
     process_exchange_transactions,
@@ -40,9 +37,6 @@ from qrdx.exchange.block_processor import (
 )
 from qrdx.exchange.amm import tick_to_sqrt_price
 
-from exchange_prices import price_market
-
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
 
 # Q96-format sqrt price at tick 0 (price = 1.0)
 SQRT_PRICE_1 = str(tick_to_sqrt_price(0))
@@ -59,11 +53,8 @@ VALIDATOR = "0xPQ" + "v" * 64
 
 @pytest.fixture(autouse=True)
 def reset_state_manager(monkeypatch):
-    """Reset the singleton before every test, and authorize this module's senders as
-    oracle reporters: many tests use UPDATE_ORACLE as a cheap generic op, and only
-    configured reporters may submit it (tests/test_perp_price_integrity.py)."""
-    from qrdx import constants
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (ALICE, BOB, VALIDATOR))
+    """Reset the singleton before every test. (Many tests use CANCEL_ALL as a cheap generic op:
+    it needs no setup.)"""
     ExchangeStateManager.reset_instance()
     yield
     ExchangeStateManager.reset_instance()
@@ -239,10 +230,14 @@ class TestExchangeTransactionValidation:
         with pytest.raises(ValueError, match="ADD_MARGIN missing"):
             tx.validate_basic()
 
-    def test_update_oracle_missing_params(self):
-        tx = make_tx(ExchangeOpType.UPDATE_ORACLE, params={})
-        with pytest.raises(ValueError, match="UPDATE_ORACLE missing"):
-            tx.validate_basic()
+    def test_no_operation_lets_one_key_set_a_price(self):
+        """UPDATE_ORACLE (11) — a price one authorized key set — is retired, like the deployer
+        markets' oracle (79–82): a transaction naming one does not decode."""
+        assert not hasattr(ExchangeOpType, "UPDATE_ORACLE")
+        assert not any(op.name.startswith("DEPLOYER_") for op in ExchangeOpType)
+        for retired in (11, 79, 80, 81, 82):
+            with pytest.raises(ValueError):
+                ExchangeOpType(retired)
 
     def test_valid_create_pool(self):
         tx = make_tx(ExchangeOpType.CREATE_POOL, params={
@@ -252,8 +247,11 @@ class TestExchangeTransactionValidation:
         })
         assert tx.validate_basic() is True
 
-    def test_valid_update_oracle(self):
-        tx = make_tx(ExchangeOpType.UPDATE_ORACLE, params={"pair": "QRDX:qETH", "price": "2000"})
+    def test_create_market_names_a_token(self):
+        tx = make_tx(ExchangeOpType.CREATE_MARKET, params={"base_token": "BTC"})
+        with pytest.raises(ValueError, match="token"):
+            tx.validate_basic()
+        tx = make_tx(ExchangeOpType.CREATE_MARKET, params={"token": "0x" + "1" * 40})
         assert tx.validate_basic() is True
 
 
@@ -323,39 +321,33 @@ class TestNonceEnforcement:
 
     def test_nonce_increments_on_success(self, mgr):
         mgr.begin_block(1, 1000.0)
-        tx = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                      params={"pair": "TEST:USD", "price": "100"})
+        tx = make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0)
         result = mgr.process_transaction(tx)
         assert result.success
         assert mgr.get_nonce(ALICE) == 1
 
     def test_nonce_rejects_replay(self, mgr):
         mgr.begin_block(1, 1000.0)
-        tx = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                      params={"pair": "TEST:USD", "price": "100"})
+        tx = make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0)
         mgr.process_transaction(tx)
 
         # Replay same nonce
-        tx2 = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                       params={"pair": "TEST:USD", "price": "200"})
+        tx2 = make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0)
         result = mgr.process_transaction(tx2)
         assert not result.success
         assert "nonce" in result.error.lower()
 
     def test_nonce_rejects_skip(self, mgr):
         mgr.begin_block(1, 1000.0)
-        tx = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=5,
-                      params={"pair": "TEST:USD", "price": "100"})
+        tx = make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=5)
         result = mgr.process_transaction(tx)
         assert not result.success
         assert "nonce" in result.error.lower()
 
     def test_nonce_per_sender(self, mgr):
         mgr.begin_block(1, 1000.0)
-        tx_a = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                        params={"pair": "A:USD", "price": "100"})
-        tx_b = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=BOB, nonce=0,
-                        params={"pair": "B:USD", "price": "200"})
+        tx_a = make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0)
+        tx_b = make_tx(ExchangeOpType.CANCEL_ALL, sender=BOB, nonce=0)
         assert mgr.process_transaction(tx_a).success
         assert mgr.process_transaction(tx_b).success
         assert mgr.get_nonce(ALICE) == 1
@@ -387,11 +379,10 @@ class TestGasEnforcement:
 
     def test_gas_charged_on_success(self, mgr):
         mgr.begin_block(1, 1000.0)
-        tx = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                      params={"pair": "X:Y", "price": "50"})
+        tx = make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0)
         result = mgr.process_transaction(tx)
         assert result.success
-        assert result.gas_used == EXCHANGE_GAS_COSTS[ExchangeOpType.UPDATE_ORACLE]
+        assert result.gas_used == EXCHANGE_GAS_COSTS[ExchangeOpType.CANCEL_ALL]
         assert mgr.block_fees > Decimal("0")
 
 
@@ -495,16 +486,6 @@ class TestOperationHandlers:
         result = mgr.process_transaction(cancel_tx)
         assert result.success
 
-    def test_update_oracle(self, mgr):
-        mgr.begin_block(1, 1000.0)
-        tx = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=VALIDATOR, nonce=0,
-                      params={"pair": "QRDX:USDC", "price": "2.50"})
-        result = mgr.process_transaction(tx)
-        assert result.success
-        oracle = mgr.get_oracle("QRDX:USDC")
-        assert oracle is not None
-        assert oracle.latest_price == Decimal("2.50")
-
     def test_the_house_perp_ops_are_retired(self, mgr):
         """OPEN_POSITION and friends traded against nobody, so they minted and burned QRDX
         (docs/PERPS_CLEARINGHOUSE.md). They now refuse; perps trade on the order book."""
@@ -518,18 +499,14 @@ class TestOperationHandlers:
 
     def test_perps_trade_between_two_accounts(self, mgr):
         mgr.begin_block(1, 1000.0)
-        assert mgr.process_transaction(make_tx(
-            ExchangeOpType.CREATE_MARKET, sender=ALICE, nonce=0,
-            params={"base_token": "AVAX"})).success
-        assert mgr.process_transaction(make_tx(
-            ExchangeOpType.UPDATE_ORACLE, sender=VALIDATOR, nonce=0,
-            params={"pair": "AVAX:QRDX", "price": "30"})).success
-        for who, n in ((ALICE, 1), (BOB, 0)):
+        mgr.clearinghouse.create_market("AVAX")
+        mgr.clearinghouse.set_oracle_price("AVAX-QRDX-PERP", Decimal(30), now=1000)
+        for who, n in ((ALICE, 0), (BOB, 0)):
             assert mgr.process_transaction(make_tx(
                 ExchangeOpType.PERP_DEPOSIT, sender=who, nonce=n,
                 params={"amount": "1000"})).success
         assert mgr.process_transaction(make_tx(
-            ExchangeOpType.PERP_ORDER, sender=ALICE, nonce=2, params={
+            ExchangeOpType.PERP_ORDER, sender=ALICE, nonce=1, params={
                 "market_id": "AVAX-QRDX-PERP", "side": "sell", "size": "10",
                 "price": "30"})).success
         # The taker's gas pays for each resting order it visits (docs/BLOCK_LIMITS.md).
@@ -562,41 +539,64 @@ class TestBlockProcessor:
         assert error == ""
         assert len(root) == 128  # BLAKE3-512 hex (Whitepaper §3.6)
 
-    def test_single_oracle_update(self):
-        tx = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=VALIDATOR, nonce=0,
-                      params={"pair": "TEST:USD", "price": "42"})
+    def test_single_transaction(self):
+        tx = make_tx(ExchangeOpType.CANCEL_ALL, sender=VALIDATOR, nonce=0)
         success, error, root = process_exchange_transactions(1, 1000.0, [tx])
         assert success
         assert len(root) == 128  # BLAKE3-512 hex (Whitepaper §3.6)
 
     def test_multiple_transactions(self):
         txs = [
-            make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                     params={"pair": "A:B", "price": "10"}),
-            make_tx(ExchangeOpType.UPDATE_ORACLE, sender=BOB, nonce=0,
-                     params={"pair": "C:D", "price": "20"}),
+            make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0),
+            make_tx(ExchangeOpType.CANCEL_ALL, sender=BOB, nonce=0),
         ]
         success, error, root = process_exchange_transactions(1, 1000.0, txs)
         assert success
 
     def test_failed_tx_non_critical(self):
-        """A single failing tx should not invalidate the block."""
+        """An operation that runs and fails does not invalidate the block."""
         txs = [
-            make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                     params={"pair": "A:B", "price": "10"}),
-            # This will fail because nonce=5 when expected 0
-            make_tx(ExchangeOpType.UPDATE_ORACLE, sender=BOB, nonce=5,
-                     params={"pair": "C:D", "price": "20"}),
+            make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0),
+            # Runs, and fails: no such order
+            make_tx(ExchangeOpType.CANCEL_ORDER, sender=BOB, nonce=0,
+                    params={"pair": "A:B", "order_id": "nope"}),
         ]
         success, error, root = process_exchange_transactions(1, 1000.0, txs)
         # Block still succeeds — individual tx failure is non-critical
         assert success
+        mgr = ExchangeStateManager.get_instance()
+        assert mgr.get_nonce(BOB) == 1                     # it ran: its nonce is consumed
+
+    def test_a_tx_that_cannot_run_invalidates_the_block(self):
+        """``exchange_inclusion``: a transaction refused before it runs (here: nonce 5 where 0
+        is next) may not be in a block at all — it used to sit there unexecuted."""
+        txs = [
+            make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0),
+            make_tx(ExchangeOpType.CANCEL_ALL, sender=BOB, nonce=5),
+        ]
+        success, error, root = process_exchange_transactions(1, 1000.0, txs)
+        assert not success and "exchange transaction 1 may not be in the block" in error
+        assert ExchangeStateManager.get_instance().get_nonce(ALICE) == 0   # nothing ran
+
+    def test_before_the_rule_such_a_tx_was_carried_unexecuted(self):
+        from qrdx import chain_spec as cs
+
+        spec = cs.build_spec("qrdx-test-incl", 991241, {}, dev=True,
+                             features=[f for f in cs.GENESIS_DEFAULT_FEATURES
+                                       if f != "exchange_inclusion"])
+        with cs.use_spec(spec):
+            txs = [
+                make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0),
+                make_tx(ExchangeOpType.CANCEL_ALL, sender=BOB, nonce=5),
+            ]
+            success, error, root = process_exchange_transactions(1, 1000.0, txs)
+        assert success                                     # the block's existing history
+        assert ExchangeStateManager.get_instance().get_nonce(BOB) == 0
 
     def test_deterministic_state_root(self):
         """Same transactions in same order produce identical state root."""
         txs = [
-            make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                     params={"pair": "X:Y", "price": "100"}),
+            make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0),
         ]
         _, _, root1 = process_exchange_transactions(1, 1000.0, txs)
 
@@ -615,8 +615,7 @@ class TestValidateExchangeStateRoot:
 
     def test_valid_state_root(self):
         txs = [
-            make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                     params={"pair": "A:B", "price": "10"}),
+            make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0),
         ]
         _, _, root = process_exchange_transactions(1, 1000.0, txs)
 
@@ -628,8 +627,7 @@ class TestValidateExchangeStateRoot:
 
     def test_invalid_state_root(self):
         txs = [
-            make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                     params={"pair": "A:B", "price": "10"}),
+            make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0),
         ]
         valid, error = validate_exchange_state_root(1, 1000.0, txs, "0" * 64)
         assert not valid
@@ -671,14 +669,6 @@ class TestBlockProcessorUtilities:
         block = Block()
         assert extract_exchange_transactions(block) == []
 
-    def test_build_oracle_update_tx(self):
-        tx = build_oracle_update_tx(VALIDATOR, "QRDX:USDC", Decimal("2.50"), 7)
-        assert tx.op_type == ExchangeOpType.UPDATE_ORACLE
-        assert tx.sender == VALIDATOR
-        assert tx.nonce == 7
-        assert tx.params["pair"] == "QRDX:USDC"
-        assert tx.params["price"] == "2.50"
-
     def test_get_validator_fee_share(self):
         from qrdx.constants import EXCHANGE_FEE_VALIDATOR_SHARE
         share = get_validator_fee_share(Decimal("1000"), VALIDATOR)
@@ -695,16 +685,14 @@ class TestSnapshotRevert:
 
     def test_snapshot_preserves_nonces(self, mgr):
         mgr.begin_block(1, 1000.0)
-        tx = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                      params={"pair": "A:B", "price": "100"})
+        tx = make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0)
         mgr.process_transaction(tx)
         assert mgr.get_nonce(ALICE) == 1
 
         # Take snapshot and process more (price within 50% of previous)
         mgr.take_snapshot()
         mgr.begin_block(2, 2000.0)
-        tx2 = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=1,
-                       params={"pair": "A:B", "price": "110"})
+        tx2 = make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=1)
         result2 = mgr.process_transaction(tx2)
         assert result2.success, result2.error
         assert mgr.get_nonce(ALICE) == 2
@@ -738,12 +726,38 @@ class TestConsensusIntegration:
         valid, error = await execute_and_validate_exchange(Block())
         assert valid
 
+    @staticmethod
+    def _signed(op_type, nonce=0):
+        from qrdx.crypto.pq.dilithium import PQPrivateKey
+
+        key = PQPrivateKey.generate()
+        tx = make_tx(op_type, sender=key.public_key.to_address(), nonce=nonce)
+        tx.public_key = key.public_key.to_bytes()
+        tx.signature = key.sign(tx.signing_bytes()).to_bytes()
+        return tx
+
+    @pytest.mark.asyncio
+    async def test_an_unsigned_transaction_is_refused(self):
+        """It executed: this path trusted ``sender`` like the core (docs/EXCHANGE_AUDIT.md 1)."""
+        from qrdx.consensus import execute_and_validate_exchange
+
+        tx = make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0)
+
+        class Block:
+            transactions = [tx]
+            height = 1
+            number = 1
+            timestamp = 1000.0
+            exchange_state_root = None
+
+        valid, error = await execute_and_validate_exchange(Block())
+        assert not valid and "failed verification" in error
+
     @pytest.mark.asyncio
     async def test_with_exchange_txs(self):
         from qrdx.consensus import execute_and_validate_exchange
 
-        tx = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                      params={"pair": "A:B", "price": "42"})
+        tx = self._signed(ExchangeOpType.CANCEL_ALL)
 
         class Block:
             transactions = [tx]
@@ -759,8 +773,7 @@ class TestConsensusIntegration:
     async def test_state_root_mismatch(self):
         from qrdx.consensus import execute_and_validate_exchange
 
-        tx = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                      params={"pair": "A:B", "price": "42"})
+        tx = self._signed(ExchangeOpType.CANCEL_ALL)
 
         class Block:
             transactions = [tx]
@@ -793,7 +806,6 @@ class TestFullBlockLifecycle:
         pool_result = mgr.process_transaction(pool_tx)
         assert pool_result.success, pool_result.error
         pool_id = pool_result.data["pool_id"]
-        pair = pool_result.data["pair"]
 
         # Alice adds liquidity (ticks must be multiples of tick_spacing=60)
         liq_tx = make_tx(ExchangeOpType.ADD_LIQUIDITY, sender=ALICE, nonce=1, params={
@@ -802,13 +814,8 @@ class TestFullBlockLifecycle:
         })
         assert mgr.process_transaction(liq_tx).success
 
-        # Bob updates oracle (price = 1.0 matches tick 0 pool)
-        oracle_tx = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=BOB, nonce=0,
-                             params={"pair": pair, "price": "1"})
-        assert mgr.process_transaction(oracle_tx).success
-
         # Bob swaps
-        swap_tx = make_tx(ExchangeOpType.SWAP, sender=BOB, nonce=1, params={
+        swap_tx = make_tx(ExchangeOpType.SWAP, sender=BOB, nonce=0, params={
             "token_in": "QRDX", "token_out": "qETH", "amount_in": "100",
         })
         swap_result = mgr.process_transaction(swap_tx)
@@ -828,15 +835,13 @@ class TestFullBlockLifecycle:
         """Process two sequential blocks."""
         # Block 1
         mgr.begin_block(1, 1000.0)
-        tx1 = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=0,
-                       params={"pair": "X:Y", "price": "100"})
+        tx1 = make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=0)
         assert mgr.process_transaction(tx1).success
         root1 = mgr.finalize_block()
 
         # Block 2 (price within 50% of previous to avoid outlier rejection)
         mgr.begin_block(2, 2000.0)
-        tx2 = make_tx(ExchangeOpType.UPDATE_ORACLE, sender=ALICE, nonce=1,
-                       params={"pair": "X:Y", "price": "110"})
+        tx2 = make_tx(ExchangeOpType.CANCEL_ALL, sender=ALICE, nonce=1)
         assert mgr.process_transaction(tx2).success
         root2 = mgr.finalize_block()
 
@@ -852,7 +857,7 @@ class TestExchangeOpTypeEnum:
     """Tests for the operation type enum."""
 
     def test_all_types_defined(self):
-        assert len(ExchangeOpType) == 83  # +TICKER_CLAIM, +4 deployer-market ops, +isolated margin, schedule cancel, builder fee approval, +20 ops (account recover, QNS register/renew/set record/set primary, account policy, referral register/join, vault create, trigger, cancel-all, two modifies, batch, TWAP and its cancel, agent approve/revoke, sub-account create/transfer), +CREATE_MARKET, +TOKEN_DEPLOY/TRANSFER (E), +STAKE_DEPOSIT/EXIT (lifecycle), +REMOVE_POOL, +5 perps clearinghouse ops, +2 backstop vault ops, +ORACLE_VOTE, +7 native-token ops, +7 token-extension ops, +8 NFT ops, +4 governance ops, +BRIDGE_WITHDRAW, +3 delegation ops
+        assert len(ExchangeOpType) == 81  # +DOOMSDAY_PROVE, +MIGRATION_CLAIM, +BRIDGE_PROVE_DEPOSIT, −UPDATE_ORACLE, +TICKER_CLAIM, +isolated margin, schedule cancel, builder fee approval, +20 ops (account recover, QNS register/renew/set record/set primary, account policy, referral register/join, vault create, trigger, cancel-all, two modifies, batch, TWAP and its cancel, agent approve/revoke, sub-account create/transfer), +CREATE_MARKET, +TOKEN_DEPLOY/TRANSFER (E), +STAKE_DEPOSIT/EXIT (lifecycle), +REMOVE_POOL, +5 perps clearinghouse ops, +2 backstop vault ops, +ORACLE_VOTE, +7 native-token ops, +7 token-extension ops, +8 NFT ops, +4 governance ops, +BRIDGE_WITHDRAW, +3 delegation ops
 
     def test_values_unique(self):
         values = [e.value for e in ExchangeOpType]

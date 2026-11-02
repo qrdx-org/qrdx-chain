@@ -35,7 +35,6 @@ from qrdx.exchange import (
     ExchangeStateManager,
     ExchangeTransaction,
     ExchangeOpType,
-    PerpSide,
 )
 from qrdx.exchange.amm import FeeTier, PoolType
 
@@ -127,9 +126,8 @@ async def run_exchange_e2e(report=False):
     pool_id = r.data["pool_id"]
     pair = r.data["pair"]
     assert sm.get_order_book(pair) is not None, "order book not auto-created"
-    assert sm.get_oracle(pair) is not None, "oracle not auto-created"
     say("\n=== 3. Trading pair created ===")
-    say(f"  pair={pair}  pool_id={pool_id[:16]}…  (order book + TWAP oracle attached)")
+    say(f"  pair={pair}  pool_id={pool_id[:16]}…  (order book attached)")
 
     # ---- 4. Add liquidity -----------------------------------------------
     lp.spend(Decimal("5000"), "AMM liquidity")

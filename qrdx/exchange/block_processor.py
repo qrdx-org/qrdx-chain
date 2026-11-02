@@ -121,6 +121,58 @@ def apply_enforcement(mgr: "ExchangeStateManager") -> None:
     mgr.enforce_fees = ENFORCE_EXCHANGE_FEES
 
 
+INCLUSION_FEATURE = "exchange_inclusion"
+
+
+def is_inclusion_checked(height: int) -> bool:
+    """Whether a block at ``height`` may carry only exchange transactions that run
+    (``ExchangeStateManager.section_errors``)."""
+    from .. import chain_spec
+
+    return chain_spec.is_active(INCLUSION_FEATURE, int(height))
+
+
+async def includable_exchange_txs(
+    db,
+    txs: List[ExchangeTransaction],
+    height: int,
+    timestamp: float,
+    base_fee: Optional[int],
+    state_manager: Optional[ExchangeStateManager] = None,
+) -> Tuple[List[ExchangeTransaction], List[Tuple[ExchangeTransaction, str]]]:
+    """The proposer's side of ``exchange_inclusion``: of its selection, the transactions its
+    block may carry, and those it may not with why. Judged by ``section_errors`` on the
+    balances every importer will pre-load (account_state now) and the block's base fee, BEFORE
+    anything is pre-loaded or executed — so the block's pre-loads are exactly its importers'
+    (dropping a transaction after executing it would leave its sender's, and the pools' and
+    escrows' it named, in the proposer's run only). Read only.
+
+    A proposer runs this on every network, the rule active or not: a transaction refused before
+    it runs is no use in any block, and the ones kept run as they would have."""
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    if not txs:
+        return [], []
+    apply_enforcement(mgr)
+    balances: Dict[str, Decimal] = {}
+    for tx in txs:
+        for holder in dict.fromkeys((tx.sender, mgr.fee_payer(tx))):
+            if holder not in balances:
+                balances[holder] = Decimal(await db.get_address_balance(holder))
+    errors = mgr.section_errors(txs, int(height), float(timestamp), balances.get, base_fee)
+    if not errors:
+        return list(txs), []
+    kept = [tx for i, tx in enumerate(txs) if i not in errors]
+    from .. import chain_spec
+    from .fair_ordering import FEATURE, ordering_error
+
+    if chain_spec.is_active(FEATURE, int(height)) and ordering_error(kept):
+        # Cannot happen: a refused transaction's lane-mates after it are refused too (its nonce
+        # is not consumed), so what is left keeps its order. Never ship an unfair block.
+        logger.warning("exchange selection: dropping refused transactions broke the order")
+        return [], []
+    return kept, [(txs[i], errors[i]) for i in sorted(errors)]
+
+
 async def ensure_oracle_committee(
     db, mgr: ExchangeStateManager, height: Optional[int] = None
 ) -> None:
@@ -222,15 +274,20 @@ async def preload_sender_balances(
             logger.debug("preload_sender_balances: %s for system wallet %s", e, wallet)
 
 
-def _swap_path(op, p: Dict[str, Any], asset) -> List[str]:
-    """The tokens a SWAP goes through, canonical (none for anything else, or a malformed
-    path — the swap fails before it moves anything)."""
+def _swap_paths(op, p: Dict[str, Any], asset, hubs: Iterable[str] = ()) -> List[List[str]]:
+    """The paths a SWAP may take, canonical (none for anything else, or a malformed path — the
+    swap fails before it moves anything): its ``path``, or the pair itself and, when it chooses
+    its own path, two hops through each routing hub (``ExchangeStateManager.swap_paths``)."""
     if op != ExchangeOpType.SWAP:
         return []
-    raw = p.get("path") if p.get("path") is not None else [p.get("token_in"), p.get("token_out")]
+    explicit = p.get("path") is not None
+    raw = p.get("path") if explicit else [p.get("token_in"), p.get("token_out")]
     if not isinstance(raw, list) or not all(isinstance(t, str) and t for t in raw):
         return []
-    return [asset(t) for t in raw]
+    path = [asset(t) for t in raw]
+    if explicit or p.get("pool_id") or str(p.get("venue", "auto")).lower() != "auto":
+        return [path]
+    return [path] + [[path[0], h, path[-1]] for h in hubs if h not in path]
 
 
 def _operations(txs) -> Iterable[Tuple[Any, Any, Dict[str, Any]]]:
@@ -273,11 +330,12 @@ async def preload_token_balances(
         if not sender:
             continue
         asset = mgr.canonical_asset  # "QRDX" for native, canonical token addresses
-        path = _swap_path(op, p, asset)
-        if path:
+        paths = _swap_paths(op, p, asset, mgr.routing_hubs())
+        if paths:
             # A multi-hop swap spends what each hop bought: every token but the last.
-            for token in path[:-1]:
-                wanted.add((sender, token))
+            for path in paths:
+                for token in path[:-1]:
+                    wanted.add((sender, token))
         elif op in (ExchangeOpType.TOKEN_TRANSFER, ExchangeOpType.TOKEN_BURN) and p.get(
             "token_address"
         ):
@@ -329,15 +387,16 @@ async def preload_token_balances(
                 wanted.add((mgr.perps_holder_address(), collateral))
         # The protocol's holders this operation may DEBIT — a pool's reserves, a book's
         # escrow — so the manager can refuse an operation they cannot cover.
-        if path:
-            for a, b in zip(path, path[1:], strict=False):
-                for pool in mgr.pool_manager.get_pools_for_pair(a, b):
-                    holder = mgr.pool_holder_address(pool.state.id)
-                    wanted.add((holder, a))
-                    wanted.add((holder, b))
-                escrow = mgr.orderbook_escrow_address(min(a, b) + ":" + max(a, b))
-                wanted.add((escrow, a))
-                wanted.add((escrow, b))
+        if paths:
+            for path in paths:
+                for a, b in zip(path, path[1:], strict=False):
+                    for pool in mgr.pool_manager.get_pools_for_pair(a, b):
+                        holder = mgr.pool_holder_address(pool.state.id)
+                        wanted.add((holder, a))
+                        wanted.add((holder, b))
+                    escrow = mgr.orderbook_escrow_address(min(a, b) + ":" + max(a, b))
+                    wanted.add((escrow, a))
+                    wanted.add((escrow, b))
         elif op in (ExchangeOpType.REMOVE_LIQUIDITY, ExchangeOpType.REMOVE_POOL) and p.get(
             "pool_id"
         ):
@@ -354,8 +413,15 @@ async def preload_token_balances(
             pair = mgr._canonical_pair(str(p.get("pair", "")))
             if ":" in pair:
                 escrow = mgr.orderbook_escrow_address(pair)
-                for tok in pair.split(":", 1):
+                b, q = pair.split(":", 1)
+                for tok in (b, q):
                     wanted.add((escrow, tok))
+                # An order takes from the pair's pools first (docs/UNIFIED_SPOT_LIQUIDITY.md 3).
+                if op != ExchangeOpType.CANCEL_ORDER:
+                    for pool in mgr.pool_manager.get_pools_for_pair(b, q):
+                        holder = mgr.pool_holder_address(pool.state.id)
+                        wanted.add((holder, b))
+                        wanted.add((holder, q))
         elif op == ExchangeOpType.CANCEL_ALL:
             # Refunds come out of the escrow of every book the sender has orders in.
             for pair in sorted(mgr._order_books):
@@ -606,6 +672,17 @@ def process_exchange_transactions(
             if unfair:
                 return False, f"unfair exchange order: {unfair}", ""
 
+    # Only transactions that run (chain-spec feature ``exchange_inclusion``): the block's are
+    # judged together before anything runs, and a block carrying one that would be refused —
+    # which used to sit in it without paying, executing or consuming its nonce, repeatably — is
+    # invalid. Each payer's fees are then reserved up front (below).
+    checked = bool(exchange_txs) and is_inclusion_checked(int(block_height))
+    if checked:
+        refused = mgr.section_errors(exchange_txs, int(block_height), block_timestamp)
+        if refused:
+            i = min(refused)
+            return False, f"exchange transaction {i} may not be in the block: {refused[i]}", ""
+
     # A revert point only for a replay (``revertible``), which must undo a section that fails
     # exactly where forward application undid it. It is a deep copy of the whole exchange: on
     # every block with transactions it was the most expensive thing a node did (115 ms at
@@ -617,8 +694,13 @@ def process_exchange_transactions(
 
     # Begin block processing
     mgr.begin_block(block_height, block_timestamp)
+    prepaid = mgr.reserve_section_fees(exchange_txs) if checked else None
 
-    # First, the exchange actions EVM contracts sent in the blocks before
+    # The perp markets the network starts with (PERP_GENESIS_MARKETS): made by the first block,
+    # on every path, before anything could trade them.
+    mgr.create_genesis_markets()
+
+    # Then the exchange actions EVM contracts sent in the blocks before
     # (qrdx/contracts/exchange_evm.py), each as an operation of its contract's account.
     if len(mgr.trading.evm_actions):
         for ev in mgr.run_evm_actions():
@@ -628,7 +710,7 @@ def process_exchange_transactions(
     failed_txs = []
     for i, tx in enumerate(exchange_txs):
         try:
-            result = mgr.process_transaction(tx)
+            result = mgr.process_transaction(tx, prepaid[i] if prepaid else None, checked)
             if not result.success:
                 # Non-critical failure: tx fails but block continues
                 # (like a reverted EVM transaction — gas is still charged)
@@ -994,6 +1076,7 @@ def _execute_block_boundary_duties(
     spot = mgr.update_spot_oracles(now)  # native-token markets read their spot markets
     events = spot + mgr.apply_policy_changes(now)
     events += mgr.run_scheduled_cancels(now)  # (first: a switch pulls orders before anything fires)
+    events += mgr.uncross_spot_books(now)  # resting orders new pool liquidity crossed fill
     events += mgr.fire_spot_triggers(now)
     perps = mgr.clearinghouse.tick(now, funding_interval=constants.PERP_FUNDING_INTERVAL_SECONDS)
     events += perps
@@ -1114,42 +1197,6 @@ def extract_exchange_transactions_from_dict(block: Dict[str, Any]) -> List[Excha
     if not isinstance(block, dict):
         return []
     return decode_exchange_txs(block.get(BLOCK_EXCHANGE_TXS_KEY))
-
-
-# ---------------------------------------------------------------------------
-# Validator duty: build oracle update transactions
-# ---------------------------------------------------------------------------
-
-
-def build_oracle_update_tx(
-    validator_address: str,
-    pair: str,
-    price: Decimal,
-    nonce: int,
-) -> ExchangeTransaction:
-    """
-    Build an oracle price update transaction for a validator to submit.
-
-    Validators are responsible for submitting price updates for pairs
-    they are assigned to.  The price is sourced from external feeds
-    and submitted as a signed ExchangeTransaction.
-
-    Args:
-        validator_address: The validator's PQ address
-        pair: Trading pair (e.g., "BTC:USDC")
-        price: Current price from external oracle feed
-        nonce: The validator's current exchange nonce
-
-    Returns:
-        An unsigned ExchangeTransaction (caller must sign)
-    """
-    return ExchangeTransaction(
-        op_type=ExchangeOpType.UPDATE_ORACLE,
-        sender=validator_address,
-        nonce=nonce,
-        params={"pair": pair, "price": str(price)},
-        gas_limit=20_000,
-    )
 
 
 def get_validator_fee_share(

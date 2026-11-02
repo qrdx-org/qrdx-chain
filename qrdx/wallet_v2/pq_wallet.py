@@ -1,7 +1,7 @@
 """
-QRDX Post-Quantum Wallet (Dilithium3)
+QRDX Post-Quantum Wallet (ML-DSA-65)
 
-Quantum-resistant wallet using Dilithium3 signatures.
+Quantum-resistant wallet using ML-DSA-65 (FIPS 204) signatures.
 """
 
 import os
@@ -15,6 +15,7 @@ from ..crypto.pq import (
     is_available as pq_available,
 )
 from .base import (
+    KEYSTORE_CIPHER,
     BaseWallet,
     WalletError,
     WalletMetadata,
@@ -22,6 +23,15 @@ from .base import (
     decrypt_key,
     encrypt_key,
 )
+
+# Signed and verified on every restore: a keystore whose secret and public keys do not belong
+# together is refused before its owner signs anything with it.
+_KEYPAIR_CHECK = b"qrdx keystore keypair check"
+
+
+def keystore_aad(address: str, public_key_hex: str) -> bytes:
+    """What a PQ keystore's ciphertext is bound to: the identity the file says it holds."""
+    return f"qrdx-pq-keystore-v2|{address}|{public_key_hex.lower()}".encode()
 
 
 class PQWallet(BaseWallet):
@@ -146,10 +156,14 @@ class PQWallet(BaseWallet):
         Returns:
             Keystore dictionary
         """
-        encrypted = encrypt_key(self._private_key.to_bytes(), password)
+        encrypted = encrypt_key(
+            self._private_key.to_bytes(),
+            password,
+            keystore_aad(self._address, self._public_key.to_hex()),
+        )
 
         return {
-            "version": 1,
+            "version": 2,
             "id": os.urandom(16).hex(),
             "address": self._address,
             "public_key": self._public_key.to_hex(),  # Store public key for restoration
@@ -176,21 +190,30 @@ class PQWallet(BaseWallet):
         if wallet_type != "pq":
             raise WalletError(f"Expected PQ wallet, got {wallet_type}")
 
-        # Decrypt private key
-        key_bytes = decrypt_key(keystore["crypto"], password)
-
-        # Restore public key from keystore (important for correct address)
+        # The public key is not optional: an ML-DSA secret key cannot re-derive it, and
+        # restoring without it would yield a different, random identity.
         public_key_hex = keystore.get("public_key")
-        if public_key_hex:
-            from ..crypto.pq import PQPublicKey
+        if not public_key_hex:
+            raise WalletError("the keystore has no public key; it cannot be restored")
+        address = keystore.get("address")
+        crypto = keystore["crypto"]
+        aad = b""
+        if crypto.get("cipher") == KEYSTORE_CIPHER:
+            if not address:
+                raise WalletError("the keystore has no address")
+            aad = keystore_aad(address, public_key_hex)
+        key_bytes = decrypt_key(crypto, password, aad)
 
-            public_key = PQPublicKey.from_hex(public_key_hex)
-            private_key = PQPrivateKey.from_bytes(key_bytes, public_key=public_key)
-        else:
-            # Legacy keystore without public key - will generate different address!
-            private_key = PQPrivateKey.from_bytes(key_bytes)
+        from ..crypto.pq import PQPublicKey
 
-        return cls(private_key)
+        public_key = PQPublicKey.from_hex(public_key_hex)
+        private_key = PQPrivateKey.from_bytes(key_bytes, public_key=public_key)
+        wallet = cls(private_key)
+        if address and wallet.address != address:
+            raise WalletError(f"the keystore names {address}, its key is {wallet.address}")
+        if not wallet.verify(_KEYPAIR_CHECK, wallet.sign(_KEYPAIR_CHECK)):
+            raise WalletError("the keystore's secret key does not match its public key")
+        return wallet
 
     @classmethod
     def generate(cls, name: str = "Post-Quantum Wallet") -> "PQWallet":

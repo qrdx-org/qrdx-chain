@@ -12,6 +12,14 @@ passed. It governs three things:
                        (docs/PROTOCOL_UPGRADES.md). An unapproved fork stays dormant.
 * ``delist_market``  — settle a perp market for good (docs/CONSENSUS_ROADMAP.md 4): every
                        position closed at one price (given, or the oracle's at execution).
+* ``list_market``    — list a perp market the validators price (docs/HYPERLIQUID_PARITY.md 1):
+                       an off-chain asset, by its symbol. (A perp on an on-chain token needs
+                       no proposal: anyone lists it by the token's address — CREATE_MARKET.)
+* ``bridge_mint_pause`` — pause (or resume) minting bridged deposits (docs/BRIDGE.md).
+* ``declare_quantum_emergency`` — trigger the Doomsday Protocol (docs/QUANTUM_MIGRATION.md): ECDSA
+                       keys stop signing, the bridge stops. For a break the canaries do not show
+                       (a canary's spend, proven with DOOMSDAY_PROVE, needs no proposal). It is
+                       not undone by a proposal: recovery is a protocol upgrade.
 
 Lifecycle, all judged by block height (never a clock):
 
@@ -44,6 +52,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import undo
 from .commitment import Section, committed
 
 ZERO = Decimal(0)
@@ -54,8 +63,9 @@ ACTIONS = (
     "freeze_master",
     "approve_fork",
     "delist_market",
-    "slash_deployer",
     "list_market",
+    "bridge_mint_pause",
+    "declare_quantum_emergency",
 )
 
 VOTING, PASSED, REJECTED, VETOED, EXECUTED, EXPIRED = (
@@ -74,7 +84,9 @@ MAX_MEMO = 280
 
 _FORK_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 _MARKET_ID = re.compile(r"^[A-Za-z0-9._:-]{1,96}$")
-_BASE_SYMBOL = re.compile(r"^[A-Za-z0-9._-]{1,32}$")  # (no ":": deployers' namespaces)
+# A validator-priced market's base: an off-chain asset's symbol (chain_spec.parse_genesis_market's
+# rule) — never an address, nor QRDX: a perp on an on-chain asset is a token perp.
+_BASE_SYMBOL = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,15}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -286,6 +298,7 @@ class Governance:
             total_weight=total,
         )
         self.proposals[p.id] = p
+        undo.keep(self, ("next_id",), "gov.next")  # (plain fields: kept for a rollback)
         self.next_id += 1
         return p
 
@@ -331,12 +344,31 @@ class Governance:
                 except ValueError as e:
                     raise GovernanceError(f"settlement price: {e}") from None
             return body
+        if action == "bridge_mint_pause":
+            # Pause (or resume) minting bridged deposits (qrdx/exchange/bridge.py "Guardrails").
+            # Deposits keep their attestations and mint once resumed, within their window.
+            paused = params.get("paused")
+            if not isinstance(paused, bool):
+                raise GovernanceError("paused is true or false")
+            return {"paused": paused}
+        if action == "declare_quantum_emergency":
+            # The Doomsday Protocol (qrdx/exchange/doomsday.py), for evidence of a break other
+            # than a canary's spend. The reason is recorded with it.
+            reason = params.get("reason")
+            if not isinstance(reason, str) or not reason.strip() or len(reason) > 200:
+                raise GovernanceError("reason is a short statement of the evidence (≤ 200 chars)")
+            return {"reason": reason.strip()}
         if action == "list_market":
-            # A validator-priced perp market (docs/HYPERLIQUID_PARITY.md): its settings are the
-            # proposal's — checked again when it executes (the clearinghouse's bounds).
+            # A validator-priced perp market (docs/HYPERLIQUID_PARITY.md 1): its settings are
+            # the proposal's — checked again when it executes (the clearinghouse's bounds).
             base = str(params.get("base_token", "")).strip()
             if not _BASE_SYMBOL.match(base):
                 raise GovernanceError(f"invalid base symbol {base!r}")
+            if base.upper() == "QRDX" or base.lower().startswith("0x"):
+                raise GovernanceError(
+                    f"{base} is on chain: its perp is a token perp, listed by its address "
+                    "(CREATE_MARKET) and priced off its own spot market"
+                )
             listing: Dict[str, Any] = {"base_token": base}
             if params.get("max_leverage") not in (None, ""):
                 lev = params["max_leverage"]
@@ -348,29 +380,7 @@ class Governance:
                 if isinstance(sz, bool) or not isinstance(sz, int) or not -1 <= sz <= 6:
                     raise GovernanceError("sz_decimals is -1 to 6")
                 listing["sz_decimals"] = sz
-            if params.get("spot_token") not in (None, ""):
-                # A native-token market (docs/HYPERLIQUID_PARITY.md 13): priced off the token's
-                # own spot market along these pools — checked against the chain when it executes.
-                pools = params.get("spot_pools")
-                if not isinstance(pools, list) or not 1 <= len(pools) <= 2:
-                    raise GovernanceError(
-                        "spot_pools: the 1 or 2 pools from the token to the " "settlement asset"
-                    )
-                listing["spot_token"] = str(params["spot_token"]).lower()
-                listing["spot_pools"] = [str(p) for p in pools]
             return listing
-        if action == "slash_deployer":
-            # A market deployer that ran a market dishonestly (docs/HYPERLIQUID_PARITY.md): burn
-            # ``bps`` of its bond — what is unbonding too — and, with ``halt``, settle every
-            # market it still runs at its oracle price. Checked when it executes (the bond is
-            # the exchange's).
-            deployer = str(params.get("deployer", "")).strip()
-            if not deployer:
-                raise GovernanceError("slash_deployer names the deployer")
-            bps = params.get("bps")
-            if isinstance(bps, bool) or not isinstance(bps, int) or not 0 < bps <= BPS:
-                raise GovernanceError(f"bps is 1 to {BPS}")
-            return {"deployer": deployer, "bps": bps, "halt": bool(params.get("halt", False))}
         # approve_fork — recorded as given; deliberately NOT checked against this node's spec
         # (see the module docstring).
         fork = str(params.get("fork", ""))
@@ -505,11 +515,15 @@ class Governance:
         elif p.action == "list_market":
             # Listed by the caller (the exchange's clearinghouse): the manager's GOV_EXECUTE.
             result.update(p.params)
-        elif p.action == "slash_deployer":
-            # Carried out by the caller (the exchange holds the bond): the manager's GOV_EXECUTE.
-            result.update(deployer=p.params["deployer"], bps=p.params["bps"], halt=p.params["halt"])
+        elif p.action == "bridge_mint_pause":
+            # Applied by the caller (the exchange's bridge): see the manager's GOV_EXECUTE.
+            result["paused"] = bool(p.params["paused"])
+        elif p.action == "declare_quantum_emergency":
+            # Applied by the caller (the Doomsday Protocol): see the manager's GOV_EXECUTE.
+            result["reason"] = p.params["reason"]
         elif p.action == "freeze_master":
             if self.master_frozen_at is None:
+                undo.keep(self, ("master_frozen_at",), "gov.master")
                 self.master_frozen_at = height
             result["master_frozen_at"] = self.master_frozen_at
         else:  # approve_fork

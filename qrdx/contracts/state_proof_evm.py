@@ -14,6 +14,8 @@ Input (packed, no padding)::
     account root      64   (``state_getProof`` returns them)
     exchange root     64
     token root        64
+    validator root    64   only for a block under ``validator_state_root``
+                           (qrdx/validator/validator_root.py)
     database tree     32   the two proof trees' roots (combined into the proof root)
     exchange tree     32
     domain            1    0: a database entry; 1: an exchange entry; 2: an exchange part
@@ -90,8 +92,13 @@ class _Reader:
 def parse(data: bytes) -> Dict[str, Any]:
     """The packed input as a dict; ValueError if malformed."""
     r = _Reader(data)
+    from ..validator import validator_root
+
     out: Dict[str, Any] = {"height": r.word()}
-    out["roots"] = {name: r.take(n).hex() for name, n in _ROOTS}
+    out["roots"] = {name: r.take(n).hex() for name, n in _ROOTS[:4]}
+    if validator_root.active(out["height"]):
+        out["roots"]["validators"] = r.take(64).hex()
+    out["roots"].update({name: r.take(n).hex() for name, n in _ROOTS[4:]})
     domain = r.take(1)[0]
     out["domain"] = domain
     if domain == 0:
@@ -174,7 +181,12 @@ def check(signed_root: Optional[str], p: Dict[str, Any]) -> bool:
         return False
     proof_root = smt.combine(droot, xroot).hex()
     unified = unified_state_root(
-        roots["utxo"], roots["account"], roots["exchange"], roots["token"], proof_root
+        roots["utxo"],
+        roots["account"],
+        roots["exchange"],
+        roots["token"],
+        proof_root,
+        roots.get("validators"),
     )
     return unified == signed_root
 
@@ -221,6 +233,8 @@ def encode(proof: Dict[str, Any], entry_override: Optional[bytes] = None) -> byt
     out = int(proof["height"]).to_bytes(32, "big")
     out += bytes.fromhex(r["utxo"] or "0" * 64) + bytes.fromhex(r["account"])
     out += bytes.fromhex(r["exchange"]) + bytes.fromhex(r["token"])
+    if r.get("validators"):  # (a block under validator_state_root)
+        out += bytes.fromhex(r["validators"])
     out += bytes.fromhex(proof["database_tree_root"]) + bytes.fromhex(proof["exchange_tree_root"])
     domain = proof.get("domain", "database")
 

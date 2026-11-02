@@ -24,7 +24,8 @@ The features that bring the protocol to Hyperliquid's are in docs/HYPERLIQUID_PA
 - isolated margin and builder codes;
 - the order grid and staking fee discounts;
 - contracts reading and trading on the exchange;
-- deployer markets (HIP-3).
+- where perp markets come from (genesis, governance) and token perps. (Deployer markets, HIP-3,
+  were built and then removed: no single key prices a market.)
 
 Frequent batch auctions (step 2 of item 1) were skipped by decision on 2026-10-22.
 

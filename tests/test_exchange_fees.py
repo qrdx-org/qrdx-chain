@@ -17,7 +17,6 @@ from qrdx.crypto.pq.dilithium import PQPrivateKey
 from qrdx.exchange import ExchangeMempool, ExchangeOpType, ExchangeStateManager, ExchangeTransaction
 from qrdx.exchange import block_processor as BP
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
 
 D = Decimal
 GWEI = 10 ** 9
@@ -150,8 +149,15 @@ def test_the_receipt_reports_the_fee(mgr):
 
 # ── listing a perp market burns the listing fee ───────────────────────────
 
-def _create_market(m, base="BTC", nonce=0):
-    return m.process_transaction(_tx(ExchangeOpType.CREATE_MARKET, {"base_token": base},
+TOKEN = "0x" + "4" * 40
+
+
+def _create_market(m, nonce=0):
+    """A token perp's listing, on a token with a deep spot market (its reading stubbed: the
+    listing's rules have their own tests, tests/test_token_perps.py)."""
+    m._token_perp_asset = lambda raw: TOKEN
+    m.spot_reading = lambda token, now: (D(2), D(10) ** 9, ("pool",))
+    return m.process_transaction(_tx(ExchangeOpType.CREATE_MARKET, {"token": TOKEN},
                                      nonce=nonce))
 
 

@@ -1,0 +1,357 @@
+{
+ "uid": "qrdx-node",
+ "title": "QRDX node",
+ "tags": [
+  "qrdx"
+ ],
+ "timezone": "utc",
+ "schemaVersion": 39,
+ "version": 1,
+ "refresh": "10s",
+ "time": {
+  "from": "now-6h",
+  "to": "now"
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "timeseries",
+   "title": "Chain height and finality",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "qrdx_chain_height",
+     "legendFormat": "tip"
+    },
+    {
+     "refId": "B",
+     "expr": "qrdx_finalized_epoch",
+     "legendFormat": "finalized epoch"
+    },
+    {
+     "refId": "C",
+     "expr": "qrdx_justified_epoch",
+     "legendFormat": "justified epoch"
+    }
+   ]
+  },
+  {
+   "id": 2,
+   "type": "timeseries",
+   "title": "Tip age and finality lag",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "qrdx_tip_age_seconds",
+     "legendFormat": "tip age (s)"
+    },
+    {
+     "refId": "B",
+     "expr": "qrdx_finality_lag_epochs",
+     "legendFormat": "finality lag (epochs)"
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "Peers and mempool",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 8,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "qrdx_peer_count",
+     "legendFormat": "peers"
+    },
+    {
+     "refId": "B",
+     "expr": "qrdx_mempool_pending",
+     "legendFormat": "mempool"
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "RPC",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 8,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(rate(qrdx_rpc_requests_total[5m]))",
+     "legendFormat": "requests/s"
+    },
+    {
+     "refId": "B",
+     "expr": "sum(rate(qrdx_rpc_errors_total[5m]))",
+     "legendFormat": "errors/s"
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "type": "timeseries",
+   "title": "Validator",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 16,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "qrdx_validator_last_vote_epoch",
+     "legendFormat": "last vote epoch"
+    },
+    {
+     "refId": "B",
+     "expr": "qrdx_validator_listening",
+     "legendFormat": "listening"
+    },
+    {
+     "refId": "C",
+     "expr": "qrdx_validator_doppelganger",
+     "legendFormat": "doppelganger"
+    }
+   ]
+  },
+  {
+   "id": 6,
+   "type": "timeseries",
+   "title": "Slashing events",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 16,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "qrdx_slashing_events",
+     "legendFormat": "recorded"
+    }
+   ]
+  },
+  {
+   "id": 7,
+   "type": "timeseries",
+   "title": "Bridge supply and today's mints",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 24,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "qrdx_bridge_supply",
+     "legendFormat": "{{asset}} supply"
+    },
+    {
+     "refId": "B",
+     "expr": "qrdx_bridge_minted_today",
+     "legendFormat": "{{asset}} minted today"
+    },
+    {
+     "refId": "C",
+     "expr": "qrdx_bridge_daily_limit",
+     "legendFormat": "{{asset}} daily limit"
+    }
+   ]
+  },
+  {
+   "id": 8,
+   "type": "timeseries",
+   "title": "Bridge state",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 24,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "qrdx_bridge_pending_attestations",
+     "legendFormat": "pending attestations"
+    },
+    {
+     "refId": "B",
+     "expr": "qrdx_bridge_mint_paused",
+     "legendFormat": "mint paused"
+    },
+    {
+     "refId": "C",
+     "expr": "qrdx_custodian_reconcile_alarms",
+     "legendFormat": "reconcile alarms {{chain}}"
+    }
+   ]
+  },
+  {
+   "id": 9,
+   "type": "timeseries",
+   "title": "Oracle price age",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 32,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "qrdx_oracle_price_age_seconds",
+     "legendFormat": "{{market}}"
+    }
+   ]
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "Stream",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 32,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "qrdx_stream_subscribers",
+     "legendFormat": "subscribers"
+    },
+    {
+     "refId": "B",
+     "expr": "rate(qrdx_blocks_streamed_total[5m])",
+     "legendFormat": "blocks/s"
+    }
+   ]
+  }
+ ]
+}

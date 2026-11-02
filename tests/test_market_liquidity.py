@@ -19,9 +19,8 @@ from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransact
 from qrdx.exchange import clearinghouse as CH
 from qrdx.exchange.block_processor import _execute_block_boundary_duties
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
-
-MID = "BTC-QRDX-PERP"
+TOKEN = "0x" + "4" * 40
+MID = f"{TOKEN}-QRDX-PERP"   # a token perp: listed by anyone, so listed with liquidity
 T0 = 1_700_000_000
 
 
@@ -44,10 +43,20 @@ def m(monkeypatch):
     ExchangeStateManager.reset_instance()
 
 
+def _stub_spot_market(m, price):
+    """The token's spot market, stubbed — deep, and priced only at listing — so these tests set
+    the oracle themselves and isolate the liquidity vault (the spot oracle has its own tests:
+    tests/test_token_perps.py)."""
+    m._token_perp_asset = lambda raw: TOKEN
+    m.spot_reading = lambda token, now: (price, D(10) ** 9, ("pool",) if price else ())
+
+
 def _list(m, liquidity="20000"):
-    r = _tx(m, "lister", ExchangeOpType.CREATE_MARKET, {"base_token": "BTC",
+    _stub_spot_market(m, D(100))
+    r = _tx(m, "lister", ExchangeOpType.CREATE_MARKET, {"token": TOKEN,
                                                          "liquidity": liquidity})
     assert r.success, r.error
+    _stub_spot_market(m, None)
     m.clearinghouse.set_oracle_price(MID, D(100), now=T0)
     return r.data["liquidity_vault"]
 
@@ -59,7 +68,8 @@ def _tick(m, t):
 
 
 def test_a_market_is_listed_with_liquidity_or_not_at_all(m):
-    r = _tx(m, "lister", ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"})
+    _stub_spot_market(m, D(100))
+    r = _tx(m, "lister", ExchangeOpType.CREATE_MARKET, {"token": TOKEN})
     assert not r.success and "at least 10000" in r.error
     vault = _list(m)
     ch = m.clearinghouse

@@ -40,14 +40,14 @@ post-quantum (Dilithium / ML-DSA-65) key. A traditional `0x` key cannot sign one
 | `PERP_CANCEL` | 22 | `market_id`, `order_id` |
 | `VAULT_DEPOSIT` | 23 | `amount` — free collateral into the backstop vault, for shares |
 | `VAULT_WITHDRAW` | 24 | `shares` |
-| `CREATE_MARKET` | 12 | a deployer market: `base_token` (`dex:ASSET`), `oracle_price`, `fee_share_bps`, `liquidity` (at least `PERP_MARKET_MIN_LIQUIDITY` of perps collateral for the market's liquidity vault — TRADING_FEATURES.md §14), optional `max_leverage` (default 20, at most 50), `sz_decimals` (the order grid). A validator-priced market (`BTC`) is listed by governance (`list_market`), or with this op where the chain spec allows open listing |
+| `CREATE_MARKET` | 12 | a token perp (HYPERLIQUID_PARITY.md §13): `token` (the on-chain token's **address**, or `QRDX`), `liquidity` (at least `PERP_MARKET_MIN_LIQUIDITY` of perps collateral for the market's liquidity vault — TRADING_FEATURES.md §14), optional `max_leverage` (default and at most `PERP_SPOT_MAX_LEVERAGE`, 10), `sz_decimals` (the order grid), `liquidity_profit_share`. Market id `<address>-USD-PERP`. Validator-priced markets (`BTC`, `ETH`, `SOL`) exist from genesis; others are listed by governance (`list_market`) |
 | `PERP_ISOLATED_MARGIN` | 76 | `market_id`, `amount` — into an isolated position's margin (negative: out of it) |
 | `SCHEDULE_CANCEL` | 77 | optional `time` — every order cancelled at that block time (none: cleared) |
 | `APPROVE_BUILDER_FEE` | 78 | `builder`, `max_fee_rate` — an order then carries `builder: {b, f}` |
-| `DEPLOYER_BOND` | 79 | `amount`, `dex` (the first bond names the namespace) |
-| `DEPLOYER_UNBOND` | 80 | `amount`, or `claim: true` |
-| `DEPLOYER_SET_ORACLE` | 81 | `market_id`, `price` — a deployer market's oracle |
-| `DEPLOYER_HALT` | 82 | `market_id` — the deployer settles its market at its oracle price |
+
+No operation sets a price. Validator-priced markets take the validators' aggregated `ORACLE_VOTE`s
+(PERPS_CLEARINGHOUSE.md §8); a token perp, its token's spot market. Operations 11
+(`UPDATE_ORACLE`) and 79–82 (the deployer markets') are retired and do not decode.
 
 Amounts, sizes and prices are decimal strings. A "market order" is `tif: "ioc"` at an aggressive
 price. An order's id is the first 16 characters of its transaction hash (the receipt also
@@ -60,7 +60,7 @@ and the trading history are in [TRADING_FEATURES.md](TRADING_FEATURES.md).
 - isolated margin, the dead man's switch and builder codes;
 - the order grid and staking fee discounts;
 - contracts trading through the `0x…0401` precompile;
-- deployer markets.
+- where markets come from (genesis, governance) and token perps.
 
 **Nonce.** `GET /get_exchange_nonce?address=` or `exchange_getNonce`. A transaction that
 executes consumes its nonce whether it succeeds or fails (e.g. an order refused for margin); one
@@ -125,9 +125,9 @@ from the chain on restart).
 |---|---|
 | `an order may be at most 20% worse than the oracle` | a buy above oracle × (1 + `PERP_PRICE_BAND_BPS`), a sell below oracle × (1 − it) |
 | `…'s circuit breaker has tripped: reduce-only orders until block time …` | the mark moved `PERP_BREAKER_MOVE_BPS` within the window; only `reduce_only` orders pass until the cooldown ends |
-| `…'s open interest is capped at …` | the order's fills would raise open interest past the market's cap (its liquidity vault's equity × 50, or `PERP_MIN_OI_CAP`); refused whole |
+| `…'s open interest is capped at …` | the order's fills would raise open interest past the market's cap (its liquidity vault's equity × 50, or `PERP_MIN_OI_CAP`; a token perp's also at most its spot depth × `SPOT_OI_DEPTH_BPS`); refused whole |
 | `… is delisted` | governance settled the market (`delist_market`); nothing more trades there |
-| `the validators have frozen …: only reduce-only orders are accepted` | a deployer market the validators froze (docs/HYPERLIQUID_PARITY.md 8) |
+| `the oracle for … is stale; only reduce-only orders are accepted` | no fresh oracle: the validators' votes lapsed, or a token perp's spot market is under its depth floor |
 | `… sizes are multiples of …` / `… prices have at most 5 significant figures and … decimals` / `an order is worth at least …` | off the market's order grid (docs/HYPERLIQUID_PARITY.md 5) |
 | `expired at block time …` | the block is later than the transaction's `expires_at` |
 
@@ -273,6 +273,24 @@ tx = dict(p["tx"], signature=signature.hex(), public_key=public_key.hex())
 httpx.post(f"{node}/submit_exchange_tx", json={"tx": tx})
 # … then poll GET /get_exchange_receipt?tx_hash=<p["tx_hash"]>
 ```
+
+### Trading from an Ethereum wallet (MetaMask)
+
+An exchange transaction is signed with ML-DSA-65, which an Ethereum wallet cannot produce. An
+Ethereum account (`0x…`) trades through a **post-quantum agent**:
+
+1. **The app makes a key.** It generates an ML-DSA-65 key in the browser: the agent, `0xPQ…`.
+2. **The user approves it.** One transaction from MetaMask calls the exchange write precompile
+   (`0x…0401`) with `sendAction('{"op": "AGENT_APPROVE", "params": {"agent": "0xPQ…",
+   "name": "web app", "valid_until": <block time>}}')`. The approval runs as the calling account,
+   authenticated by the EVM, at the start of the next block.
+3. **The agent signs.** It signs ordinary exchange transactions with `sender` set to the user's
+   `0x…` address and `signer` set to its own address, in its own nonce lane
+   (`exchange_getNonce("<0x…>|<0xPQ…>")`).
+
+An agent trades only. It can place, cancel and modify orders, but never withdraw or transfer the
+account's funds (`AGENT_SCOPE`). `max_notional_per_day` caps what it may trade. The account ends
+it with `AGENT_REVOKE` through the same precompile.
 
 ---
 

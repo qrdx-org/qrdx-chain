@@ -387,6 +387,7 @@ async def chain_event_poller(
     get_finality: Optional[_MaybeAsync] = None,
     get_slashing_count: Optional[_MaybeAsync] = None,
     get_mempool_depth: Optional[_MaybeAsync] = None,
+    get_gauges: Optional[_MaybeAsync] = None,
     interval: float = 1.0,
     signal: Optional[ChangeSignal] = None,
     _max_iterations: Optional[int] = None,  # test hook
@@ -397,9 +398,10 @@ async def chain_event_poller(
     Each block is one ``block`` event with its height and hash (``get_hashes(lo, hi)`` →
     {height: hash}). When blocks this feed already announced are replaced, it first publishes a
     ``reorg`` event naming the last block that survived, then the new blocks above it, so a
-    subscriber can drop what it showed. The slower gauges (peers, finality, slashing, mempool)
-    are refreshed at most every ``interval``. Best-effort: a getter error is retried on the next
-    wake."""
+    subscriber can drop what it showed. The slower gauges (peers, finality, slashing, mempool,
+    and ``get_gauges``: ``(name, value, labels)`` triples — the validator's signing state, the
+    bridge's guardrails, oracle ages) are refreshed at most every ``interval``. Best-effort: a
+    getter error is retried on the next wake."""
     metrics.describe("qrdx_chain_height", "Current chain tip height")
     metrics.describe("qrdx_finalized_epoch", "Highest finalized epoch")
     metrics.describe("qrdx_peer_count", "Connected peer count")
@@ -428,6 +430,7 @@ async def chain_event_poller(
                         get_finality,
                         get_slashing_count,
                         get_mempool_depth,
+                        get_gauges,
                     )
                 if tip != last_height or get_hashes is not None:
                     last_height = await _publish_blocks(
@@ -458,6 +461,7 @@ async def _refresh_gauges(
     get_finality: Optional[_MaybeAsync],
     get_slashing_count: Optional[_MaybeAsync],
     get_mempool_depth: Optional[_MaybeAsync],
+    get_gauges: Optional[_MaybeAsync] = None,
 ) -> Dict[str, Any]:
     metrics.set("qrdx_stream_subscribers", hub.subscriber_count)
     metrics.set("qrdx_stream_dropped_total", hub.dropped_count)
@@ -478,6 +482,9 @@ async def _refresh_gauges(
         metrics.set("qrdx_slashing_events", int(await _maybe_await(get_slashing_count())))
     if get_mempool_depth is not None:
         metrics.set("qrdx_mempool_pending", int(await _maybe_await(get_mempool_depth())))
+    if get_gauges is not None:
+        for name, value, labels in (await _maybe_await(get_gauges())) or ():
+            metrics.set(name, float(value), labels)
     return fin
 
 

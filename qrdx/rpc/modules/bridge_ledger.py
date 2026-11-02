@@ -4,12 +4,19 @@ exchange transactions (``BRIDGE_WITHDRAW``); deposits are attested by validators
 
     bridge_getAssets()                    → the bridged tokens: source chain and token, decimals,
                                             the QRDX token address, supply minted so far
-    bridge_getDeposit(id)                 → "<chain>:<tx hash>:<log index>": minted, or the
+    bridge_getDeposit(id)                 → "<chain>:<lockbox deposit id>": minted, or the
                                             attestations it has so far
     bridge_getWithdrawals(from_id, limit) → recorded withdrawals from ``from_id``, oldest first
                                             — what the lockbox's custodian releases
-
-(The Doomsday reads in qrdx/rpc/modules/bridge.py share the namespace.)
+    bridge_getGuardrails()                → the deposit window (what the custodian's refunds
+                                            wait for), the mint limits and today's use, and
+                                            whether governance paused minting
+    bridge_getHeads(chain)                → the source chain's attested finalized heads (the
+                                            last 64), oldest first: what BRIDGE_PROVE_DEPOSIT
+                                            proves a deposit against
+    bridge_getDoomsday()                  → whether the Doomsday Protocol triggered (its time,
+                                            block and cause) and each chain's canary
+                                            (docs/QUANTUM_MIGRATION.md)
 """
 
 from __future__ import annotations
@@ -56,3 +63,43 @@ class BridgeLedgerModule(RPCModule):
         except (TypeError, ValueError) as exc:
             raise RPCError(RPCErrorCode.INVALID_PARAMS, "from_id and limit are integers") from exc
         return _manager().bridge.list_withdrawals(from_id, max(1, min(limit, 1000)))
+
+    @rpc_method
+    async def getGuardrails(self) -> Dict[str, Any]:
+        return _manager().bridge.guardrails()
+
+    @rpc_method
+    async def getHeads(self, chain: int) -> List[Dict[str, Any]]:
+        try:
+            chain = int(chain)
+        except (TypeError, ValueError) as exc:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, "chain is an integer") from exc
+        bridge = _manager().bridge
+        heights = sorted(
+            int(k.split("|", 1)[1])
+            for k in dict.keys(bridge.head_history)
+            if k.split("|", 1)[0] == str(chain)
+        )
+        out = []
+        for height in heights:
+            head = bridge.head_at(chain, height)
+            if head is not None:
+                out.append(
+                    {
+                        "chain": chain,
+                        "height": head.height,
+                        "hash": head.hash,
+                        "state_root": head.state_root,
+                        "timestamp": head.timestamp,
+                    }
+                )
+        return out
+
+    @rpc_method
+    async def getDoomsday(self) -> Dict[str, Any]:
+        from ...exchange.doomsday import configured_canaries
+
+        return {
+            "triggered": _manager().bridge.doomsday,
+            "canaries": {str(c): a for c, a in sorted(configured_canaries().items())},
+        }

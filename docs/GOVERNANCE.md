@@ -16,7 +16,7 @@ Verified live (2026-10-09, 4-node testnet, S22 33/33):
 - **Fork approval:** approval was driven on chain in the upgrade rehearsal
   (docs/PROTOCOL_UPGRADES.md).
 
-It governs six things:
+It governs seven things:
 
 | Action | Effect when executed |
 |---|---|
@@ -24,8 +24,9 @@ It governs six things:
 | `freeze_master` | ends the genesis master controller's authority over the system wallets now |
 | `approve_fork` | authorises a fork scheduled in the chain spec to activate (docs/PROTOCOL_UPGRADES.md) |
 | `delist_market` | settles a perp market for good: `{market_id, price?}` — below |
-| `list_market` | lists a perp market: validator-priced `{base_token, max_leverage?, sz_decimals?}` (docs/HYPERLIQUID_PARITY.md 10), or priced off a native token's own spot market with `spot_token` and `spot_pools` (13) |
-| `slash_deployer` | burns `bps` of a market deployer's bond and, with `halt`, settles its markets: `{deployer, bps, halt?}` (docs/HYPERLIQUID_PARITY.md 8) |
+| `list_market` | lists a perp market the validators price, an off-chain asset by its symbol: `{base_token, max_leverage?, sz_decimals?}` (docs/HYPERLIQUID_PARITY.md 8). Never `QRDX` or an address: a perp on an on-chain token is a token perp, which anyone lists by the token's address (13) |
+| `bridge_mint_pause` | pauses (`{paused: true}`) or resumes (`{paused: false}`) minting bridged deposits. Held deposits keep their attestations and mint once resumed, within their window; past it they are refunded (docs/BRIDGE.md "Guardrails") |
+| `declare_quantum_emergency` | triggers the Doomsday Protocol, `{reason}` (≤ 200 characters): ECDSA keys stop signing, the bridge stops (docs/QUANTUM_MIGRATION.md). For evidence the canaries do not show; a canary's proven spend needs no proposal. No proposal undoes it: recovery is a protocol upgrade |
 
 **Delisting** (docs/CONSENSUS_ROADMAP.md 4). Executing `delist_market` cancels every order,
 trigger and TWAP in the market and closes every position at one settlement price — the `price`
@@ -175,5 +176,5 @@ transactions (`exchange_sendTransaction`).
 - **Parameters can't be changed by governance.** They are fixed in the chain spec; a rule
   change is a fork, approved through `approve_fork`.
 - Resolved proposals are kept in state (bounded by the open-proposal limits).
-- `qrdx/governance/` is the earlier in-memory governance library. No consensus path uses it;
-  this module replaces it.
+- The earlier in-memory governance library (`qrdx/governance/`), which no consensus path used,
+  was removed on 2026-10-27 (docs/MAINNET_READINESS.md B8).

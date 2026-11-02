@@ -92,8 +92,11 @@ def highest_at_or_below(height: int, checkpoints: Optional[Dict[int, str]] = Non
 
 
 async def reorg_floor(db: Any) -> int:
-    """No reorganization may roll back below this height: the finalized block, or the highest
-    trusted checkpoint this node holds, whichever is higher."""
+    """No reorganization may roll back below this height: the finalized block, the highest
+    trusted checkpoint this node holds, or the block a snapshot restored it at (qrdx/snapshot.py:
+    verified against a trusted checkpoint), whichever is highest."""
+    import json
+
     from .validator.finality import finalized_block_height
 
     tip = int(await db.get_next_block_id()) - 1
@@ -101,7 +104,17 @@ async def reorg_floor(db: Any) -> int:
         finalized = int(await finalized_block_height(db))
     except Exception:
         finalized = -1
-    return max(finalized, highest_at_or_below(tip))
+    restored = -1
+    try:
+        cur = await db.connection.execute(
+            "SELECT value FROM chain_metadata WHERE key = 'restored_from_snapshot'"
+        )
+        row = await cur.fetchone()
+        if row is not None:
+            restored = int(json.loads(row[0])["height"])
+    except Exception:
+        pass
+    return max(finalized, highest_at_or_below(tip), restored)
 
 
 async def startup_error(db: Any) -> str:

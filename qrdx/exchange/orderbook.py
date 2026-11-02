@@ -421,6 +421,15 @@ class OrderBook:
         logger.info("Order book %s resumed", self.pool_id)
 
     @_pinned
+    def enter_block(self, height: int, now: float) -> None:
+        """Block ``height`` (at block time ``now``) uses this book: on its first use in the block,
+        the block starts for it (``new_block``). Lazily, so a block costs the books it uses, not
+        every book (docs/EXCHANGE_AUDIT.md 8)."""
+        if self.__dict__.get("_block_height") != height:
+            self.new_block(now)
+            self._block_height = height
+
+    @_pinned
     def new_block(self, now: Optional[float] = None) -> None:
         """Start a block: reset the per-block rate limits and drop the orders that have expired
         by ``now`` — the block's timestamp, never the wall clock."""
@@ -458,6 +467,7 @@ class OrderBook:
         "_has_expiring",
         "_block_order_count",
         "_trades",
+        "_block_height",
     )
 
     def _keep_scalars(self) -> None:
@@ -475,6 +485,7 @@ class OrderBook:
             "_has_expiring": self.__dict__.get("_has_expiring", True),
             "_block_order_count": dict(self._block_order_count),
             "_trades": list(self._trades),
+            "_block_height": self.__dict__.get("_block_height"),
         }
 
         def restore() -> None:
@@ -783,6 +794,45 @@ class OrderBook:
         if order.is_iceberg:
             order.shown = min(order.shown, order.remaining)
         return order
+
+    @_pinned
+    def fill_resting(self, order_id: str, amount: Decimal) -> Order:
+        """``amount`` more of a resting order filled away from the book — by a pool its price
+        reached (docs/UNIFIED_SPOT_LIQUIDITY.md 4). It keeps its place in the queue; whole, it
+        leaves the book."""
+        self._keep_scalars()
+        self._version += 1
+        order = self._orders.get(order_id)
+        if order is None or not order.is_active:
+            raise ValueError(f"no resting order {order_id}")
+        amount = Decimal(str(amount))
+        if not ZERO < amount <= order.remaining:
+            raise ValueError("a fill must be positive and at most what the order has left")
+        self._touch(order.side, order.price)  # (records the level, this very order with it)
+        order.filled += amount
+        if order.remaining > 0:
+            order.status = OrderStatus.PARTIALLY_FILLED
+            if order.is_iceberg:
+                order.shown = min(order.shown, order.remaining)
+            return order
+        self._keep_order(self._orders, order_id)
+        order.status = OrderStatus.FILLED
+        book = self._bids if order.side == OrderSide.BUY else self._asks
+        level = book.get(order.price)
+        if level is not None:
+            level.remove_order(order_id)
+            if level.total_amount == 0:
+                del book[order.price]
+        del self._orders[order_id]
+        self._decrement_owner_count(order.owner)
+        return order
+
+    def record_price(self, price: Decimal) -> None:
+        """The pair traded at ``price`` somewhere other than this book (a pool): it is the
+        pair's last price now — what spot triggers watch."""
+        self._keep_scalars()
+        self._version += 1
+        self.last_price = Decimal(str(price))
 
     @_pinned
     def cancel_order(self, order_id: str, caller: str = "") -> Optional[Order]:

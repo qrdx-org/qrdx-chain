@@ -263,6 +263,7 @@ def transition(state: State, epoch: int, inputs: EpochInputs) -> State:
 
     s = copy.deepcopy(state)
     s.__dict__.pop("_stakes_memo", None)  # (the copy's stakes are its own, recomputed if asked)
+    s.__dict__.pop("_hash_memo", None)  # (and so is its hash)
     if not isinstance(s, State):  # a plain mapping (tests, an older cache)
         s = State(s)
     e = int(epoch)
@@ -536,9 +537,19 @@ def _load(blob: str) -> State:
 
 
 def state_hash(state: State) -> str:
+    """The state's canonical hash. Memoized on the state (a state is never changed once
+    computed): the validator root (qrdx/validator/validator_root.py) asks for it every block."""
     import hashlib
 
-    return hashlib.sha256(_dump(state).encode()).hexdigest()
+    memo = getattr(state, "_hash_memo", None)
+    if memo is not None:
+        return memo
+    digest = hashlib.sha256(_dump(state).encode()).hexdigest()
+    try:
+        state._hash_memo = digest  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    return digest
 
 
 # ── the chain's inputs ───────────────────────────────────────────────────────────────────

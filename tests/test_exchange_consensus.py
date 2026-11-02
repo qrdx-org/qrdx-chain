@@ -20,7 +20,6 @@ from qrdx.exchange import (
     ExchangeStateManager,
     ExchangeTransaction,
     ExchangeOpType,
-    PerpSide,
     process_exchange_transactions,
     validate_exchange_state_root,
     verify_exchange_tx,

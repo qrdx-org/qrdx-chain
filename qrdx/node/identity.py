@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 import blake3
 import oqs
 
+from ..crypto.pq.algorithms import SIG_ALGORITHM, require as require_pq_algorithms
 from ..logger import get_logger
 
 logger = get_logger(__name__)
@@ -25,18 +26,10 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-# Resolve algorithm name at import time (ML-DSA-65 preferred, Dilithium3 legacy)
-def _resolve_sig_algorithm() -> str:
-    for name in ("ML-DSA-65", "Dilithium3"):
-        try:
-            oqs.Signature(name)
-            return name
-        except Exception:
-            continue
-    raise RuntimeError("No supported PQ signature algorithm found in liboqs")
 
 
-PQ_ALGORITHM = _resolve_sig_algorithm()  # NIST Level 3 — CRYSTALS-Dilithium / ML-DSA-65
+PQ_ALGORITHM = SIG_ALGORITHM  # ML-DSA-65 only; liboqs is proven to compute it (algorithms.py)
+require_pq_algorithms()
 
 # Allow per-node key directory via env var (for testnet multi-node on same machine)
 _key_dir = os.environ.get("QRDX_NODE_KEY_DIR", os.path.dirname(__file__))

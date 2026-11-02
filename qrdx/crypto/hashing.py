@@ -201,6 +201,7 @@ def unified_state_root(
     exchange_root: str,
     token_root: str = TOKEN_ZERO_ROOT,
     proof_root: Optional[str] = None,
+    validator_root: Optional[str] = None,
 ) -> str:
     """
     Combine the per-domain state roots into one block state root (Whitepaper §3.6).
@@ -224,6 +225,8 @@ def unified_state_root(
             ``provable_state`` feature is in force (qrdx/state_proofs.py) — a fifth input, so a
             single entry can be proven against the signed root. None before: the payload is
             unchanged.
+        validator_root: the validators' state (qrdx/validator/validator_root.py), once the
+            ``validator_state_root`` feature is in force. None before: the payload is unchanged.
 
     Returns:
         128-char hex BLAKE3-512 unified state root.
@@ -231,4 +234,6 @@ def unified_state_root(
     payload = f"{utxo_root}|{account_root}|{exchange_root}|{token_root}"
     if proof_root is not None:
         payload += f"|{proof_root}"
+    if validator_root is not None:
+        payload += f"|validators:{validator_root}"
     return state_root_hex(payload.encode("utf-8"))

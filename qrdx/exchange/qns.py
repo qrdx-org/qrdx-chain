@@ -78,10 +78,14 @@ class NameRecord:
     expires: Decimal  # block time
     target: str  # the address it resolves to ("" none)
     texts: Tuple[Tuple[str, str], ...] = ()
+    # The account that held the name's NFT when these records were set. They are its: once the
+    # NFT is someone else's — sold or transferred, by any path — they no longer count, and the
+    # name resolves to its new owner until that owner sets its own.
+    holder: str = ""
 
 
 def _encode_record(_name: str, r: NameRecord) -> Any:
-    return [str(r.expires), r.target, [list(t) for t in r.texts]]
+    return [str(r.expires), r.target, [list(t) for t in r.texts], r.holder]
 
 
 class NameService:
@@ -101,10 +105,25 @@ class NameService:
         nft = nfts.items.peek((QNS_COLLECTION, name_token_id(name)))
         return nft.owner if nft is not None else None
 
+    def current(self, nfts, name: str) -> Optional[NameRecord]:
+        """The name's records — as its present owner holds them: set by an earlier owner (before
+        the NFT changed hands), they are cleared — the name resolves to its owner and carries no
+        text records until the owner sets its own. (They used to survive a sale: the name kept
+        resolving to the seller.)"""
+        from ..crypto.account_id import same_account
+
+        r = self.record(name)
+        owner = self.owner(nfts, name)
+        if r is None or owner is None:
+            return None
+        if r.holder and same_account(r.holder, owner):
+            return r
+        return NameRecord(expires=r.expires, target=owner, holder=owner)
+
     def resolve(self, nfts, name: str, now: Decimal) -> Optional[str]:
         """What ``name`` resolves to now (None: unregistered, expired or no address record)."""
-        r = self.record(name)
-        if r is None or now >= r.expires or self.owner(nfts, name) is None:
+        r = self.current(nfts, name)
+        if r is None or now >= r.expires:
             return None
         return r.target or None
 
@@ -159,7 +178,7 @@ class NameService:
 
 
 def summary(svc: NameService, nfts, name: str, now: Decimal) -> Optional[Dict[str, Any]]:
-    r = svc.record(name)
+    r = svc.current(nfts, name)
     owner = svc.owner(nfts, name)
     if r is None or owner is None:
         return None

@@ -139,7 +139,7 @@ class GenesisInitializer:
                 f"produced by an incompatible release; refusing to start a different chain."
             )
 
-        await self._init_database_from_genesis(state, block, prefunded_accounts)
+        await self._init_database_from_genesis(state, block, prefunded_accounts, spec)
 
         self._genesis_initialized = True
         logger.info("Genesis initialization complete!")
@@ -152,6 +152,7 @@ class GenesisInitializer:
         state: GenesisState,
         block: GenesisBlock,
         prefunded_accounts: Dict[str, Tuple[Decimal, str]],
+        spec: Optional[ChainSpec] = None,
     ):
         """
         Initialize the database with genesis data.
@@ -220,6 +221,10 @@ class GenesisInitializer:
             await self._init_system_wallets(
                 block.block_hash, state.system_wallets, state.system_wallet_controller
             )
+
+        # Contracts present from genesis (EVM_PREDEPLOYS: the PQ smart account's
+        # implementation and factory by default)
+        await self._init_predeploys(block.block_hash, spec or chain_spec_mod.active())
 
         # Initialize validators if any
         if state.validators:
@@ -302,6 +307,26 @@ class GenesisInitializer:
 
         await self.db.connection.commit()
         logger.info(f"Funded {len(prefunded_accounts)} genesis accounts in account_state")
+
+    async def _init_predeploys(self, genesis_block_hash: str, spec: ChainSpec) -> None:
+        """Write each of the spec's predeploys (qrdx/predeploys.py) as a block-0 record — what
+        every rebuild seeds the state from — and seed it."""
+        from .. import predeploys
+        from ..crypto.hashing import sha256
+
+        for p in predeploys.check(list(spec.params.get("EVM_PREDEPLOYS") or [])):
+            record = predeploys.genesis_record(p)
+            await self.db.add_transaction(
+                block_hash=genesis_block_hash,
+                tx_hash=sha256(f"genesis:contract:{p.address}:{record['code_hash']}".encode()),
+                tx_hex=json.dumps(record, sort_keys=True),
+                inputs_addresses=[],
+                outputs_addresses=[p.address],
+                outputs_amounts=[0],
+                fees=Decimal("0"),
+            )
+            await self.db.seed_genesis_contract(record)
+            logger.info(f"Predeployed {p.address} ({len(p.code)} bytes of code)")
 
     async def _init_system_wallets(
         self,

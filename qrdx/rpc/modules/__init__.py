@@ -4,7 +4,6 @@ QRDX RPC Modules
 Web3-compatible JSON-RPC method implementations.
 """
 
-from .bridge import BridgeModule
 from .eth import EthModule
 from .net import NetModule
 from .qrdx import QRDXModule
@@ -15,5 +14,4 @@ __all__ = [
     "NetModule",
     "Web3Module",
     "QRDXModule",
-    "BridgeModule",
 ]

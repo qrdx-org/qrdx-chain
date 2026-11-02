@@ -205,3 +205,61 @@ async def test_a_contract_cannot_send_actions_as_its_caller(chain):
     r = await chain.tx(ALICE, EXCHANGE_WRITE_ADDRESS, _action("PERP_DEPOSIT", amount="1"),
                        value=10 ** 18)
     assert not r.success and len(mgr.trading.evm_actions) == 0
+
+
+# ── an Ethereum account trades through a post-quantum agent ─────────────────────────────────
+
+
+async def test_an_ethereum_account_approves_a_pq_agent_that_trades_for_it(chain):
+    """A MetaMask user's account (0x…) cannot sign exchange transactions: they are Dilithium-
+    signed. One EVM call to the write precompile approves a PQ key held by the trading app; that
+    key then signs ordinary exchange transactions for the 0x account, trading only (it can never
+    move the account's funds out), until the account revokes it."""
+    from qrdx.crypto.pq.dilithium import PQPrivateKey
+    from qrdx.exchange import ExchangeOpType, ExchangeTransaction
+
+    mgr = _mgr()
+    account = "0x" + ALICE.hex()
+    mgr.clearinghouse.deposit(account, D(100_000))
+    agent_key = PQPrivateKey.generate()
+    agent = agent_key.public_key.to_address()
+    assert (await chain.tx(ALICE, EXCHANGE_WRITE_ADDRESS,
+                           _action("AGENT_APPROVE", agent=agent, name="web app"))).success
+    (event,) = _next_block(mgr)
+    assert event["success"] and event["owner"] == account and event["op"] == "AGENT_APPROVE"
+
+    def signed(op, params, height):
+        t = ExchangeTransaction(op_type=op, sender=account, signer=agent, params=params,
+                                nonce=mgr.get_nonce(f"{account}|{agent}"), gas_limit=10**6)
+        t.public_key = agent_key.public_key.to_bytes()
+        t.signature = agent_key.sign(t.signing_bytes()).to_bytes()
+        assert t.verify()  # the signature binds to the agent's key, not the 0x account
+        mgr.begin_block(height, float(T0 + height))
+        return mgr.process_transaction(t)
+
+    order = {"market_id": MID, "side": "buy", "size": "0.1", "price": "29000"}
+    r = signed(ExchangeOpType.PERP_ORDER, order, 4)
+    assert r.success, r.error
+    assert mgr.clearinghouse.markets[MID].orders[r.data["order_id"]].owner == account
+    r = signed(ExchangeOpType.PERP_WITHDRAW, {"amount": "10"}, 5)
+    assert not r.success                                    # trading only: no funds out
+
+    assert (await chain.tx(ALICE, EXCHANGE_WRITE_ADDRESS,
+                           _action("AGENT_REVOKE", agent=agent))).success
+    assert _next_block(mgr, 6)[0]["success"]
+    assert not signed(ExchangeOpType.PERP_ORDER, order, 7).success
+
+
+async def test_no_one_else_can_approve_an_agent_for_an_account(chain):
+    """The action runs as the EVM account that sent it, so a contract approving an agent only
+    ever approves it for itself."""
+    from qrdx.crypto.pq.dilithium import PQPrivateKey
+
+    mgr = _mgr()
+    c, key = await _sender(chain)
+    agent = PQPrivateKey.generate().public_key.to_address()
+    assert (await chain.tx(ALICE, c, _action("AGENT_APPROVE", agent=agent))).success
+    (event,) = _next_block(mgr)
+    assert event["owner"] == key != "0x" + ALICE.hex()
+    assert [g.agent for g in mgr.trading.agents.peek(key, ())] == [agent]
+    assert not mgr.trading.agents.peek("0x" + ALICE.hex(), ())

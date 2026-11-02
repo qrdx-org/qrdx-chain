@@ -1,17 +1,54 @@
 # QRDX Alert Rules for Prometheus
+#
+# Every expression reads a metric the node exports on /metrics: qrdx/node/observability.py (the
+# chain, finality, peers, mempool, RPC) and qrdx/node/health_gauges.py (the tip's age, the
+# validator's signing state, the bridge's guardrails, oracle ages). An alert on a metric nothing
+# exports never fires; tests/test_alert_rules.py checks each one against the exporters.
+# The bridge custodian's reconcile runs outside the node: scripts/bridge/reconcile_cron.sh
+# writes qrdx_custodian_reconcile_alarms for node_exporter's textfile collector.
 
 groups:
   - name: qrdx_node_alerts
     rules:
-      # Chain stall — no new blocks for 5 minutes
-      - alert: ChainStall
-        expr: increase(qrdx_blocks_processed_total[5m]) == 0
-        for: 5m
+      # The node itself is gone (no scrape, or the process is down).
+      - alert: NodeDown
+        expr: up{job="qrdx-node"} == 0 or absent(qrdx_up)
+        for: 2m
         labels:
           severity: critical
         annotations:
-          summary: "QRDX chain stall detected"
-          description: "No new blocks processed in the last 5 minutes."
+          summary: "QRDX node is down"
+          description: "Prometheus cannot scrape the node, or it reports nothing."
+
+      # Chain stall — the tip block is old (at 250 ms slots a minute is ~240 missed slots).
+      - alert: ChainStall
+        expr: qrdx_tip_age_seconds > 60
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "QRDX chain stall: the tip is {{ $value | humanizeDuration }} old"
+          description: "No new block for over a minute. Check peers, validators and the logs."
+
+      # Finality stall — finalized epoch not advancing
+      - alert: FinalityStall
+        expr: increase(qrdx_finalized_epoch[10m]) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Finality stall detected"
+          description: "Finalized epoch has not advanced in 10 minutes."
+
+      # Finality falling behind the tip
+      - alert: FinalityLag
+        expr: qrdx_finality_lag_epochs > 4
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Finality is {{ $value }} epochs behind the tip"
+          description: "Validators holding two thirds of the stake are not voting in time."
 
       # Low peer count
       - alert: LowPeerCount
@@ -25,7 +62,7 @@ groups:
 
       # High RPC error rate
       - alert: HighRPCErrorRate
-        expr: rate(qrdx_rpc_errors_total[5m]) / rate(qrdx_rpc_requests_total[5m]) > 0.1
+        expr: sum(rate(qrdx_rpc_errors_total[5m])) / sum(rate(qrdx_rpc_requests_total[5m])) > 0.1
         for: 5m
         labels:
           severity: warning
@@ -35,7 +72,7 @@ groups:
 
       # Mempool backlog
       - alert: MempoolBacklog
-        expr: qrdx_mempool_size > 10000
+        expr: qrdx_mempool_pending > 10000
         for: 10m
         labels:
           severity: warning
@@ -43,22 +80,105 @@ groups:
           summary: "Large mempool backlog ({{ $value }})"
           description: "Mempool has over 10,000 pending transactions."
 
-      # Validator inactive
+      # A slashing offence was recorded (anyone's: evidence rides the chain).
+      - alert: SlashingEvent
+        expr: increase(qrdx_slashing_events[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "A slashing offence was recorded"
+          description: "Slashing evidence landed on chain. Check whether it names one of your validators."
+
+  - name: qrdx_validator_alerts
+    rules:
+      # Another machine is signing with this validator's key: it has stopped signing for good.
+      - alert: ValidatorDoppelganger
+        expr: qrdx_validator_doppelganger == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "Doppelganger: this validator's key is signing elsewhere"
+          description: "Stop one of the two machines, then restart this one (docs/VALIDATOR_KEYS.md)."
+
+      # The validator has signed nothing new (no block, no vote) for 10 minutes.
       - alert: ValidatorInactive
-        expr: qrdx_validator_active == 0
+        expr: qrdx_validator_enabled == 1 and qrdx_validator_listening == 0 and changes(qrdx_validator_last_vote_epoch[10m]) == 0
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "Validator is inactive"
-          description: "This validator node has been inactive for 5 minutes."
+          summary: "Validator is not voting"
+          description: "No FFG vote in 10 minutes: check its stake, its sync and its logs."
 
-      # Finality stall — finalized epoch not advancing
-      - alert: FinalityStall
-        expr: increase(qrdx_finalized_epoch[10m]) == 0
-        for: 10m
+      # Still listening for a doppelganger long after a start (a few epochs is expected).
+      - alert: ValidatorStillListening
+        expr: qrdx_validator_listening == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Validator has not started signing"
+          description: "It is still in its doppelganger window, or has not reached its first slot."
+
+  - name: qrdx_bridge_alerts
+    rules:
+      - alert: DoomsdayTriggered
+        expr: qrdx_doomsday_triggered == 1
         labels:
           severity: critical
         annotations:
-          summary: "Finality stall detected"
-          description: "Finalized epoch has not advanced in 10 minutes."
+          summary: "The Doomsday Protocol triggered: ECDSA keys no longer sign"
+          description: "A canary's key signed, or governance declared a quantum emergency. EVM transactions signed with secp256k1 are refused and the bridge has stopped (docs/QUANTUM_MIGRATION.md)."
+
+      - alert: BridgeMintPaused
+        expr: qrdx_bridge_mint_paused == 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "Governance paused bridge minting"
+          description: "Deposits keep their attestations; past their window they are refunded."
+
+      - alert: BridgeNearDailyLimit
+        expr: qrdx_bridge_daily_limit > 0 and qrdx_bridge_minted_today / qrdx_bridge_daily_limit > 0.8
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset }} has minted {{ $value | humanizePercentage }} of its daily limit"
+          description: "Deposits past the limit wait for the next day of QRDX's clock."
+
+      - alert: BridgeNearSupplyCap
+        expr: qrdx_bridge_supply_cap > 0 and qrdx_bridge_supply / qrdx_bridge_supply_cap > 0.9
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset }} supply is at {{ $value | humanizePercentage }} of its cap"
+          description: "Raising the cap is a chain-spec change (BRIDGE_MINT_LIMITS)."
+
+      - alert: BridgeAttestationBacklog
+        expr: qrdx_bridge_pending_attestations > 500
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} bridge attestations short of a mint"
+          description: "Deposits are not reaching a quorum or are held by a guardrail."
+
+      # From scripts/bridge/reconcile_cron.sh (node_exporter textfile collector).
+      - alert: CustodianReconcileAlarm
+        expr: qrdx_custodian_reconcile_alarms > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Lockbox reconcile raised {{ $value }} alarm(s)"
+          description: "A release or refund does not match QRDX's records. Investigate before any more releases."
+
+  - name: qrdx_market_alerts
+    rules:
+      - alert: OraclePriceStale
+        expr: qrdx_oracle_price_age_seconds > 120
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.market }} oracle price is {{ $value | humanizeDuration }} old"
+          description: "Validators' price votes are not arriving. At PERP_ORACLE_STALE_SECONDS (300 s by default) the market refuses new exposure."

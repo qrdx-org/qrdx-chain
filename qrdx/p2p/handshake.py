@@ -34,6 +34,7 @@ from typing import Optional, Tuple
 import blake3
 import oqs
 
+from ..crypto.pq.algorithms import KEM_ALGORITHM, SIG_ALGORITHM, require as require_pq_algorithms
 from ..logger import get_logger
 
 logger = get_logger(__name__)
@@ -45,29 +46,10 @@ NONCE_SIZE = 32  # 32 bytes of randomness per nonce
 HANDSHAKE_TIMEOUT_SEC = 5.0
 
 
-# Resolve algorithm names at import time (ML-DSA-65 preferred, Dilithium3 legacy)
-def _resolve_sig_algorithm() -> str:
-    for name in ("ML-DSA-65", "Dilithium3"):
-        try:
-            oqs.Signature(name)
-            return name
-        except Exception:
-            continue
-    raise RuntimeError("No supported PQ signature algorithm found in liboqs")
-
-
-def _resolve_kem_algorithm() -> str:
-    for name in ("ML-KEM-768", "Kyber768"):
-        try:
-            oqs.KeyEncapsulation(name)
-            return name
-        except Exception:
-            continue
-    raise RuntimeError("No supported PQ KEM algorithm found in liboqs")
-
-
-PQ_SIG_ALGORITHM = _resolve_sig_algorithm()
-PQ_KEM_ALGORITHM = _resolve_kem_algorithm()
+# ML-DSA-65 and ML-KEM-768 only; liboqs is proven to compute them (qrdx/crypto/pq/algorithms.py).
+PQ_SIG_ALGORITHM = SIG_ALGORITHM
+PQ_KEM_ALGORITHM = KEM_ALGORITHM
+require_pq_algorithms()
 
 
 class HandshakeStep(IntEnum):

@@ -24,7 +24,6 @@ from .amm import (
 from .block_processor import (
     BLOCK_EXCHANGE_TXS_KEY,
     apply_block_exchange_section,
-    build_oracle_update_tx,
     decode_exchange_txs,
     encode_exchange_txs,
     exchange_txs_canonical_bytes,
@@ -58,14 +57,6 @@ from .orderbook import (
     OrderType,
     SelfTradeAction,
     Trade,
-)
-from .perpetual import (
-    FundingSnapshot,
-    LiquidationResult,
-    PerpEngine,
-    PerpMarket,
-    PerpPosition,
-    PerpSide,
 )
 from .router import (
     FillResult,
@@ -101,13 +92,6 @@ __all__ = [
     "ConcentratedLiquidityPool",
     "PoolManager",
     "FeeTier",
-    # Perpetual
-    "PerpPosition",
-    "PerpSide",
-    "PerpMarket",
-    "FundingSnapshot",
-    "LiquidationResult",
-    "PerpEngine",
     # Router
     "FillResult",
     "FillSource",
@@ -131,7 +115,6 @@ __all__ = [
     "process_exchange_transactions",
     "validate_exchange_state_root",
     "extract_exchange_transactions",
-    "build_oracle_update_tx",
     "get_validator_fee_share",
     "verify_exchange_tx",
     "apply_block_exchange_section",

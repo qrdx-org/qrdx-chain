@@ -18,12 +18,12 @@ Nothing here lives only in a node's memory.
 | 5 | Order grid (`szDecimals`, 5 significant figures, minimum order value) | built | `Clearinghouse._check_grid` · `test_order_grid.py` |
 | 6 | Staking fee discounts | built | `Clearinghouse.stake_discount` · `test_stake_fee_discount.py` |
 | 7 | EVM ↔ exchange (HyperEVM read precompiles, CoreWriter) | built | `contracts/exchange_evm.py` · `test_evm_exchange.py` |
-| 8 | Deployer markets (HIP-3, builder-deployed perps) | built | `DEPLOYER_*`, `slash_deployer` · `test_deployer_markets.py` |
+| 8 | Where perp markets come from: genesis majors, governance listings (HIP-3's deployer markets: **not adopted**) | built | `PERP_GENESIS_MARKETS`, `list_market` · `test_perp_markets.py` |
 | 9 | Leverage per trade, per market (`updateLeverage` in the order ticket) | built | an order's `leverage` / `margin_mode` · `test_perps_listing_and_leverage.py` |
 | 10 | Perps settings no outside actor chooses | built | `list_market`, `PERP_MARKET_MAX_LEVERAGE` · `test_perps_listing_and_leverage.py` |
 | 11 | Unique tickers by Dutch auction (HIP-1's deploy auction) | built | `TICKER_CLAIM` · `test_tickers.py` |
 | 12 | Big blocks (HyperEVM's two block sizes) | built | `BIG_BLOCK_*`, `block_limits.evm_gas_limit_at` · `test_big_blocks.py` |
-| 13 | Perps on native tokens, priced off their own spot market | built | `list_market {spot_token, spot_pools}`, `update_spot_oracles` · `test_native_token_perps.py` |
+| 13 | Token perps: any on-chain token's perp, by its address, priced off its own spot market | built | `CREATE_MARKET {token}`, `spot_reading`, `update_spot_oracles` · `test_token_perps.py`, `test_token_perps_adversarial.py` |
 | — | Batch auctions (frequent batch auctions) | **skipped** | the decision of 2026-10-22 |
 
 A network needs a fresh genesis for the new operations and state. Every default below is a
@@ -31,10 +31,17 @@ chain-spec parameter or a module constant and **awaits review** before mainnet
 (docs/KNOWN_ISSUES.md, "Defaults awaiting review").
 
 Where this differs from Hyperliquid:
+- **A stop-market that finds nothing within 10 % waits.** On Hyperliquid it is cancelled. Here
+  the unfilled part waits and fires again at later ticks, so a stop the price gapped past still
+  executes once the market comes back (the user's choice, 2026-10-27;
+  docs/UNIFIED_SPOT_LIQUIDITY.md 5).
 - **Big blocks** run inline with the 250 ms slots, not on a clock of their own as HyperEVM's
   do. A big block's slowest possible work is about 1.8 s of execution (section 12).
-- **Deployer markets** are protected by a validator freeze that holds while two thirds of the
-  stake keeps voting for it. Hyperliquid relies on slashing alone.
+- **No deployer markets.** A HIP-3 deployer sets its own markets' oracle. Here no single key
+  prices any market: the validators' stake-weighted votes price the markets of off-chain
+  assets, and a token perp's own spot market prices it (sections 8 and 13). Deployer markets
+  were built and then removed (2026-10-26), as was `UPDATE_ORACLE`, a configured reporter's
+  price.
 
 ---
 
@@ -191,115 +198,38 @@ same reason). Only a plain CALL acts, as the calling contract. The precompiles t
 
 ---
 
-## 8. Deployer markets (HIP-3)
+## 8. Where perp markets come from
 
-A **deployer** bonds QRDX under a namespace of its own and lists perp markets there. It runs
-their oracle and takes a share of the protocol's fees on them. Validators can stop a deployer
-fast, and governance can slash its bond. Hyperliquid's builder-deployed perps work the same way.
+Three kinds of market, and no other way to make one:
 
-### Bond and namespace
+| Market | Made by | Priced by | Named |
+|---|---|---|---|
+| The genesis majors | the chain spec: `PERP_GENESIS_MARKETS`, made by the first block | the validators' votes | `BTC-USD-PERP` |
+| Any other off-chain asset | governance: `list_market {base_token, max_leverage?, sz_decimals?}` | the validators' votes | `AVAX-USD-PERP` |
+| An on-chain token | anyone: `CREATE_MARKET {token, liquidity, …}` (section 13) | its own spot market | `0x…-USD-PERP`, by the token's address |
 
-`DEPLOYER_BOND {dex, amount}`. The first bond names the namespace: 1 to 8 lowercase letters and
-digits, starting with a letter. It is first come, first served, and stays the deployer's for
-good.
+**The genesis majors** are Hyperliquid's settings for each (`BASE:MAX_LEVERAGE:SZ_DECIMALS`):
 
-The bond is real QRDX, held by the protocol holder `0xDBND…` (`deployer_bond_address`).
+| Market | Maximum leverage | Size decimals |
+|---|---|---|
+| BTC | 40 | 5 |
+| ETH | 25 | 4 |
+| SOL | 20 | 2 |
 
-`DEPLOYER_UNBOND {amount}` starts unbonding:
-- The amount is claimable `DEPLOYER_UNBOND_SECONDS` (14 days) after the latest start, with
-  `DEPLOYER_UNBOND {claim: true}`.
-- It stays slashable until then. The delay is longer than a governance proposal's voting period
-  plus its timelock, so a deployer cannot unbond ahead of a slash.
-- A deployer running markets keeps `DEPLOYER_MIN_BOND` (1,250 QRDX, ~$500,000) bonded.
+Every block path (the proposer, the importers, both rebuilds) runs the same block function, which
+makes any genesis market not yet there before the block's transactions. So a node rebuilding from
+genesis makes them where the network did. A market is never removed: a delisted one stays,
+settled, and is not made again. Their bases are reserved tickers (section 11), so no token can
+call itself BTC.
 
-### Listing
+**A validator-priced base** is an off-chain asset's symbol: a letter, then up to 15 letters and
+digits. It is never `QRDX` or an address: a perp on anything on chain is a token perp, and its
+price comes from the chain itself.
 
-`CREATE_MARKET {base_token: "dex:ASSET", oracle_price, fee_share_bps, liquidity, …}`. Only the
-namespace's deployer may list in it, and only with at least `DEPLOYER_MIN_BOND` bonded and fewer
-than `DEPLOYER_MAX_MARKETS` (10) live markets.
-- The market id is `dex:ASSET-USD-PERP`.
-- It starts at the deployer's `oracle_price`.
-- The deployer takes `fee_share_bps` of what the protocol keeps on the market's fees, at most
-  `DEPLOYER_MAX_FEE_SHARE_BPS` (50 %), paid to its margin account. The stakers' share comes
-  first; the backstop vault keeps the rest.
-- The listing fee, the seeded liquidity vault, the grid, leverage tiers, the price band, the
-  circuit breaker, the open-interest cap and the maximum leverage cap apply as on any market.
-
-### Its risk stays in it
-
-The deployer's oracle must reach no one outside its market:
-- **Isolated margin only.** An account's first order there makes its position isolated; a
-  cross margin mode is refused. A manipulated price can take at most the margin in that
-  position, never an account's cross collateral.
-- **No shared backstop.** The backstop vault is everyone's, so it never takes over a deployer
-  market's positions. A liquidation there closes on its book; what the book cannot absorb is
-  auto-deleveraged against that market's own counterparties.
-- **It never prices margin.** A deployer market's oracle values no one's portfolio-margin
-  collateral.
-- **No reporter override.** An authorized reporter's `UPDATE_ORACLE` cannot set it.
-- **No funding on a price no one stands behind.** While the market is frozen, or its oracle is
-  stale (`PERP_ORACLE_STALE_SECONDS` without an update), its funding premium is not sampled. A
-  deployer that walked off, or that the validators stopped, cannot keep moving funding at the
-  4 %/hour cap on the price it left. An interval of none pays the interest rate alone.
-
-What a malicious deployer can still do before the validators freeze it (and what bounds it):
-- walk its oracle 1 % a second to liquidate the side it is against. The circuit breaker, the
-  price band and isolation bound this: only that market's isolated positions are reached;
-- hold its oracle off the book to collect funding, at most 4 % an hour of open interest, paid by
-  the other side.
-
-Both are the case the bond and the freeze exist for, and `test_deployer_adversarial.py` plays
-them out block by block. The test confirms that no cross margin, no other market and no
-backstop vault is reached, and that the freeze stops the oracle and the funding. Governance then
-burns the whole bond and settles at the validators' price.
-
-A base containing `:` is reserved for deployers. This keeps their markets apart from
-validator-priced ones: a deployer cannot list a market that validators already vote on.
-
-### The deployer's oracle
-
-`DEPLOYER_SET_ORACLE {market_id, price}` sets the price at most once per block time. The price
-moves at most `DEPLOYER_ORACLE_MAX_STEP_BPS` (1 %) per second since the last update, counting at
-most 10 seconds. A price further away is applied at the bound.
-
-An agent key may sign it, so the deployer's oracle bot need not hold the main key. A contract
-may be the deployer, through the write precompile: an on-chain oracle aggregator, for example.
-
-Validators' price votes for a deployer market are skipped, not refused, while it is not frozen.
-
-### Settling
-
-`DEPLOYER_HALT {market_id}` settles the deployer's market for good at its oracle price, as a
-passed `delist_market` does. Every position closes and the result is zero-sum.
-
-### The validators' freeze
-
-An `ORACLE_VOTE` may carry `freeze: [market_id, …]`, at most 16 entries. Operators set it with
-`QRDX_ORACLE_FREEZE`.
-
-While fresh freeze votes hold more than two thirds of the committee's stake, the market is
-frozen. Frozen means:
-- it takes only reduce-only orders;
-- the deployer can neither set its oracle nor settle it;
-- **its oracle is the validators'**: their price votes apply as on any market.
-
-The freeze lasts until one vote window (`PERP_ORACLE_VOTE_MAX_AGE`) after the last block with a
-quorum. Stale votes, non-members' votes, and votes for settled markets are dropped.
-
-### Slashing
-
-The governance action `slash_deployer {deployer, bps, halt}` burns `bps` of the deployer's bond,
-including what is unbonding. With `halt`, it also settles every market the deployer runs at its
-oracle price, which is the validators' while frozen.
-
-The intended sequence is: freeze at once, then slash and settle by proposal.
-
-### State and API
-
-- **Committed:** `trading.deployers`, `trading.freeze_votes`, and each market's
-  `deployer`, `deployer_fee_share` and `frozen_until` (`header.dep`, `header.frozen`).
-- **RPC:** `perp_getDeployer(address | dex)`. `perp_getMarkets` shows each market's deployer,
-  fee share and freeze.
+**No one else prices a market.** The only operation that sets a validator-priced market's price
+is `ORACLE_VOTE`, aggregated by stake (a majority, at least `ORACLE_MIN_VOTERS`, at most
+`ORACLE_MAX_STEP_BPS` a second). Operations 11 (`UPDATE_ORACLE`) and 79–82 (the deployer
+markets') are retired: a transaction naming one does not decode.
 
 ---
 
@@ -340,15 +270,16 @@ Who may change what:
 | A validator-priced market's existence and settings (name, maximum leverage, grid) | governance: `list_market` |
 | A validator-priced market's oracle | the validators: a stake majority, at most `ORACLE_MAX_STEP_BPS` a second |
 | Delisting a validator-priced market | governance: `delist_market` |
-| A deployer market's oracle and settlement | its deployer, within bounds; the validators while they freeze it; governance by slashing |
+| A token perp's oracle | no one: its token's spot market, read the same by every node (section 13) |
+| Listing a token perp | anyone, once per token, while the token has a spot market deep enough |
 | Fee rates, margin tiers, funding caps, the price band, the circuit breaker | the protocol (chain-spec parameters and code): only a fork changes them, and governance approves it |
 
 What changed to make it so:
 - **Listing by governance.** Whoever listed a validator-priced market chose its maximum leverage
   and its grid, and took its name for good. Anyone could squat `ETH-USD-PERP` with settings that
   made it unusable or unsafe. The governance action `list_market {base_token, max_leverage,
-  sz_decimals}` lists them now. `CREATE_MARKET` lists only deployer markets (`dex:ASSET`),
-  unless the chain spec's `PERP_OPEN_LISTING` is on: a dev network's convenience, off by default.
+  sz_decimals}` lists them now, after the genesis majors (section 8). `CREATE_MARKET` lists
+  only token perps (section 13).
 - **A bounded maximum leverage.** A market's maintenance margin is half its initial margin at
   maximum leverage, and there was no upper bound: a 10,000× market would liquidate far too late,
   and the shared backstop would pay. `PERP_MARKET_MAX_LEVERAGE` (50) bounds it.
@@ -360,8 +291,8 @@ What changed to make it so:
 - **No reused order ids.** An order id already live in a market is refused. Ids are
   transaction hashes, so this needs a collision, but two live orders sharing an id would share
   metadata.
-- **A bounded reporter.** `UPDATE_ORACLE` by a configured reporter (none by default) walks at
-  the validators' step bound and cannot price a deployer market.
+- **No reporter.** `UPDATE_ORACLE`, a configured reporter's price, is retired: one key could
+  move every market it reported.
 - **Contracts act only as themselves** (section 7).
 
 ---
@@ -383,7 +314,8 @@ one token holds it, for good. Hyperliquid sells spot tickers in a gas auction (H
   | Then | falls linearly to `TICKER_MIN_PRICE` (25 QRDX, ~$10,000) over `TICKER_AUCTION_SECONDS` (31 h) |
 
   Every node prices it at the block's time.
-- **Reserved:** `QRDX`, the perps quote (`USD`) and every bridged asset's symbol. A bridged
+- **Reserved:** `QRDX`, the perps quote (`USD`), the genesis markets' bases (`BTC`, `ETH`,
+  `SOL`) and every bridged asset's symbol. A bridged
   token takes its own ticker when the bridge creates it, so the bridged USDC holds `USDC`.
 - **A ticker's token keeps its symbol.** Its metadata authority may rename it, but not change
   its symbol to another one: the ticker and the symbol always agree.
@@ -414,49 +346,73 @@ the larger ones did not fit any block before.
   full ordinary block does for 0.6 s. Its price makes doing that on purpose expensive within
   minutes. `BIG_BLOCK_INTERVAL` 0 turns big blocks off.
 
-## 13. Perps on native tokens
+## 13. Token perps
 
-A native token has no price outside this chain, so no validator votes one. Its perp market reads
-the token's own spot market instead.
+A perp on an on-chain token: a native token (one bridged in included) or QRDX itself. No
+validator votes its price, since it has no price outside this chain. The market reads the
+token's own spot market instead, and nothing else can move its oracle.
 
-**Listing.** Governance lists it with `list_market {base_token, spot_token, spot_pools,
-max_leverage?, sz_decimals?}`:
-- `spot_token` is a native token that holds `base_token` as its ticker (section 11), so the
-  market's name can be no one else's.
-- `spot_pools` are 1 or 2 AMM pools leading from the token to the settlement asset: the token's
-  QRDX pool, and with a stablecoin settlement, a QRDX/stablecoin pool after it. They are pinned
-  at listing, so no one can later route the oracle through a pool they made.
-- The maximum leverage is at most `PERP_SPOT_MAX_LEVERAGE` (10).
-- **QRDX itself** may be listed this way (`spot_token: "QRDX"`, listed as `QRDX`), priced off
-  its pool against a stablecoin settlement asset. When perps settle in QRDX, QRDX has no price
-  in itself and the listing is refused.
+**Listing.** Anyone lists one with `CREATE_MARKET {token, liquidity, max_leverage?,
+sz_decimals?, liquidity_profit_share?}`:
+- `token` is the token's **address** ("QRDX" for QRDX). A symbol is refused, since anyone can
+  deploy a token with any symbol. The market id is `<address>-USD-PERP`, and the market shows
+  the token's ticker if it holds one (section 11). No ticker is needed.
+- One market per token.
+- The token needs a spot market to read: a path of pools to the settlement asset, each with
+  `SPOT_ORACLE_TWAP_SECONDS` of price history, and `SPOT_ORACLE_MIN_DEPTH` of depth.
+- The maximum leverage is at most, and by default, `PERP_SPOT_MAX_LEVERAGE` (10).
+- As for any listing: the listing fee is burned, and `liquidity` seeds the market's liquidity
+  vault (docs/TRADING_FEATURES.md §14).
+- Not the settlement asset itself: settling in QRDX, QRDX has no price in itself.
+- A contract may list one through the write precompile (section 7).
+
+**The path.** No one chooses the pools, not even the lister. Each block, the market reads every
+path from the token to the settlement asset: a pool between the two, or two through QRDX. It
+takes the deepest path that has a price.
+- A new pool counts only once it has a TWAP's history.
+- Outweighing the others takes real capital, held near the price for as long as it should count.
+- So a perp listed while its token traded thinly follows the token to deeper pools. A squatter
+  cannot pin it to a pool of its own.
+
+The path last read is shown as `spot_pools`.
 
 **The oracle**, each block before the clearinghouse's tick (`update_spot_oracles`):
-- **Price:** the geometric-mean TWAP over `SPOT_ORACLE_TWAP_SECONDS` (600) along the pinned
-  pools, multiplied hop by hop into the settlement asset. Pools keep checkpoints of their tick
-  cumulatives 15 seconds apart, so the TWAP is exact over its span, and a swap cannot move it
-  within a block. It moves at most `ORACLE_MAX_STEP_BPS` a second, as the validators' does.
-- **Depth:** the smallest of the pools' virtual reserves on the way out, in the settlement
-  asset. It rises at most doubling every `SPOT_ORACLE_TWAP_SECONDS`, starting from
-  `SPOT_ORACLE_MIN_DEPTH`, and falls at once. Liquidity added for a moment, however much, raises
-  the depth by a sliver; only liquidity that stays raises it.
+- **Price:** the geometric-mean TWAP over `SPOT_ORACLE_TWAP_SECONDS` (600), multiplied hop by
+  hop into the settlement asset. Pools keep checkpoints of their tick cumulatives 15 seconds
+  apart, so the TWAP is exact over its span, and a swap cannot move it within a block. It moves
+  at most `ORACLE_MAX_STEP_BPS` a second, as the validators' does.
+- **Depth** is what moving each pool's price `SPOT_ORACLE_DEPTH_BAND_BPS` (2 %) up or down
+  takes (`ConcentratedLiquidityPool.band_depth`), by walking the liquidity in between. The
+  smaller side counts, valued in the settlement asset, and the path's least pool sets it.
+  - Liquidity concentrated at the price counts as the capital it actually holds within the band.
+    The pool's virtual reserves, the measure before, counted a narrow range as if it spread over
+    every price: over 20× its capital in the test.
+  - The market's depth rises at most doubling every `SPOT_ORACLE_TWAP_SECONDS` from
+    `SPOT_ORACLE_MIN_DEPTH`, and falls at once. Liquidity added for a moment raises it by a
+    sliver.
 - **No price without depth.** While the depth is under `SPOT_ORACLE_MIN_DEPTH` (10,000 of the
-  settlement asset), the oracle is not updated: it goes stale, and the market takes only
+  settlement asset), the oracle is not updated. It goes stale, and the market takes only
   reduce-only orders.
 
-**Open interest** is capped at the depth × `SPOT_OI_DEPTH_BPS` (1×), so moving the price that
-marks the positions costs about what the open interest could gain from the move. A large swap
-moves the pool at once but the oracle by a sliver: the test moves the pool 30 % and the oracle
-under 2 %.
+**Open interest** is capped at the depth × `SPOT_OI_DEPTH_BPS` (10×). Moving the TWAP 2 % for its
+window costs more than the depth, and gains 2 % of the open interest: at most 20 % of that
+cost. A large swap moves the pool at once but the oracle by a sliver: the test moves the pool
+30 % and the oracle under 2 %.
 
-**Contained,** as a deployer market is (section 8):
+**Contained:**
 - isolated margin only;
-- the shared backstop vault never takes it over;
+- the shared backstop vault never takes it over, so a loss the book cannot absorb is
+  auto-deleveraged inside the market;
 - it never prices anyone's margin;
-- validators' votes and reporters cannot price it;
-- no funding premium is sampled while its oracle is stale or the validators hold it frozen.
+- validators' votes for it are skipped;
+- no funding premium is sampled while its oracle is stale.
 
-The validators may freeze it like a deployer market.
+`test_token_perps_adversarial.py` plays the attacks out block by block:
+- the token's creator dumps it 30 %, and only that market's isolated positions are reached;
+- a push held for one block moves the oracle under 1 %;
+- a squatter's thin pool is replaced by a deeper one;
+- votes cannot price it.
 
-**State:** each market's `spot_token`, `spot_pools`, `spot_depth` and `spot_time` (`header.spot`),
-committed and provable.
+**State:** each market's `spot_token`, `spot_pools`, `spot_depth` and `spot_time`
+(`header.spot`), committed and provable. `perp_getMarkets` shows `oracle_source` (`validators`
+or `spot`), the token, its ticker, the path and the depth.

@@ -13,14 +13,12 @@ from decimal import Decimal
 
 import pytest
 
-from qrdx import constants
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransaction
 from qrdx.exchange import block_processor as BP
 from qrdx.exchange import views
 from qrdx.exchange.market_data import MAX_TRADES, MarketData
 from qrdx.exchange.tokens import NATIVE_ASSET
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
 
 D = Decimal
 LP, TRADER, MAKER, MAKER2 = ("0xPQ" + c * 64 for c in "abcd")
@@ -137,8 +135,9 @@ def test_spot_trades_are_recorded_at_commit_with_side_venue_and_tx(spot):
     m, tok, pid = spot
     market = f"{tok}:{NATIVE_ASSET}"
     m.begin_block(2, float(T0 + 70))
+    # (The pool sells at 2 plus its 0.3 % fee: an ask at 2 is the better price.)
     _run(m, MAKER, ExchangeOpType.PLACE_ORDER, pair=market, side="sell", order_type="limit",
-         price="2.5", amount="10")
+         price="2", amount="10")
     fill = _run(m, TRADER, ExchangeOpType.PLACE_ORDER, pair=f"qrdx:{tok}", side="buy",
                 order_type="limit", price="3", amount="4")
     swap = _run(m, TRADER, ExchangeOpType.SWAP, token_in=tok, token_out="QRDX", amount_in="5",
@@ -150,7 +149,7 @@ def test_spot_trades_are_recorded_at_commit_with_side_venue_and_tx(spot):
     trades = views.market_trades(m, f"QRDX/{tok}")["trades"]     # either order, "/" too
     clob, amm = trades
     assert (clob["venue"], clob["side"], clob["price"], clob["amount"], clob["quote_amount"]) == \
-        ("clob", "buy", "2.5", "4", "10.0")
+        ("clob", "buy", "2", "4", "8")
     assert (clob["maker"], clob["taker"], clob["block_height"], clob["block_time"]) == \
         (MAKER, TRADER, 2, float(T0 + 70))
     assert clob["tx_hash"] == m._block_exchange_txs[1].tx_hash()
@@ -205,7 +204,7 @@ def test_the_order_book_at_level_2_and_3(spot):
 def test_tickers_and_candles_by_symbol(spot):
     m, tok, _ = spot
     market = f"{tok}:{NATIVE_ASSET}"
-    for h, price in ((2, "2.5"), (3, "2.7")):
+    for h, price in ((2, "2.001"), (3, "2.003")):  # (inside the pool's fee band: the book)
         m.begin_block(h, float(T0 + 60 * h))
         _run(m, MAKER, ExchangeOpType.PLACE_ORDER, pair=market, side="sell", order_type="limit",
              price=price, amount="1")
@@ -213,23 +212,25 @@ def test_tickers_and_candles_by_symbol(spot):
              price=price, amount="1")
         m.commit_block()
     t = views.market_ticker(m, "TOK/QRDX")                           # a unique symbol resolves
-    assert t["market"] == market and t["last_price"] == "2.7" and t["trades_24h"] == 2
-    assert (t["open_24h"], t["high_24h"], t["low_24h"], t["change_24h"]) == ("2.5", "2.7", "2.5", "0.2")
+    assert t["market"] == market and t["last_price"] == "2.003" and t["trades_24h"] == 2
+    assert (t["open_24h"], t["high_24h"], t["low_24h"], t["change_24h"]) == \
+        ("2.001", "2.003", "2.001", "0.002")
     assert D(t["amm_price"]) == 2 and t["pools"] == 1 and t["has_order_book"]
     assert [x["market"] for x in views.market_tickers(m)] == [market]
     assert views.market_tickers(m, "perp") == []
     c = views.market_candles(m, market, "1m")["candles"]
-    assert [(x["time"], x["close"]) for x in c] == [(T0 + 120, "2.5"), (T0 + 180, "2.7")]
+    assert [(x["time"], x["close"]) for x in c] == [(T0 + 120, "2.001"), (T0 + 180, "2.003")]
 
 
 def test_a_taker_selling_into_a_bid(spot):
     m, tok, _ = spot
     market = f"{tok}:{NATIVE_ASSET}"
     m.begin_block(2, float(T0 + 90))
+    # (The pool buys at 2 less its 0.3 % fee: a bid at 2 is the better price.)
     _run(m, MAKER, ExchangeOpType.PLACE_ORDER, pair=market, side="buy", order_type="limit",
-         price="1.9", amount="3")
+         price="2", amount="3")
     _run(m, TRADER, ExchangeOpType.PLACE_ORDER, pair=market, side="sell", order_type="limit",
-         price="1.9", amount="2")
+         price="2", amount="2")
     m.commit_block()
     (trade,) = views.market_trades(m, market)["trades"]
     assert (trade["side"], trade["maker"], trade["taker"]) == ("sell", MAKER, TRADER)
@@ -237,10 +238,9 @@ def test_a_taker_selling_into_a_bid(spot):
 
 # ── perps feed the same store ──────────────────────────────────────────────
 
-def test_perps_fills_are_market_trades(monkeypatch):
-    from test_perps_api import BTC, Key, _block, _market, _order
-    rep = Key()
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (rep.addr,))
+def test_perps_fills_are_market_trades(genesis_btc):
+    from test_perps_api import BTC, Key, Voter, _block, _market, _order
+    rep = Voter()
     ExchangeStateManager.reset_instance()
     mgr = ExchangeStateManager.get_instance()
     try:
@@ -269,13 +269,13 @@ async def test_market_rpc_module(spot):
     market = f"{tok}:{NATIVE_ASSET}"
     m.begin_block(2, float(T0 + 70))
     _run(m, MAKER, ExchangeOpType.PLACE_ORDER, pair=market, side="sell", order_type="limit",
-         price="2.5", amount="2")
+         price="2.001", amount="2")
     _run(m, TRADER, ExchangeOpType.PLACE_ORDER, pair=market, side="buy", order_type="limit",
-         price="2.5", amount="1")
+         price="2.001", amount="1")
     m.commit_block()
     rpc = MarketModule()
     assert [t["market"] for t in await rpc.getMarkets()] == [market]
-    assert (await rpc.getTicker(f"QRDX:{tok}"))["last_price"] == "2.5"
+    assert (await rpc.getTicker(f"QRDX:{tok}"))["last_price"] == "2.001"
     assert (await rpc.getOrderBook(market, 10, 3))["asks"][0]["orders"][0]["owner"] == MAKER
     assert len((await rpc.getTrades(market))["trades"]) == 1
     assert (await rpc.getCandles(market, "1h"))["candles"][0]["volume"] == "1"
@@ -302,16 +302,16 @@ def test_orderbook_trades_and_tickers_stream(spot):
 
     m.begin_block(2, float(T0 + 70))
     _run(m, MAKER, ExchangeOpType.PLACE_ORDER, pair=market, side="sell", order_type="limit",
-         price="2.5", amount="2")
+         price="2.001", amount="2")
     _run(m, TRADER, ExchangeOpType.PLACE_ORDER, pair=market, side="buy", order_type="limit",
-         price="2.5", amount="1")
+         price="2.001", amount="1")
     m.commit_block()
     pub.step(m)
     events = [q.get_nowait() for _ in range(q.qsize())]
     by_type = {e["type"]: e for e in events}
-    assert by_type["trade"]["key"] == market and by_type["trade"]["trade"]["price"] == "2.5"
+    assert by_type["trade"]["key"] == market and by_type["trade"]["trade"]["price"] == "2.001"
     assert by_type["orderbook"]["book"]["asks"][0]["amount"] == "1"
-    assert by_type["ticker"]["ticker"]["last_price"] == "2.5"
+    assert by_type["ticker"]["ticker"]["last_price"] == "2.001"
     pub.step(m)                                    # nothing changed: nothing sent
     assert q.qsize() == 0
 

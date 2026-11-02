@@ -3,7 +3,7 @@ EVM transaction mempool — admission gate for account-model (eth) transactions.
 
 This is the EVM/account analog of ``qrdx.exchange.mempool.ExchangeMempool`` and
 the first step (E-D1) of giving the account domain the same consensus integration
-the exchange domain received (see docs/EVM_STATE_CONSENSUS_INTEGRATION.md §6).
+the exchange domain received (see docs/archive/EVM_STATE_CONSENSUS_INTEGRATION.md §6).
 
 Admission decides which signed EVM transactions are *eligible* to enter a block.
 It does NOT execute them or include them in blocks (E-D2/E-D3) — keeping it
@@ -38,6 +38,13 @@ _LEGACY_BASE_GAS = 21_000
 _LEGACY_CREATE_GAS = 32_000
 _GAS_TXDATA_ZERO = 4
 _GAS_TXDATA_NONZERO = 16
+# EIP-2930 access lists: what each pre-warmed address and storage key costs up front.
+_ACCESS_LIST_ADDRESS_GAS = 2_400
+_ACCESS_LIST_STORAGE_KEY_GAS = 1_900
+# Typed transactions (EIP-2718) wallets send: EIP-2930 (access lists) and EIP-1559 (fee caps).
+ACCESS_LIST_TX_TYPE = 0x01
+DYNAMIC_FEE_TX_TYPE = 0x02
+_SECP256K1_HALF_N = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
 
 
 def intrinsic_gas_legacy(data: bytes, is_create: bool = False) -> int:
@@ -53,6 +60,27 @@ def intrinsic_gas_legacy(data: bytes, is_create: bool = False) -> int:
     for byte in data or b"":
         gas += _GAS_TXDATA_ZERO if byte == 0 else _GAS_TXDATA_NONZERO
     return gas
+
+
+def _ecdsa_signer_allowed(raw_tx_hex: str) -> Tuple[bool, str]:
+    """Whether an ECDSA-signed transaction's signer may still sign: its account has not turned
+    its own key off, and the Doomsday Protocol has not turned every ECDSA key off. A transaction
+    whose signer cannot be recovered is the parser's to refuse."""
+    from ..exchange.state_manager import ExchangeStateManager
+
+    try:
+        sender = parse_eth_raw_tx(raw_tx_hex)["sender"]
+    except ValueError:
+        return True, ""
+    mgr = ExchangeStateManager.get_instance()
+    if mgr.doomsday_cutoff() is not None:
+        return False, (
+            "the Doomsday Protocol has turned ECDSA keys off: sign with the account's "
+            "post-quantum controller (docs/QUANTUM_MIGRATION.md)"
+        )
+    if not mgr.authority.own_key_enabled(sender):
+        return False, f"{sender}'s ECDSA key is turned off by its account policy"
+    return True, ""
 
 
 async def verify_delegated_spend(
@@ -92,7 +120,10 @@ async def verify_delegated_spend(
     except Exception:
         return True, ""  # malformed hex is the parser's business, not ours
     if not raw or raw[0] != PQ_TX_TYPE:
-        return True, ""  # legacy envelope cannot delegate (nor carry a policy: PQ-only)
+        # An ECDSA envelope cannot delegate. Its signer's account may still have turned its own
+        # key off (quantum migration, docs/QUANTUM_MIGRATION.md), or the Doomsday Protocol may
+        # have turned every ECDSA key off: then it signs nothing.
+        return _ecdsa_signer_allowed(raw_tx_hex)
 
     try:
         tx = decode_pq_tx(raw)
@@ -268,15 +299,20 @@ def parse_eth_raw_tx(raw_tx_hex: str) -> Dict[str, Any]:
     """
     Decode a signed transaction and establish its sender.
 
-    Handles two envelopes, both of which end up with a 20-byte sender:
+    Handles these envelopes, all of which end up with a 20-byte sender:
 
       * **legacy / EIP-155** — sender recovered from ``(v, r, s)``.
+      * **type 0x01 (EIP-2930) and 0x02 (EIP-1559)** — what wallets send by default; sender
+        recovered from ``(y_parity, r, s)`` over the typed signing hash
+        (see ``_parse_typed_eth_tx``).
       * **type 0x51 (PQ)** — sender derived from an embedded ML-DSA-65 public key,
         signature verified here (see ``_parse_pq_raw_tx``).
 
     Returns a dict: ``sender`` (0x-hex), ``nonce``, ``to`` (0x-hex or None),
     ``value`` (wei int), ``data`` (bytes), ``gas``, ``gas_price``, ``chain_id``,
-    ``tx_hash`` (0x-hex, keccak of the raw bytes), and ``tx_type``.
+    ``tx_hash`` (0x-hex, keccak of the raw bytes), and ``tx_type``. For a type-0x02
+    transaction ``gas_price`` is its fee cap (``max_fee_per_gas``), the most it can pay: what
+    the base-fee floor is judged against. What it does pay is ``effective_gas_price``.
 
     Raises ValueError on malformed input, an unsupported transaction type, or a
     signature that cannot be recovered / verified.
@@ -298,10 +334,12 @@ def parse_eth_raw_tx(raw_tx_hex: str) -> Dict[str, Any]:
     # Typed transactions (EIP-2718) start with a type byte < 0x80.
     if raw_tx[0] == PQ_TX_TYPE:
         return _parse_pq_raw_tx(raw_tx)
+    if raw_tx[0] in (ACCESS_LIST_TX_TYPE, DYNAMIC_FEE_TX_TYPE):
+        return _parse_typed_eth_tx(raw_tx)
     if raw_tx[0] < 0x80:
         raise ValueError(
-            f"unsupported typed transaction 0x{raw_tx[0]:02x} "
-            f"(supported: legacy/EIP-155, 0x{PQ_TX_TYPE:02x} post-quantum)"
+            f"unsupported typed transaction 0x{raw_tx[0]:02x} (supported: legacy/EIP-155, "
+            f"0x01 EIP-2930, 0x02 EIP-1559, 0x{PQ_TX_TYPE:02x} post-quantum)"
         )
 
     try:
@@ -365,6 +403,145 @@ def parse_eth_raw_tx(raw_tx_hex: str) -> Dict[str, Any]:
         "spend_from": encode_hex(sender),
         "intrinsic_gas": intrinsic_gas_legacy(data, is_create=not to_bytes),
     }
+
+
+def _canonical_int(field: Any, name: str) -> int:
+    """An RLP integer in its one valid encoding: big-endian, no leading zero bytes."""
+    if not isinstance(field, bytes):
+        raise ValueError(f"{name} is not an integer")
+    if field[:1] == b"\x00":
+        raise ValueError(f"{name} has a leading zero byte (non-canonical encoding)")
+    if len(field) > 32:
+        raise ValueError(f"{name} does not fit in 256 bits")
+    return int.from_bytes(field, "big") if field else 0
+
+
+def _access_list(field: Any) -> List[Tuple[bytes, List[bytes]]]:
+    """An EIP-2930 access list: [[address (20 bytes), [storage key (32 bytes), ...]], ...]."""
+    if not isinstance(field, list):
+        raise ValueError("access list is not a list")
+    entries: List[Tuple[bytes, List[bytes]]] = []
+    for entry in field:
+        if not (isinstance(entry, list) and len(entry) == 2):
+            raise ValueError("access list entry is not [address, storage keys]")
+        address, keys = entry
+        if not (isinstance(address, bytes) and len(address) == 20):
+            raise ValueError("access list address is not 20 bytes")
+        if not isinstance(keys, list) or not all(
+            isinstance(k, bytes) and len(k) == 32 for k in keys
+        ):
+            raise ValueError("access list storage keys are not 32 bytes each")
+        entries.append((address, list(keys)))
+    return entries
+
+
+def access_list_gas(access_list: List[Tuple[bytes, List[bytes]]]) -> int:
+    """What an EIP-2930 access list costs up front."""
+    return sum(
+        _ACCESS_LIST_ADDRESS_GAS + _ACCESS_LIST_STORAGE_KEY_GAS * len(keys)
+        for _address, keys in access_list
+    )
+
+
+def _parse_typed_eth_tx(raw_tx: bytes) -> Dict[str, Any]:
+    """Decode and authenticate an EIP-2930 (0x01) or EIP-1559 (0x02) transaction.
+
+    0x01: ``0x01 || rlp([chain_id, nonce, gas_price, gas, to, value, data, access_list,
+    y_parity, r, s])``; 0x02: ``0x02 || rlp([chain_id, nonce, max_priority_fee_per_gas,
+    max_fee_per_gas, gas, to, value, data, access_list, y_parity, r, s])``. The signature is
+    over ``keccak(type || rlp(the fields before y_parity))``. Every integer must be in its
+    canonical encoding and ``s`` in the lower half of the curve order (EIP-2), so one
+    transaction has exactly one valid encoding and one hash.
+    """
+    import rlp
+    from eth_hash.auto import keccak
+    from eth_keys import keys
+    from eth_utils import encode_hex
+
+    tx_type = raw_tx[0]
+    try:
+        fields = rlp.decode(raw_tx[1:])
+    except Exception as e:
+        raise ValueError(f"malformed RLP: {e}") from e
+    want = 11 if tx_type == ACCESS_LIST_TX_TYPE else 12
+    if not isinstance(fields, list) or len(fields) != want:
+        raise ValueError(f"expected {want} RLP fields for a type-0x{tx_type:02x} transaction")
+
+    chain_id = _canonical_int(fields[0], "chain id")
+    nonce = _canonical_int(fields[1], "nonce")
+    if tx_type == ACCESS_LIST_TX_TYPE:
+        gas_price = _canonical_int(fields[2], "gas price")
+        max_priority = max_fee = gas_price
+        rest = fields[3:]
+    else:
+        max_priority = _canonical_int(fields[2], "max priority fee per gas")
+        max_fee = _canonical_int(fields[3], "max fee per gas")
+        if max_priority > max_fee:
+            raise ValueError(
+                f"max priority fee per gas {max_priority} exceeds max fee per gas {max_fee}"
+            )
+        gas_price = max_fee
+        rest = fields[4:]
+    gas = _canonical_int(rest[0], "gas")
+    to_bytes = rest[1]
+    if not isinstance(to_bytes, bytes) or len(to_bytes) not in (0, 20):
+        raise ValueError("to is neither empty nor a 20-byte address")
+    value = _canonical_int(rest[2], "value")
+    data = rest[3]
+    if not isinstance(data, bytes):
+        raise ValueError("data is not a byte string")
+    access_list = _access_list(rest[4])
+    y_parity = _canonical_int(rest[5], "y parity")
+    r_int = _canonical_int(rest[6], "r")
+    s_int = _canonical_int(rest[7], "s")
+    if y_parity not in (0, 1):
+        raise ValueError(f"invalid y parity {y_parity}")
+    if r_int == 0 or s_int == 0:
+        raise ValueError("missing signature (r/s zero)")
+    if s_int > _SECP256K1_HALF_N:
+        raise ValueError("signature s is in the upper half of the curve order (EIP-2)")
+    _require_chain_id(chain_id)
+
+    signed = len(fields) - 3
+    message_hash = keccak(bytes([tx_type]) + rlp.encode(fields[:signed]))
+    try:
+        sig = keys.Signature(
+            r_int.to_bytes(32, "big") + s_int.to_bytes(32, "big") + bytes([y_parity])
+        )
+        sender = sig.recover_public_key_from_msg_hash(message_hash).to_canonical_address()
+    except Exception as e:
+        raise ValueError(f"signature recovery failed: {e}") from e
+
+    return {
+        "sender": encode_hex(sender),
+        "nonce": nonce,
+        "to": encode_hex(to_bytes) if to_bytes else None,
+        "value": value,
+        "data": data,
+        "gas": gas,
+        "gas_price": gas_price,
+        "max_fee_per_gas": max_fee,
+        "max_priority_fee_per_gas": max_priority,
+        "access_list": access_list,
+        "chain_id": chain_id,
+        "tx_hash": encode_hex(keccak(raw_tx)),
+        "tx_type": tx_type,
+        "spend_from": encode_hex(sender),
+        "intrinsic_gas": intrinsic_gas_legacy(data, is_create=not to_bytes)
+        + access_list_gas(access_list),
+    }
+
+
+def effective_gas_price(parsed: Dict[str, Any], base_fee: int) -> int:
+    """What a transaction pays per unit of gas in a block with ``base_fee``: an EIP-1559
+    transaction ``min(max_fee_per_gas, base_fee + max_priority_fee_per_gas)``, every other one
+    its gas price. (All of it is burned: QRDX pays proposers no tips.)"""
+    if int(parsed.get("tx_type") or 0) == DYNAMIC_FEE_TX_TYPE:
+        return min(
+            int(parsed["max_fee_per_gas"]),
+            int(base_fee) + int(parsed["max_priority_fee_per_gas"]),
+        )
+    return int(parsed["gas_price"])
 
 
 def _default_nonce_provider(address: str) -> int:

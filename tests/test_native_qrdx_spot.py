@@ -119,16 +119,17 @@ def test_an_order_book_quoted_in_qrdx(mgr):
     tok, _, _, escrow = _setup(mgr)
     mgr.set_available_token_balance(MAKER, tok, D(500))
     pair = f"QRDX:{tok}"                                         # either order, any casing
+    # (At 2 the bid beats the pool, which buys at 2 less its 0.3 % fee.)
     r = _run(mgr, TRADER, ExchangeOpType.PLACE_ORDER, pair=pair, side="buy",
-             order_type="limit", price="1.5", amount="40")
+             order_type="limit", price="2", amount="40")
     assert r.success, r.error
-    assert _qrdx(mgr, escrow) == D(60)                           # 40 × 1.5 QRDX escrowed
+    assert _qrdx(mgr, escrow) == D(80)                           # 40 × 2 QRDX escrowed
     r = _run(mgr, MAKER, ExchangeOpType.PLACE_ORDER, pair=pair, side="sell",
-             order_type="limit", price="1.5", amount="10")
-    assert r.success, r.error                                    # fills 10 at 1.5
+             order_type="limit", price="2", amount="10")
+    assert r.success, r.error                                    # fills 10 at 2
     assert mgr.token_balance_deltas()[(TRADER, tok)] == D(10)
-    assert _qrdx(mgr, MAKER) == D(15) - r.fee                    # the sale's proceeds …
-    assert _qrdx(mgr, escrow) == D(45)                           # … came out of the escrow
+    assert _qrdx(mgr, MAKER) == D(20) - r.fee                    # the sale's proceeds …
+    assert _qrdx(mgr, escrow) == D(60)                           # … came out of the escrow
     book = mgr._order_books[f"{tok}:{NATIVE_ASSET}"]
     oid = next(iter(book._orders))
     assert _run(mgr, TRADER, ExchangeOpType.CANCEL_ORDER, pair=pair, order_id=oid).success

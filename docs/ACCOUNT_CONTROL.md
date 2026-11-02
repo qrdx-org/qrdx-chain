@@ -67,7 +67,10 @@ policy. At most 10 changes wait per account.
 **Exchange.** A transaction with `sender` the account and `signer` a controller — signed by the
 controller's key or multisig — may be any operation (withdrawals included). Its nonce comes from
 the `sender|signer` lane (`exchange_getNonce(address, signer)`); the account pays its gas. A
-transaction refused for authority consumes nothing.
+transaction refused for authority consumes nothing, and a block may not carry it
+(`exchange_inclusion`). One exception: a signer whose authority an earlier transaction in the
+same block took away. Its transaction was valid when the block began, so it runs as a failure,
+paying for its gas and consuming its lane's nonce.
 
 **EVM.** A type-0x51 transaction signed by a controller with `on_behalf_of` the account runs **as
 the account**: value leaves it, and contracts see it as `msg.sender` (`tx.origin` is the

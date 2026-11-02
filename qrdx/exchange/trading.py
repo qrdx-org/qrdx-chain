@@ -43,6 +43,9 @@ SPOT_TRIGGER_MAX_MAKERS = 100
 SPOT_TRIGGERS_PER_ACCOUNT = 50  # in each pair
 SPOT_TRIGGER_FIRES_PER_BLOCK = 64
 SPOT_TRIGGER_MAKERS_PER_BLOCK = 1000
+# Resting spot orders a pool's new liquidity crossed, filled from the pools at a block's tick
+# (docs/UNIFIED_SPOT_LIQUIDITY.md 4); the rest wait for the next block.
+SPOT_UNCROSS_ORDERS_PER_BLOCK = 32
 
 
 # TWAP orders: a size worked into the market in equal slices over a duration, each slice an
@@ -118,22 +121,6 @@ def _encode_evm_action(_key: str, v: Tuple[str, str, str, int]) -> Any:
     return list(v)
 
 
-@dataclass(frozen=True)
-class Deployer:
-    """A market deployer (docs/HYPERLIQUID_PARITY.md): its namespace, the QRDX it has bonded,
-    what it is unbonding and the block time that becomes claimable. Kept when emptied: a
-    namespace is its deployer's for good (a market named in it stays its, settled or not)."""
-
-    dex: str
-    bond: Decimal
-    unbonding: Decimal = Decimal(0)
-    unlock: Decimal = Decimal(0)
-
-
-def _encode_deployer(_address: str, d: Deployer) -> Any:
-    return [d.dex, str(d.bond), str(d.unbonding), str(d.unlock)]
-
-
 def _encode_sale(_key: str, sale: Tuple[Decimal, Decimal]) -> Any:
     return [str(sale[0]), str(sale[1])]
 
@@ -187,6 +174,13 @@ class SpotTrigger:
     tp_price: Decimal = ZERO  # an oco's take-profit leg
     tp_limit: Decimal = ZERO
     parent: str = ""
+    # The leg ("sl" / "tp") a trade reached since it was placed — even within a block, even if
+    # the price went back (docs/UNIFIED_SPOT_LIQUIDITY.md 5): it fires at the next tick it can.
+    reached: str = ""
+    # A market trigger that fired but could not fill whole within its band: the rest waits and
+    # fires again at each tick the pair's price is back within it (docs/UNIFIED_SPOT_LIQUIDITY.md
+    # 5) — a stop never disappears unfilled.
+    waiting: bool = False
 
     def legs(self) -> List[Tuple[str, Decimal, Decimal]]:
         """(kind, trigger price, limit price) of each leg: the stop's first."""
@@ -231,19 +225,24 @@ class SpotTrigger:
 
 
 def _encode_spot_trigger(_tid: str, t: SpotTrigger) -> Any:
-    return [
-        t.owner,
-        t.pair,
-        t.side,
-        t.kind,
-        str(t.trigger_price),
-        str(t.amount),
-        str(t.limit_price),
-        t.tif,
-        t.max_makers,
-        str(t.escrowed),
-        t.seq,
-    ] + ([str(t.tp_price), str(t.tp_limit), t.parent] if t.kind == "oco" or t.parent else [])
+    return (
+        [
+            t.owner,
+            t.pair,
+            t.side,
+            t.kind,
+            str(t.trigger_price),
+            str(t.amount),
+            str(t.limit_price),
+            t.tif,
+            t.max_makers,
+            str(t.escrowed),
+            t.seq,
+        ]
+        + ([str(t.tp_price), str(t.tp_limit), t.parent] if t.kind == "oco" or t.parent else [])
+        + ([t.reached] if t.reached else [])
+        + (["waiting"] if t.waiting else [])
+    )
 
 
 @dataclass(frozen=True)
@@ -319,16 +318,15 @@ class TradingState:
     # "height:index" → (contract, operation, params JSON, exchange gas limit): exchange actions
     # EVM contracts sent, waiting for the start of the next block
     evm_actions = committed("tr.evm_actions", _encode_evm_action, mutable=False)
-    # deployer address → Deployer (DEPLOYER_BOND)
-    deployers = committed("tr.deployers", _encode_deployer, mutable=False)
-    # "market|validator" → block time of its vote to freeze that deployer market (ORACLE_VOTE)
-    freeze_votes = committed("tr.freeze_votes", encode_value, mutable=False)
     # TICKER → the token it names (TICKER_CLAIM, and the bridge's own); "last" → (price, block
     # time) of the ticker auction's last sale
     tickers = committed("tr.tickers", encode_value, mutable=False)
     ticker_auction = committed("tr.ticker_auction", _encode_sale, mutable=False)
     # account → (free trading actions it has used, block time of its last free one)
     action_budgets = committed("tr.action_budgets", _encode_budget, mutable=False)
+    # spot pair → 1: its resting orders a pool's price may be past, filled from the pools at the
+    # next tick (docs/UNIFIED_SPOT_LIQUIDITY.md 4) — kept until the tick gets through them
+    uncross = committed("tr.uncross", encode_value, mutable=False)
 
     def __init__(self) -> None:
         self.spot_triggers = {}  # id → SpotTrigger
@@ -340,11 +338,10 @@ class TradingState:
         self.cancel_at = {}  # account → (time, day, fired that day): SCHEDULE_CANCEL
         self.builder_approvals = {}  # "account|builder" → max fee rate (APPROVE_BUILDER_FEE)
         self.evm_actions = {}  # queued exchange actions of EVM contracts
-        self.deployers = {}  # market deployers and their bonds
-        self.freeze_votes = {}  # validators' votes to freeze deployer markets
         self.tickers = {}  # unique tickers of native tokens
         self.ticker_auction = {}  # the ticker auction's last sale
         self.action_budgets = {}  # free trading actions used (docs/TOKENOMICS.md)
+        self.uncross = {}  # spot pairs whose crossed resting orders the tick fills
         self.seq = 0  # trigger and TWAP orders placed so far
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
@@ -357,14 +354,13 @@ class TradingState:
             self.builder_approvals = {}
         if "evm_actions" not in state:  # (pickled before EVM actions)
             self.evm_actions = {}
-        if "deployers" not in state:  # (pickled before deployer markets)
-            self.deployers = {}
-            self.freeze_votes = {}
         if "tickers" not in state:  # (pickled before the ticker auction)
             self.tickers = {}
             self.ticker_auction = {}
         if "action_budgets" not in state:  # (pickled before free trading)
             self.action_budgets = {}
+        if "uncross" not in state:  # (pickled before unified spot liquidity)
+            self.uncross = {}
 
     # ── scheduled cancels ───────────────────────────────────────────────
 
@@ -486,7 +482,15 @@ class TradingState:
         triggers = tracked(self.spot_triggers)
         index = self.__dict__.get("_spot_index")
         if index is None or triggers.__dict__.get("_index_token") is not index["token"]:
-            index = {"token": [], "owned": {}, "keys": {}, "above": {}, "below": {}, "parents": {}}
+            index = {
+                "token": [],
+                "owned": {},
+                "keys": {},
+                "above": {},
+                "below": {},
+                "parents": {},
+                "reached": {},
+            }
             triggers.track_changes()
             triggers.take_changes()
             triggers.__dict__["_index_token"] = index["token"]
@@ -504,6 +508,7 @@ class TradingState:
                     if i < len(lst) and lst[i] == key:
                         del lst[i]
                 index["owned"][(owner, pair)].discard(tid)
+                index["reached"].get(pair, set()).discard(tid)
                 if parent and index["parents"].get(parent) == tid:
                     del index["parents"][parent]
             t = triggers.peek(tid)
@@ -516,6 +521,8 @@ class TradingState:
                     entries.append((above, key))
                 index["keys"][tid] = (t.owner, t.pair, t.parent, entries)
                 index["owned"].setdefault((t.owner, t.pair), set()).add(tid)
+                if t.reached:
+                    index["reached"].setdefault(t.pair, set()).add(tid)
                 if t.parent:
                     index["parents"][t.parent] = tid
         return index
@@ -526,6 +533,19 @@ class TradingState:
 
     def owned(self, owner: str, pair: str) -> List[str]:
         return sorted(self.spot_index()["owned"].get((owner, pair), ()))
+
+    def trigger_pairs(self) -> List[str]:
+        """The pairs that hold spot triggers, sorted."""
+        index = self.spot_index()
+        return sorted(
+            {p for p, entries in index["above"].items() if entries}
+            | {p for p, entries in index["below"].items() if entries}
+            | {p for p, ids in index["reached"].items() if ids}
+        )
+
+    def reached(self, pair: str) -> List[str]:
+        """The pair's triggers a trade has reached, not yet fired."""
+        return sorted(self.spot_index()["reached"].get(pair, ()))
 
     def crossed(self, pair: str, price: Decimal) -> List[str]:
         index = self.spot_index()
@@ -549,11 +569,10 @@ class TradingState:
                 self.cancel_at,
                 self.builder_approvals,
                 self.evm_actions,
-                self.deployers,
-                self.freeze_votes,
                 self.tickers,
                 self.ticker_auction,
                 self.action_budgets,
+                self.uncross,
             )
         )
 
@@ -575,16 +594,14 @@ class TradingState:
             sec.raw(self.builder_approvals.commitment())
         if len(self.evm_actions):  # (absent while no contract's action waits)
             sec.raw(self.evm_actions.commitment())
-        if len(self.deployers):  # (absent until the first deployer bonds)
-            sec.raw(self.deployers.commitment())
-        if len(self.freeze_votes):  # (absent while no freeze vote is live)
-            sec.raw(self.freeze_votes.commitment())
         if len(self.tickers):  # (absent until the first ticker)
             sec.raw(self.tickers.commitment())
         if len(self.ticker_auction):  # (absent until the first ticker sale)
             sec.raw(self.ticker_auction.commitment())
         if len(self.action_budgets):  # (absent until the first free trading action)
             sec.raw(self.action_budgets.commitment())
+        if len(self.uncross):  # (absent while no pair waits for the tick)
+            sec.raw(self.uncross.commitment())
         return sec.digest()
 
     def state_hash(self) -> bytes:
@@ -636,21 +653,6 @@ class TradingState:
                     else {}
                 ),
                 **(
-                    {
-                        "deployers": {
-                            k: _encode_deployer(k, v)
-                            for k, v in sorted(self.deployers.peek_items())
-                        }
-                    }
-                    if len(self.deployers)
-                    else {}
-                ),
-                **(
-                    {"freeze_votes": {k: str(v) for k, v in sorted(self.freeze_votes.peek_items())}}
-                    if len(self.freeze_votes)
-                    else {}
-                ),
-                **(
                     {"tickers": dict(sorted(self.tickers.peek_items()))}
                     if len(self.tickers)
                     else {}
@@ -674,6 +676,11 @@ class TradingState:
                     if len(self.action_budgets)
                     else {}
                 ),
+                **(
+                    {"uncross": dict(sorted(self.uncross.peek_items()))}
+                    if len(self.uncross)
+                    else {}
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -690,8 +697,7 @@ class TradingState:
         self.cancel_at.verify()
         self.builder_approvals.verify()
         self.evm_actions.verify()
-        self.deployers.verify()
-        self.freeze_votes.verify()
         self.tickers.verify()
         self.ticker_auction.verify()
         self.action_budgets.verify()
+        self.uncross.verify()

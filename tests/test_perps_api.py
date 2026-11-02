@@ -23,7 +23,7 @@ from qrdx.exchange import block_processor as BP
 from qrdx.exchange import views
 from qrdx.exchange.submission import ExchangeSubmitter, parse_exchange_tx, signing_payload
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+pytestmark = pytest.mark.usefixtures("genesis_btc")  # BTC from the first block
 
 D = Decimal
 BTC = "BTC-QRDX-PERP"            # the test session quotes perps in QRDX (tests/conftest.py)
@@ -47,10 +47,24 @@ class Key:
         return t
 
 
+class Voter(Key):
+    """The one genesis validator: it votes BTC's price (ORACLE_VOTE, its own sequence)."""
+
+    def __init__(self):
+        super().__init__()
+        self.seq = 0
+        self.genesis = json.dumps({"type": "genesis", "validators": 1,
+                                   "validator_set": [{"address": self.addr, "stake": "1000"}]})
+
+    def vote(self, price):
+        self.seq += 1
+        return self.tx(ExchangeOpType.ORACLE_VOTE, {"prices": {"BTC": str(price)}},
+                       nonce=self.seq)
+
+
 @pytest.fixture
 def ex(monkeypatch):
-    rep = Key()
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (rep.addr,))
+    rep = Voter()
     ExchangeStateManager.reset_instance()
     mgr = ExchangeStateManager.get_instance()
     yield mgr, rep
@@ -65,8 +79,10 @@ def _block(mgr, height, txs, ts=None):
 
 
 def _market(mgr, rep, *traders, price="30000", deposit="100000"):
-    _block(mgr, 1, [rep.tx(ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"}),
-                    rep.tx(ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": price})]
+    """Block 1: BTC (a genesis market), ``rep``'s vote pricing it — applied at the block's
+    tick — and the traders' deposits."""
+    mgr.load_oracle_committee(rep.genesis)
+    _block(mgr, 1, [rep.vote(price)]
            + [t.tx(ExchangeOpType.PERP_DEPOSIT, {"amount": deposit}) for t in traders])
 
 
@@ -124,7 +140,7 @@ def test_liquidations_and_funding_are_journaled(ex, monkeypatch):
     _block(mgr, 2, [alice.tx(ExchangeOpType.PERP_DEPOSIT, {"amount": "3500"}),
                     _order(bob, "sell", 1, 30000), _order(alice, "buy", 1, 30000),
                     _order(carol, "buy", 1, 26900)])
-    _block(mgr, 3, [rep.tx(ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": "27000"})],
+    _block(mgr, 3, [rep.vote("27000")],
            ts=T0 + 120)
     kinds = [(e["type"], e.get("liquidation")) for e in views.events(mgr)["events"]]
     assert ("liquidation", None) in kinds and ("fill", True) in kinds and ("funding", None) in kinds
@@ -166,10 +182,10 @@ def test_the_estimated_liquidation_price_is_where_liquidation_starts(ex):
     liq = _liq(mgr, alice.addr)
     assert abs(liq - D(26515) / D("0.975")) < D("0.01")        # (30000 − 3485) / (1 − 2.5 %)
     above = (liq + 1).quantize(D(1))
-    _block(mgr, 3, [rep.tx(ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": str(above)})])
+    _block(mgr, 3, [rep.vote(str(above))])
     assert BTC in views.account(mgr, alice.addr)["positions"], "liquidated above the estimate"
     below = (liq - 1).quantize(D(1))
-    _block(mgr, 4, [rep.tx(ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": str(below)})])
+    _block(mgr, 4, [rep.vote(str(below))])
     assert BTC not in views.account(mgr, alice.addr)["positions"], "not liquidated below it"
 
 

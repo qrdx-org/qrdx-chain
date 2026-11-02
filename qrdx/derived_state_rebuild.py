@@ -60,6 +60,9 @@ async def rebuild_derived_state_interleaved(db, evm_state_manager=None, execute_
 
     Returns ``{"tip", "blocks", "exchange", "evm", "withdrawals", "account_root"}``.
     """
+    from .history_pruning import require_history
+
+    await require_history(db, 1, "a replay from genesis")  # (before anything is reset)
     from . import undo_journal
     from .exchange.block_processor import apply_enforcement
     from .exchange.state_manager import ExchangeStateManager

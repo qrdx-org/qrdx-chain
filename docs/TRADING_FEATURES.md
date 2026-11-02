@@ -94,7 +94,9 @@ instead). At most 50 per account per market.
 order paying at most 10 % above the trigger for a buy, taking at least 10 % below it for a sell),
 `tif` `gtc`/`ioc`, `max_makers`. `order_type` `oco` is both at once over one escrow — a stop leg
 (`trigger_price`, `price`) and a take-profit leg (`tp_price`, `tp_limit`); the first the price
-reaches fires. Judged on the pair's **last order-book trade price**. Its funds
+reaches fires. Judged on the pair's **last trade price, pool trades included**, and on every
+price a trade reached after the trigger was placed, even within a block and even if the price
+went back (the trigger is marked `reached`; docs/UNIFIED_SPOT_LIQUIDITY.md 5). Its funds
 are **escrowed when placed** (the base for a sell, `amount` × its highest price of quote for a
 buy) in the pair's book escrow. When it fires it settles entirely out of that escrow; what it did
 not use comes back. Cancel with `CANCEL_ORDER` (full refund). At most 50 per account per pair.
@@ -124,7 +126,10 @@ replaces the order carries the trigger over to the new order.
 Triggers fire in the tick at the end of every block (after its transactions), as orders of their
 owner: risk-reducing ones first, then those the price passed furthest, then the first placed. A
 block fires at most 64 of each kind, visiting at most 1,000 resting orders between them; the rest
-fire in the next blocks. One that cannot be placed (margin, a book limit) is cancelled with the
+fire in the next blocks. A **market** trigger that cannot fill whole within 10 % (of the mark for
+perps, of its trigger for spot) keeps the rest waiting and fires again at later ticks, behind
+triggers firing for the first time; it never disappears unfilled (events `trigger_waiting`, or
+`waiting` on the fired event). One that cannot be placed (margin, a book limit) is cancelled with the
 reason; it changes nothing else. While a market's oracle is stale only risk-reducing perps
 triggers fire. A spot pair whose token is paused fires nothing until it resumes. A liquidation
 cancels the account's perps triggers.
@@ -163,8 +168,12 @@ the batch's hash and the action's place, so identical actions get distinct ids (
 ## 6. Multi-hop swaps — `SWAP` with `path`
 
 `{"path": ["A", "B", "C"], "amount_in": "…", "min_amount_out": "…"}` — up to 4 hops, each
-through its pair's best venue (AMM pools or order book), each spending exactly what the hop
-before it bought. `min_amount_out` bounds the last hop; short of it, the whole swap is undone.
+through its pair's combined market (its order book and every pool, best prices first: docs/
+UNIFIED_SPOT_LIQUIDITY.md), each spending exactly what the hop before it bought.
+`min_amount_out` bounds the last hop; short of it, the whole swap is undone, pools included.
+
+Without `path`, a swap chooses its own: the pair itself, or two hops through QRDX or the perps
+settlement asset when that pays more (docs/UNIFIED_SPOT_LIQUIDITY.md 2).
 
 A swap through an order book now pays for the resting orders it visits, as an order does: SWAP's
 65,000 gas per hop plus 10,000 a resting order, and the router quotes the book within what the
@@ -177,7 +186,7 @@ A size worked into the market unattended, in equal slices over `duration` second
 | param | |
 |---|---|
 | perps | `market_id`, `side`, `size`, optional `reduce_only` |
-| spot | `token_in`, `token_out`, `amount_in` — escrowed now, swapped slice by slice through the best venue |
+| spot | `token_in`, `token_out`, `amount_in` — escrowed now, swapped slice by slice through the pair's combined market |
 | `slices` | Default one every 30 s, at most 60; at least 30 s apart |
 | `max_slippage` | Each slice an IOC at most this far from the price (perps: the mark; spot: the marginal price of a thousandth of the slice); default 3 %, at most 10 % |
 | `max_makers` | Per slice, 1–20, default 5 |
@@ -211,10 +220,15 @@ until revoked). Never withdrawals, deposits, transfers, approvals, staking or go
 10 per account. Revoked by the account, or by the agent itself. A bot holds an agent key; the
 wallet never signs its orders.
 
-**Trust.** An agent cannot move funds out, but trading can lose them: a stolen or dishonest agent
-key can trade the account's balances at bad prices against a counterparty its holder controls
-(an order, or a swap through a pool it seeded). Approve agent keys as you would an exchange API
-key with trading rights — and give them an expiry.
+**Trust.** An agent cannot move funds out, but trading can lose them. A stolen or dishonest agent
+key can trade the account's balances against a counterparty its holder controls. Approve agent
+keys as you would an exchange API key with trading rights, and give them an expiry.
+
+An agent's orders and swaps take the best prices first (docs/UNIFIED_SPOT_LIQUIDITY.md). A swap
+it signs may not name a pool or venue (`pool_id`, `venue`): it cannot steer the account's funds
+into a pool it seeded, past better prices. The same holds for a vault's leader. What is left is
+the market it chooses: where a market it controls is the only one for a token, it can still
+trade there. The agent's spending limits bound that (docs/ACCOUNT_CONTROL.md).
 
 **Nonces.** A signer's transactions take their nonces from their own lane: `sender|signer`
 (`exchange_getNonce(address, signer)`). A bot and its owner's wallet never race for one nonce.

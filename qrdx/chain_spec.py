@@ -53,6 +53,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+from . import predeploys as _predeploys
+
 __all__ = [
     "SPEC_FORMAT",
     "PARAMS",
@@ -110,6 +112,24 @@ def _parse_str(raw: str) -> str:
 
 def _parse_list(raw: str) -> List[str]:
     return [a.strip() for a in raw.split(",") if a.strip()]
+
+
+def parse_genesis_market(entry: str) -> Tuple[str, int, int]:
+    """A PERP_GENESIS_MARKETS entry, BASE:MAX_LEVERAGE:SZ_DECIMALS, as (base, max leverage, sz
+    decimals). The base is an off-chain asset's symbol — never an address: a perp on an on-chain
+    token is listed by its address, priced off its own spot market."""
+    parts = entry.split(":")
+    if parts[0].upper() == "QRDX" or parts[0].lower().startswith("0x"):
+        raise ValueError(f"{parts[0]} is on chain: its perp is a token perp")
+    if len(parts) != 3 or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,15}", parts[0]):
+        raise ValueError(f"{entry!r} is not BASE:MAX_LEVERAGE:SZ_DECIMALS")
+    try:
+        leverage, sz = int(parts[1]), int(parts[2])
+    except ValueError:
+        raise ValueError(f"{entry!r}: leverage and sz decimals are whole numbers") from None
+    if not 1 <= leverage or not -1 <= sz <= 6:
+        raise ValueError(f"{entry!r}: leverage at least 1, sz decimals 0 to 6 (-1: no grid)")
+    return parts[0], leverage, sz
 
 
 def _parse_decimal(raw: str) -> str:
@@ -174,7 +194,12 @@ PARAMS: Dict[str, Param] = {
         "int", 20_000_000, "QRDX_BLOCK_EXCHANGE_GAS_LIMIT", minimum=1_000_000
     ),
     # Exchange / perps.
-    "ORACLE_REPORTERS": Param("list", [], "QRDX_ORACLE_REPORTERS"),
+    # The perp markets every network starts with, priced by the validators' votes
+    # (docs/HYPERLIQUID_PARITY.md 1): BASE:MAX_LEVERAGE:SZ_DECIMALS — Hyperliquid's settings for
+    # each. Created by the first block on every path; more by governance (``list_market``).
+    "PERP_GENESIS_MARKETS": Param(
+        "list", ["BTC:40:5", "ETH:25:4", "SOL:20:2"], "QRDX_PERP_GENESIS_MARKETS"
+    ),
     "PERP_VAULT_LOCKUP_SECONDS": Param(
         "int", 4 * 24 * 3600, "QRDX_PERP_VAULT_LOCKUP_SECONDS", minimum=0
     ),
@@ -193,12 +218,7 @@ PARAMS: Dict[str, Param] = {
     # The highest maximum leverage a perp market may be listed with (its maintenance margin is
     # half the initial margin at it: beyond this, liquidations come too late to close).
     "PERP_MARKET_MAX_LEVERAGE": Param("int", 50, "QRDX_PERP_MARKET_MAX_LEVERAGE", minimum=1),
-    # Who lists a validator-priced perp market: 0 — governance only (a passed ``list_market``
-    # proposal); 1 — anyone, with CREATE_MARKET (a dev network's convenience: the first lister
-    # chooses the market's settings). Deployer markets (``dex:ASSET``) are listed by their
-    # deployer either way.
-    "PERP_OPEN_LISTING": Param("int", 0, "QRDX_PERP_OPEN_LISTING", minimum=0),
-    # QRDX burned to list a perp market: every market costs every node work in every block.
+    # QRDX burned to list a token perp: every market costs every node work in every block.
     # (docs/TOKENOMICS.md: QRDX amounts are sized for ~$400 a QRDX — 25 is ~$10,000.)
     "PERP_MARKET_LISTING_FEE": Param("int", 25, "QRDX_PERP_MARKET_LISTING_FEE", minimum=0),
     # Liquidity a perp market's creator puts into the market's liquidity vault (the settlement
@@ -232,27 +252,18 @@ PARAMS: Dict[str, Param] = {
     # A perp market's open-interest floor (notional): its cap is the larger of this and its
     # liquidity vault's equity × OI_CAP_MULTIPLE; 0 with no vault: uncapped.
     "PERP_MIN_OI_CAP": Param("int", 0, "QRDX_PERP_MIN_OI_CAP", minimum=0),
-    # Deployer markets (docs/HYPERLIQUID_PARITY.md): the QRDX bond a deployer keeps while it has
-    # markets (slashable by governance, unbonding over DEPLOYER_UNBOND_SECONDS — longer than a
-    # proposal's voting period and timelock), its markets at most, the largest share of their
-    # protocol fees it may take (basis points), and how far its oracle may move a second.
-    "DEPLOYER_MIN_BOND": Param("int", 1_250, "QRDX_DEPLOYER_MIN_BOND", minimum=0),  # ~$500,000
-    "DEPLOYER_UNBOND_SECONDS": Param(
-        "int", 14 * 24 * 3600, "QRDX_DEPLOYER_UNBOND_SECONDS", minimum=0
-    ),
-    "DEPLOYER_MAX_MARKETS": Param("int", 10, "QRDX_DEPLOYER_MAX_MARKETS", minimum=0),
-    "DEPLOYER_MAX_FEE_SHARE_BPS": Param("int", 5_000, "QRDX_DEPLOYER_MAX_FEE_SHARE_BPS", minimum=0),
-    "DEPLOYER_ORACLE_MAX_STEP_BPS": Param(
-        "int", 100, "QRDX_DEPLOYER_ORACLE_MAX_STEP_BPS", minimum=0
-    ),
-    # Native-token perps (docs/HYPERLIQUID_PARITY.md 13): priced off the token's own spot market —
-    # the TWAP over SPOT_ORACLE_TWAP_SECONDS along pools governance pinned — with at most
-    # PERP_SPOT_MAX_LEVERAGE, no price while the pools' depth (in the settlement asset) is under
-    # SPOT_ORACLE_MIN_DEPTH, and open interest at most SPOT_OI_DEPTH_BPS of that depth.
+    # Token perps (docs/HYPERLIQUID_PARITY.md 13): a perp on an on-chain token, by its address,
+    # listed by anyone (CREATE_MARKET) and priced off the token's own spot market — the TWAP over
+    # SPOT_ORACLE_TWAP_SECONDS along its deepest path of pools to the settlement asset — with at
+    # most PERP_SPOT_MAX_LEVERAGE. Depth is what moving a pool's price SPOT_ORACLE_DEPTH_BAND_BPS
+    # either way takes, in the settlement asset: under SPOT_ORACLE_MIN_DEPTH there is no price
+    # (nor a listing), and open interest is at most SPOT_OI_DEPTH_BPS of it — 10×: moving the
+    # price 2 % for the TWAP's window costs more than the open interest could gain from it.
     "PERP_SPOT_MAX_LEVERAGE": Param("int", 10, "QRDX_PERP_SPOT_MAX_LEVERAGE", minimum=1),
     "SPOT_ORACLE_TWAP_SECONDS": Param("int", 600, "QRDX_SPOT_ORACLE_TWAP_SECONDS", minimum=60),
+    "SPOT_ORACLE_DEPTH_BAND_BPS": Param("int", 200, "QRDX_SPOT_ORACLE_DEPTH_BAND_BPS", minimum=1),
     "SPOT_ORACLE_MIN_DEPTH": Param("int", 10_000, "QRDX_SPOT_ORACLE_MIN_DEPTH", minimum=0),
-    "SPOT_OI_DEPTH_BPS": Param("int", 10_000, "QRDX_SPOT_OI_DEPTH_BPS", minimum=0),
+    "SPOT_OI_DEPTH_BPS": Param("int", 100_000, "QRDX_SPOT_OI_DEPTH_BPS", minimum=0),
     # Big blocks (docs/BLOCK_LIMITS.md, HyperEVM's two block sizes): every BIG_BLOCK_INTERVAL-th
     # block (by height; 0: none) may carry BIG_BLOCK_GAS_LIMIT of EVM gas — room for a contract
     # deployment no ordinary block holds — priced on a fee track of its own.
@@ -273,12 +284,34 @@ PARAMS: Dict[str, Param] = {
     ),
     # Tokens the consensus bridge carries (docs/BRIDGE.md): SYMBOL:CHAIN_ID:SOURCE_TOKEN:DECIMALS.
     "BRIDGE_ASSETS": Param("list", [], "QRDX_BRIDGE_ASSETS"),
+    # A deposit counts toward a mint only while younger than this (seconds, by its source block's
+    # time on QRDX's clock); afterwards never, and the lockbox's custodian may refund it. At least
+    # BRIDGE_MIN_REAL_WINDOW on a real network (a dev network may test with less).
+    "BRIDGE_DEPOSIT_WINDOW": Param("int", 7 * 24 * 3600, "QRDX_BRIDGE_DEPOSIT_WINDOW", minimum=60),
+    # Per source chain, CHAIN_ID:LOCKBOX_ADDRESS: the lockbox whose deposit records a storage proof
+    # against an attested head may show (BRIDGE_PROVE_DEPOSIT, docs/BRIDGE.md "Proving a deposit").
+    "BRIDGE_LOCKBOXES": Param("list", [], "QRDX_BRIDGE_LOCKBOXES"),
+    # Per bridged chain, CHAIN_ID:REGISTRY_ADDRESS: the QRDXMigrationRegistry whose commitments a
+    # MIGRATION_CLAIM may prove (docs/QUANTUM_MIGRATION.md).
+    "MIGRATION_REGISTRIES": Param("list", [], "QRDX_MIGRATION_REGISTRIES"),
+    # Per bridged chain, CHAIN_ID:CANARY_ADDRESS: an address no one holds the key of (a public key
+    # derived from a hash, qrdx/exchange/doomsday.py); proof that it signed triggers the Doomsday
+    # Protocol (DOOMSDAY_PROVE).
+    "DOOMSDAY_CANARIES": Param("list", [], "QRDX_DOOMSDAY_CANARIES"),
+    # Per bridged asset, SYMBOL:PER_DAY:CAP (its own units; 0: none): at most PER_DAY minted in a
+    # day of QRDX's clock and a supply of at most CAP. On a real network an asset with no entry
+    # mints nothing (qrdx/exchange/bridge.py "Guardrails").
+    "BRIDGE_MINT_LIMITS": Param("list", [], "QRDX_BRIDGE_MINT_LIMITS"),
     # The exchange's gas price floor, 0.1 gwei: what every operation outside the free trading lane
     # pays at least (below) — an order beyond its account's free actions ~$0.0024 at $400 a QRDX.
     "EXCHANGE_MIN_GAS_PRICE_WEI": Param("int", 10**8, "QRDX_EXCHANGE_MIN_GAS_PRICE_WEI", minimum=0),
     # The EVM's floor under its base fee (qrdx/fee_market.py): EVM gas had no price floor at all
     # (a gas price of 0 executed for free).
     "EVM_MIN_GAS_PRICE_WEI": Param("int", 10**9, "QRDX_EVM_MIN_GAS_PRICE_WEI", minimum=0),
+    # Contracts present from genesis, ADDRESS:CODE[:SLOT=VALUE...] (qrdx/predeploys.py): ones too
+    # big to deploy in a block — by default the PQ smart account's implementation and factory
+    # (docs/PQ_SMART_ACCOUNTS.md). The genesis block commits to the code through this spec.
+    "EVM_PREDEPLOYS": Param("list", _predeploys.default_entries(), "QRDX_EVM_PREDEPLOYS"),
     # Free trading (docs/TOKENOMICS.md, Hyperliquid's model): a trading operation sent at gas price
     # 0 pays nothing, within its account's free actions — FREE_ACTIONS_INITIAL, plus
     # FREE_ACTIONS_PER_VOLUME per unit of settlement-asset volume it has traded; past them, one
@@ -365,6 +398,33 @@ FEATURES: Dict[str, str] = {
         "against a block's signed root — by a light client, a bridge, or a contract (the state "
         "proof precompile)."
     ),
+    "evm_standard_precompiles": (
+        "Ethereum's precompile at 0x09 (BLAKE2F) is restored and 0x0a–0x0c are left to "
+        "Ethereum's later forks; ML-DSA-65 verification and BLAKE3 move to 0x0500 and 0x0501, "
+        "and the ML-KEM precompiles (which took a secret key in calldata) are removed "
+        "(qrdx/contracts/evm_world.py)."
+    ),
+    "slot_timestamps": (
+        "A block's timestamp is its slot's start time (genesis time + slot × slot duration, in "
+        "whole seconds: block_verification.slot_timestamp), not its proposer's clock: the "
+        "exchange's only clock (funding, oracle staleness, TWAPs, lockups, the bridge's deposit "
+        "window) can be neither moved nor run backwards by a proposer."
+    ),
+    "validator_state_root": (
+        "The unified state root also commits to the validators' state: the validator set of the "
+        "block's epoch (stakes, pools, payouts owed) and a hash chain of the staking logs block "
+        "application writes (qrdx/validator/validator_root.py), so a snapshot's validator state "
+        "can be verified against a signed root (docs/CHECKPOINT_SYNC.md)."
+    ),
+    "exchange_inclusion": (
+        "A block carries only exchange transactions that run. They are judged together before "
+        "any runs (form, signer, expiry, each lane's nonces in sequence, gas, the free lane), "
+        "each payer must hold the maximum fees of all its transactions in the block, and those "
+        "fees are reserved up front, so no earlier operation can spend a later one's gas "
+        "(ExchangeStateManager.section_errors). A block carrying a transaction that would be "
+        "refused before it runs — which used to sit in the block without paying, consuming its "
+        "nonce or executing — is invalid."
+    ),
 }
 
 # The rules a network created by this release has from genesis unless its spec says otherwise
@@ -373,6 +433,10 @@ GENESIS_DEFAULT_FEATURES: Tuple[str, ...] = (
     "incremental_state_root",
     "provable_state",
     "fair_ordering",
+    "slot_timestamps",
+    "evm_standard_precompiles",
+    "validator_state_root",
+    "exchange_inclusion",
 )
 
 
@@ -437,6 +501,8 @@ QRDX_NETWORKS: Dict[int, str] = {
 # (release procedure: docs/PROTOCOL_UPGRADES.md).
 PINNED_NETWORKS: Dict[str, str] = {}
 
+BRIDGE_MIN_REAL_WINDOW = 24 * 3600  # BRIDGE_DEPOSIT_WINDOW's floor outside dev networks
+
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 _NETWORK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _SPEC_KEYS = {"format", "network", "chain_id", "dev", "params", "features", "forks"}
@@ -492,6 +558,18 @@ def _check_param_value(name: str, value: Any, where: str) -> Any:
         raise ChainSpecError(f"{where}: {name} must be a list of non-empty strings, got {value!r}")
     if len(set(value)) != len(value):
         raise ChainSpecError(f"{where}: {name} lists an entry twice")
+    if name == "EVM_PREDEPLOYS":
+        try:
+            _predeploys.check(value)
+        except ValueError as e:
+            raise ChainSpecError(f"{where}: {name}: {e}") from None
+    if name == "PERP_GENESIS_MARKETS":
+        try:
+            bases = [parse_genesis_market(entry)[0].upper() for entry in value]
+        except ValueError as e:
+            raise ChainSpecError(f"{where}: {name}: {e}") from None
+        if len(set(bases)) != len(bases):
+            raise ChainSpecError(f"{where}: {name} lists a market twice")
     return list(value)
 
 
@@ -599,6 +677,13 @@ class ChainSpec:
                 f"network spec lists every parameter explicitly"
             )
         clean_params = {k: _check_param_value(k, params[k], "chain spec params") for k in PARAMS}
+        if not raw["dev"] and clean_params["BRIDGE_DEPOSIT_WINDOW"] < BRIDGE_MIN_REAL_WINDOW:
+            # Shorter, and a deposit a busy or partitioned network has not attested in time
+            # turns into a refund the depositor did not ask for (qrdx/exchange/bridge.py).
+            raise ChainSpecError(
+                f"chain spec: BRIDGE_DEPOSIT_WINDOW must be at least {BRIDGE_MIN_REAL_WINDOW} "
+                f"seconds on a real network"
+            )
 
         genesis_features = _check_features(raw["features"], "chain spec")
 

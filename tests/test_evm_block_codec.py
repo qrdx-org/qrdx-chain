@@ -4,7 +4,7 @@ E-D2 — EVM block-body codec.
 Before EVM transactions can be included in blocks, they must serialize into the
 block body and come back faithful (and still authenticate) and deterministically.
 The account/EVM analog of tests/test_exchange_block_codec.py.
-See docs/EVM_STATE_CONSENSUS_INTEGRATION.md §6 (E-D2).
+See docs/archive/EVM_STATE_CONSENSUS_INTEGRATION.md §6 (E-D2).
 """
 
 import json

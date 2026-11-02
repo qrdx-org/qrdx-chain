@@ -29,7 +29,6 @@ from the same views as the REST endpoints (qrdx/exchange/views.py), so all surfa
     perp_getTrades(id, limit)   perp_getEvents(market_id, address, types, since, limit)
     perp_getTriggers(address)   perp_getTwaps(address)   perp_getFeeSchedule(address)
     perp_getUserVaults(leader)   perp_getUserVault(vault, holder)
-    perp_getDeployer(address | dex)   (docs/HYPERLIQUID_PARITY.md: a deployer's bond and markets)
     exchange_getAgents(address)   exchange_getSubaccounts(address)
     exchange_getTicker(ticker)   exchange_getTickerAuction()   (unique tickers: HIP-1's auction)
     exchange_getFreeActions(address)   (the free trading lane: docs/TOKENOMICS.md)
@@ -438,29 +437,6 @@ class PerpModule(RPCModule):
         if found is None:
             raise RPCError(RPCErrorCode.RESOURCE_NOT_FOUND, f"no vault {vault}")
         return found
-
-    @rpc_method
-    async def getDeployer(self, who: str) -> Dict[str, Any]:
-        """A market deployer, by address or namespace: its bond, what it is unbonding and
-        when that unlocks, and the markets it runs."""
-        mgr = _manager()
-        address = who
-        found = mgr.trading.deployers.peek(who)
-        if found is None:
-            for addr, d in mgr.trading.deployers.peek_items():
-                if d.dex == who:
-                    address, found = addr, d
-                    break
-        if found is None:
-            raise RPCError(RPCErrorCode.RESOURCE_NOT_FOUND, f"no deployer {who}")
-        return {
-            "address": address,
-            "dex": found.dex,
-            "bond": str(found.bond),
-            "unbonding": str(found.unbonding),
-            "unlock": str(found.unlock) if found.unbonding > 0 else None,
-            "markets": mgr.deployer_markets(address),
-        }
 
     @rpc_method
     async def getVault(self) -> Dict[str, Any]:

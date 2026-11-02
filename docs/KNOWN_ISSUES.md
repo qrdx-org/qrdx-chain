@@ -7,11 +7,411 @@ only as a comment in a diff.
 Companions: [UNIFIED_ACCOUNT_IDENTITY.md](UNIFIED_ACCOUNT_IDENTITY.md),
 [EXCHANGE_AND_VALIDATOR_STAKE_AUDIT.md](EXCHANGE_AND_VALIDATOR_STAKE_AUDIT.md),
 [CONSENSUS_REMAINING_WORK.md](CONSENSUS_REMAINING_WORK.md),
-[PROTOCOL_UPGRADES.md](PROTOCOL_UPGRADES.md) (chain specs, forks, network identity).
+[PROTOCOL_UPGRADES.md](PROTOCOL_UPGRADES.md) (chain specs, forks, network identity),
+[MAINNET_READINESS.md](MAINNET_READINESS.md) (what stands between here and mainnet).
 
 ---
 
 # Open defects
+
+## FIXED — Unfunded exchange transactions rode in blocks for free
+
+**Severity: medium.** Reported 2026-11-02 against the public testnet.
+
+**Before:**
+* `exchange_sendTransaction` checked the signature, the key's binding to the sender, the nonce
+  window and the gas price. It never checked that the payer could cover `gas_limit × gas_price`.
+* The proposer selected such a transaction. At execution it was refused before running ("not
+  includable, consumes nothing"), but a refusal was treated like a failed operation: the
+  transaction stayed in the block.
+* So it sat in the block unexecuted: no fee, receipt `null`, status `unknown` in the chain index,
+  and the sender's nonce not consumed. Every node still held a gossiped copy, and the same nonce
+  could be carried again. Accounts are free, so one zero-balance account could fill block space
+  indefinitely. Two nonce-0 transactions of one empty account were carried in blocks 1727221
+  and 1727828.
+
+The same gap covered every refusal before execution: a wrong or stale nonce, an expired action,
+a signer the account had not authorized, too little gas, and the free lane's conditions.
+
+**Fixed:**
+* **The rule (chain-spec feature `exchange_inclusion`, in `GENESIS_DEFAULT_FEATURES`).** A block's
+  exchange transactions are judged together before any runs (`ExchangeStateManager.section_errors`):
+  * each must pass every check `process_transaction` makes before executing;
+  * each nonce lane continues in sequence;
+  * each payer must hold the maximum fees of all its transactions in the block.
+
+  A block carrying one that fails is invalid. The block then reserves every transaction's
+  maximum fee before anything runs, so an earlier operation cannot spend a later one's gas: an
+  account that moved out its QRDX and then sent a cancel used to have the cancel refused and
+  carried. A signer whose approval an earlier transaction in the same block revoked is the one
+  change judging can't foresee; its transaction runs as a failure, paying for its gas and
+  consuming its nonce.
+* **The proposer** (`block_processor.includable_exchange_txs`) judges its selection the same way
+  before preloading or executing anything. It uses the balances its importers will read, and
+  drops what it refuses from its mempool. Judging first matters: dropping a transaction after
+  running it would leave balances in the proposer's preload that importers don't have, such as
+  its sender's, or a pool's or escrow's it named, and the roots would differ.
+* **Admission** (`ExchangeSubmitter`) refuses a transaction whose payer cannot pay
+  `gas_limit × gas_price` now, as the EVM path does.
+
+**Existing networks:**
+* The proposer and admission fixes need only the upgrade.
+* The block rule is a fork. A network started before it schedules `exchange_inclusion` at a
+  height, approved by governance (docs/PROTOCOL_UPGRADES.md), so that a malicious proposer
+  cannot carry such transactions either. Blocks below that height keep the old meaning.
+
+**Verified:**
+* Unit tests: `tests/test_exchange_inclusion.py`. They fail with the rule or the reservation
+  removed.
+* `test_fast_reorg_rebuild` had relied on the gap: after each reorg its workload sent
+  transactions with nonces ahead of the chain, which rode along unexecuted. It now takes nonces
+  from the chain, so its branches actually execute.
+* **Live, on a 4-node network:**
+  * An account never funded was refused at admission ("holds 0; the transaction may cost
+    0.0000225").
+  * An account funded with exactly one transaction's maximum fee then sent nonce 0 and nonce 1.
+    Each was affordable alone, so both were admitted.
+  * The proposer of block 122 carried nonce 0 and left nonce 1 out ("may cost 0.0000450"). Each
+    of the other three proposers left its own gossiped copy out once and dropped it.
+  * Nonce 1 never reached a block. The account's nonce is 1 on every node, and its history holds
+    one transaction, successful, with its fee.
+  * No node rejected a block; hashes and state roots were equal across the four nodes.
+* **The integration harness** passed with the rule active from genesis: all scenarios, then the
+  soak with a node killed and restarted. No proposer had to leave a transaction out, and no
+  node rejected a block or saw a root mismatch.
+
+## FIXED — A mined block could be appended to the proof-of-stake chain (latent)
+
+**Severity: high (latent: a type error happened to stop it).** Found 2026-11-02 while removing
+the legacy UTXO balance fallback.
+
+The inherited proof-of-work path (`manager.create_block`) was still reachable from four
+places:
+* the public `/push_block` endpoint;
+* peers' `submit_block` and `submit_blocks`;
+* sync, for a block with no proposer.
+
+It judged a block by the proof-of-work rules alone. None of the proof-of-stake checks applied:
+no proposer signature, slot eligibility, state roots or sections. Below is how it played out on
+a proof-of-stake chain.
+* **Most blocks:** blocks store no difficulty, so the expected difficulty was `None` and every
+  mined block failed the comparison.
+* **Every 512th block:** the adjustment rule computed 1.0 from that, so a hash only had to share
+  one hex digit with the tip's, about sixteen tries.
+* **Reproduced on a copy of a testnet node's database:** a block mined in 5 tries passed every
+  check (difficulty, proof of work, timestamp, coinbase, merkle root). It failed only writing a
+  `Decimal` to SQLite.
+
+Fix that type error, as any refactor might, and anyone could have appended unsigned blocks at
+the tip. Each such block would split the nodes that took it from the rest, and pay its miner a
+coinbase. The legacy balance fallback below would have counted that coinbase.
+
+**Fixed:**
+* `manager.create_block` refuses every block.
+* `/push_block` answers 410.
+* Sync refuses a block without a proposer.
+* The peer paths refuse through `create_block`, and record a violation against the sender.
+
+**Verified:** `tests/test_no_proof_of_work.py` mines such a block and shows that the legacy rules
+accept it. With the type error fixed, the old `create_block` appended it, so the test fails
+against the old code. Now nothing appends it. The integration harness then passed all scenarios
+and the soak with this change and the UTXO fallback removed, with no node rejecting a block or
+seeing a root mismatch.
+
+## FIXED — A restored snapshot's contract code and genesis records were not verified
+
+**Severity: medium.** Found 2026-11-02 while adding genesis predeploys.
+* **Code.** The checkpoint-sync restore (docs/CHECKPOINT_SYNC.md) checked every root against
+  the signed one. But the root commits to each account's code hash, not to `contract_code`, the
+  table keyed by that hash.
+  * A snapshot server could store other code under a contract's hash.
+  * The restored node would have followed the chain until that contract next ran, then stopped.
+  * Meanwhile it would have answered `eth_call` with the substitute code, for example a
+    token's `balanceOf`.
+* **Genesis records.** Block 0's records (allocations, system wallets, now predeploys), which
+  every later rebuild seeds the state from, were kept from the snapshot.
+
+**Fixed:**
+* Every code row must hash to its key, or the restore refuses.
+* Block 0's records come from the genesis the node builds itself.
+
+**Verified:** a published snapshot with one byte of the factory's code changed passed the root
+check and was refused by the code check; nothing was written. Unit test:
+`tests/test_snapshot_publishing.py`.
+
+## FIXED — Dev and release ran different liboqs builds; dead code read as live
+
+**Severity: medium (B6), low (B8).** From the 2026-10-27 mainnet readiness review
+(docs/MAINNET_READINESS.md).
+
+**B6, liboqs.**
+* **Before:** development built liboqs from git HEAD with an unpinned wrapper. The release image
+  built 0.15.0 under wrapper 0.16.0.1, and the requirements accepted any wrapper from 0.9.0.
+* **Fixed:** liboqs 0.16.0 (checked against commit `5a1a854b`) and liboqs-python 0.16.0.1
+  everywhere: docker/Dockerfile, .devcontainer/install-liboqs.sh, requirements-v3.txt and
+  pyproject.toml.
+* **Verified:** the startup known-answer test and the PQ suites (96 tests) pass on that exact
+  pair, built from source. Existing development containers update by rerunning the install
+  script.
+
+**B8, dead code, removed.**
+* The unattached Doomsday and shielding scaffolding: `qrdx/bridge/` adapters, shielding, store,
+  types and persistence, the `bridge_getDoomsday*` RPCs, the validator's canary hooks, and the
+  `qrdx/tokens` hook. The `post_doomsday_trade` token extension stays.
+* The retired `PerpEngine`. Its always-empty section stays in the exchange root formula, so roots
+  are unchanged.
+* The earlier in-memory governance library (`qrdx/governance/`).
+* The unused EVM executor v1, and the PoW miners.
+* Root leftovers, and constants nothing read.
+* Their tests and integration scenarios S08/S09.
+
+Twenty-nine superseded status documents moved to docs/archive/, and docs/README.md indexes the
+living ones.
+
+The Doomsday Protocol is rebuilt on the consensus bridge: see the entry below.
+
+## DONE — Quantum migration and the Doomsday Protocol, in consensus (2026-10-28)
+
+docs/QUANTUM_MIGRATION.md.
+
+* **Migration.** An ECDSA account binds a post-quantum successor as its controller:
+  * on QRDX through account control;
+  * on Ethereum through the immutable `QRDXMigrationRegistry`, proven on QRDX with
+    `MIGRATION_CLAIM` (two storage proofs against an attested head). The binding is recorded in
+    the exchange root.
+* **Doomsday.** It triggers in one of two ways:
+  * `DOOMSDAY_PROVE`: an account proof that a hash-derived canary, whose key no one holds, has
+    signed;
+  * governance's `declare_quantum_emergency`.
+
+  From that block:
+  * ECDSA transactions are refused, and `ECRECOVER` recovers nothing;
+  * agents of `0x` accounts are revoked;
+  * bridge mints and withdrawals stop;
+  * commitments made from its time on bind nothing.
+* **Found on the way.**
+  * An account whose own key was off could not move its native QRDX at all: only an EVM
+    transaction moved it, and that needs the key. Now `TOKEN_TRANSFER` takes
+    `token_address: "QRDX"`, so a controller moves it.
+  * A rule "an ECDSA account's agents stop" would also have stopped contracts' agents,
+    including PQ smart accounts', since every `0x` address looks alike. The trigger instead
+    revokes them once, and afterwards they are approved only through post-quantum roots.
+
+Tests: tests/test_quantum_migration.py and tests/test_doomsday.py. Verified live against anvil:
+* a successor proven from the registry;
+* a canary spend proven: ECDSA refused, the successor moved the account's QRDX, a late
+  registration refused;
+* roots equal on 4 nodes, and equal again after a full rebuild from genesis.
+
+## DONE — Deposits mint on a proof, not only on per-deposit votes (2026-10-28)
+
+The trust-minimized inbound bridge (docs/BRIDGE.md, "Proving a deposit").
+* **Lockbox v3.** It records each deposit in storage, and anyone mints a deposit with a
+  Merkle-Patricia storage proof of that record against a finalized head the validators attested
+  (`BRIDGE_PROVE_DEPOSIT`).
+* **One id.** A deposit's id is `<chain>:<lockbox id>` on either path, so it mints once.
+* **Refunds** are now checked by the contract: a recorded deposit, whole, to its depositor, after
+  `refundDelay`.
+* **Found on the way.** A deployed lockbox's code holds its immutable `refundDelay`, so the deploy
+  script compares against the build with it filled in. Before, it would have refused every v3
+  deployment.
+
+Tests: tests/test_bridge_proofs.py and tests/test_lockbox_contract.py. Verified live against
+anvil, with validators attesting heads only.
+
+## FIXED — The validators' consensus state was not in the signed state root; no checkpoint sync, no pruning (2026-10-28)
+
+**Severity: medium (blocked checkpoint sync).** Found 2026-10-27 while designing checkpoint
+sync. docs/CHECKPOINT_SYNC.md has the details.
+
+* **The root.** Feature `validator_state_root` (a genesis feature of new networks) commits
+  `S_E`, the validator set of the block's epoch, and a hash chain over the six staking logs to
+  the unified root. The audit found the other "uncovered" tables were display copies, caches,
+  genesis-fixed or unused.
+* **Snapshots.** `scripts/node/snapshot.py create | restore`. The restore:
+  * rebuilds genesis from the node's genesis file;
+  * hash-verifies history to a trusted checkpoint;
+  * steps back to the exchange checkpoint and recomputes every root from the rows, which must
+    equal the signed one;
+  * never unpickles the exchange state with a plain unpickler.
+* **Pruning.** `QRDX_HISTORY_RETENTION_BLOCKS` strips signatures and sections behind finality. A
+  pruned node refuses what needs them (a replay from genesis, serving old blocks).
+* **Found on the way.**
+  * The persisted exchange checkpoint is a pickle. Loading a downloaded one would have run any
+    code it named, so snapshots use an allowlisting unpickler.
+  * The integration harness had rotted, and every scenario now runs again:
+    * removed chain-spec parameters;
+    * plaintext validator keys, which non-dev networks refuse (it now writes encrypted
+      keystores);
+    * S02 raced the first block;
+    * S13 listed a perp market the old way (`qBTC` is now a genesis market of the testnet);
+    * S13 and S19 left the stakers' 20 % fee share out of their conservation sums (it was there,
+      at the staker-fee holder);
+    * S21 expected a swap to skip a cheaper pool, which unified spot routing no longer does;
+    * S23 used the old deposit format and no mint limit.
+
+Verified live: 6 tampered snapshots refused; a restored node rejoined with identical roots; a
+pruned snapshot restored with the same root. Tests: tests/test_validator_root.py,
+tests/test_snapshot.py, tests/test_history_pruning.py.
+
+Open: nodes do not publish or advertise snapshots themselves. Any HTTP server publishes one, and
+`snapshot.py fetch` downloads it.
+
+## FIXED — The EVM's post-quantum precompiles sat on Ethereum's addresses
+
+**Severity: medium.** Found 2026-10-27 while building PQ smart accounts.
+
+* **The clash.** The EVM fork put ML-DSA-65 verification at `0x09`, which is Ethereum's BLAKE2F
+  (EIP-152, Istanbul): a contract calling BLAKE2F got a signature check instead. It also put
+  BLAKE3 and two ML-KEM precompiles at `0x0a`–`0x0c`, which Ethereum's later forks assign.
+* **Leaking keys.** The ML-KEM decapsulation precompile could only be used by putting a secret key
+  in calldata, where everyone can read it.
+
+**Fixed:** chain-spec feature `evm_standard_precompiles`, a default for new networks, applied in
+`qrdx/contracts/evm_world.py` (no change to the py-evm fork).
+* `0x09` is BLAKE2F again (checked against `hashlib.blake2b`), and `0x0a`–`0x0c` are free.
+* ML-DSA-65 verification and BLAKE3 moved to `0x0500` and `0x0501`.
+* The ML-KEM precompiles are removed.
+
+Tests: tests/test_pq_smart_account.py.
+
+## FIXED — A proposer chose the exchange's clock
+
+**Severity: high.** Found 2026-10-27 while making bridge refunds safe.
+
+The block timestamp is the exchange's only clock: funding, oracle staleness, TWAPs, lockups, name
+expiry, and the bridge's deposit window all read it. A PoS block's timestamp was its proposer's
+wall clock, and nothing on the import path checked it against the slot or the parent. An eligible
+proposer could therefore:
+
+* move that clock forwards, accruing funding or expiring oracle prices and lockups;
+* run it backwards, which would have let a deposit back into its window after a refund.
+
+**Fixed:** chain-spec feature `slot_timestamps`, in the defaults of every new genesis.
+* A block's timestamp must be its slot's start time: genesis time plus slot × slot duration, in
+  whole seconds (`block_verification.slot_timestamp`).
+* Every import path checks it (`_verify_chain_rules`), and the proposer stamps it.
+* Slots strictly increase and are bound to eligibility, so the clock is deterministic and never
+  runs backwards.
+* A chain whose spec lacks the feature keeps its old rule.
+
+Tests: tests/test_slot_timestamps.py.
+
+## FIXED — The lockbox could not return a stuck deposit; the bridge had no guardrails
+
+**Severity: medium (B5).** From the 2026-10-27 mainnet readiness review.
+
+**The problem.** A deposit QRDX never mints stayed locked: an unlisted token, or a recipient QRDX
+refuses. The only exit, `release`, took QRDX withdrawal ids, and a token listed later would have
+minted a deposit already returned. Nothing bounded what a quorum could mint.
+
+**Fixed (qrdx/exchange/bridge.py, contracts/bridge/QRDXLockbox.sol, docs/BRIDGE.md):**
+
+* **The deposit window.**
+  * Deposits are attested with their source block's time.
+  * One counts toward a mint only within `BRIDGE_DEPOSIT_WINDOW` (7 days; at least a day on a
+    real network), so past it no QRDX block can mint it.
+  * A deposit time ahead of QRDX's clock does not count.
+* **Refunds.**
+  * The lockbox's `refund(depositTx, depositLog, …)` has its own key space, and each deposit is
+    refunded at most once.
+  * `custodian.py refunds` plans only deposits that no node reports minted and whose window
+    closed before the finalized block's time.
+  * `reconcile` alarms on any other refund.
+* **Guardrails.**
+  * `BRIDGE_MINT_LIMITS` caps each asset per day and in supply. On a real network an asset
+    without a limit mints nothing.
+  * Governance can pause minting (`bridge_mint_pause`).
+  * A held deposit keeps its attestations and mints at a later vote.
+* **The watcher.** It takes turns through outstanding deposits, so a few that cannot mint never
+  crowd out the rest. It drops expired deposits and offers only well-formed chain heads.
+
+**Found on the way.** B7's `eth_getBlockByNumber` reported QRDX's 64-byte unified root as
+`stateRoot`. Validators copy that field into chain-head votes, so every vote failed, with its
+deposits. Clients need 32 bytes, so `stateRoot` is now the root's keccak-256, with the root
+itself in `qrdxStateRoot`.
+
+**Tests:** tests/test_bridge_guardrails.py and tests/test_lockbox_tools.py.
+
+**Verified live (docs/BRIDGE.md, "Refunds end to end").** One deposit minted. A deposit held by
+the daily limit and an unlisted token's deposit were refunded after their window. The lockbox
+was left holding exactly QRDX's supply.
+
+## FIXED — Validators had no slashing protection, kept their key in plaintext and could run a different signature scheme; wallets could not send transactions
+
+**Severity: high.** From the 2026-10-27 mainnet readiness review (docs/MAINNET_READINESS.md §1).
+Fixed 2026-10-27; operators' guide: docs/VALIDATOR_KEYS.md.
+
+* **B1, slashing protection.** The running validator never opened the protection database
+  (only `ValidatorManager.create`, which the node does not call, did). Blocks had no record at
+  all. Votes had one in the chain database, which a resync lost and a second machine never
+  shared. That record compared only checkpoints, so a validator restarted mid-epoch could sign a
+  second attestation for the same checkpoints at a later slot, which importers judge a double
+  vote.
+  **Fixed:** qrdx/validator/slashing_protection.py.
+  * Every block and vote is recorded before it is signed, in one durable transaction with the
+    check.
+  * Attestations are compared by their whole signing root.
+  * The record is its own file, held by one process (an exclusive lock), kept per network, and
+    pruned into watermarks.
+  * It moves between machines in EIP-3076's interchange format
+    (`scripts/validator/slashing_protection.py`).
+  * The proposer checks it before any section executes, and undoes the sections if signing is
+    refused.
+  * The doppelganger check (qrdx/validator/doppelganger.py) makes a starting validator listen
+    for `QRDX_DOPPELGANGER_EPOCHS` (3; 0 on dev) before signing. Every epoch it stops for good if
+    the chain carries a block or vote from its key that its record does not hold.
+
+  Tests: tests/test_slashing_protection.py. Verified live on a 4-node network:
+  * a duplicate of a running validator was caught within 7 s and never signed;
+  * the lock refused a second opener;
+  * the restarted original resumed;
+  * no slashing evidence was recorded.
+* **B2, the validator key.** It was read as plaintext hex, and `QRDX_VALIDATOR_PASSWORD` was
+  stored but never used.
+  **Fixed:** qrdx/validator/keystore.py.
+  * The node requires an encrypted keystore outside dev networks. The cipher is now scrypt
+    (N = 2^18) and AES-256-GCM, bound to the address and public key; it was AES-128 Fernet under
+    PBKDF2.
+  * A keystore whose parts do not belong together is refused.
+  * The password comes from `QRDX_VALIDATOR_PASSWORD_FILE`, or from the variable, which is then
+    removed from the environment.
+  * A key error stops the node instead of leaving it running without its validator.
+  * `scripts/validator/keystore.py` creates, encrypts, upgrades and checks keystores, and
+    `docker/validator-init.py` writes encrypted ones.
+
+  Tests: tests/test_validator_keystore.py.
+* **B3, the signature scheme.** Every module that called liboqs fell back to round-3 Dilithium3
+  (and Kyber768) when ML-DSA-65 (ML-KEM-768) was missing. Those are incompatible: a node on them
+  splits from the network silently.
+  **Fixed:** qrdx/crypto/pq/algorithms.py names the algorithms once. At import, before any key is
+  used, a known-answer test checks the sizes, verifies a signature from an independent FIPS 204
+  implementation (and refuses a tampered one), and decapsulates an independent FIPS 203
+  ciphertext. The vectors were cross-checked both ways against liboqs and are regenerable
+  (`scripts/crypto/gen_pq_kat.py`). A config naming another algorithm is refused.
+  Tests: tests/test_pq_algorithms.py.
+* **B4, EVM wallets.** The EVM refused EIP-1559 (type 2) and EIP-2930 (type 1) transactions,
+  which MetaMask, ethers and viem send by default.
+  **Fixed:**
+  * Both parse and authenticate, with canonical integers and low `s` only.
+  * A type-2 transaction pays `min(max fee, base fee + tip)` per gas, all burned.
+    `eth_maxPriorityFeePerGas` is 0, since tips buy nothing here.
+  * Access lists are charged up front and warm.
+  * Found on the way: a successful transaction's gas charge could drive its payer's balance
+    negative, because nothing checked up front that the payer could cover its gas. A payer who
+    cannot now runs nothing and pays nothing (a no-op, as a stale nonce is), and
+    `eth_sendRawTransaction` refuses it with the standard "insufficient funds" error.
+
+  Tests: tests/test_evm_typed_txs.py. Verified live: a type-2 and a type-1 transfer were charged
+  exactly (21,000 gas at base + 0; 25,300 with the access list), with identical state roots on
+  all four nodes.
+* **B7, block headers.** `eth_getBlockByNumber` reported a 30M gas limit, a zero base fee, zero
+  roots and an empty bloom.
+  **Fixed:** it reports the per-height EVM gas limit, the block's base fee, its state root (the
+  64-byte unified root's keccak-256, the root itself in `qrdxStateRoot`), its EVM gas used, and
+  Ethereum's log bloom (checked against `eth_bloom`).
+  `receiptsRoot` stays zero: QRDX builds no receipt trie.
+  Tests: tests/test_eth_rpc_blocks.py.
 
 ## OPEN — Perpetuals: rebuilt on a zero-sum clearinghouse; mainnet needs its bridge deployed
 
@@ -119,7 +519,7 @@ funding paid none (caught by S19's funding check). The duplicate is gone and
   `qrdx/bridge/` is not part of it and could not have been: its `BridgeMinter`
   (`qrdx/bridge/shielding.py`) only tallies totals in memory, and its Ethereum lock-event scan
   matches a sha256 topic (Ethereum uses keccak) and never decodes the amount or recipient. It
-  remains for the Doomsday Protocol's reads only.
+  was removed on 2026-10-27, with the unattached Doomsday scaffolding (MAINNET_READINESS.md B8).
 
 **Fixed (2026-10-12):**
 * **Oracle votes are gossiped and have their own sequence.** A vote used to ride only in its
@@ -228,8 +628,10 @@ The Hyperliquid-parity features (docs/HYPERLIQUID_PARITY.md) add their own:
 - **Contract actions:** 25,000 EVM gas each plus 1 per 10 exchange gas, at most 2,000,000
   exchange gas, 256 run per block.
 - **Tickers:** opening price 250 QRDX, floor 25, 31 h auctions.
-- **Native-token perps:** at most 10× leverage, a 600 s TWAP, a minimum depth of 10,000 of the
-  settlement asset, open interest at most 1× the depth (rising at most 2× per window).
+- **Token perps:** at most 10× leverage, a 600 s TWAP, depth measured within 2 % of the price, a
+  minimum depth of 10,000 of the settlement asset (to list, and to be priced), open interest at
+  most 10× the depth (rising at most 2× per window).
+- **Genesis markets:** BTC 40× / 5 size decimals, ETH 25× / 4, SOL 20× / 2 (Hyperliquid's).
 - **Token economics at ~$400 a QRDX:** every QRDX amount in docs/TOKENOMICS.md — a 10M supply,
   system wallets of $100k–$1M each, the free trading lane's budget (10,000 actions, 1 per unit
   traded, one per 10 s past it, 64 an account a block, a $10 holding, closed above 2× the base
@@ -237,14 +639,106 @@ The Hyperliquid-parity features (docs/HYPERLIQUID_PARITY.md) add their own:
 - **Big blocks:** every 240th block, 3,000,000 EVM gas, a fee track moving up to 1/2 per big
   block.
 - **Perps listing:** maximum leverage at most 50 (`PERP_MARKET_MAX_LEVERAGE`); validator-priced
-  markets listed by governance (`PERP_OPEN_LISTING` off).
-- **Deployer markets:** a 1,250 QRDX (~$500,000) bond, 14-day unbonding, 10 markets per deployer, a fee
-  share of at most 50 %, an oracle step of 1 % a second (10 s at most per update), a freeze at
-  more than 2/3 of stake for one vote window.
+  markets at genesis or by governance.
+- **Unified spot liquidity** (docs/UNIFIED_SPOT_LIQUIDITY.md): routing hubs QRDX and the perps
+  settlement asset, 40 bisection steps to split a fill between pools, 32 crossed resting orders
+  filled per block.
 
-Deployer markets put a deployer's oracle in charge of real positions. The bounds, the circuit
-breaker, the validators' freeze and the slashable bond limit the damage, and they need the
-audit too.
+Token perps put an on-chain spot market in charge of real positions. The TWAP, the depth
+measure, the depth-capped open interest, the step bound and their containment limit what moving
+that market can win, and they need the audit too.
+
+## FIXED — A proposer could forge exchange transactions; a token's issuer could lock shared pools
+
+**Severity: critical (the first), high (the second).** Found 2026-10-27 in the exchange audit,
+reproduced, fixed and tested: docs/EXCHANGE_AUDIT.md. A fresh genesis carries the fixes.
+
+- **Forged exchange transactions.** The importer verified an exchange section's signatures only
+  when the block declared an exchange state root. A block without one had its section executed
+  unverified. So any eligible proposer could move any account's funds with an unsigned
+  transaction in its name. Every import path now verifies every transaction first.
+- **A token's issuer could lock a shared pool.** Freezing a pool's holder, pausing the token, or
+  pulling it out of the pool as the permanent delegate stopped every liquidity provider from
+  withdrawing, their QRDX included. Holders of many accounts' funds can no longer be frozen or
+  drawn from, and a paused token still pays out withdrawals and refunds.
+- Also fixed:
+  - the spot-trigger tick walked every order book (47 ms a block at 10,000 pairs);
+  - each block reset every book (15 ms);
+  - staker fee conversion visited every pending token;
+  - five operations left plain state behind when rolled back (latent);
+  - an unused consensus function executed exchange transactions unverified;
+  - inert per-pair reporter oracles sat in the state root;
+  - an agent could steer an account's swap into a pool it owns;
+  - token views now list what an issuer can still do to holders;
+  - one validator could fill the bridge's state with deposits that never happened (medium):
+    attestations short of a quorum are now capped per validator and indexed, and chain heads
+    count only for bridged chains;
+  - a waiting perps stop that opens a position fills only within 10 % of its trigger.
+
+## FIXED — Spot swaps and orders missed better prices; triggers never saw the pools; a failed batch moved a pool
+
+**Severity: high (the failed batch); medium otherwise (users lost value to arbitrage, stops did
+not fire).** Found 2026-10-27, on
+the user's question. docs/UNIFIED_SPOT_LIQUIDITY.md. A fresh genesis carries the fixes.
+
+- **A swap never routed through another token**, even when A→QRDX→B paid twice what A→B did
+  (the user's example). A swap now plans the pair and two hops through each routing hub, and
+  takes the best.
+- **A swap used one venue for all of its input**: one pool, or the book. It now walks the
+  pair's book and every pool in price order, and splits between pools to one marginal price.
+- **A spot limit order matched only the book.** A buy at 2.10 rested while a pool sold at 2.00:
+  anyone could buy from the pool and sell to it. Orders now take from the pools first, within
+  their limit; post-only orders that would are refused.
+- **A swap could push a pool past resting orders without filling them.** No taker trades through
+  a resting order now. Resting orders that new liquidity (or their owner's own swap) left crossed
+  fill from the pools at the next tick, at the pools' price.
+- **Spot stops and take-profits watched only the book's last trade.** On a pair that trades in
+  its pools a stop never fired. The last price now includes pool trades, and a trigger reached by
+  any trade after it was placed fires, even if the price came back within the block.
+- **A failed operation left a pool's price moved (high).** A pool's snapshot was restored only
+  if the failure came inside the step that moved it. Every balance was undone, but the pool kept
+  the swap's price, so its curve no longer matched what its holder held. Two cases, both
+  reproduced on the code before this change:
+  - a `BATCH` whose swap succeeded and whose next action failed;
+  - a two-hop swap that missed its `min_amount_out`.
+
+  Anyone could move a pool's price for free with a batch built to fail, then trade against the
+  moved price at the liquidity providers' expense. The snapshot now belongs to the operation's
+  undo scope, so any failure puts the pool back.
+
+Tests: `test_unified_spot.py` (`test_a_failed_batch_puts_its_swaps_pool_back`).
+
+## FIXED — A sold name kept routing to its seller; one key could price a market
+
+**Severity: high (the first two).** Found 2026-10-26. None was ever on a network but the
+snapshot test nets; a fresh genesis carries the fixes.
+
+- **A QNS name kept resolving to its seller after it was sold or transferred.** A name's records
+  (its address and text records) were the name's, not its holder's. The NFT moved, by
+  `NFT_TRANSFER`, the EVM's ERC-721 precompile or any sale, but the name still resolved where
+  the old owner had pointed it, and the old owner's primary name stayed valid. Records now carry
+  the account that held the NFT when they were set. Held by anyone else, the name resolves to
+  its current owner, with no text records, until that owner sets its own. This covers every
+  path that moves the NFT without hooking any of them.
+  Test: `test_qns.py::test_selling_or_transferring_a_name_takes_its_records_with_it`.
+- **One key could set a market's price.** A configured reporter's `UPDATE_ORACLE` set any
+  validator-priced market's oracle outright. A deployer market's deployer set its own
+  (`DEPLOYER_SET_ORACLE`, docs/HYPERLIQUID_PARITY.md 8 as it was). Both are gone: operations 11
+  and 79–82 no longer decode, and `ORACLE_REPORTERS` and the `DEPLOYER_*` parameters are
+  removed. The validators' aggregated votes price the markets of off-chain assets. A token perp
+  is priced by its token's spot market (13).
+- **Native-token perps were listed by ticker, on pools the proposal pinned**, and their depth was
+  the pools' virtual reserves.
+  - Liquidity in a narrow range near the price counted as if spread over every price: over 20×
+    its capital in the test. So it raised the open-interest cap cheaply.
+  - A market pinned to a thin pool stayed on it.
+
+  Token perps are listed by the token's address. They read the deepest path with a TWAP's
+  history every block, and depth is what moving the price 2 % takes.
+  Tests: `test_token_perps.py`, `test_token_perps_adversarial.py`.
+- **Open listing.** `PERP_OPEN_LISTING` let anyone list a validator-priced market on a network
+  that set it. Removed: such markets come from genesis (`PERP_GENESIS_MARKETS`: BTC, ETH, SOL)
+  or governance.
 
 ## FIXED — Isolated orders crossing the spread were refused; pool TWAPs had 16 s of history
 
@@ -263,26 +757,16 @@ Found building native-token perps (2026-10-23):
 
 ## FIXED — Funding on a deployer's untrusted price; a ticker's token renamed
 
-Found by playing out a malicious deployer block by block (`tests/test_deployer_adversarial.py`,
-2026-10-23):
+Found by playing out a malicious deployer block by block (the deployer markets' adversarial
+test, 2026-10-23; deployer markets were removed on 2026-10-26):
 - **Funding kept running on a frozen or abandoned deployer market's price.** The funding
   premium (book against oracle) was sampled every block, frozen or not. The validators' freeze
   stopped the deployer's oracle, but not funding at up to 4 % an hour on the price it left
   behind. The same held for an oracle its deployer stopped updating. Neither samples a premium
-  now: such an interval pays the interest rate alone.
+  now: such an interval pays the interest rate alone. The rule stays for token perps: none is
+  sampled while a token perp's oracle is stale.
 - **A ticker's token could change its symbol** (its metadata authority). It would then show one
   asset's symbol under another's ticker. A token holding a ticker now keeps its symbol.
-
-## OPEN — A deployer can extract funding until the validators freeze its market
-
-**Severity: medium (design, bounded).** docs/HYPERLIQUID_PARITY.md 8. A deployer that holds its
-oracle away from the book collects funding from the other side, at most 4 % of open interest an
-hour, until the validators freeze the market (`QRDX_ORACLE_FREEZE`) and governance slashes the
-bond. It can also walk the oracle 1 % a second to liquidate that side. Only that market's
-isolated positions are reachable. The bond (1,250 QRDX, ~$500,000) should exceed what a deployer market's
-open interest could yield in the time the validators take to react: review the bond and the
-open-interest caps together. Monitoring deployer markets for an oracle off the book is
-operators' work.
 
 ## FIXED — Perps settings an outside actor could choose, and paths around the perps rules
 
@@ -303,8 +787,8 @@ operators' work.
   (tests/test_constants_single_definition.py caught it).
 - **Whoever listed a validator-priced market first chose its settings.** That included its
   maximum leverage and grid, and it took the canonical name for good. These markets are now
-  listed by governance (`list_market`). `CREATE_MARKET` lists deployer markets only, unless the
-  chain spec sets `PERP_OPEN_LISTING` (a dev network's setting).
+  listed by governance (`list_market`). (Since 2026-10-26, `CREATE_MARKET` lists token perps
+  only.)
 - **A deployer's oracle could reach accounts outside its market.**
   - Cross margin mixed a deployer market with an account's other positions.
   - The shared backstop vault took over its liquidations.
@@ -542,7 +1026,9 @@ signed release) and from the operator (`QRDX_TRUSTED_CHECKPOINT`).
 
 Tests: `tests/test_trusted_checkpoints.py`.
 
-**Still open:** checkpoint sync. A new node still replays from genesis.
+**Checkpoint sync, then open, is built** (2026-10-28, [CHECKPOINT_SYNC.md](CHECKPOINT_SYNC.md)).
+A new node restores a verified snapshot instead of replaying from genesis, and nodes publish
+snapshots themselves (`QRDX_SNAPSHOT_DIR`).
 
 ## FIXED — A second, unused token class remained
 
@@ -733,7 +1219,7 @@ followed by the new branch's blocks. Measured on the local 250 ms testnet: the m
 `block` events is 250 ms, as the blocks are produced. Tests: `tests/test_observability.py`
 (signal, latency, reorg detection, the exchange stream waking on a block).
 
-## OPEN — Each block still carries a 3.3 KB signature (was: the chain grew 7 GB a day)
+## FIXED on full nodes, ACCEPTED on archives — Each block carried a 3.3 KB signature (was: the chain grew 7 GB a day)
 
 **Severity: low (operations).** At 250 ms slots a node grew by 21.8 KB a block, about 7.5 GB a
 day. Three hex fields made most of each 17.8 KB body:
@@ -770,6 +1256,16 @@ day. Going lower needs one of two choices:
 - **Produce no block for an empty slot.** Inclusion latency is unchanged, but votes, oracle
   updates and exchange ticks would have to ride the next block, or a periodic one.
 
+**Fixed (2026-10-28) by the first option, history pruning** ([CHECKPOINT_SYNC.md](CHECKPOINT_SYNC.md)
+§3). A full node (`QRDX_HISTORY_RETENTION_BLOCKS`, at least 4,096) drops, behind finality:
+* the proposer's signature;
+* its votes' signatures;
+* its exchange and EVM sections.
+
+It keeps every header. That was about 4.4 KB a block on the live testnet. New nodes join from a
+verified snapshot instead of replaying from genesis. An archive node (the default) still keeps
+everything: ~1.2 GB a day at 250 ms, accepted for the nodes that serve history.
+
 ## FIXED — An EVM precompile read a node-local table
 
 The QRDX fork's `getChainState` precompile (0x0200, `py-evm/eth/vm/forks/qrdx/precompiles.py`)
@@ -781,13 +1277,13 @@ forward: docs/BRIDGE.md "Chain heads"), and the node's EVM answers 0x0200 from t
 state, ahead of the fork's table (`evm_world.chain_state_precompile`). Test:
 `tests/test_chain_heads.py` (the table is filled with a node's own view, and ignored).
 
-## ACCEPTED — Oracle reporters are trusted (development override only)
+## FIXED — Oracle reporters were trusted (was: accepted as a development override)
 
-Production prices come from the validator oracle (docs/PERPS_CLEARINGHOUSE.md §8). Addresses in
-`QRDX_ORACLE_REPORTERS` (a consensus parameter; empty by default) may still set a market's oracle
-directly with `UPDATE_ORACLE` — trusted outright, no aggregation — which unit tests and
-development setups use. No production network should configure one; the integration testnet no
-longer does.
+`QRDX_ORACLE_REPORTERS` let configured addresses set a market's oracle directly with
+`UPDATE_ORACLE`, trusted outright with no aggregation. Unit tests and development setups used it.
+Removed on 2026-10-26: no key prices a market on any network. Tests price markets with real
+validator votes (the `oracle_committee` fixture), or set the clearinghouse's oracle directly
+where only settlement math is under test.
 
 ## FIXED — A finality stall longer than the withdrawability delay reopened the slashing window
 
@@ -836,15 +1332,17 @@ the unification. See [UNIFIED_ACCOUNT_IDENTITY.md §2](UNIFIED_ACCOUNT_IDENTITY.
 
 ---
 
-## ACCEPTED — Exchange operations are PQ-only senders
+## RESOLVED — Exchange operations were PQ-only senders
 
-`ExchangeTransaction.verify()` binds to a Dilithium key, so a traditional `0x` account
-cannot open a perp position, place a CLOB order, or deploy a QRC-20. Native transfers and
-contract calls are symmetric between the two account families; exchange operations are
-not.
+`ExchangeTransaction.verify()` binds to a Dilithium key, so a traditional `0x` account could
+not trade on the exchange.
 
-**To close (if wanted):** a secp256k1-signed exchange envelope, or route exchange
-operations through contracts so the EVM's own authentication covers them.
+**Resolved (2026-10-27).** An Ethereum account approves a post-quantum agent key with one EVM
+transaction to the exchange write precompile (`AGENT_APPROVE` is now an EVM action; so is
+`AGENT_REVOKE`). The agent then signs ordinary exchange transactions for the `0x` account. It
+trades only, and can never move the account's funds (`AGENT_SCOPE`). An account can also trade
+directly through the precompile, one EVM transaction per action. See docs/PERPS_API.md,
+"Trading from an Ethereum wallet", and tests/test_evm_exchange.py.
 
 ---
 
@@ -859,16 +1357,19 @@ production-scale set or a larger slot ([PROTOCOL_UPGRADES.md](PROTOCOL_UPGRADES.
 
 ---
 
-## ACCEPTED — The legacy UTXO ledger is vestigial
+## FIXED — The legacy UTXO ledger was still read for balances
 
-`unspent_outputs` is still read as a fallback in `get_address_balance`, but nothing writes
+`unspent_outputs` was read as a fallback in `get_address_balance`, though nothing should write
 to it: genesis funds every allocation, system wallets included, in `account_state`. Until
 2026-10-09 the system wallets were the exception, and that fallback is what hid a
 value-creation bug ([below](#fixed-system-wallet-balances-lived-only-in-the-legacy-utxo-ledger)).
+Its last writer was the proof-of-work path, now refused
+([above](#fixed--a-mined-block-could-be-appended-to-the-proof-of-stake-chain-latent)).
 
-`qrdx/transactions/transaction_output.py` cannot represent `0x` or `0xPQ` addresses at all
-(it needs base58 secp256k1 curve points). Kept only for legacy reads. Removing the fallback
-would make any future gap fail loudly rather than read as a balance.
+**Fixed (2026-11-02):** balances come from `account_state` alone, so a future gap reads as zero
+and fails loudly. The table stays: the unified root still hashes it (empty).
+`qrdx/transactions/transaction_output.py`, which cannot represent `0x` or `0xPQ` addresses,
+remains only for legacy reads.
 
 ---
 
@@ -905,6 +1406,12 @@ These are not defects, but they are the reason two real bugs survived a green su
   green result. The test now asserts the position and the liquidity actually landed;
   every equivalence chain should assert its operations took effect, and each new one
   here ships with a sensitivity test showing the old code diverges on it.
+* **A transaction that never ran looks like one that failed.** `test_fast_reorg_rebuild`
+  built a new branch after each reorg with nonces from its own counter, which had moved past
+  the chain's. The branch's transfers were refused before running, carried unexecuted and
+  ignored, so the fast and full rebuilds agreed over branches where nothing happened. The
+  `exchange_inclusion` rule (2026-11-02) made such blocks invalid, and the test failed until it
+  read its nonces from the chain. Its branches now execute.
 * **Synthetic fixtures miss real formats.** The interleaved rebuild passed every unit test
   and crashed on the first real chain, because real genesis stores a `datetime` timestamp
   and the fixtures used integers. Replaying a soak node's database offline with the real
@@ -921,6 +1428,9 @@ These are not defects, but they are the reason two real bugs survived a green su
 
 | Issue | Where |
 |---|---|
+| Unfunded exchange transactions rode in blocks for free (no fee, no nonce, repeatable) | [above](#fixed--unfunded-exchange-transactions-rode-in-blocks-for-free) |
+| A mined block could be appended to the proof-of-stake chain (latent) | [above](#fixed--a-mined-block-could-be-appended-to-the-proof-of-stake-chain-latent) |
+| A restored snapshot's contract code and genesis records were not verified | [above](#fixed--a-restored-snapshots-contract-code-and-genesis-records-were-not-verified) |
 | Exchange duties cost O(state) per block (liquidation scan, revert snapshot, book digests, top-of-book reads); two stop orders could fail a section | [below](#fixed-exchange-duties-cost-ostate-per-block) |
 | Restarts replayed derived state from genesis, and fast reorgs kept orphaned exchange history | [below](#fixed-restarts-replayed-derived-state-from-genesis-and-fast-reorgs-kept-orphaned-history) |
 | Each block carried 17 KB of hex (key, unused RANDAO reveal, signature); the chain grew 7.5 GB a day | [below](#open-each-block-still-carries-a-33-kb-signature-was-the-chain-grew-7-gb-a-day) |
@@ -1560,7 +2070,7 @@ a single key, controlled all ten system wallets (75M QRDX) with no way to remove
 - **Forks need validator approval** to activate (PROTOCOL_UPGRADES.md §4a).
 
 Tests: `tests/test_governance.py`; live: `integration_tests/scenarios/s22_governance.py`. The old
-`qrdx/governance/` library remains, unused.
+`qrdx/governance/` library was removed on 2026-10-27.
 
 ## FIXED — There was no way to change a consensus rule after launch
 
@@ -1727,7 +2237,9 @@ QRDX, **burned** as EVM gas is (about 0.00004–0.00015 QRDX per operation). `ga
 gas_price` is reserved before the operation runs, so it cannot spend its own gas, and the rest
 is refunded. An operation priced below the floor or not whole wei, or whose sender cannot cover
 the reservation, is refused before it executes and consumes nothing, nonce included; the
-mempool refuses an under-priced one at admission. Receipts carry `fee` and `gas_price`.
+mempool refuses an under-priced one at admission. (Such a refused transaction could still be
+carried in a block, unpaid and repeatable, until the 2026-11-02 fix: "Unfunded exchange
+transactions rode in blocks for free", at the top.) Receipts carry `fee` and `gas_price`.
 `tests/test_exchange_fees.py`; soaked with every scenario now paying gas (21/21, SOAK PASS).
 
 **Found on the way: the enforcement gates were set in four places.** The proposer, the
@@ -2032,7 +2544,8 @@ What the interim fix did (qrdx/exchange/state_manager.py, since removed):
   judged time by the node's wall clock"), refuses to trade.
 * `UPDATE_ORACLE` is accepted only from `constants.ORACLE_REPORTERS`
   (`QRDX_ORACLE_REPORTERS`, a consensus parameter; empty by default, which disables perps until
-  configured). The trust this places in reporters is listed under accepted limitations.
+  configured). Reporters were later removed altogether (2026-10-26): only validator votes, or a
+  token perp's spot market, price a market.
 * Only a position's owner may close it.
 * The integration testnet configures an "Oracle Reporter" wallet, and S13 prices its market
   through it before trading — S13 passed in the soak with the reporter-priced market.

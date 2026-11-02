@@ -172,7 +172,7 @@ Like an SPL Token-2022 mint, a token opts into extensions **when it is deployed*
 | permanent delegate | `permanent_delegate` | may transfer (`TOKEN_TRANSFER_FROM`) and burn (`TOKEN_BURN` with `from`) anyone's balance without an allowance — a regulated issuer's clawback. Frozen balances stay frozen |
 | pausable | `pausable: true`, `pause_authority` (default: the deployer) | `TOKEN_PAUSE` stops every transfer, mint and burn of the token — spot and perps moves included — until `TOKEN_RESUME` |
 | default operators | `default_operators` (≤ 8 addresses) | ERC-777: operators for every holder, until that holder revokes one |
-| Doomsday trading flag | `post_doomsday_trade: true` | Whitepaper §9.2: the deployer declares the token backed by locked classical assets, so clients may keep trading it after the Doomsday Protocol triggers. Advisory only: `qrdx/tokens/doomsday_hook.py` combines it with the protocol's state for a client's Strict / Warning / Permissionless mode |
+| Doomsday trading flag | `post_doomsday_trade: true` | Whitepaper §9.2: the deployer declares the token backed by locked classical assets, so clients may keep trading it after the Doomsday Protocol triggers. Advisory only: a client combines it with the protocol's state (`bridge_getDoomsday`, docs/QUANTUM_MIGRATION.md) to decide whether to warn |
 
 **Operators (ERC-777).** Any holder may authorize operators (`TOKEN_AUTHORIZE_OPERATOR`, at
 most 64 per holder across tokens) that move and burn its balance without an allowance, and
@@ -257,3 +257,9 @@ A token's symbol is not unique: anyone may deploy one called USDC. A **ticker** 
 holds it, for good, bought by its creator in a continuous Dutch auction (`TICKER_CLAIM`). The
 bridged assets' tickers are reserved for the bridge's tokens. A token holding a ticker keeps its
 symbol. See docs/HYPERLIQUID_PARITY.md 11.
+
+## Perps
+
+Any token with a spot market deep enough may have a perp: anyone lists it by the token's address
+(`CREATE_MARKET {token}`), and it is priced off the token's own pools, never by a vote or a key.
+See docs/HYPERLIQUID_PARITY.md 13.

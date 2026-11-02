@@ -17,6 +17,9 @@ os.environ.setdefault("QRDX_PERP_MARKET_MIN_LIQUIDITY", "0")
 # Likewise without the order grid (sizes, prices, a minimum value: tests/test_order_grid.py).
 os.environ.setdefault("QRDX_PERP_MIN_ORDER_VALUE", "0")
 os.environ.setdefault("QRDX_PERP_DEFAULT_SZ_DECIMALS", "-1")
+# No genesis perp markets (BTC, ETH, SOL by default): a test lists what it trades. Genesis markets
+# have their own tests (tests/test_perp_markets.py), and the ``genesis_btc`` fixture.
+os.environ.setdefault("QRDX_PERP_GENESIS_MARKETS", "")
 
 # Every incremental exchange root is checked against a from-scratch recomputation, so any code
 # that changes exchange state without the commitment tracking seeing it fails the test that
@@ -39,13 +42,44 @@ def no_risk_limits(monkeypatch):
 
 
 @pytest.fixture
-def open_listing(monkeypatch):
-    """Anyone may list a validator-priced perp market with CREATE_MARKET (PERP_OPEN_LISTING, a
-    dev network's setting), for tests that list markets as their setup. Production lists them by
-    governance (``list_market``): tests/test_perps_listing_and_leverage.py."""
+def genesis_btc(monkeypatch):
+    """BTC, the one genesis perp market (PERP_GENESIS_MARKETS): every block path — forward,
+    import and rebuild — creates it with the first block, so a test on a chain of blocks trades
+    it from the start. Maximum leverage 20, no order grid."""
     from qrdx import constants
 
-    monkeypatch.setattr(constants, "PERP_OPEN_LISTING", 1)
+    monkeypatch.setattr(constants, "PERP_GENESIS_MARKETS", ("BTC:20:-1",))
+
+
+@pytest.fixture
+def oracle_committee():
+    """A one-validator oracle committee for tests that price validator markets with real votes
+    (ORACLE_VOTE): no single key prices a market, so a test's prices come the way a network's
+    do. ``load(mgr)`` sets the committee on a manager (each rebuild's too); ``vote(prices)``
+    signs a vote — it applies at its block's tick, after the block's transactions."""
+    import json
+    from types import SimpleNamespace
+
+    from qrdx.crypto.pq.dilithium import PQPrivateKey
+    from qrdx.exchange import ExchangeOpType, ExchangeTransaction
+
+    key = PQPrivateKey.generate()
+    addr = key.public_key.to_address()
+    genesis = json.dumps({"type": "genesis", "validators": 1,
+                          "validator_set": [{"address": addr, "stake": "1000"}]})
+    seq = [0]
+
+    def vote(prices):
+        seq[0] += 1
+        tx = ExchangeTransaction(op_type=ExchangeOpType.ORACLE_VOTE, sender=addr, nonce=seq[0],
+                                 params={"prices": {b: str(p) for b, p in prices.items()}},
+                                 gas_limit=100_000)
+        tx.public_key = key.public_key.to_bytes()
+        tx.signature = key.sign(tx.signing_bytes()).to_bytes()
+        return tx
+
+    return SimpleNamespace(address=addr, key=key, genesis=genesis,
+                           load=lambda mgr: mgr.load_oracle_committee(genesis), vote=vote)
 
 
 @pytest.fixture

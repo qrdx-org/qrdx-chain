@@ -321,15 +321,10 @@ class DNSSeedDiscovery:
             signature = bytes.fromhex(sig_hex)
             public_key = bytes.fromhex(pubkey_hex)
 
-            # Resolve algorithm name
-            for algo_name in ("ML-DSA-65", "Dilithium3"):
-                try:
-                    verifier = oqs.Signature(algo_name)
-                    return verifier.verify(message, signature, public_key)
-                except Exception:
-                    continue
+            from ..crypto.pq.algorithms import SIG_ALGORITHM, require
 
-            return False
+            require()
+            return bool(oqs.Signature(SIG_ALGORITHM).verify(message, signature, public_key))
 
         except ImportError:
             logger.warning("liboqs not available — cannot verify DNS seed signatures")

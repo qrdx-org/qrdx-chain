@@ -140,20 +140,21 @@ def test_a_quote_is_exactly_what_the_swap_gets_and_changes_nothing(mgr):
 
 def test_the_spot_book_open_orders_and_a_book_quote(mgr):
     _pool(mgr, lo=-60000, hi=60000, liquidity="1000")         # a thin pool
+    # (At 1.002 the bid beats the pool, which buys at 1 less its 0.3 % fee.)
     o = mgr.process_transaction(_tx(CAROL, ExchangeOpType.PLACE_ORDER, {
-        "pair": f"{T0}:{T1}", "side": "buy", "order_type": "limit", "price": "0.99",
+        "pair": f"{T0}:{T1}", "side": "buy", "order_type": "limit", "price": "1.002",
         "amount": "50"}))
     assert o.success, o.error
     book = views.spot_order_book(mgr, f"{T1}:{T0}")           # either order
     assert book["pair"] == f"{T0}:{T1}" and book["base"] == T0
-    assert [[D(p), D(a)] for p, a in book["bids"]] == [[D("0.99"), D(50)]] and book["asks"] == []
+    assert [[D(p), D(a)] for p, a in book["bids"]] == [[D("1.002"), D(50)]] and book["asks"] == []
     assert book["escrow_address"] == mgr.orderbook_escrow_address(f"{T0}:{T1}")
     [mine] = views.spot_open_orders(mgr, CAROL)
     assert mine["side"] == "buy" and D(mine["remaining"]) == 50
     assert views.spot_open_orders(mgr, BOB) == []
     q = views.quote(mgr, T0, T1, "10", BOB)
-    assert q["source"] == "clob" and D(q["amount_out"]) == D("9.9")
-    # Carol's own bid would stop her at once (self-trade prevention), so her quote is the pool's.
+    assert q["source"] == "clob" and D(q["amount_out"]) == D("10.02")
+    # Carol's own bid closes the book to her (self-trade prevention), so her quote is the pool's.
     assert views.quote(mgr, T0, T1, "10", CAROL)["source"] == "amm"
     assert views.spot_order_book(mgr, f"{T0}:0x" + "44" * 20) is None
 

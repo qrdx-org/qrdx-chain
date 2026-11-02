@@ -2,12 +2,11 @@
 QRDX Validator Node Integration
 
 This module integrates the PoS consensus validator into the node lifecycle.
-It handles validator initialization, block production, attestation, epoch processing,
-and canary wallet monitoring for the Doomsday Protocol (§8.5).
+It handles validator initialization, block production, attestation, epoch processing and
+oracle votes (prices, bridge deposits and chain heads).
 """
 
 import asyncio
-import json
 import os
 import time
 from datetime import datetime, timezone
@@ -15,10 +14,10 @@ from decimal import Decimal
 from typing import Any, List, Optional
 
 from ..constants import SLOT_DURATION, SLOTS_PER_EPOCH
-from ..crypto.pq.dilithium import PQPrivateKey as PrivateKey
 from ..logger import get_logger
 from ..wallet_v2.pq_wallet import PQWallet
 from .config import ValidatorConfig
+from .keystore import ValidatorKeyError
 from .manager import ValidatorManager
 from .types import Validator, ValidatorSet, ValidatorStatus
 
@@ -140,11 +139,6 @@ class ValidatorNode:
         self._block_production_task: Optional[asyncio.Task] = None
         self._attestation_task: Optional[asyncio.Task] = None
         self._epoch_processing_task: Optional[asyncio.Task] = None
-        self._canary_monitor_task: Optional[asyncio.Task] = None
-
-        # ── Doomsday / canary monitoring (§8.5) ──
-        self._eth_adapter = None  # Set via set_eth_adapter()
-        self._doomsday_protocol = None  # Set via set_doomsday_protocol()
 
         # ── Exchange tx inclusion (Phase D2.2) ──
         # An object exposing select_for_block(limit) -> [ExchangeTransaction]
@@ -167,6 +161,9 @@ class ValidatorNode:
         self._proposal_guard = None
         self._last_skip_reason = None
         self._restore_hook = None  # main._restore_after_rejected_block
+        # Slashing protection and the doppelganger check (set in initialize()).
+        self.protection: Optional[Any] = None
+        self._doppelganger: Optional[Any] = None
 
         logger.info(f"ValidatorNode initialized for wallet: {validator_wallet_path}")
 
@@ -178,32 +175,18 @@ class ValidatorNode:
             True if initialization successful, False otherwise
         """
         try:
-            # Load wallet from JSON
+            # The key must come from an encrypted keystore on a real network; a plaintext key
+            # is accepted on dev networks only (qrdx/validator/keystore.py). The loader checks
+            # that the file's address, public key and secret key all belong together: a
+            # validator proposing under an identity other than its registration never converges.
+            from .. import chain_spec as _chain_spec
+            from .keystore import load_validator_wallet
+
             logger.info(f"Loading PQ wallet from {self.wallet_path}")
-            with open(self.wallet_path, "r") as f:
-                wallet_data = json.load(f)
-
-            # Extract keys and address
-            address = wallet_data["address"]
-            private_key_hex = wallet_data["private_key"]
-            public_key_hex = wallet_data.get("public_key")
-
-            # Load PQ wallet from hex private key. CRITICAL: the stored public key
-            # MUST be passed — a Dilithium secret key cannot re-derive its public
-            # key, so restoring without it makes PQPrivateKey generate a RANDOM new
-            # keypair (see dilithium._restore_from_bytes), yielding a wrong address.
-            # That made each validator propose under an identity that didn't match
-            # its genesis registration → validators never converged on a common set
-            # → every node thought it was the sole proposer → reorg churn.
-            private_key = PrivateKey.from_hex(private_key_hex, public_key_hex=public_key_hex)
-            self.wallet = PQWallet(private_key=private_key)
-
-            # Fail fast if the restored identity does not match the wallet file.
-            if public_key_hex and self.wallet.address != address:
-                raise Exception(
-                    f"validator wallet identity mismatch: file address {address} != "
-                    f"restored {self.wallet.address} (public key not preserved on load)"
-                )
+            self.wallet = load_validator_wallet(
+                self.wallet_path, self.password, allow_plaintext=_chain_spec.active().dev
+            )
+            self.password = ""  # no longer needed once the key is open
             logger.info(f"Wallet loaded: {self.wallet.address}")
 
             # Create validator configuration (use defaults)
@@ -216,6 +199,26 @@ class ValidatorNode:
                 config=self.config,
                 database=self.db,  # Pass database for stake persistence
             )
+
+            # Slashing protection: every block and vote recorded before it is signed, in a
+            # record of its own (it survives a resync of the chain database) that one process
+            # holds at a time. The chain database's older vote record is folded in. Then the
+            # doppelganger check, for the same key signing on another machine.
+            from .doppelganger import DoppelgangerGuard, configured_epochs
+            from .slashing_protection import SlashingProtection, default_path, network_key
+
+            self.protection = await SlashingProtection.open(default_path(), network_key())
+            if await self.protection.import_legacy_votes(self.db):
+                logger.info("Folded the chain database's vote record into slashing protection")
+            self.manager.slashing_protection = self.protection
+            self._doppelganger = DoppelgangerGuard(
+                self.db,
+                self.protection,
+                self.wallet.address,
+                configured_epochs(_chain_spec.active().dev),
+                SLOTS_PER_EPOCH,
+            )
+            logger.info(f"Slashing protection: {self.protection.path}")
 
             # Load existing stakes from database
             await self.manager.stake_manager.load_from_database()
@@ -332,6 +335,8 @@ class ValidatorNode:
             logger.info("✅ Validator initialization complete")
             return True
 
+        except ValidatorKeyError:
+            raise  # the operator asked for a validator: never fall back to running without one
         except Exception as e:
             logger.error(f"Failed to initialize validator: {e}", exc_info=True)
             return False
@@ -351,11 +356,6 @@ class ValidatorNode:
         self._epoch_processing_task = asyncio.create_task(self._epoch_processing_loop())
         self._oracle_task = asyncio.create_task(self._oracle_vote_loop())
 
-        # Start canary monitor if adapter & doomsday are configured
-        if self._eth_adapter is not None and self._doomsday_protocol is not None:
-            self._canary_monitor_task = asyncio.create_task(self._canary_monitor_loop())
-            logger.info("🔍 Canary monitor started (Doomsday §8.5)")
-
         logger.info("✅ Validator tasks started")
 
     async def stop(self):
@@ -372,8 +372,9 @@ class ValidatorNode:
             self._epoch_processing_task.cancel()
         if getattr(self, "_oracle_task", None):
             self._oracle_task.cancel()
-        if self._canary_monitor_task:
-            self._canary_monitor_task.cancel()
+        if self.protection is not None:
+            await self.protection.close()
+            self.protection = None
 
         logger.info("Validator stopped")
 
@@ -508,6 +509,7 @@ class ValidatorNode:
                     # fail on the height it just took. Nor before the node's first sync with
                     # its peers: its tip may be far behind the network's.
                     reason = self._proposal_guard() if self._proposal_guard is not None else None
+                    reason = reason or await self._block_signing_refusal(current_slot)
                     if reason:
                         if reason != self._last_skip_reason:
                             logger.info("⏭  Skipping slot %s: %s", current_slot, reason)
@@ -537,8 +539,16 @@ class ValidatorNode:
                         # The block's timestamp, fixed BEFORE the sections execute and passed to
                         # propose_block so the block carries exactly this value: importers execute
                         # the sections at the block's timestamp, and the exchange judges funding,
-                        # oracle staleness and swap deadlines by it.
-                        block_timestamp = int(datetime.now(timezone.utc).timestamp())
+                        # oracle staleness and swap deadlines by it. Under ``slot_timestamps``
+                        # it is the slot's start time, which importers require.
+                        from .. import chain_spec as _spec
+                        from .block_verification import genesis_time, slot_timestamp
+
+                        origin = await genesis_time(self.db)
+                        if _spec.is_active("slot_timestamps", next_height) and origin is not None:
+                            block_timestamp = slot_timestamp(origin, current_slot)
+                        else:
+                            block_timestamp = int(datetime.now(timezone.utc).timestamp())
 
                         # The base fees the parent sets (qrdx/fee_market.py): the block carries
                         # them, and only transactions offering at least them.
@@ -563,6 +573,26 @@ class ValidatorNode:
 
                                 if exchange_txs and chain_spec.is_active(FEATURE, next_height):
                                     exchange_txs = fair_order(exchange_txs)
+                                # Only transactions that will run (``exchange_inclusion``),
+                                # judged before anything is pre-loaded; the rest leave this
+                                # node's mempool (the sender may send them again).
+                                from ..exchange.block_processor import includable_exchange_txs
+
+                                exchange_txs, refused = await includable_exchange_txs(
+                                    self.db,
+                                    exchange_txs,
+                                    next_height,
+                                    float(block_timestamp),
+                                    base_fees[1],
+                                )
+                                if refused:
+                                    logger.info(
+                                        f"Leaving {len(refused)} exchange tx(s) out of block "
+                                        f"#{next_height}: {refused[0][1]}"
+                                    )
+                                    self._exchange_tx_source.remove(
+                                        [t.tx_hash() for t, _why in refused]
+                                    )
                             except Exception as e:
                                 logger.warning(f"Exchange tx selection failed: {e}")
                                 exchange_txs = []
@@ -735,25 +765,34 @@ class ValidatorNode:
                         # exchange) and bind it into the block's signed header. The importer
                         # recomputes it after replaying the sections and verifies it matches
                         # this signed root — full cryptographic binding of all state domains.
-                        unified_root = await self._compute_unified_state_root(next_height)
+                        unified_root = await self._compute_unified_state_root(
+                            next_height, current_slot
+                        )
 
                         # The sections in their wire form: the header commits to them
                         # (body_root), exactly as importers will receive them.
                         from ..contracts.evm_block import encode_evm_txs
                         from ..exchange.block_processor import encode_exchange_txs
+                        from .types import AlreadyProposedError
 
-                        block = await self.manager.propose_block(
-                            slot=current_slot,
-                            parent_hash=parent_hash,
-                            transactions=pending_txs[:100],  # Limit to 100 txs per block
-                            state_root=unified_root,
-                            timestamp=block_timestamp,
-                            exchange_section=(
-                                encode_exchange_txs(exchange_txs) if exchange_txs else []
-                            ),
-                            evm_section=encode_evm_txs(evm_txs) if evm_txs else [],
-                            base_fees=base_fees,
-                        )
+                        try:
+                            block = await self.manager.propose_block(
+                                slot=current_slot,
+                                parent_hash=parent_hash,
+                                transactions=pending_txs[:100],  # Limit to 100 txs per block
+                                state_root=unified_root,
+                                timestamp=block_timestamp,
+                                exchange_section=(
+                                    encode_exchange_txs(exchange_txs) if exchange_txs else []
+                                ),
+                                evm_section=encode_evm_txs(evm_txs) if evm_txs else [],
+                                base_fees=base_fees,
+                            )
+                        except AlreadyProposedError:
+                            # Slashing protection refused to sign: the sections already ran
+                            # for this height, so undo them before giving up the slot.
+                            await self._restore_state(next_height, "slashing protection refused")
+                            block = None
 
                         if block:
                             logger.info(
@@ -863,7 +902,6 @@ class ValidatorNode:
 
         from . import ffg
 
-        signing = ffg.SigningRecord(self.db)
         voted: set = set()  # epochs this process has voted in (the record is the authority)
         last_slot = -1
         current_slot = 0
@@ -887,8 +925,10 @@ class ValidatorNode:
                 # A later slot of the epoch retries.
                 if self._proposal_guard is not None and self._proposal_guard():
                     continue
+                if await self._signing_hold(current_slot):
+                    continue
                 await self._sleep_until(current_slot, 1 / 3)
-                if await self._cast_vote(current_slot, current_epoch, signing):
+                if await self._cast_vote(current_slot, current_epoch):
                     voted.add(current_epoch)
                     voted.discard(current_epoch - 2)
 
@@ -937,20 +977,46 @@ class ValidatorNode:
                 epoch=0, validators=members, total_stake=sum((v.stake for v in members), Decimal(0))
             )
 
-    async def _cast_vote(self, slot: int, epoch: int, signing: Any) -> bool:
-        """Cast this epoch's FFG vote: from our latest justified checkpoint to the epoch's
-        checkpoint, recorded as signed BEFORE it leaves the node. True once the epoch is
-        settled (voted, or a vote would be slashable); False to retry next slot."""
-        from . import ffg
+    async def _signing_hold(self, slot: int) -> Optional[str]:
+        """Why this validator must not sign at ``slot`` (the doppelganger check), or None."""
+        if self._doppelganger is None:
+            return None
+        try:
+            return await self._doppelganger.hold(slot)
+        except Exception as e:
+            # A check that cannot run must not let the validator sign blind.
+            logger.error(f"doppelganger check failed: {e}")
+            return f"doppelganger check failed: {e}"
 
-        if self.manager is None or self.wallet is None:
+    async def _block_signing_refusal(self, slot: int) -> Optional[str]:
+        """Why no block may be signed at ``slot``, checked before any section runs: the
+        doppelganger check, or a block for the slot already in the slashing-protection record
+        (signed just before a restart, say). None if a block may be signed."""
+        hold = await self._signing_hold(slot)
+        if hold:
+            return hold
+        if self.protection is not None and self.wallet is not None:
+            if not await self.protection.may_sign_block(self.wallet.address, slot):
+                return "slashing protection: a block for this slot is already signed"
+        return None
+
+    async def _cast_vote(self, slot: int, epoch: int) -> bool:
+        """Cast this epoch's FFG vote: from our latest justified checkpoint to the epoch's
+        checkpoint, recorded as signed BEFORE it leaves the node (create_attestation, through
+        slashing protection). True once the epoch is settled (voted, or a vote would be
+        slashable); False to retry next slot."""
+        from . import ffg
+        from .types import AlreadyAttestedError
+
+        if self.manager is None or self.wallet is None or self.protection is None:
             return False
         vote = await ffg.vote_for(self.db, epoch)
         head = await self._read_block_header(await self.db.get_next_block_id() - 1)
         if vote is None or not head:
             return False
         address = self.wallet.address
-        if not await signing.may_sign(address, vote):
+        source_epoch, source_root, target_epoch, target_root = vote
+        if not await self.protection.may_vote(address, source_epoch, target_epoch):
             logger.warning(
                 "Not voting in epoch %d: %s would double- or surround-vote a recorded vote",
                 epoch,
@@ -958,16 +1024,17 @@ class ValidatorNode:
             )
             return True
         block_hash = str(head.get("hash") or head.get("block_hash"))
-        await signing.record(address, vote)
-        source_epoch, source_root, target_epoch, target_root = vote
-        attestation = await self.manager.create_attestation(
-            slot=slot,
-            block_hash=block_hash,
-            source_epoch=source_epoch,
-            target_epoch=target_epoch,
-            source_root=source_root,
-            target_root=target_root,
-        )
+        try:
+            attestation = await self.manager.create_attestation(
+                slot=slot,
+                block_hash=block_hash,
+                source_epoch=source_epoch,
+                target_epoch=target_epoch,
+                source_root=source_root,
+                target_root=target_root,
+            )
+        except AlreadyAttestedError:
+            return True  # the record refused it: the epoch is settled
         if attestation and await self.manager.submit_attestation(attestation):
             logger.info(
                 "✅ Voted %d→%d (%s…) at slot %d",
@@ -1056,28 +1123,6 @@ class ValidatorNode:
 
         logger.info("Epoch processing loop stopped")
 
-    # ── Canary / Doomsday Monitoring (§8.5) ─────────────────────────
-
-    def set_eth_adapter(self, adapter) -> None:
-        """
-        Attach an EthereumAdapter for canary balance monitoring.
-
-        Args:
-            adapter: EthereumAdapter instance
-        """
-        self._eth_adapter = adapter
-        logger.info("ValidatorNode: EthereumAdapter attached for canary monitoring")
-
-    def set_doomsday_protocol(self, doomsday) -> None:
-        """
-        Attach a DoomsdayProtocol for submitting canary attestations.
-
-        Args:
-            doomsday: DoomsdayProtocol instance
-        """
-        self._doomsday_protocol = doomsday
-        logger.info("ValidatorNode: DoomsdayProtocol attached for canary monitoring")
-
     def set_exchange_submitter(self, submitter) -> None:
         """Attach the node's exchange submitter (admit + gossip): oracle votes go through it."""
         self._exchange_submitter = submitter
@@ -1144,7 +1189,7 @@ class ValidatorNode:
         from ..exchange.bridge import MAX_VOTE_DEPOSITS
         from ..exchange.state_manager import ExchangeStateManager
         from .epoch_state import committee_for_block
-        from .price_feed import PERP_SUFFIX, build_vote, freeze_from_env
+        from .price_feed import PERP_SUFFIX, build_vote
 
         mgr = ExchangeStateManager.get_instance()
         # Whether the next block would count this vote: read-only — the committee the exchange
@@ -1154,14 +1199,13 @@ class ValidatorNode:
             return None
         from ..exchange.clearinghouse import Clearinghouse
 
-        now = mgr._block_clock()
-        # A deployer market's deployer prices it — the validators only while they freeze it.
+        # A token perp's spot market prices it, never the validators.
         bases = sorted(
             m.base
             for m in mgr.clearinghouse.markets.values()
             if m.quote == constants.PERP_QUOTE
             and m.settled_price <= 0
-            and (not Clearinghouse.contained(m) or Clearinghouse.frozen(m, now))
+            and not Clearinghouse.contained(m)
         )
         # The oracle price, and other venues' perp price where the feed has one (the mark's
         # third input).
@@ -1176,25 +1220,22 @@ class ValidatorNode:
             self._vote_cursor = start + limit
             keys = (keys + keys)[start : start + limit]
         prices = {k: got[k] for k in keys}
-        deposits = watcher.outstanding(mgr.bridge.done, MAX_VOTE_DEPOSITS) if watcher else []
+        from .bridge_watcher import deposit_votes_enabled
+
+        deposits = (
+            watcher.outstanding(mgr.bridge.done, MAX_VOTE_DEPOSITS)
+            if watcher and deposit_votes_enabled()
+            else []
+        )
         # Source chains' finalized heads the chain has not attested yet (docs/BRIDGE.md).
         heads = [
             h
             for h in (watcher.heads() if watcher else [])
             if (cur := mgr.bridge.head(int(h["chain"]))) is None or int(h["height"]) > cur.height
         ]
-        # Deployer markets the operator votes to freeze (QRDX_ORACLE_FREEZE), while they run.
-        live = {
-            mid
-            for mid, m in mgr.clearinghouse.markets.items()
-            if Clearinghouse.contained(m) and m.settled_price <= 0
-        }
-        freeze = [mid for mid in freeze_from_env() if mid in live]
-        if not prices and not deposits and not heads and not freeze:
+        if not prices and not deposits and not heads:
             return None
-        return build_vote(
-            self.wallet, await self._get_current_slot(), prices, deposits, heads, freeze
-        )
+        return build_vote(self.wallet, await self._get_current_slot(), prices, deposits, heads)
 
     def set_exchange_tx_source(self, source) -> None:
         """
@@ -1212,7 +1253,9 @@ class ValidatorNode:
         self._evm_tx_source = source
         logger.info("ValidatorNode: EVM tx source attached for block inclusion")
 
-    async def _compute_unified_state_root(self, height: Optional[int] = None) -> str:
+    async def _compute_unified_state_root(
+        self, height: Optional[int] = None, slot: Optional[int] = None
+    ) -> str:
         """
         E-D4: the post-block unified state root bound into the block's signed
         header — BLAKE3-512 over (UTXO root, account/EVM root, exchange root,
@@ -1250,7 +1293,12 @@ class ValidatorNode:
         except Exception:
             token_root = TOKEN_ZERO_ROOT
         from .. import state_proofs
+        from . import validator_root as vroot
 
+        # The validators' state (qrdx/validator/validator_root.py), once its feature is in force.
+        validators = None
+        if height is not None and slot is not None and vroot.active(height):
+            validators = await vroot.compute(self.db, height, slot)
         proof_root = xtree = None
         if height is not None and state_proofs.scheduled():
             # The exchange tree beside the database tree (qrdx/exchange/proofs.py), at the same
@@ -1270,10 +1318,11 @@ class ValidatorNode:
                     "token": token_root,
                     "proof": proof_root,
                     "xtree": xtree,
+                    "validators": validators,
                 },
             )
         return unified_state_root(
-            utxo_root or "0" * 64, account_root, exchange_root, token_root, proof_root
+            utxo_root or "0" * 64, account_root, exchange_root, token_root, proof_root, validators
         )
 
     def set_block_processing_lock(self, lock) -> None:
@@ -1316,62 +1365,6 @@ class ValidatorNode:
         """
         self._evm_section_producer = producer
         logger.info("ValidatorNode: EVM section producer attached")
-
-    async def _canary_monitor_loop(self):
-        """
-        Periodically poll the Ethereum canary wallet balance.
-
-        Runs once per epoch (SLOTS_PER_EPOCH × SLOT_DURATION seconds).
-        If the canary balance has dropped below expected, generates a
-        DoomsdayAttestation and submits it to the DoomsdayProtocol.
-
-        Once doomsday is triggered, the loop exits.
-        """
-        epoch_seconds = SLOTS_PER_EPOCH * SLOT_DURATION_SECONDS
-        logger.info(f"Canary monitor: polling every {epoch_seconds}s (1 epoch)")
-
-        while self._running:
-            try:
-                # Skip if doomsday already active
-                if self._doomsday_protocol and self._doomsday_protocol.is_active:
-                    logger.info("Canary monitor: doomsday already active — stopping")
-                    break
-
-                if self._eth_adapter is None or self._doomsday_protocol is None:
-                    await asyncio.sleep(epoch_seconds)
-                    continue
-
-                if self.wallet is None:
-                    await asyncio.sleep(epoch_seconds)
-                    continue
-
-                # Generate attestation (returns None if canary is safe)
-                attestation = self._eth_adapter.generate_doomsday_attestation(
-                    validator_address=self.wallet.address,
-                )
-
-                if attestation is not None:
-                    logger.warning(
-                        f"Canary monitor: drain detected — submitting attestation "
-                        f"(balance={attestation.observed_balance}, "
-                        f"block={attestation.observed_block_height})"
-                    )
-                    triggered = self._doomsday_protocol.submit_canary_attestation(attestation)
-                    if triggered:
-                        logger.critical("Canary monitor: DOOMSDAY TRIGGERED by validator quorum")
-                        break
-                else:
-                    logger.debug("Canary monitor: canary is safe")
-
-                await asyncio.sleep(epoch_seconds)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.error(f"Error in canary monitor loop: {exc}", exc_info=True)
-                await asyncio.sleep(epoch_seconds)
-
-        logger.info("Canary monitor loop stopped")
 
     async def _read_block_header(self, height: int) -> Optional[dict]:
         """The block at ``height`` without its ~45 KB body when the database can (hash,

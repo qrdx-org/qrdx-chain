@@ -19,7 +19,7 @@ from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransaction
 from qrdx.exchange import block_processor as BP
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+pytestmark = pytest.mark.usefixtures("genesis_btc")  # BTC from the first block
 
 D = Decimal
 BTC = "BTC-QRDX-PERP"
@@ -42,16 +42,17 @@ class Trader:
 
 
 @pytest.fixture
-async def env(monkeypatch):
-    reporter, alice, bob = Trader(), Trader(), Trader()
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (reporter.addr,))
+async def env(monkeypatch, oracle_committee):
+    """``reporter``: the genesis validator, which votes BTC's price."""
+    reporter, alice, bob = oracle_committee, Trader(), Trader()
     db = await DatabaseSQLite.create(db_path=tempfile.mktemp(suffix=".db"))
-    for i, who in enumerate((alice, bob)):
+    for i, who in enumerate((alice, bob, reporter)):
         await db.add_transaction(
             tx_hash=f"alloc-{i}", block_hash=f"{0:064x}",
-            tx_hex=json.dumps({"type": "genesis_allocation", "recipient": who.addr,
-                               "amount": "100000"}))
-    await db.add_block(block_hash=f"{0:064x}", block_height=0, block_content="",
+            tx_hex=json.dumps({"type": "genesis_allocation", "recipient": who.address
+                               if who is reporter else who.addr, "amount": "100000"}))
+    await db.add_block(block_hash=f"{0:064x}", block_height=0,
+                       block_content=oracle_committee.genesis,
                        validator_address="0xPQ" + "00" * 32, timestamp=int(T0))
     await db.seed_genesis_account_state()
     await db.connection.commit()
@@ -86,8 +87,7 @@ async def test_perps_conserve_real_qrdx_end_to_end(env):
     total = await _total_qrdx(db)
 
     await _block(db, mgr, 1, [
-        reporter.tx(ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"}),
-        reporter.tx(ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": "30000"}),
+        reporter.vote({"BTC": "30000"}),
         alice.tx(ExchangeOpType.PERP_DEPOSIT, {"amount": "20000"}),
         bob.tx(ExchangeOpType.PERP_DEPOSIT, {"amount": "20000"}),
     ])
@@ -104,9 +104,10 @@ async def test_perps_conserve_real_qrdx_end_to_end(env):
     assert all(r.success for r in results), [r.error for r in results]
     assert await _total_qrdx(db) == total, "a trade must not move real QRDX"
 
-    # BTC rallies 10 %; both close at the new price; both withdraw everything.
-    await _block(db, mgr, 3, [
-        reporter.tx(ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": "33000"}),
+    # BTC rallies 10 % (the validators' vote walks the oracle there); both close at the new
+    # price; both withdraw everything.
+    await _block(db, mgr, 3, [reporter.vote({"BTC": "33000"})])
+    await _block(db, mgr, 4, [
         bob.tx(ExchangeOpType.PERP_ORDER, {"market_id": BTC, "side": "buy", "size": "1",
                                            "price": "33000", "reduce_only": True}),
         alice.tx(ExchangeOpType.PERP_ORDER, {"market_id": BTC, "side": "sell", "size": "1",
@@ -114,7 +115,7 @@ async def test_perps_conserve_real_qrdx_end_to_end(env):
     ])
     ch = mgr.clearinghouse
     a_out, b_out = ch.withdrawable(alice.addr), ch.withdrawable(bob.addr)
-    await _block(db, mgr, 4, [
+    await _block(db, mgr, 5, [
         alice.tx(ExchangeOpType.PERP_WITHDRAW, {"amount": str(a_out)}),
         bob.tx(ExchangeOpType.PERP_WITHDRAW, {"amount": str(b_out)}),
     ])
@@ -137,8 +138,7 @@ async def test_an_unaffordable_deposit_is_refused(env):
 async def test_a_rejected_block_restores_the_clearinghouse(env):
     db, mgr, reporter, alice, bob = env
     await _block(db, mgr, 1, [
-        reporter.tx(ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"}),
-        reporter.tx(ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": "30000"}),
+        reporter.vote({"BTC": "30000"}),
         alice.tx(ExchangeOpType.PERP_DEPOSIT, {"amount": "20000"}),
     ])
     before_root = mgr.compute_state_root()

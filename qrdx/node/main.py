@@ -30,7 +30,13 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -1044,6 +1050,20 @@ async def readyz():
     )
 
 
+@app.get("/snapshot/{name}")
+async def snapshot_file(name: str):
+    """The snapshot this node publishes (``QRDX_SNAPSHOT_DIR``; qrdx/snapshot_publisher.py):
+    ``manifest.json`` and ``qrdx.db``, with range requests so a cut download resumes. 404 when
+    it publishes none. A restore verifies it whoever served it (docs/CHECKPOINT_SYNC.md)."""
+    from ..snapshot_publisher import published_file
+
+    path = published_file(name)
+    if path is None or not os.path.isfile(path):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "this node publishes no snapshot")
+    kind = "application/json" if name.endswith(".json") else "application/octet-stream"
+    return FileResponse(path, media_type=kind)
+
+
 @app.get("/chain_spec")
 async def chain_spec_endpoint():
     """The network this node follows and its upgrade schedule: chain id, parameters, which
@@ -1331,7 +1351,7 @@ block_processing_lock = SignallingLock(CHAIN_CHANGED)
 
 # Seen-cache for EVM / account-model transactions (keyed by keccak(raw_tx)).
 # Prevents double execution and terminates gossip loops in Phase 1 cross-node
-# convergence. See docs/EVM_STATE_CONSENSUS_INTEGRATION.md.
+# convergence. See docs/archive/EVM_STATE_CONSENSUS_INTEGRATION.md.
 EVM_TX_CACHE = TimeBasedCache(max_size=4096, ttl_seconds=600)
 
 # Exchange-transaction admission mempool (Phase D1). Lazily created so the
@@ -1368,7 +1388,12 @@ def _get_exchange_submitter():
                 "exchange_sendTransaction", [tx_dict, True]
             )
 
-        EXCHANGE_SUBMITTER = ExchangeSubmitter(_get_exchange_mempool, _peer_urls, _forward)
+        async def _balance(address):
+            return await db.get_address_balance(address)
+
+        EXCHANGE_SUBMITTER = ExchangeSubmitter(
+            _get_exchange_mempool, _peer_urls, _forward, get_balance=_balance
+        )
     return EXCHANGE_SUBMITTER
 
 
@@ -1585,12 +1610,15 @@ async def _execute_evm_raw_tx(
     # type 0x51 post-quantum (sender derived from the embedded ML-DSA-65 key).
     # Either way ``sender`` is 20 bytes, which is why the EVM below needs no
     # knowledge of PQ accounts at all.
-    from ..contracts.evm_mempool import parse_eth_raw_tx
+    from ..contracts.evm_mempool import effective_gas_price, parse_eth_raw_tx
+    from ..fee_market import current_evm_base_fee
 
     try:
         parsed = parse_eth_raw_tx(raw_tx_hex)
         nonce = parsed["nonce"]
-        gas_price_wei = parsed["gas_price"]
+        # What it pays per gas in this block: its price, or for an EIP-1559 transaction its
+        # fee cap or base fee + tip, whichever is lower (all burned).
+        gas_price_wei = effective_gas_price(parsed, current_evm_base_fee())
         gas = parsed["gas"] or 21000
         value_wei = parsed["value"]
         data = parsed["data"]
@@ -1640,6 +1668,34 @@ async def _execute_evm_raw_tx(
                 "sender": sender_hex,
                 "nonce": nonce,
             }
+
+    # The payer must be able to pay for all the gas it offers, at its highest price (Ethereum's
+    # up-front check). Otherwise nothing runs and nothing is charged: like a stale nonce, the
+    # same no-op on every node. Without it a successful transaction's gas charge drove the
+    # payer's balance negative. (A payer who covers the gas but not the value still runs and
+    # pays for the failure, below.)
+    try:
+        upfront = int(gas) * int(parsed["gas_price"])
+        payer_balance = int(await state_manager.get_balance(sender_hex))
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"cannot read the payer's balance: {e}",
+            "tx_hash": tx_hash_hex,
+            "sender": sender_hex,
+            "nonce": nonce,
+        }
+    if payer_balance < upfront:
+        return {
+            "success": False,
+            "error": (
+                f"insufficient funds for gas * price: {gas} x {parsed['gas_price']} wei "
+                f"exceeds the balance {payer_balance}"
+            ),
+            "tx_hash": tx_hash_hex,
+            "sender": sender_hex,
+            "nonce": nonce,
+        }
 
     # The EVM reads state on demand from the state manager (this block's pending changes over
     # the database) and writes back everything it touched (contracts/evm_world.py). Native
@@ -1705,6 +1761,7 @@ async def _execute_evm_raw_tx(
                 timestamp=_evm_block_timestamp(block_timestamp),
                 world=world,
                 payer=sender,
+                access_list=parsed.get("access_list") or (),
             ),
             preload=[sender, spend_from, to_bytes],
         )
@@ -1844,8 +1901,22 @@ async def _apply_exchange_section_on_import(
         flush_validator_lifecycle_deltas,
         preload_sender_balances,
         preload_token_balances,
+        verify_exchange_tx,
     )
     from ..exchange.state_manager import ExchangeStateManager
+
+    # Authenticate every transaction first, on both paths, before anything changes. The
+    # trust-replay branch (no declared root) used to execute the section unverified: a proposer
+    # that left the root out could act as any account with an unsigned transaction in its name
+    # (docs/EXCHANGE_AUDIT.md).
+    try:
+        _verified = decode_exchange_txs(ex_section)
+    except Exception as e:
+        return False, f"undecodable exchange section: {e}"
+    for _i, _tx in enumerate(_verified):
+        _ok, _why = verify_exchange_tx(_tx)
+        if not _ok:
+            return False, f"exchange tx {_i} in block {block_height} failed verification: {_why}"
 
     mgr = ExchangeStateManager.get_instance()
     apply_enforcement(mgr)
@@ -2129,13 +2200,15 @@ async def _verify_chain_rules(
     * it carries no more than a block may — gas, votes, slashing proofs (qrdx/block_limits.py);
     * it declares the base fees its parent sets, and pays them (qrdx/fee_market.py);
     * its slot is later than its parent's and not ahead of the clock
-      (block_verification.verify_slot_progression);
+      (block_verification.verify_slot_progression), and its timestamp is that slot's start
+      time (block_verification.verify_block_timestamp, under ``slot_timestamps``);
     * every attestation it carries is a valid Casper FFG vote for this chain — known key,
       valid signature, target this chain's checkpoint (ffg.verify_block_votes)."""
     from ..validator import ffg
     from ..validator.block_verification import (
         _parse_block_content,
         epoch_from_block,
+        verify_block_timestamp,
         verify_slot_progression,
     )
 
@@ -2171,6 +2244,9 @@ async def _verify_chain_rules(
         return False, wrong
     try:
         ok, err = await verify_slot_progression(db, bc, int(block_height), await _current_slot())
+        if not ok:
+            return False, err
+        ok, err = await verify_block_timestamp(db, bc, int(block_height))
         if not ok:
             return False, err
         return await ffg.verify_block_votes(db, bc, int(block_height), epoch_from_block(bc))
@@ -2232,9 +2308,19 @@ async def _verify_unified_state_root(
     except Exception:
         token_root = "0" * 128
 
-    # The state-proof tree's root (qrdx/state_proofs.py), once its feature is in force.
+    # The validators' state (qrdx/validator/validator_root.py), once its feature is in force:
+    # S of the block's epoch on its parent chain and the staking logs through this block.
     from .. import state_proofs
+    from ..validator import validator_root as vroot
 
+    validators = None
+    if height is not None and vroot.active(height):
+        try:
+            validators = await vroot.compute(db, int(height), int(bc["slot"]))
+        except Exception as e:
+            logger.error(f"validator root failed at block {height}: {e}")
+            return False, f"validator root: {e}"
+    # The state-proof tree's root (qrdx/state_proofs.py), once its feature is in force.
     proof_root = None
     if height is not None and state_proofs.scheduled():
         # The exchange tree beside the database tree (qrdx/exchange/proofs.py), at the same
@@ -2257,12 +2343,13 @@ async def _verify_unified_state_root(
                 "token": token_root,
                 "proof": proof_root,
                 "xtree": xroot.hex(),
+                "validators": validators,
             },
         )
     # Token domain bound at the live token-ledger root — token state is now a
     # consensus object that converges across nodes (Phase E spot inc4/inc4b).
     computed = unified_state_root(
-        utxo_root or "0" * 64, account_root, exchange_root, token_root, proof_root
+        utxo_root or "0" * 64, account_root, exchange_root, token_root, proof_root, validators
     )
     if computed != declared:
         msg = (
@@ -4008,38 +4095,12 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
                 logger.error(f"[SYNC] Failed to store PoS block {block_height}: {e}")
                 return False
 
-    # ---- Legacy PoW path ----
-    if not block_content:
-        logger.warning(f"Sync failed: No block content for block {block_height}.")
-        return False
-
-    # Validate block content size
-    if len(block_content) > MAX_BLOCK_CONTENT_SIZE:
-        logger.warning(f"Sync failed: Block content too large for block {block_height}.")
-        return False
-
-    try:
-        transactions = []
-        for tx_hex in txs_hex:
-            is_valid, error_msg = security.input_validator.validate_transaction_data(tx_hex)
-            if not is_valid:
-                logger.warning(
-                    f"Sync failed: Invalid transaction in block {block_height}: {error_msg}"
-                )
-                return False
-            transactions.append(await Transaction.from_hex(tx_hex))
-
-    except Exception as e:
-        logger.error(
-            f"Sync failed: Could not deserialize transactions for block {block_height}: {e}"
-        )
-        return False
-
-    if not await create_block(block_content, transactions):
-        logger.warning(f"Sync failed: Invalid block received from peer at height {block_height}.")
-        return False
-
-    return True
+    # ---- A block without a proposer: the inherited proof-of-work format, refused ----
+    # (manager.create_block refuses it too; docs/KNOWN_ISSUES.md)
+    logger.warning(
+        f"Sync failed: block {block_height} has no proposer (a proof-of-work block): refused"
+    )
+    return False
 
 
 # Drop the deposit log of rolled-back blocks: the validator set is computed from the chain and
@@ -4204,6 +4265,8 @@ async def _rebuild_derived_state_on_startup():
             logger.warning(f"Exchange state rebuild on startup skipped: {e}")
         return
 
+    from ..history_pruning import HistoryPruned
+
     try:
         from ..derived_state_rebuild import (
             load_persisted_checkpoint,
@@ -4254,6 +4317,10 @@ async def _rebuild_derived_state_on_startup():
                 tip,
                 exchange_root[:16],
             )
+    except HistoryPruned as e:
+        # A pruned node without a usable checkpoint cannot rebuild its state: refuse to run on
+        # a half-built one.
+        raise SystemExit(f"[startup] {e}") from e
     except Exception as e:
         logger.error(f"[startup] derived-state rebuild failed: {e}")
 
@@ -5276,6 +5343,14 @@ async def startup():
     GENESIS_BLOCK_HASH = await _verify_chain_identity()
     _warn_slow_crypto()
     await _verify_trusted_checkpoints()
+    try:  # a full node's history window (qrdx/history_pruning.py): refuse a bad one at once
+        from ..history_pruning import retention as _history_retention
+
+        _window = _history_retention()
+    except ValueError as e:
+        raise SystemExit(f"[startup] {e}") from e
+    if _window:
+        logger.info(f"[history] full node: block bodies kept for {_window} blocks below finality")
     _next = CHAIN_SPEC.next_fork(max(0, await db.get_next_block_id() - 1))
     logger.info(
         f"[chain-spec] genesis {GENESIS_BLOCK_HASH[:16]}… verified; "
@@ -5329,7 +5404,11 @@ async def startup():
     if validator_enabled:
         logger.info("🔷 PoS Validator Mode Enabled")
         validator_wallet_path = os.getenv("QRDX_VALIDATOR_WALLET")
-        validator_password = os.getenv("QRDX_VALIDATOR_PASSWORD", "")
+        from ..validator.keystore import ValidatorKeyError, read_password
+
+        # QRDX_VALIDATOR_PASSWORD_FILE, else QRDX_VALIDATOR_PASSWORD (removed from the
+        # environment once read).
+        validator_password = read_password() or ""
 
         if validator_wallet_path and os.path.exists(validator_wallet_path):
             try:
@@ -5379,6 +5458,11 @@ async def startup():
                         logger.warning(f"Could not attach EVM tx source/producer: {e}")
                 else:
                     logger.error("❌ Failed to initialize validator node")
+            except ValidatorKeyError as e:
+                # Running on without the validator the operator configured would only hide
+                # the problem: stop, saying why.
+                logger.critical(f"❌ Validator key: {e}")
+                raise SystemExit(f"validator key: {e}") from e
             except Exception as e:
                 logger.error(f"❌ Validator initialization error: {e}", exc_info=True)
         else:
@@ -5434,6 +5518,17 @@ async def startup():
             except Exception:
                 return {}
 
+        async def _poll_gauges():
+            # The tip's age, the validator's signing state, the bridge's guardrails, oracle ages
+            # (qrdx/node/health_gauges.py), for docker/alert-rules.yml.
+            from qrdx.exchange import ExchangeStateManager
+
+            from . import health_gauges
+
+            return await health_gauges.collect(
+                db, getattr(app.state, "validator", None), ExchangeStateManager.get_instance()
+            )
+
         async def _poll_mempool():
             try:
                 return int(await db.get_pending_transaction_count())
@@ -5471,10 +5566,24 @@ async def startup():
                 get_finality=_poll_finality,
                 get_slashing_count=_poll_slashing,
                 get_mempool_depth=_poll_mempool,
+                get_gauges=_poll_gauges,
                 interval=2.0,
             )
         )
         app.state.chain_poller_task = _chain_poller_task
+        # Publishing snapshots for nodes joining by checkpoint sync (QRDX_SNAPSHOT_DIR): a
+        # poller, off the block path, like the one above.
+        from qrdx import snapshot_publisher
+
+        publish_dir = snapshot_publisher.configured()
+        if publish_dir:
+            app.state.snapshot_task = asyncio.create_task(
+                snapshot_publisher.run(
+                    str(DENARO_DATABASE_PATH) if DENARO_DATABASE_PATH else "data/qrdx.db",
+                    publish_dir,
+                )
+            )
+            logger.info(f"Publishing snapshots from {publish_dir} at /snapshot/")
         if STREAMING_ENABLED:
             # Perps channels (qrdx/exchange/stream.py): read-only, like the chain poller.
             from qrdx.exchange import ExchangeStateManager
@@ -5673,6 +5782,21 @@ async def startup():
                     if not deleg_ok:
                         raise Exception(f"rejected: {deleg_err}")
 
+                    # The standard refusal wallets understand: the sender cannot cover what
+                    # it offers (gas at its highest price plus the value).
+                    from ..contracts.evm_mempool import parse_eth_raw_tx
+
+                    sm = EVM_STATE_MANAGER
+                    if sm is not None:
+                        parsed = parse_eth_raw_tx(raw_tx_hex)
+                        cost = int(parsed["gas"]) * int(parsed["gas_price"])
+                        if (parsed.get("spend_from") or parsed["sender"]).lower() == str(
+                            parsed["sender"]
+                        ).lower():
+                            cost += int(parsed["value"])
+                        if int(await sm.get_balance(parsed["sender"])) < cost:
+                            raise Exception("rejected: insufficient funds for gas * price + value")
+
                     mp = _get_evm_mempool()
                     admit_ok, admit_err, _ = mp.admit(raw_tx_hex)
                     if not admit_ok and "duplicate" not in (admit_err or ""):
@@ -5739,6 +5863,10 @@ async def shutdown():
     if http_client:
         await http_client.aclose()
         logger.info("Shared HTTP client closed.")
+
+    snapshot_task = getattr(app.state, "snapshot_task", None)
+    if snapshot_task is not None:
+        snapshot_task.cancel()
 
     # Stop the observability poller.
     if _chain_poller_task is not None:
@@ -6470,14 +6598,17 @@ async def get_unified_state_root():
 
         cur = (
             await db.connection.execute(
-                "SELECT proof FROM state_root_parts WHERE height = ?", (tip,)
+                "SELECT proof, validators FROM state_root_parts WHERE height = ?", (tip,)
             )
             if state_proofs.scheduled()
             else None
         )
         row = await cur.fetchone() if cur is not None else None
         proof_root = row[0] if row is not None else None
-        root = unified_state_root(utxo_root, account_root, exchange_root, token_root, proof_root)
+        validators = row[1] if row is not None else None
+        root = unified_state_root(
+            utxo_root, account_root, exchange_root, token_root, proof_root, validators
+        )
         return {
             "ok": True,
             "result": {
@@ -6487,6 +6618,7 @@ async def get_unified_state_root():
                 "exchange_root": exchange_root,
                 "token_root": token_root,
                 "proof_root": proof_root,
+                "validator_root": validators,
                 "token_root_bound": True,
                 "enforced": False,
             },
@@ -6527,96 +6659,17 @@ async def get_randao_mix():
 
 @app.post("/push_block")
 @limiter.limit("12/minute")
-async def push_block(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    body: dict = Body(...),
-):
-    """Unauthenticated endpoint for miners with heavy validation"""
-
-    block_content = body.get("block_content")
-    if not block_content:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Missing block_content.")
-
-    # Validate block content size
-    if len(block_content) > MAX_BLOCK_CONTENT_SIZE:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Block content too large.")
-
-    block_identifier = sha256(block_content.encode())
-
-    # Use time-based cache
-    if await security.block_cache.contains(block_identifier):
-        return {"ok": False, "error": "Block recently seen"}
-
-    # Check sync state
-    if security.sync_state_manager.is_syncing:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"ok": False, "error": "Node is busy synchronizing, please try again later."},
-        )
-
-    # Block processing lock prevents race conditions
-    async with block_processing_lock:
-        txs_data = body.get("txs", [])
-        block_no = body.get("id") or body.get("block_no")
-
-        if not all([txs_data is not None, block_no is not None]):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Missing block data.")
-
-        # Validate block height
-        if not await security.input_validator.validate_block_height(block_no, db, max_ahead=1):
-            return {"ok": False, "error": "Invalid block height"}
-
-        next_block_id = await db.get_next_block_id()
-
-        # Only accept blocks that build directly on our current chain tip
-        if next_block_id != block_no:
-            return {
-                "ok": False,
-                "error": f"Invalid block height. Expected {next_block_id}, got {block_no}. This may be a stale block.",
-            }
-
-        await security.block_cache.put(block_identifier, True)
-
-        final_transactions = []
-        tx_hashes_to_find = []
-        if isinstance(txs_data, str):
-            txs_data = txs_data.split(",") if txs_data else []
-        for tx_hex in txs_data:
-            if isinstance(tx_hex, str) and len(tx_hex) == 64:
-                tx_hashes_to_find.append(tx_hex)
-            else:
-                is_valid, error_msg = security.input_validator.validate_transaction_data(tx_hex)
-                if not is_valid:
-                    raise HTTPException(
-                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        f"Transaction data within block is invalid: {error_msg}",
-                    )
-                final_transactions.append(await Transaction.from_hex(tx_hex))
-
-        if tx_hashes_to_find:
-            db_results = await db.get_pending_transactions_by_hash(tx_hashes_to_find)
-            if len(db_results) < len(tx_hashes_to_find):
-                return {
-                    "ok": False,
-                    "error": "One or more transaction hashes not found in pending pool.",
-                }
-
-            tx_map = {tx.hash(): tx for tx in db_results}
-            ordered_txs = [tx_map.get(tx_hash) for tx_hash in tx_hashes_to_find]
-            final_transactions.extend(ordered_txs)
-
-        if not await create_block(block_content, final_transactions):
-            return {"ok": False, "error": "Block failed validation."}
-
-        miner_ip = request.client.host if request.client else "unknown"
-        logger.info(
-            f"Accepted block {block_no} from miner at {miner_ip}. Propagating to network..."
-        )
-
-        # Propagate to all peers
-        background_tasks.add_task(propagate, "submit_block", body, ignore_node_id=None, db=db)
-        return {"ok": True, "result": f"Block {block_no} accepted."}
+async def push_block(request: Request):
+    """The inherited miners' endpoint. QRDX is proof of stake: a mined block is refused here
+    (and by ``manager.create_block`` on every other path). It used to be judged by the
+    proof-of-work rules alone and appended at the tip (docs/KNOWN_ISSUES.md)."""
+    return JSONResponse(
+        status_code=status.HTTP_410_GONE,
+        content={
+            "ok": False,
+            "error": "proof-of-work blocks are not accepted: QRDX is proof of stake",
+        },
+    )
 
 
 @app.post("/submit_block")
@@ -8509,6 +8562,12 @@ async def get_blocks(
     client_ip = get_remote_address(request)
     await security.query_calculator.check_and_update_cost(client_ip, offset, limit)
 
+    from ..history_pruning import HistoryPruned, require_history
+
+    try:  # (a full node does not hold the bodies below its pruning point)
+        await require_history(db, offset, "serving these blocks")
+    except HistoryPruned as e:
+        return {"ok": False, "error": str(e)}
     blocks = await db.get_blocks(offset, limit)
 
     # Return structured block data including transactions so that

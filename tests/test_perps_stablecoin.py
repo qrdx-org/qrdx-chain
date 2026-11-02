@@ -21,7 +21,6 @@ from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransact
 from qrdx.exchange import block_processor as BP
 from qrdx.exchange import encode_exchange_txs
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
 
 D = Decimal
 BTC = "BTC-USD-PERP"
@@ -44,18 +43,19 @@ class Key:
 
 
 @pytest.fixture
-async def chain(monkeypatch):
+async def chain(monkeypatch, genesis_btc, oracle_committee):
     issuer, rep, alice, bob = Key(), Key(), Key(), Key()
+    rep.vote = oracle_committee.vote        # the genesis validator votes BTC's price
     usd = ExchangeStateManager.derive_token_address(issuer.addr, 0, "qUSD")
     monkeypatch.setattr(constants, "PERP_COLLATERAL_TOKEN", usd)
     monkeypatch.setattr(constants, "PERP_QUOTE", "USD")
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (rep.addr,))
     db = await DatabaseSQLite.create(db_path=tempfile.mktemp(suffix=".db"))
     blocks = []
 
     async def add(h, txs=(), alloc=()):
         bh = f"{h:064x}"
-        await db.add_block(block_hash=bh, block_height=h, block_content="",
+        await db.add_block(block_hash=bh, block_height=h,
+                           block_content=oracle_committee.genesis if h == 0 else "",
                            validator_address="0xPQ" + "00" * 32, timestamp=T0 + 2 * h)
         for i, (r, a) in enumerate(alloc):
             await db.add_transaction(tx_hash=f"a{h}{i}", block_hash=bh, tx_hex=json.dumps(
@@ -64,8 +64,8 @@ async def chain(monkeypatch):
             await db.add_block_exchange_txs(bh, encode_exchange_txs(list(txs)))
         blocks.append((h, list(txs)))
 
-    # The reporter lists the market: the listing fee, when a path runs with the fee gate on.
-    await add(0, alloc=[(k.addr, "5000" if k is rep else "1000") for k in (issuer, rep, alice, bob)])
+    await add(0, alloc=[(k.addr, "1000") for k in (issuer, rep, alice, bob)]
+              + [(oracle_committee.address, "1000")])
     await db.seed_genesis_account_state()
     await db.connection.commit()
     ExchangeStateManager.reset_instance()
@@ -108,7 +108,8 @@ async def _qrdx_total(db):
 
 
 async def _fund(apply, issuer, rep, alice, bob):
-    """The issuer mints 1,000,000 qUSD and pays each trader; the market opens at 30,000."""
+    """The issuer mints 1,000,000 qUSD and pays each trader; the validators price BTC (a genesis
+    market) at 30,000."""
     await apply(1, [issuer.tx(ExchangeOpType.TOKEN_DEPLOY, {"name": "Test USD", "symbol": "qUSD",
                                                             "decimals": 18,
                                                             "total_supply": "1000000"})])
@@ -116,12 +117,8 @@ async def _fund(apply, issuer, rep, alice, bob):
     await apply(2, [issuer.tx(ExchangeOpType.TOKEN_TRANSFER,
                               {"token_address": usd, "to": who.addr, "amount": "50000"})
                     for who in (alice, bob)])
-    results = await apply(3, [
-        rep.tx(ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"}),
-        rep.tx(ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:USD", "price": "30000"}),
-    ])
+    results = await apply(3, [rep.vote({"BTC": "30000"})])
     assert all(r.success for r in results), [r.error for r in results]
-    assert results[0].data["market_id"] == BTC
 
 
 async def test_perps_settle_in_the_stablecoin_and_conserve_it(chain):
@@ -139,7 +136,7 @@ async def test_perps_settle_in_the_stablecoin_and_conserve_it(chain):
                                                        "size": "1", "price": "30000"}),
                     alice.tx(ExchangeOpType.PERP_ORDER, {"market_id": BTC, "side": "buy",
                                                          "size": "1", "price": "30000"})])
-    await apply(6, [rep.tx(ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:USD", "price": "33000"}),
+    await apply(6, [rep.vote({"BTC": "33000"}),
                     bob.tx(ExchangeOpType.PERP_ORDER, {"market_id": BTC, "side": "buy",
                                                        "size": "1", "price": "33000",
                                                        "reduce_only": True}),
@@ -205,7 +202,7 @@ async def test_forward_and_rebuild_agree_on_stablecoin_perps(chain):
                                                        "size": "1", "price": "30000"}),
                     alice.tx(ExchangeOpType.PERP_ORDER, {"market_id": BTC, "side": "buy",
                                                          "size": "1", "price": "30000"})])
-    await apply(6, [rep.tx(ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:USD", "price": "26900"})])
+    await apply(6, [rep.vote({"BTC": "26900"})])
     await apply(7)
     ch = mgr.clearinghouse
     assert BTC not in ch.accounts[alice.addr].positions, "alice should have been liquidated"

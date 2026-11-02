@@ -9,10 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
-
-if TYPE_CHECKING:
-    import aiosqlite
+from typing import Dict, List, Optional, Tuple
 
 from ..logger import get_logger
 
@@ -166,57 +163,22 @@ class SlashingExecutor:
     - Collect and verify slashing evidence
     - Execute slashing penalties
     - Report slashing to network
-    - Persist detection state via SlashingProtectionDB
     """
 
-    def __init__(self, protection_db: Optional["SlashingProtectionDB"] = None):
-        """
-        Initialize slashing executor.
-
-        Args:
-            protection_db: Optional SlashingProtectionDB for persistent
-                tracking. If provided, proposals and attestations are
-                cross-checked against the DB so that detection state
-                survives node restarts.
-        """
+    def __init__(self) -> None:
+        """Initialize slashing executor. (What this validator itself signed is guarded by
+        qrdx/validator/slashing_protection.py, recorded before signing.)"""
         self._pending_evidence: List[SlashingEvidence] = []
         self._processed_evidence: List[SlashingEvidence] = []
         self._lock = asyncio.Lock()
-        self._protection_db = protection_db
 
-        # In-memory tracking mirrors (fast lookup, DB is authority)
+        # In-memory tracking (fast lookup)
         self._proposals: Dict[Tuple[str, int], List[str]] = (
             {}
         )  # (validator, slot) -> [block_hashes]
         self._attestations: Dict[Tuple[str, int], List[Tuple[int, int]]] = (
             {}
         )  # (validator, epoch) -> [(source, target)]
-
-    def set_protection_db(self, db: "SlashingProtectionDB") -> None:
-        """Bind a SlashingProtectionDB for persistent tracking."""
-        self._protection_db = db
-
-    async def _record_block_to_db(self, validator_address: str, slot: int, block_hash: str) -> None:
-        """Persist a block signing record to the protection DB."""
-        if self._protection_db:
-            try:
-                await self._protection_db.record_block_signature(
-                    validator_address, slot, block_hash
-                )
-            except Exception as e:
-                logger.error(f"Failed to record block to protection DB: {e}")
-
-    async def _record_attestation_to_db(
-        self, validator_address: str, source_epoch: int, target_epoch: int
-    ) -> None:
-        """Persist an attestation record to the protection DB."""
-        if self._protection_db:
-            try:
-                await self._protection_db.record_attestation_signature(
-                    validator_address, source_epoch, target_epoch
-                )
-            except Exception as e:
-                logger.error(f"Failed to record attestation to protection DB: {e}")
 
     # =========================================================================
     # EVIDENCE DETECTION
@@ -265,11 +227,10 @@ class SlashingExecutor:
                         self._pending_evidence.append(evidence)
                         return evidence
 
-            # Record this proposal (memory + DB)
+            # Record this proposal
             if key not in self._proposals:
                 self._proposals[key] = []
             self._proposals[key].append(block_hash)
-            await self._record_block_to_db(validator_address, slot, block_hash)
 
             return None
 
@@ -362,7 +323,6 @@ class SlashingExecutor:
             if key not in self._attestations:
                 self._attestations[key] = []
             self._attestations[key].append((source_epoch, target_epoch))
-            await self._record_attestation_to_db(validator_address, source_epoch, target_epoch)
 
             return None
 
@@ -672,119 +632,3 @@ class SlashingExecutor:
             self._attestations = {k: v for k, v in self._attestations.items() if k[1] >= min_epoch}
 
             logger.debug(f"Pruned slashing data: keeping epochs >= {min_epoch}")
-
-
-class SlashingProtectionDB:
-    """
-    Local database for slashing protection.
-
-    Prevents the validator from signing slashable messages
-    by tracking previously signed data.
-    """
-
-    def __init__(self, db_path: str):
-        """
-        Initialize slashing protection database.
-
-        Args:
-            db_path: Path to SQLite database file
-        """
-        self.db_path = db_path
-        self._conn: Optional["aiosqlite.Connection"] = None
-
-    @property
-    def _db(self) -> "aiosqlite.Connection":
-        if self._conn is None:
-            raise RuntimeError("SlashingProtectionDB used before initialize()")
-        return self._conn
-
-    async def initialize(self):
-        """Initialize database tables."""
-        import aiosqlite
-
-        self._conn = await aiosqlite.connect(self.db_path)
-
-        await self._db.execute("""
-            CREATE TABLE IF NOT EXISTS signed_blocks (
-                validator_address TEXT,
-                slot INTEGER,
-                block_hash TEXT,
-                PRIMARY KEY (validator_address, slot)
-            )
-        """)
-
-        await self._db.execute("""
-            CREATE TABLE IF NOT EXISTS signed_attestations (
-                validator_address TEXT,
-                source_epoch INTEGER,
-                target_epoch INTEGER,
-                PRIMARY KEY (validator_address, target_epoch)
-            )
-        """)
-
-        await self._db.commit()
-
-    async def can_sign_block(self, validator_address: str, slot: int) -> bool:
-        """Check if it's safe to sign a block at this slot."""
-        async with self._db.execute(
-            "SELECT block_hash FROM signed_blocks WHERE validator_address = ? AND slot = ?",
-            (validator_address, slot),
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row is None
-
-    async def record_block_signature(self, validator_address: str, slot: int, block_hash: str):
-        """Record that a block was signed."""
-        await self._db.execute(
-            "INSERT OR REPLACE INTO signed_blocks VALUES (?, ?, ?)",
-            (validator_address, slot, block_hash),
-        )
-        await self._db.commit()
-
-    async def can_sign_attestation(
-        self, validator_address: str, source_epoch: int, target_epoch: int
-    ) -> bool:
-        """Check if it's safe to sign an attestation."""
-        # Check for existing attestation at same target
-        async with self._db.execute(
-            "SELECT source_epoch FROM signed_attestations "
-            "WHERE validator_address = ? AND target_epoch = ?",
-            (validator_address, target_epoch),
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row is not None:
-                return False
-
-        # Check for surround violations
-        async with self._db.execute(
-            "SELECT source_epoch, target_epoch FROM signed_attestations "
-            "WHERE validator_address = ?",
-            (validator_address,),
-        ) as cursor:
-            async for row in cursor:
-                existing_source, existing_target = row
-
-                # Would new vote surround existing?
-                if source_epoch < existing_source and existing_target < target_epoch:
-                    return False
-
-                # Would existing surround new?
-                if existing_source < source_epoch and target_epoch < existing_target:
-                    return False
-
-        return True
-
-    async def record_attestation_signature(
-        self, validator_address: str, source_epoch: int, target_epoch: int
-    ):
-        """Record that an attestation was signed."""
-        await self._db.execute(
-            "INSERT OR REPLACE INTO signed_attestations VALUES (?, ?, ?)",
-            (validator_address, source_epoch, target_epoch),
-        )
-        await self._db.commit()
-
-    async def close(self):
-        """Close database connection."""
-        if self._conn:
-            await self._db.close()

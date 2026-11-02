@@ -274,7 +274,7 @@ docker compose -f docker/docker-compose.tunnel.yml down
 
 > **Genesis is fixed once the chain exists.** `genesis-init` writes it once and never regenerates it. If you change `QRDX_GENESIS_ALLOCATIONS` later, it only logs a warning. A different genesis needs a fresh chain: `down -v`, which **also deletes the validator key** on the volume, so back that up first. Every other node joining this chain must start from the same file: copy it out with `docker compose -f docker/docker-compose.tunnel.yml cp node:/app/data/genesis_config.json .` and place it two directories above that node's `QRDX_DATABASE_PATH`. A node that builds its own default genesis has a different block 0 and rejects this chain's blocks.
 
-> **Key custody:** the wallet format this node loads is **unencrypted** — the Dilithium secret key is plain hex in the JSON, and `QRDX_VALIDATOR_PASSWORD` is accepted by the loader but never used to encrypt it. The `node-data` volume therefore holds a live private key: back it up, restrict host access, and keep it off shared storage.
+> **Key custody:** outside dev networks the node accepts only an encrypted keystore (scrypt + AES-256-GCM) and refuses a plaintext key. Set `QRDX_VALIDATOR_PASSWORD_FILE` (or `QRDX_VALIDATOR_PASSWORD`) before the first start and `validator-init` writes one. Back up the keystore, its password and the validator's slashing-protection record together. See [docs/VALIDATOR_KEYS.md](docs/VALIDATOR_KEYS.md).
 
 > **Exposure:** the routed hostname publishes the node's entire HTTP surface, including `/rpc`, `/metrics` and the realtime feeds. Use a Cloudflare WAF rule or Access policy to restrict paths you do not want public, and set `QRDX_RPC_ADMIN_TOKEN` if admin RPC methods are enabled.
 
@@ -435,106 +435,14 @@ To setup a nodeless wallet, use [QRDX Wallet Client GUI](https://github.com/The-
 
 ---
 
-## Mining
+## Consensus
 
-**QRDX** adopts a Proof of Work (PoW) system for mining using SHA256 hashing, with dynamic difficulty adjustment every 512 blocks to maintain a target block time of 180 seconds (3 minutes).
+QRDX is proof of stake; there is no mining. Validators stake QRDX and sign blocks and Casper FFG
+votes with ML-DSA-65:
 
-<details>
-<summary><b>Mining Details:</b></summary>
-
-<dl><dd>
-
-- **Block Hashing**:
-  - Utilizes the SHA256 algorithm for block hashing.
-  - The hash of a block must begin with the last `difficulty` hexadecimal characters of the hash from the previously mined block.
-  - `difficulty` can have decimal digits, which restricts the `difficulty + 1`st character of the derived hash to have a limited set of values.
-
-    ```python
-    from math import ceil
-
-    difficulty = 6.3
-    decimal = difficulty % 1
-
-    charset = '0123456789abcdef'
-    count = ceil(16 * (1 - decimal))
-    allowed_characters = charset[:count]
-    ```
-
-- **Difficulty Adjustment**:
-  - Difficulty adjusts every 512 blocks based on the actual block time versus the target block time of 180 seconds (3 minutes).
-  - Starting difficulty is 6.0.
-
-- **Block Size and Capacity**:
-  - Maximum block size is 2MB (raw bytes), equivalent to 4MB in hexadecimal format.
-  - Transaction data is limited to approximately 1.9MB hex characters per block.
-
-- **Rewards**:
-  - Block rewards start at 64 QRDX and decrease by half every 262,144 blocks until they reach zero.
-
-</dd></dl>
-</details>
-
-<details>
-<summary><b>Mining Software:</b></summary>
-
-<dl><dd>
-
-- **CPU Mining**:
-
-  The CPU miner script (`./miner/cpu_miner.py`) can be used to mine QRDX.
-          
-  <details>
-  <summary><b>Usage:</b></summary>
-  <dl><dd>
-  
-  - **Syntax**:
-      ```bash
-      python3 miner/cpu_miner.py [-h] [-a ADDRESS] [-n NODE] [-w WORKERS] [-m MAX_BLOCKS]
-      ```
-  
-  - **Arguments**:
-        
-      * `--address`, `-a` (Required): Your public QRDX wallet address where mining rewards will be sent.
-
-      * `--node`, `-n` (Optional): The URL or IP address of the QRDX node to connect to. Defaults to `http://127.0.0.1:3006/`.
-
-      * `--workers`, `-w` (Optional): The number of parallel processes to run. It's recommended to set this to the number of CPU cores you want to use for mining. Defaults to 1.
-
-      * `--max-blocks`, `-m` (Optional): Maximum number of blocks to mine before exiting. If not specified, the miner will continue indefinitely.
-
-      * `--help`, `-h`: Shows the help message.
-
-  <details>
-  <summary><b>Examples:</b></summary>
-  <dl><dd>
-  
-  - #### Basic Mining (Single Core)    
-    ```bash
-    python3 miner/cpu_miner.py --address WALLET_ADDRESS
-    ```
-  
-  - #### Mining while connected to a Remote Node    
-    ```bash
-    python3 miner/cpu_miner.py --address WALLET_ADDRESS --node http://a-public-node.com:3006
-    ```
-  
-  - #### Mining with Multiple Cores    
-    ```bash
-    python3 miner/cpu_miner.py --address WALLET_ADDRESS --workers 8
-    ```
-  
-  *(Replace `WALLET_ADDRESS` with your actual QRDX address)*
-    
-  </dd></dl>
-  </dd></dl>
-  </details>
-
-- **GPU Mining**:
-
-  For GPU mining please refer to [QRDX CUDA Miner Setup and Usage](https://github.com/The-Sycorax/qrdx-chain-denaro/tree/main/miner).
-
-</dd></dl>
-</details>
+* **Validators and staking:** docs/STAKING.md.
+* **Validator keys and slashing protection:** docs/VALIDATOR_KEYS.md.
+* **Slots, finality and fork choice:** docs/FORK_CHOICE_CONVERGENCE.md and docs/CONSENSUS_ROADMAP.md.
 
 ---
 

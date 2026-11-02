@@ -172,8 +172,8 @@ class NativeToken:
     pause_authority: Optional[str] = None
     paused: bool = False
     default_operators: Tuple[str, ...] = ()
-    # Whitepaper §9.2: the deployer's advisory flag that the token stays tradable after the
-    # Doomsday Protocol (backed by locked classical assets). Read by qrdx/tokens/doomsday_hook.
+    # The deployer's advisory flag that the token stays tradable after the Doomsday Protocol
+    # (docs/QUANTUM_MIGRATION.md): backed by locked classical assets. Part of the token's record.
     post_doomsday_trade: bool = False
 
     def fee_config(self, height: int) -> Tuple[int, Optional[Decimal]]:
@@ -252,6 +252,41 @@ class NativeToken:
             "extensions": self.extensions(),
         }
 
+    def issuer_powers(self) -> List[Dict[str, Any]]:
+        """What someone other than a holder can still do to holders' balances or the token, in
+        plain terms, for a wallet to show before anyone buys it (docs/EXCHANGE_AUDIT.md 9). Empty:
+        a fixed, plain token no one controls. None of these reach the protocol's shared holders —
+        pools, escrows, vaults (``account_id.holds_pooled_funds``)."""
+        powers: List[Dict[str, Any]] = []
+
+        def add(power: str, by: Any, what: str) -> None:
+            powers.append({"power": power, "by": by, "what": what})
+
+        if self.mint_authority is not None:
+            cap = "" if self.max_supply is None else f", up to {self.max_supply}"
+            add("mint", self.mint_authority, f"can create more of it{cap}")
+        if self.freeze_authority is not None:
+            add("freeze", self.freeze_authority, "can freeze any holder's balance")
+        if self.default_frozen:
+            add("default_frozen", self.freeze_authority, "every account starts frozen")
+        if self.pausable and self.pause_authority is not None:
+            add("pause", self.pause_authority, "can stop every transfer of it")
+        if self.permanent_delegate is not None:
+            add("clawback", self.permanent_delegate, "can move or burn any holder's balance")
+        if self.default_operators:
+            add(
+                "default_operators",
+                list(self.default_operators),
+                "can move any holder's balance unless that holder revokes them",
+            )
+        if self.fee_enabled and self.fee_authority is not None:
+            add("transfer_fee", self.fee_authority, "can change the fee taken on transfers")
+        if self.metadata_authority is not None:
+            add("metadata", self.metadata_authority, "can change its name, symbol and links")
+        if self.non_transferable:
+            add("non_transferable", None, "holders cannot transfer it")
+        return powers
+
     def canonical_extensions(self) -> Optional[List[Any]]:
         ext = self.extensions()
         if not ext:
@@ -311,6 +346,10 @@ class TokenRegistry:
         return t
 
     def is_frozen(self, token: str, holder: str) -> bool:
+        from ..crypto.account_id import holds_pooled_funds
+
+        if holds_pooled_funds(holder):  # (never: it holds everyone's funds — see there)
+            return False
         token = str(token).lower()
         t = self.tokens.get(token)
         default_frozen = t is not None and t.default_frozen
@@ -466,6 +505,13 @@ class TokenRegistry:
             raise TokenError(f"{t.symbol} has no freeze authority")
         if not same(t.freeze_authority, sender):
             raise TokenError(f"only {t.symbol}'s freeze authority may freeze or thaw")
+        from ..crypto.account_id import holds_pooled_funds
+
+        if frozen and holds_pooled_funds(holder):
+            raise TokenError(
+                "a protocol holder of many accounts' funds (a pool, an escrow, a vault) cannot "
+                "be frozen"
+            )
         key = (t.address, account(holder))
         if frozen:
             self.frozen.add(key)

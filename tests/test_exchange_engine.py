@@ -57,24 +57,6 @@ from qrdx.exchange.amm import (
 )
 
 # ---------------------------------------------------------------------------
-# Perpetual imports
-# ---------------------------------------------------------------------------
-from qrdx.exchange.perpetual import (
-    FundingSnapshot,
-    LiquidationResult,
-    PerpEngine,
-    PerpMarket,
-    PerpPosition,
-    PerpSide,
-    PositionStatus,
-    FUNDING_INTERVAL,
-    MAX_FUNDING_RATE,
-    MAX_LEVERAGE,
-    DEFAULT_INITIAL_MARGIN,
-    DEFAULT_MAINT_MARGIN,
-)
-
-# ---------------------------------------------------------------------------
 # Router imports
 # ---------------------------------------------------------------------------
 from qrdx.exchange.router import (
@@ -812,12 +794,9 @@ class TestUnifiedRouter:
         book.place_order(Order(id="ask1", owner=ADDR_B, side=OrderSide.SELL,
                                order_type=OrderType.LIMIT, price=Decimal("1.01"),
                                amount=Decimal("100")))
-        oracle = TWAPOracle(pool_id="QRDX:USDC")
-        oracle.record(Decimal("1.0"), timestamp=time.time() - 10)
 
         router = UnifiedRouter(pool_manager=mgr)
         router.register_order_book("QRDX:USDC", book)
-        router.register_oracle("QRDX:USDC", oracle)
         return router
 
     def test_amm_only_fill(self):
@@ -869,27 +848,18 @@ class TestUnifiedRouter:
         total = result.fee_lp + result.fee_creator + result.fee_treasury + result.fee_validator
         assert total == result.fee_total
 
-    def test_trades_do_not_write_the_reporter_oracle(self):
+    def test_the_router_keeps_no_reporter_oracle(self):
         """Fills used to be recorded into the pair's reporter oracle with wall-clock
-        timestamps — which made a replay compute a different state root. Each pool now keeps
-        its own block-time oracle; the reporter oracle is the reporters' alone."""
-        router = self._setup_router()
-        oracle = router.get_oracle("QRDX:USDC")
-        before = oracle.observation_count
-        router.execute("QRDX", "USDC", Decimal("10"), ADDR_A)
-        assert oracle.observation_count == before
+        timestamps, which made a replay compute a different state root. Each pool keeps its own
+        block-time oracle; the per-pair reporter oracles, inert since, are gone from the router
+        and the state root (docs/EXCHANGE_AUDIT.md 9)."""
+        assert not hasattr(self._setup_router(), "_oracles")
 
     def test_register_and_get_order_book(self):
         router = UnifiedRouter()
         book = OrderBook(pool_id="test")
         router.register_order_book("A:B", book)
         assert router.get_order_book("A:B") is book
-
-    def test_register_and_get_oracle(self):
-        router = UnifiedRouter()
-        oracle = TWAPOracle()
-        router.register_oracle("A:B", oracle)
-        assert router.get_oracle("A:B") is oracle
 
 
 class TestFillResult:
@@ -915,307 +885,6 @@ class TestFillResult:
 # ============================================================================
 #  PERPETUAL CONTRACTS
 # ============================================================================
-
-class TestPerpMarketCreation:
-    """Perp market creation and config."""
-
-    def test_create_market(self):
-        engine = PerpEngine()
-        market = engine.create_market("BTC")
-        assert market.id == "BTC-QRDX-PERP"
-        assert market.max_leverage == MAX_LEVERAGE
-        assert engine.market_count == 1
-
-    def test_create_duplicate_rejected(self):
-        engine = PerpEngine()
-        engine.create_market("BTC")
-        with pytest.raises(ValueError, match="already exists"):
-            engine.create_market("BTC")
-
-    def test_invalid_margin_rates(self):
-        engine = PerpEngine()
-        with pytest.raises(ValueError, match="positive"):
-            engine.create_market("ETH", initial_margin_rate=Decimal("-0.05"))
-
-    def test_maintenance_gte_initial_rejected(self):
-        engine = PerpEngine()
-        with pytest.raises(ValueError, match="less than"):
-            engine.create_market("ETH", initial_margin_rate=Decimal("0.05"),
-                                 maintenance_margin_rate=Decimal("0.05"))
-
-    def test_excessive_leverage_rejected(self):
-        engine = PerpEngine()
-        with pytest.raises(ValueError, match="Leverage"):
-            engine.create_market("ETH", max_leverage=Decimal("100"))
-
-    def test_get_market(self):
-        engine = PerpEngine()
-        engine.create_market("BTC")
-        assert engine.get_market("BTC-QRDX-PERP") is not None
-        assert engine.get_market("NOPE") is None
-
-
-class TestPerpPositions:
-    """Open, close, and manage perpetual positions."""
-
-    def _engine_with_market(self) -> PerpEngine:
-        engine = PerpEngine()
-        market = engine.create_market("BTC")
-        market.index_price = Decimal("50000")
-        market.mark_price = Decimal("50000")
-        return engine
-
-    def test_open_long(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        assert pos.side == PerpSide.LONG
-        assert pos.size == Decimal("1")
-        assert pos.is_open
-
-    def test_open_short(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.SHORT,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        assert pos.side == PerpSide.SHORT
-
-    def test_open_invalid_market(self):
-        engine = PerpEngine()
-        with pytest.raises(ValueError, match="not found"):
-            engine.open_position("NOPE", ADDR_A, PerpSide.LONG,
-                                  Decimal("1"), Decimal("10"), Decimal("100"))
-
-    def test_open_zero_size(self):
-        engine = self._engine_with_market()
-        with pytest.raises(ValueError, match="positive"):
-            engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                  Decimal("0"), Decimal("10"), Decimal("50000"))
-
-    def test_open_excess_leverage(self):
-        engine = self._engine_with_market()
-        with pytest.raises(ValueError, match="Leverage"):
-            engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                  Decimal("1"), Decimal("25"), Decimal("50000"))
-
-    def test_close_long_profit(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        pnl = engine.close_position(pos.id, Decimal("55000"))
-        assert pnl == Decimal("5000")
-        assert not pos.is_open
-
-    def test_close_short_profit(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.SHORT,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        pnl = engine.close_position(pos.id, Decimal("45000"))
-        assert pnl == Decimal("5000")
-
-    def test_close_long_loss(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        pnl = engine.close_position(pos.id, Decimal("48000"))
-        assert pnl == Decimal("-2000")
-
-    def test_close_already_closed(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        engine.close_position(pos.id, Decimal("50000"))
-        with pytest.raises(ValueError, match="closed"):
-            engine.close_position(pos.id, Decimal("50000"))
-
-    def test_unrealized_pnl(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        assert pos.unrealized_pnl(Decimal("52000")) == Decimal("2000")
-        assert pos.unrealized_pnl(Decimal("48000")) == Decimal("-2000")
-
-    def test_margin_ratio(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        mr = pos.margin_ratio(Decimal("50000"))
-        assert mr > 0
-
-    def test_liquidation_price(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        liq = pos.liquidation_price()
-        assert liq < Decimal("50000")
-        assert liq > 0
-
-    def test_bankruptcy_price(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        bp = pos.bankruptcy_price()
-        assert bp < pos.liquidation_price()
-
-    def test_get_positions_by_owner(self):
-        engine = self._engine_with_market()
-        engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                              Decimal("1"), Decimal("10"), Decimal("50000"))
-        engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.SHORT,
-                              Decimal("0.5"), Decimal("5"), Decimal("50000"))
-        positions = engine.get_positions_by_owner(ADDR_A)
-        assert len(positions) == 2
-
-    def test_open_interest_tracking(self):
-        engine = self._engine_with_market()
-        engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                              Decimal("1"), Decimal("10"), Decimal("50000"))
-        engine.open_position("BTC-QRDX-PERP", ADDR_B, PerpSide.SHORT,
-                              Decimal("0.5"), Decimal("5"), Decimal("50000"))
-        market = engine.get_market("BTC-QRDX-PERP")
-        assert market.open_interest_long == Decimal("1")
-        assert market.open_interest_short == Decimal("0.5")
-        assert market.open_interest == Decimal("1.5")
-
-    def test_add_margin(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        old_margin = pos.margin
-        new_margin = engine.add_margin(pos.id, Decimal("1000"))
-        assert new_margin == old_margin + Decimal("1000")
-
-
-class TestPerpFunding:
-    """Funding rate calculation and application."""
-
-    def _setup(self):
-        engine = PerpEngine()
-        market = engine.create_market("BTC")
-        market.index_price = Decimal("50000")
-        market.mark_price = Decimal("50050")  # slight premium
-        market.last_funding_time = 0.0  # force eligibility
-        return engine, market
-
-    def test_funding_rate_positive(self):
-        engine, market = self._setup()
-        rate = engine.calculate_funding_rate("BTC-QRDX-PERP")
-        assert rate > 0  # mark > index → longs pay
-
-    def test_funding_rate_negative(self):
-        engine, _ = self._setup()
-        market = engine.get_market("BTC-QRDX-PERP")
-        market.mark_price = Decimal("49950")  # discount
-        rate = engine.calculate_funding_rate("BTC-QRDX-PERP")
-        assert rate < 0
-
-    def test_funding_rate_capped(self):
-        engine, _ = self._setup()
-        market = engine.get_market("BTC-QRDX-PERP")
-        market.mark_price = Decimal("100000")  # extreme premium
-        rate = engine.calculate_funding_rate("BTC-QRDX-PERP")
-        assert rate == MAX_FUNDING_RATE
-
-    def test_apply_funding(self):
-        engine, _ = self._setup()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        old_margin = pos.margin
-        snapshot = engine.apply_funding("BTC-QRDX-PERP")
-        assert snapshot is not None
-        # Long should lose margin when rate > 0
-        assert pos.margin < old_margin
-
-    def test_funding_too_early(self):
-        engine = PerpEngine()
-        market = engine.create_market("BTC")
-        market.index_price = Decimal("50000")
-        market.mark_price = Decimal("50050")
-        market.last_funding_time = time.time()  # just now
-        assert engine.apply_funding("BTC-QRDX-PERP") is None
-
-
-class TestPerpLiquidation:
-    """Liquidation, insurance fund, ADL."""
-
-    def _setup(self):
-        engine = PerpEngine()
-        market = engine.create_market("BTC")
-        market.index_price = Decimal("50000")
-        market.mark_price = Decimal("50000")
-        return engine
-
-    def test_healthy_position_not_liquidated(self):
-        engine = self._setup()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        assert engine.check_liquidation(pos.id) is None
-
-    def test_undercollateralized_position_liquidated(self):
-        engine = self._setup()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        # Crash the mark price below liquidation price
-        market = engine.get_market("BTC-QRDX-PERP")
-        liq_price = pos.liquidation_price()
-        market.mark_price = liq_price - Decimal("100")
-        result = engine.check_liquidation(pos.id)
-        assert result is not None
-        assert result.pnl < 0
-        assert pos.status == PositionStatus.LIQUIDATED
-
-    def test_insurance_fund_used(self):
-        engine = self._setup()
-        engine.add_insurance("BTC-QRDX-PERP", Decimal("100000"))
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        market = engine.get_market("BTC-QRDX-PERP")
-        # Crash below bankruptcy
-        bp = pos.bankruptcy_price()
-        market.mark_price = bp - Decimal("1000")
-        result = engine.check_liquidation(pos.id)
-        assert result is not None
-        assert result.insurance_used > 0
-        assert not result.adl_triggered
-
-    def test_adl_triggered_when_insurance_depleted(self):
-        engine = self._setup()
-        # No insurance fund
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        market = engine.get_market("BTC-QRDX-PERP")
-        bp = pos.bankruptcy_price()
-        market.mark_price = bp - Decimal("5000")
-        result = engine.check_liquidation(pos.id)
-        assert result is not None
-        assert result.adl_triggered
-
-    def test_add_insurance_fund(self):
-        engine = self._setup()
-        engine.add_insurance("BTC-QRDX-PERP", Decimal("10000"))
-        market = engine.get_market("BTC-QRDX-PERP")
-        assert market.insurance_fund == Decimal("10000")
-
-    def test_add_insurance_invalid(self):
-        engine = self._setup()
-        with pytest.raises(ValueError, match="positive"):
-            engine.add_insurance("BTC-QRDX-PERP", Decimal("0"))
-
-
-class TestPerpPricing:
-    """Mark price and index price management."""
-
-    def test_update_price(self):
-        engine = PerpEngine()
-        market = engine.create_market("BTC")
-        engine.update_price("BTC-QRDX-PERP", Decimal("50000"))
-        assert market.index_price == Decimal("50000")
-        assert market.mark_price > 0
-
-    def test_update_price_invalid_market(self):
-        engine = PerpEngine()
-        with pytest.raises(ValueError, match="not found"):
-            engine.update_price("NOPE", Decimal("100"))
-
 
 # ============================================================================
 #  EXCHANGE CONSTANTS
@@ -1281,10 +950,6 @@ class TestPackageImports:
         from qrdx.exchange import PoolState, Position, TickInfo, ConcentratedLiquidityPool, PoolManager, FeeTier
         assert PoolManager is not None
 
-    def test_perp_imports(self):
-        from qrdx.exchange import PerpPosition, PerpSide, PerpMarket, FundingSnapshot, LiquidationResult, PerpEngine
-        assert PerpEngine is not None
-
     def test_router_imports(self):
         from qrdx.exchange import FillResult, FillSource, UnifiedRouter
         assert UnifiedRouter is not None
@@ -1323,12 +988,6 @@ from qrdx.exchange.oracle import (
     MIN_OBSERVATION_PERIOD,
     MAX_PRICE_CHANGE_PCT,
     STALENESS_THRESHOLD,
-)
-from qrdx.exchange.perpetual import (
-    LIQUIDATION_PENALTY_RATE,
-    MAX_OPEN_INTEREST_DEFAULT,
-    ORACLE_STALENESS_SECONDS,
-    MAX_POSITIONS_PER_OWNER,
 )
 from qrdx.exchange.router import (
     MAX_PRICE_DEVIATION,
@@ -1742,138 +1401,6 @@ class TestAMMSecurity:
 #  PERPETUAL SECURITY
 # ============================================================================
 
-class TestPerpSecurity:
-    """Partial close, max OI, oracle staleness, reduce-only, pause, liquidation penalty."""
-
-    def _engine_with_market(self) -> PerpEngine:
-        engine = PerpEngine()
-        market = engine.create_market("BTC")
-        market.index_price = Decimal("50000")
-        market.mark_price = Decimal("50000")
-        return engine
-
-    # -- Emergency pause ----------------------------------------------------
-
-    def test_paused_engine_rejects_open(self):
-        engine = self._engine_with_market()
-        engine.pause()
-        assert engine.is_paused
-        with pytest.raises(ValueError, match="[Pp]aused"):
-            engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                  Decimal("1"), Decimal("10"), Decimal("50000"))
-
-    def test_unpause_resumes(self):
-        engine = self._engine_with_market()
-        engine.pause()
-        engine.unpause()
-        assert not engine.is_paused
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        assert pos.is_open
-
-    # -- Partial close ------------------------------------------------------
-
-    def test_partial_close_reduces_size(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        pnl = engine.partial_close(pos.id, Decimal("0.5"), Decimal("52000"))
-        assert pos.is_open
-        assert pos.size == Decimal("0.5")
-        assert pnl == Decimal("0.5") * (Decimal("52000") - Decimal("50000"))
-
-    def test_partial_close_releases_proportional_margin(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        original_margin = pos.margin
-        engine.partial_close(pos.id, Decimal("0.5"), Decimal("50000"))
-        # Should release roughly half the margin
-        assert pos.margin == original_margin * Decimal("0.5")
-
-    def test_partial_close_updates_oi(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        market = engine.get_market("BTC-QRDX-PERP")
-        assert market.open_interest_long == Decimal("1")
-        engine.partial_close(pos.id, Decimal("0.3"), Decimal("50000"))
-        assert market.open_interest_long == Decimal("0.7")
-
-    def test_partial_close_full_size_closes_entirely(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        engine.partial_close(pos.id, Decimal("1"), Decimal("50000"))
-        assert not pos.is_open
-
-    def test_partial_close_invalid_size(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        with pytest.raises(ValueError, match="positive"):
-            engine.partial_close(pos.id, Decimal("0"), Decimal("50000"))
-
-    # -- Liquidation penalty ------------------------------------------------
-
-    def test_liquidation_penalty_goes_to_insurance(self):
-        engine = self._engine_with_market()
-        market = engine.get_market("BTC-QRDX-PERP")
-        initial_insurance = market.insurance_fund
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        liq_price = pos.liquidation_price()
-        market.mark_price = liq_price - Decimal("100")
-        engine.check_liquidation(pos.id)
-        # Insurance fund should have received the penalty
-        assert market.insurance_fund > initial_insurance
-
-    def test_liquidation_penalty_rate(self):
-        engine = self._engine_with_market()
-        market = engine.get_market("BTC-QRDX-PERP")
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        liq_price = pos.liquidation_price()
-        mark = liq_price - Decimal("100")
-        market.mark_price = mark
-        initial_insurance = market.insurance_fund
-        engine.check_liquidation(pos.id)
-        # Penalty = notional * 2.5%
-        expected_penalty = (Decimal("1") * mark * LIQUIDATION_PENALTY_RATE).quantize(
-            Decimal("0.00000001"), rounding=ROUND_HALF_UP
-        )
-        # Insurance gained at least the penalty (minus any clawback)
-        assert market.insurance_fund >= initial_insurance + expected_penalty - abs(pos.realized_pnl)
-
-    # -- Deterministic position IDs -----------------------------------------
-
-    def test_position_ids_deterministic(self):
-        engine = self._engine_with_market()
-        pos = engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                                    Decimal("1"), Decimal("10"), Decimal("50000"))
-        assert "-" not in pos.id  # blake2b, not uuid
-        assert len(pos.id) == 16
-
-    # -- OI-weighted funding dampening --------------------------------------
-
-    def test_funding_rate_dampened_by_oi_imbalance(self):
-        """With all-long OI, rate is scaled by imbalance ratio."""
-        engine = self._engine_with_market()
-        market = engine.get_market("BTC-QRDX-PERP")
-        market.mark_price = Decimal("50050")  # slight premium
-
-        # No positions → no OI → no dampening
-        rate_no_oi = engine.calculate_funding_rate("BTC-QRDX-PERP")
-
-        # Add only long OI (100% longs, 0% shorts)
-        engine.open_position("BTC-QRDX-PERP", ADDR_A, PerpSide.LONG,
-                              Decimal("1"), Decimal("10"), Decimal("50000"))
-        rate_all_long = engine.calculate_funding_rate("BTC-QRDX-PERP")
-
-        # With 100% long ratio: rate * 1.0 * 2 = 2x base rate
-        assert rate_all_long > rate_no_oi
-
-
 # ============================================================================
 #  ROUTER SECURITY
 # ============================================================================
@@ -1886,11 +1413,7 @@ class TestRouterSecurity:
         pool = mgr.create_pool("QRDX", "USDC", FeeTier.MEDIUM, PoolType.STANDARD,
                                tick_to_sqrt_price(0), ADDR_A, Decimal("10000"))
         pool.add_liquidity(ADDR_A, -60, 60, Decimal("100000"))
-        oracle = TWAPOracle(pool_id="QRDX:USDC")
-        oracle.record(Decimal("1.0"), timestamp=time.time() - 10)
-        router = UnifiedRouter(pool_manager=mgr)
-        router.register_oracle("QRDX:USDC", oracle)
-        return router
+        return UnifiedRouter(pool_manager=mgr)
 
     # -- Deadline enforcement -----------------------------------------------
 

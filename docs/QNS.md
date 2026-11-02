@@ -33,6 +33,13 @@ gives the name up at once.
 Records are set by the name's owner: whoever holds the NFT, or an account it approved for the
 NFT, or an operator.
 
+**Records belong to the holder who set them.** Each set of records remembers the account that
+held the NFT when they were set. Once the NFT is someone else's, the old records no longer count:
+the name resolves to its new owner and carries no text records until the new owner sets its own.
+This holds however the NFT moved: `NFT_TRANSFER`, the EVM's ERC-721 interface, or a sale. (A name
+used to keep resolving to its seller after a sale.) If the NFT comes back to the account that set
+the records, they count again.
+
 ## Lifetime
 
 A name resolves until it **expires**. During the 30-day **grace period** after that, it doesn't
@@ -40,8 +47,8 @@ resolve, but only renewal is open: no one else can register it. After the grace 
 may register it, the old NFT is burned and its records are cleared.
 
 A **primary name** (reverse record) counts only while that name resolves to the account that set
-it. Transfer the name, point it elsewhere, or let it expire, and the reverse lookup returns
-nothing.
+it. Transfer or sell the name, point it elsewhere, or let it expire, and the reverse lookup
+returns nothing.
 
 ## Reading
 

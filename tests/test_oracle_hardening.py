@@ -5,13 +5,10 @@ far from the median are recorded against their validators.
 """
 from decimal import Decimal
 
-import pytest
 
 from test_validator_oracle import BTC, T0, _oracle, _vote, setup  # noqa: F401  (fixture)
 
 from qrdx import constants
-
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
 
 D = Decimal
 

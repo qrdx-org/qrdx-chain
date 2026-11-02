@@ -72,11 +72,10 @@ netifaces>=0.11.0
 # ============================================================================
 # NEW: POST-QUANTUM CRYPTOGRAPHY
 # ============================================================================
-# Note: liboqs-python requires liboqs system library
-# Install liboqs first: https://github.com/open-quantum-safe/liboqs
-# For Debian/Ubuntu: apt-get install liboqs-dev
-# Or build from source following OQS instructions
-liboqs-python>=0.9.0
+# liboqs-python needs the liboqs C library of the same release: 0.16.0, built from its tag and
+# checked against its commit (docker/Dockerfile, .devcontainer/install-liboqs.sh). Every node
+# proves at startup that it computes FIPS 204/203 (qrdx/crypto/pq/algorithms.py).
+liboqs-python==0.16.0.1
 
 # BLAKE3 hashing for PQ node identity
 blake3>=0.4.0

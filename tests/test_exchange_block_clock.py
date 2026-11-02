@@ -23,7 +23,6 @@ import pytest
 
 from qrdx.exchange import ExchangeStateManager
 from qrdx.exchange import block_processor as BP
-from qrdx.exchange.perpetual import ORACLE_STALENESS_SECONDS
 
 T = 1_700_000_000.0
 MARKET = "BTC-QRDX-PERP"
@@ -33,40 +32,12 @@ MARKET = "BTC-QRDX-PERP"
 def mgr():
     ExchangeStateManager.reset_instance()
     m = ExchangeStateManager.get_instance()
-    m.perp_engine.create_market("BTC", "QRDX")
     yield m
     ExchangeStateManager.reset_instance()
 
 
 def _wall(monkeypatch, value):
     monkeypatch.setattr(time, "time", lambda: value)
-
-
-def _price_at(mgr, height, ts):
-    mgr.begin_block(height, ts)
-    mgr.perp_engine.update_price(MARKET, Decimal("30000"))
-
-
-def _stale(mgr):
-    try:
-        mgr.perp_engine._check_oracle_staleness(mgr.perp_engine.get_market(MARKET))
-        return False
-    except ValueError:
-        return True
-
-
-def test_oracle_staleness_is_judged_by_block_time(mgr, monkeypatch):
-    _price_at(mgr, 1, T)
-
-    # Block time says stale; the wall clock (a fast replay) says one second has passed.
-    _wall(monkeypatch, T + 1)
-    mgr.begin_block(2, T + ORACLE_STALENESS_SECONDS + 60)
-    assert _stale(mgr)
-
-    # Block time says fresh; the wall clock (a node catching up hours later) says stale.
-    _wall(monkeypatch, T + 10 * 3600)
-    mgr.begin_block(2, T + 30)
-    assert not _stale(mgr)
 
 
 def test_swap_deadline_is_judged_by_block_time(mgr, monkeypatch):
@@ -132,7 +103,5 @@ def test_funding_does_not_settle_early_by_block_time(mgr, monkeypatch):
 
 def test_standalone_engines_keep_the_wall_clock():
     """Only the consensus manager rewires the clock; a bare engine (tools, tests) is unchanged."""
-    from qrdx.exchange.perpetual import PerpEngine
     from qrdx.exchange.router import UnifiedRouter
-    assert PerpEngine().clock is time.time
     assert UnifiedRouter().clock is time.time

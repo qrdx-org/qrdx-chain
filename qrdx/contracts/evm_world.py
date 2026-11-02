@@ -396,6 +396,17 @@ EXTERNAL_PROOF_ADDRESS = (0x0201).to_bytes(20, "big")  # (0x0100-0x0104: retired
 # as the contract's account (run at the start of the next block).
 EXCHANGE_READ_ADDRESS = (0x0400).to_bytes(20, "big")
 EXCHANGE_WRITE_ADDRESS = (0x0401).to_bytes(20, "big")
+# Post-quantum precompiles at QRDX's own addresses (chain-spec feature
+# ``evm_standard_precompiles``). The fork placed ML-DSA-65 verification at 0x09 — Ethereum's
+# BLAKE2F since Istanbul — and BLAKE3 and two ML-KEM precompiles at 0x0a–0x0c, which Ethereum's
+# later forks assign (point evaluation, BLS12-381). Under the feature 0x09 is BLAKE2F again,
+# 0x0a–0x0c are free, and the PQ ones live here. The ML-KEM precompiles are gone: decapsulating
+# on chain needs the secret key in calldata, where everyone can read it.
+PQ_VERIFY_ADDRESS = (0x0500).to_bytes(20, "big")  # ML-DSA-65: hash (32) · key · signature → 1
+BLAKE3_ADDRESS = (0x0501).to_bytes(20, "big")
+_LEGACY_PQ_ADDRESSES = tuple(n.to_bytes(20, "big") for n in (0x09, 0x0A, 0x0B, 0x0C))
+BLAKE2F_ADDRESS = (0x09).to_bytes(20, "big")
+ECRECOVER_ADDRESS = (1).to_bytes(20, "big")
 BN128_MUL_ADDRESS = (7).to_bytes(20, "big")
 BN128_PAIRING_ADDRESS = (8).to_bytes(20, "big")
 BN128_MUL_SURCHARGE = 12_000  # 6,000 → 18,000 (py_ecc: ~8.5 ms a multiplication)
@@ -429,6 +440,23 @@ def chain_state_precompile(computation):
     return computation
 
 
+def _ecrecover_off(computation):
+    """ECRECOVER once the Doomsday Protocol triggered (qrdx/exchange/doomsday.py): it charges
+    its gas and recovers no address, as for an invalid signature, so a contract that checks an
+    ECDSA signature (a permit, a multisig) reads address(0) and refuses it. Anyone may forge
+    one by then."""
+    from eth import constants
+
+    computation.consume_gas(constants.GAS_ECRECOVER, reason="ECRecover Precompile")
+    return computation
+
+
+def _doomsday() -> bool:
+    from ..exchange.state_manager import ExchangeStateManager
+
+    return ExchangeStateManager.get_instance().doomsday_cutoff() is not None
+
+
 def _surcharged(precompile, extra):
     def run(computation):
         computation.consume_gas(extra(computation.msg.data), reason="QRDX precompile surcharge")
@@ -444,11 +472,28 @@ _SURCHARGES = {
 }
 
 
+def _standard_precompiles(base, block_number):
+    """The fork's precompiles under ``evm_standard_precompiles`` (see PQ_VERIFY_ADDRESS)."""
+    from eth.precompiles import blake2b_fcompress
+    from eth.vm.forks.qrdx.precompiles import blake3_hash_precompile, dilithium_verify
+
+    from .. import chain_spec
+
+    if not chain_spec.is_active("evm_standard_precompiles", int(block_number)):
+        return base
+    table = {a: fn for a, fn in base.items() if a not in _LEGACY_PQ_ADDRESSES}
+    table[BLAKE2F_ADDRESS] = blake2b_fcompress
+    table[PQ_VERIFY_ADDRESS] = dilithium_verify
+    table[BLAKE3_ADDRESS] = blake3_hash_precompile
+    return table
+
+
 class _WorldPrecompiles(Mapping):
     """The fork's precompiles — the slow ones surcharged — plus every native token's and NFT
     collection's address (when tokens are in play)."""
 
-    def __init__(self, base, tokens):
+    def __init__(self, base, tokens, block_number: int = 0):
+        base = _standard_precompiles(base, block_number)
         self.base, self.tokens = base, tokens
         self._wrapped = {
             address: _surcharged(base[address], extra)
@@ -465,6 +510,8 @@ class _WorldPrecompiles(Mapping):
             return external_proof_precompile
         fn = self._wrapped.get(address) or self.base.get(address)
         if fn is not None:
+            if address == ECRECOVER_ADDRESS and _doomsday():
+                return _ecrecover_off
             return fn
         if address == STATE_PROOF_ADDRESS:
             from .state_proof_evm import state_proof_precompile
@@ -510,7 +557,11 @@ class _WorldPrecompiles(Mapping):
 class WorldComputation(QRDXComputation):
     @property
     def precompiles(self):
-        return _WorldPrecompiles(super().precompiles, getattr(self.state, "native_tokens", None))
+        return _WorldPrecompiles(
+            super().precompiles,
+            getattr(self.state, "native_tokens", None),
+            getattr(self.state, "block_number", 0),
+        )
 
 
 class WorldState(QRDXState):

@@ -4,9 +4,10 @@ The EVM's way into the exchange (docs/HYPERLIQUID_PARITY.md, Hyperliquid's Hyper
 * **Read** (``EXCHANGE_READ_ADDRESS``, 0x…0400): a contract reads live exchange state — a market's
   mark and oracle price, a perps position, an account's equity and withdrawable collateral, a QNS
   name's address — as of this point of the block, the same on every node.
-* **Write** (``EXCHANGE_WRITE_ADDRESS``, 0x…0401, Hyperliquid's CoreWriter): a contract sends an
-  exchange action — an order, a cancel, a deposit, a withdrawal, a vault or staking move — as its
-  own account (its address, ``0x`` + 40 hex). The action is journaled with the call (a revert
+* **Write** (``EXCHANGE_WRITE_ADDRESS``, 0x…0401, Hyperliquid's CoreWriter): a contract — or an
+  ordinary account, calling it directly — sends an exchange action (an order, a cancel, a deposit,
+  a withdrawal, a vault or staking move, approving a PQ agent key) as its own account (its
+  address, ``0x`` + 40 hex). The action is journaled with the call (a revert
   drops it), queued in the exchange's committed state when the block's EVM section is accepted,
   and executed at the start of the next block's exchange processing, before its transactions —
   authorized by the EVM execution itself (no signature; its gas was paid in the EVM).
@@ -71,13 +72,20 @@ EVM_ACTION_OPS = frozenset(
         "STAKE_DELEGATE",
         "STAKE_UNDELEGATE",
         "SCHEDULE_CANCEL",
-        # A contract may be a market deployer (docs/HYPERLIQUID_PARITY.md): bond, list, run the
-        # oracle — an on-chain oracle aggregator, say — and settle.
-        "DEPLOYER_BOND",
-        "DEPLOYER_UNBOND",
+        # A contract may list a token perp (docs/HYPERLIQUID_PARITY.md 13) — priced off the
+        # token's spot market, never by the contract.
         "CREATE_MARKET",
-        "DEPLOYER_SET_ORACLE",
-        "DEPLOYER_HALT",
+        # An account approves (and revokes) a post-quantum agent key — a session key that signs
+        # its trading operations, never moving funds (AGENT_SCOPE). This is how an Ethereum
+        # account (MetaMask) trades on the exchange: one EVM transaction approves a PQ key held
+        # by the trading app, which then signs ordinary exchange transactions for the account.
+        "AGENT_APPROVE",
+        "AGENT_REVOKE",
+        # Account control (docs/ACCOUNT_CONTROL.md) for an Ethereum account: bind a post-quantum
+        # controller and, when it chooses, turn its own ECDSA key off — quantum migration on QRDX
+        # (docs/QUANTUM_MIGRATION.md). Signed by the account's ECDSA key through the EVM, it counts
+        # as the account's own key (a change waits out its delay).
+        "ACCOUNT_POLICY",
     }
 )
 

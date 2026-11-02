@@ -69,9 +69,8 @@ def testnet_chain_spec(wallets: Dict[str, dict]):
         # Withdrawability delay after exit (standard 2,048): long enough to cover the finality
         # lag, short enough that a soak sees the principal come back.
         "WITHDRAWAL_DELAY_EPOCHS": 4,
-        # Prices come from the validators' votes (docs/PERPS_CLEARINGHOUSE.md §8); no trusted
-        # reporter. The reporter wallet doubles as the treasury vault seeder.
-        "ORACLE_REPORTERS": [],
+        # Prices come from the validators' votes (docs/PERPS_CLEARINGHOUSE.md §8). The
+        # "Oracle Reporter" wallet is the treasury vault seeder.
         "PERP_VAULT_SEEDERS": [reporter] if reporter else [],
         # Vault deposits unlock after 20 s instead of 4 days so S19 can redeem within the run.
         "PERP_VAULT_LOCKUP_SECONDS": 20,
@@ -82,12 +81,14 @@ def testnet_chain_spec(wallets: Dict[str, dict]):
         # fixed in advance by the issuer's first nonce.
         "PERP_COLLATERAL_TOKEN": stablecoin_address(wallets),
         "PERP_QUOTE": "USD",
-        # S13 lists its market with CREATE_MARKET, without seeding a liquidity vault (production:
-        # validator-priced markets are listed by governance, docs/HYPERLIQUID_PARITY.md).
-        "PERP_OPEN_LISTING": 1,
+        # S13/S19 trade a validator-priced qBTC perp: a genesis market (a deployer can no longer
+        # list one; governance or genesis does: docs/HYPERLIQUID_PARITY.md). No liquidity vault.
+        "PERP_GENESIS_MARKETS": ["qBTC:20:4"],
         "PERP_MARKET_MIN_LIQUIDITY": 0,
         # One bridged asset, from the scripted source chain S23 deposits into.
         "BRIDGE_ASSETS": [BRIDGE_TEST_ASSET],
+        # A real network mints nothing of an asset without a limit (docs/BRIDGE.md).
+        "BRIDGE_MINT_LIMITS": [BRIDGE_TEST_ASSET.split(":")[0] + ":100000:1000000"],
         # Governance on testnet time (standard: a week of voting, a 2-day timelock, a
         # 256-block fork-approval lead): 2 minutes of voting, a 16 s timelock, ~13 minutes to
         # execute. The veto threshold is small enough for a test holder to reach (S22); the

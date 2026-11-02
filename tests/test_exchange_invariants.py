@@ -19,7 +19,6 @@ import pytest
 from qrdx.exchange.amm import (
     ConcentratedLiquidityPool, PoolState, FeeTier, PoolType, tick_to_sqrt_price,
 )
-from qrdx.exchange.perpetual import PerpEngine, PerpSide, MAX_LEVERAGE
 from qrdx.exchange.orderbook import (
     Order, OrderBook, OrderSide, OrderType, SelfTradeAction,
 )
@@ -99,70 +98,6 @@ class TestSwapInvariants:
 # ─────────────────────────────────────────────────────────────────────────
 #  Perpetual invariants
 # ─────────────────────────────────────────────────────────────────────────
-
-class TestPerpInvariants:
-    def _engine(self):
-        eng = PerpEngine()
-        eng.create_market("qBTC", "qUSD", max_leverage=MAX_LEVERAGE)
-        return eng, "qBTC-qUSD-PERP"
-
-    @pytest.mark.parametrize("seed", SEEDS)
-    def test_pnl_sign_and_open_interest(self, seed):
-        rng = random.Random(seed)
-        eng, mid = self._engine()
-        side = PerpSide.LONG if rng.random() < 0.5 else PerpSide.SHORT
-        size = Decimal(rng.randint(1, 100))
-        entry = Decimal(rng.randint(100, 50_000))
-        lev = Decimal(rng.randint(1, int(MAX_LEVERAGE)))
-        pos = eng.open_position(mid, ADDR_A, side, size, lev, entry)
-
-        market = eng.get_market(mid)
-        oi = market.open_interest_long if side == PerpSide.LONG else market.open_interest_short
-        assert oi == size, "open interest must reflect the opened size"
-        assert pos.margin > 0
-
-        # Close at a higher price: long profits, short loses (and vice versa).
-        exit_up = entry + Decimal(rng.randint(1, 1000))
-        pnl = eng.close_position(pos.id, exit_up)
-        if side == PerpSide.LONG:
-            assert pnl > 0, "long must profit when price rises"
-        else:
-            assert pnl < 0, "short must lose when price rises"
-        # PnL magnitude is exact: size * |exit - entry|.
-        assert abs(pnl) == size * (exit_up - entry)
-
-        # Open interest released on close.
-        oi_after = market.open_interest_long if side == PerpSide.LONG else market.open_interest_short
-        assert oi_after == 0, "open interest must be released on close"
-
-    def test_close_at_entry_is_zero_pnl(self):
-        eng, mid = self._engine()
-        pos = eng.open_position(mid, ADDR_A, PerpSide.LONG, Decimal("5"), Decimal("2"), Decimal("30000"))
-        assert eng.close_position(pos.id, Decimal("30000")) == 0
-
-    @pytest.mark.parametrize("lev", [Decimal("0"), Decimal("-1"), MAX_LEVERAGE + 1])
-    def test_invalid_leverage_rejected(self, lev):
-        eng, mid = self._engine()
-        with pytest.raises(ValueError):
-            eng.open_position(mid, ADDR_A, PerpSide.LONG, Decimal("1"), lev, Decimal("30000"))
-
-    @pytest.mark.parametrize("size,price", [(Decimal("0"), Decimal("1")), (Decimal("-1"), Decimal("1")),
-                                            (Decimal("1"), Decimal("0")), (Decimal("1"), Decimal("-5"))])
-    def test_invalid_size_or_price_rejected(self, size, price):
-        eng, mid = self._engine()
-        with pytest.raises(ValueError):
-            eng.open_position(mid, ADDR_A, PerpSide.LONG, size, Decimal("2"), price)
-
-    @pytest.mark.parametrize("seed", SEEDS)
-    def test_margin_ratio_falls_as_price_moves_against(self, seed):
-        rng = random.Random(seed)
-        eng, mid = self._engine()
-        entry = Decimal(rng.randint(1000, 40000))
-        pos = eng.open_position(mid, ADDR_A, PerpSide.LONG, Decimal("3"), Decimal("5"), entry)
-        good = pos.margin_ratio(entry)               # at entry
-        worse = pos.margin_ratio(entry / 2)          # price halved (against long)
-        assert worse < good, "margin ratio must fall as price moves against the position"
-
 
 # ─────────────────────────────────────────────────────────────────────────
 #  Order book invariants

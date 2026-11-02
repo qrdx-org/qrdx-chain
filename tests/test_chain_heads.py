@@ -8,7 +8,7 @@ have split the chain the day a node filled it.
 from decimal import Decimal
 
 import pytest
-from test_bridge import CHAIN, T0, Key, _genesis
+from test_bridge import ASSET, CHAIN, T0, Key, _genesis
 from test_evm_world import ALICE, Chain, chain  # noqa: F401  (fixture)
 
 from qrdx.contracts.evm_world import CHAIN_STATE_ADDRESS
@@ -16,6 +16,14 @@ from qrdx.exchange import ExchangeOpType, ExchangeStateManager
 from qrdx.exchange.bridge import HEAD_VOTE_MAX_AGE, parse_head
 
 D = Decimal
+
+
+@pytest.fixture(autouse=True)
+def _bridged(monkeypatch):
+    """Heads are attested only for the chains the network bridges (docs/EXCHANGE_AUDIT.md 10)."""
+    from qrdx import constants
+
+    monkeypatch.setattr(constants, "BRIDGE_ASSETS", (ASSET,))
 
 
 def _head(height, h="11", root="22", ts=1_800_000_000):

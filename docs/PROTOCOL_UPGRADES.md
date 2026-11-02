@@ -72,7 +72,7 @@ The `chain_spec` section of a network's genesis file:
   unknown parameter is an error, because a later release changing a default must not change a
   running chain. The parameters are the ones networks have always varied: slot length (in
   milliseconds, `SLOT_DURATION_MS`, so a network can run sub-second slots), epoch length,
-  minimum validators, staking delays, oracle reporters and the perps settings, and the exchange
+  minimum validators, staking delays, the genesis perp markets and the perps settings, and the exchange
   gas floor. The standard is 250 ms slots and 32-slot (8 s) epochs. Parameters counted in blocks
   (`GOV_*_BLOCKS`, `SYSTEM_WALLET_MASTER_SUNSET_HEIGHT`) or epochs (`UNBONDING_PERIOD_EPOCHS`,
   `WITHDRAWAL_DELAY_EPOCHS`) have defaults sized for that, so they last a set wall-clock time:

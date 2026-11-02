@@ -27,9 +27,10 @@ except ImportError as e:
     ) from e
 
 
+from . import algorithms as _algorithms  # noqa: E402
+
 # ML-KEM-768 parameters (formerly Kyber768) — FIPS 203
-ALGORITHM = "ML-KEM-768"
-ALGORITHM_LEGACY = "Kyber768"
+ALGORITHM = _algorithms.KEM_ALGORITHM
 PUBLIC_KEY_SIZE = 1184  # ML-KEM-768 public key size
 PRIVATE_KEY_SIZE = 2400  # ML-KEM-768 private key size
 CIPHERTEXT_SIZE = 1088  # ML-KEM-768 ciphertext size
@@ -42,25 +43,9 @@ class KEMError(Exception):
     pass
 
 
-def _get_working_algorithm() -> str:
-    """Determine which KEM algorithm name the installed liboqs supports."""
-    try:
-        oqs.KeyEncapsulation(ALGORITHM)
-        return ALGORITHM
-    except Exception:
-        try:
-            oqs.KeyEncapsulation(ALGORITHM_LEGACY)
-            return ALGORITHM_LEGACY
-        except Exception as exc:
-            raise KEMError(
-                f"Neither {ALGORITHM} nor {ALGORITHM_LEGACY} is supported by "
-                f"the installed liboqs. Upgrade liboqs to a version that "
-                f"supports FIPS 203 (ML-KEM-768)."
-            ) from exc
-
-
-# Validate at import time
-_WORKING_ALGORITHM = _get_working_algorithm()
+# Prove the installed liboqs computes FIPS 203 before any key is used: QRDX runs exactly
+# ALGORITHM, never an older or draft scheme under a nearby name (see algorithms.py).
+_algorithms.require()
 
 
 @dataclass
@@ -137,7 +122,7 @@ class KEMPrivateKey:
     def _generate(self):
         """Generate new KEM keypair."""
         try:
-            self._kem = oqs.KeyEncapsulation(_WORKING_ALGORITHM)
+            self._kem = oqs.KeyEncapsulation(ALGORITHM)
             pub_bytes = self._kem.generate_keypair()
             self._public_key = KEMPublicKey(pub_bytes)
             self._key_bytes = self._kem.export_secret_key()
@@ -147,7 +132,7 @@ class KEMPrivateKey:
     def _restore_from_bytes(self, key_bytes: bytes):
         """Restore KEM keypair from private key bytes."""
         try:
-            self._kem = oqs.KeyEncapsulation(_WORKING_ALGORITHM, key_bytes)
+            self._kem = oqs.KeyEncapsulation(ALGORITHM, key_bytes)
             if self._public_key is None:
                 pub_bytes = self._kem.generate_keypair()
                 self._public_key = KEMPublicKey(pub_bytes)
@@ -205,7 +190,7 @@ class KEMPrivateKey:
             raise KEMError(f"Decapsulation failed: {e}") from e
 
     def __repr__(self) -> str:
-        return f"KEMPrivateKey(algorithm={_WORKING_ALGORITHM})"
+        return f"KEMPrivateKey(algorithm={ALGORITHM})"
 
 
 # ============================================================================
@@ -244,7 +229,7 @@ def kyber_encapsulate(public_key: KEMPublicKey) -> Tuple[bytes, bytes]:
         raise TypeError("public_key must be a KEMPublicKey")
 
     try:
-        kem = oqs.KeyEncapsulation(_WORKING_ALGORITHM)
+        kem = oqs.KeyEncapsulation(ALGORITHM)
         ciphertext, shared_secret = kem.encap_secret(public_key.to_bytes())
         return ciphertext, shared_secret
     except Exception as e:
@@ -274,7 +259,7 @@ def is_available() -> bool:
 
 def get_algorithm_info() -> dict:
     """Get information about the KEM algorithm."""
-    algo = _WORKING_ALGORITHM
+    algo = ALGORITHM
     try:
         kem = oqs.KeyEncapsulation(algo)
         details = kem.details

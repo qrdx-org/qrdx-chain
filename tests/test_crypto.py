@@ -27,7 +27,7 @@ class TestDilithiumImport:
 
     def test_module_imports(self):
         from qrdx.crypto.pq import dilithium
-        assert hasattr(dilithium, '_WORKING_ALGORITHM')
+        assert dilithium.ALGORITHM == 'ML-DSA-65'
 
     def test_liboqs_required(self):
         """Verify liboqs is genuinely loaded, not stubbed."""
@@ -45,9 +45,10 @@ class TestDilithiumImport:
             "PQNotAvailableError must not exist — liboqs is mandatory"
 
     def test_working_algorithm(self):
-        """Algorithm must be ML-DSA-65 or Dilithium3."""
-        from qrdx.crypto.pq.dilithium import _WORKING_ALGORITHM
-        assert _WORKING_ALGORITHM in ('ML-DSA-65', 'Dilithium3')
+        """Exactly ML-DSA-65: the round-3 Dilithium3 is not compatible, so there is no fallback
+        to it (tests/test_pq_algorithms.py)."""
+        from qrdx.crypto.pq.dilithium import ALGORITHM
+        assert ALGORITHM == 'ML-DSA-65'
 
     def test_is_available_always_true(self):
         """Since liboqs is mandatory, is_available must always return True."""
@@ -266,11 +267,11 @@ class TestKyberImport:
 
     def test_module_imports(self):
         from qrdx.crypto.pq import kyber
-        assert hasattr(kyber, '_WORKING_ALGORITHM')
+        assert kyber.ALGORITHM == 'ML-KEM-768'
 
     def test_working_algorithm(self):
-        from qrdx.crypto.pq.kyber import _WORKING_ALGORITHM
-        assert _WORKING_ALGORITHM in ('ML-KEM-768', 'Kyber768')
+        from qrdx.crypto.pq.kyber import ALGORITHM
+        assert ALGORITHM == 'ML-KEM-768'  # exactly: no fallback to the round-3 Kyber768
 
     def test_kem_is_available(self):
         from qrdx.crypto.pq import kem_is_available

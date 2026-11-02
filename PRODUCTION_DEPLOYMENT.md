@@ -352,6 +352,52 @@ SQLite has a practical limit of ~281 TB per file. For archive nodes growing beyo
 - Monitor file size: `du -sh /opt/qrdx/data/qrdx.db`
 - Ensure the underlying volume has at least 2× current DB size free for VACUUM operations.
 
+### 7.6 Joining from a Snapshot (Checkpoint Sync)
+
+A new node does not have to replay from genesis. Restore a snapshot of another node's database,
+verified against a trusted checkpoint (docs/CHECKPOINT_SYNC.md):
+
+```bash
+# On a synced node (running or not):
+python scripts/node/snapshot.py create --db /opt/qrdx/data/qrdx.db --out /tmp/snapshot
+
+# Publish /tmp/snapshot with any static HTTP server; on the new node fetch it:
+python scripts/node/snapshot.py fetch --url https://snapshots.example/qrdx/ --out /tmp/snapshot
+
+# Or take the newest snapshot any of the given nodes publishes (see below):
+python scripts/node/snapshot.py fetch --peer http://node-a:3007 --peer http://node-b:3007 \
+    --out /tmp/snapshot
+
+# On the new node, with its own environment (QRDX_GENESIS_FILE), before its first start:
+python scripts/node/snapshot.py restore --snapshot /tmp/snapshot --db /opt/qrdx/data/qrdx.db \
+    --checkpoint <finalized height>:<its block hash>
+```
+
+The checkpoint is a finalized block you trust: from your own node, another operator, or an
+explorer you trust. The restore trusts nothing in the snapshot. It writes nothing unless the
+recomputed state equals the state root the network signed.
+
+**Publishing snapshots.** Set `QRDX_SNAPSHOT_DIR` on a synced node (a directory with room for
+one copy of the database, plus as much again while the next is written).
+* At each exchange checkpoint (every 1,024 finalized blocks) the node writes a snapshot there
+  and keeps only the newest. The work runs in the background.
+* It serves the snapshot at `/snapshot/manifest.json` and `/snapshot/qrdx.db` on its API port.
+  Downloads resume.
+* Its `p2p_getStatus` advertises it.
+* The node's own tables (peers, pending transactions, indexes) are left out of it.
+
+### 7.7 Full and Archive Nodes
+
+By default a node keeps all of history (archive). Set `QRDX_HISTORY_RETENTION_BLOCKS=N`
+(N ≥ 4,096; for example 2,419,200 ≈ one week at 250 ms slots) to drop the signatures and
+sections of blocks more than N below finality. A pruned node:
+
+* cannot replay from genesis: keep its database backed up, or restore from a snapshot;
+* does not serve old blocks to nodes syncing from genesis.
+
+Run at least one archive node per operator group. The freed space is reused; run `VACUUM` with
+the node stopped to shrink the file.
+
 ---
 
 ## 8. Docker Production Deployment
@@ -731,7 +777,7 @@ No core/protocol change was needed; the harness was simply built against the wro
 **Issue (as found):** `eth_sendRawTransaction` applied EVM transfers to the receiving node's
 `account_state` only — no mempool, no gossip, no block inclusion — and block import never re-executes
 EVM transactions. So account-model state was single-node and not durable across resync. See the full
-analysis and design in [docs/EVM_STATE_CONSENSUS_INTEGRATION.md](docs/EVM_STATE_CONSENSUS_INTEGRATION.md).
+analysis and design in [docs/archive/EVM_STATE_CONSENSUS_INTEGRATION.md](docs/archive/EVM_STATE_CONSENSUS_INTEGRATION.md).
 
 **Phase 1 (implemented):** `eth_sendRawTransaction` now gossips the signed raw tx to peers, which run
 the identical deterministic execution, so all **live** nodes converge on the same `account_state`. A
@@ -827,5 +873,4 @@ All five issues from the production readiness report have been resolved:
 | `qrdx/transactions/`  | ≥ 85%           |
 | `qrdx/p2p/`           | ≥ 80%           |
 | `qrdx/exchange/`      | ≥ 80%           |
-| `qrdx/governance/`    | ≥ 75%           |
 | Overall               | ≥ 80%           |

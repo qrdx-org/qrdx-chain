@@ -15,7 +15,7 @@ import os
 import sys
 from dataclasses import dataclass
 from importlib import util as importlib_util
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 if importlib_util.find_spec("eth") is None:
     _vendored_py_evm = os.path.join(
@@ -137,6 +137,7 @@ class QRDXEVMExecutor:
         world=None,
         write_back: bool = True,
         payer: Optional[bytes] = None,
+        access_list: Sequence[Tuple[bytes, Sequence[bytes]]] = (),
     ) -> EVMResult:
         """
         Execute an EVM transaction.
@@ -155,6 +156,9 @@ class QRDXEVMExecutor:
         real transaction (``eth_call``, gas estimation) leave it at 0.
 
         ``write_back`` False (``eth_call``, estimation): nothing is written anywhere.
+
+        ``access_list``: an EIP-2930 transaction's addresses and storage keys, warm from the
+        start (their up-front cost is in ``intrinsic_gas``).
 
         Returns an EVMResult; ``gas_used`` is the amount actually charged, i.e. the floor when
         execution consumed less than it.
@@ -179,6 +183,7 @@ class QRDXEVMExecutor:
                     timestamp,
                     write_back,
                     payer,
+                    access_list,
                 ),
             )
         return self._execute(
@@ -195,6 +200,7 @@ class QRDXEVMExecutor:
             timestamp,
             write_back,
             payer,
+            access_list,
         )
 
     def _execute(
@@ -212,6 +218,7 @@ class QRDXEVMExecutor:
         timestamp,
         write_back,
         payer=None,
+        access_list=(),
     ) -> EVMResult:
         from .evm_world import StateMiss, WorldComputation
 
@@ -221,6 +228,10 @@ class QRDXEVMExecutor:
 
         try:
             state = world.build_state(self._execution_context(block_number, timestamp))
+            for address, keys in access_list:  # EIP-2930: warm from the start
+                state.mark_address_warm(address)
+                for key in keys:
+                    state.mark_storage_warm(address, int.from_bytes(key, "big"))
             if is_create:
                 code = data
                 to = self._compute_create_address(sender, state.get_nonce(sender))

@@ -30,7 +30,7 @@ import hashlib
 import logging
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from ...constants import CHAIN_ID as _CHAIN_ID  # the network's chain id (EIP-155 / EIP-695)
 from ..server import RPCError, RPCErrorCode, RPCModule, rpc_method
@@ -41,6 +41,23 @@ logger = logging.getLogger(__name__)
 _ZERO_ADDR_HEX = "0x" + "0" * 40
 _ZERO_HASH = "0x" + "0" * 64
 _EMPTY_BLOOM = "0x" + "00" * 256
+
+
+def _logs_bloom(rows: Iterable[Any]) -> str:
+    """The 2048-bit log bloom (Ethereum's): for each log's address and each topic, three bits
+    picked by the low 11 bits of the first three byte pairs of its keccak."""
+    from eth_hash.auto import keccak
+
+    bloom = 0
+    for row in rows:
+        for value in row[:5]:
+            if not value:
+                continue
+            data = bytes.fromhex(_strip_0x(value)) if isinstance(value, str) else bytes(value)
+            digest = keccak(data)
+            for i in (0, 2, 4):
+                bloom |= 1 << (((digest[i] << 8) | digest[i + 1]) & 2047)
+    return "0x" + bloom.to_bytes(256, "big").hex()
 
 
 # ─── Filter System ────────────────────────────────────────────────────────────
@@ -135,13 +152,23 @@ def _to_hex(value: int) -> str:
     return hex(value)
 
 
-def _strip_0x(h: str) -> str:
+def _text(h: Any) -> str:
+    """A hash or address as text: raw bytes (as some rows store them — the genesis allocations'
+    transaction hashes) become hex, which every block holding one used to fail on."""
+    if isinstance(h, (bytes, bytearray, memoryview)):
+        return bytes(h).hex()
+    return str(h)
+
+
+def _strip_0x(h: Any) -> str:
     """Remove 0x prefix if present."""
+    h = _text(h)
     return h[2:] if h.startswith("0x") or h.startswith("0X") else h
 
 
-def _ensure_0x(h: str) -> str:
+def _ensure_0x(h: Any) -> str:
     """Add 0x prefix if missing."""
+    h = _text(h)
     return h if h.startswith("0x") else ("0x" + h)
 
 
@@ -403,8 +430,11 @@ class EthModule(RPCModule):
 
     # ── formatting helpers ──
 
-    def _fmt_block(self, block: Dict, txs: List[Dict], include_full: bool) -> Dict:
-        """Format a SQLite block row into a Web3-compatible block object."""
+    def _fmt_block(
+        self, block: Dict, txs: List[Dict], include_full: bool, header: Optional[Dict] = None
+    ) -> Dict:
+        """Format a SQLite block row into a Web3-compatible block object (``header``: the
+        fields ``_header_fields`` reads from the block itself)."""
         block_hash = block.get("hash") or block.get("block_hash") or ("0" * 64)
         block_number = _safe_int(block.get("id") or block.get("block_height"), 0)
         parent_hash = block.get("prev_block_hash") or block.get("previous_hash") or ("0" * 64)
@@ -441,6 +471,7 @@ class EthModule(RPCModule):
             "uncles": [],
             "baseFeePerGas": "0x0",
             "mixHash": _ZERO_HASH,
+            **(header or {}),
         }
 
     def _fmt_native_tx(self, tx: Dict, block: Optional[Dict] = None) -> Dict:
@@ -650,8 +681,10 @@ class EthModule(RPCModule):
 
     @rpc_method
     async def maxPriorityFeePerGas(self) -> str:
-        """Returns the suggested priority fee (EIP-1559)."""
-        return _to_hex(1_000_000_000)  # 1 gwei
+        """The suggested priority fee (EIP-1559): zero. QRDX burns the whole fee and orders a
+        block's EVM transactions without regard to price, so a tip buys nothing; the base fee
+        (in ``baseFeePerGas`` and ``eth_feeHistory``) is what a fee cap must cover."""
+        return "0x0"
 
     @rpc_method
     async def feeHistory(
@@ -777,7 +810,49 @@ class EthModule(RPCModule):
         for ntx in native_txs:
             formatted_txs.append(self._fmt_native_tx(ntx, block))
 
-        return self._fmt_block(block, formatted_txs, include_full)
+        return self._fmt_block(
+            block,
+            formatted_txs,
+            include_full,
+            header=await self._header_fields(block, block_num, contract_txs),
+        )
+
+    async def _header_fields(self, block: Dict, height: int, contract_txs: List[Dict]) -> Dict:
+        """What a block's header says that wallets and indexers read: its EVM gas limit and
+        base fee (fee caps are built from it), its unified state root, the gas its EVM
+        transactions used, and the bloom of their logs."""
+        from ...block_limits import evm_gas_limit_at
+        from ...fee_market import header_fees
+        from ...validator.block_verification import _parse_block_content
+
+        try:
+            content = _parse_block_content(block.get("content") or block.get("block_content"))
+        except Exception:
+            content = None
+        fields: Dict[str, Any] = {
+            "gasLimit": _to_hex(evm_gas_limit_at(height)),
+            "baseFeePerGas": _to_hex(header_fees(content)[0]),
+            "gasUsed": _to_hex(sum(_safe_int(t.get("gas_used"), 0) for t in contract_txs)),
+        }
+        root = (content or {}).get("state_root") if isinstance(content, dict) else None
+        if root:
+            # The unified root is BLAKE3-512 (64 bytes); clients require a 32-byte stateRoot, so
+            # it is reported as the root's keccak-256, with the root itself beside it.
+            from eth_hash.auto import keccak
+
+            raw = bytes.fromhex(_strip_0x(str(root)))
+            fields["stateRoot"] = "0x" + (raw if len(raw) == 32 else keccak(raw)).hex()
+            fields["qrdxStateRoot"] = "0x" + raw.hex()
+        try:
+            cursor = await self._db().connection.execute(
+                "SELECT contract_address, topic0, topic1, topic2, topic3 FROM contract_logs"
+                " WHERE block_number = ? AND (removed IS NULL OR removed = 0)",
+                (height,),
+            )
+            fields["logsBloom"] = _logs_bloom(await cursor.fetchall())
+        except Exception as e:
+            logger.debug("logs bloom for block %s skipped: %s", height, e)
+        return fields
 
     # ══════════════════════════════════════════════════════════════════════════
     #  TRANSACTIONS

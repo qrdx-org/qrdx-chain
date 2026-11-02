@@ -120,7 +120,7 @@ class S10Consistency(Scenario):
         # Verify the S04 transfer propagated across nodes at the ACCOUNT-MODEL
         # layer (eth_getBalance), not the UTXO layer. The transfer mutates
         # account_state; without cross-node propagation (Phase 1 gossip — see
-        # docs/EVM_STATE_CONSENSUS_INTEGRATION.md) only the receiving node would
+        # docs/archive/EVM_STATE_CONSENSUS_INTEGRATION.md) only the receiving node would
         # reflect it. Reading the UTXO balance would hide the gap because it is
         # unchanged by EVM transfers, so this check uses eth_getBalance.
         tx_hash = self.ctx.artifacts.get("first_tx_hash")

@@ -16,8 +16,9 @@ the same chain computes the same finality:
   justified checkpoint) and a target checkpoint (the current epoch's), each by epoch and block
   hash, both signed. An honest validator casts one per epoch (``vote_slot``), and never two
   different ones for the same target or one that surrounds another — both are slashable
-  (``slashing_block.attestation_equivocation``), and ``SigningRecord`` keeps a validator from
-  doing either by accident, across restarts.
+  (``slashing_block.attestation_equivocation``). Slashing protection
+  (qrdx/validator/slashing_protection.py) keeps a validator from doing either by accident,
+  across restarts.
 * **What counts.** Only votes carried by canonical blocks, each validated on import
   (``verify_block_votes``): a known key, a valid signature, and a target that is this chain's
   checkpoint. A vote's source must be a checkpoint already justified on this chain.
@@ -385,6 +386,12 @@ async def update(db: Any) -> Dict[str, int]:
             await prune_reorg_state(db, state.finalized_height)
         except Exception as e:
             logger.debug("reorg-state prune skipped: %s", e)
+        try:  # (a full node: bodies far below finality; qrdx/history_pruning.py)
+            from ..history_pruning import prune as prune_history
+
+            await prune_history(db, state.finalized_height)
+        except Exception as e:
+            logger.warning("history pruning skipped: %s", e)
         if hasattr(db, "prune_attestation_votes"):
             try:
                 await db.prune_attestation_votes(fin_epoch - VOTE_HISTORY_EPOCHS)
@@ -449,55 +456,6 @@ async def vote_for(db: Any, epoch: int) -> Optional[Tuple[int, str, int, str]]:
         return None
     se = max(sources)
     return se, state.justified[se], int(epoch), cp[1]
-
-
-class SigningRecord:
-    """What a validator has signed (``ffg_signing_record`` in the node's database), so it never
-    signs a double vote (two different votes for one target epoch) or a surround vote — not
-    even across a restart, when it no longer remembers voting. Slashing protection."""
-
-    _SCHEMA = (
-        "CREATE TABLE IF NOT EXISTS ffg_signing_record ("
-        " validator TEXT NOT NULL,"
-        " target_epoch INTEGER NOT NULL,"
-        " source_epoch INTEGER NOT NULL,"
-        " vote TEXT NOT NULL,"
-        " PRIMARY KEY (validator, target_epoch))"
-    )
-
-    def __init__(self, db: Any) -> None:
-        self.db = db
-        self._ready = False
-
-    async def _ensure(self) -> None:
-        if not self._ready:
-            await self.db.connection.execute(self._SCHEMA)
-            self._ready = True
-
-    async def may_sign(self, validator: str, vote: Tuple[int, str, int, str]) -> bool:
-        """True if signing ``vote`` is safe: no different vote for its target, no surround."""
-        await self._ensure()
-        se, _sr, te, _tr = vote
-        cur = await self.db.connection.execute(
-            "SELECT target_epoch, source_epoch, vote FROM ffg_signing_record WHERE validator = ?",
-            (validator,),
-        )
-        for t, s, recorded in await cur.fetchall():
-            if int(t) == te:
-                return json.loads(recorded) == list(vote)  # the same vote again is harmless
-            if (s < se and te < t) or (se < s and t < te):
-                return False
-        return True
-
-    async def record(self, validator: str, vote: Tuple[int, str, int, str]) -> None:
-        """Record ``vote`` as signed. Committed before the vote leaves the node."""
-        await self._ensure()
-        await self.db.connection.execute(
-            "INSERT OR IGNORE INTO ffg_signing_record (validator, target_epoch, source_epoch, "
-            "vote) VALUES (?, ?, ?, ?)",
-            (validator, vote[2], vote[0], json.dumps(list(vote))),
-        )
-        await self.db.connection.commit()
 
 
 # ── inclusion ────────────────────────────────────────────────────────────────────────────

@@ -26,10 +26,10 @@ except ImportError as e:
     ) from e
 
 
+from . import algorithms as _algorithms  # noqa: E402
+
 # ML-DSA-65 parameters (formerly Dilithium3) — FIPS 204
-# Try ML-DSA-65 first (newer liboqs ≥0.9), fallback to Dilithium3 (older)
-ALGORITHM = "ML-DSA-65"
-ALGORITHM_LEGACY = "Dilithium3"
+ALGORITHM = _algorithms.SIG_ALGORITHM
 PRIVATE_KEY_SIZE = 4032  # ML-DSA-65 private key size
 PUBLIC_KEY_SIZE = 1952  # ML-DSA-65 public key size
 SIGNATURE_SIZE = 3309  # ML-DSA-65 signature size
@@ -47,25 +47,9 @@ class PQSignatureError(PQCryptoError):
     pass
 
 
-def _get_working_algorithm() -> str:
-    """Determine which algorithm name the installed liboqs supports."""
-    try:
-        oqs.Signature(ALGORITHM)
-        return ALGORITHM
-    except Exception:
-        try:
-            oqs.Signature(ALGORITHM_LEGACY)
-            return ALGORITHM_LEGACY
-        except Exception as exc:
-            raise PQCryptoError(
-                f"Neither {ALGORITHM} nor {ALGORITHM_LEGACY} is supported by "
-                f"the installed liboqs. Upgrade liboqs to a version that "
-                f"supports FIPS 204 (ML-DSA-65)."
-            ) from exc
-
-
-# Validate at import time that at least one algorithm works
-_WORKING_ALGORITHM = _get_working_algorithm()
+# Prove the installed liboqs computes FIPS 204 before any key is used: QRDX runs exactly
+# ALGORITHM, never an older or draft scheme under a nearby name (see algorithms.py).
+_algorithms.require()
 
 
 @dataclass
@@ -232,7 +216,7 @@ class PQPrivateKey:
     def _generate(self):
         """Generate new keypair using liboqs."""
         try:
-            self._signer = oqs.Signature(_WORKING_ALGORITHM)
+            self._signer = oqs.Signature(ALGORITHM)
             pub_bytes = self._signer.generate_keypair()
             self._public_key = PQPublicKey(pub_bytes)
             self._key_bytes = self._signer.export_secret_key()
@@ -258,7 +242,7 @@ class PQPrivateKey:
         returning a random identity. Signing still works either way.
         """
         try:
-            self._signer = oqs.Signature(_WORKING_ALGORITHM, key_bytes)
+            self._signer = oqs.Signature(ALGORITHM, key_bytes)
         except Exception as e:
             raise PQCryptoError(f"Key restoration failed: {e}") from e
 
@@ -426,7 +410,7 @@ def verify(public_key: PQPublicKey, message: bytes, signature: PQSignature) -> b
         return False
 
     try:
-        verifier = oqs.Signature(_WORKING_ALGORITHM)
+        verifier = oqs.Signature(ALGORITHM)
         return verifier.verify(message, signature.to_bytes(), public_key.to_bytes())
     except Exception:
         return False
@@ -453,7 +437,7 @@ def get_liboqs_error() -> Optional[str]:
 
 def get_algorithm_info() -> dict:
     """Get information about the signature algorithm."""
-    algo = _WORKING_ALGORITHM
+    algo = ALGORITHM
     try:
         sig = oqs.Signature(algo)
         details = sig.details

@@ -27,7 +27,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, Decimal
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -38,10 +38,13 @@ from qrdx.exchange.amm import (
     FEE_LP_SHARE,
     FEE_TREASURY_SHARE,
     FEE_VALIDATOR_SHARE,
+    MAX_TICK,
+    MIN_TICK,
+    Q96,
     PoolManager,
     SwapPlan,
+    _sqrt_ratio,
 )
-from qrdx.exchange.oracle import TWAPOracle
 from qrdx.exchange.orderbook import (
     MIN_ORDER_SIZE,
     MatchBudget,
@@ -58,6 +61,14 @@ logger = logging.getLogger(__name__)
 ZERO = Decimal("0")
 MAX_PRICE_DEVIATION = Decimal("0.10")  # kept for callers that pass it; no longer enforced
 DEFAULT_DEADLINE_SECONDS = 120
+# Bisection steps that split a fill between pools at the same price (docs/UNIFIED_SPOT_LIQUIDITY.md)
+SPLIT_STEPS = 40
+
+
+def _units(amount: Decimal) -> Decimal:
+    """``amount`` in a token's units (18 decimals), rounded down only if it has more."""
+    units = amount.quantize(AMOUNT_QUANTUM, rounding=ROUND_DOWN)
+    return amount if units == amount else units
 
 
 class FillSource(str, Enum):
@@ -86,6 +97,23 @@ class FillResult:
 
 
 @dataclass
+class Leg:
+    """One venue's part of a fill: the order book's (one leg, however many levels it takes) or
+    one pool's (one plan, however many times the walk came back to it)."""
+
+    source: FillSource
+    amount_in: Decimal  # what the taker pays in (a pool's fee included)
+    amount_out: Decimal  # what the taker receives (after the order book's taker fees)
+    fee: Decimal  # a pool's fee, in the input; the order book's taker fees, in the output
+    base: Decimal = ZERO  # base traded
+    price: Decimal = ZERO  # the pair's price where it left the venue (quote per base)
+    pool_id: Optional[str] = None
+    plan: Optional[SwapPlan] = None
+    limit_price: Decimal = ZERO  # the order book: the worst level it takes
+    makers: int = 0  # the order book: resting orders it visits
+
+
+@dataclass
 class Route:
     """An exactly-quoted way to fill a swap."""
 
@@ -102,10 +130,42 @@ class Route:
     size: Decimal = ZERO  # base units
     limit_price: Decimal = ZERO
     makers: int = 0  # resting orders the fill visits (an order-book route)
+    parts: List[Leg] = field(default_factory=list)  # a combined route's legs (``plan_fill``)
+    stopped: str = ""  # why a combined route stopped short: "self", "budget", "dust" or ""
+    last_price: Decimal = ZERO  # the worst price the fill reached (quote per base)
 
     @property
     def price(self) -> Decimal:
         return self.amount_in / self.amount_out if self.amount_out > 0 else ZERO
+
+    @property
+    def legs(self) -> List[Leg]:
+        """What executes: the combined route's legs, or a single venue's one."""
+        if self.parts:
+            return self.parts
+        if self.source == FillSource.AMM:
+            return [
+                Leg(
+                    FillSource.AMM,
+                    self.amount_in,
+                    self.amount_out,
+                    self.fee_total,
+                    pool_id=self.pool_id,
+                    plan=self.plan,
+                )
+            ]
+        return [
+            Leg(
+                FillSource.CLOB,
+                self.amount_in,
+                self.amount_out,
+                self.fee_total,
+                base=self.size,
+                price=self.limit_price,
+                limit_price=self.limit_price,
+                makers=self.makers,
+            )
+        ]
 
     def amm(self) -> Tuple[str, SwapPlan]:
         """(pool id, plan) — set on every AMM route."""
@@ -127,12 +187,10 @@ class UnifiedRouter:
         self,
         pool_manager: Optional[PoolManager] = None,
         order_books: Optional[Dict[str, OrderBook]] = None,
-        oracles: Optional[Dict[str, TWAPOracle]] = None,
         max_price_deviation: Decimal = MAX_PRICE_DEVIATION,
     ):
         self.pool_manager = pool_manager or PoolManager()
         self._order_books: Dict[str, OrderBook] = order_books or {}
-        self._oracles: Dict[str, TWAPOracle] = oracles or {}
         self._max_price_deviation = max_price_deviation
         self._paused: bool = False
         self._clob_sequence: int = 0  # deterministic order ID counter
@@ -162,14 +220,8 @@ class UnifiedRouter:
     def unregister_order_book(self, pair_key: str) -> None:
         self._order_books.pop(pair_key, None)
 
-    def register_oracle(self, pair_key: str, oracle: TWAPOracle) -> None:
-        self._oracles[pair_key] = oracle
-
     def get_order_book(self, pair_key: str) -> Optional[OrderBook]:
         return self._order_books.get(pair_key)
-
-    def get_oracle(self, pair_key: str) -> Optional[TWAPOracle]:
-        return self._oracles.get(pair_key)
 
     # -- Quoting (read-only, exact) -----------------------------------------
 
@@ -279,6 +331,309 @@ class UnifiedRouter:
             makers=visited,
         )
 
+    def taker_rate(self, sender: str) -> Decimal:
+        """The order book's taker fee rate for ``sender``, as settlement charges it (it ranks the
+        book against the pools; the fee itself is charged fill by fill)."""
+        if self.taker_fee is None:
+            return ZERO
+        unit = Decimal(10**9)
+        return self.taker_fee(sender, unit) / unit
+
+    @_pinned
+    def plan_fill(
+        self,
+        pair: str,
+        buy: bool,
+        amount: Decimal,
+        *,
+        exact_in: bool,
+        limit: Optional[Decimal] = None,
+        sender: str = "",
+        max_makers: Optional[int] = None,
+        pool_ids: Optional[List[str]] = None,
+        book: bool = True,
+        pools: bool = True,
+    ) -> Optional[Route]:
+        """The best fill of one taker on a pair's combined market — its order book and every
+        pool — walked in price order (docs/UNIFIED_SPOT_LIQUIDITY.md). Read only: it returns the
+        legs, and executing them does exactly what they say.
+
+        ``buy``: the taker buys base (pays quote). ``amount``: with ``exact_in``, what it pays
+        in; otherwise the base it buys (a sell's amount is always the base it sells).
+        ``limit``: the worst price (quote per base) — a book level's own price, a pool's
+        marginal price with its fee. Prices are ranked after each venue's fee; resting orders
+        come first at the same price; pools at the same price move together, the amount split
+        so they end at one marginal price. At the taker's own resting order the book closes to
+        it (self-trade prevention; the pools may still fill it); at ``max_makers`` resting
+        orders visited it stops, as matching does. None if nothing fills."""
+        amount = Decimal(str(amount))
+        if amount <= 0 or ":" not in pair:
+            return None
+        base, quote = pair.split(":", 1)
+        ob = self._order_books.get(pair) if book else None
+        candidates_pools = []
+        if pools:
+            for pool in sorted(
+                self.pool_manager.get_pools_for_pair(base, quote), key=lambda p: p.state.id
+            ):
+                if pool.is_paused or (pool_ids is not None and pool.state.id not in pool_ids):
+                    continue
+                if (pool.state.token0, pool.state.token1) != (base, quote):
+                    continue
+                candidates_pools.append(pool)
+        rate = self.taker_rate(sender)
+        zfo = not buy  # selling base (token0) moves a pool's price down
+        out_mode = buy and not exact_in  # pools quoted by the base they deliver
+
+        def key(eff: Decimal) -> Decimal:  # lower is better, either way
+            return eff if buy else -eff
+
+        def pool_eff(pool, raw: Decimal) -> Decimal:
+            f = pool.state.fee_tier.rate
+            return raw / (1 - f) if buy else raw * (1 - f)
+
+        def pool_limit(pool, eff: Optional[Decimal]) -> Decimal:
+            """The plain √price where the pool's marginal price, fee included, is ``eff``."""
+            if eff is None:
+                return _sqrt_ratio(MIN_TICK if zfo else MAX_TICK)
+            f = pool.state.fee_tier.rate
+            raw = eff * (1 - f) if buy else eff / (1 - f)
+            return raw.sqrt() if raw > 0 else _sqrt_ratio(MIN_TICK)
+
+        def measure(plan: SwapPlan) -> Decimal:
+            return plan.amount_out if out_mode else plan.amount_in
+
+        # Pools: where each stands (its plan so far), and its marginal price (None: no more).
+        state: Dict[str, Dict[str, Any]] = {}
+        for pool in candidates_pools:
+            s0 = pool.liquid_sqrt(zfo)
+            state[pool.state.id] = {
+                "pool": pool,
+                "plan": None,
+                "eff": None if s0 is None else pool_eff(pool, s0 * s0),
+            }
+
+        def refresh(ps: Dict[str, Any], reached: Optional[Decimal]) -> None:
+            plan, pool = ps["plan"], ps["pool"]
+            if plan.exhausted:
+                ps["eff"] = None
+            elif plan.liquidity > 0 and reached is not None:
+                ps["eff"] = reached  # (exactly the price it was moved to: ties stay ties)
+            else:
+                s1 = pool.liquid_sqrt(zfo, start=plan)
+                ps["eff"] = None if s1 is None else pool_eff(pool, s1 * s1)
+
+        def quote_to(ps: Dict[str, Any], amt: Decimal, eff: Optional[Decimal]) -> SwapPlan:
+            return ps["pool"].quote(
+                amt,
+                zfo,
+                sqrt_limit=pool_limit(ps["pool"], eff),
+                exact_out=out_mode,
+                start=ps["plan"],
+            )
+
+        def commit(ps: Dict[str, Any], plan: SwapPlan, reached: Optional[Decimal]) -> None:
+            ps["plan"] = plan if ps["plan"] is None else ps["plan"].then(plan)
+            ps["chain"] = ps.get("chain", 0) + 1
+            refresh(ps, reached)
+
+        # The order book: its levels on the taker's opposite side, best first.
+        side_levels = (ob._asks if buy else ob._bids) if ob is not None else {}
+        levels = sorted(side_levels, reverse=not buy)
+        li, qi = 0, 0
+        queue: Optional[List[Tuple[Order, Decimal]]] = None
+        book_open = ob is not None
+        left = max_makers
+        size = spent = got = fees = ZERO
+        visited = 0
+        book_limit = ZERO
+        fee_of = self.taker_fee
+        remaining = amount
+        stopped = ""
+        self_stop = False
+        steps = 0
+        while remaining > 0 and not stopped:
+            steps += 1
+            if steps > 64 + 4 * (len(levels) + len(state)):  # (each step passes a price)
+                break
+            level_price = None
+            while book_open and li < len(levels):
+                lp = levels[li]
+                if limit is not None and (lp > limit if buy else lp < limit):
+                    book_open = False
+                    break
+                if queue is None:
+                    queue, qi = OrderBook.fill_queue(side_levels[lp]), 0
+                if qi >= len(queue):
+                    li, queue = li + 1, None
+                    continue
+                level_price = lp
+                break
+            options: List[Tuple[Decimal, int, str]] = []
+            if level_price is not None:
+                book_eff = level_price / (1 - rate) if buy else level_price * (1 - rate)
+                options.append((key(book_eff), 0, ""))
+            for pid, ps in state.items():
+                if ps["eff"] is not None and (limit is None or key(ps["eff"]) < key(limit)):
+                    options.append((key(ps["eff"]), 1, pid))
+            if not options:
+                break
+            options.sort()
+            best_key, kind, _pid = options[0]
+            if kind == 0 and queue is not None and level_price is not None:
+                # The book's level: maker by maker, as matching takes them.
+                while qi < len(queue) and remaining > 0:
+                    order, offered = queue[qi]
+                    if order.owner == sender:
+                        # Self-trade prevention: the book is closed to the taker from here; the
+                        # pools may still fill it (it passes only its own order).
+                        book_open, self_stop = False, True
+                        break
+                    if left is not None and left <= 0:  # out of budget: matching stops here
+                        stopped = "budget"
+                        break
+                    if buy and exact_in:
+                        affordable = (remaining / level_price).quantize(
+                            AMOUNT_QUANTUM, rounding=ROUND_DOWN
+                        )
+                        take = min(offered, affordable)
+                    else:
+                        take = min(offered, remaining)
+                    if take <= 0:
+                        stopped = "dust"
+                        break
+                    if left is not None:
+                        left -= 1
+                    visited += 1
+                    received = take if buy else take * level_price
+                    fee = fee_of(sender, received) if fee_of is not None else ZERO
+                    size += take
+                    spent += take * level_price if buy else take
+                    got += received - fee
+                    fees += fee
+                    book_limit = level_price
+                    remaining -= take * level_price if (buy and exact_in) else take
+                    if take < offered:
+                        queue[qi] = (order, offered - take)
+                    else:
+                        qi += 1
+                continue
+            # Pools: every pool at the best price moves to the next price anything else offers
+            # (the book's next level, another pool, the limit) — together.
+            active = [pid for k, t, pid in options if t == 1 and k == best_key]
+            beyond = [k for k, _t, _p in options if k > best_key]
+            if limit is not None:
+                beyond.append(key(limit))
+            target_key = min(beyond) if beyond else None
+            target = None if target_key is None else (target_key if buy else -target_key)
+            amt = _units(remaining)
+            if amt <= 0:
+                stopped = "dust"
+                break
+            plans = {pid: quote_to(state[pid], amt, target) for pid in active}
+            total = sum((measure(q) for q in plans.values()), ZERO)
+            if any(q.amount_out <= 0 < q.amount_in for q in plans.values()):
+                stopped = "dust"  # (input too small to buy anything)
+                break
+            if total <= amt:
+                for pid, q in plans.items():
+                    commit(state[pid], q, target)
+                remaining -= total
+                continue
+            # More than is left: split it so they end at one marginal price.
+            ends = [
+                pool_eff(state[pid]["pool"], (q.sqrt_price / Q96) ** 2) for pid, q in plans.items()
+            ]
+            lo = best_key
+            hi = target_key if target_key is not None else max(key(e) for e in ends)
+            for _ in range(SPLIT_STEPS):
+                mid = (lo + hi) / 2
+                eff = mid if buy else -mid
+                f_mid = sum((measure(quote_to(state[pid], amt, eff)) for pid in active), ZERO)
+                if f_mid <= remaining:
+                    lo = mid
+                else:
+                    hi = mid
+            at = lo if buy else -lo
+            used = ZERO
+            for pid in active:
+                q = quote_to(state[pid], amt, at)
+                used += measure(q)
+                commit(state[pid], q, at)
+            remaining -= used
+            rest = _units(remaining)
+            if rest > 0:  # the exact rest to the deepest of them
+                deepest = max(
+                    active,
+                    key=lambda pid: (state[pid]["plan"].liquidity, [-ord(c) for c in pid]),
+                )
+                q = quote_to(state[deepest], rest, target)
+                if q.amount_out <= 0 < q.amount_in:
+                    stopped = "dust"
+                    break
+                commit(state[deepest], q, target)
+                remaining -= measure(q)
+
+        legs: List[Leg] = []
+        last = ZERO
+        if size > 0:
+            legs.append(
+                Leg(
+                    FillSource.CLOB,
+                    spent,
+                    got,
+                    fees,
+                    base=size,
+                    price=book_limit,
+                    limit_price=book_limit,
+                    makers=visited,
+                )
+            )
+            last = book_limit
+        for pid in sorted(state):
+            plan = state[pid]["plan"]
+            if plan is None or plan.amount_out <= 0:
+                continue  # (it only crossed empty ranges: nothing to apply)
+            end = (plan.sqrt_price / Q96) ** 2
+            legs.append(
+                Leg(
+                    FillSource.AMM,
+                    plan.amount_in,
+                    plan.amount_out,
+                    plan.fee,
+                    base=plan.amount_out if buy else plan.amount_in,
+                    price=end,
+                    pool_id=pid,
+                    plan=plan,
+                )
+            )
+            if last == 0 or (end > last if buy else end < last):
+                last = end
+        if not legs:
+            return None
+        token_in, token_out = (quote, base) if buy else (base, quote)
+        sources = {leg.source for leg in legs}
+        amm_legs = [leg for leg in legs if leg.source == FillSource.AMM]
+        book_leg = legs[0] if legs[0].source == FillSource.CLOB else None
+        return Route(
+            (FillSource.HYBRID if len(sources) > 1 or len(amm_legs) > 1 else next(iter(sources))),
+            token_in,
+            token_out,
+            sum((leg.amount_in for leg in legs), ZERO),
+            sum((leg.amount_out for leg in legs), ZERO),
+            sum((leg.fee for leg in legs), ZERO),
+            pool_id=amm_legs[0].pool_id if amm_legs else None,
+            plan=amm_legs[0].plan if len(legs) == 1 and amm_legs else None,
+            pair=pair,
+            side=OrderSide.BUY if buy else OrderSide.SELL,
+            size=sum((leg.base for leg in legs), ZERO),
+            limit_price=book_leg.limit_price if book_leg else ZERO,
+            makers=book_leg.makers if book_leg else 0,
+            parts=legs,
+            stopped=stopped or ("self" if self_stop else ""),
+            last_price=last,
+        )
+
     def best_route(
         self,
         token_in: str,
@@ -289,25 +644,23 @@ class UnifiedRouter:
         venue: str = "auto",
         max_makers: Optional[int] = None,
     ) -> Optional[Route]:
-        """The route giving the most output (ties: the AMM, then the lowest pool id). An
-        order-book route visits no more than ``max_makers`` resting orders."""
+        """The best exact-input fill of ``token_in`` for ``token_out`` on their pair's combined
+        market (``plan_fill``). ``pool_id``: that pool only; ``venue`` "clob": the book only,
+        "amm": the pools — resting orders at better prices still fill first (no swap trades
+        through a resting order). The book visits no more than ``max_makers`` resting orders."""
         amount_in = Decimal(str(amount_in))
-        candidates: List[Route] = []
-        if venue in ("auto", "amm"):
-            candidates += self.amm_routes(token_in, token_out, amount_in, pool_id)
-        if venue in ("auto", "clob") and not pool_id:
-            r = self.clob_route(token_in, token_out, amount_in, sender, max_makers)
-            if r is not None:
-                candidates.append(r)
-        if not candidates:
+        if token_in == token_out:
             return None
-        return max(
-            candidates,
-            key=lambda r: (
-                r.amount_out,
-                r.source == FillSource.AMM,
-                [-ord(c) for c in (r.pool_id or "")],
-            ),
+        pair = self._pair_key(token_in, token_out)
+        return self.plan_fill(
+            pair,
+            token_in != pair.split(":", 1)[0],
+            amount_in,
+            exact_in=True,
+            sender=sender,
+            max_makers=max_makers,
+            pool_ids=[pool_id] if pool_id else None,
+            pools=venue != "clob",
         )
 
     # Back-compat quoting helpers ----------------------------------------------
@@ -330,27 +683,19 @@ class UnifiedRouter:
     # -- Execution ----------------------------------------------------------
 
     @_pinned
-    def apply_route(self, route: Route, sender: str, now: Optional[int] = None) -> FillResult:
-        """Execute a route from ``best_route`` against unchanged state: exactly what it quoted."""
+    def apply_leg(
+        self, route: Route, leg: Leg, sender: str, now: Optional[int] = None
+    ) -> Tuple[List[Trade], Optional[Order], int]:
+        """Execute one leg of a route against unchanged state, exactly as quoted: (the order
+        book's trades, its immediate-or-cancel order, the resting orders it visited)."""
         if self._paused:
             raise ValueError("Router is paused — emergency mode")
-        if route.source == FillSource.AMM:
-            pool_id, plan = route.amm()
-            pool = self.pool_manager.get_pool(pool_id)
-            if pool is None:
-                raise ValueError(f"Pool {pool_id} not found")
-            pool.apply(plan, now)
-            fees = self._fee_parts(plan.fee, plan.protocol_fee)
-            return FillResult(
-                source=FillSource.AMM,
-                amount_in=route.amount_in,
-                amount_out=route.amount_out,
-                fee_total=route.fee_total,
-                **fees,
-                price=route.price,
-                trades=[],
-                pool_id=route.pool_id,
-            )
+        if leg.source == FillSource.AMM:
+            pool = self.pool_manager.get_pool(leg.pool_id or "")
+            if pool is None or leg.plan is None:
+                raise ValueError(f"Pool {leg.pool_id} not found")
+            pool.apply(leg.plan, now)
+            return [], None, 0
         pair, side = route.clob()
         book = self._order_books[pair]
         self._clob_sequence += 1
@@ -359,28 +704,42 @@ class UnifiedRouter:
             owner=sender,
             side=side,
             order_type=OrderType.LIMIT,
-            price=route.limit_price,
-            amount=route.size,
+            price=leg.limit_price,
+            amount=leg.base,
             nonce=0,
             timestamp=0.0,
+            tif="ioc",
         )
-        budget = MatchBudget(route.makers)
+        budget = MatchBudget(leg.makers)
         trades = book.place_order(order, protocol=True, budget=budget)
-        if order.is_active:
-            book.cancel_order(order.id, caller=sender)  # immediate-or-cancel
         filled = sum((t.amount for t in trades), ZERO)
-        if filled != route.size:
-            raise ValueError(f"order book fill {filled} differs from its quote {route.size}")
-        fees = self._fee_parts(ZERO, ZERO)
+        if filled != leg.base:
+            raise ValueError(f"order book fill {filled} differs from its quote {leg.base}")
+        return trades, order, budget.visited
+
+    @_pinned
+    def apply_route(self, route: Route, sender: str, now: Optional[int] = None) -> FillResult:
+        """Execute a route from ``best_route`` against unchanged state: exactly what it quoted."""
+        trades: List[Trade] = []
+        order: Optional[Order] = None
+        visited = 0
+        for leg in route.legs:
+            leg_trades, leg_order, leg_visited = self.apply_leg(route, leg, sender, now)
+            trades += leg_trades
+            order = leg_order or order
+            visited += leg_visited
+        pool_fee = sum((leg.fee for leg in route.legs if leg.source == FillSource.AMM), ZERO)
+        protocol = sum((leg.plan.protocol_fee for leg in route.legs if leg.plan is not None), ZERO)
         return FillResult(
-            makers_visited=budget.visited,
-            source=FillSource.CLOB,
+            makers_visited=visited,
+            source=route.source,
             amount_in=route.amount_in,
             amount_out=route.amount_out,
-            fee_total=ZERO,
-            **fees,
+            fee_total=route.fee_total if route.source == FillSource.AMM else ZERO,
+            **self._fee_parts(pool_fee, protocol),
             price=route.price,
             trades=trades,
+            pool_id=route.pool_id,
             order=order,
         )
 

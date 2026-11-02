@@ -119,12 +119,16 @@ class AccountAuthority:
     pending = committed("auth.pending", _encode_change, mutable=False)
     keysets = committed("auth.keysets", _encode_keyset, mutable=False)
     recovery_votes = committed("auth.recovery_votes", encode_value, mutable=False)
+    # Quantum migration (docs/QUANTUM_MIGRATION.md): account id → [post-quantum account, source
+    # chain (0: registered on QRDX), registration time]. One per account; the first claim binds.
+    migrations = committed("auth.migrations", encode_value, mutable=False)
 
     def __init__(self) -> None:
         self.policies = {}  # account id → Policy
         self.pending = {}  # change id → Change
         self.keysets = {}  # multisig address (lowercase) → Keyset, once it signed or was published
         self.recovery_votes = {}  # "account id|guardian id" → the new controller it backs
+        self.migrations = {}  # account id → [pq account, source chain, registration time]
         self.seq = 0
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
@@ -133,6 +137,8 @@ class AccountAuthority:
             self.keysets = {}
         if "recovery_votes" not in state:
             self.recovery_votes = {}
+        if "migrations" not in state:
+            self.migrations = {}
 
     # ── social recovery ─────────────────────────────────────────────────
 
@@ -349,7 +355,12 @@ class AccountAuthority:
 
     @property
     def touched(self) -> bool:
-        return self.seq > 0 or bool(len(self.policies)) or bool(len(self.keysets))
+        return (
+            self.seq > 0
+            or bool(len(self.policies))
+            or bool(len(self.keysets))
+            or bool(len(self.migrations))
+        )
 
     def commitment(self) -> bytes:
         sec = (
@@ -361,6 +372,8 @@ class AccountAuthority:
         )
         if len(self.recovery_votes):  # (absent until a guardian first backs a recovery)
             sec.raw(self.recovery_votes.commitment())
+        if len(self.migrations):  # (absent until the first quantum-migration binding)
+            sec.raw(self.migrations.commitment())
         return sec.digest()
 
     def state_hash(self) -> bytes:
@@ -377,6 +390,11 @@ class AccountAuthority:
                     if len(self.recovery_votes)
                     else {}
                 ),
+                **(
+                    {"migrations": dict(sorted(self.migrations.peek_items()))}
+                    if len(self.migrations)
+                    else {}
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -388,6 +406,7 @@ class AccountAuthority:
         self.pending.verify()
         self.keysets.verify()
         self.recovery_votes.verify()
+        self.migrations.verify()
 
 
 def describe(policy: Policy) -> Dict[str, Any]:

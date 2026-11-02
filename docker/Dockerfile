@@ -33,8 +33,11 @@ ARG BASE_IMAGE=python:3.11.17-slim-bookworm@sha256:0a310eeecf4e1f5a0743f9a6520c9
 # and apt refuses. Bump the two together.
 ARG DEBIAN_SNAPSHOT=20261008T000000Z
 # liboqs C library: the post-quantum implementation every node signs and verifies with.
-ARG LIBOQS_VERSION=0.15.0
-ARG LIBOQS_COMMIT=97f6b86b1b6d109cfd43cf276ae39c2e776aed80
+# The same pair everywhere (release/requirements.lock pins liboqs-python 0.16.0.1, and
+# .devcontainer/install-liboqs.sh builds this tag and checks this commit). Every node also proves
+# at startup that it computes FIPS 204/203 (qrdx/crypto/pq/algorithms.py).
+ARG LIBOQS_VERSION=0.16.0
+ARG LIBOQS_COMMIT=5a1a854b0dc9f2141bdc771c555ee60c37950183
 # Reproducibility clock (the release commit's time); 0 for an unpinned development build.
 ARG SOURCE_DATE_EPOCH=0
 # Release identity, recorded in labels and reported by the node.

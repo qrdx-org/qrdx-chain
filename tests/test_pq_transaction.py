@@ -260,9 +260,13 @@ def test_mempool_rejects_a_forged_pq_transaction(keypair):
 
 
 def test_unknown_typed_transactions_are_still_rejected():
-    """Only legacy and 0x51 are supported; every other type byte must be refused."""
-    for type_byte in (0x01, 0x02, 0x03, 0x04, 0x7f):
+    """Legacy, 0x01 (EIP-2930), 0x02 (EIP-1559) and 0x51 are supported (tests/test_evm_typed_txs.py);
+    every other type byte must be refused, and an empty 0x01/0x02 body is malformed."""
+    for type_byte in (0x03, 0x04, 0x7f):
         with pytest.raises(ValueError, match="unsupported typed transaction"):
+            parse_eth_raw_tx("0x" + bytes([type_byte]).hex() + "c0")
+    for type_byte in (0x01, 0x02):
+        with pytest.raises(ValueError, match="RLP fields"):
             parse_eth_raw_tx("0x" + bytes([type_byte]).hex() + "c0")
 
 

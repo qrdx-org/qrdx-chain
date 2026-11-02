@@ -76,6 +76,31 @@ def test_a_name_moves_as_an_nft_and_its_owner_sets_its_records(m):
     assert summary["texts"] == {"url": "https://x"}
 
 
+def test_selling_or_transferring_a_name_takes_its_records_with_it(m):
+    """The bug: a name's address record outlived a sale — the buyer held the NFT while the name
+    still resolved to the seller. Records are the holder's: once the NFT is someone else's, by
+    any path, the name resolves to its new owner and the old records and primary name lapse."""
+    tid = str(name_token_id("alice.qrdx"))
+    _tx(m, ALICE, Op.QNS_REGISTER, name="alice")
+    assert _tx(m, ALICE, Op.QNS_SET_RECORD, name="alice", key="url", value="https://a").success
+    assert _tx(m, ALICE, Op.QNS_SET_PRIMARY, name="alice").success
+    assert _tx(m, ALICE, Op.NFT_TRANSFER, collection=QNS_COLLECTION, token_id=tid,
+               to=BOB).success
+    now = D(T0)
+    assert m.qns.resolve(m.nfts, "alice.qrdx", now) == BOB             # not the seller
+    assert m.qns.reverse(m.nfts, ALICE, now) is None
+    summary = views_name(m, "alice.qrdx")
+    assert summary["resolves_to"] == BOB and summary["texts"] == {}
+    assert not _tx(m, ALICE, Op.QNS_SET_RECORD, name="alice", key="address", value=ALICE).success
+    # A sale through the EVM (the ERC-721 precompile's path) moves the NFT the same way.
+    carol = "0xPQ" + "c" * 64
+    m.nfts.set_owner(QNS_COLLECTION, int(tid), carol)
+    assert m.qns.resolve(m.nfts, "alice.qrdx", now) == carol
+    m.nfts.set_owner(QNS_COLLECTION, int(tid), ALICE)                   # back to the setter:
+    assert m.qns.resolve(m.nfts, "alice.qrdx", now) == ALICE           # its records again
+    assert views_name(m, "alice.qrdx")["texts"] == {"url": "https://a"}
+
+
 def views_name(m, name):
     from qrdx.exchange.qns import summary
 

@@ -112,7 +112,7 @@ def test_the_proposer_skips_its_slot_mid_adoption():
     guard = next(i for i, l in enumerate(lines) if "self._proposal_guard()" in l)
     first_section = next(i for i, l in enumerate(lines) if "process_exchange_transactions(" in l)
     assert start < guard < first_section, "the guard must be checked under the lock, before execution"
-    assert any("continue" in l for l in lines[guard + 1:guard + 6])
+    assert any("continue" in l for l in lines[guard + 1:guard + 8])
 
 
 def test_main_wires_the_guard():

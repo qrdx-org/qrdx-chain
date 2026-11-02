@@ -33,8 +33,6 @@ from integration_tests.scenarios.s03_block_production import S03BlockProduction
 from integration_tests.scenarios.s04_transactions import S04Transactions
 from integration_tests.scenarios.s04b_cross_type_transfers import S04bCrossTypeTransfers
 from integration_tests.scenarios.s07_validators import S07Validators
-from integration_tests.scenarios.s08_governance import S08Governance
-from integration_tests.scenarios.s09_bridge import S09Bridge
 from integration_tests.scenarios.s10_consistency import S10Consistency
 from integration_tests.scenarios.s11_stress import S11Stress
 from integration_tests.scenarios.s12_exchange_consensus import S12ExchangeConsensus
@@ -59,8 +57,6 @@ ALL_SCENARIOS = [
     S04Transactions,
     S04bCrossTypeTransfers,
     S07Validators,
-    S08Governance,
-    S09Bridge,
     S10Consistency,
     S11Stress,
     S12ExchangeConsensus,

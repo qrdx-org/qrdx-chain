@@ -63,7 +63,7 @@ That is 1.5–3 % inflation a year.
 - perp listing fees;
 - ticker auctions;
 - subsidized pools' stakes;
-- slashed validator stakes and deployer bonds.
+- slashed validator stakes.
 
 **Paid out:**
 - QNS fees, to the treasury;
@@ -97,7 +97,9 @@ modify, trigger, TWAP, swap or leverage change, or a batch only of those. Turn t
 Free operations' gas still counts toward every block's exchange gas limit and toward the base fee.
 So a flood of free traffic raises the base fee, and past the threshold the free lane pauses:
 everyone pays until the blocks clear. A refused free operation consumes nothing (no nonce, no
-budget). The mempool refuses one its account could not send free, so spam never reaches a block.
+budget). The mempool refuses one its account could not send free, and a block may not carry one
+(chain-spec feature `exchange_inclusion`: a block's operations are judged together, in order,
+before any runs), so spam never reaches a block.
 
 **The gas system stays.** Every operation still declares and is metered in gas. Blocks are still
 bounded by `BLOCK_EXCHANGE_GAS_LIMIT`, and the EIP-1559 base fee still prices congestion. Anything
@@ -123,7 +125,6 @@ trading operation that would go free, and the floor otherwise.
 | AMM pool stake: standard / bootstrap / institutional | `EXCHANGE_POOL_STAKE_*` | 10,000 / 25,000 / 100,000 | **25 / 50 / 250** | $10k / $20k / $100k |
 | Subsidized pool burn | `EXCHANGE_POOL_BURN_SUBSIDIZED` | 5,000 | **10** | $4,000 |
 | Perp listing fee | `PERP_MARKET_LISTING_FEE` | 1,000 | **25** | $10,000 |
-| Deployer bond | `DEPLOYER_MIN_BOND` | 100,000 | **1,250** | $500,000 |
 | Ticker auction: opening / floor | `TICKER_OPENING_PRICE` / `TICKER_MIN_PRICE` | 10,000 / 500 | **250 / 25** | $100k / $10k |
 | QNS, a year: 5+ / 4 / 3 characters | `QNS_PRICE_PER_YEAR` × `qns.price_factor` | 10 flat | **0.0125 / 0.4 / 1.6** | $5 / $160 / $640 |
 | Staking fee discount tiers (5 %…40 %) | `STAKE_FEE_DISCOUNTS` | 10 … 500,000 | **1, 10, 100, 1k, 10k, 50k** | $400 … $20M |
@@ -133,9 +134,6 @@ trading operation that would go free, and the floor otherwise.
 Why these values:
 - **Validators:** $400,000 each, a Hyperliquid validator's self-stake. Security is the total
   staked: 100 validators at the minimum is $40M.
-- **Deployer bond:** $500,000. It must exceed what a malicious deployer could take before the
-  validators freeze its markets. A new deployer market's open-interest cap is its liquidity
-  vault's equity × 50 (10,000 of the settlement asset seeds it), and governance can raise the bond.
 - **QNS:** ENS's ladder. **Discount tiers:** Hyperliquid's, in value.
 
 Removed: `MAX_SUPPLY` (a leftover 2^25 from the proof-of-work chain, read by nothing),

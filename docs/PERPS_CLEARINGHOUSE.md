@@ -68,8 +68,8 @@ with no balance: it minted QRDX on every winning trade and burned it on every lo
 | Price | Definition | Used for |
 |---|---|---|
 | Trade | The order book's fill price | Entry, exit, realized PnL |
-| Oracle (index) | Stake-weighted median of the validator committee's fresh price votes (§8). A configured reporter's `UPDATE_ORACLE` also sets it — development and tests only; production configures none | Funding notional and premium; mark price input |
-| Impact bid / ask | Average price to sell / buy 1,000 QRDX of notional on the book (none if the book is shallower) | Funding premium |
+| Oracle (index) | Stake-weighted median of the validator committee's fresh price votes (§8); for a token perp, its token's spot TWAP (docs/HYPERLIQUID_PARITY.md 13). Nothing else sets it: `UPDATE_ORACLE`, a configured reporter's price, is retired | Funding notional and premium; mark price input |
+| Impact bid / ask | Average price to sell / buy the market's impact notional on the book — Hyperliquid's: 20,000 for BTC and ETH, 6,000 for every other market (none if the book is shallower) | Funding premium |
 | External perp | Stake-weighted median of the committee's votes for other venues' perp price (`"BTC:perp"`, §8); fresh for 120 s of block time | Mark price input |
 | Mark | Median of: oracle + 150 s EMA(book mid − oracle); median(best bid, best ask, last trade); the external perp price while fresh, else the 30 s EMA of that book median — held within ±5 % of the oracle. With two inputs (no book), their mean | Margin, liquidation triggers, unrealized PnL |
 

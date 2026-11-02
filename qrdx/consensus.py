@@ -971,6 +971,15 @@ async def execute_and_validate_exchange(
             # No exchange transactions — valid by default
             return True, ""
 
+        # Authenticate every transaction before executing any: the exchange core trusts
+        # ``sender`` (docs/EXCHANGE_AUDIT.md 1).
+        from .exchange.block_processor import verify_exchange_tx
+
+        for i, tx in enumerate(exchange_txs):
+            ok, why = verify_exchange_tx(tx)
+            if not ok:
+                return False, f"exchange tx {i} failed verification: {why}"
+
         # Determine block height and timestamp
         block_height = getattr(block, "height", getattr(block, "number", 0))
         block_timestamp = getattr(block, "timestamp", 0)

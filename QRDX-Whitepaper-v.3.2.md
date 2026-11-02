@@ -1,5 +1,9 @@
 # QRDX Protocol Whitepaper v3.2
 
+> **Superseded by [QRDX-Whitepaper-v3.4.md](QRDX-Whitepaper-v3.4.md)** (October 2026), which describes the
+> protocol as built and lists what this version described but is not built (its §12).
+
+
 <div align="center">
   <img src="logo.png" alt="QRDX Logo" width="200"/>
 </div>

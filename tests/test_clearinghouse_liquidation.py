@@ -20,7 +20,7 @@ from qrdx.exchange.clearinghouse import (
     PROTOCOL, VAULT, Clearinghouse, ClearinghouseError, MAKER_FEE_RATE, TAKER_FEE_RATE,
 )
 
-pytestmark = pytest.mark.usefixtures("open_listing")  # lists markets with CREATE_MARKET
+pytestmark = pytest.mark.usefixtures("genesis_btc")  # BTC from the first block
 
 D = Decimal
 BTC = "BTC-QRDX-PERP"
@@ -300,14 +300,13 @@ def test_liquidations_are_deterministic():
 
 # ── the chain: forward ≡ rebuild, with a liquidation inside a block's tick ────
 
-async def test_forward_and_rebuild_liquidate_identically(monkeypatch):
+async def test_forward_and_rebuild_liquidate_identically(monkeypatch, oracle_committee):
     """A leveraged long, then an oracle crash in a later block: the liquidation happens in that
     block's tick. The interleaved rebuild must reach the same clearinghouse — the same vault
     position, the same zeroed account — and real QRDX is conserved."""
     import json
     import os
     import tempfile
-    from qrdx import constants
     from qrdx.crypto.pq.dilithium import PQPrivateKey
     from qrdx.database_sqlite import DatabaseSQLite
     from qrdx.derived_state_rebuild import rebuild_derived_state_interleaved
@@ -317,7 +316,6 @@ async def test_forward_and_rebuild_liquidate_identically(monkeypatch):
 
     keys = [PQPrivateKey.generate() for _ in range(3)]
     rep, alice, bob = (k.public_key.to_address() for k in keys)
-    monkeypatch.setattr(constants, "ORACLE_REPORTERS", (rep,))
     nonces = {a: 0 for a in (rep, alice, bob)}
 
     def tx(i, op, params):
@@ -333,7 +331,8 @@ async def test_forward_and_rebuild_liquidate_identically(monkeypatch):
     try:
         async def add(h, txs=None, alloc=None):
             bh = f"{h:064x}"
-            await db.add_block(block_hash=bh, block_height=h, block_content="",
+            await db.add_block(block_hash=bh, block_height=h,
+                               block_content=oracle_committee.genesis if h == 0 else "",
                                validator_address="0xPQ" + "00" * 32, timestamp=int(T0) + 2 * h)
             for i, (r, a) in enumerate(alloc or []):
                 await db.add_transaction(tx_hash=f"a{h}{i}", block_hash=bh, tx_hex=json.dumps(
@@ -341,10 +340,11 @@ async def test_forward_and_rebuild_liquidate_identically(monkeypatch):
             if txs:
                 await db.add_block_exchange_txs(bh, encode_exchange_txs(txs))
 
-        # every sender pays gas: Alice keeps a little beyond her deposit, the reporter is funded
-        await add(0, alloc=[(alice, "3500.01"), (bob, "1000000"), (rep, "5000")])
-        await add(1, [tx(0, ExchangeOpType.CREATE_MARKET, {"base_token": "BTC"}),
-                      tx(0, ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": "30000"}),
+        # every sender pays gas: Alice keeps a little beyond her deposit, the genesis validator
+        # (which votes BTC's price) is funded
+        await add(0, alloc=[(alice, "3500.01"), (bob, "1000000"),
+                            (oracle_committee.address, "5000")])
+        await add(1, [oracle_committee.vote({"BTC": "30000"}),
                       tx(1, ExchangeOpType.PERP_DEPOSIT, {"amount": "3500"}),
                       tx(2, ExchangeOpType.PERP_DEPOSIT, {"amount": "100000"})])
         await add(2, [tx(2, ExchangeOpType.PERP_ORDER, {"market_id": BTC, "side": "sell",
@@ -352,7 +352,7 @@ async def test_forward_and_rebuild_liquidate_identically(monkeypatch):
                       tx(1, ExchangeOpType.PERP_ORDER, {"market_id": BTC, "side": "buy",
                                                         "size": "1", "price": "30000"})])
         await add(3)
-        await add(4, [tx(0, ExchangeOpType.UPDATE_ORACLE, {"pair": "BTC:QRDX", "price": "26900"})])
+        await add(4, [oracle_committee.vote({"BTC": "26900"})])   # (walked: 5 % a second)
         await add(5)
         tip = 5
 
@@ -364,6 +364,7 @@ async def test_forward_and_rebuild_liquidate_identically(monkeypatch):
         for h in range(1, tip + 1):
             section = await db.get_block_exchange_txs(f"{h:064x}")
             ts = float(int(T0) + 2 * h)
+            await BP.ensure_oracle_committee(db, mgr, h)     # as every path does
             if section:
                 txs = BP.decode_exchange_txs(section)
                 await BP.preload_sender_balances(db, txs, mgr)

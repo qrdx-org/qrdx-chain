@@ -61,9 +61,21 @@ def _genesis(stakes):
                        "validator_set": [{"address": a, "stake": str(s)} for a, s in stakes]})
 
 
-def _deposit(to, amount="250.5", tx="ab", log=3):
-    return {"chain": CHAIN, "token": USDC, "tx": "0x" + tx * 32, "log": log, "to": to,
-            "amount": amount}
+DEPOSITOR = "0x" + "de" * 20
+
+
+def _n(tx="ab", log=3):
+    """The lockbox deposit id the tests give a deposit (once named by transaction and log)."""
+    return int(tx, 16) * 100 + log + 1
+
+
+def _did(tx="ab", log=3):
+    return f"{CHAIN}:{_n(tx, log)}"
+
+
+def _deposit(to, amount="250.5", tx="ab", log=3, time=T0):
+    return {"chain": CHAIN, "id": _n(tx, log), "token": USDC, "from": DEPOSITOR, "to": to,
+            "amount": amount, "time": time}
 
 
 @pytest.fixture
@@ -105,13 +117,14 @@ def test_assets_parse_strictly():
 def test_a_deposit_is_normalized_so_honest_copies_are_identical():
     assets = parse_assets([ASSET])
     a = parse_deposit(_deposit("0xPQ" + "cd" * 32, "250.5"), assets)
-    b = parse_deposit(dict(_deposit("0xPQ" + "cd" * 32, "250.500000"), tx="0x" + "AB" * 32), assets)
-    assert a == b and a.digest == b.digest and a.id == f"{CHAIN}:0x{'ab' * 32}:3"
+    b = parse_deposit(dict(_deposit("0xPQ" + "cd" * 32, "250.500000"), **{"from": DEPOSITOR.upper()}), assets)
+    assert a == b and a.digest == b.digest and a.id == _did()
     for bad, why in ((dict(_deposit("0xPQ" + "cd" * 32), token="0x" + "11" * 20), "no bridged"),
                      (_deposit("0xPQ" + "cd" * 32, "1.0000001"), "decimals"),
                      (_deposit("0xPQ" + "cd" * 32, "-1"), "positive"),
                      (_deposit("nobody"), "recipient"),
-                     (dict(_deposit("0xPQ" + "cd" * 32), tx="0x12"), "transaction hash")):
+                     (dict(_deposit("0xPQ" + "cd" * 32), **{"from": "0x12"}), "depositor"),
+                     (dict(_deposit("0xPQ" + "cd" * 32), id=0), "deposit id")):
         with pytest.raises(BridgeError, match=why):
             parse_deposit(bad, assets)
 
@@ -124,11 +137,11 @@ def test_a_deposit_mints_once_two_thirds_of_the_stake_attest_it(setup):
     r = _attest(mgr, v3, d)                      # 300 of 500: not more than two thirds
     assert r.success and "minted" not in r.data and mgr.tokens.get(_usdc()) is None
     r = _attest(mgr, v1, d)                      # 400 of 500
-    assert r.success and r.data["minted"] == [f"{CHAIN}:0x{'ab' * 32}:3"]
+    assert r.success and r.data["minted"] == [_did()]
     t = mgr.tokens.get(_usdc())
     assert t.supply == D("250.5") and t.mint_authority == BRIDGE_AUTHORITY and t.decimals == 6
     assert mgr.token_balance_deltas() == {(user.addr, _usdc()): D("250.5")}
-    assert mgr.bridge.done == {f"{CHAIN}:0x{'ab' * 32}:3"} and not mgr.bridge.pending
+    assert mgr.bridge.done == {_did()} and not mgr.bridge.pending
 
 
 def test_a_minted_deposit_is_never_minted_again(setup):
@@ -167,7 +180,7 @@ def test_a_vote_with_a_bad_deposit_is_refused_whole(setup):
     mgr, _v1, _v2, v3, user = setup
     mgr.begin_block(2, float(T0))
     r = mgr.process_transaction(v3.tx(ExchangeOpType.ORACLE_VOTE, {
-        "prices": {}, "deposits": [_deposit(user.addr), dict(_deposit(user.addr), log=-1)]}))
+        "prices": {}, "deposits": [_deposit(user.addr), dict(_deposit(user.addr), id=-1)]}))
     assert not r.success and "deposit" in r.error and not mgr.bridge.pending
     r = mgr.process_transaction(v3.tx(ExchangeOpType.ORACLE_VOTE, {
         "deposits": [_deposit(user.addr, log=i) for i in range(17)]}))
@@ -309,8 +322,9 @@ async def test_forward_and_rebuild_agree_on_the_bridge(monkeypatch):
 # ── the validators' watcher ───────────────────────────────────────────────
 
 def test_the_watcher_decodes_a_real_lockbox_deposit():
-    """The log fixture was emitted by contracts/bridge/QRDXLockbox.sol (solc 0.8.24) in an
-    EVM: a 250.5-unit deposit of a 6-decimal token to a 0xPQ recipient."""
+    """The log fixture was emitted by contracts/bridge/QRDXLockbox.sol (the committed build, run
+    in an EVM: tests/fixtures/make_lockbox_deposit_logs.py): a 250.5-unit deposit of a 6-decimal
+    token to a 0xPQ recipient, deposit id 1."""
     from qrdx.validator.bridge_watcher import DEPOSIT_EVENT, decode_deposit_log, deposit_topic
 
     fx = json.load(open(FIXTURE))
@@ -318,7 +332,7 @@ def test_the_watcher_decodes_a_real_lockbox_deposit():
     deposits = [log for log in fx["logs"] if log["topics"][0] == deposit_topic()]
     assert len(deposits) == 1 < len(fx["logs"])          # the custody event is not a deposit
     d = decode_deposit_log(fx["chain"], deposits[0], assets)
-    assert d["amount"] == "250.500000" and d["to"] == "0xPQ" + "ab" * 32 and d["log"] == 0
+    assert d["amount"] == "250.500000" and d["to"] == "0xPQ" + "ab" * 32 and d["id"] == 1
     assert parse_deposit(d, assets).amount == D("250.5")
     abi = json.load(open(os.path.join(os.path.dirname(__file__), "..", "contracts", "bridge",
                                       "QRDXLockbox.abi.json")))
@@ -348,7 +362,8 @@ def test_the_evm_source_scans_only_finalized_blocks(monkeypatch):
     src = W.EvmSource(fx["chain"], "http://unused", "0x" + "ee" * 20, from_block=0)
     monkeypatch.setattr(src, "_call", call)
     found = src.poll(assets)
-    assert [d["log"] for d in found] == [0]               # the removed (reorged) log is not
+    assert [d["id"] for d in found] == [1]                # the removed (reorged) log is not
+    assert found[0]["time"] > 0                           # as the lockbox recorded it
     ranges = [(int(p[0]["fromBlock"], 16), int(p[0]["toBlock"], 16))
               for m, p in calls if m == "eth_getLogs"]
     assert ranges == [(0, 1_999), (2_000, 3_999), (4_000, 4_500)] and src.next_block == 4_501
@@ -364,8 +379,8 @@ def test_the_watcher_hands_out_unminted_deposits_oldest_first(monkeypatch, tmp_p
     path.write_text(json.dumps([_deposit(to, log=1), _deposit(to, log=2), {"bogus": 1}]))
     w = BridgeWatcher([FileSource(str(path))], start=False)
     w.poll_once()
-    assert [d["log"] for d in w.outstanding(set(), 16)] == [1, 2]
-    assert [d["log"] for d in w.outstanding({f"{CHAIN}:0x{'ab' * 32}:1"}, 16)] == [2]
+    assert [d["id"] for d in w.outstanding(set(), 16, now=T0)] == [_n("ab", 1), _n("ab", 2)]
+    assert [d["id"] for d in w.outstanding({_did("ab", 1)}, 16, now=T0)] == [_n("ab", 2)]
     assert watcher_from_env("") is None
     assert isinstance(watcher_from_env(f"file:{path}").sources[0], FileSource)
     src = watcher_from_env("42161=https://arb.example/rpc@0x" + "ee" * 20).sources[0]
@@ -379,7 +394,7 @@ async def test_a_validator_without_a_price_feed_still_attests_deposits(setup, mo
     mgr, v1, _v2, _v3, user = setup
     path = tempfile.mktemp(suffix=".json")
     with open(path, "w") as f:
-        json.dump([_deposit(user.addr)], f)
+        json.dump([_deposit(user.addr, time=int(__import__("time").time()))], f)
     watcher = BridgeWatcher([FileSource(path)], start=False)
     watcher.poll_once()
 
@@ -401,5 +416,6 @@ async def test_a_validator_without_a_price_feed_still_attests_deposits(setup, mo
     node._price_feed, node._bridge_watcher = None, watcher
     node._get_current_slot = slot
     vote = await node._oracle_vote()
-    assert vote.nonce == 9 and vote.params == {"prices": {}, "deposits": [_deposit(user.addr)]}
+    assert vote.nonce == 9 and vote.params["prices"] == {}
+    assert [d["to"] for d in vote.params["deposits"]] == [user.addr]
     os.remove(path)

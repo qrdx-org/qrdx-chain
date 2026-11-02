@@ -150,6 +150,34 @@ jobs:
         run: bash scripts/release/test-image.sh qrdx-node:ci tests -m integration --timeout=300 -q
 
   # ---------------------------------------------------------------------------
+  # TypeScript SDK — pinned dependencies (package-lock.json), type check, tests against the
+  # node's vectors (tests/test_sdk_vectors.py keeps those current)
+  # ---------------------------------------------------------------------------
+  sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.12.0"
+
+      - name: Install the locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Tests
+        run: npm test
+
+  # ---------------------------------------------------------------------------
   # Docker build — development images from main only. Release images (v* tags) are built,
   # tested, signed and published ONLY by release.yml (docs/RELEASES.md); publishing a second,
   # unsigned image under a release's version here would let operators pull the wrong one.

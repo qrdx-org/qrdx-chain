@@ -56,7 +56,7 @@ LOG_BACKUP_COUNT = 5
 # ==================================================================================
 # CORE PROTOCOL CONSTANTS
 # ==================================================================================
-NODE_VERSION = "2.0.1"
+NODE_VERSION = "3.0.0"
 ENDIAN: Final = "little"
 CURVE = curve.P256
 SMALLEST = 1000000  # Smallest unit divisor
@@ -625,12 +625,10 @@ STAKING_REWARD_RATE_BPS = _NETWORK_PARAMS["STAKING_REWARD_RATE_BPS"]
 STAKING_DEFAULT_COMMISSION_BPS = 1_000  # a pool's commission until its validator sets one
 STAKE_MIN_DELEGATION = Decimal("0.01")  # QRDX (~$4): smaller delegations are refused (dust)
 
-# Addresses allowed to submit UPDATE_ORACLE. Oracle prices drive perp execution, margin,
-# PnL and liquidations — all settled into real balances — so an unrestricted update let any
-# user set the price their own position closed at. A chain-spec parameter: every node must
-# hold the same list (like SLOTS_PER_EPOCH). Empty (the default) means no one can set a
-# price, so perp markets cannot trade until reporters are configured.
-ORACLE_REPORTERS = tuple(_NETWORK_PARAMS["ORACLE_REPORTERS"])
+# The perp markets a network starts with, BASE:MAX_LEVERAGE:SZ_DECIMALS (chain_spec
+# ``parse_genesis_market``), priced by the validators' votes; more come by governance. No single
+# key ever prices a market (there used to be ORACLE_REPORTERS, and deployers' oracles).
+PERP_GENESIS_MARKETS = tuple(_NETWORK_PARAMS["PERP_GENESIS_MARKETS"])
 
 # Perps backstop vault (docs/PERPS_CLEARINGHOUSE.md). Deposits are locked for this much block
 # time (Hyperliquid's HLP: 4 days) so capital cannot leave the moment a loss is in sight.
@@ -671,15 +669,13 @@ BLOCK_EXCHANGE_GAS_LIMIT = _NETWORK_PARAMS["BLOCK_EXCHANGE_GAS_LIMIT"]
 # Every BIG_BLOCK_INTERVAL-th block may carry BIG_BLOCK_GAS_LIMIT of EVM gas (qrdx/block_limits.py).
 BIG_BLOCK_INTERVAL = _NETWORK_PARAMS["BIG_BLOCK_INTERVAL"]
 BIG_BLOCK_GAS_LIMIT = _NETWORK_PARAMS["BIG_BLOCK_GAS_LIMIT"]
-# QRDX burned by CREATE_MARKET (with the fee gate on). Every market costs every node work in
-# every block (its mark, funding and liquidation duties) and a place in the validators' price
-# votes, so listing one must not be nearly free. A chain-spec parameter.
+# QRDX burned by CREATE_MARKET, a token perp's listing (with the fee gate on). Every market costs
+# every node work in every block (its oracle, mark, funding and liquidation duties), so listing
+# one must not be nearly free. A chain-spec parameter.
 PERP_MARKET_LISTING_FEE = _NETWORK_PARAMS["PERP_MARKET_LISTING_FEE"]
-# A perp market's maximum leverage at most; whether anyone may list a validator-priced market
-# (else governance: ``list_market``). Chain-spec.
+# A perp market's maximum leverage at most. Chain-spec.
 PERP_MARKET_MAX_LEVERAGE = _NETWORK_PARAMS["PERP_MARKET_MAX_LEVERAGE"]
-PERP_OPEN_LISTING = _NETWORK_PARAMS["PERP_OPEN_LISTING"]
-# A perp market's creator seeds the market's liquidity vault with at least this much of its perps
+# A token perp's lister seeds the market's liquidity vault with at least this much of its perps
 # collateral, locked for the lockup (qrdx/exchange/clearinghouse.py MARKET_MAKER_*). Chain-spec.
 PERP_MARKET_MIN_LIQUIDITY = _NETWORK_PARAMS["PERP_MARKET_MIN_LIQUIDITY"]
 # Stakers' share of the protocol's QRDX fee income (validator/epoch_state.py). Chain-spec.
@@ -698,15 +694,10 @@ PERP_BREAKER_WINDOW_SECONDS = _NETWORK_PARAMS["PERP_BREAKER_WINDOW_SECONDS"]
 PERP_BREAKER_COOLDOWN_SECONDS = _NETWORK_PARAMS["PERP_BREAKER_COOLDOWN_SECONDS"]
 # A perp market's open-interest floor (qrdx/exchange/clearinghouse.py ``oi_cap``). Chain-spec.
 PERP_MIN_OI_CAP = _NETWORK_PARAMS["PERP_MIN_OI_CAP"]
-# Deployer markets (docs/HYPERLIQUID_PARITY.md). Chain-spec.
-DEPLOYER_MIN_BOND = _NETWORK_PARAMS["DEPLOYER_MIN_BOND"]
-DEPLOYER_UNBOND_SECONDS = _NETWORK_PARAMS["DEPLOYER_UNBOND_SECONDS"]
-DEPLOYER_MAX_MARKETS = _NETWORK_PARAMS["DEPLOYER_MAX_MARKETS"]
-DEPLOYER_MAX_FEE_SHARE_BPS = _NETWORK_PARAMS["DEPLOYER_MAX_FEE_SHARE_BPS"]
-DEPLOYER_ORACLE_MAX_STEP_BPS = _NETWORK_PARAMS["DEPLOYER_ORACLE_MAX_STEP_BPS"]
-# Native-token perps, priced off the token's own spot market (docs/HYPERLIQUID_PARITY.md 13).
+# Token perps, priced off the token's own spot market (docs/HYPERLIQUID_PARITY.md 13).
 PERP_SPOT_MAX_LEVERAGE = _NETWORK_PARAMS["PERP_SPOT_MAX_LEVERAGE"]
 SPOT_ORACLE_TWAP_SECONDS = _NETWORK_PARAMS["SPOT_ORACLE_TWAP_SECONDS"]
+SPOT_ORACLE_DEPTH_BAND_BPS = _NETWORK_PARAMS["SPOT_ORACLE_DEPTH_BAND_BPS"]
 SPOT_ORACLE_MIN_DEPTH = _NETWORK_PARAMS["SPOT_ORACLE_MIN_DEPTH"]
 SPOT_OI_DEPTH_BPS = _NETWORK_PARAMS["SPOT_OI_DEPTH_BPS"]
 # Ticker auction (docs/HYPERLIQUID_PARITY.md 11). Chain-spec.
@@ -730,6 +721,11 @@ PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS = _NETWORK_PARAMS["PERP_MARKET_LIQUIDITY_LO
 # "SYMBOL:CHAIN_ID:SOURCE_TOKEN:DECIMALS". Validators attest deposits into the lockbox there; a
 # quorum mints them here. Empty: no bridge. A chain-spec parameter (adding an asset is a fork).
 BRIDGE_ASSETS = tuple(_NETWORK_PARAMS["BRIDGE_ASSETS"])
+BRIDGE_DEPOSIT_WINDOW = int(_NETWORK_PARAMS["BRIDGE_DEPOSIT_WINDOW"])
+BRIDGE_MINT_LIMITS = tuple(_NETWORK_PARAMS["BRIDGE_MINT_LIMITS"])
+BRIDGE_LOCKBOXES = tuple(_NETWORK_PARAMS["BRIDGE_LOCKBOXES"])
+MIGRATION_REGISTRIES = tuple(_NETWORK_PARAMS["MIGRATION_REGISTRIES"])
+DOOMSDAY_CANARIES = tuple(_NETWORK_PARAMS["DOOMSDAY_CANARIES"])
 
 # --- Exchange fees ---
 # Exchange transactions pay gas like EVM ones: gas_price is in WEI (1 QRDX = 10^18 wei), at least
@@ -867,112 +863,15 @@ SPENDING_SCOPE_ALL = 15  # All operations
 
 
 # ==================================================================================
-# CROSS-CHAIN BRIDGE & ORACLE (Whitepaper §8, §10)
+# CROSS-CHAIN BRIDGE: chain-spec parameters (BRIDGE_ASSETS, BRIDGE_DEPOSIT_WINDOW,
+# BRIDGE_MINT_LIMITS) and the rules in qrdx/exchange/bridge.py (docs/BRIDGE.md).
 # ==================================================================================
-
-# Chain identifiers (matches bridge.types.ChainId)
-BRIDGE_CHAIN_QRDX = 0
-BRIDGE_CHAIN_ETHEREUM = 1
-BRIDGE_CHAIN_BITCOIN = 2
-BRIDGE_CHAIN_SOLANA = 3
-BRIDGE_CHAIN_COSMOS = 4
-
-# Confirmation requirements per chain (source chain finality)
-BRIDGE_CONFIRMATIONS_ETH = 12  # ~3 minutes (Ethereum PoS)
-BRIDGE_CONFIRMATIONS_BTC = 6  # ~60 minutes (Bitcoin PoW)
-BRIDGE_CONFIRMATIONS_SOL = 32  # ~12.8 seconds (Solana finality)
-BRIDGE_CONFIRMATIONS_COSMOS = 1  # Instant finality (Tendermint)
-
-# Bridge fees (basis points: 10 bps = 0.1%)
-BRIDGE_FEE_BPS = 10
-
-# Doomsday Protocol (§8.5)
-DOOMSDAY_CANARY_ADDRESS = "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
-DOOMSDAY_CANARY_BOUNTY = Decimal("1000000")  # 1M QRDX
-
-# Fraud proof window for high-value unshields (§8.2)
-FRAUD_PROOF_WINDOW_SECONDS = 604800  # 7 days
-HIGH_VALUE_THRESHOLD_USD = Decimal("100000")  # $100K
-
-# Oracle attestation threshold (§10.2)
-# Minimum fraction of validators required: ≥ 2/3+1
-ORACLE_ATTESTATION_QUORUM_NUMERATOR = 2
-ORACLE_ATTESTATION_QUORUM_DENOMINATOR = 3
-
-# Oracle precompile addresses (Step 4.5)
-ORACLE_PRECOMPILE_GET_CHAIN_STATE = 0x0200
-ORACLE_PRECOMPILE_VERIFY_PROOF = 0x0201
-ORACLE_PRECOMPILE_SUBMIT_CROSS_CHAIN_TX = 0x0202
-
-# Oracle precompile gas costs
-ORACLE_GAS_GET_CHAIN_STATE = 100_000
-ORACLE_GAS_VERIFY_PROOF = 200_000
-ORACLE_GAS_SUBMIT_CROSS_CHAIN_TX = 500_000
-
-# Bridge token minimum/maximum amounts
-BRIDGE_MIN_AMOUNT_ETH = Decimal("0.01")
-BRIDGE_MAX_AMOUNT_ETH = Decimal("10000")
-BRIDGE_MIN_AMOUNT_BTC = Decimal("0.0001")
-BRIDGE_MAX_AMOUNT_BTC = Decimal("1000")
-BRIDGE_MIN_AMOUNT_SOL = Decimal("0.01")
-BRIDGE_MAX_AMOUNT_SOL = Decimal("100000")
 
 # Default institutional custody thresholds (Whitepaper §6.3)
 TREASURY_MULTISIG_THRESHOLD = 5  # 5-of-9 for main treasury
 TREASURY_MULTISIG_TOTAL = 9
 EMERGENCY_RECOVERY_THRESHOLD = 3  # 3-of-5 for emergency
 EMERGENCY_RECOVERY_TOTAL = 5
-
-
-# ==================================================================================
-# ON-CHAIN GOVERNANCE (Whitepaper §13)
-# ==================================================================================
-
-# --- Proposal Thresholds ---
-GOVERNANCE_PROPOSAL_DEPOSIT = Decimal("10000000")  # 10M QRDX to submit proposal
-GOVERNANCE_TEMPERATURE_SUPPORT = Decimal("1000000")  # 1M QRDX temperature-check min
-GOVERNANCE_MIN_DISCUSSION_DAYS = 3  # Days before formal proposal
-
-# --- Voting Configuration ---
-GOVERNANCE_VOTING_PERIOD_DAYS = 7  # 7-day voting window
-GOVERNANCE_VOTING_PERIOD_EPOCHS = 7 * 24 * 60  # ~7 days in epochs (1 epoch ≈ 64s)
-GOVERNANCE_QUORUM_THRESHOLD = Decimal("0.10")  # 10% of circulating supply
-GOVERNANCE_APPROVAL_THRESHOLD = Decimal("0.60")  # 60% for parameter changes
-GOVERNANCE_SUPERMAJORITY_THRESHOLD = Decimal("0.75")  # 75% for protocol upgrades
-
-# --- Vote Types ---
-GOVERNANCE_VOTE_FOR = 1
-GOVERNANCE_VOTE_AGAINST = 2
-GOVERNANCE_VOTE_ABSTAIN = 3
-
-# --- Timelock ---
-GOVERNANCE_TIMELOCK_MIN_DELAY_SECONDS = 2 * 24 * 3600  # 2 days minimum
-GOVERNANCE_TIMELOCK_MAX_DELAY_SECONDS = 14 * 24 * 3600  # 14 days maximum
-GOVERNANCE_TIMELOCK_DEFAULT_DELAY_SECONDS = 2 * 24 * 3600  # 2 days default
-
-# --- Guardian Council (§13.4) ---
-GOVERNANCE_GUARDIAN_THRESHOLD = 3  # 3-of-5 PQ multisig
-GOVERNANCE_GUARDIAN_TOTAL = 5
-
-# --- Governable Parameter Defaults (§13.5) ---
-GOVERNANCE_DEFAULT_PARAMETERS = {
-    "trading_fee_tiers": [Decimal("0.0001"), Decimal("0.0005"), Decimal("0.003"), Decimal("0.01")],
-    "orderbook_maker_fee": Decimal("0.0002"),
-    "orderbook_taker_fee": Decimal("0.0005"),
-    "bridge_fee_bps": 10,
-    "min_validator_stake": Decimal("100000"),
-    "pool_creation_stake": Decimal("10000"),
-    "pool_creation_subsidy_burn": Decimal("5000"),
-    "validator_set_size": 150,
-    "block_time_seconds": 2,
-    "proposal_threshold": Decimal("10000000"),
-    "voting_period_days": 7,
-    "oracle_attestation_threshold": Decimal("0.667"),
-    "min_chain_adapters": 1,
-}
-
-# Domain separator for governance signatures
-GOVERNANCE_DOMAIN_SEPARATOR = b"QRDX-GOVERNANCE-v1"
 
 
 # ==================================================================================

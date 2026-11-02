@@ -9,10 +9,10 @@ Perps settings no outside actor chooses, and leverage chosen per trade (docs/HYP
   topped up from free cross margin when it goes down.
 * A market's maximum leverage is bounded (PERP_MARKET_MAX_LEVERAGE): far beyond it, liquidations
   come too late and the backstop pays.
-* A validator-priced market — its name, its leverage, its grid — is listed by governance
-  (``list_market``), not by whoever lists it first.
-* A deployer market is isolated-margin only, never backstopped by the shared vault, and never
-  prices anyone's margin: its deployer's oracle reaches no one outside it.
+* A validator-priced market — its name, its leverage, its grid — is listed at genesis or by
+  governance (``list_market``), not by whoever lists it first.
+* A token perp is isolated-margin only, never backstopped by the shared vault, and never prices
+  anyone's margin: a thin spot market's price reaches no one outside it.
 """
 from decimal import Decimal as D
 
@@ -149,8 +149,8 @@ def test_a_markets_maximum_leverage_is_bounded():
 
 
 def test_validator_priced_markets_are_listed_by_governance_only(m):
-    r = _tx(m, ALICE, Op.CREATE_MARKET, base_token="SOL", liquidity="20000")
-    assert not r.success and "governance" in r.error
+    r = _tx(m, ALICE, Op.CREATE_MARKET, token="SOL", liquidity="20000")
+    assert not r.success and "no on-chain token" in r.error         # CREATE_MARKET: tokens only
     assert "SOL-QRDX-PERP" not in m.clearinghouse.markets
     from qrdx.exchange.governance import Governance, GovernanceError
 
@@ -158,7 +158,8 @@ def test_validator_priced_markets_are_listed_by_governance_only(m):
     listing = gov._check_action("list_market", {"base_token": "SOL", "max_leverage": 10,
                                                 "sz_decimals": 2}, 1)
     assert listing == {"base_token": "SOL", "max_leverage": 10, "sz_decimals": 2}
-    for bad in ({"base_token": "gold:XAU"}, {"base_token": "SOL", "max_leverage": "x"},
+    for bad in ({"base_token": "gold:XAU"}, {"base_token": "0x" + "1" * 40},
+                {"base_token": "QRDX"}, {"base_token": "SOL", "max_leverage": "x"},
                 {"base_token": "SOL", "sz_decimals": 9}):
         with pytest.raises(GovernanceError):
             gov._check_action("list_market", bad, 1)
@@ -166,15 +167,11 @@ def test_validator_priced_markets_are_listed_by_governance_only(m):
     out = m._list_market(listing)
     market = m.clearinghouse.markets[out["market_id"]]
     assert market.base == "SOL" and market.quote == monkey_quote
-    assert market.max_leverage == 10 and market.sz_decimals == 2 and not market.deployer
+    assert market.max_leverage == 10 and market.sz_decimals == 2 and not market.spot_token
     with pytest.raises(GovernanceError):
         m._list_market(listing)                                    # listed once
     with pytest.raises(GovernanceError):
         m._list_market({"base_token": "AVAX", "max_leverage": 1000})
-
-
-def test_open_listing_is_a_dev_networks_setting(m, open_listing):
-    assert _tx(m, ALICE, Op.CREATE_MARKET, base_token="SOL", liquidity="20000").success
 
 
 def test_no_one_changes_another_accounts_leverage_or_orders(m):
@@ -201,17 +198,18 @@ def test_an_order_id_already_live_is_refused():
     assert ch.markets[BTC].orders["same"].owner == "alice"
 
 
-# ── deployer markets reach no one outside them ──────────────────────────────
+# ── token perps reach no one outside them ───────────────────────────────────
 
-def _deployer_market():
+def _token_perp():
     ch = Clearinghouse()
-    gold = ch.create_market("gold:XAU", deployer="dep", deployer_fee_share=D("0.5")).id
-    ch.set_oracle_price(gold, D(30000))
+    token = "0x" + "7" * 40
+    gold = ch.create_market(token, spot_token=token).id
+    ch.set_spot_reading(gold, D(30000), D(10) ** 9, D(T0))      # a deep spot market
     return ch, gold
 
 
-def test_a_deployer_market_is_isolated_margin_only():
-    ch, gold = _deployer_market()
+def test_a_token_perp_is_isolated_margin_only():
+    ch, gold = _token_perp()
     ch.deposit("alice", D(100_000))
     with pytest.raises(ClearinghouseError, match="isolated margin only"):
         ch.set_leverage("alice", gold, D(5), isolated=False)
@@ -219,11 +217,11 @@ def test_a_deployer_market_is_isolated_margin_only():
     assert ch.accounts["alice"].isolated[gold] is True
 
 
-def test_the_shared_vault_never_backstops_a_deployer_market(no_risk_limits):
+def test_the_shared_vault_never_backstops_a_token_perp(no_risk_limits):
     """The case where a validator-priced market's liquidation goes to the backstop vault
-    (tests/test_clearinghouse_liquidation.py): the only bid is below bankruptcy. In a deployer
-    market the loss stays there — auto-deleveraging against its own counterparty."""
-    ch, gold = _deployer_market()
+    (tests/test_clearinghouse_liquidation.py): the only bid is below bankruptcy. In a token perp
+    the loss stays there — auto-deleveraging against its own counterparty."""
+    ch, gold = _token_perp()
     ch.deposit("alice", D(3500))
     ch.deposit("bob", D(10_000_000))
     ch.place_order("bob", gold, "s1", "sell", D(1), D(30000), 0)
@@ -239,8 +237,8 @@ def test_the_shared_vault_never_backstops_a_deployer_market(no_risk_limits):
     assert ch.identity_gap() == 0 and ch.net_size(gold) == 0
 
 
-def test_a_deployer_market_never_prices_anyones_margin(monkeypatch):
-    ch, gold = _deployer_market()
+def test_a_token_perp_never_prices_anyones_margin(monkeypatch):
+    ch, gold = _token_perp()
     from qrdx.exchange import clearinghouse as C
 
     monkeypatch.setattr(C, "portfolio_assets", lambda: {"0xtok": (gold, D("0.2"))})
