@@ -62,8 +62,9 @@ async def test_a_chain_without_the_feature_keeps_its_old_rule():
 
 def test_every_import_path_and_the_proposer_use_it():
     from qrdx.node import main as node_main
+    from qrdx.node import block_import
 
-    src = inspect.getsource(node_main._verify_chain_rules)
-    assert "verify_block_timestamp(db, bc, int(block_height))" in src
+    src = inspect.getsource(block_import._verify_chain_rules)
+    assert "verify_block_timestamp(_node.db, bc, int(block_height))" in src
     proposer = inspect.getsource(NI.ValidatorNode._block_production_loop)
     assert "slot_timestamp(origin, current_slot)" in proposer

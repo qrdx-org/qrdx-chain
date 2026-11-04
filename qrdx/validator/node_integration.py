@@ -33,7 +33,24 @@ _PROPOSER_PROPAGATION_GRACE = os.getenv("QRDX_PROPOSER_PROPAGATION_GRACE", "0").
     "true",
     "yes",
 )
-_PROPOSER_PROPAGATION_GRACE_SECONDS = SLOT_DURATION_SECONDS / 2
+# How long a proposer waits for the previous slot's block before building beside it: until it
+# lands, at most this long (it slept the whole half slot, even when the block landed at once).
+# Waiting a full slot was tried under load and did not reduce competing blocks: the block that
+# is late is usually still being built (docs/PERFORMANCE.md).
+_PROPOSER_PROPAGATION_GRACE_SECONDS = SLOT_DURATION_SECONDS * float(
+    os.environ.get("QRDX_PROPOSER_GRACE_SLOTS", "0.5")
+)
+
+# What share of a slot a proposer spends running a block's exchange operations, and the fewest
+# it includes (docs/PERFORMANCE.md). The chain allows a block BLOCK_EXCHANGE_GAS_LIMIT of gas,
+# 2,000 transfers; a proposer includes what it measures it can run in this share of the slot,
+# so that its block, and every peer's import of it, fits the slot. Filled to the limit, a block
+# took a second to build and as long to import: slots were missed and proposers built on stale
+# parents. A faster node fills more of the limit.
+EXCHANGE_BUILD_SHARE = float(os.environ.get("QRDX_EXCHANGE_BUILD_SHARE", "0.4"))
+EXCHANGE_BUILD_MIN = 64
+EXCHANGE_BUILD_MAX = 10_000
+EXCHANGE_BUILD_START = 500
 
 
 def parse_block_timestamp(ts) -> Optional[datetime]:
@@ -91,6 +108,9 @@ def assemble_pos_block_data(
         from ..exchange.block_processor import BLOCK_EXCHANGE_TXS_KEY, encode_exchange_txs
 
         data[BLOCK_EXCHANGE_TXS_KEY] = encode_exchange_txs(exchange_txs)
+        # Kept beside the block, never sent: the decoded operations, which name the section by
+        # hash when it is relayed compact (qrdx/node/block_relay.py).
+        data["_exchange_objects"] = list(exchange_txs)
         if exchange_state_root:
             data["exchange_state_root"] = exchange_state_root
     if evm_txs:
@@ -144,6 +164,9 @@ class ValidatorNode:
         # An object exposing select_for_block(limit) -> [ExchangeTransaction]
         # (the node's ExchangeMempool). Set via set_exchange_tx_source().
         self._exchange_tx_source = None
+        # How many exchange operations the next block selects (EXCHANGE_BUILD_SHARE): grown while
+        # full blocks run inside the share of a slot, cut in proportion when one does not.
+        self._exchange_limit = EXCHANGE_BUILD_START
 
         # ── EVM tx inclusion (E-D3b execute-on-mine) ──
         # _evm_tx_source: the node's EVMMempool (select_for_block / remove).
@@ -452,7 +475,7 @@ class ValidatorNode:
                     except Exception:
                         tip_slot = None
                     if tip_slot is not None and tip_slot < current_slot - 1:
-                        await asyncio.sleep(_PROPOSER_PROPAGATION_GRACE_SECONDS)
+                        await self._await_tip_change(_PROPOSER_PROPAGATION_GRACE_SECONDS)
 
                 # Everything from the tip re-check to storing the block runs under the node's
                 # block-processing lock — the one every import path and the reorg rebuild
@@ -461,6 +484,7 @@ class ValidatorNode:
                 # half-rebuilt state, and importers rejected the declared root (the recurring
                 # E-D4 observe mismatch). A block's sections could equally land in the middle
                 # of a replay, out of order. Broadcasting happens after the lock is released.
+                _build_started = time.perf_counter()
                 async with self._production_lock():
                     # Re-check the tip for EVERY rank, not just backups.
                     #
@@ -560,11 +584,14 @@ class ValidatorNode:
                         # failure rather than ship a bad block.
                         exchange_txs = []
                         exchange_state_root = None
+                        _exchange_started = time.perf_counter()
                         if self._exchange_tx_source is not None:
                             try:
                                 exchange_txs = (
                                     self._exchange_tx_source.select_for_block(
-                                        min_price=base_fees[1]
+                                        limit=self._exchange_budget(),
+                                        min_price=base_fees[1],
+                                        height=next_height,
                                     )
                                     or []
                                 )
@@ -640,6 +667,10 @@ class ValidatorNode:
                                             block_height=next_height,
                                         )
                                         exchange_state_root = root
+                                        self._measure_exchange(
+                                            len(exchange_txs),
+                                            time.perf_counter() - _exchange_started,
+                                        )
                                         logger.info(
                                             f"📦 Including {len(exchange_txs)} exchange tx(s) in "
                                             f"block #{next_height} (root={root[:16]}...)"
@@ -796,7 +827,8 @@ class ValidatorNode:
 
                         if block:
                             logger.info(
-                                f"📦 Proposed block #{next_height} at slot {current_slot}: {block.hash[:16]}..."
+                                f"📦 Proposed block #{next_height} at slot {current_slot}: {block.hash[:16]}... "
+                                f"({1000 * (time.perf_counter() - _build_started):.0f} ms)"
                             )
 
                             block_data = assemble_pos_block_data(
@@ -1236,6 +1268,33 @@ class ValidatorNode:
         if not prices and not deposits and not heads:
             return None
         return build_vote(self.wallet, await self._get_current_slot(), prices, deposits, heads)
+
+    async def _await_tip_change(self, at_most: float) -> None:
+        """Return once the chain's tip moves (a block landed), or after ``at_most`` seconds."""
+        start = await self.db.get_next_block_id()
+        deadline = time.monotonic() + at_most
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+            if await self.db.get_next_block_id() != start:
+                return
+
+    def _exchange_budget(self) -> int:
+        """How many exchange operations to select: what this node runs in its share of a slot."""
+        return self._exchange_limit
+
+    def _measure_exchange(self, count: int, seconds: float) -> None:
+        """Size the next block by how long this one's exchange section took, selection to flush
+        (a block also has fixed costs: a cost per operation alone overstated small blocks'). A
+        full block inside the share grows the next by a quarter; any block over it shrinks the
+        next in proportion, at most by half. A block the mempool could not fill says nothing
+        about growing."""
+        budget = SLOT_DURATION_SECONDS * EXCHANGE_BUILD_SHARE
+        limit = self._exchange_limit
+        if seconds > budget:
+            limit = int(limit * max(0.5, budget / seconds))
+        elif count >= 0.9 * limit:
+            limit = int(limit * 1.25) + 1
+        self._exchange_limit = max(EXCHANGE_BUILD_MIN, min(EXCHANGE_BUILD_MAX, limit))
 
     def set_exchange_tx_source(self, source) -> None:
         """

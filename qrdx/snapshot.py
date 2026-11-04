@@ -96,6 +96,7 @@ SAFE_MODULES: frozenset = frozenset(
         "qrdx.exchange.clearinghouse",
         "qrdx.exchange.commitment",
         "qrdx.exchange.governance",
+        "qrdx.exchange.handlers.common",
         "qrdx.exchange.nfts",
         "qrdx.exchange.oracle",
         "qrdx.exchange.orderbook",
@@ -124,7 +125,9 @@ def _safe_global(module: str, name: str) -> Any:
         obj = getattr(importlib.import_module(module), name)
     except (ImportError, AttributeError):
         raise SnapshotError(f"the exchange checkpoint names {module}.{name}: unknown") from None
-    if getattr(obj, "__module__", None) != module:  # (an imported name, defined elsewhere)
+    # An imported name must be defined in a safe module too. (state_manager.py re-exports the
+    # helpers of handlers/common.py, where they moved: a checkpoint made before names them there.)
+    if getattr(obj, "__module__", None) not in SAFE_MODULES:
         raise SnapshotError(f"the exchange checkpoint names {module}.{name}: refused")
     if inspect.isclass(obj):
         return obj

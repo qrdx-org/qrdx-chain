@@ -25,6 +25,7 @@ from qrdx.crypto.account_id import to_account_id
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.fee_market import CURRENT_EVM_BASE_FEE
 from qrdx.node import main as node_main
+from qrdx.node import evm_runtime
 
 GWEI = 10**9
 WEI = 10**18
@@ -171,7 +172,7 @@ async def _close(db, saved):
 async def _execute(raw, base_fee=GWEI, height=1):
     token = CURRENT_EVM_BASE_FEE.set(base_fee)
     try:
-        return await node_main._execute_evm_raw_tx(
+        return await evm_runtime._execute_evm_raw_tx(
             raw, height, f"{height:064x}", 1_700_000_000 + height
         )
     finally:

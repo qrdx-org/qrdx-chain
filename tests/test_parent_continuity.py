@@ -11,6 +11,7 @@ import json
 import pytest
 
 import qrdx.node.main as main
+from qrdx.node import block_import
 
 
 class _FakeDB:
@@ -33,28 +34,28 @@ def patched_db(monkeypatch):
 
 
 async def test_genesis_exempt(patched_db):
-    ok, err = await main._check_parent_continuity(0, _content("anything"), enforce=True)
+    ok, err = await block_import._check_parent_continuity(0, _content("anything"), enforce=True)
     assert ok and err == ""
 
 
 async def test_matching_parent_passes(patched_db):
-    ok, err = await main._check_parent_continuity(2, _content("tip_hash_AAAA"), enforce=True)
+    ok, err = await block_import._check_parent_continuity(2, _content("tip_hash_AAAA"), enforce=True)
     assert ok and err == ""
 
 
 async def test_mismatch_observe_accepts(patched_db, caplog):
     import logging
     with caplog.at_level(logging.WARNING):
-        ok, err = await main._check_parent_continuity(2, _content("WRONG_parent"), enforce=False)
+        ok, err = await block_import._check_parent_continuity(2, _content("WRONG_parent"), enforce=False)
     assert ok  # observe: accepted
     assert any("parent-continuity observe" in r.message for r in caplog.records)
 
 
 async def test_mismatch_enforce_rejects(patched_db):
-    ok, err = await main._check_parent_continuity(2, _content("WRONG_parent"), enforce=True)
+    ok, err = await block_import._check_parent_continuity(2, _content("WRONG_parent"), enforce=True)
     assert not ok and "parent_hash mismatch" in err
 
 
 async def test_missing_parent_field_is_lenient(patched_db):
-    ok, err = await main._check_parent_continuity(2, json.dumps({"number": 1}), enforce=True)
+    ok, err = await block_import._check_parent_continuity(2, json.dumps({"number": 1}), enforce=True)
     assert ok and err == ""

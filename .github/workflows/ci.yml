@@ -149,6 +149,26 @@ jobs:
         if: github.event_name == 'pull_request' && github.base_ref == 'main'
         run: bash scripts/release/test-image.sh qrdx-node:ci tests -m integration --timeout=300 -q
 
+      # Ethereum's state tests through QRDX's EVM (docs/EVM_CONFORMANCE.md). The fixtures
+      # release is pinned by version and sha256 in fetch_eest.sh, and cached by that version.
+      - name: Cache the EVM conformance fixtures
+        uses: actions/cache@v4
+        with:
+          path: .eest
+          key: eest-${{ hashFiles('scripts/conformance/fetch_eest.sh') }}
+
+      - name: EVM conformance (Ethereum's state tests)
+        run: |
+          bash scripts/conformance/fetch_eest.sh
+          QRDX_EEST_FIXTURES=/tmp/repo/.eest/fixtures \
+            bash scripts/release/test-image.sh qrdx-node:ci tests/test_evm_conformance.py -q
+
+      - name: Deep fuzzing (pull requests to main)
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        run: |
+          QRDX_FUZZ_EXAMPLES=3000 \
+            bash scripts/release/test-image.sh qrdx-node:ci tests/test_fuzz_decoders.py -q
+
   # ---------------------------------------------------------------------------
   # TypeScript SDK — pinned dependencies (package-lock.json), type check, tests against the
   # node's vectors (tests/test_sdk_vectors.py keeps those current)

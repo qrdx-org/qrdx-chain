@@ -40,10 +40,21 @@ def _op(gas_limit, sender="0xPQ" + "a" * 64, nonce=0):
                                params={"order_id": "x"}, gas_limit=gas_limit, gas_price=10 ** 9)
 
 
+def _spec_with(forks=(), **params):
+    from qrdx import chain_spec
+
+    base = chain_spec.active()
+    return chain_spec.build_spec(base.network, base.chain_id, {**base.params, **params},
+                                 forks=list(forks), dev=True)
+
+
 @pytest.fixture
 def limits(monkeypatch):
+    from qrdx import chain_spec
+
     monkeypatch.setattr(constants, "BLOCK_GAS_LIMIT", 100_000)
-    monkeypatch.setattr(constants, "BLOCK_EXCHANGE_GAS_LIMIT", 1_000_000)
+    spec = _spec_with(BLOCK_EXCHANGE_GAS_LIMIT=1_000_000)   # (read from the spec, by height)
+    monkeypatch.setattr(chain_spec, "active", lambda: spec)
     monkeypatch.setattr(constants, "BIG_BLOCK_INTERVAL", 0)  # (big blocks: test_big_blocks.py)
 
 
@@ -83,6 +94,7 @@ async def test_every_import_path_refuses_an_oversized_block_before_anything_runs
     """_verify_chain_rules is what the sync, push and REST import paths call before applying a
     block: it refuses an oversized one without verifying a single vote or slot."""
     from qrdx.node import main as node_main
+    from qrdx.node import block_import
 
     async def must_not_run(*a, **k):
         raise AssertionError("verified a block that carries too much")
@@ -93,7 +105,7 @@ async def test_every_import_path_refuses_an_oversized_block_before_anything_runs
     evm = [_raw(1, gas=100_001)]
     block = {"slot": 5, "attestations": []}
     block["body_root"] = body_root(block, [], evm)            # honest: the body is as signed
-    ok, err = await node_main._verify_chain_rules(repr(block), 3, None, evm)
+    ok, err = await block_import._verify_chain_rules(repr(block), 3, None, evm)
     assert not ok and "block gas limit" in err
 
 
@@ -193,3 +205,33 @@ async def test_bn128_precompiles_are_charged_what_they_cost_in_python(tmp_path):
             assert r.success and r.gas_used == want, (address.hex(), r.gas_used, r.error)
     finally:
         await db.close()
+
+
+# ── the exchange limit by height (docs/BLOCK_LIMITS.md) ─────────────────────────────
+
+def test_the_exchange_limit_is_a_height_aware_parameter_of_4000_transfers_a_second():
+    from qrdx import chain_spec
+    from qrdx.exchange.transactions import EXCHANGE_GAS_COSTS
+
+    param = chain_spec.PARAMS["BLOCK_EXCHANGE_GAS_LIMIT"]
+    assert param.height_aware and param.default == 80_000_000
+    transfer = EXCHANGE_GAS_COSTS[ExchangeOpType.TOKEN_TRANSFER]
+    slots_per_second = 1000 / chain_spec.PARAMS["SLOT_DURATION_MS"].default
+    sustained = param.default // 2 // transfer * slots_per_second   # (the base fee's target)
+    assert sustained >= 4000
+
+
+def test_a_fork_raises_the_exchange_limit_from_its_height(monkeypatch):
+    from qrdx import chain_spec
+    from qrdx.block_limits import exchange_gas_limit_at
+
+    spec = _spec_with(
+        [{"name": "wider", "height": 100, "features": [],
+          "params": {"BLOCK_EXCHANGE_GAS_LIMIT": 3_000_000}, "approval": "none"}],
+        BLOCK_EXCHANGE_GAS_LIMIT=1_000_000)
+    monkeypatch.setattr(chain_spec, "active", lambda: spec)
+    section = [_op(1_000_000).to_dict(), _op(1_000_000).to_dict()]
+    assert "exceeds" in exchange_section_gas_error(section, 99)     # before the fork
+    assert exchange_section_gas_error(section, 100) == ""            # from its height
+    assert exchange_gas_limit_at(None) == 3_000_000                  # what a mempool may hold
+    assert "exceeds" in block_resource_error({}, exchange_section=section, height=99)

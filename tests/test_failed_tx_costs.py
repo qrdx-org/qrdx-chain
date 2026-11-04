@@ -31,6 +31,7 @@ from qrdx.contracts.state import ContractStateManager
 from qrdx.crypto.account_id import to_account_id
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.node import main as node_main
+from qrdx.node import evm_runtime
 from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 WEI = 10 ** 18
@@ -90,7 +91,7 @@ async def _balance(sm, address):
 
 
 async def _execute(raw, height=1):
-    return await node_main._execute_evm_raw_tx(
+    return await evm_runtime._execute_evm_raw_tx(
         raw, height, f"{height:064x}", 1_700_000_000 + height)
 
 
@@ -108,12 +109,12 @@ def test_the_gate_is_on_by_default():
 
     saved = os.environ.pop("QRDX_ENFORCE_FAILED_TX_COSTS", None)
     try:
-        importlib.reload(node_main)
-        assert node_main._ENFORCE_FAILED_TX_COSTS is True
+        importlib.reload(evm_runtime)
+        assert evm_runtime._ENFORCE_FAILED_TX_COSTS is True
     finally:
         if saved is not None:
             os.environ["QRDX_ENFORCE_FAILED_TX_COSTS"] = saved
-        importlib.reload(node_main)
+        importlib.reload(evm_runtime)
 
 
 @pytest.fixture(autouse=True)
@@ -122,7 +123,7 @@ def _force_the_gate_on(monkeypatch):
     Pin the gate ON for the behaviour tests regardless of the ambient env var, so an
     operator running with QRDX_ENFORCE_FAILED_TX_COSTS=0 still exercises this code.
     """
-    monkeypatch.setattr(node_main, "_ENFORCE_FAILED_TX_COSTS", True)
+    monkeypatch.setattr(evm_runtime, "_ENFORCE_FAILED_TX_COSTS", True)
 
 
 # ── A failure that cannot afford its value ─────────────────────────────────

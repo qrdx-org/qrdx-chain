@@ -37,7 +37,7 @@ unified state-root check could not catch it: the proposer computed that root wit
 transaction included. In the test, an unsigned `TOKEN_TRANSFER` moved a victim's whole token
 balance to the thief, and the block was accepted.
 
-**Fix.** `_apply_exchange_section_on_import` (`qrdx/node/main.py`) authenticates every
+**Fix.** `_apply_exchange_section_on_import` (`qrdx/node/block_import.py`) authenticates every
 transaction in the section before anything changes, on both paths. A section with any
 transaction that fails verification rejects the block. The p2p and REST import paths both go
 through it. The EVM section was already safe: a post-quantum EVM transaction is verified where

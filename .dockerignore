@@ -86,3 +86,7 @@ dist/
 postgres/
 target-openapi.json
 test_results.txt
+
+# --- the native module's build output (the image builds it from source) ---
+native/qrdx-native/target
+native/qrdx-native/dist

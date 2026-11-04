@@ -23,6 +23,7 @@ from starlette.requests import Request
 from qrdx import chain_spec
 from qrdx.node import identity
 from qrdx.node import main as node_main
+from qrdx.node import security as node_security
 from qrdx.node.nodes_manager import NodeInterface, NodesManager
 from qrdx.rpc.modules.p2p import handshake_proof_message, verify_handshake_proof
 from qrdx.rpc.server import RPCModule, rpc_caller, rpc_method
@@ -110,8 +111,10 @@ async def test_an_unsigned_read_is_served_anonymously(peers, whoami):
     assert "error" not in reply and reply["result"] is None
 
 
-PEER_ONLY = ["p2p_handshakeChallenge", "p2p_handshakeResponse", "p2p_pushAttestation",
-             "p2p_pushTx", "p2p_submitBlock", "p2p_submitBlocks"]
+PEER_ONLY = ["exchange_announceTransactions", "p2p_getBlockTxs", "p2p_handshakeChallenge",
+             "p2p_handshakeResponse",
+             "p2p_pushAttestation", "p2p_pushTx", "p2p_submitBlock", "p2p_submitBlocks",
+             "p2p_submitCompactBlock"]
 
 
 def test_the_peer_only_methods_are_exactly_these():
@@ -171,15 +174,21 @@ async def test_the_client_signs_the_exact_bytes_it_sends(me, peers):
         await NodeInterface("http://peer.invalid", client=client, db=None)._rpc_call("p2p_getStatus")
     h = seen["headers"]
     assert h["x-node-id"] == me and identity.node_id_for_public_key(h["x-public-key"]) == me
+    # The hash of the exact bytes (x-body-hash: sha256): a block's body is a megabyte, and
+    # canonicalizing it to sign cost as much as sending it.
+    import hashlib
+
+    assert h["x-body-hash"] == "sha256"
     signed = identity.get_canonical_json_bytes(
-        {"body": seen["body"].decode(), "timestamp": int(h["x-timestamp"]), "nonce": h["x-nonce"]})
+        {"body_sha256": hashlib.sha256(seen["body"]).hexdigest(),
+         "timestamp": int(h["x-timestamp"]), "nonce": h["x-nonce"]})
     assert identity.verify_signature(h["x-public-key"], h["x-signature"], signed)
 
 
 # ── the handshake ───────────────────────────────────────────────────────────────────────
 
 async def test_a_challenge_is_answerable_only_by_the_node_it_was_issued_to():
-    mgr = node_main.HandshakeChallengeManager()
+    mgr = node_security.HandshakeChallengeManager()
     challenge = await mgr.create_challenge(issued_to="qxalice")
     assert not await mgr.verify_and_consume_challenge(challenge, "qxmallory")
     assert not await mgr.verify_and_consume_challenge(challenge, None)

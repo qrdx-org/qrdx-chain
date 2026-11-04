@@ -26,6 +26,7 @@ from qrdx.exchange import (
     ExchangeOpType, ExchangeStateManager, ExchangeTransaction, encode_exchange_txs)
 from qrdx.exchange import block_processor as BP
 from qrdx.node import main as node_main
+from qrdx.node import evm_runtime
 
 TS0 = 1_700_000_000
 ALICE = EthAccount.from_key("0x" + "a1" * 32)
@@ -112,7 +113,7 @@ async def test_forward_and_rebuild_agree_on_evm_token_moves_and_storage(monkeypa
         BP.apply_enforcement(mgr)
         sm = ContractStateManager(db)
         _use(db, sm)
-        execute = node_main._evm_defer_execute()
+        execute = evm_runtime._evm_defer_execute()
         for h in range(1, tip + 1):
             bh = f"{h:064x}"
             section = await db.get_block_exchange_txs(bh)
@@ -165,7 +166,7 @@ async def test_forward_and_rebuild_agree_on_evm_token_moves_and_storage(monkeypa
         # ── rebuild from the chain on a fresh manager and executor ──
         sm2 = ContractStateManager(db)
         _use(db, sm2)
-        res = await rebuild_derived_state_interleaved(db, sm2, node_main._evm_defer_execute())
+        res = await rebuild_derived_state_interleaved(db, sm2, evm_runtime._evm_defer_execute())
         assert res["evm"] == 2
         rebuilt = (await db.get_token_balances_root(), await db.get_account_state_root(),
                    ExchangeStateManager.get_instance().compute_state_root())

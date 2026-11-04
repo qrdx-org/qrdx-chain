@@ -14,6 +14,7 @@ import pytest
 
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.node import main as node_main
+from qrdx.node import block_import
 
 
 @pytest.mark.parametrize("tip, finalized_gate, at_finalized, expected", [
@@ -24,18 +25,18 @@ from qrdx.node import main as node_main
     (False, False, True, False),
 ])
 def test_sync_enforcement_decision(monkeypatch, tip, finalized_gate, at_finalized, expected):
-    monkeypatch.setattr(node_main, "_ED4_ENFORCE_SYNC_TIP", tip)
-    monkeypatch.setattr(node_main, "_ED4_ENFORCE_SYNC_FINALIZED", finalized_gate)
-    assert node_main._sync_ed4_enforced(at_finalized) is expected
+    monkeypatch.setattr(block_import, "_ED4_ENFORCE_SYNC_TIP", tip)
+    monkeypatch.setattr(block_import, "_ED4_ENFORCE_SYNC_FINALIZED", finalized_gate)
+    assert block_import._sync_ed4_enforced(at_finalized) is expected
 
 
 def test_the_tip_gate_defaults_on():
     if "QRDX_ED4_ENFORCE_SYNC" not in os.environ:
-        assert node_main._ED4_ENFORCE_SYNC_TIP is True
+        assert block_import._ED4_ENFORCE_SYNC_TIP is True
 
 
 def test_the_sync_path_uses_the_decision():
-    src = inspect.getsource(node_main.process_and_create_block)
+    src = inspect.getsource(block_import.process_and_create_block)
     assert "enforce=_sync_ed4_enforced(at_finalized)" in src
 
 
@@ -63,18 +64,18 @@ async def _current_root(db):
 
 async def test_a_matching_root_is_accepted(node_db):
     content = str({"state_root": await _current_root(node_db)})
-    assert await node_main._verify_unified_state_root(content, enforce=True) == (True, "")
+    assert await block_import._verify_unified_state_root(content, enforce=True) == (True, "")
 
 
 async def test_a_mismatched_root_is_rejected_when_enforced(node_db):
     content = str({"state_root": "ab" * 64})
-    ok, err = await node_main._verify_unified_state_root(content, enforce=True)
+    ok, err = await block_import._verify_unified_state_root(content, enforce=True)
     assert not ok and "unified state root mismatch" in err
 
 
 async def test_observe_mode_only_logs(node_db, caplog):
     content = str({"state_root": "ab" * 64})
-    assert await node_main._verify_unified_state_root(content, enforce=False) == (True, "")
+    assert await block_import._verify_unified_state_root(content, enforce=False) == (True, "")
     assert "[E-D4 observe]" in caplog.text
 
 
@@ -82,6 +83,6 @@ async def test_the_check_runs_at_the_blocks_height_not_its_slot(node_db):
     """A block's signed ``number`` is its slot. The check is made — and the block's proof roots
     filed (qrdx/state_proofs.py) — at the height the importer applies it at."""
     content = str({"state_root": "ab" * 64, "number": 999, "slot": 999})
-    await node_main._verify_unified_state_root(content, enforce=False, height=5)
+    await block_import._verify_unified_state_root(content, enforce=False, height=5)
     cur = await node_db.connection.execute("SELECT height FROM state_root_parts")
     assert [r[0] for r in await cur.fetchall()] == [5]

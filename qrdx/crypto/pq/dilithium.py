@@ -10,7 +10,11 @@ A node without liboqs cannot generate keys, sign, or verify — it will fail har
     pip install liboqs-python
 """
 
+import contextlib
+import contextvars
+import functools
 import hashlib
+import threading
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -97,9 +101,7 @@ class PQPublicKey:
 
         Address is first 32 bytes of keccak256(pubkey) with 0xPQ prefix.
         """
-        from ..address import AddressType, public_key_to_address
-
-        return public_key_to_address(self.key_bytes, AddressType.POST_QUANTUM)
+        return _address_of(bytes(self.key_bytes))
 
     def to_account_id(self) -> str:
         """
@@ -386,6 +388,45 @@ def sign(private_key: PQPrivateKey, message: bytes) -> PQSignature:
     return private_key.sign(message)
 
 
+@functools.lru_cache(maxsize=65536)
+def _address_of(key_bytes: bytes) -> str:
+    """A key's ``0xPQ`` address, remembered: every transaction's signature is bound to its
+    sender's address through it, and deriving it (keccak and a checksum, in Python) cost as
+    much as checking the signature (docs/PERFORMANCE.md)."""
+    from ..address import AddressType, public_key_to_address
+
+    return public_key_to_address(key_bytes, AddressType.POST_QUANTUM)
+
+
+_verifiers = threading.local()
+
+# Verdicts already reached for a batch (``precomputed``), by (public key, message, signature):
+# ``verify`` reads them in place of asking liboqs again.
+_PRECOMPUTED: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar(
+    "qrdx_pq_precomputed", default=None
+)
+
+
+@contextlib.contextmanager
+def precomputed(verdicts: dict):
+    """Within this block, ``verify`` answers from ``verdicts`` where it holds the item (the
+    native module's batch, qrdx/native.py); anything else is checked as usual."""
+    token = _PRECOMPUTED.set(verdicts)
+    try:
+        yield
+    finally:
+        _PRECOMPUTED.reset(token)
+
+
+def _verifier():
+    """This thread's liboqs verifier (a new one each time cost a fifth of a verification). A
+    verification holds no state in it; one per thread keeps threads from sharing one."""
+    v = getattr(_verifiers, "sig", None)
+    if v is None:
+        v = _verifiers.sig = oqs.Signature(ALGORITHM)
+    return v
+
+
 def verify(public_key: PQPublicKey, message: bytes, signature: PQSignature) -> bool:
     """
     Verify a signature against a public key.
@@ -409,11 +450,20 @@ def verify(public_key: PQPublicKey, message: bytes, signature: PQSignature) -> b
     if not isinstance(message, bytes):
         return False
 
-    try:
-        verifier = oqs.Signature(ALGORITHM)
-        return verifier.verify(message, signature.to_bytes(), public_key.to_bytes())
-    except Exception:
-        return False
+    pre = _PRECOMPUTED.get()
+    known = pre.get((public_key.to_bytes(), message, signature.to_bytes())) if pre else None
+    if known is not None:
+        verdict = bool(known)
+    else:
+        try:
+            verdict = bool(_verifier().verify(message, signature.to_bytes(), public_key.to_bytes()))
+        except Exception:
+            verdict = False
+    from . import openssl_backend
+
+    if openssl_backend.shadow_enabled():  # (OpenSSL asked too: docs/PQ_CRYPTO_BACKEND.md)
+        openssl_backend.shadow(public_key.to_bytes(), message, signature.to_bytes(), verdict)
+    return verdict
 
 
 def is_available() -> bool:

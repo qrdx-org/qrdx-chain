@@ -14,6 +14,269 @@ Companions: [UNIFIED_ACCOUNT_IDENTITY.md](UNIFIED_ACCOUNT_IDENTITY.md),
 
 # Open defects
 
+## OPEN — Live throughput is about a tenth of what the protocol allows
+
+**Severity: medium (capacity, not safety).** Measured 2026-11-04 (docs/PERFORMANCE.md).
+
+The exchange gas limit allows 4,000 transfers a second sustained, 8,000 in bursts. A 4-node
+network on one host executes about 450 a second before its backlog grows; up to 300 a second it
+fills nearly every slot.
+
+* Every node admits, relays and imports every transaction on one Python thread, which is at
+  100% CPU at the ceiling.
+* A block of 400–500 transfers takes longer than a 250 ms slot to build and to import, so the
+  next proposer often builds beside it: forks, and the time to resolve them.
+* Nothing is unsafe at the ceiling.
+  * Every admitted transaction executes or waits.
+  * The proposer's budget keeps blocks importable.
+  * The mempool bounds the backlog (65,536 operations), and refuses more when full.
+  * The base fee does not rise: budgeted blocks stay under its target. So past the ceiling,
+    admission refuses rather than prices.
+
+**Closing it requires:**
+* execution, preloading, flushing and storage in native code, as the signature checks and the
+  body root already are (docs/NATIVE.md);
+* admission and relaying off the thread that imports blocks;
+* pipelined block dissemination;
+* the geo-distributed soak (docs/MAINNET_READINESS.md §3.4) to measure it on real hosts.
+
+## FIXED — Any peer could stall a node with a block built to parse slowly
+
+**Severity: high (liveness).** Found 2026-11-04 by fuzzing the decoders peers reach
+(`tests/test_fuzz_decoders.py`).
+
+A block's content is a Python-dict repr, parsed with `ast.literal_eval`. Parsing costs in
+proportion to the structure built, not to the text's length. A 4 MB signature is one string,
+read in milliseconds; 4 MB of `1,1,1,…` is two million numbers, about four seconds. The REST
+`submit_block` path needs only a signed request, and any key will do. It then parsed the content
+several times before checking who signed the block: once to see whether the claimed proposer
+is a validator, once to verify the signature, once for eligibility, the parent and the chain
+rules. It did all of that holding the block-processing lock. One request could stop a validator
+proposing for many 250 ms slots, and the rate limit allowed two a second.
+
+**Fixed** (`block_verification._parse_block_content`):
+* Content with more structure than a block can carry is refused before it is parsed.
+  `max_content_structure` allows twice a full block's, which is 128 votes, 16 slashing proofs
+  and a header. Structure is counted as the characters a parse builds nodes for, so the count is
+  one C-speed scan, the same on every node. At the limit, the slowest content parses in about
+  15 ms.
+* Each content string is parsed once. Every later call gets its own copy of the result.
+* A proposer's graffiti is cut to 64 characters, so an honest block stays far inside the limit.
+
+The limit is a validity rule. No honest block comes near it: a full block uses about 11,400 of
+the 25,600 allowed.
+
+## FIXED — The DHT stored values for anyone, without bound
+
+**Severity: medium (memory exhaustion).** Found 2026-11-04 by fuzzing. `dht_message` needs no
+identity. A STORE kept any key with up to 8 KB for 24 hours, and nothing bounded how many. A
+message with a malformed node id or payload also raised errors the handler didn't expect.
+
+**Fixed:**
+* The store holds at most 1,024 entries (`MAX_STORE_ENTRIES`). When it is full, new keys are
+  refused until entries expire.
+* Messages, node ids (20 bytes, hex) and STORE keys and values are type-checked, and refused
+  with a `ValueError` that the handler answers.
+
+## FIXED — Malformed transactions and keys reached checks that expected well-formed ones
+
+**Severity: low.** Found 2026-11-04 by fuzzing. Several decoders raised `TypeError`,
+`AttributeError` or `KeyError` instead of a `ValueError`, which every caller turns into a
+refusal:
+* an exchange transaction whose nonce, gas limit, sender, signer or params were the wrong type;
+* an operation type given as `null`;
+* a multisig keyset or signature missing a field;
+* `is_double_sign` on content that was not a dict.
+
+None of these reached state: verification runs before anything is applied, and a block whose
+section raised was not stored. But a caller that caught only `ValueError` let the exception
+through.
+
+**Fixed:** each decoder now refuses with a `ValueError`. `ExchangeTransaction.from_dict` refuses
+only shapes that could never have verified, because they cannot be hashed, so no block's
+validity changes. Admission checks a transaction's form before its fee: a price that isn't a
+number of wei has no maximum fee to compare.
+
+## FIXED — The EVM differed from Ethereum's: free intrinsic gas, no refunds, cold sender (fork)
+
+**Severity: medium.** Found 2026-11-04 by running Ethereum's state tests through QRDX's
+executor (docs/EVM_CONFORMANCE.md). Before the fix, 247 of the 1,469 Shanghai tests differed;
+after it, 9 do, each on purpose.
+
+* **Intrinsic gas was a floor, not a cost.** The message ran with the whole gas limit, and the
+  charge was `max(executed, intrinsic)`. Calldata, and a type-0x51 transaction's ML-DSA-65
+  signature check, were therefore free whenever a transaction executed more than their price.
+  The block gas limit bounded only about half the work.
+* **No EIP-3529 refund** was given.
+* **Gas was charged after the message,** so `BALANCE` of the payer during execution showed it
+  unspent.
+* **The sender and recipient started cold** (EIP-2929).
+* **A creation didn't check for an account at its address.**
+* **MODEXP of an empty base returned 0.** It is `1 mod m` when the exponent is 0. This is a
+  py-evm bug.
+* **0x0202 returned a hash and sent nothing.**
+
+**Fixed** by chain-spec feature `evm_conformance`, which is in `GENESIS_DEFAULT_FEATURES`. An
+existing network schedules it as a fork. `eth_estimateGas` now includes the intrinsic gas.
+
+**Verified:** `tests/test_evm_conformance.py` covers each rule with and without the feature. The
+state-test run is in CI.
+
+## FIXED — Anyone could fill a node's peer table
+
+**Severity: high (eclipse, liveness).** Found 2026-11-04 while fixing the RPC limiter (below).
+
+Any signed request that named this chain's genesis made its caller a peer, up to `MAX_PEERS`.
+Keys cost nothing, so one machine could sign with a fresh key per request:
+
+* it filled the table, and whoever filled it first kept it;
+* honest nodes that tried later were refused;
+* the fake peers shared the pool of RPC capacity kept for peers;
+* a node whose table they held heard blocks and votes only through them.
+
+**Fixed** (`qrdx/node/nodes_manager.py` `admit_peer`, `qrdx/node/peers.py`):
+* **Only a handshake admits.** A caller becomes a peer only by completing the mutual handshake
+  (or by our own dial). A signed request from a stranger no longer admits it. The node dials
+  the stranger's URL back instead, at most once per URL every 10 minutes and at most 8 dials at
+  once, so an honest newcomer still gets in.
+* **A few places per network.** At most `QRDX_PEERS_PER_SUBNET` (default 4) peers come from
+  one /24 (IPv4) or /48 (IPv6). Loopback is exempt.
+* **Eviction, not a closed door.** A full table makes room for a newcomer by dropping the
+  newest inbound peer of the most crowded network group. It never drops a validator, a peer
+  this node dialed, or one of the 8 longest-connected peers. Taking the table means outlasting
+  the honest peers, from many networks.
+* **Validators prove it.** A peer that runs a validator signs its node id with the validator
+  key, under the `peer-validator` signing domain. The proof is checked against the validator
+  set at the tip. Such a peer is exempt from the network-group cap and is never evicted.
+
+**Verified:** `tests/test_peer_table.py`.
+* group cap and eviction order;
+* a full table of protected peers admits no one;
+* a signed request does not admit its caller but is dialed back;
+* the old signature form is still accepted;
+* a validator proof is bound to both the node and the validator, and a key outside the set is
+  refused.
+
+## FIXED — Every node re-sent every transaction to every peer
+
+**Severity: medium (capacity).** Found 2026-11-04 by `integration_tests/load.py`.
+
+* **Every copy whole.** A node that admitted a transaction from a peer forwarded it whole to
+  every peer it has. So each node received each transaction once from every peer. In a
+  mesh of four, three copies to parse, of which two were for nothing; more with more peers.
+* **A cap on forwarding.** A node forwarded at most 64 transactions to each peer every 50 ms,
+  about 1,280 a second, whatever arrived.
+
+**Fixed** (`qrdx/exchange/submission.py`):
+* The node a wallet sent to pushes the transaction whole.
+* Nodes that relay it announce its hash (`exchange_announceTransactions`, peer-only) and send
+  it to the peers that answer that they lack it. A node does not ask for one it holds or handled
+  lately.
+* Everything waiting goes each interval, a batch encoded and signed once for all peers.
+
+**Verified:** `tests/test_gossip_announce.py`.
+
+## FIXED — A full block took longer to build and import than a slot
+
+**Severity: high (liveness at load).** Found 2026-11-04 when the exchange gas limit was raised
+to 80,000,000 (docs/BLOCK_LIMITS.md).
+
+Under a backlog, every proposer filled its block to the new limit, 2,000 transfers. That took
+about a second to build and as long to import, four slots. The next proposers built beside it,
+fork choice rolled back and replayed 2,000-transfer blocks, and the block rate fell to one
+every four seconds.
+
+**Fixed** (`qrdx/validator/node_integration.py`): a proposer includes what it runs in its share
+of a slot (`EXCHANGE_BUILD_SHARE`, 40% of a 250 ms slot).
+* It grows the next block by a quarter while full blocks run inside the share.
+* It cuts the next block in proportion, by at most half, when one runs over.
+* A block the mempool could not fill does not count toward growing.
+
+Consensus still allows the full limit; a faster node fills more of it.
+
+**Verified:** `tests/test_rpc_rate_limits.py`
+(`test_a_proposer_sizes_its_blocks_to_its_share_of_the_slot`), and the load test.
+
+## FIXED — Peers' gossip was refused from about 50 transactions a second
+
+**Severity: high (liveness under load).** Found 2026-11-04 by `integration_tests/load.py`.
+
+The RPC limiter gave peers a pool of their own, but each peer still had its own bucket at the
+public per-address rate: 50 calls a second. Peers gossip every transaction they admit to every
+peer, one call each, so a node receives each transaction once from each of its peers. On the
+4-node testnet:
+
+* about 50 transactions a second network-wide was already past one peer's 50;
+* the load test raised the per-address limit, so there it was the peers' pool of 500 that broke,
+  at about 170 a second;
+* refused gossip left proposers without the transactions;
+* the same refusals hit blocks and votes, so nodes forked, senders' next nonces went missing,
+  and latency climbed to tens of seconds.
+
+**Fixed** (`qrdx/rpc/server.py`, `qrdx/node/main.py`): a peer's own bucket is at the per-peer
+rate, `QRDX_RPC_PEER_RPS` (default 4,000 calls a second), and all peers together have
+`QRDX_RPC_PEER_POOL_RPS` (default 16,000). These are sized for gossip at the protocol's
+2,000 transfers a second. Batches are still charged per call.
+
+**Was open, now fixed:** re-gossip sent each transaction to a node once from every peer.
+Relays now announce hashes and send only what a peer lacks. See "Every node re-sent every
+transaction to every peer" below.
+
+**Verified:** `tests/test_rpc_rate_limits.py`, and the load test (docs/PERFORMANCE.md).
+
+## FIXED — One address could throttle a node's peers, and a JSON-RPC batch passed every limit
+
+**Severity: high (liveness).** Found 2026-11-04 by the flood attack and the load generator
+(`integration_tests/adversarial.py`, `integration_tests/load.py`).
+
+* **One shared budget, spent before the caller's own.** The RPC limiter has a limit per caller
+  (50 requests a second) and a global one (500). A request took its global token *before*
+  being checked against its caller's limit. So one IP flooding far past its own limit still
+  drained the global budget. Peers shared that budget, so their calls (blocks, votes,
+  transactions) were refused with everyone else's. In the flood, blocks fell from 2.9 to 1.8 a
+  second.
+* **Signed callers were limited by their key.** A fresh key per request was a fresh limit.
+* **A batch cost one request, at any size.** Its calls all run at once, so a single request of
+  10,000 calls went past every limit.
+
+**Fixed** (`qrdx/rpc/server.py`, `main.rpc_endpoint`):
+* A request takes its caller's token first.
+* This node's peers draw on a pool of their own, which public traffic cannot reach.
+* Callers that aren't peers are limited by address, signed or not.
+* A batch holds at most 100 calls and costs one token per call.
+* The limits are node-local settings: `QRDX_RPC_CLIENT_RPS` (per address, 50),
+  `QRDX_RPC_GLOBAL_RPS` (all public callers, 500), `QRDX_RPC_PEER_RPS` (per peer, 4,000) and
+  `QRDX_RPC_PEER_POOL_RPS` (all peers, 16,000).
+* **Found later the same day:** a peer was still held to the public per-address limit. See
+  "Peers' gossip was refused from about 50 transactions a second" below.
+
+**Was open, now fixed:** an unknown caller that named this chain's genesis became a peer
+implicitly, so a Sybil could fill the peer table and share the peers' pool. See "Anyone could
+fill a node's peer table" below.
+
+**Verified:** `tests/test_rpc_rate_limits.py`.
+
+## FIXED — A refused EVM transaction was answered as admitted when sent again
+
+**Severity: medium (not consensus).** Found 2026-11-04 by the flood attack of
+`integration_tests/adversarial.py`. It sent 21,000 transactions a node must refuse, and saw 643
+of them "admitted".
+
+`eth_sendRawTransaction` remembers the transactions it admitted, so that a peer's echo is not
+gossiped again. It remembered each one *before* judging it. Sent a second time, a refused
+transaction (malformed, or from an account that could not pay) was answered with its hash, as
+if admitted. A wallet retrying was told its transaction was in. A transaction refused because
+its account could not pay could not be sent again once it could, until the entry expired. Every
+refusal was also logged at ERROR with a traceback: anyone could fill a node's log, at the
+event loop's cost.
+
+**Fixed:** only an admitted transaction is remembered, and a refusal is logged at DEBUG. While
+there: the HTTP middleware queried the database for legacy transactions to re-propagate on every
+request. The flood's profile showed it, and it now runs at most every 5 s.
+
+**Verified:** the flood now sees no refused transaction admitted.
+`tests/test_evm_admission_cache.py`.
+
 ## FIXED — Unfunded exchange transactions rode in blocks for free
 
 **Severity: medium.** Reported 2026-11-02 against the public testnet.
@@ -1412,6 +1675,14 @@ These are not defects, but they are the reason two real bugs survived a green su
   ignored, so the fast and full rebuilds agreed over branches where nothing happened. The
   `exchange_inclusion` rule (2026-11-02) made such blocks invalid, and the test failed until it
   read its nonces from the chain. Its branches now execute.
+* **Tests feed decoders what honest code produces.** A peer or a user sends anything. Fuzzing
+  every decoder they reach (`tests/test_fuzz_decoders.py`, Hypothesis; `QRDX_FUZZ_EXAMPLES=N` for
+  a deep run) found a block that took seconds to parse, an unbounded store and several decoders
+  raising errors their callers did not catch, on its first day. A new decoder of outside input
+  gets a property there.
+* **An EVM run through a custom world is a custom EVM.** Ethereum's state tests through QRDX's
+  executor (docs/EVM_CONFORMANCE.md) found six differences no unit test had, because each test
+  asserted what the executor already did.
 * **Synthetic fixtures miss real formats.** The interleaved rebuild passed every unit test
   and crashed on the first real chain, because real genesis stores a `datetime` timestamp
   and the fixtures used integers. Replaying a soak node's database offline with the real
@@ -1428,6 +1699,11 @@ These are not defects, but they are the reason two real bugs survived a green su
 
 | Issue | Where |
 |---|---|
+| One address could throttle a node's peers; a JSON-RPC batch passed every limit | [above](#fixed--one-address-could-throttle-a-nodes-peers-and-a-json-rpc-batch-passed-every-limit) |
+| A refused EVM transaction was answered as admitted when sent again | [above](#fixed--a-refused-evm-transaction-was-answered-as-admitted-when-sent-again) |
+| Any peer could stall a node with a block built to parse slowly | [above](#fixed--any-peer-could-stall-a-node-with-a-block-built-to-parse-slowly) |
+| The DHT stored values for anyone, without bound | [above](#fixed--the-dht-stored-values-for-anyone-without-bound) |
+| The EVM differed from Ethereum's (free intrinsic gas, no refunds, cold sender, MODEXP): `evm_conformance` | [above](#fixed--the-evm-differed-from-ethereums-free-intrinsic-gas-no-refunds-cold-sender-fork) |
 | Unfunded exchange transactions rode in blocks for free (no fee, no nonce, repeatable) | [above](#fixed--unfunded-exchange-transactions-rode-in-blocks-for-free) |
 | A mined block could be appended to the proof-of-stake chain (latent) | [above](#fixed--a-mined-block-could-be-appended-to-the-proof-of-stake-chain-latent) |
 | A restored snapshot's contract code and genesis records were not verified | [above](#fixed--a-restored-snapshots-contract-code-and-genesis-records-were-not-verified) |
@@ -2462,7 +2738,7 @@ canonical prefix in forward order, the proposer stopped building over half-finis
 and the exchange stopped reading the wall clock — two fault-injecting soaks with those fixes had
 logged zero observe mismatches.
 
-**Fixed:** `_ED4_ENFORCE_SYNC_TIP` (main.py, default on; `QRDX_ED4_ENFORCE_SYNC=0` for A/B only)
+**Fixed:** `_ED4_ENFORCE_SYNC_TIP` (block_import.py, default on; `QRDX_ED4_ENFORCE_SYNC=0` for A/B only)
 makes the sync path reject a mismatched unified root at any height. A node whose own state is at
 fault is not stranded: the rejection rebuilds derived state from the chain
 (`_restore_after_rejected_block`), and the next sync attempt re-applies the block on clean state.
@@ -2709,7 +2985,7 @@ replaying — which is exactly the interleaved rebuild below.
 
 ### Fixed
 
-* `_rebuild_derived_state_on_startup` (qrdx/node/main.py) runs the interleaved rebuild at
+* `_rebuild_derived_state_on_startup` (qrdx/node/derived_state.py) runs the interleaved rebuild at
   startup: exchange in memory, `account_state` and the token ledger, block by block.
 * The contract system (EVM executor + account-state manager) is now initialised **before**
   the rebuild and before the validator, epoch loop and chain poller start. It used to be
@@ -2821,7 +3097,7 @@ node whose chain does not contain it.
 
 ### Fixed
 
-`_restore_after_rejected_block` (qrdx/node/main.py) rolls back the open transaction and
+`_restore_after_rejected_block` (qrdx/node/derived_state.py) rolls back the open transaction and
 rebuilds derived state from the canonical chain, which the rejected block never joined —
 restoring the exact pre-block state in every domain, in memory included. It is called on
 EVM-section and E-D4 rejection on the sync, REST and p2p paths (p2p through the

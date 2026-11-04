@@ -265,11 +265,9 @@ schedule and the margin and leverage tiers are among the defaults that still awa
 
 No code change clears these; each needs a person or an outside party.
 
-1. **Commit, then freeze.** Everything since 321da74 is uncommitted: about 90 changed files. Commit it, tag an audit freeze and change only what the audits ask for.
-   docs/RELEASES.md also lists three release blockers:
-   * the `dvm` gitlink;
-   * an unpushed py-evm change;
-   * no maintainer keys.
+1. **Freeze.** The work through 2026-11-02 is committed (90933b0, branch `test`). Tag an audit
+   freeze and change only what the audits ask for. Of docs/RELEASES.md's three release blockers,
+   the `dvm` gitlink and the py-evm change are resolved; maintainer keys remain.
 2. **External audits**, in four scopes:
    * consensus: fork choice, FFG, slashing, epoch state, the body commitment, sync;
    * the exchange: the clearinghouse, unified spot, account control and multisig, governance,
@@ -286,6 +284,13 @@ No code change clears these; each needs a person or an outside party.
    * the adversarial harness: an equivocating proposer, partitions, long-range attempts, a node
      flooding transactions;
    * load at the target throughput.
+
+   *The adversarial harness exists (2026-11-04): `integration_tests/adversarial.py`, run by
+   `run_scenarios --adversarial` and nightly. It covers an equivocating proposer (a twin of a
+   tip block, signed with the validator's key), a block built to parse slowly, and a flood of
+   transactions every node must refuse. A partition and a long-range branch are not covered
+   yet. Its first runs found a refused EVM transaction being answered as admitted, and that
+   refusals were logged at ERROR with a traceback (docs/KNOWN_ISSUES.md).*
 
    **250 ms slots must be measured there.** Round trips between continents are 100–250 ms, before
    Python processing and a 3.3 KB signature per block. The time parameters live in the chain spec
@@ -325,6 +330,16 @@ signing and verification, for example mldsa-native, PQClean's verified code path
 FIPS-validated module such as AWS-LC's. Keep liboqs only where nothing else exists. Whatever is
 chosen, pin it by hash and test it against the NIST vectors (B3, B6).
 
+*Evaluated 2026-11-04 (docs/PQ_CRYPTO_BACKEND.md).*
+* *OpenSSL's ML-DSA is already in the node image, through the locked pyca/cryptography 50. It
+  agrees with liboqs on the known-answer vector, on each other's signatures, and on thousands of
+  fuzzed inputs (`tests/test_pq_backends.py`).*
+* *Shadow verification (`QRDX_PQ_SHADOW_VERIFY`) asks both and counts disagreements, the evidence a
+  switch needs.*
+* *The recommendation is to verify with OpenSSL after a shadow period on the testnet, and to keep
+  signing with liboqs until validators rotate keys. mldsa-native (formally verified) is the
+  alternative if a C extension in the image is acceptable.*
+
 ### Performance
 
 The node is Python on a 250 ms clock.
@@ -335,17 +350,57 @@ The node is Python on a 250 ms clock.
 * Move whatever the profile shows into native code (Rust through PyO3, or Cython) behind the same
   interfaces, with the existing equivalence tests as the referee.
 
+*Measured 2026-11-04 (docs/PERFORMANCE.md, `integration_tests/load.py`).*
+* *On one host, the network executes 50 exchange transfers a second with every 250 ms slot filled
+  (latency p50 0.31 s). At 100 a second every transfer still executes, but half the slots are
+  missed.*
+* *The profile showed transaction gossip (one signed call per transaction per peer) delaying
+  blocks. Batching it doubled the sustained rate.*
+* *The next limit is the proposer's sequential database round trips per transaction.*
+
+*Later the same day:*
+* *Database round trips are batched. One core runs a block's pipeline at 4,450 transfers a
+  second (it was 2,190).*
+* *The exchange gas limit is 80,000,000: the protocol allows 4,000 transfers a second
+  sustained.*
+* *Blocks travel compact and gossip is announced (docs/PERFORMANCE.md).*
+* *Signatures are checked and the body root is written by a Rust module, through liboqs
+  (docs/NATIVE.md).*
+* *Live, 300 transfers a second fills nearly every slot, and the ceiling on one host is about
+  450 (it was 250). That gap is open in docs/KNOWN_ISSUES.md, "Live throughput is about a tenth
+  of what the protocol allows". It needs execution in native code and admission off the block
+  thread.*
+
 ### Determinism checks in CI
 
 The rollback-audit plugin, the hash-seed check and the rebuild-equivalence tests catch the bugs
 that split a network. Make each one a CI job, and add a nightly multi-node run that compares
 state roots.
 
+*Built 2026-11-04:*
+* *The rollback audit and the hash-seed check are now in the repository
+  (`scripts/determinism/check.py rollback|hashseed`).*
+* *The rebuild-equivalence tests are part of the unit suite.*
+* *A nightly workflow (`.github/workflows/nightly.yml`) runs both checks, deep fuzzing, and a
+  4-node network inside the node image: every scenario, then the attacks of
+  `integration_tests/adversarial.py`, then a soak with a node killed and restarted, comparing
+  state roots across nodes.*
+
 ### Fuzzing and conformance
 
 * Fuzz every decoder that peers or users reach: block bodies, exchange operations, RLP and 0x51
   transactions, p2p messages. Use Hypothesis, or Atheris for the C-backed paths.
 * Run the Ethereum state tests (GeneralStateTests) against the EVM, since its world is custom.
+
+*Built 2026-11-04:*
+* *`tests/test_fuzz_decoders.py` fuzzes these with Hypothesis: exchange transactions and their
+  execution, raw EVM and 0x51 transactions, block content, multisig material, DHT messages, the
+  handshake answer and every precompile. It found a block content that stalled a node for
+  seconds, an unbounded DHT store, and decoders raising errors their callers did not catch.*
+* *`scripts/conformance/eest_state_tests.py` runs execution-spec-tests' Shanghai state tests
+  through QRDX's executor (docs/EVM_CONFORMANCE.md). 1,460 of 1,469 agree; the other 9 differ
+  on purpose. The run found six differences, fixed by the `evm_conformance` fork. Both run in
+  CI.*
 
 ### A written specification
 
@@ -358,6 +413,22 @@ first step toward a second client.
 `state_manager.py` (6,800 lines) and `node/main.py` (8,700) are hard to review. Split them along
 the lines that already exist (spot, perps, bridge, account control; import, propose, sync) before
 the audit freeze.
+
+*`state_manager.py` was split on 2026-11-04.*
+* *It keeps the manager's core: the block lifecycle, transaction processing and inclusion, the
+  free lane, undo scopes, the state root, snapshots and queries (about 1,750 lines).*
+* *The operations moved verbatim to `qrdx/exchange/handlers/`: `spot`, `trading`, `tokens`,
+  `perps`, `accounts`, `staking` and `oracle`, plus `common` for the module's helpers.*
+* *Each is a function of the manager, `self: ExchangeStateManager`, so mypy still checks it
+  fully. The class binds each under its old name, and every old import path still resolves.*
+
+*`node/main.py` was split the same day (docs/NODE_LAYOUT.md), from 8,904 lines to 1,215.*
+* *main keeps the app, the node's state, and startup and shutdown.*
+* *The rest moved by concern: `block_import`, `evm_runtime`, `derived_state`, `fork_choice`,
+  `sync`, `peers`, `discovery`, `chain_identity`, `security`, and the REST API in `api/`.*
+* *Moved code reads the node's state from main at call time (`_node.db`), so startup and tests
+  still rebind it in one place. Routes, parameters, middleware and rate limits were checked
+  identical before and after.*
 
 ### Documentation
 
@@ -527,6 +598,13 @@ Items that need a person or an outside party (§3) stay with the user.
 | 5 | Whitepaper v3.4: the protocol as built, and a dated roadmap | **done** (QRDX-Whitepaper-v3.4.md) |
 | 5 | Reported 2026-11-02: unfunded exchange transactions carried in blocks for free → `exchange_inclusion` | **done**, verified live (admission checks the payer; the proposer judges its selection first; a block carrying a transaction that cannot run is invalid; fees reserved up front; docs/KNOWN_ISSUES.md). Existing networks schedule the fork |
 | 5 | Node version 3.0.0 | **done** (changelogs/2026/10/2026-10-27-release(3.0.0).md) |
+| 6 | §4 fuzzing of every decoder peers and users reach | **done** (tests/test_fuzz_decoders.py; found and fixed: slow-to-parse block content (liveness), unbounded DHT store, decoder exceptions) |
+| 6 | §3 the adversarial harness: equivocation, slow-to-parse blocks, a transaction flood | **done** (integration_tests/adversarial.py; found and fixed: refused EVM transactions answered as admitted on resend, ERROR-level refusal logging). Partitions and long-range branches still to add |
+| 6 | §4 determinism checks in CI, and a nightly multi-node run | **done** (scripts/determinism/check.py; .github/workflows/nightly.yml) |
+| 6 | §4 performance: a profile under load (integration_tests/load.py) | **done** (docs/PERFORMANCE.md: 50 transfers/s at full block rate on one host after batching gossip, 2× before; next: the proposer's database round trips) |
+| 6 | §4 PQ crypto implementation: OpenSSL compared with liboqs | **done** (docs/PQ_CRYPTO_BACKEND.md; differential tests; shadow verification). The switch is your decision |
+| 6 | §4 split `state_manager.py` and `node/main.py` | **done**: qrdx/exchange/handlers/ (7,119 → ~1,750 lines); qrdx/node/ by concern (8,904 → 1,215, docs/NODE_LAYOUT.md) |
+| 6 | §4 Ethereum state tests against the EVM | **done** (docs/EVM_CONFORMANCE.md; `evm_conformance` fork: intrinsic gas, refunds, up-front gas, warm sender, create collision, MODEXP, 0x0202). Existing networks schedule the fork |
 
 Not in this plan, and why:
 

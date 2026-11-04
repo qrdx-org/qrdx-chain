@@ -1,0 +1,26 @@
+[package]
+name = "qrdx-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+description = "Native hot paths for the QRDX node and validator (docs/NATIVE.md)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "qrdx_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22.6", features = ["extension-module", "abi3-py310"] }
+rayon = "1.10.0"
+sha2 = "0.10.8"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[lints.rust]
+# (pyo3 0.22's create_exception! names a feature of pyo3's own)
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("gil-refs"))'] }

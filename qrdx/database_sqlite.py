@@ -9,7 +9,7 @@ import json
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import aiosqlite
 
@@ -1252,6 +1252,177 @@ class DatabaseSQLite:
         )
         return True
 
+    # ── batched reads and writes for a block's exchange section (docs/PERFORMANCE.md) ──
+    # Each matches its one-row form exactly (the same keys, the same rounding, the same clamps
+    # and the same order of application): every node must read and write the same values. A
+    # block used to make an await per holder, and per delta, through aiosqlite's worker thread.
+
+    _BATCH = 500  # parameters per IN (...) query, well under SQLite's limit
+
+    async def get_address_balances(self, addresses) -> Dict[str, "Decimal"]:
+        """``get_address_balance`` of each address (any form), keyed by the address as given."""
+        from decimal import Decimal
+
+        from .crypto.account_id import to_account_id
+
+        ids: Dict[str, Optional[str]] = {}
+        for a in addresses:
+            if a in ids:
+                continue
+            try:
+                ids[a] = to_account_id(a)
+            except ValueError:
+                ids[a] = None  # unkeyable: no account can exist for it
+        wanted = sorted({i for i in ids.values() if i})
+        found: Dict[str, Any] = {}
+        for at in range(0, len(wanted), self._BATCH):
+            part = wanted[at : at + self._BATCH]
+            cur = await self.connection.execute(
+                "SELECT LOWER(address), balance FROM account_state WHERE LOWER(address) IN ("
+                + ",".join("?" * len(part))
+                + ")",
+                part,
+            )
+            for addr, bal in await cur.fetchall():
+                found.setdefault(addr, bal)  # (the first row, as fetchone takes it)
+        out: Dict[str, Decimal] = {}
+        for a, i in ids.items():
+            raw = found.get(i) if i else None
+            try:
+                wei = int(raw) if raw else 0
+            except (TypeError, ValueError):
+                wei = 0
+            out[a] = Decimal(wei) / Decimal(10**18) if wei > 0 else Decimal(0)
+        return out
+
+    async def get_token_balances_of(self, pairs) -> Dict[Tuple[str, str], "Decimal"]:
+        """``get_token_balance(token, holder)`` of each (token, holder) pair, keyed by the pair
+        as given."""
+        from decimal import Decimal
+
+        from .crypto.account_id import to_account_id
+
+        keys: Dict[Tuple[str, str], Tuple[str, str]] = {}
+        for token, holder in pairs:
+            try:
+                resolved = to_account_id(holder)
+            except ValueError:
+                resolved = holder
+            keys[(token, holder)] = (token, resolved)
+        by_token: Dict[str, set] = {}
+        for token, holder in keys.values():
+            by_token.setdefault(token, set()).add(holder)
+        found: Dict[Tuple[str, str], Any] = {}
+        for token, holders in sorted(by_token.items()):
+            ordered = sorted(holders)
+            for at in range(0, len(ordered), self._BATCH):
+                part = ordered[at : at + self._BATCH]
+                cur = await self.connection.execute(
+                    "SELECT holder_address, balance FROM token_balances WHERE token_address = ? "
+                    "AND holder_address IN (" + ",".join("?" * len(part)) + ")",
+                    (token, *part),
+                )
+                for holder, bal in await cur.fetchall():
+                    found.setdefault((token, holder), bal)
+        return {
+            pair: (Decimal(found[k]) if found.get(k) is not None else Decimal("0"))
+            for pair, k in keys.items()
+        }
+
+    async def apply_account_balance_deltas(self, deltas) -> Dict[str, bool]:
+        """``apply_account_balance_delta`` of each (address, delta), in order: what each
+        returned. One read of the accounts, then the writes together."""
+        from decimal import Decimal
+
+        from .crypto.account_id import to_account_id
+
+        steps = []
+        for addr, delta in deltas:
+            wei = int(Decimal(str(delta)) * Decimal(10**18))
+            steps.append((addr, wei, to_account_id(addr) if wei else None))
+        ids = sorted({i for _a, _w, i in steps if i})
+        for i in ids:
+            for listener in getattr(self, "account_write_listeners", ()):
+                listener(i)
+        rows: Dict[str, Any] = {}
+        for at in range(0, len(ids), self._BATCH):
+            part = ids[at : at + self._BATCH]
+            cur = await self.connection.execute(
+                "SELECT LOWER(address), balance FROM account_state WHERE LOWER(address) IN ("
+                + ",".join("?" * len(part))
+                + ")",
+                part,
+            )
+            for addr, bal in await cur.fetchall():
+                rows.setdefault(addr, int(bal or 0))
+        balance = dict(rows)  # id → its balance as the deltas leave it
+        created: set = set()
+        results: Dict[str, bool] = {}
+        for addr, wei, maybe_id in steps:
+            if not wei or maybe_id is None:
+                results[addr] = False
+                continue
+            i = maybe_id
+            if i in balance:
+                balance[i] = max(0, balance[i] + wei)  # (a debit clamps at 0)
+                results[addr] = True
+            elif wei > 0:
+                balance[i] = wei
+                created.add(i)
+                results[addr] = True
+            else:
+                results[addr] = False  # a debit on an account that does not exist
+        updates = [(str(balance[i]), i) for i in ids if i in balance and i not in created]
+        inserts = [(i, str(balance[i])) for i in ids if i in created]
+        if updates:
+            await self.connection.executemany(
+                "UPDATE account_state SET balance = ? WHERE LOWER(address) = LOWER(?)", updates
+            )
+        if inserts:
+            await self.connection.executemany(
+                "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, "
+                "is_contract) VALUES (?, ?, 0, 0, 0, 0)",
+                inserts,
+            )
+        return results
+
+    async def apply_token_balance_deltas(self, deltas) -> None:
+        """``apply_token_balance_delta`` of each ((holder, token), delta), in order. One read
+        of the balances, then the writes together."""
+        from decimal import Decimal
+
+        from .crypto.account_id import to_account_id
+
+        steps = []
+        for (holder, token), delta in deltas:
+            d = Decimal(str(delta))
+            if d != 0:
+                steps.append((token, to_account_id(holder), d))
+        if not steps:
+            return
+        current = await self.get_token_balances_of({(t, h) for t, h, _d in steps})
+        balance = dict(current)
+        for token, holder, d in steps:
+            cur_bal = balance[(token, holder)]
+            new_bal = cur_bal + d
+            if new_bal < 0:
+                logger.critical(
+                    "[TOKEN-OVERDRAFT] %s of token %s debited %s with %s: balance %s",
+                    holder,
+                    token,
+                    -d,
+                    cur_bal,
+                    new_bal,
+                )
+            balance[(token, holder)] = new_bal
+        touched = list(dict.fromkeys((t, h) for t, h, _d in steps))
+        await self.connection.executemany(
+            """INSERT INTO token_balances (token_address, holder_address, balance, updated_at)
+               VALUES (?, ?, ?, 0)
+               ON CONFLICT(token_address, holder_address) DO UPDATE SET balance = ?, updated_at = 0""",
+            [(t, h, str(balance[(t, h)]), str(balance[(t, h)])) for t, h in touched],
+        )
+
     async def apply_token_registry_op(self, op: dict) -> bool:
         """
         Mirror one native token's registry entry (a deploy, or a block that changed its
@@ -1646,12 +1817,14 @@ class DatabaseSQLite:
             return
         import json
 
-        for idx, item in enumerate(items):
-            await self.connection.execute(
-                "INSERT OR IGNORE INTO block_exchange_transactions "
-                "(block_hash, tx_index, tx_hash, tx_data) VALUES (?, ?, ?, ?)",
-                (block_hash, idx, item.get("tx_hash", ""), json.dumps(item, sort_keys=True)),
-            )
+        await self.connection.executemany(
+            "INSERT OR IGNORE INTO block_exchange_transactions "
+            "(block_hash, tx_index, tx_hash, tx_data) VALUES (?, ?, ?, ?)",
+            [
+                (block_hash, idx, item.get("tx_hash", ""), json.dumps(item, sort_keys=True))
+                for idx, item in enumerate(items)
+            ],
+        )
         await self.connection.commit()
 
     async def get_block_exchange_txs(self, block_hash: str) -> list:

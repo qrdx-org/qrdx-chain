@@ -1,5 +1,5 @@
 """
-Fork choice, resolved at once (qrdx/node/main.py resolve_fork_with_peer; qrdx/validator/ffg.py
+Fork choice, resolved at once (qrdx/node/fork_choice.py resolve_fork_with_peer; qrdx/validator/ffg.py
 prefer).
 
 Forks used to be repaired only by a pass every ~8 s, under two rules that disagreed (sync took
@@ -30,6 +30,11 @@ import pytest
 
 from qrdx.constants import SLOTS_PER_EPOCH as S
 from qrdx.node import main as node_main
+from qrdx.node import block_import
+from qrdx.node import chain_identity
+from qrdx.node import derived_state
+from qrdx.node import fork_choice
+from qrdx.node import sync as node_sync
 from qrdx.node.nodes_manager import NodesManager
 from qrdx.rpc.modules.p2p import blocks_for_transfer
 from qrdx.validator import ffg
@@ -85,10 +90,11 @@ async def setup(monkeypatch, keys):  # noqa: F811
         return True
 
     monkeypatch.setattr(node_main, "db", ours.db)
-    monkeypatch.setattr(node_main, "NodeInterface", _Peer)
-    monkeypatch.setattr(node_main, "process_and_create_block", apply)
-    monkeypatch.setattr(node_main, "_rebuild_derived_state_after_rollback", nothing)
-    monkeypatch.setattr(node_main, "_drop_if_incompatible", compatible)
+    monkeypatch.setattr(fork_choice, "NodeInterface", _Peer)
+    monkeypatch.setattr(node_sync, "NodeInterface", _Peer)
+    monkeypatch.setattr(block_import, "process_and_create_block", apply)
+    monkeypatch.setattr(derived_state, "_rebuild_derived_state_after_rollback", nothing)
+    monkeypatch.setattr(chain_identity, "_drop_if_incompatible", compatible)
     monkeypatch.setattr(NodesManager, "peers", {PEER: {"node_id": PEER, "url": "http://peer"}})
     monkeypatch.setattr(NodesManager, "sync", staticmethod(lambda: None))
     _Peer.chain = theirs
@@ -130,7 +136,7 @@ async def test_a_newer_justified_checkpoint_wins_over_a_longer_branch(setup):
     await theirs.epochs(2, 3, voters=[0, 1, 2], tag="T")
     for i in range(8):                                        # ours: longer, no votes
         await ours.block(2 * S + 1 + i, tag="O")
-    assert await node_main.resolve_fork_with_peer(PEER)
+    assert await fork_choice.resolve_fork_with_peer(PEER)
     assert await _tip(ours) == theirs.hashes[-1]
     assert (await update_finality(ours.db))["justified_epoch"] == 3
 
@@ -142,7 +148,7 @@ async def test_a_longer_branch_does_not_pull_a_node_off_a_newer_justified_checkp
     for i in range(8):
         await theirs.block(2 * S + 1 + i, tag="T")
     before = await _tip(ours)
-    assert not await node_main.resolve_fork_with_peer(PEER)
+    assert not await fork_choice.resolve_fork_with_peer(PEER)
     assert await _tip(ours) == before
 
 
@@ -155,7 +161,7 @@ async def test_votes_for_a_shared_checkpoint_do_not_beat_a_taller_branch(setup):
     for i in range(6):
         await ours.block(2 * S + 1 + i, tag="O")
     before = await _tip(ours)
-    assert not await node_main.resolve_fork_with_peer(PEER)
+    assert not await fork_choice.resolve_fork_with_peer(PEER)
     assert await _tip(ours) == before
 
 
@@ -167,7 +173,7 @@ async def test_a_node_carrying_the_votes_still_joins_a_taller_branch(setup):
     await ours.epochs(2, 2, voters=[0, 1, 2], tag="O")
     for i in range(6):
         await theirs.block(2 * S + 1 + i, tag="T")
-    assert await node_main.resolve_fork_with_peer(PEER)
+    assert await fork_choice.resolve_fork_with_peer(PEER)
     assert await _tip(ours) == theirs.hashes[-1]
 
 
@@ -185,7 +191,7 @@ async def test_with_equal_justification_the_taller_branch_wins(setup):
     await ours.block(2 * S + 1, tag="O")
     for i in range(3):
         await theirs.block(2 * S + 1 + i, tag="T")
-    assert await node_main.resolve_fork_with_peer(PEER)
+    assert await fork_choice.resolve_fork_with_peer(PEER)
     assert await _tip(ours) == theirs.hashes[-1]
 
 
@@ -194,7 +200,7 @@ async def test_at_equal_height_both_nodes_pick_the_lower_tip_hash(setup):
     await _common(ours, theirs, 1)
     a = await ours.block(2 * S + 1, tag="O")
     b = await theirs.block(2 * S + 1, tag="T")
-    moved = await node_main.resolve_fork_with_peer(PEER)
+    moved = await fork_choice.resolve_fork_with_peer(PEER)
     assert moved == (b < a)
     assert await _tip(ours) == min(a, b)
     # From the other side the same rule picks the same block.
@@ -208,7 +214,7 @@ async def test_a_branch_with_a_refused_block_is_undone_and_ours_restored(setup):
     mine = [await ours.block(2 * S + 1 + i, tag="O") for i in range(2)]
     theirs_new = [await theirs.block(2 * S + 1 + i, tag="T") for i in range(4)]
     refuse.add(theirs_new[2])
-    assert not await node_main.resolve_fork_with_peer(PEER)
+    assert not await fork_choice.resolve_fork_with_peer(PEER)
     h = await ours.db.get_next_block_id() - 1
     assert [(await ours.db.get_block_hashes(x, x))[x] for x in (h - 1, h)] == mine
 
@@ -220,7 +226,7 @@ async def test_never_below_the_finalized_checkpoint(setup):
     for i in range(30):                                        # theirs: a long branch from genesis
         await theirs.block(1 + i, tag="T")
     before = await _tip(ours)
-    assert not await node_main.resolve_fork_with_peer(PEER)
+    assert not await fork_choice.resolve_fork_with_peer(PEER)
     assert await _tip(ours) == before
 
 
@@ -235,16 +241,16 @@ async def test_a_block_arriving_mid_switch_waits_for_it(setup, monkeypatch):
 
     async def push():
         async with node_main.block_processing_lock:
-            return await node_main.process_and_create_block(echoed[0])
+            return await block_import.process_and_create_block(echoed[0])
 
     async def rebuild_and_receive_a_push():
         if not pushes:
             pushes.append(asyncio.create_task(push()))
             await asyncio.sleep(0)  # the push now waits on the block-processing lock
 
-    monkeypatch.setattr(node_main, "_rebuild_derived_state_after_rollback",
+    monkeypatch.setattr(derived_state, "_rebuild_derived_state_after_rollback",
                         rebuild_and_receive_a_push)
-    assert await node_main.resolve_fork_with_peer(PEER)
+    assert await fork_choice.resolve_fork_with_peer(PEER)
     assert await pushes[0] is False  # it ran after the switch, and no longer fits
     assert await _tip(ours) == theirs.hashes[-1] != mine
 
@@ -264,6 +270,6 @@ async def test_a_chain_that_moved_while_the_branch_was_scored_is_left_alone(setu
         return await fetch(self, start, limit)
 
     monkeypatch.setattr(_Peer, "get_blocks", get_blocks_while_ours_grows)
-    assert not await node_main.resolve_fork_with_peer(PEER)
+    assert not await fork_choice.resolve_fork_with_peer(PEER)
     assert len(ours.hashes) == n + 3
     assert await _tip(ours) == ours.hashes[-1]

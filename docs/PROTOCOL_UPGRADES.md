@@ -1,7 +1,7 @@
 # Protocol upgrades: chain specs, forks and network identity
 
 How a QRDX network defines its consensus rules, changes them after launch, and keeps nodes
-on different rules apart. Code: `qrdx/chain_spec.py`; startup checks in `qrdx/node/main.py`
+on different rules apart. Code: `qrdx/chain_spec.py`; startup checks in `qrdx/node/chain_identity.py`
 (`_verify_chain_identity`); genesis in `qrdx/validator/genesis.py` and `genesis_init.py`.
 
 Status (2026-10-09): implemented and tested, including signing-domain separation (§7) and

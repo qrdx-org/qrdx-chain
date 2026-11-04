@@ -140,7 +140,9 @@ async def test_component_2_consensus():
     
     sender = "0x1234567890123456789012345678901234567890"
     
-    tx1 = MockTransaction(sender=sender, to=None, value=0, data=bytecode)
+    # (Free gas: the sender holds nothing, and a transaction buys its gas limit up front —
+    # evm_conformance. The old charge after the message drove its balance negative.)
+    tx1 = MockTransaction(sender=sender, to=None, value=0, data=bytecode, gas_price=0)
     block = MockBlock([tx1])
     
     # Execute contracts in block

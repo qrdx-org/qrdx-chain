@@ -20,6 +20,7 @@ from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, ExchangeTransaction, encode_exchange_txs
 from qrdx.exchange import block_processor as BP
 from qrdx.node import main as node_main
+from qrdx.node import evm_runtime
 from eth_account import Account as EthAccount
 from eth_utils import to_checksum_address
 from test_evm_native_token_rebuild import ALICE, BOB, TS0, _add_block, _legacy, _transfer, _use
@@ -69,7 +70,7 @@ async def _apply(db, sm, mgr, h):
     evm = await db.get_block_evm_txs(bh)
     if evm:
         root, included = await produce_block_evm_section(h, bh, TS0 + h, evm, db, sm,
-                                                         node_main._evm_defer_execute())
+                                                         evm_runtime._evm_defer_execute())
         assert root is not None and len(included) == len(evm)
     await db.connection.commit()
 
@@ -209,7 +210,7 @@ async def test_a_reorg_cuts_the_index_and_reindexes(chain):
     await _add_block(db, 3, evm=[_pay(2, BOB, 10 ** 18)])   # (state is not rolled back here)
     bh = f"{3:064x}"
     await produce_block_evm_section(3, bh, TS0 + 3, await db.get_block_evm_txs(bh), db, sm,
-                                    node_main._evm_defer_execute())
+                                    evm_runtime._evm_defer_execute())
     await db.connection.commit()
     assert await tx_index.sync_index(db, mgr.journal) == 1
     assert _ops(await tx_index.history(db, BOB)) == [("evm", "TRANSFER", 3)]

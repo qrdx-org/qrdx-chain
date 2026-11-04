@@ -234,7 +234,7 @@ site that sets the others:
 
 | Path | Site |
 |---|---|
-| live-broadcast import | `node/main.py::_apply_exchange_section_on_import` |
+| live-broadcast import | `node/block_import.py::_apply_exchange_section_on_import` |
 | proposer | `validator/node_integration.py` |
 | reorg / rejected-block / startup rebuild | `derived_state_rebuild.py::rebuild_derived_state_interleaved` |
 | by-domain rebuild (A/B only) | `exchange/block_processor.py::rebuild_exchange_state_from_chain` |

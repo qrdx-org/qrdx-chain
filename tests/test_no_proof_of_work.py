@@ -79,9 +79,10 @@ async def test_the_inherited_rules_would_take_a_cheaply_mined_block_and_nothing_
 
 async def test_a_sync_peer_cannot_hand_over_a_block_without_a_proposer(pos_chain):
     from qrdx.node import main
+    from qrdx.node import block_import
 
     _db, tip = pos_chain
-    assert await main.process_and_create_block({"block": {"id": 513, "content": _mine(tip)}}) is False
+    assert await block_import.process_and_create_block({"block": {"id": 513, "content": _mine(tip)}}) is False
 
 
 def test_the_miners_endpoint_is_gone(monkeypatch):

@@ -132,6 +132,44 @@ def is_inclusion_checked(height: int) -> bool:
     return chain_spec.is_active(INCLUSION_FEATURE, int(height))
 
 
+async def _balances(db, holders: List[str]) -> Dict[str, Decimal]:
+    """Each holder's QRDX (account_state): one query a few hundred holders at a time
+    (``get_address_balances``), or one read each where the database has no batched read. A
+    holder whose read fails is left out, as before."""
+    if not holders:
+        return {}
+    if hasattr(db, "get_address_balances"):
+        try:
+            return {h: Decimal(b) for h, b in (await db.get_address_balances(holders)).items()}
+        except Exception as e:  # noqa: BLE001 — read them one at a time instead
+            logger.debug("batched balance read failed, reading one at a time: %s", e)
+    out: Dict[str, Decimal] = {}
+    for holder in holders:
+        try:
+            out[holder] = Decimal(await db.get_address_balance(holder))
+        except Exception as e:
+            logger.debug("balance of %s not read: %s", str(holder)[:20], e)
+    return out
+
+
+async def _token_balances(db, pairs: List[Tuple[str, str]]) -> Dict[Tuple[str, str], Decimal]:
+    """Each (token, holder)'s token balance, batched like ``_balances``."""
+    if not pairs:
+        return {}
+    if hasattr(db, "get_token_balances_of"):
+        try:
+            return dict(await db.get_token_balances_of(pairs))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("batched token balance read failed, reading one at a time: %s", e)
+    out: Dict[Tuple[str, str], Decimal] = {}
+    for token, holder in pairs:
+        try:
+            out[(token, holder)] = await db.get_token_balance(token, holder)
+        except Exception as e:
+            logger.debug("token balance (%s,%s) not read: %s", str(holder)[:16], token[:16], e)
+    return out
+
+
 async def includable_exchange_txs(
     db,
     txs: List[ExchangeTransaction],
@@ -153,11 +191,8 @@ async def includable_exchange_txs(
     if not txs:
         return [], []
     apply_enforcement(mgr)
-    balances: Dict[str, Decimal] = {}
-    for tx in txs:
-        for holder in dict.fromkeys((tx.sender, mgr.fee_payer(tx))):
-            if holder not in balances:
-                balances[holder] = Decimal(await db.get_address_balance(holder))
+    holders = list(dict.fromkeys(h for tx in txs for h in (tx.sender, mgr.fee_payer(tx))))
+    balances = await _balances(db, holders)
     errors = mgr.section_errors(txs, int(height), float(timestamp), balances.get, base_fee)
     if not errors:
         return list(txs), []
@@ -237,21 +272,17 @@ async def preload_sender_balances(
             logger.warning("exchange base fee unread for block %s: %s", height, e)
     # The exchange actions EVM contracts sent run first (process_exchange_transactions).
     txs = mgr.evm_action_txs() + list(txs or [])
-    seen = set()
+    seen: Dict[str, None] = {}
     for tx in txs:
         sender = getattr(tx, "sender", None)
         if not sender:
             continue
         # The sender's, and whoever pays its gas (a user vault's leader: ``fee_payer``).
         payer = mgr.fee_payer(tx) if isinstance(tx, ExchangeTransaction) else sender
-        for holder in dict.fromkeys((sender, payer)):
-            if holder in seen:
-                continue
-            seen.add(holder)
-            try:
-                mgr.set_available_balance(holder, await db.get_address_balance(holder))
-            except Exception as e:
-                logger.debug("preload_sender_balances: %s for %s", e, str(holder)[:20])
+        for holder in (sender, payer):
+            seen.setdefault(holder)
+    for holder, balance in (await _balances(db, list(seen))).items():
+        mgr.set_available_balance(holder, balance)
     # A governance system_spend debits a system wallet, not its sender: pre-load that wallet's
     # balance too, under the key the execution debits (the wallet's lowercase address).
     for tx in txs or []:
@@ -267,7 +298,7 @@ async def preload_sender_balances(
         wallet = proposal.params["wallet"]
         if wallet in seen:
             continue
-        seen.add(wallet)
+        seen[wallet] = None
         try:
             mgr.set_available_balance(wallet, await db.get_address_balance(wallet))
         except Exception as e:
@@ -431,18 +462,16 @@ async def preload_token_balances(
                         wanted.add((escrow, tok))
     from .tokens import is_native_asset
 
-    for holder, token in sorted(wanted):
-        try:
-            if is_native_asset(token):  # native QRDX: the account balance
-                mgr.set_available_balance(holder, await db.get_address_balance(holder))
-                continue
-            mgr.set_available_token_balance(
-                holder, token, await db.get_token_balance(token, holder)
-            )
-        except Exception as e:
-            logger.debug(
-                "preload_token_balances: %s for (%s,%s)", e, str(holder)[:16], str(token)[:16]
-            )
+    ordered = sorted(wanted)
+    native = [holder for holder, token in ordered if is_native_asset(token)]
+    native_balances = await _balances(db, native)
+    tokens = await _token_balances(db, [(t, h) for h, t in ordered if not is_native_asset(t)])
+    for holder, token in ordered:
+        if is_native_asset(token):  # native QRDX: the account balance
+            if holder in native_balances:
+                mgr.set_available_balance(holder, native_balances[holder])
+        elif (token, holder) in tokens:
+            mgr.set_available_token_balance(holder, token, tokens[(token, holder)])
 
 
 async def flush_exchange_balance_deltas(
@@ -474,6 +503,22 @@ async def flush_exchange_balance_deltas(
             len(deltas),
             {a[:12]: str(d) for a, d in deltas.items()},
         )
+        return
+    applied_all = None
+    if hasattr(db, "apply_account_balance_deltas"):
+        try:
+            applied_all = await db.apply_account_balance_deltas(list(deltas.items()))
+        except ValueError as e:  # an address no account id is made from: one at a time
+            logger.debug("batched balance flush refused, applying one at a time: %s", e)
+    if applied_all is not None:
+        for addr, delta in deltas.items():
+            if not applied_all.get(addr) and delta < 0:
+                logger.error(
+                    "[VALUE-LOST] flush_exchange_balance_deltas: debit of %s on %s "
+                    "found no account_state row",
+                    delta,
+                    str(addr)[:24],
+                )
         return
     for addr, delta in deltas.items():
         try:
@@ -528,6 +573,12 @@ async def flush_token_balance_deltas(
             await db.apply_token_registry_op(op)
         except Exception as e:
             logger.warning("flush_token: registry %s for %s", e, str(op.get("token_address"))[:20])
+    if hasattr(db, "apply_token_balance_deltas"):
+        try:
+            await db.apply_token_balance_deltas(list(deltas.items()))
+            return
+        except ValueError as e:  # a holder no account id is made from: one at a time
+            logger.debug("batched token flush refused, applying one at a time: %s", e)
     for (holder, token), delta in deltas.items():
         try:
             await db.apply_token_balance_delta(token, holder, delta)
@@ -615,7 +666,15 @@ def verify_exchange_tx(tx: ExchangeTransaction) -> Tuple[bool, str]:
 
     Returns:
         (ok, error). ``error`` is empty on success.
+
+    A transaction that passed is not checked again: every check here is a property of the
+    transaction alone, so the verdict is remembered on it, with the exact bytes it was reached
+    for: the signed payload, the signature and the key. Change any of them and it is checked
+    afresh. A node checked each transaction when its mempool admitted it and again when a block
+    carried it.
     """
+    if is_verified(tx):
+        return True, ""
     try:
         tx.validate_basic()
     except ValueError as e:
@@ -630,12 +689,110 @@ def verify_exchange_tx(tx: ExchangeTransaction) -> Tuple[bool, str]:
         return False, f"gas limit {tx.gas_limit} does not cover {need} (its signatures included)"
     if not tx.verify():
         return False, "signature verification failed (bad signature or sender mismatch)"
+    tx.__dict__["_verified"] = _verified_form(tx)
     return True, ""
+
+
+def _verified_form(tx: ExchangeTransaction) -> Tuple[Any, ...]:
+    return (tx._canonical_bytes(), tx.signature, tx.public_key, tx.chain_id)
+
+
+def is_verified(tx: ExchangeTransaction) -> bool:
+    """Whether ``verify_exchange_tx`` has passed this transaction, as it is now."""
+    passed = tx.__dict__.get("_verified")
+    if passed is None:
+        return False
+    try:
+        return bool(passed == _verified_form(tx))
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
 # Block-level exchange processing
 # ---------------------------------------------------------------------------
+
+
+# A section this large is verified on threads (``verify_exchange_txs``): liboqs checks a
+# signature in C without Python's lock, so the checks run side by side and the event loop stays
+# free meanwhile. Smaller ones are not worth the hand-off.
+PARALLEL_VERIFY_MIN = 64
+_verify_pool = None
+
+
+def _pool():
+    global _verify_pool
+    if _verify_pool is None:
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+
+        workers = int(os.environ.get("QRDX_VERIFY_THREADS") or min(8, os.cpu_count() or 2))
+        _verify_pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="verify")
+    return _verify_pool
+
+
+def _verify_chunk(txs: List[ExchangeTransaction]) -> List[Tuple[bool, str]]:
+    return [verify_exchange_tx(tx) for tx in txs]
+
+
+async def _verify_natively(txs: List[ExchangeTransaction]) -> List[Tuple[bool, str]]:
+    """``verify_exchange_tx`` of each, with every ML-DSA-65 signature among them checked first in
+    one batch by the native module, on its threads and off the event loop. The checks are the
+    Python ones; only the signature verdicts come from the batch (the same liboqs)."""
+    import asyncio
+
+    from .. import native
+    from ..crypto import multisig_wire
+    from ..crypto.pq import dilithium
+
+    items = [
+        (bytes(tx.public_key), tx.signing_bytes(), bytes(tx.signature))
+        for tx in txs
+        if tx.public_key
+        and tx.signature
+        and len(tx.public_key) == dilithium.PUBLIC_KEY_SIZE
+        and not multisig_wire.is_multisig_material(tx.public_key)
+    ]
+    verdicts = await asyncio.get_running_loop().run_in_executor(
+        None, native.mldsa65_verify_batch, items
+    )
+    if verdicts is None:
+        return _verify_chunk(txs)
+    with dilithium.precomputed(dict(zip(items, verdicts, strict=True))):
+        return _verify_chunk(txs)
+
+
+async def verify_exchange_txs(txs: List[ExchangeTransaction]) -> List[Tuple[bool, str]]:
+    """``verify_exchange_tx`` of each transaction, in order — on the verification threads when
+    there are many (docs/PERFORMANCE.md). The verdicts are the same as one at a time."""
+    todo = [i for i, tx in enumerate(txs) if not is_verified(tx)]
+    if len(todo) < len(txs):  # (those already passed: only the rest go to the threads)
+        verdicts: List[Tuple[bool, str]] = [(True, "")] * len(txs)
+        if todo:
+            for i, verdict in zip(
+                todo, await verify_exchange_txs([txs[i] for i in todo]), strict=True
+            ):
+                verdicts[i] = verdict
+        return verdicts
+    from .. import native
+
+    if native.AVAILABLE and len(txs) >= native.BATCH_MIN:
+        return await _verify_natively(txs)
+    if len(txs) < PARALLEL_VERIFY_MIN:
+        return _verify_chunk(txs)
+    import asyncio
+
+    pool = _pool()
+    workers = pool._max_workers
+    size = max(16, -(-len(txs) // workers))
+    loop = asyncio.get_running_loop()
+    parts = await asyncio.gather(
+        *[
+            loop.run_in_executor(pool, _verify_chunk, txs[at : at + size])
+            for at in range(0, len(txs), size)
+        ]
+    )
+    return [verdict for part in parts for verdict in part]
 
 
 def process_exchange_transactions(
@@ -935,9 +1092,10 @@ async def rebuild_exchange_state_from_chain(
 def apply_block_exchange_section(
     block_height: int,
     block_timestamp: float,
-    section_items: Optional[List[Dict[str, Any]]],
+    section_items: Optional[List[Any]],  # (wire dicts, or transactions already decoded)
     declared_state_root: Optional[str],
     state_manager: Optional[ExchangeStateManager] = None,
+    verified: bool = False,
 ) -> Tuple[bool, str]:
     """
     Securely validate and apply a block's exchange section on import (Phase D3).
@@ -971,12 +1129,15 @@ def apply_block_exchange_section(
 
     mgr = state_manager or ExchangeStateManager.get_instance()
 
-    # 1. Authenticate every tx before mutating any state.
+    # 1. Authenticate every tx before mutating any state (``verified``: the caller just did,
+    #    on these very items — main._apply_exchange_section_on_import — and checking each
+    #    signature twice was a third of an import's work).
     txs = decode_exchange_txs(section_items)
-    for i, tx in enumerate(txs):
-        ok, err = verify_exchange_tx(tx)
-        if not ok:
-            return False, f"exchange tx {i} in block {block_height} failed verification: {err}"
+    if not verified:
+        for i, tx in enumerate(txs):
+            ok, err = verify_exchange_tx(tx)
+            if not ok:
+                return False, f"exchange tx {i} in block {block_height} failed verification: {err}"
 
     # 2–4. Execute (snapshots internally), compare, revert on mismatch.
     success, error, computed_root = process_exchange_transactions(
@@ -1160,15 +1321,19 @@ def encode_exchange_txs(txs: List[ExchangeTransaction]) -> List[Dict[str, Any]]:
     return [tx.to_dict() for tx in txs]
 
 
-def decode_exchange_txs(items: Optional[List[Dict[str, Any]]]) -> List[ExchangeTransaction]:
+def decode_exchange_txs(items: Optional[List[Any]]) -> List[ExchangeTransaction]:
     """
     Decode the block-body exchange section back into transactions.
 
-    Backward compatible: a missing/empty section yields an empty list.
+    Backward compatible: a missing/empty section yields an empty list. A transaction already
+    decoded passes through (the import path decodes a section once; a compact block's come from
+    the mempool, docs/PERFORMANCE.md).
     """
     if not items:
         return []
-    return [ExchangeTransaction.from_dict(d) for d in items]
+    return [
+        d if isinstance(d, ExchangeTransaction) else ExchangeTransaction.from_dict(d) for d in items
+    ]
 
 
 def exchange_txs_canonical_bytes(txs: List[ExchangeTransaction]) -> bytes:

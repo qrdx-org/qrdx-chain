@@ -153,12 +153,15 @@ def test_every_path_ticks_blocks_without_exchange_transactions():
     from qrdx import derived_state_rebuild
     from qrdx.exchange import block_processor as BP
     from qrdx.node import main as node_main
+    from qrdx.node import block_import
     from qrdx.rpc.modules import p2p
     from qrdx.validator import node_integration as NI
 
-    main_src = inspect.getsource(node_main)
+    from node_source import node_source
+
+    main_src = node_source()
     assert main_src.count("_exchange_tick_on_import(") >= 3      # def + sync + REST
-    assert "tick_and_flush(" in inspect.getsource(node_main._exchange_tick_on_import)
+    assert "tick_and_flush(" in inspect.getsource(block_import._exchange_tick_on_import)
     # Every path ticks through tick_and_flush: the tick, then its ledger moves flushed (a fired
     # spot trigger or a TWAP slice settles real tokens in the tick).
     assert "tick_and_flush(" in inspect.getsource(p2p)

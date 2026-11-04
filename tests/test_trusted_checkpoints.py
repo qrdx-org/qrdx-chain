@@ -14,6 +14,8 @@ import pytest
 from qrdx import chain_spec as cs
 from qrdx import checkpoints as CP
 from qrdx.node import main as node_main
+from qrdx.node import block_import
+from qrdx.node import fork_choice
 
 from test_finality_compute import Chain, keys  # noqa: F401  (keys: the module fixture)
 from test_fork_resolution import PEER, copy_blocks, setup  # noqa: F401  (the fixture)
@@ -69,10 +71,10 @@ async def test_no_reorganization_goes_below_a_checkpoint_the_node_holds(setup, m
     monkeypatch.setenv(CP.ENV, f"{fork + 1}:{ours.hashes[fork + 1]}")   # ours, above the fork
     before = ours.hashes[-1]
     assert await CP.reorg_floor(ours.db) == fork + 1
-    assert not await node_main.resolve_fork_with_peer(PEER)
+    assert not await fork_choice.resolve_fork_with_peer(PEER)
     assert (await ours.db.get_block_hashes(ours.height, ours.height))[ours.height] == before
     monkeypatch.delenv(CP.ENV)                                        # without it: followed
-    assert await node_main.resolve_fork_with_peer(PEER)
+    assert await fork_choice.resolve_fork_with_peer(PEER)
 
 
 async def test_every_import_path_refuses_a_block_off_the_trusted_chain(monkeypatch):
@@ -85,7 +87,7 @@ async def test_every_import_path_refuses_a_block_off_the_trusted_chain(monkeypat
     block["body_root"] = body_root(block)
     own = reconstruct_signing_root(block).hex()
     monkeypatch.setenv(CP.ENV, f"7:{'cd' * 32}")
-    ok, err = await node_main._verify_chain_rules(repr(block), 7, None, None, own)
+    ok, err = await block_import._verify_chain_rules(repr(block), 7, None, None, own)
     assert not ok and "not the trusted checkpoint" in err
 
 

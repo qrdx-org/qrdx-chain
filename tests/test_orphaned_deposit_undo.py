@@ -37,7 +37,8 @@ async def _logged(db):
 
 def test_the_gate_is_on():
     from qrdx.node import main
-    assert main._ENFORCE_DEPOSIT_REORG_UNDO is True
+    from qrdx.node import derived_state
+    assert derived_state._ENFORCE_DEPOSIT_REORG_UNDO is True
 
 
 async def test_an_orphaned_deposit_leaves_no_log_and_one_below_the_tip_survives():
@@ -82,6 +83,7 @@ async def test_the_real_rollback_hook_drops_orphaned_deposits():
     """``_rebuild_derived_state_after_rollback`` — what every reorg calls after removing the
     blocks — drops the log of the rolled-back heights, deriving the tip from the chain."""
     from qrdx.node import main as node_main
+    from qrdx.node import derived_state
 
     db = await _db()
     try:
@@ -97,7 +99,7 @@ async def test_the_real_rollback_hook_drops_orphaned_deposits():
         original_db, original_sm = node_main.db, node_main.EVM_STATE_MANAGER
         node_main.db, node_main.EVM_STATE_MANAGER = db, None
         try:
-            await node_main._rebuild_derived_state_after_rollback()
+            await derived_state._rebuild_derived_state_after_rollback()
         finally:
             node_main.db, node_main.EVM_STATE_MANAGER = original_db, original_sm
         assert [r[1] for r in await _logged(db)] == [survivor]

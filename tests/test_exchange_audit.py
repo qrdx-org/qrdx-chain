@@ -218,6 +218,7 @@ async def test_a_block_without_an_exchange_root_cannot_carry_forged_transactions
     from qrdx.database_sqlite import DatabaseSQLite
     from qrdx.exchange import block_processor as BP, encode_exchange_txs
     from qrdx.node import main as node_main
+    from qrdx.node import block_import
 
     victim_key = PQPrivateKey.generate()
     victim = victim_key.public_key.to_address()
@@ -254,7 +255,7 @@ async def test_a_block_without_an_exchange_root_cannot_carry_forged_transactions
                                      params={"token_address": token, "to": thief,
                                              "amount": "1000"},
                                      gas_limit=2_000_000, gas_price=10**9)  # never signed
-        ok, err = await node_main._apply_exchange_section_on_import(
+        ok, err = await block_import._apply_exchange_section_on_import(
             2, float(T + 2), encode_exchange_txs([forged]), None)
         assert not ok and "failed verification" in err
         assert await db.get_token_balance(token, thief) == 0

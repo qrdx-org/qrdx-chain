@@ -307,16 +307,16 @@ def test_the_proposer_applies_withdrawals_before_computing_the_root():
 
 
 def test_the_sync_import_path_applies_withdrawals_before_e_d4():
-    from qrdx.node import main
-    src = source_of(main)
+    from node_source import normalized_node_source
+    src = normalized_node_source()
     sync = src[src.index('logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {verr_evm}")'):]
     assert _between(sync, "Rejecting PoS block", "_apply_block_withdrawals_on_import(",
                     "_verify_unified_state_root(")
 
 
 def test_the_rest_import_path_applies_withdrawals_before_e_d4():
-    from qrdx.node import main
-    src = source_of(main)
+    from node_source import normalized_node_source
+    src = normalized_node_source()
     rest = src[src.index("return {'ok': False, 'error': f'Invalid EVM section: {verr_evm}'}"):]
     assert _between(rest, "Invalid EVM section", "_apply_block_withdrawals_on_import(",
                     "_verify_unified_state_root(block_content, height=block_no)")
@@ -337,13 +337,14 @@ def test_exits_are_logged_with_their_carrying_block():
 
 def test_the_rollback_rebuild_restores_the_ledger():
     from qrdx.node import main
-    src = source_of(main._rebuild_derived_state_after_rollback)
+    from qrdx.node import derived_state
+    src = source_of(derived_state._rebuild_derived_state_after_rollback)
     # Orphaned rows must be trimmed BEFORE the rebuild, which re-credits every row left.
     assert "undo_withdrawal_logs_above(" in src and "rebuild_to_tip(" in src
     assert src.index("undo_withdrawal_logs_above(") < src.index("rebuild_to_tip(")
     # The A/B-only by-domain path re-credits after its account_state rebuild, or the
     # re-credit would be wiped by it.
-    old = source_of(main._rebuild_derived_state_by_domain)
+    old = source_of(derived_state._rebuild_derived_state_by_domain)
     assert old.index("rebuild_account_state_from_chain") < old.index("reapply_withdrawal_ledger(")
 
 

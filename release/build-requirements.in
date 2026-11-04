@@ -3,3 +3,5 @@
 # instead of letting pip fetch whatever is newest into an isolated build environment.
 setuptools
 wheel
+# The native module's build backend (native/qrdx-native; docs/NATIVE.md).
+maturin==1.7.4

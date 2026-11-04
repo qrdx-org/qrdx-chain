@@ -1,6 +1,7 @@
 # denaro/node/nodes_manager.py
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import os
@@ -8,11 +9,12 @@ import socket
 import time
 from os.path import dirname, exists
 from random import sample
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse
 
 import httpx
 
+from .. import fastjson
 from ..constants import (
     ACTIVE_NODES_DELTA,
     BOOTSTRAP_NODES,
@@ -32,6 +34,27 @@ path = dirname(os.path.realpath(__file__)) + "/nodes.json"
 # A peer's last_seen changes on every request it makes; the peer store on disk only needs it
 # for a restart, measured against a 7-day window (ACTIVE_NODES_DELTA).
 LAST_SEEN_PERSIST_INTERVAL = 60
+
+# The peer table's rules (NodesManager.admit_peer): peers from one network group, and the
+# longest-connected peers no newcomer displaces.
+PEERS_PER_GROUP = int(os.environ.get("QRDX_PEERS_PER_SUBNET", "4"))
+PROTECTED_LONGEST = 8
+
+
+def network_group(host: Optional[str]) -> Optional[str]:
+    """The network a peer's address belongs to, for the peer table's diversity rule: an IPv4
+    /24 or an IPv6 /48; a hostname is its own group; None for loopback (a node's own machine,
+    as a local testnet's peers are) and for no address at all."""
+    if not host:
+        return None
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return "host:" + host.lower()
+    if ip.is_loopback:
+        return None
+    prefix = 24 if ip.version == 4 else 48
+    return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
 
 
 class NodesManager:
@@ -322,35 +345,114 @@ class NodesManager:
     def add_or_update_peer(
         node_id: str, pubkey: str, url: str | None, is_public: bool, at_schema: str = ""
     ):
-        """
-        Adds a new peer or updates an existing one's information.
+        """A peer this node dialed and handshook (``admit_peer``, outbound). Returns True if it
+        is new."""
+        return NodesManager.admit_peer(
+            node_id, pubkey, url, is_public, at_schema=at_schema, outbound=True
+        )
 
-        Args:
-            node_id: Peer's node ID (qx…)
-            pubkey: Peer's Dilithium public key (hex)
-            url: Peer's HTTP URL for API connection
-            is_public: Whether the peer is publicly reachable
-            at_schema: Peer's @-schema address (optional)
-        """
+    @staticmethod
+    def admit_peer(
+        node_id: str,
+        pubkey: str,
+        url: str | None,
+        is_public: bool,
+        *,
+        at_schema: str = "",
+        outbound: bool = False,
+        source_ip: Optional[str] = None,
+        validator: Optional[str] = None,
+    ) -> bool:
+        """Admit a peer that proved its key in a handshake (docs/KNOWN_ISSUES.md, "Anyone could
+        fill a node's peer table"), under the peer table's rules:
+
+        * at most ``PEERS_PER_GROUP`` peers from one network group (an IPv4 /24, an IPv6 /48;
+          loopback exempt), so one machine or one subnet cannot hold the table;
+        * when the table is full, a newcomer takes the place of an inbound peer from the most
+          crowded group (``_eviction_candidate``). Validators, peers this node dialed itself and
+          the longest-connected are never displaced;
+        * a peer that proved it runs a validator (``validator``: its address, proven by the
+          validator's own key — p2p_handshakeResponse) is exempt from both limits.
+
+        A peer used to be admitted by any signed request that named this chain's genesis, up
+        to the limit, and once the table was full nobody else was: whoever filled it first held
+        it. Returns True if the peer is new."""
         if node_id == NodesManager.self_id:
             return False
-
-        is_new = node_id not in NodesManager.peers
-        if is_new and len(NodesManager.peers) >= MAX_PEERS_COUNT:
-            logger.warning(f"Peer limit reached ({MAX_PEERS_COUNT}), new peer will not be added.")
-            return False
-
+        now = int(time.time())
         url_to_store = url.strip("/") if url else None
-
+        host = source_ip or (urlparse(url_to_store).hostname if url_to_store else None)
+        existing = NodesManager.peers.get(node_id)
+        if existing is not None:
+            existing.update(
+                {
+                    "pubkey": pubkey or existing.get("pubkey"),
+                    "url": url_to_store or existing.get("url"),
+                    "at_schema": at_schema or existing.get("at_schema", ""),
+                    "last_seen": now,
+                    "is_public": is_public,
+                    "outbound": bool(existing.get("outbound")) or outbound,
+                    "validator": validator or existing.get("validator"),
+                }
+            )
+            NodesManager.sync()
+            return False
+        group = network_group(host)
+        if not validator and group is not None:
+            crowd = [
+                p
+                for p in NodesManager.peers.values()
+                if p.get("group") == group and not p.get("validator")
+            ]
+            if len(crowd) >= PEERS_PER_GROUP:
+                logger.info(
+                    "Not adding peer %s: %d peers already from %s", node_id, len(crowd), group
+                )
+                return False
+        if len(NodesManager.peers) >= MAX_PEERS_COUNT:
+            victim = NodesManager._eviction_candidate()
+            if victim is None:
+                logger.warning(
+                    f"Peer limit reached ({MAX_PEERS_COUNT}) and no peer may be displaced: "
+                    f"{node_id} not added"
+                )
+                return False
+            logger.info("Peer table full: %s takes the place of %s", node_id, victim)
+            del NodesManager.peers[victim]
         NodesManager.peers[node_id] = {
             "pubkey": pubkey,
             "url": url_to_store,
             "at_schema": at_schema,
-            "last_seen": int(time.time()),
+            "last_seen": now,
             "is_public": is_public,
+            "added_at": now,
+            "group": group,
+            "outbound": outbound,
+            "validator": validator,
         }
         NodesManager.sync()
-        return is_new
+        return True
+
+    @staticmethod
+    def _eviction_candidate() -> Optional[str]:
+        """The peer a newcomer displaces from a full table, or None: an inbound peer that is not
+        a validator, not among the PROTECTED_LONGEST longest-connected, from the most crowded
+        network group — its most recent arrival (Bitcoin Core's rule, simplified)."""
+        peers = NodesManager.peers
+        by_age = sorted(peers, key=lambda n: (peers[n].get("added_at") or 0, n))
+        protected = set(by_age[:PROTECTED_LONGEST])
+        candidates = [
+            n
+            for n in peers
+            if n not in protected and not peers[n].get("outbound") and not peers[n].get("validator")
+        ]
+        if not candidates:
+            return None
+        groups: dict = {}
+        for n in candidates:
+            groups.setdefault(peers[n].get("group") or n, []).append(n)
+        crowded = max(groups.values(), key=lambda members: (len(members), sorted(members)))
+        return max(crowded, key=lambda n: (peers[n].get("added_at") or 0, n))
 
     @staticmethod
     def update_peer_last_seen(node_id: str):
@@ -447,6 +549,9 @@ class NodeInterface:
     # async () -> this node's network identity (chain spec, genesis, fork id); set by
     # main.startup. Sent with every handshake so the remote can refuse another network.
     network_identity_provider = None
+    # () -> ``{address, signature}`` or None: this node's validator vouching for it (set by
+    # main.startup when it runs one), sent with every handshake (p2p_handshakeResponse).
+    validator_proof_provider = None
 
     def __init__(self, url: str, client: httpx.AsyncClient, db):
         self.url = url.strip("/")
@@ -482,7 +587,7 @@ class NodeInterface:
         rpc_url = f"{self.url}/rpc"
         # Signed by this node, over these exact bytes: the receiver attributes the call to us
         # and refuses a peer-only method (a block, a transaction, a handshake) without it.
-        body = json.dumps(payload, separators=(",", ":"))
+        body = fastjson.dumps(payload)
         headers = {"Content-Type": "application/json"}
         try:
             headers.update(await self._identity_headers(body))
@@ -494,7 +599,7 @@ class NodeInterface:
             elapsed = time.time() - start_time
             logger.debug(f"RPC {method} → {self.url} [{response.status_code}] ({elapsed:.3f}s)")
             response.raise_for_status()
-            return response.json()
+            return fastjson.loads(response.content)
         except httpx.RequestError as exc:
             elapsed = time.time() - start_time
             logger.warning(f"RPC {method} → {self.url} NETWORK_ERROR ({elapsed:.3f}s)")
@@ -503,6 +608,71 @@ class NodeInterface:
             elapsed = time.time() - start_time
             logger.warning(f"RPC {method} → {self.url} ERROR ({elapsed:.3f}s): {exc}")
             return None
+
+    @staticmethod
+    async def prepare_rpc(method: str, params: Any) -> Tuple[str, dict]:
+        """One JSON-RPC request, encoded and signed once, for ``post_prepared`` to send to any
+        number of peers: a block is a megabyte to encode, and its signature is valid for every
+        receiver (each sees its nonce once)."""
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": NodeInterface._next_id(),
+        }
+        body = fastjson.dumps(payload)
+        headers = {"Content-Type": "application/json"}
+        try:
+            headers.update(await NodeInterface._identity_headers(body))
+        except RuntimeError:
+            pass
+        return body, headers
+
+    async def post_prepared(self, prepared: Tuple[str, dict]) -> Optional[dict]:
+        """Send a ``prepare_rpc`` request; its result in the ``{ok, result}`` shape."""
+        body, headers = prepared
+        try:
+            response = await self.client.post(f"{self.url}/rpc", content=body, headers=headers)
+            response.raise_for_status()
+            return self._unwrap(fastjson.loads(response.content))
+        except (json.JSONDecodeError, httpx.HTTPStatusError) as exc:
+            logger.warning(f"RPC → {self.url} ERROR: {exc}")
+            return None
+
+    @staticmethod
+    async def prepare_batch(calls: List[Tuple[str, Any]]) -> Tuple[str, dict]:
+        """A JSON-RPC batch, encoded and signed once, for ``post_prepared_batch`` to send to any
+        number of peers (gossip sends each peer the same transactions)."""
+        payload = [
+            {"jsonrpc": "2.0", "method": method, "params": params, "id": NodeInterface._next_id()}
+            for method, params in calls
+        ]
+        body = fastjson.dumps(payload)
+        headers = {"Content-Type": "application/json"}
+        try:
+            headers.update(await NodeInterface._identity_headers(body))
+        except RuntimeError:
+            pass
+        return body, headers
+
+    async def _rpc_batch(self, calls: List[Tuple[str, Any]]) -> Optional[List[Any]]:
+        """Several JSON-RPC calls in one signed request (a JSON-RPC batch): the responses, or
+        None on a network or parse failure. One signature and one round trip for all of them —
+        what transaction gossip sends, a batch at a time."""
+        return await self.post_prepared_batch(await self.prepare_batch(calls))
+
+    async def post_prepared_batch(self, prepared: Tuple[str, dict]) -> Optional[List[Any]]:
+        """Send a ``prepare_batch`` request: the responses, or None on a network or parse
+        failure."""
+        body, headers = prepared
+        try:
+            response = await self.client.post(f"{self.url}/rpc", content=body, headers=headers)
+            response.raise_for_status()
+            out = fastjson.loads(response.content)
+        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError) as exc:
+            logger.debug("RPC batch → %s failed: %s", self.url, exc)
+            return None
+        return out if isinstance(out, list) else [out]
 
     def _unwrap(self, rpc_resp: Optional[dict]) -> Optional[dict]:
         """
@@ -562,16 +732,22 @@ class NodeInterface:
         )
         return result
 
-    async def _identity_headers(
-        self, body: str, signed_headers_data: Optional[dict] = None
-    ) -> dict:
+    @staticmethod
+    async def _identity_headers(body: str, signed_headers_data: Optional[dict] = None) -> dict:
         """Headers that sign ``body`` (the exact bytes sent) as this node: its id, public key,
         a Dilithium signature over {body, timestamp, nonce, x-denaro-* values} and that
         timestamp and nonce (the receiver refuses stale or replayed ones). Raises RuntimeError
         when this process has no node identity."""
         current_time = int(time.time())
         nonce = os.urandom(16).hex()
-        payload_to_sign: dict = {"body": body, "timestamp": current_time, "nonce": nonce}
+        # The body's hash is signed, not the body (the receiver hashes what it received): a
+        # block's body is a megabyte, and canonicalizing it to sign cost as much as sending it.
+        raw = body.encode("utf-8") if isinstance(body, str) else bytes(body)
+        payload_to_sign: dict = {
+            "body_sha256": hashlib.sha256(raw).hexdigest(),
+            "timestamp": current_time,
+            "nonce": nonce,
+        }
         # Name our genesis block (signed, as x-denaro-genesis): the receiver adds an unknown
         # caller as a peer only if it is on the same chain.
         if NodeInterface.network_identity_provider is not None:
@@ -593,6 +769,7 @@ class NodeInterface:
             "x-signature": signature,
             "x-timestamp": str(current_time),
             "x-nonce": nonce,
+            "x-body-hash": "sha256",
         }
         for key, value in (signed_headers_data or {}).items():
             headers[f"x-denaro-{key}"] = str(value)
@@ -685,10 +862,17 @@ class NodeInterface:
         network = None
         if NodeInterface.network_identity_provider is not None:
             network = await NodeInterface.network_identity_provider()
-        resp = await self._rpc_call(
-            "p2p_handshakeResponse",
-            [challenge, current_height, last_block_hash, network],
-        )
+        params = [challenge, current_height, last_block_hash, network]
+        if NodeInterface.validator_proof_provider is not None:
+            # A validator's node proves it, so the peer keeps its place (NodesManager.admit_peer).
+            try:
+                proof = NodeInterface.validator_proof_provider()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("no validator proof for the handshake: %s", e)
+                proof = None
+            if proof:
+                params.append(proof)
+        resp = await self._rpc_call("p2p_handshakeResponse", params)
         return self._unwrap(resp)
 
     async def check_peer_reachability(self, url_to_check: str) -> bool:

@@ -325,6 +325,11 @@ The QEVM is Ethereum's Shanghai EVM with QRDX's state and precompiles:
 * **The exchange** has its own gas, base fee (floor 0.1 gwei) and per-block budget.
 * **Up-front check.** Before running a transaction, the chain checks that its payer can cover all
   its gas at its highest price. One that cannot runs nothing.
+* **Ethereum's gas rules** (`evm_conformance`). A transaction's intrinsic gas comes out of its gas
+  limit and is paid on top of what it executes. The payer buys the limit up front and gets back
+  the unused part with EIP-3529's refund. The sender and recipient start warm. Ethereum's
+  Shanghai state tests run against the QEVM in CI; 1,460 of 1,469 agree, and the rest differ
+  on purpose (docs/EVM_CONFORMANCE.md).
 
 ---
 
@@ -482,7 +487,9 @@ decisions (docs/TOKENOMICS.md).
   * deterministic rebuild-equals-forward checks;
   * a rollback audit of every exchange operation;
   * known-answer tests of the cryptography;
-  * an equivalence suite of the EVM against a reference world.
+  * an equivalence suite of the EVM against a reference world;
+  * Ethereum's Shanghai state tests, run against the QEVM;
+  * fuzzing of every decoder that peers and users reach.
 * Live multi-node runs on a 4-node network, covering:
   * finality;
   * slashing evidence;

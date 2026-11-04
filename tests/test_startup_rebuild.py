@@ -23,6 +23,7 @@ from qrdx.crypto.pq.dilithium import PQPrivateKey
 from qrdx.exchange import ExchangeOpType, ExchangeStateManager, encode_exchange_txs
 from qrdx.exchange import block_processor as BP
 from qrdx.node import main as node_main
+from qrdx.node import derived_state
 
 from test_interleaved_rebuild_equivalence import _add_block, _db, _forward
 from test_reorg_rebuild_equivalence import _sign, _tx
@@ -55,7 +56,7 @@ async def _restart(db):
     saved = node_main.db, node_main.EVM_STATE_MANAGER
     node_main.db, node_main.EVM_STATE_MANAGER = db, None
     try:
-        await node_main._rebuild_derived_state_on_startup()
+        await derived_state._rebuild_derived_state_on_startup()
     finally:
         node_main.db, node_main.EVM_STATE_MANAGER = saved
     return ExchangeStateManager.get_instance().compute_state_root()
@@ -127,7 +128,7 @@ async def test_a_durable_state_mismatch_is_reported_and_repaired(caplog, monkeyp
 def test_startup_initialises_evm_then_rebuilds_before_anything_consumes_state():
     src = inspect.getsource(node_main.startup)
     init = src.index("EVM_STATE_MANAGER = ContractStateManager(db)")
-    rebuild = src.index("await _rebuild_derived_state_on_startup()")
+    rebuild = src.index("await _derived._rebuild_derived_state_on_startup()")
     assert init < rebuild, "the rebuild replays EVM sections, so EVM must be initialised first"
     for consumer in ("initialize_validator_node(", "epoch_validator_update_loop(",
                      "chain_event_poller("):

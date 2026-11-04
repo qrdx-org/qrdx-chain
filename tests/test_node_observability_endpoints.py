@@ -1,5 +1,5 @@
 """
-Node operational-readiness endpoints (qrdx/node/main.py): /healthz, /readyz, /metrics, and the
+Node operational-readiness endpoints (qrdx/node/api/observability.py): /healthz, /readyz, /metrics, and the
 TOGGLEABLE realtime stream (/stream SSE, /ws WebSocket). Handlers are exercised directly so no full
 node startup is needed.
 """
@@ -7,18 +7,19 @@ import pytest
 from starlette.responses import StreamingResponse
 
 import qrdx.node.main as m
+from qrdx.node.api import observability as observability_api
 
 
 @pytest.mark.asyncio
 async def test_healthz_ok():
-    r = await m.healthz()
+    r = await observability_api.healthz()
     assert r["status"] == "ok" and "version" in r and r["uptime_s"] >= 0
 
 
 @pytest.mark.asyncio
 async def test_metrics_renders_prometheus():
     m.METRICS.set("qrdx_chain_height", 5)
-    resp = await m.metrics_endpoint()
+    resp = await observability_api.metrics_endpoint()
     body = resp.body.decode()
     assert "qrdx_chain_height 5" in body
     assert "qrdx_streaming_enabled" in body
@@ -31,25 +32,25 @@ async def test_readyz_ready_and_not_ready(monkeypatch):
         async def get_next_block_id(self):
             return 7                      # tip = 6
     monkeypatch.setattr(m, "db", _DB())
-    ok = await m.readyz()
+    ok = await observability_api.readyz()
     assert ok.status_code == 200
 
     class _BadDB:
         async def get_next_block_id(self):
             raise RuntimeError("db down")
     monkeypatch.setattr(m, "db", _BadDB())
-    bad = await m.readyz()
+    bad = await observability_api.readyz()
     assert bad.status_code == 503
 
 
 @pytest.mark.asyncio
 async def test_stream_toggle(monkeypatch):
     monkeypatch.setattr(m, "STREAMING_ENABLED", False)
-    off = await m.stream_endpoint()
+    off = await observability_api.stream_endpoint()
     assert off.status_code == 404                       # disabled → 404
 
     monkeypatch.setattr(m, "STREAMING_ENABLED", True)
-    on = await m.stream_endpoint()
+    on = await observability_api.stream_endpoint()
     assert isinstance(on, StreamingResponse)            # enabled → SSE stream
 
 
@@ -67,7 +68,7 @@ async def test_ws_disabled_closes_without_accept(monkeypatch):
         async def send_json(self, _):
             events["sent"] = True
 
-    await m.ws_stream(_WS())
+    await observability_api.ws_stream(_WS())
     assert events.get("close_code") == 1008 and "accepted" not in events
 
 
@@ -94,7 +95,7 @@ async def test_ws_enabled_accepts_and_streams_a_published_event(monkeypatch):
             await asyncio.Event().wait()       # a client that never sends a control frame
 
     import asyncio
-    task = asyncio.create_task(m.ws_stream(_WS()))
+    task = asyncio.create_task(observability_api.ws_stream(_WS()))
     await asyncio.sleep(0.05)
     await m.EVENT_HUB.publish({"type": "block", "height": 99})
     await asyncio.wait_for(task, timeout=2)
@@ -159,7 +160,7 @@ async def test_ws_client_subscribes_to_perps_channels(monkeypatch):
         async def close(self, code=1000):
             pass
 
-    task = asyncio.create_task(m.ws_stream(_WS()))
+    task = asyncio.create_task(observability_api.ws_stream(_WS()))
     await asyncio.sleep(0.05)
     await inbox.put({"op": "set", "channels": ["perp_events:BTC-USD-PERP"]})
     await asyncio.sleep(0.05)

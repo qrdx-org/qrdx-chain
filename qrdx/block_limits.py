@@ -18,7 +18,7 @@ blocks to the same limits.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 # Each proof carries two signed messages to verify; a block of them is still a few hundred
 # milliseconds of verification at most. Offences are rare: a backlog waits a block.
@@ -65,17 +65,37 @@ def exchange_section_gas(section: Optional[Iterable[Any]]) -> int:
     return total
 
 
-def exchange_section_gas_error(section: Optional[Iterable[Any]]) -> str:
-    from .constants import BLOCK_EXCHANGE_GAS_LIMIT
+def exchange_gas_limit_at(height: Optional[int]) -> int:
+    """The exchange gas a block at ``height`` may carry (``BLOCK_EXCHANGE_GAS_LIMIT``, which a
+    fork may change). With no height, the largest the schedule ever allows: a mempool turning
+    away an operation that no block could carry."""
+    from . import chain_spec
 
+    spec = chain_spec.active()
+    name = "BLOCK_EXCHANGE_GAS_LIMIT"
+    if height is not None:
+        return int(spec.param_at(name, max(0, int(height))))
+    if _largest_exchange_gas[0] is not spec:  # (asked once a transaction: worked out once a spec)
+        values = [spec.params[name]] + [
+            f["params"][name] for f in spec.forks if name in f.get("params", {})
+        ]
+        _largest_exchange_gas[:] = [spec, max(int(v) for v in values)]
+    return int(_largest_exchange_gas[1])
+
+
+_largest_exchange_gas: List[Any] = [None, 0]
+
+
+def exchange_section_gas_error(
+    section: Optional[Iterable[Any]], height: Optional[int] = None
+) -> str:
     try:
         total = exchange_section_gas(section)
     except (TypeError, ValueError, AttributeError) as e:
         return f"malformed exchange section: {e}"
-    if total > BLOCK_EXCHANGE_GAS_LIMIT:
-        return (
-            f"exchange section exceeds the block gas limit ({total} > {BLOCK_EXCHANGE_GAS_LIMIT})"
-        )
+    limit = exchange_gas_limit_at(height)
+    if total > limit:
+        return f"exchange section exceeds the block gas limit ({total} > {limit})"
     return ""
 
 
@@ -99,7 +119,7 @@ def block_resource_error(
         return f"{len(evidence)} slashing proofs (at most {MAX_SLASHING_EVIDENCE_PER_BLOCK})"
     if exchange_section is None:
         exchange_section = block.get("exchange_transactions")
-    error = exchange_section_gas_error(exchange_section)
+    error = exchange_section_gas_error(exchange_section, height)
     if error:
         return error
     if evm_section is None:

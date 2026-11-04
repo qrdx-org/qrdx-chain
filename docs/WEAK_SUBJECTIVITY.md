@@ -14,7 +14,7 @@ chains that contain it.
 |---|---|
 | Checkpoints, their checks, the reorganization floor | `qrdx/checkpoints.py` |
 | In the chain spec | `"checkpoints"` (`qrdx/chain_spec.py`) |
-| Checked on import | `_verify_chain_rules` (`qrdx/node/main.py`) |
+| Checked on import | `_verify_chain_rules` (`qrdx/node/block_import.py`) |
 | A checkpoint to give a new node | RPC `qrdx_weakSubjectivityCheckpoint` |
 | Tests | `tests/test_trusted_checkpoints.py` |
 

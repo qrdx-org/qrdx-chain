@@ -104,12 +104,18 @@ def node_id_to_hex(node_id: NodeID) -> str:
 
 
 def hex_to_node_id(hex_str: str) -> NodeID:
-    """Convert 'qx'-prefixed or plain hex string to 20-byte node ID."""
+    """Convert 'qx'-prefixed or plain hex string to 20-byte node ID (ValueError if it is not
+    one: peers send these)."""
+    if not isinstance(hex_str, str):
+        raise ValueError("a node id is hex text")
     if hex_str.startswith(NODE_ID_PREFIX):
         hex_str = hex_str[len(NODE_ID_PREFIX) :]
     if hex_str.startswith("0x"):
         hex_str = hex_str[2:]
-    return bytes.fromhex(hex_str)
+    node_id = bytes.fromhex(hex_str)
+    if len(node_id) != 20:
+        raise ValueError(f"a node id is 20 bytes, not {len(node_id)}")
+    return node_id
 
 
 # ---------------------------------------------------------------------------

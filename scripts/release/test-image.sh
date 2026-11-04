@@ -3,6 +3,7 @@
 # (docs/RELEASES.md). The release workflow runs this on the candidate image before pushing it.
 #
 #   scripts/release/test-image.sh IMAGE [pytest args...]
+#   scripts/release/test-image.sh IMAGE --script SCRIPT [args...]   (a script, in the same view)
 #
 # The image itself is not modified. A throwaway container gets the test tools from
 # release/test-requirements.lock (hash-checked, constrained to the image's own versions) and a
@@ -20,10 +21,18 @@ PYTEST_ARGS=("$@")
 
 # Root only to install the test tools into the container's site-packages; the image's user is
 # unchanged. /src is read-only, so nothing a test does can touch the checkout.
+# Passed through when set: a deep fuzz run (tests/test_fuzz_decoders.py), the EVM conformance
+# fixtures (tests/test_evm_conformance.py; a path inside the container, e.g. /tmp/repo/.eest/fixtures),
+# and the nightly integration run's attacks and soak (tests/test_testnet_integration.py).
+EXTRA_ENV=()
+for name in QRDX_FUZZ_EXAMPLES QRDX_EEST_FIXTURES QRDX_ADVERSARIAL QRDX_SOAK_SECONDS; do
+  [[ -n "${!name:-}" ]] && EXTRA_ENV+=(-e "$name=${!name}")
+done
+
 exec docker run --rm --user 0 \
   --entrypoint /bin/sh \
   -v "$REPO:/src:ro" \
-  -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 \
+  -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
   "$IMAGE" -c '
     set -eu
     pip install --quiet --root-user-action=ignore --no-compile --require-hashes --no-deps \
@@ -63,5 +72,6 @@ EOF
       /app/qrdx/*) echo "scripts started from the workspace import the shipped code too" ;;
       *) echo "a script started from the workspace imports $where, not /app/qrdx" >&2; exit 1 ;;
     esac
+    if [ "${1:-}" = "--script" ]; then shift; exec python "$@"; fi
     exec python -m pytest -p no:cacheprovider "$@"
   ' sh "${PYTEST_ARGS[@]}"

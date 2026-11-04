@@ -407,6 +407,8 @@ BLAKE3_ADDRESS = (0x0501).to_bytes(20, "big")
 _LEGACY_PQ_ADDRESSES = tuple(n.to_bytes(20, "big") for n in (0x09, 0x0A, 0x0B, 0x0C))
 BLAKE2F_ADDRESS = (0x09).to_bytes(20, "big")
 ECRECOVER_ADDRESS = (1).to_bytes(20, "big")
+MODEXP_ADDRESS = (5).to_bytes(20, "big")
+SUBMIT_CROSS_CHAIN_ADDRESS = (0x0202).to_bytes(20, "big")
 BN128_MUL_ADDRESS = (7).to_bytes(20, "big")
 BN128_PAIRING_ADDRESS = (8).to_bytes(20, "big")
 BN128_MUL_SURCHARGE = 12_000  # 6,000 → 18,000 (py_ecc: ~8.5 ms a multiplication)
@@ -472,20 +474,62 @@ _SURCHARGES = {
 }
 
 
+def modexp_conformant(computation):
+    """MODEXP (0x05) as Ethereum computes it. py-evm returns 0 whenever the base is empty, but
+    an empty base is 0 and 0⁰ = 1: ``modexp(base=∅, exp=0, mod=m)`` is ``1 mod m``. (Gas is
+    EIP-2565's, charged before any length is used, as py-evm charges it.)"""
+    from eth.precompiles.modexp import extract_lengths
+    from eth.vm.forks.berlin.computation import _compute_modexp_gas_fee_eip_2565
+
+    data = bytes(computation.msg.data_as_bytes)
+    computation.consume_gas(_compute_modexp_gas_fee_eip_2565(data), reason="MODEXP Precompile")
+    base_length, exponent_length, modulus_length = extract_lengths(data)
+    if modulus_length == 0:
+        computation.output = b""
+        return computation
+
+    def word(start: int, length: int) -> int:
+        return int.from_bytes(data[start : start + length].ljust(length, b"\x00"), "big")
+
+    modulus = word(96 + base_length + exponent_length, modulus_length)
+    result = 0
+    if modulus:
+        result = pow(word(96, base_length), word(96 + base_length, exponent_length), modulus)
+    computation.output = result.to_bytes(modulus_length, "big")
+    return computation
+
+
 def _standard_precompiles(base, block_number):
-    """The fork's precompiles under ``evm_standard_precompiles`` (see PQ_VERIFY_ADDRESS)."""
+    """The fork's precompiles under ``evm_standard_precompiles`` (see PQ_VERIFY_ADDRESS), and
+    ``evm_conformance``'s corrections (docs/EVM_CONFORMANCE.md)."""
     from eth.precompiles import blake2b_fcompress
     from eth.vm.forks.qrdx.precompiles import blake3_hash_precompile, dilithium_verify
 
     from .. import chain_spec
 
-    if not chain_spec.is_active("evm_standard_precompiles", int(block_number)):
-        return base
-    table = {a: fn for a, fn in base.items() if a not in _LEGACY_PQ_ADDRESSES}
-    table[BLAKE2F_ADDRESS] = blake2b_fcompress
-    table[PQ_VERIFY_ADDRESS] = dilithium_verify
-    table[BLAKE3_ADDRESS] = blake3_hash_precompile
+    table = base
+    if chain_spec.is_active("evm_standard_precompiles", int(block_number)):
+        table = {a: fn for a, fn in base.items() if a not in _LEGACY_PQ_ADDRESSES}
+        table[BLAKE2F_ADDRESS] = blake2b_fcompress
+        table[PQ_VERIFY_ADDRESS] = dilithium_verify
+        table[BLAKE3_ADDRESS] = blake3_hash_precompile
+    if chain_spec.is_active("evm_conformance", max(1, int(block_number))):
+        table = dict(table)
+        table[MODEXP_ADDRESS] = modexp_conformant
+        # 0x0202 answered a hash as if it had sent a transaction to another chain, and sent
+        # nothing: it reverts now, as the other retired precompiles do.
+        table[SUBMIT_CROSS_CHAIN_ADDRESS] = _cross_chain_retired
     return table
+
+
+def _cross_chain_retired(computation):
+    from eth.exceptions import Revert
+    from eth.vm.forks.qrdx.precompiles import GAS_RETIRED_EXCHANGE_PRECOMPILE, _error_string
+
+    reason = "0x0202 is retired: nothing on QRDX sends transactions to other chains"
+    computation.consume_gas(GAS_RETIRED_EXCHANGE_PRECOMPILE, reason="retired precompile")
+    computation.output = _error_string(reason)
+    raise Revert(reason)
 
 
 class _WorldPrecompiles(Mapping):

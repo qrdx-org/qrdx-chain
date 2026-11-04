@@ -5,28 +5,29 @@ QRDX_P2P_STATE_DIR says. They used to be a file inside the package and a cwd-rel
 directory — shared by every node started from one directory, which made one testnet dial another.
 """
 from qrdx.node import main
+from qrdx.node import discovery as node_discovery
 
 
 def test_two_nodes_get_two_state_directories(monkeypatch):
     monkeypatch.delenv("QRDX_P2P_STATE_DIR", raising=False)
     dirs = set()
     for db in ("testnet/databases/node0.db", "testnet/databases/node1.db"):
-        monkeypatch.setattr(main, "DENARO_DATABASE_PATH", db)
-        dirs.add(main._p2p_state_dir())
+        monkeypatch.setattr(node_discovery, "DENARO_DATABASE_PATH", db)
+        dirs.add(node_discovery._p2p_state_dir())
     assert dirs == {"testnet/databases/node0.p2p", "testnet/databases/node1.p2p"}
 
 
 def test_the_state_directory_can_be_named(monkeypatch, tmp_path):
     monkeypatch.setenv("QRDX_P2P_STATE_DIR", str(tmp_path))
-    assert main._p2p_state_dir() == str(tmp_path)
+    assert node_discovery._p2p_state_dir() == str(tmp_path)
 
 
 def test_the_peer_store_is_no_longer_inside_the_package():
     import inspect
     src = inspect.getsource(main).replace("'", '"')   # quote style is the formatter's choice
-    start = src.index('NodesManager.db_path = os.path.join(_p2p_state_dir(), "nodes.json")')
+    start = src.index('NodesManager.db_path = os.path.join(_discovery._p2p_state_dir(), "nodes.json")')
     assert start < src.index("NodesManager.purge_peers()", start - 200)
-    assert "persist_dir = _p2p_state_dir()" in src
+    assert "persist_dir = _p2p_state_dir()" in inspect.getsource(node_discovery._init_dht)
 
 
 def test_no_function_in_the_node_shadows_os():
@@ -35,7 +36,8 @@ def test_no_function_in_the_node_shadows_os():
     the node would not start (caught by a soak, not by a source check)."""
     import pathlib
     import symtable
-    src = pathlib.Path(main.__file__).read_text()
+
+    from node_source import node_modules
 
     def walk(table):
         for child in table.get_children():
@@ -48,4 +50,5 @@ def test_no_function_in_the_node_shadows_os():
                     f"{child.get_name()}() (line {child.get_lineno()}) makes 'os' local")
             walk(child)
 
-    walk(symtable.symtable(src, main.__file__, "exec"))
+    for module in node_modules():
+        walk(symtable.symtable(pathlib.Path(module.__file__).read_text(), module.__file__, "exec"))

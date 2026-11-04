@@ -125,6 +125,7 @@ def test_the_sections_travel_beside_the_content_or_inside_it_alike():
 
 async def test_every_import_path_refuses_a_stripped_block_before_anything_runs(monkeypatch):
     from qrdx.node import main as node_main
+    from qrdx.node import block_import
 
     async def must_not_run(*a, **k):
         raise AssertionError("verified a block that is not its proposer's")
@@ -133,12 +134,12 @@ async def test_every_import_path_refuses_a_stripped_block_before_anything_runs(m
     b = _block()
     content, ex, evm = _received(b)
     content["attestations"] = content["attestations"][:1]
-    ok, err = await node_main._verify_chain_rules(str(content), 5, ex, evm, b.hash)
+    ok, err = await block_import._verify_chain_rules(str(content), 5, ex, evm, b.hash)
     assert not ok and "body_root" in err
 
 
 def test_fork_choice_ignores_a_branch_sent_under_hashes_it_does_not_own():
-    from qrdx.node.main import _parse_transfer_block
+    from qrdx.node.fork_choice import _parse_transfer_block
 
     b = _block()
     content, _ex, _evm = _received(b)

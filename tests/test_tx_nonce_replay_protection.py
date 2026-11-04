@@ -29,6 +29,7 @@ from qrdx.contracts.state import ContractStateManager
 from qrdx.crypto.account_id import to_account_id
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.node import main as node_main
+from qrdx.node import evm_runtime
 from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
 
 WEI = 10 ** 18
@@ -86,12 +87,12 @@ async def _close(db, saved):
 
 
 async def _execute(raw, height=1):
-    return await node_main._execute_evm_raw_tx(
+    return await evm_runtime._execute_evm_raw_tx(
         raw, height, f"{height:064x}", 1_700_000_000 + height)
 
 
 def test_the_gate_is_on():
-    assert node_main._ENFORCE_TX_NONCE is True, (
+    assert evm_runtime._ENFORCE_TX_NONCE is True, (
         "nonce validity must stay ON — it is the only thing stopping a replayed "
         "transaction from executing twice")
 
@@ -232,7 +233,7 @@ async def test_pending_nonces_are_rehydrated_from_durable_account_state():
                 "updated_at, is_contract) VALUES (?, '0', ?, 0, 0, 0)", (addr, nonce))
         await db.connection.commit()
 
-        loaded = await node_main._rehydrate_evm_pending_nonces()
+        loaded = await evm_runtime._rehydrate_evm_pending_nonces()
 
         assert loaded == 2, "only non-zero nonces need restoring"
         assert node_main.EVM_PENDING_NONCE[a] == 5
@@ -261,7 +262,7 @@ async def test_rehydration_never_lowers_a_live_expectation():
             "is_contract) VALUES (?, '0', 4, 0, 0, 0)", (addr,))
         await db.connection.commit()
 
-        await node_main._rehydrate_evm_pending_nonces()
+        await evm_runtime._rehydrate_evm_pending_nonces()
         assert node_main.EVM_PENDING_NONCE[addr] == 9
     finally:
         node_main.db = saved_db
@@ -283,7 +284,7 @@ async def test_rehydration_is_best_effort_and_does_not_raise():
     saved_db = node_main.db
     try:
         node_main.db = Broken()
-        assert await node_main._rehydrate_evm_pending_nonces() == 0
+        assert await evm_runtime._rehydrate_evm_pending_nonces() == 0
     finally:
         node_main.db = saved_db
 

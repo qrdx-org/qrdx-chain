@@ -1580,6 +1580,7 @@ class EthModule(RPCModule):
         data = decode_hex(data_hex) if has_data else b""
         value = _parse_hex_int(value_str)
 
+        height = await self._current_height() + 1  # (the block it would be in)
         estimated = await self._run_world(
             lambda world: evm.estimate_gas(
                 sender=sender,
@@ -1587,6 +1588,7 @@ class EthModule(RPCModule):
                 data=data,
                 value=value,
                 world=world,
+                block_number=height,
             ),
             preload=[sender, to],
         )

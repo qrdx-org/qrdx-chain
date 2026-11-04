@@ -11,12 +11,12 @@ Implements the JSON-RPC 2.0 specification with support for:
 import asyncio
 import json
 import time
-from collections import defaultdict
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Callable, Dict, List, Optional, Union
 
+from .. import fastjson
 from ..logger import get_logger
 
 logger = get_logger(__name__)
@@ -24,6 +24,9 @@ logger = get_logger(__name__)
 # The peer node behind the JSON-RPC request being handled — its signature verified by the
 # HTTP endpoint (qrdx/node/main.py rpc_endpoint) — or None for an unsigned request.
 rpc_caller: ContextVar[Optional[str]] = ContextVar("rpc_caller", default=None)
+# What the verified caller's request said of it — its key, advertised URL and address (the
+# HTTP endpoint sets it): a handshake admits the caller as a peer with them.
+rpc_caller_meta: ContextVar[Optional[Dict[str, Any]]] = ContextVar("rpc_caller_meta", default=None)
 
 # Best-effort metrics recording into the shared observability registry (imports only stdlib, so no
 # cycle). Falls back to a no-op so RPC handling never depends on observability being importable.
@@ -118,7 +121,7 @@ class RPCResponse:
         return response
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict())
+        return fastjson.dumps(self.to_dict())
 
 
 # Type for RPC method handlers
@@ -230,11 +233,25 @@ def rpc_admin_method(func: RPCMethod) -> RPCMethod:
     return wrapper
 
 
+# The most calls one JSON-RPC batch may hold.
+MAX_BATCH_SIZE = 100
+
+
 class RPCRateLimiter:
     """
-    Token-bucket rate limiter for JSON-RPC requests.
+    Token-bucket rate limiter for JSON-RPC requests: per client, and in two global pools, one
+    for this node's peers and one for everyone else.
 
-    Limits are per-client (by IP or identifier) and globally.
+    A request takes its client's token first and a global one only if it has one. It used to take
+    the global token first: one IP flooding past its own limit still drained the global budget,
+    and the node's peers (blocks, votes, transactions) were refused with everyone else
+    (integration_tests/adversarial.py, the flood). Peers now draw on a pool of their own, which
+    public traffic cannot reach.
+
+    A peer's own limit is ``per_peer_rps``, not the public ``per_client_rps``. Peers gossip
+    every transaction to each other, a call each, so a peer's traffic grows with the chain's:
+    held to the public 50 a second, gossip was refused from about 50 transactions a second, and
+    with it the peer's blocks and votes (docs/PERFORMANCE.md).
     Thread-safe via asyncio lock.
     """
 
@@ -243,51 +260,57 @@ class RPCRateLimiter:
         per_client_rps: int = 50,
         global_rps: int = 500,
         burst_multiplier: float = 2.0,
+        peer_rps: Optional[int] = None,
+        per_peer_rps: Optional[int] = None,
     ):
         self.per_client_rps = per_client_rps
         self.global_rps = global_rps
+        self.peer_rps = global_rps if peer_rps is None else peer_rps  # all peers together
+        self.per_peer_rps = per_client_rps if per_peer_rps is None else per_peer_rps
         self.burst_multiplier = burst_multiplier
-        self._clients: Dict[str, Dict[str, float]] = defaultdict(
-            lambda: {"tokens": per_client_rps * burst_multiplier, "last": time.monotonic()}
-        )
-        self._global_tokens = global_rps * burst_multiplier
-        self._global_last = time.monotonic()
+        self._clients: Dict[str, Dict[str, float]] = {}  # (made at the caller's rate)
+        now = time.monotonic()
+        self._pools: Dict[bool, Dict[str, float]] = {
+            False: {"tokens": global_rps * burst_multiplier, "last": now},
+            True: {"tokens": self.peer_rps * burst_multiplier, "last": now},
+        }
         self._lock = asyncio.Lock()
 
-    async def check(self, client_id: str = "anonymous") -> bool:
+    @property
+    def _global_tokens(self) -> float:  # (the public pool, as before)
+        return self._pools[False]["tokens"]
+
+    @staticmethod
+    def _refill(bucket: Dict[str, float], rate: float, cap: float, now: float) -> None:
+        bucket["tokens"] = min(cap, bucket["tokens"] + (now - bucket["last"]) * rate)
+        bucket["last"] = now
+
+    async def check(self, client_id: str = "anonymous", peer: bool = False, cost: int = 1) -> bool:
         """
-        Check if a request from client_id is allowed.
+        Check if ``cost`` requests from client_id are allowed (``peer``: one of this node's
+        peers; a batch costs one a call).
 
         Returns True if allowed, False if rate-limited.
         """
         async with self._lock:
             now = time.monotonic()
-
-            # Refill global bucket
-            elapsed_g = now - self._global_last
-            self._global_tokens = min(
-                self.global_rps * self.burst_multiplier,
-                self._global_tokens + elapsed_g * self.global_rps,
-            )
-            self._global_last = now
-
-            if self._global_tokens < 1.0:
+            own = self.per_peer_rps if peer else self.per_client_rps
+            bucket = self._clients.get(client_id)
+            if bucket is None:
+                bucket = self._clients[client_id] = {
+                    "tokens": own * self.burst_multiplier,
+                    "last": now,
+                }
+            self._refill(bucket, own, own * self.burst_multiplier, now)
+            if bucket["tokens"] < cost:
                 return False
-            self._global_tokens -= 1.0
-
-            # Refill per-client bucket
-            bucket = self._clients[client_id]
-            elapsed_c = now - bucket["last"]
-            bucket["tokens"] = min(
-                self.per_client_rps * self.burst_multiplier,
-                bucket["tokens"] + elapsed_c * self.per_client_rps,
-            )
-            bucket["last"] = now
-
-            if bucket["tokens"] < 1.0:
+            rate = self.peer_rps if peer else self.global_rps
+            pool = self._pools[peer]
+            self._refill(pool, rate, rate * self.burst_multiplier, now)
+            if pool["tokens"] < cost:
                 return False
-            bucket["tokens"] -= 1.0
-
+            bucket["tokens"] -= cost
+            pool["tokens"] -= cost
             return True
 
     def cleanup(self, max_age: float = 600.0) -> int:
@@ -313,11 +336,18 @@ class RPCServer:
         rate_limit: bool = True,
         per_client_rps: int = 50,
         global_rps: int = 500,
+        peer_rps: Optional[int] = None,
+        per_peer_rps: Optional[int] = None,
     ):
         self._methods: Dict[str, RPCMethod] = {}
         self._modules: Dict[str, RPCModule] = {}
         self._rate_limiter: Optional[RPCRateLimiter] = (
-            RPCRateLimiter(per_client_rps=per_client_rps, global_rps=global_rps)
+            RPCRateLimiter(
+                per_client_rps=per_client_rps,
+                global_rps=global_rps,
+                peer_rps=peer_rps,
+                per_peer_rps=per_peer_rps,
+            )
             if rate_limit
             else None
         )
@@ -370,6 +400,7 @@ class RPCServer:
         self,
         data: Union[str, bytes, dict, list],
         client_id: str = "anonymous",
+        peer: bool = False,
     ) -> Optional[str]:
         """
         Handle a JSON-RPC request.
@@ -377,31 +408,43 @@ class RPCServer:
         Args:
             data: Request data (JSON string or dict)
             client_id: Client identifier for rate limiting (e.g. IP address)
+            peer: the caller is one of this node's peers (its own global pool)
 
         Returns:
             JSON response string, or None for notifications
         """
         # Rate limit check
         if self._rate_limiter is not None:
-            if not await self._rate_limiter.check(client_id):
+            if not await self._rate_limiter.check(client_id, peer=peer):
                 _metric("qrdx_rpc_ratelimited_total")
                 error = RPCError(RPCErrorCode.LIMIT_EXCEEDED, "Rate limit exceeded")
                 return RPCResponse(error=error.to_dict()).to_json()
         # Parse request
         try:
             if isinstance(data, (str, bytes)):
-                parsed = json.loads(data)
+                parsed = fastjson.loads(data)
             else:
                 parsed = data
         except json.JSONDecodeError as e:
             error = RPCError(RPCErrorCode.PARSE_ERROR, f"Parse error: {e}")
             return RPCResponse(error=error.to_dict()).to_json()
 
-        # Handle batch request
+        # Handle batch request. Its calls run at once, so it is capped, and each costs what a
+        # request does: a batch used to cost one, whatever it held, and was any size.
         if isinstance(parsed, list):
             if not parsed:
                 error = RPCError(RPCErrorCode.INVALID_REQUEST, "Empty batch")
                 return RPCResponse(error=error.to_dict()).to_json()
+            if len(parsed) > MAX_BATCH_SIZE:
+                error = RPCError(
+                    RPCErrorCode.INVALID_REQUEST, f"A batch holds at most {MAX_BATCH_SIZE} calls"
+                )
+                return RPCResponse(error=error.to_dict()).to_json()
+            if self._rate_limiter is not None and len(parsed) > 1:
+                if not await self._rate_limiter.check(client_id, peer=peer, cost=len(parsed) - 1):
+                    _metric("qrdx_rpc_ratelimited_total")
+                    error = RPCError(RPCErrorCode.LIMIT_EXCEEDED, "Rate limit exceeded")
+                    return RPCResponse(error=error.to_dict()).to_json()
 
             responses = await asyncio.gather(*[self._handle_single(req) for req in parsed])
 
@@ -409,13 +452,13 @@ class RPCServer:
             responses = [r for r in responses if r is not None]
             if not responses:
                 return None
-            return json.dumps(responses)
+            return fastjson.dumps(responses)
 
         # Handle single request
         response = await self._handle_single(parsed)
         if response is None:
             return None
-        return json.dumps(response)
+        return fastjson.dumps(response)
 
     async def _handle_single(self, data: dict) -> Optional[dict]:
         """Handle a single request and return response dict."""

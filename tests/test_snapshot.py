@@ -130,3 +130,12 @@ def test_a_snapshot_downloads_from_any_server_and_a_broken_one_is_caught(tmp_pat
         assert not (tmp_path / "bad" / "qrdx.db").exists()
     finally:
         server.shutdown()
+
+
+@pytest.mark.parametrize("module", ["qrdx.exchange.state_manager", "qrdx.exchange.handlers.common"])
+def test_a_helper_resolves_where_it_lives_and_where_it_used_to(module):
+    """The manager's helpers moved to handlers/common.py (re-exported from state_manager.py): a
+    checkpoint made before the move names them in state_manager and must still load."""
+    from qrdx.exchange.handlers.common import _encode_fee_token
+
+    assert safe_loads(_stack_global(module, "_encode_fee_token", call=False)) is _encode_fee_token

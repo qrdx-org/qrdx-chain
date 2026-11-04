@@ -53,7 +53,8 @@ def test_contracts_read_the_block_context(opcode, context, expected):
 
 def test_every_consensus_execution_passes_its_block():
     from qrdx.node import main as node_main
-    src = source_of(node_main._execute_evm_raw_tx)
+    from qrdx.node import evm_runtime
+    src = source_of(evm_runtime._execute_evm_raw_tx)
     assert "block_number=int(block_height or 1)" in src
     assert "timestamp=_evm_block_timestamp(block_timestamp)" in src
 
@@ -64,13 +65,14 @@ def test_every_consensus_execution_passes_its_block():
     (None, 1), (0, 1),
 ])
 def test_block_timestamps_map_to_evm_seconds(value, expected):
-    from qrdx.node.main import _evm_block_timestamp
+    from qrdx.node.evm_runtime import _evm_block_timestamp
     assert _evm_block_timestamp(value) == expected
 
 
 def test_eth_call_uses_the_latest_block():
     from qrdx.node import main as node_main
-    src = source_of(node_main._eth_call)
+    from qrdx.node import evm_runtime
+    src = source_of(evm_runtime._eth_call)
     call = src[src.index("evm_executor.call("):]
     call = call[:call.index("preload=")]
     assert "block_number=max(tip, 1)" in call and "timestamp=_evm_block_timestamp(" in call
@@ -96,6 +98,7 @@ async def test_eth_call_honours_the_calls_value_and_gas(tmp_path, monkeypatch):
 
     from qrdx.database_sqlite import DatabaseSQLite
     from qrdx.node import main as node_main
+    from qrdx.node import evm_runtime
 
     db = await DatabaseSQLite.create(db_path=str(tmp_path / "call.db"))
     try:
@@ -106,11 +109,11 @@ async def test_eth_call_honours_the_calls_value_and_gas(tmp_path, monkeypatch):
         await sm.commit(1)
         monkeypatch.setattr(node_main, "db", db)
         call = {"from": to_checksum_address(CALLER), "to": CONTRACT}
-        assert int(await node_main._eth_call(ex, dict(call, value="0x2a")), 16) == 42
-        assert int(await node_main._eth_call(ex, dict(call)), 16) == 0
+        assert int(await evm_runtime._eth_call(ex, dict(call, value="0x2a")), 16) == 42
+        assert int(await evm_runtime._eth_call(ex, dict(call)), 16) == 0
         with pytest.raises(Exception, match="Call failed"):           # more than it holds
-            await node_main._eth_call(ex, dict(call, value=hex(10 ** 19)))
+            await evm_runtime._eth_call(ex, dict(call, value=hex(10 ** 19)))
         with pytest.raises(Exception, match="Call failed"):           # too little gas
-            await node_main._eth_call(ex, dict(call, value="0x1", gas="0x5"))
+            await evm_runtime._eth_call(ex, dict(call, value="0x1", gas="0x5"))
     finally:
         await db.close()

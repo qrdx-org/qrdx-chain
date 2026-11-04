@@ -144,6 +144,17 @@ async def main(args: argparse.Namespace) -> int:
             logger.error("\n✗ FAILED SCENARIOS: %s", failed)
             exit_code = 1
 
+        # ── Phase 4.4: Attacks (opt-in; integration_tests/adversarial.py) ──
+        if args.adversarial:
+            logger.info("Phase 4.4: Adversarial attacks")
+            from integration_tests.adversarial import run_adversarial_phase
+            attack_report = await run_adversarial_phase(
+                node_urls, [s.db_path for s in node_specs], orch.get_wallet("Validator 0"))
+            logger.info("\n" + attack_report.summary())
+            if not attack_report.passed:
+                logger.error("\n✗ ADVERSARIAL FAILED")
+                exit_code = 1
+
         # ── Phase 4.5: Soak-invariant monitor (opt-in) ──────────────
         if args.soak and args.soak > 0:
             logger.info("Phase 4.5: Soak-invariant monitor (%.0fs, fault_inject=%s)",
@@ -151,7 +162,8 @@ async def main(args: argparse.Namespace) -> int:
             from integration_tests.soak import run_soak_phase
             soak_report = await run_soak_phase(
                 node_urls, duration=args.soak, node_processes=orch.node_processes,
-                fault_inject=args.fault_inject)
+                fault_inject=args.fault_inject,
+                expected_slashings=attack_report.slashings if args.adversarial else 0)
             logger.info("\n" + soak_report.summary())
             if not soak_report.passed:
                 logger.error("\n✗ SOAK FAILED")
@@ -215,6 +227,9 @@ Examples:
                         help="After scenarios, run a soak-invariant monitor for SECONDS (health/"
                              "liveness/finality/convergence/safety via /metrics). The ≥30-day soak "
                              "gate, parameterized. Requires QRDX_ENABLE_STREAMING for /metrics.")
+    parser.add_argument("--adversarial", action="store_true",
+                        help="after the scenarios, attack the network (equivocation, a block "
+                             "built to parse slowly, a transaction flood) and check it holds")
     parser.add_argument("--fault-inject", action="store_true",
                         help="During --soak, kill + restart a backup node and verify recovery")
     return parser.parse_args()

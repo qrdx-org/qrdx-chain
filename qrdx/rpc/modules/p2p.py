@@ -23,11 +23,20 @@ Methods:
 
 import asyncio
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 from ...constants import SLOTS_PER_EPOCH
 from ...logger import get_logger
-from ..server import RPCError, RPCErrorCode, RPCModule, peer_only, rpc_caller, rpc_method
+from ..server import (
+    RPCError,
+    RPCErrorCode,
+    RPCModule,
+    peer_only,
+    rpc_caller,
+    rpc_caller_meta,
+    rpc_method,
+)
 
 logger = get_logger(__name__)
 
@@ -54,6 +63,16 @@ def handshake_proof_message(client_nonce: str, challenge_result: Dict[str, Any])
     return chain_spec.signing_domain("p2p-handshake") + get_canonical_json_bytes(
         {"client_nonce": client_nonce, **claims}
     )
+
+
+def validator_peer_message(node_id: str) -> bytes:
+    """What a validator signs, with its validator key, to vouch that the node ``node_id`` is its
+    own: a peer that proves it runs a validator holds a place in the peer table no newcomer
+    takes (NodesManager.admit_peer). Bound to this network and to the node, so it serves no
+    other node and no other chain."""
+    from ... import chain_spec
+
+    return chain_spec.signing_domain("peer-validator") + str(node_id).encode()
 
 
 def verify_handshake_proof(client_nonce: str, challenge_result: Dict[str, Any]) -> Optional[str]:
@@ -115,6 +134,8 @@ class P2PModule(RPCModule):
 
     def __init__(self, context: Any = None):
         super().__init__(context)
+        self._block_relay: Any = None  # compact blocks (qrdx/node/block_relay.py)
+        self._rebuilding: set = set()  # (block hashes being rebuilt from a compact block now)
         self._db: Any = None
         self._security: Any = None
         self._propagate_fn: Any = None
@@ -150,6 +171,8 @@ class P2PModule(RPCModule):
         # async (content, height, exchange section, evm section, hash) -> (ok, err) (main)
         self._verify_chain_rules: Any = None
         self._on_fork: Any = None  # (peer id, reason) -> None: resolve a fork now (main)
+        # async (node id, request meta, validator proof) -> None: admit a handshaken caller
+        self._admit_peer: Any = None
 
     # ---- wiring (called once at startup from main.py) --------------------
 
@@ -179,6 +202,8 @@ class P2PModule(RPCModule):
         check_peer_identity=None,
         verify_chain_rules=None,
         on_fork=None,
+        admit_peer=None,
+        block_relay=None,
     ):
         self._db = db
         self._security = security
@@ -203,6 +228,8 @@ class P2PModule(RPCModule):
         self._check_peer_identity = check_peer_identity
         self._verify_chain_rules = verify_chain_rules
         self._on_fork = on_fork
+        self._admit_peer = admit_peer
+        self._block_relay = block_relay
 
     def _signal_fork(self, block_no: Any, block_data: Dict, reason: str) -> None:
         """A peer sent a block that does not extend our tip: let fork choice compare its chain
@@ -363,6 +390,7 @@ class P2PModule(RPCModule):
         """
         self._require_db()
         _metric("qrdx_p2p_blocks_received_total")
+        _received = time.perf_counter()
 
         block_content = block_data.get("block_content")
         if not block_content:
@@ -532,7 +560,8 @@ class P2PModule(RPCModule):
                                 ok_ex, verr = await self._exchange_apply_section(
                                     block_no,
                                     float(block_data.get("timestamp", 0) or 0),
-                                    ex_section,
+                                    # (a compact block's: the mempool's own, already checked)
+                                    block_data.get("_exchange_objects") or ex_section,
                                     block_data.get("exchange_state_root"),
                                     epoch_from_block(block_data),
                                 )
@@ -653,7 +682,10 @@ class P2PModule(RPCModule):
                             await record_finality_from_block(self._db, block_content)
                         except Exception as e:
                             logger.debug(f"finality record skipped for block {block_no}: {e}")
-                        logger.info(f"Accepted PoS block {block_no} via RPC. Propagating...")
+                        logger.info(
+                            f"Accepted PoS block {block_no} via RPC "
+                            f"({1000 * (time.perf_counter() - _received):.0f} ms). Propagating..."
+                        )
                         asyncio.create_task(
                             self._propagate_fn(
                                 "submit_block", block_data, ignore_node_id=None, db=self._db
@@ -903,6 +935,74 @@ class P2PModule(RPCModule):
 
     @rpc_method
     @peer_only
+    async def submitCompactBlock(self, block_data: Dict) -> Dict:
+        """A block whose exchange operations are named by hash (qrdx/node/block_relay.py): rebuilt
+        from this node's mempool and what the sender sends of the rest, then accepted exactly as
+        ``submitBlock`` accepts a whole one. A rebuilt body that is not the signed one is
+        fetched whole and tried once more."""
+        if self._block_relay is None:
+            raise RPCError(RPCErrorCode.METHOD_NOT_FOUND, "compact blocks are not relayed here")
+        if not isinstance(block_data, dict):
+            return {"ok": False, "error": "a block is an object"}
+        # A block this node has: its own, echoed back by each peer that relays it, or one it
+        # already took from another peer. Its operations have left the mempool, so rebuilding it
+        # fetched every one of them from the sender, for submitBlock to drop it as seen.
+        self._require_db()
+        content = block_data.get("block_content")
+        if isinstance(content, str):
+            from hashlib import sha256
+
+            if await self._security.block_cache.contains(sha256(content.encode()).hexdigest()):
+                return {"ok": False, "error": "Block recently seen"}
+        known = block_data.get("block_hash")
+        if isinstance(known, str) and await self._db.get_block(known) is not None:
+            return {"ok": False, "error": "Block recently seen"}
+        # The same block from several relays at once: rebuilt once (each copy fetched its
+        # missing operations again before the first was stored).
+        if isinstance(known, str):
+            if known in self._rebuilding:
+                return {"ok": False, "error": "Block recently seen"}
+            self._rebuilding.add(known)
+        try:
+            sender_url = self._sender_url()
+            full, why = await self._block_relay.rebuild(block_data, sender_url)
+            if full is None:
+                return {"ok": False, "error": why}
+            reply = await self.submitBlock(full)
+            if not reply.get("ok") and "body_root" in str(reply.get("error", "")):
+                full, why = await self._block_relay.rebuild(block_data, sender_url, whole=True)
+                if full is None:
+                    return {"ok": False, "error": why}
+                reply = await self.submitBlock(full)
+            return reply
+        finally:
+            if isinstance(known, str):
+                self._rebuilding.discard(known)
+
+    @rpc_method
+    @peer_only
+    async def getBlockTxs(self, block_hash: str, indexes: List[int]) -> Dict:
+        """The exchange operations at ``indexes`` of a block this node relayed lately, for a peer
+        rebuilding it from a compact block."""
+        if self._block_relay is None or not isinstance(indexes, list):
+            return {"ok": False, "error": "unavailable"}
+        txs = self._block_relay.body_txs(str(block_hash), indexes)
+        if txs is None:
+            return {"ok": False, "error": "unknown block or positions"}
+        return {"ok": True, "result": txs}
+
+    def _sender_url(self) -> Optional[str]:
+        """Where the verified caller is reached: its peer entry, else the URL it signed."""
+        caller = rpc_caller.get()
+        if caller and self._nodes_manager is not None:
+            peer = self._nodes_manager.get_peer(caller)
+            if peer and peer.get("url"):
+                return peer["url"]
+        meta = rpc_caller_meta.get() or {}
+        return meta.get("url")
+
+    @rpc_method
+    @peer_only
     async def pushTx(self, tx_hex: str) -> Dict:
         """
         Accept a new transaction from a peer.
@@ -1051,6 +1151,7 @@ class P2PModule(RPCModule):
         peer_height: int = -1,
         peer_hash: Optional[str] = None,
         network: Optional[Dict] = None,
+        validator_proof: Optional[Dict] = None,
     ) -> Dict:
         """
         Verify a handshake response and negotiate sync direction.
@@ -1062,6 +1163,11 @@ class P2PModule(RPCModule):
             network:     The caller's network identity (chain_spec.network_identity). A caller
                          on another network, or with an incompatible fork history, is refused
                          before any sync is negotiated.
+            validator_proof: ``{address, signature}``, the caller's validator key over
+                         ``validator_peer_message``: the caller runs that validator.
+
+        A caller that completes the handshake is admitted as a peer, under the peer table's
+        rules (NodesManager.admit_peer) — the only way an unknown node becomes one.
         """
         self._require_db()
 
@@ -1077,6 +1183,11 @@ class P2PModule(RPCModule):
             ok, reason = await self._check_peer_identity(network)
             if not ok:
                 return {"ok": False, "error": "network_mismatch", "detail": reason}
+        if self._admit_peer is not None:
+            try:
+                await self._admit_peer(rpc_caller.get(), rpc_caller_meta.get(), validator_proof)
+            except Exception as e:  # noqa: BLE001 — admission never fails the handshake
+                logger.debug("peer admission after handshake failed: %s", e)
 
         local_height = await self._db.get_next_block_id() - 1
 

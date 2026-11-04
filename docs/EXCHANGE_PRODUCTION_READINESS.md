@@ -131,7 +131,7 @@ node rebuilt from chain history reconstructs identical account/exchange state.
   on SQLite: `database.pool` / `$1`). The exchange-wiring design they contained
   is preserved in §3–§4 of this document. Verified dead first: zero references
   repo-wide (incl. tests/scripts/dynamic imports). The live path is unchanged:
-  `node/main.py::process_and_create_block` → `manager.create_block`.
+  `node/block_import.py::process_and_create_block` → `manager.create_block`.
 - C2. ✅ Ported the one reachable PG remnant (`get_pos_chain_head`, called by the
   validator RPC module) to SQLite; `manager.py` now has **zero** `database.pool`
   / `$N` usages. Pinned by `tests/test_block_path_single_source.py`.

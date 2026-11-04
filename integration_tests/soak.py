@@ -114,10 +114,13 @@ async def run_soak_phase(
     stall_ticks: int = 8,
     max_finality_lag: int = 12,
     max_finality_spread: int = 2,
+    expected_slashings: int = 0,
 ) -> SoakReport:
     """Monitor the network for ``duration`` seconds, asserting the soak invariants each ``interval``.
     If ``fault_inject`` and ``node_processes`` are given, kills a non-primary node ~40% in and
-    restarts it ~70% in, verifying the rest stay live and the node re-syncs."""
+    restarts it ~70% in, verifying the rest stay live and the node re-syncs.
+    ``expected_slashings``: offences an attack made before the soak (integration_tests/
+    adversarial.py): an honest network adds none to them."""
     report = SoakReport()
     start = time.time()
     global_max_height = -1
@@ -204,8 +207,10 @@ async def run_soak_phase(
             report.worst_live_spread = max(report.worst_live_spread, max(heights) - min(heights))
 
         # SAFETY — no slashing on an honest network; track reorg count.
-        if slashes and max(slashes) > 0:
-            report.violate("safety", f"slashing_events={max(slashes)} on an honest network")
+        if slashes and max(slashes) > expected_slashings:
+            report.violate("safety", f"slashing_events={max(slashes)} on an honest network"
+                           + (f" (the attacks made {expected_slashings})"
+                              if expected_slashings else ""))
         if reorg_counts:
             report.max_reorgs = max(report.max_reorgs, max(reorg_counts))
 

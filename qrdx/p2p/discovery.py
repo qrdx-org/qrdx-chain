@@ -62,6 +62,10 @@ MAX_STORE_VALUE_SIZE = 8192
 # Store TTL (seconds) — stored values expire after 24 hours
 STORE_TTL = 24 * 60 * 60
 
+# Most values held at once. STORE needs no identity, so without a bound anyone could fill a node's
+# memory 8 KB at a time; when full, new keys are refused until entries expire.
+MAX_STORE_ENTRIES = 1024
+
 
 # ---------------------------------------------------------------------------
 # DHT Message Types
@@ -107,12 +111,23 @@ class DHTMessage:
 
     @classmethod
     def from_dict(cls, d: dict) -> "DHTMessage":
+        """ValueError unless ``d`` is a message: anyone may send one (``dht_message``)."""
+        if not isinstance(d, dict):
+            raise ValueError("a DHT message is an object")
+        payload = d.get("payload", {})
+        port = d["sender_port"]
+        if not isinstance(d["sender_id"], str) or not isinstance(d["sender_host"], str):
+            raise ValueError("sender_id and sender_host are text")
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+            raise ValueError("sender_port is a port number")
+        if not isinstance(payload, dict):
+            raise ValueError("payload is an object")
         return cls(
             type=DHTMessageType(d["type"]),
             sender_id=d["sender_id"],
             sender_host=d["sender_host"],
-            sender_port=d["sender_port"],
-            payload=d.get("payload", {}),
+            sender_port=port,
+            payload=payload,
         )
 
 
@@ -243,8 +258,21 @@ class KademliaProtocol:
                 payload={"stored": False, "error": "Value too large"},
             )
 
+        if not isinstance(key, str) or not isinstance(value, (str, bytes)):
+            return DHTMessage(
+                type=DHTMessageType.STORE_RESPONSE,
+                **self._make_sender_info(),
+                payload={"stored": False, "error": "key and value are text"},
+            )
+
         # Clean expired entries
         self._cleanup_store()
+        if key not in self._store and len(self._store) >= MAX_STORE_ENTRIES:
+            return DHTMessage(
+                type=DHTMessageType.STORE_RESPONSE,
+                **self._make_sender_info(),
+                payload={"stored": False, "error": "Store full"},
+            )
 
         expiry = time.time() + STORE_TTL
         self._store[key] = (value.encode() if isinstance(value, str) else value, expiry)
@@ -258,6 +286,8 @@ class KademliaProtocol:
     def _handle_find_value(self, msg: DHTMessage) -> DHTMessage:
         """Handle FIND_VALUE → return value if found, else closest nodes."""
         key = msg.payload.get("key", "")
+        if not isinstance(key, str):
+            key = ""
 
         if key in self._store:
             value, expiry = self._store[key]

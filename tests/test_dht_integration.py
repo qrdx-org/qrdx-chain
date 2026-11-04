@@ -332,6 +332,7 @@ class TestInitDHT:
     async def test_init_dht_creates_discovery(self, pq_keypair, tmp_path):
         """_init_dht should create dht_discovery and wire it into DHTModule."""
         import qrdx.node.main as main_mod
+        from qrdx.node import discovery as node_discovery
 
         orig_disc = main_mod.dht_discovery
         orig_dns = main_mod.dht_dns_seeds
@@ -359,11 +360,11 @@ class TestInitDHT:
             mock_dht_mod = DHTModule()
             main_mod.dht_rpc_module = mock_dht_mod
 
-            with patch('qrdx.node.main.get_public_key_bytes', return_value=pk), \
-                 patch('qrdx.node.main.DENARO_NODE_HOST', '127.0.0.1'), \
-                 patch('qrdx.node.main.DENARO_NODE_PORT', '30303'), \
-                 patch('qrdx.node.main.BOOTSTRAP_NODES', []):
-                await main_mod._init_dht()
+            with patch('qrdx.node.discovery.get_public_key_bytes', return_value=pk), \
+                 patch('qrdx.node.discovery.DENARO_NODE_HOST', '127.0.0.1'), \
+                 patch('qrdx.node.discovery.DENARO_NODE_PORT', '30303'), \
+                 patch('qrdx.node.discovery.BOOTSTRAP_NODES', []):
+                await node_discovery._init_dht()
 
             # Verify subsystems were created
             assert main_mod.dht_discovery is not None
@@ -388,6 +389,7 @@ class TestInitDHT:
     async def test_init_dht_non_fatal_on_error(self, tmp_path):
         """If _init_dht fails, dht_discovery should be None (non-fatal)."""
         import qrdx.node.main as main_mod
+        from qrdx.node import discovery as node_discovery
 
         orig_disc = main_mod.dht_discovery
         orig_dns = main_mod.dht_dns_seeds
@@ -399,8 +401,8 @@ class TestInitDHT:
             from qrdx.p2p.config import DiscoveryConfig
             main_mod.dht_config = DiscoveryConfig(routing_table_path=str(tmp_path))
 
-            with patch('qrdx.node.main.get_public_key_bytes', side_effect=RuntimeError("test error")):
-                await main_mod._init_dht()
+            with patch('qrdx.node.discovery.get_public_key_bytes', side_effect=RuntimeError("test error")):
+                await node_discovery._init_dht()
 
             assert main_mod.dht_discovery is None
 
@@ -455,6 +457,7 @@ class TestDHTBridge:
     async def test_bridge_sync_pushes_peers_to_dht(self, discovery):
         """Peers in NodesManager should be pushed into the DHT routing table."""
         import qrdx.node.main as main_mod
+        from qrdx.node import discovery as node_discovery
 
         orig_disc = main_mod.dht_discovery
         orig_self_id = main_mod.self_node_id
@@ -466,7 +469,7 @@ class TestDHTBridge:
             with patch.object(main_mod.NodesManager, 'peers', {
                 test_nid: {'url': 'http://10.1.0.1:30303', 'pubkey': ''}
             }):
-                await main_mod._dht_bridge_sync()
+                await node_discovery._dht_bridge_sync()
 
             total = discovery.routing_table.total_nodes
             assert total >= 1
@@ -479,10 +482,11 @@ class TestDHTBridge:
     async def test_bridge_sync_noop_when_dht_not_initialized(self):
         """_dht_bridge_sync should be a no-op when dht_discovery is None."""
         import qrdx.node.main as main_mod
+        from qrdx.node import discovery as node_discovery
         orig = main_mod.dht_discovery
         main_mod.dht_discovery = None
         try:
-            await main_mod._dht_bridge_sync()
+            await node_discovery._dht_bridge_sync()
         finally:
             main_mod.dht_discovery = orig
 
@@ -506,34 +510,34 @@ class TestDHTGlobals:
         assert isinstance(dht_config, DiscoveryConfig)
 
     def test_init_dht_importable(self):
-        from qrdx.node.main import _init_dht
+        from qrdx.node.discovery import _init_dht
         assert asyncio.iscoroutinefunction(_init_dht)
 
     def test_dht_bridge_sync_importable(self):
-        from qrdx.node.main import _dht_bridge_sync
+        from qrdx.node.discovery import _dht_bridge_sync
         assert asyncio.iscoroutinefunction(_dht_bridge_sync)
 
 
 class TestP2PImports:
-    """Verify that main.py imports all required P2P modules."""
+    """Verify that the node's DHT wiring (qrdx/node/discovery.py) imports the P2P modules."""
 
     def test_imports_p2p_node(self):
-        from qrdx.node.main import P2PNode, P2PAddress, p2p_hex_to_node_id
+        from qrdx.node.discovery import P2PNode, P2PAddress, p2p_hex_to_node_id
 
     def test_imports_routing_table(self):
-        from qrdx.node.main import RoutingTable, KBucketEntry
+        from qrdx.node.discovery import RoutingTable, KBucketEntry
 
     def test_imports_kademlia_discovery(self):
-        from qrdx.node.main import KademliaDiscovery
+        from qrdx.node.discovery import KademliaDiscovery
 
     def test_imports_dns_seed_discovery(self):
-        from qrdx.node.main import DNSSeedDiscovery
+        from qrdx.node.discovery import DNSSeedDiscovery
 
     def test_imports_discovery_config(self):
-        from qrdx.node.main import DiscoveryConfig
+        from qrdx.node.main import DiscoveryConfig  # (the node's DHT configuration, dht_config)
 
     def test_imports_get_public_key_bytes(self):
-        from qrdx.node.main import get_public_key_bytes
+        from qrdx.node.discovery import get_public_key_bytes
         assert callable(get_public_key_bytes)
 
 
@@ -555,7 +559,7 @@ class TestDHTIntegrationComplete:
     def test_init_dht_not_stub(self):
         """_init_dht must create real objects, not stubs."""
         import inspect
-        from qrdx.node.main import _init_dht
+        from qrdx.node.discovery import _init_dht
         source = inspect.getsource(_init_dht)
         assert 'KademliaDiscovery' in source
         assert 'RoutingTable' in source
@@ -565,7 +569,7 @@ class TestDHTIntegrationComplete:
     def test_bridge_sync_not_stub(self):
         """_dht_bridge_sync must have real logic."""
         import inspect
-        from qrdx.node.main import _dht_bridge_sync
+        from qrdx.node.discovery import _dht_bridge_sync
         source = inspect.getsource(_dht_bridge_sync)
         assert 'NodesManager' in source
         assert 'routing_table' in source

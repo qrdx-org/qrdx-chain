@@ -34,7 +34,16 @@ are kept in [archive/](archive/) for their history; none of them describes the c
 - [FORK_CHOICE_CONVERGENCE.md](FORK_CHOICE_CONVERGENCE.md): fork choice and finality.
 - [CONSENSUS_ROADMAP.md](CONSENSUS_ROADMAP.md): fair ordering, risk limits, oracle hardening,
   state proofs, attested chain heads.
-- [BLOCK_LIMITS.md](BLOCK_LIMITS.md): what a block may carry, gas, base fees.
+- [BLOCK_LIMITS.md](BLOCK_LIMITS.md): what a block may carry, gas, base fees, the content
+  structure budget.
+- [PERFORMANCE.md](PERFORMANCE.md): throughput under load, what the profiles showed, and what
+  limits it next.
+- [NODE_LAYOUT.md](NODE_LAYOUT.md): which module of qrdx/node/ holds what, and why the node's
+  state stays in main.py.
+- [PQ_CRYPTO_BACKEND.md](PQ_CRYPTO_BACKEND.md): liboqs, OpenSSL and mldsa-native compared for
+  ML-DSA-65, and the shadow verification that makes a switch safe.
+- [EVM_CONFORMANCE.md](EVM_CONFORMANCE.md): Ethereum's state tests run through QRDX's EVM, and
+  the `evm_conformance` fork they led to.
 - [WEAK_SUBJECTIVITY.md](WEAK_SUBJECTIVITY.md): trusted checkpoints.
 - [STATE_PROOFS.md](STATE_PROOFS.md): proving one entry against a signed root.
 - [PROTOCOL_UPGRADES.md](PROTOCOL_UPGRADES.md): chain specs, forks, network identity.

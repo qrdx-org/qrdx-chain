@@ -43,6 +43,12 @@ from ..fee_market import current_evm_base_fee
 logger = logging.getLogger(__name__)
 
 
+def _conformance(block_number) -> bool:
+    from .. import chain_spec
+
+    return chain_spec.is_active("evm_conformance", max(1, int(block_number or 1)))
+
+
 @dataclass
 class EVMResult:
     """Minimal EVM execution result."""
@@ -225,6 +231,18 @@ class QRDXEVMExecutor:
         if origin is None:
             origin = sender
         is_create = to is None
+        payer = payer or sender
+        # Ethereum's transaction rules around the message (chain-spec feature ``evm_conformance``,
+        # docs/EVM_CONFORMANCE.md): the intrinsic gas comes out of the gas limit before the
+        # message runs, the payer buys the whole limit up front and gets back what is unused
+        # (with EIP-3529's refund), and the sender and recipient start warm (EIP-2929).
+        # Before it the intrinsic gas was only a floor on the charge: the message ran with the
+        # whole limit, so a transaction got its intrinsic gas (its calldata, a 0x51
+        # transaction's signature check) free whenever it executed more than that.
+        conform = _conformance(block_number)
+        if conform and gas < intrinsic_gas:
+            return EVMResult(False, gas, b"", [], "intrinsic gas exceeds the gas limit", None, [])
+        exec_gas = gas - intrinsic_gas if conform else gas
 
         try:
             state = world.build_state(self._execution_context(block_number, timestamp))
@@ -235,15 +253,26 @@ class QRDXEVMExecutor:
             if is_create:
                 code = data
                 to = self._compute_create_address(sender, state.get_nonce(sender))
+                if conform and (state.get_code(to) or state.get_nonce(to)):
+                    return EVMResult(False, gas, b"", [], "contract address collision", None, [])
             else:
                 code = state.get_code(to)
+            if conform:
+                upfront = gas * gas_price
+                if state.get_balance(payer) < upfront:
+                    return EVMResult(
+                        False, 0, b"", [], "insufficient balance for the gas limit", None, []
+                    )
+                state.delta_balance(payer, -upfront)
+                state.mark_address_warm(origin)
+                state.mark_address_warm(to)
 
             message = self._create_message(
                 sender=sender,
                 to=to if to else ZERO_ADDRESS,
                 value=value,
                 data=data if not is_create else b"",
-                gas=gas,
+                gas=exec_gas,
                 code=code,
                 is_create=is_create,
             )
@@ -259,7 +288,12 @@ class QRDXEVMExecutor:
                 # that SELFDESTRUCTed are removed (with their storage).
                 for account in computation.get_accounts_for_deletion():
                     state.delete_account(account)
-            gas_used = gas - computation.get_gas_remaining()
+            if conform:
+                used = intrinsic_gas + exec_gas - computation.get_gas_remaining()
+                gas_used = used - min(computation.get_gas_refund(), used // 5)  # (0 on failure)
+                state.delta_balance(payer, (gas - gas_used) * gas_price)
+            else:
+                gas_used = gas - computation.get_gas_remaining()
             output = bytes(computation.output)
             logs = []
             try:
@@ -302,7 +336,6 @@ class QRDXEVMExecutor:
         # Every account and slot the execution changed — the sender, the recipient, any
         # account a contract paid or created, every storage slot it wrote — into the
         # state manager. (A failed top-level call was already rolled back by the EVM.)
-        payer = payer or sender
         world.write_back(state, always=[sender, payer])
 
         # Increment the payer's nonce on ANY successful transaction, not just a contract
@@ -315,11 +348,13 @@ class QRDXEVMExecutor:
             )
 
         # Charge tx-level gas: py-evm's apply_message does no transaction-level gas
-        # accounting. At least the intrinsic floor, never more than the gas limit.
-        gas_used = min(gas, max(gas_used, intrinsic_gas))
-        gas_cost = gas_used * gas_price
-        sender_balance = self.state_manager.get_balance_sync(sender_addr)
-        self.state_manager.set_balance_sync(sender_addr, sender_balance - gas_cost)
+        # accounting. At least the intrinsic floor, never more than the gas limit. (Under
+        # ``evm_conformance`` the payer already paid, inside the execution's state.)
+        if not conform:
+            gas_used = min(gas, max(gas_used, intrinsic_gas))
+            gas_cost = gas_used * gas_price
+            sender_balance = self.state_manager.get_balance_sync(sender_addr)
+            self.state_manager.set_balance_sync(sender_addr, sender_balance - gas_cost)
 
         return EVMResult(
             success=success,
@@ -367,10 +402,14 @@ class QRDXEVMExecutor:
         data: bytes,
         value: int = 0,
         world=None,
+        block_number: int = 1,
     ) -> int:
-        """Estimate gas by binary search for the least gas the call succeeds with (+10 %).
-        Writes nothing."""
-        low, high = 21000, max_evm_tx_gas()  # no transaction may need more (a big block's)
+        """Estimate gas by binary search for the least gas the call succeeds with (+10 %), its
+        intrinsic gas included (a legacy transaction's: what a wallet sends). Writes nothing."""
+        from .evm_mempool import intrinsic_gas_legacy
+
+        intrinsic = intrinsic_gas_legacy(data, is_create=to is None)
+        low, high = intrinsic, max_evm_tx_gas()  # no transaction may need more (a big block's)
         while low < high:
             mid = (low + high) // 2
             result = self.execute(
@@ -380,6 +419,8 @@ class QRDXEVMExecutor:
                 data=data,
                 gas=mid,
                 gas_price=0,
+                intrinsic_gas=intrinsic,
+                block_number=block_number,
                 world=world,
                 write_back=False,
             )

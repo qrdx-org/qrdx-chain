@@ -140,11 +140,10 @@ def test_every_path_sets_the_gates_through_one_function():
 
     from qrdx import derived_state_rebuild
     from qrdx.exchange import ExchangeStateManager
+    from qrdx.node import block_import
 
     root = pathlib.Path(BP.__file__).parents[1]
-    main_src = (root / "node" / "main.py").read_text()
-    start = main_src.index("async def _apply_exchange_section_on_import(")
-    importer = main_src[start:main_src.index("\nasync def ", start + 1)]
+    importer = inspect.getsource(block_import._apply_exchange_section_on_import)
     proposer_src = (root / "validator" / "node_integration.py").read_text()
     bodies = {
         "importer": importer,

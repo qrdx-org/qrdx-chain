@@ -19,6 +19,8 @@ import pytest
 
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.node import main as node_main
+from qrdx.node import discovery as node_discovery
+from qrdx.node import sync as node_sync
 from qrdx.node.nodes_manager import NodeInterface, NodesManager
 from qrdx.rpc.modules.p2p import P2PModule
 
@@ -83,7 +85,7 @@ def _receiver(next_height=1):
 
 async def test_pushed_blocks_reach_the_pos_import_path(chain, pushed):
     batches, _ = pushed
-    await node_main._push_sync_to_peer(PEER, 1, chain, {"id": 6})
+    await node_sync._push_sync_to_peer(PEER, 1, chain, {"id": 6})
     items = [item for batch in batches for item in batch]
     assert [i["id"] for i in items] == [1, 2, 3, 4, 5]
     for i in items:
@@ -105,7 +107,7 @@ async def test_a_refused_push_does_not_count_against_the_receiver(chain, pushed)
     rep = node_main.security.reputation_manager
     before = await rep.get_score(PEER["node_id"])
     for _ in range(6):  # more than enough refusals to have banned it before
-        await node_main._push_sync_to_peer(PEER, 1, chain, {"id": 6})
+        await node_sync._push_sync_to_peer(PEER, 1, chain, {"id": 6})
     assert await rep.get_score(PEER["node_id"]) == before
     assert not await rep.is_banned(PEER["node_id"])
 
@@ -132,8 +134,8 @@ async def test_a_node_with_no_connectable_peer_rebootstraps(monkeypatch, tmp_pat
         if len(sleeps) > 2:
             raise _Stop
 
-    monkeypatch.setattr(node_main, "bootstrap_from_all_nodes", bootstrap)
+    monkeypatch.setattr(node_discovery, "bootstrap_from_all_nodes", bootstrap)
     monkeypatch.setattr(node_main.asyncio, "sleep", sleep)
     with pytest.raises(_Stop):
-        await node_main.periodic_peer_discovery()
+        await node_discovery.periodic_peer_discovery()
     assert len(bootstraps) == 2  # the startup bootstrap, then a retry in the periodic loop

@@ -332,6 +332,7 @@ async def test_the_real_rollback_hook_replays_in_forward_order():
     deposit so the deposit is accepted again — the old by-domain rebuild rejected it.
     """
     from qrdx.node import main as node_main
+    from qrdx.node import derived_state
 
     db, path = await _db()
     try:
@@ -351,7 +352,7 @@ async def test_the_real_rollback_hook_replays_in_forward_order():
         saved = node_main.db, node_main.EVM_STATE_MANAGER
         node_main.db, node_main.EVM_STATE_MANAGER = db, None
         try:
-            await node_main._rebuild_derived_state_after_rollback()
+            await derived_state._rebuild_derived_state_after_rollback()
         finally:
             node_main.db, node_main.EVM_STATE_MANAGER = saved
 

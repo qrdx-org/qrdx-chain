@@ -28,8 +28,9 @@ and does not harm liveness. Slot-eligibility + RANDAO + attestation checks
 from __future__ import annotations
 
 import ast
+import copy
+import functools
 import hashlib
-import json
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -146,8 +147,9 @@ def body_root(
         "exchange_transactions": list(exchange_section or ()),
         "evm_transactions": list(evm_section or ()),
     }
-    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return hashlib.sha256(b"qrdx-block-body:" + encoded.encode()).hexdigest()
+    from .. import native  # (the same bytes, written in Rust when it is installed)
+
+    return native.body_root(b"qrdx-block-body:", body)
 
 
 def block_integrity_error(
@@ -180,9 +182,43 @@ def block_integrity_error(
     return ""
 
 
+# What ``ast.literal_eval`` builds a node for: a parse costs in proportion to these, not to the
+# text's length (a 4 MB signature is one string, read in milliseconds; 4 MB of ``1,1,1,…`` is two
+# million numbers, about four seconds). Counted in the raw text, quotes and all, so the count is
+# as cheap as a scan and the same on every node.
+_STRUCTURE = ",:[{('\"+-"
+
+
+def max_content_structure() -> int:
+    """How much structure a block's content may have (``_STRUCTURE``, counted): twice a full
+    block's — a header (about 90), a vote (64) and a slashing proof (184) each — plus room for a
+    graffiti. A block over it is refused before it is parsed (docs/BLOCK_LIMITS.md)."""
+    from ..block_limits import MAX_SLASHING_EVIDENCE_PER_BLOCK
+    from ..constants import MAX_ATTESTATIONS_PER_BLOCK
+
+    return 1024 + 128 * MAX_ATTESTATIONS_PER_BLOCK + 512 * MAX_SLASHING_EVIDENCE_PER_BLOCK
+
+
+def content_structure(text: str) -> int:
+    return sum(text.count(c) for c in _STRUCTURE)
+
+
+@functools.lru_cache(maxsize=8)
+def _parse_text(text: str) -> Any:
+    if content_structure(text) > max_content_structure():
+        raise ValueError("block content has more structure than a block may")
+    return ast.literal_eval(text)
+
+
 def _parse_block_content(block_content: Any) -> Dict[str, Any]:
     """Block content is ``str(block.to_dict())`` — a Python-dict repr — or that text as it is
-    stored, compressed (qrdx/block_codec.py)."""
+    stored, compressed (qrdx/block_codec.py).
+
+    Content comes from anyone who submits a block, and every import path parses it several
+    times before the proposer's signature is checked. So content with more structure than a
+    block can have (``max_content_structure``) is refused unparsed, and a parse is done once
+    per content: each call gets its own copy, as when every call parsed (tests/
+    test_fuzz_decoders.py)."""
     if isinstance(block_content, dict):
         return block_content
     if isinstance(block_content, (bytes, bytearray, memoryview)):
@@ -191,7 +227,7 @@ def _parse_block_content(block_content: Any) -> Dict[str, Any]:
         block_content = decode(block_content)
     if not isinstance(block_content, str) or not block_content:
         raise ValueError("empty/invalid block_content")
-    return ast.literal_eval(block_content)
+    return copy.deepcopy(_parse_text(block_content))
 
 
 def is_double_sign(block_content_a: Any, block_content_b: Any) -> bool:
@@ -205,6 +241,8 @@ def is_double_sign(block_content_a: Any, block_content_b: Any) -> bool:
         a = _parse_block_content(block_content_a)
         b = _parse_block_content(block_content_b)
     except Exception:
+        return False
+    if not isinstance(a, dict) or not isinstance(b, dict):
         return False
     pa, pb = a.get("proposer_address"), b.get("proposer_address")
     if not pa or pa != pb:

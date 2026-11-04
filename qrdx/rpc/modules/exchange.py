@@ -41,7 +41,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from ..server import RPCError, RPCErrorCode, RPCModule, rpc_method
+from ..server import RPCError, RPCErrorCode, RPCModule, peer_only, rpc_method
 
 
 def _manager():
@@ -67,6 +67,20 @@ class ExchangeModule(RPCModule):
         if not ok:
             raise RPCError(RPCErrorCode.TRANSACTION_REJECTED, err)
         return tx_hash
+
+    @rpc_method
+    @peer_only
+    async def announceTransactions(self, hashes: List[str]) -> List[str]:
+        """Which of these exchange transactions, announced by a peer, this node lacks: the peer
+        sends those next (qrdx/exchange/submission.py)."""
+        from ...exchange.submission import ANNOUNCE_BATCH
+
+        submitter = getattr(self.context, "submitter", None)
+        if submitter is None:
+            raise RPCError(RPCErrorCode.RESOURCE_UNAVAILABLE, "exchange submission unavailable")
+        if not isinstance(hashes, list) or len(hashes) > ANNOUNCE_BATCH:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, f"at most {ANNOUNCE_BATCH} hashes")
+        return submitter.wanted(hashes)
 
     @rpc_method
     async def getSigningPayload(self, tx: Dict[str, Any]) -> Dict[str, Any]:

@@ -36,9 +36,11 @@ from .transactions import ExchangeOpType, ExchangeTransaction
 logger = logging.getLogger(__name__)
 
 # Defaults (DoS resistance + bounded queuing)
-DEFAULT_MAX_MEMPOOL = 8192  # total admitted txs
-DEFAULT_MAX_PER_SENDER = 64  # queued txs per sender
-DEFAULT_MAX_NONCE_GAP = 64  # how far ahead of expected a nonce may be
+# Sized for 4,000 operations a second (docs/PERFORMANCE.md): about 16 s of the whole network's
+# traffic, and a market maker's quotes for many blocks.
+DEFAULT_MAX_MEMPOOL = 65_536  # total admitted txs
+DEFAULT_MAX_PER_SENDER = 256  # queued txs per sender
+DEFAULT_MAX_NONCE_GAP = 256  # how far ahead of expected a nonce may be
 
 # nonce lane (``ExchangeTransaction.nonce_key``: the account, or account|signer) -> next nonce
 NonceProvider = Callable[[str], int]
@@ -85,6 +87,7 @@ class ExchangeMempool:
         self.max_size = max_size
         self.max_per_sender = max_per_sender
         self.max_nonce_gap = max_nonce_gap
+        self._pruned_at = float("-inf")
         self._nonce_provider = nonce_provider or _default_nonce_provider
         self._vote_seq = vote_seq_provider or _default_vote_seq_provider
         self._signer_check = signer_check or _default_signer_check
@@ -124,12 +127,12 @@ class ExchangeMempool:
                 return False, str(e)
 
         # More gas than a block may carry: it could never be included (docs/BLOCK_LIMITS.md).
-        from ..constants import BLOCK_EXCHANGE_GAS_LIMIT
+        from ..block_limits import exchange_gas_limit_at
 
-        if int(tx.gas_limit) > BLOCK_EXCHANGE_GAS_LIMIT:
+        most = exchange_gas_limit_at(None)
+        if int(tx.gas_limit) > most:
             return False, (
-                f"gas limit {tx.gas_limit} exceeds the block's exchange gas limit "
-                f"{BLOCK_EXCHANGE_GAS_LIMIT}"
+                f"gas limit {tx.gas_limit} exceeds the block's exchange gas limit {most}"
             )
 
         tx_hash = tx.tx_hash()
@@ -155,7 +158,7 @@ class ExchangeMempool:
         #    (and eventually the whole pool) would be locked out by its own history.
         self._prune_sender(lane)
         if len(self._txs) >= self.max_size:
-            self.prune_stale()
+            self.prune_stale(force=False)  # (full and swept a moment ago: refuse, not sweep again)
         if len(self._txs) >= self.max_size:
             return False, "mempool full"
         sender_hashes = self._by_sender.get(lane, set())
@@ -230,7 +233,11 @@ class ExchangeMempool:
         return [self._votes[v] for v in sorted(self._votes)]
 
     def select_for_block(
-        self, limit: int = 256, gas_limit: Optional[int] = None, min_price: int = 0
+        self,
+        limit: int = 10_000,
+        gas_limit: Optional[int] = None,
+        min_price: int = 0,
+        height: Optional[int] = None,
     ) -> List[ExchangeTransaction]:
         """
         Deterministically select an executable set for block inclusion.
@@ -238,7 +245,8 @@ class ExchangeMempool:
         For each sender, include a *gap-free* run of nonces starting at the
         sender's expected next nonce (expected, expected+1, …). Senders are
         ordered by address and the runs concatenated, capped at ``limit`` operations and
-        ``gas_limit`` declared gas (default ``BLOCK_EXCHANGE_GAS_LIMIT``, docs/BLOCK_LIMITS.md),
+        ``gas_limit`` declared gas (default: the limit at ``height``, the block being built;
+        ``BLOCK_EXCHANGE_GAS_LIMIT``, docs/BLOCK_LIMITS.md),
         offering at least ``min_price`` (the block's exchange base fee; oracle votes are exempt);
         a sender's run stops at the first operation that does not fit or pays too little.
         Oracle votes go first.
@@ -247,10 +255,10 @@ class ExchangeMempool:
         the same mempool contents + committed state — the basis for D2.
         """
         if gas_limit is None:
-            from ..constants import BLOCK_EXCHANGE_GAS_LIMIT
+            from ..block_limits import exchange_gas_limit_at
 
-            gas_limit = BLOCK_EXCHANGE_GAS_LIMIT
-        self.prune_stale()
+            gas_limit = exchange_gas_limit_at(height)
+        self.prune_stale(force=False)
         selected: List[ExchangeTransaction] = []
         gas = 0
         for vote in self.votes():  # prices first
@@ -304,13 +312,23 @@ class ExchangeMempool:
         expected = self._nonce_provider(sender)
         return self.remove([h for h in hashes if self._txs[h].nonce < expected])
 
-    def prune_stale(self) -> int:
+    # The most often ``prune_stale`` sweeps the whole pool when a proposer selects. A sweep reads
+    # every transaction; at every proposal, with a backlog of tens of thousands, it was a share of
+    # building each block. It is hygiene: selection starts each sender at its expected nonce,
+    # and a block judges expiry by its own time.
+    PRUNE_INTERVAL = 1.0
+
+    def prune_stale(self, force: bool = True) -> int:
         """
         Drop txs whose nonce is now below the sender's expected nonce (e.g. a
         competing tx for that nonce was committed). Returns the number pruned.
+        ``force=False``: only if the last sweep was ``PRUNE_INTERVAL`` ago.
         """
         import time as _time
 
+        if not force and _time.monotonic() - self._pruned_at < self.PRUNE_INTERVAL:
+            return 0
+        self._pruned_at = _time.monotonic()
         to_remove: List[str] = []
         now = _time.time()  # (local hygiene only: blocks judge expiry by their own time)
         for sender, hashes in list(self._by_sender.items()):

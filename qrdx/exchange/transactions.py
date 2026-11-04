@@ -31,13 +31,14 @@ Security:
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 ZERO = Decimal("0")
 
@@ -61,7 +62,12 @@ _SIGNING_TAG = b"QRDX-EXCHANGE-TX-v1\x00"
 def _wei_per_qrdx() -> Decimal:
     from .. import constants
 
-    return Decimal(constants.WEI_PER_QRDX)
+    return _decimal_of(constants.WEI_PER_QRDX)
+
+
+@functools.lru_cache(maxsize=8)
+def _decimal_of(n: int) -> Decimal:
+    return Decimal(n)
 
 
 # ---------------------------------------------------------------------------
@@ -259,10 +265,16 @@ class ExchangeTransaction:
 
     def signature_gas(self) -> int:
         """What verifying the signature costs beyond a single key's: a multisig's every
-        partial signature (``MULTISIG_GAS_PER_SIGNATURE`` each)."""
+        partial signature (``MULTISIG_GAS_PER_SIGNATURE`` each). Remembered for the signature
+        it was counted for (asked several times a transaction)."""
+        memo = self.__dict__.get("_signature_gas")
+        if memo is not None and memo[0] is self.signature:
+            return memo[1]
         from ..crypto import multisig_wire
 
-        return multisig_wire.signer_count(self.signature) * MULTISIG_GAS_PER_SIGNATURE
+        gas = multisig_wire.signer_count(self.signature) * MULTISIG_GAS_PER_SIGNATURE
+        self.__dict__["_signature_gas"] = (self.signature, gas)
+        return gas
 
     def nonce_key(self) -> str:
         """The nonce sequence this transaction takes its nonce from: the account's own, or
@@ -361,21 +373,58 @@ class ExchangeTransaction:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> ExchangeTransaction:
-        """Deserialize from a dictionary."""
+        """Deserialize from a dictionary: a block's section, a gossiped or a submitted
+        transaction. ValueError for a field no transaction could have — one that cannot be
+        hashed (a nonce or gas limit that is not an 8-byte whole number, a sender that is not
+        text), hex that is not hex, a signer that is not an address's text, a gas price that is
+        not a number. Such a transaction never verified (it raised on the way, wherever it
+        met), so refusing it here changes no block's validity; it only keeps the checks after
+        this one from meeting types they do not expect (tests/test_fuzz_decoders.py)."""
+        if not isinstance(data, dict):
+            raise ValueError("an exchange transaction is an object")
+        missing = [k for k in ("op_type", "sender", "nonce", "params") if k not in data]
+        if missing:
+            raise ValueError(f"exchange transaction missing {', '.join(missing)}")
+        try:
+            op_type = ExchangeOpType(data["op_type"])
+        except (TypeError, ValueError):
+            raise ValueError(f"unknown operation type {data['op_type']!r}") from None
+        if not isinstance(data["sender"], str):
+            raise ValueError("sender is an address")
+        nonce = data["nonce"]
+        gas_limit = data.get("gas_limit", 100_000)
+        for name, value in (("nonce", nonce), ("gas_limit", gas_limit)):
+            if not isinstance(value, int) or not 0 <= value < 2**64:
+                raise ValueError(f"{name} is a whole number below 2**64")
+        gas_price = data.get("gas_price", _min_gas_price())
+        if not isinstance(gas_price, (int, float, str)):
+            raise ValueError("gas_price is a number of wei")
+        signer = data.get("signer") or ""
+        if not isinstance(signer, str):
+            raise ValueError("signer is an address")
+
+        def _hex(key: str) -> bytes:
+            raw = data.get(key)
+            if not raw:
+                return b""
+            if not isinstance(raw, str):
+                raise ValueError(f"{key} is hex")
+            return bytes.fromhex(raw)
+
         return cls(
-            op_type=ExchangeOpType(data["op_type"]),
+            op_type=op_type,
             sender=data["sender"],
-            nonce=data["nonce"],
+            nonce=nonce,
             params=data["params"],
-            gas_limit=data.get("gas_limit", 100_000),
-            gas_price=data.get("gas_price", _min_gas_price()),
+            gas_limit=gas_limit,
+            gas_price=cast(int, gas_price),  # (__post_init__ makes a whole number of wei an int)
             timestamp=data.get("timestamp", 0.0),
-            signature=bytes.fromhex(data["signature"]) if data.get("signature") else b"",
-            public_key=bytes.fromhex(data["public_key"]) if data.get("public_key") else b"",
+            signature=_hex("signature"),
+            public_key=_hex("public_key"),
             # Absent means unbound (0): such a transaction never verifies. Never defaulted to
             # this network's id — that would make an unbound signature valid everywhere.
             chain_id=data.get("chain_id") or 0,
-            signer=data.get("signer") or "",
+            signer=signer,
         )
 
     def to_hex(self) -> str:
@@ -417,7 +466,7 @@ class ExchangeTransaction:
         """The block time after which the action may not be included (the signed
         ``params.expires_at``, as Hyperliquid's ``expiresAfter``); None if it never expires (or
         the value is not a time)."""
-        raw = (self.params or {}).get("expires_at")
+        raw = self.params.get("expires_at") if isinstance(self.params, dict) else None
         if raw is None or isinstance(raw, bool):
             return None
         try:
@@ -442,6 +491,12 @@ class ExchangeTransaction:
             raise ValueError("Nonce must be non-negative")
         if self.gas_limit <= 0:
             raise ValueError("Gas limit must be positive")
+        if not isinstance(self.gas_price, (int, float, Decimal)):
+            raise ValueError(f"gas_price must be a number of wei, got {self.gas_price!r}")
+        # (Params are an object. A falsy non-object — null, [] — has always read as {}; any
+        # other made every check below raise. Each check after this one may rely on it.)
+        if self.params and not isinstance(self.params, dict):
+            raise ValueError("params must be an object")
         if self.gas_price < 0 or (self.gas_price == 0 and not self.free_eligible()):
             raise ValueError(
                 "Gas price must be positive (0 only for a trading operation in the free lane)"
@@ -465,7 +520,7 @@ class ExchangeTransaction:
 
     def _validate_params(self) -> None:
         """Validate operation-specific parameters."""
-        p = self.params
+        p = self.params or {}
         op = self.op_type
 
         if op == ExchangeOpType.CREATE_POOL:
@@ -813,7 +868,7 @@ class ExchangeTransaction:
             pass  # the sender exits their own validator; no extra params
 
         elif op == ExchangeOpType.REMOVE_POOL:
-            if not self.params.get("pool_id"):
+            if not p.get("pool_id"):
                 raise ValueError("REMOVE_POOL missing param: pool_id")
 
     # -- Identification -----------------------------------------------------

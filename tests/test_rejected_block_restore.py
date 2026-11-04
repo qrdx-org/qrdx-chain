@@ -23,6 +23,9 @@ import pytest
 
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.node import main as node_main
+from qrdx.node import block_import
+from qrdx.node import derived_state
+from qrdx.node import evm_runtime
 
 from pq_addrs import pq
 
@@ -30,11 +33,13 @@ from pq_addrs import pq
 # ── Every rejection after state mutation restores ──────────────────────────
 
 def _main_src():
-    return source_of(node_main)
+    from node_source import normalized_node_source
+
+    return normalized_node_source()
 
 
 def test_sync_path_restores_on_evm_and_e_d4_rejection():
-    src = source_of(node_main.process_and_create_block)
+    src = source_of(block_import.process_and_create_block)
     evm = src.index('Rejecting PoS block {block_height}: {verr_evm}')
     ed4 = src.index('Rejecting block {block_height}: E-D4')
     assert "_restore_after_rejected_block(" in src[evm:evm + 300]
@@ -65,12 +70,12 @@ def test_the_p2p_hook_is_injected():
              and getattr(n.func, "attr", getattr(n.func, "id", None)) == "set_node_context"]
     assert calls
     for call in calls:
-        hooks = {k.arg: getattr(k.value, "id", None) for k in call.keywords}
-        assert hooks.get("restore_after_rejected_block") == "_restore_after_rejected_block"
+        hooks = {k.arg: ast.unparse(k.value) for k in call.keywords}
+        assert hooks.get("restore_after_rejected_block") == "_derived._restore_after_rejected_block"
 
 
 def test_restore_uses_the_full_derived_state_rebuild():
-    src = source_of(node_main._restore_after_rejected_block)
+    src = source_of(derived_state._restore_after_rejected_block)
     assert "_rebuild_derived_state_after_rollback()" in src
     assert "rollback()" in src
 
@@ -88,7 +93,7 @@ async def test_restore_undoes_a_rejected_blocks_uncommitted_credit():
         node_main.db, node_main.EVM_STATE_MANAGER = db, None
         who = pq("rejected-credit")
         await db.apply_account_balance_delta(who, Decimal("100"))   # the rejected block's effect
-        await node_main._restore_after_rejected_block(7, "test")
+        await derived_state._restore_after_rejected_block(7, "test")
         await db.connection.commit()                                # a later block commits
         assert await db.get_address_balance(who) == 0, (
             "a rejected block's credit survived and was committed by the next block")
@@ -119,7 +124,7 @@ async def test_the_rebuild_resets_mempool_nonce_expectations():
         node_main.EVM_PENDING_NONCE.clear()
         node_main.EVM_PENDING_NONCE[sender] = 5       # bumped by an orphaned block's txs
 
-        await node_main._reset_evm_pending_nonces()
+        await evm_runtime._reset_evm_pending_nonces()
         assert node_main.EVM_PENDING_NONCE.get(sender) == 3, (
             "the mempool still expects the orphaned block's nonces — re-queued "
             "transactions would be refused as 'nonce too low'")
@@ -133,5 +138,5 @@ async def test_the_rebuild_resets_mempool_nonce_expectations():
 
 
 def test_the_rollback_rebuild_resets_nonces():
-    src = source_of(node_main._rebuild_derived_state_after_rollback)
+    src = source_of(derived_state._rebuild_derived_state_after_rollback)
     assert "_reset_evm_pending_nonces()" in src

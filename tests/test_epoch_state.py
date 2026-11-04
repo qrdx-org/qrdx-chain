@@ -350,9 +350,10 @@ async def test_a_historical_block_is_judged_against_its_own_epochs_set(chain):
 def test_every_import_path_enforces_eligibility():
     """Sync and fork-choice adoption used to trust-replay it (``not is_bulk_sync``)."""
     from qrdx.node import main
-    src = inspect.getsource(main.process_and_create_block)
+    from qrdx.node import block_import
+    src = inspect.getsource(block_import.process_and_create_block)
     assert "enforce=_ENFORCE_PROPOSER_ELIGIBILITY," in src and "not is_bulk_sync" not in src
-    assert main._ENFORCE_PROPOSER_ELIGIBILITY
+    assert block_import._ENFORCE_PROPOSER_ELIGIBILITY
 
 
 async def test_finality_weighs_each_target_by_its_own_epochs_state(chain):

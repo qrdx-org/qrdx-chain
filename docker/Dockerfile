@@ -8,6 +8,7 @@
 #   * the base image by digest;
 #   * Debian packages through a fixed snapshot.debian.org timestamp;
 #   * liboqs by release tag AND commit (checked);
+#   * the Rust toolchain by version, its installer by sha256, and every crate by Cargo.lock;
 #   * every Python package by version AND sha256 (release/requirements.lock), and the build
 #     backends for the few that ship only as source (release/build-requirements.lock);
 #   * time: SOURCE_DATE_EPOCH (the release commit's time) drives every timestamp — file times
@@ -22,8 +23,9 @@
 # exporter options a reproducible build needs). A plain build still works for development:
 #   docker build -f docker/Dockerfile -t qrdx-node:local .          # context = repo root
 #
-# Stages: base (pinned apt) → liboqs (PQ crypto C library) → wheels (Python dependencies) →
-#         app (application files, normalised) → runtime (no compilers).
+# Stages: base (pinned apt) → liboqs (PQ crypto C library) → native (the Rust module, against
+#         that liboqs) → wheels (Python dependencies) → app (application files, normalised) →
+#         runtime (no compilers).
 # =============================================================================
 
 # python:3.11.17-slim-bookworm (multi-arch index digest).
@@ -100,6 +102,39 @@ RUN set -eux; \
         -DOQS_DIST_BUILD=ON \
         -DCMAKE_C_FLAGS="-ffile-prefix-map=/src/liboqs=. -g0"; \
     ninja -C /src/liboqs/build install
+
+# -----------------------------------------------------------------------------
+# native — the Rust module (native/qrdx-native; docs/NATIVE.md), linked against the liboqs
+# above: the library the node verifies with through liboqs-python, so a signature is judged by
+# one implementation however it is checked.
+# -----------------------------------------------------------------------------
+FROM liboqs AS native
+ARG SOURCE_DATE_EPOCH
+ARG RUST_VERSION=1.86.0
+ARG RUSTUP_VERSION=1.28.2
+ARG RUSTUP_INIT_SHA256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:${PATH} \
+    QRDX_OQS_LIB_DIR=/opt/liboqs/lib \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    RUSTFLAGS="--remap-path-prefix=/build/native=. --remap-path-prefix=/opt/cargo=cargo -C debuginfo=0"
+RUN apt-get update && apt-get install -y curl && apt-clean-reproducible
+RUN set -eux; \
+    curl -sSf -o /tmp/rustup-init \
+        "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"; \
+    echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init" | sha256sum -c -; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --profile minimal --default-toolchain "${RUST_VERSION}" --no-modify-path; \
+    rm /tmp/rustup-init
+COPY release/build-requirements.lock /build/build-requirements.lock
+RUN pip install --no-compile --require-hashes --no-deps -r /build/build-requirements.lock
+COPY native/qrdx-native /build/native
+RUN set -eux; cd /build/native; \
+    cargo fetch --locked; \
+    maturin build --release --locked --auditwheel skip --interpreter python3 -o /native-wheels
 
 # -----------------------------------------------------------------------------
 # wheels — every Python dependency, hash-verified; source-only ones built deterministically
@@ -195,6 +230,8 @@ RUN ldconfig && apt-clean-reproducible
 # would embed build-time state; Python compiles in memory at import instead.
 RUN --mount=type=bind,from=wheels,source=/wheels,target=/wheels \
     pip install --no-compile --no-index --no-deps /wheels/*.whl
+RUN --mount=type=bind,from=native,source=/native-wheels,target=/native-wheels \
+    pip install --no-compile --no-index --no-deps /native-wheels/*.whl
 
 WORKDIR /app
 # Owned by the runtime user (created below with this uid/gid) in the same layer that adds it.
@@ -208,7 +245,8 @@ mechs = oqs.get_enabled_sig_mechanisms();\
 assert 'ML-DSA-65' in mechs, 'ML-DSA-65 missing from liboqs build';\
 print('liboqs', oqs.oqs_version(), '| liboqs-python', oqs.oqs_python_version(), '| ML-DSA-65 OK')" \
     && python -c "from eth.vm.forks.qrdx import QRDXVM; print('py-evm QRDXVM OK')" \
-    && python -c "import qrdx.constants; print('qrdx package OK')"
+    && python -c "import qrdx.constants; print('qrdx package OK')" \
+    && python -c "import qrdx.native as n; assert n.AVAILABLE; print('native module OK')"
 
 # Non-root runtime user. UID/GID 1000 matches the default `user:` in the compose files so
 # bind-mounted data directories stay writable. /testnet exists in the image so that a named

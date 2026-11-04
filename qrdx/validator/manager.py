@@ -657,7 +657,8 @@ class ValidatorManager:
             attestations=attestations,
             transactions=transactions,
             slashing_evidence=slashing_evidence,
-            graffiti=self.config.graffiti,
+            # (at most 64 characters: a block's content has a structure budget — block_verification)
+            graffiti=str(self.config.graffiti or "")[:64],
         )
 
         # The base fees, then the body, then the header's signature (which commits to both).

@@ -56,6 +56,7 @@ un-does the unification.
 
 from __future__ import annotations
 
+import functools
 from typing import Union
 
 from .hashing import keccak256
@@ -199,7 +200,15 @@ def to_account_id(address: Union[str, bytes, bytearray, memoryview]) -> str:
 
     if not isinstance(address, str):
         raise ValueError(f"address must be str or bytes, got {type(address).__name__}")
+    return _account_id_of_text(address)
 
+
+@functools.lru_cache(maxsize=262144)
+def _account_id_of_text(address: str) -> str:
+    """``to_account_id`` of text, remembered: a PQ address's id is a keccak of its key hash, and
+    every balance read and write, every ledger move and every transaction derived it again
+    (docs/PERFORMANCE.md). Pure, so remembering it changes nothing. (An unkeyable address
+    raises each time: errors are not remembered.)"""
     addr = address.strip()
     if not addr:
         raise ValueError("empty address")

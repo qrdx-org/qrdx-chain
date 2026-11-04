@@ -187,11 +187,14 @@ PARAMS: Dict[str, Param] = {
     # sum of the transactions' declared gas limits, checked before anything runs.
     # The EVM's: py-evm runs its cheapest instructions at ~1.9 Mgas/s (measured), so a block of
     # them takes ~0.5 s — two 250 ms slots — while 1,000,000 still fits a token contract's
-    # deployment. The exchange's: its operations run ~200x faster per unit of gas; 20,000,000
-    # is ~500 orders, ~40 ms of execution.
+    # deployment.
     "BLOCK_GAS_LIMIT": Param("int", 1_000_000, "QRDX_BLOCK_GAS_LIMIT", minimum=21_000),
+    # The exchange's: 80,000,000 is 2,000 transfers or spot orders a block (1,333 perp orders).
+    # The base fee targets half of it, so the sustained rate at 250 ms slots is 4,000 transfers
+    # a second, with bursts to 8,000 (docs/PERFORMANCE.md). It was 20,000,000 (500 a block).
+    # Height-aware: a fork may raise it on a running network (docs/BLOCK_LIMITS.md).
     "BLOCK_EXCHANGE_GAS_LIMIT": Param(
-        "int", 20_000_000, "QRDX_BLOCK_EXCHANGE_GAS_LIMIT", minimum=1_000_000
+        "int", 80_000_000, "QRDX_BLOCK_EXCHANGE_GAS_LIMIT", minimum=1_000_000, height_aware=True
     ),
     # Exchange / perps.
     # The perp markets every network starts with, priced by the validators' votes
@@ -416,6 +419,15 @@ FEATURES: Dict[str, str] = {
         "application writes (qrdx/validator/validator_root.py), so a snapshot's validator state "
         "can be verified against a signed root (docs/CHECKPOINT_SYNC.md)."
     ),
+    "evm_conformance": (
+        "The EVM follows Ethereum where it did not (docs/EVM_CONFORMANCE.md): a transaction's "
+        "intrinsic gas comes out of its gas limit before the message runs and is paid on top of "
+        "what it executes (it was only a floor), the payer buys the gas limit up front and gets "
+        "back what is unused with EIP-3529's refund, the sender and recipient start warm "
+        "(EIP-2929), a creation onto an account that has code or a nonce fails, MODEXP of an "
+        "empty base is 0 raised to the exponent (it returned 0), and 0x0202 reverts like the "
+        "other retired precompiles (it answered a hash and sent nothing)."
+    ),
     "exchange_inclusion": (
         "A block carries only exchange transactions that run. They are judged together before "
         "any runs (form, signer, expiry, each lane's nonces in sequence, gas, the free lane), "
@@ -437,6 +449,7 @@ GENESIS_DEFAULT_FEATURES: Tuple[str, ...] = (
     "evm_standard_precompiles",
     "validator_state_root",
     "exchange_inclusion",
+    "evm_conformance",
 )
 
 
@@ -1291,7 +1304,8 @@ def use_spec(spec: ChainSpec) -> Iterator[ChainSpec]:
 # headers a validator signed at one slot on a testnet are a valid DOUBLE_SIGN proof on every
 # network where it uses the same key.
 # p2p-handshake: a node proving its identity to a peer (qrdx.rpc.modules.p2p).
-SIGNING_PURPOSES = ("block", "attestation", "randao", "p2p-handshake")
+# peer-validator: a validator's key vouching for its own node (validator_peer_message).
+SIGNING_PURPOSES = ("block", "attestation", "randao", "p2p-handshake", "peer-validator")
 _SIGNING_DOMAIN_TAG = b"QRDX-SIGNING-DOMAIN-v1\x00"
 
 

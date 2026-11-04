@@ -432,6 +432,7 @@ def test_the_node_serves_all_of_it():
     """Every surface is wired in the node: REST routes, always-on RPC modules, the stream."""
     import inspect
     from qrdx.node import main
+    from qrdx.node.api import observability as observability_api
     paths = {getattr(r, "path", None) for r in main.app.routes}
     for path in ("/submit_exchange_tx", "/exchange_signing_payload", "/get_exchange_receipt",
                  "/get_exchange_nonce", "/get_perp_account", "/get_perp_orders",
@@ -443,4 +444,4 @@ def test_the_node_serves_all_of_it():
                  "exchange_getSigningPayload", "perp_getMarkets", "perp_getAccount",
                  "perp_getOrderBook", "perp_getEvents"):
         assert name in methods, name
-    assert "handle_client_frame(EVENT_HUB, q, frame)" in inspect.getsource(main.ws_stream)
+    assert "handle_client_frame(EVENT_HUB, q, frame)" in inspect.getsource(observability_api.ws_stream)

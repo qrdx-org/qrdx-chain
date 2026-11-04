@@ -6,7 +6,7 @@ rises with demand.
 
 | Part | Where |
 |---|---|
-| The limits, checked on every import path | `qrdx/block_limits.py` (from `_verify_chain_rules` in `qrdx/node/main.py`) |
+| The limits, checked on every import path | `qrdx/block_limits.py` (from `_verify_chain_rules` in `qrdx/node/block_import.py`) |
 | EVM gas of a section | `qrdx/contracts/evm_block_apply.py` `section_gas_error` |
 | Matching paid per resting order | `qrdx/exchange/orderbook.py` `MatchBudget`, `EXCHANGE_GAS_PER_MAKER` |
 | Base fees | `qrdx/fee_market.py` |
@@ -22,9 +22,15 @@ A block is refused, before anything in it is verified or executed, if it carries
 |---|---|---|
 | EVM gas: its transactions' declared gas limits, summed | 1,000,000 | `BLOCK_GAS_LIMIT` (chain spec) |
 | EVM gas in a big block (every 240th, by height) | 3,000,000 | `BIG_BLOCK_GAS_LIMIT`, `BIG_BLOCK_INTERVAL` |
-| Exchange gas: its operations' declared gas limits, summed | 20,000,000 | `BLOCK_EXCHANGE_GAS_LIMIT` (chain spec) |
+| Exchange gas: its operations' declared gas limits, summed | 80,000,000 (was 20,000,000) | `BLOCK_EXCHANGE_GAS_LIMIT` (chain spec, height-aware) |
 | Votes, each a Dilithium signature to verify | 128 | `MAX_ATTESTATIONS_PER_BLOCK` |
 | Slashing proofs, each two signatures | 16 | `MAX_SLASHING_EVIDENCE_PER_BLOCK` |
+| Structure in its content: the characters `,:[{('"+-`, counted | 25,600 (1,024 + 128 a vote + 512 a slashing proof) | `block_verification.max_content_structure` |
+
+The structure limit is checked before the content is parsed. A parse costs in proportion to the
+structure it builds, so content built to be slow to parse could hold a node for seconds. It
+allows twice what a full block uses; a proposer's graffiti is cut to 64 characters, so honest
+blocks stay far inside it.
 
 Declared limits are summed, not gas used, so a block can be judged before any of it runs. The
 proposer fills blocks to the limits (`select_for_block`). The mempools refuse a transaction with
@@ -51,7 +57,30 @@ transactions run far faster per unit of gas: a transfer is about 1 ms.
 
 Exchange operations run in the node's own code, about 200 times faster per unit of gas. An
 order is ~75 µs, most of it verifying its Dilithium signature, against 40,000–60,000 gas.
-20,000,000 gas is about 500 orders, ~40 ms of execution.
+
+80,000,000 gas is 2,000 transfers or spot orders a block, or 1,333 perp orders. The base fee
+targets half of it, so at 250 ms slots the sustained rate is 4,000 transfers a second, with
+bursts to 8,000 (docs/PERFORMANCE.md). It was 20,000,000: 500 a block, 1,000 a second
+sustained. A node verifies a block's signatures in one parallel batch (docs/NATIVE.md) and runs
+the rest of the block's pipeline at about 4,450 transfers a second on one core.
+
+### Raising the exchange limit on a running network
+
+New networks start at 80,000,000. A network keeps the limit its genesis committed to, so
+existing testnets keep 20,000,000 until a fork changes it. `BLOCK_EXCHANGE_GAS_LIMIT` is a
+height-aware parameter: a fork in the network's chain spec may set it from a height on
+(docs/PROTOCOL_UPGRADES.md). Every consumer reads it for the height of the block it judges:
+
+* block checks (`block_limits.exchange_gas_limit_at`);
+* the proposer's selection;
+* the base fee, which uses the parent's limit.
+
+```json
+"forks": [{"name": "wider-blocks", "height": 250000, "features": [],
+           "params": {"BLOCK_EXCHANGE_GAS_LIMIT": 80000000}}]
+```
+
+A mempool admits any operation that fits the largest limit the schedule reaches.
 
 Run the script on the slowest hardware a network's validators use before setting its limits.
 

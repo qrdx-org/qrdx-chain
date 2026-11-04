@@ -21,6 +21,8 @@ import pytest
 
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.node import main as node_main
+from qrdx.node import block_import
+from qrdx.node import fork_choice
 
 from pq_addrs import pq
 
@@ -29,13 +31,14 @@ def _reloaded_defaults():
     saved = {k: os.environ.pop(k, None) for k in
              ("QRDX_ENFORCE_PARENT_CONTINUITY", "QRDX_ENFORCE_FORK_CHOICE_RECONCILE")}
     try:
-        mod = importlib.reload(node_main)
-        return mod._ENFORCE_PARENT_CONTINUITY, mod._ENFORCE_FORK_CHOICE_RECONCILE
+        return (importlib.reload(block_import)._ENFORCE_PARENT_CONTINUITY,
+                importlib.reload(fork_choice)._ENFORCE_FORK_CHOICE_RECONCILE)
     finally:
         for k, v in saved.items():
             if v is not None:
                 os.environ[k] = v
-        importlib.reload(node_main)
+        importlib.reload(block_import)
+        importlib.reload(fork_choice)
 
 
 def test_both_gates_are_on_by_default():
@@ -49,13 +52,13 @@ def test_reconciliation_enforce_path_is_not_a_stub():
     now runs the fork-choice resolver, which fetches and scores the peer's branch BEFORE it
     rolls anything back, and applies it after."""
     import inspect
-    src = inspect.getsource(node_main.resolve_fork_with_peer)
+    src = inspect.getsource(fork_choice.resolve_fork_with_peer)
     assert "intentionally not wired yet" not in inspect.getsource(
-        node_main.fork_choice_reconcile_pass)
+        fork_choice.fork_choice_reconcile_pass)
     assert src.index("get_blocks(") < src.index("ffg.prefer(") < src.index("_rollback_to(")
     assert src.index("_rollback_to(") < src.index("_apply_branch(branch")
     # ... all under one hold of the block-processing lock (tests/test_fork_resolution.py)
-    assert "async with _adopting_peer_chain(), block_processing_lock:" in src
+    assert "async with _sync._adopting_peer_chain(), _node.block_processing_lock:" in src
     assert "remote_height <= local_height" not in src, (
         "must not reuse _sync_blockchain's longest-chain gate: equal-height forks are "
         "exactly the case that gate declines")
@@ -73,7 +76,7 @@ async def _check(db, **kw):
     saved = node_main.db
     node_main.db = db
     try:
-        return await node_main._check_parent_continuity(
+        return await block_import._check_parent_continuity(
             6, str({"parent_hash": "ee" * 32, "slot": 6}), **kw)
     finally:
         node_main.db = saved
@@ -85,7 +88,7 @@ async def test_a_caller_that_omits_enforce_honours_the_gate(monkeypatch):
     `enforce`. That used to default to False, so p2p never enforced. It must now follow
     the global gate.
     """
-    monkeypatch.setattr(node_main, "_ENFORCE_PARENT_CONTINUITY", True)
+    monkeypatch.setattr(block_import, "_ENFORCE_PARENT_CONTINUITY", True)
     db = await _db_with_block(5, "aa" * 32)
     try:
         ok, err = await _check(db)            # no `enforce` — as p2p calls it
@@ -96,7 +99,7 @@ async def test_a_caller_that_omits_enforce_honours_the_gate(monkeypatch):
 
 
 async def test_gate_off_keeps_observe_behaviour(monkeypatch):
-    monkeypatch.setattr(node_main, "_ENFORCE_PARENT_CONTINUITY", False)
+    monkeypatch.setattr(block_import, "_ENFORCE_PARENT_CONTINUITY", False)
     db = await _db_with_block(5, "aa" * 32)
     try:
         ok, _ = await _check(db)
@@ -106,7 +109,7 @@ async def test_gate_off_keeps_observe_behaviour(monkeypatch):
 
 
 async def test_a_matching_parent_is_accepted(monkeypatch):
-    monkeypatch.setattr(node_main, "_ENFORCE_PARENT_CONTINUITY", True)
+    monkeypatch.setattr(block_import, "_ENFORCE_PARENT_CONTINUITY", True)
     db = await _db_with_block(5, "ee" * 32)
     try:
         ok, err = await _check(db)

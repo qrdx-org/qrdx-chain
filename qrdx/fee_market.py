@@ -27,6 +27,8 @@ run of full ones must get expensive in minutes. Twenty full big blocks multiply 
 from __future__ import annotations
 
 import contextvars
+import weakref
+from collections import OrderedDict
 from typing import Any, Iterable, Optional, Tuple
 
 # The EVM base fee of the block whose EVM section is executing (evm_block_apply sets it from the
@@ -118,24 +120,50 @@ def header_fees(block: Optional[dict]) -> Tuple[int, int]:
     )
 
 
-async def _stored_block(db: Any, height: int):
-    """(header content, exchange section, EVM section) of the stored block at ``height``, or
-    None if there is none."""
+# What a stored block contributes to its children's base fees, by block hash, for each database:
+# its header's fees, and the gas its sections declared. A block's hash commits to its header and
+# its body, so on one chain a hash names one block's worth, across reorganizations. Read once a
+# block: the parent's whole exchange section, read back and parsed for every block built or
+# imported on it, was megabytes a block at full load.
+_FEE_INPUTS: "weakref.WeakKeyDictionary[Any, OrderedDict]" = weakref.WeakKeyDictionary()
+_FEE_INPUTS_KEPT = 1024
+
+
+def _fee_cache(db: Any) -> Optional["OrderedDict"]:
+    try:
+        cache = _FEE_INPUTS.get(db)
+        if cache is None:
+            cache = _FEE_INPUTS[db] = OrderedDict()
+        return cache
+    except TypeError:  # (a database object that cannot be referenced weakly: not cached)
+        return None
+
+
+async def _stored_block(db: Any, height: int) -> Optional[Tuple[Tuple[int, int], int, int]]:
+    """(header fees, EVM gas, exchange gas) of the stored block at ``height``, or None if there
+    is none."""
     from .validator.block_verification import _parse_block_content
 
     block = await db.get_block_by_id(int(height))
     if not block:
         return None
+    block_hash = block.get("hash") or block.get("block_hash")
+    cache = _fee_cache(db) if block_hash else None
+    known = cache.get(block_hash) if cache is not None else None
+    if known is not None:
+        return known
     try:
         content = _parse_block_content(block.get("content") or block.get("block_content"))
     except (ValueError, SyntaxError):
         content = None  # no header to read: the floors (every node reads the same bytes)
-    block_hash = block.get("hash") or block.get("block_hash")
-    return (
-        content,
-        await db.get_block_exchange_txs(block_hash),
-        await db.get_block_evm_txs(block_hash),
-    )
+    evm_gas, _ = fee_gas((), await db.get_block_evm_txs(block_hash))
+    _, exchange_gas = fee_gas(await db.get_block_exchange_txs(block_hash), ())
+    inputs = (header_fees(content), evm_gas, exchange_gas)
+    if cache is not None:
+        cache[block_hash] = inputs
+        while len(cache) > _FEE_INPUTS_KEPT:
+            cache.popitem(last=False)
+    return inputs
 
 
 def _evm_track_parent(height: int) -> int:
@@ -157,8 +185,7 @@ async def base_fees_at(db: Any, height: int) -> Tuple[int, int]:
     parent, the block at ``height − 1``; the EVM's by the previous block of its kind
     (``_evm_track_parent``) — the parent, unless big blocks are in play (each stored, with its
     sections, before anything is built on it)."""
-    from .block_limits import evm_gas_limit_at, is_big_block
-    from .constants import BLOCK_EXCHANGE_GAS_LIMIT
+    from .block_limits import evm_gas_limit_at, exchange_gas_limit_at, is_big_block
 
     evm_floor, exchange_floor = floors()
     if height <= 1:  # the parent is genesis: no fees, no sections
@@ -166,11 +193,11 @@ async def base_fees_at(db: Any, height: int) -> Tuple[int, int]:
     parent = await _stored_block(db, int(height) - 1)
     if parent is None:
         return floors()
-    content, exchange, evm = parent
+    fees, evm_gas, exchange_gas = parent
     exchange_fee = next_base_fee(
-        header_fees(content)[1],
-        fee_gas(exchange, ())[1],
-        BLOCK_EXCHANGE_GAS_LIMIT,
+        fees[1],
+        exchange_gas,
+        exchange_gas_limit_at(int(height) - 1),  # (the parent's limit, its gas over its target)
         exchange_floor,
     )
     source_height = _evm_track_parent(int(height))
@@ -180,10 +207,10 @@ async def base_fees_at(db: Any, height: int) -> Tuple[int, int]:
         source = await _stored_block(db, source_height)
         if source is None:
             return evm_floor, exchange_fee
-        content, _exchange, evm = source
+        fees, evm_gas, _exchange_gas = source
     evm_fee = next_base_fee(
-        header_fees(content)[0],
-        fee_gas((), evm)[0],
+        fees[0],
+        evm_gas,
         evm_gas_limit_at(source_height),
         evm_floor,
         # A big block comes once an interval: its price moves faster, so that filling every big

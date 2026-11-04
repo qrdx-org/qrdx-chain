@@ -51,7 +51,15 @@ def encode_keyset(keyset: MultisigKeySet) -> bytes:
 
 
 def decode_keyset(material: bytes) -> MultisigKeySet:
-    """The keyset in ``material`` (its address derived from its keys and threshold)."""
+    """The keyset in ``material`` (its address derived from its keys and threshold); ValueError
+    if it is not one."""
+    try:
+        return _decode_keyset(material)
+    except (KeyError, TypeError, AttributeError, OverflowError, RecursionError) as e:
+        raise ValueError(f"malformed multisig keyset: {e!r}") from None
+
+
+def _decode_keyset(material: bytes) -> MultisigKeySet:
     data = json.loads(material.decode())
     if not isinstance(data, dict) or set(data) - {"m", "n", "public_keys"}:
         raise ValueError("a keyset is {m, n, public_keys}")
@@ -68,10 +76,14 @@ def encode_signature(signature: MultisigSignature) -> bytes:
 
 
 def decode_signature(material: bytes) -> MultisigSignature:
-    data = json.loads(material.decode())
-    if not isinstance(data, dict) or len(data.get("partials") or []) > MAX_KEYS:
-        raise ValueError("malformed multisig signature")
-    return MultisigSignature.from_dict(data)
+    """The signature in ``material``; ValueError if it is not one."""
+    try:
+        data = json.loads(material.decode())
+        if not isinstance(data, dict) or len(data.get("partials") or []) > MAX_KEYS:
+            raise ValueError("malformed multisig signature")
+        return MultisigSignature.from_dict(data)
+    except (KeyError, TypeError, AttributeError, OverflowError, RecursionError) as e:
+        raise ValueError(f"malformed multisig signature: {e!r}") from None
 
 
 def signer_count(signature: bytes) -> int:

@@ -234,8 +234,9 @@ def verify_signature(pubkey_hex: str, signature_hex: str, message: bytes) -> boo
     try:
         pub = bytes.fromhex(pubkey_hex)
         sig = bytes.fromhex(signature_hex)
-        verifier = oqs.Signature(PQ_ALGORITHM)
-        return verifier.verify(message, sig, pub)
+        from ..crypto.pq.dilithium import _verifier  # (this thread's: one per call cost)
+
+        return bool(_verifier().verify(message, sig, pub))
     except Exception:
         return False
 
