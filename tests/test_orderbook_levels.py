@@ -129,3 +129,20 @@ def test_an_undone_order_leaves_the_kept_order_as_it_was():
             raise RuntimeError("roll back")
     assert book._asks.prices() == before
     _check(book._asks)
+
+
+def test_one_price_in_any_spelling_is_one_level_to_the_digest():
+    """Orders at "2.0" and "2.00" rest at one level. Its payload named the level by whichever
+    spelling touched it, so the incremental digest differed from a full recomputation — a
+    restarted node's — and one order could split the network."""
+    book = _book()
+    for i, px in enumerate(["2.0", "2.00", "2", "2.000", "20E-1"]):
+        book.place_order(Order(id=f"s{i}", owner=f"0xPQ{i}", side=OrderSide.SELL,
+                               order_type=OrderType.LIMIT, price=D(px), amount=D(3),
+                               timestamp=1.0), protocol=True)
+        assert book.cached_digest() == book.state_digest(), px
+    book.place_order(Order(id="t", owner="0xPQt", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                           price=D("2.0000"), amount=D(4), timestamp=1.0), protocol=True)
+    assert len(book._asks) == 1
+    assert book.cached_digest() == book.state_digest()
+    book.verify_digest()                                       # (the level tree too)

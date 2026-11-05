@@ -56,6 +56,26 @@ the node's database is written only through its own connection; a snapshot is re
 the node starts. A tool writing `blocks` into a running node's database through another
 connection would not be seen until the next write or rollback through the node's own.
 
+## FIXED — One price written two ways could split the network
+
+**Severity: high (consensus).** Found 2026-11-05 while porting the order book to Rust
+(docs/EXCHANGE_ENGINE.md).
+
+A book's digest hashes each price level's payload, which began with the level's price as text.
+Prices come from parameters as written, and "2.0" and "2.00" are one level (equal `Decimal`s,
+one dict key). The incremental digest (`cached_digest`) named a level by the spelling of
+whatever touched it last in the block — a resting order at "2.00" on a level opened at "2.0" —
+while the full recomputation (`state_digest`, which a restarted node, a snapshot restore or a
+rollback that drops the cache computes) named it by its key. The two disagreed, so a node that
+recomputed in full computed a different exchange root from its peers. Two ordinary orders were
+enough; the level's proof-tree key had the same flaw.
+
+**Fixed** (`orderbook.price_text`): a level's payload and tree key name its price by its exact
+canonical text (trailing zeros dropped, never rounded), the same for every spelling. A format
+change, taken with the testnet's regenesis. `tests/test_orderbook_levels.py` checks the
+incremental digest and level tree against a full recomputation after each order at one price in
+five spellings.
+
 ## FIXED — Any peer could stall a node with a block built to parse slowly
 
 **Severity: high (liveness).** Found 2026-11-04 by fuzzing the decoders peers reach

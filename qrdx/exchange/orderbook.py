@@ -71,6 +71,24 @@ MAX_RECENT_TRADES = 1000  # display history per book — bounded, never consensu
 _CTX = Context(prec=78, rounding=ROUND_HALF_EVEN)
 
 
+def price_text(price: Any) -> str:
+    """A price as a level's payload and proof-tree key name it: its value, exactly, in one
+    spelling (trailing zeros dropped, never rounded). Prices come from parameters as written,
+    and "2.0" and "2.00" are one level: named by the spelling that touched it, the book's
+    incremental digest differed from its full recomputation (a restarted node's), so one
+    order could split the network."""
+    sign, coefficient, exponent = Decimal(str(price)).as_tuple()
+    if not isinstance(exponent, int):  # (an infinity or a NaN: as written)
+        return str(price)
+    digits = list(coefficient)
+    if not any(digits):
+        return "0"
+    while digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    return str(Decimal((sign, tuple(digits), exponent)))
+
+
 def _pinned(method):
     @functools.wraps(method)
     def wrapper(*args, **kwargs):
@@ -681,11 +699,11 @@ class OrderBook:
         """A price level's key in the book's proof tree (docs/STATE_PROOFS.md)."""
         from ..crypto import smt
 
-        return smt.key_of(b"\x21" + f"{tag}{price}".encode())
+        return smt.key_of(b"\x21" + f"{tag}{price_text(price)}".encode())
 
     def _level_payload(self, tag: str, price: Decimal, level: PriceLevel) -> bytes:
         """A level's canonical bytes: its orders in time priority (what its digest hashes)."""
-        parts = [f"{tag}{price}"]
+        parts = [f"{tag}{price_text(price)}"]
         for o in level.orders:  # time priority
             entry = (
                 f"{o.id}:{o.owner}:{o.side.value}:{o.order_type.value}:"
