@@ -29,6 +29,10 @@ getrandom = "0.2.15"
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
 num-integer = "0.1.46"
+# The exchange engine's state (src/book.rs): persistent maps, so a copy or an undo is a pointer.
+im = "15.1.0"
+# Python's repr of a float (src/book.rs): the shortest digits that read back, the closest of them.
+ryu = "1.0.18"
 
 [profile.release]
 opt-level = 3

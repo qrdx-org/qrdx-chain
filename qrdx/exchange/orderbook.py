@@ -1302,7 +1302,7 @@ class OrderBook:
         ):
             raise ValueError("Stop-loss requires positive stop_price")
         if order.tif not in ("gtc", "ioc", "fok", "alo"):
-            raise ValueError(f"unknown time in force {order.tif!r} (gtc, ioc, fok, alo)")
+            raise ValueError("unknown time in force (gtc, ioc, fok, alo)")
         if order.tif == "alo" and order.order_type != OrderType.LIMIT:
             raise ValueError("a post-only order must be a limit order")
         if order.tif != "gtc" and order.order_type == OrderType.STOP_LOSS:

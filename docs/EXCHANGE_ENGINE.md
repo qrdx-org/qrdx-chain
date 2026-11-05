@@ -26,7 +26,7 @@ the plan for moving the exchange into Rust, and what is done.
 |---|---|---|---|
 | E0 | Reference speed-ups | Sorted book sides (no sort per read), read-only token lookups, copy-free undo where nothing changes | done: orders 260–290 → 185–210 µs |
 | E1 | Exact decimal (`src/dec.rs`) | Python's `Decimal` — add, subtract, multiply, divide, quantize, compare, `str` — under any context, every rounding | done: held to `decimal` on 116,000 random cases |
-| E2 | Order book | Price levels, orders, matching (limit, market, iceberg, hidden, stop, expiry, self-trade), fees, trades, the book's digest and level tree, undo and snapshots | next |
+| E2 | Order book | Price levels, orders, matching (limit, market, iceberg, hidden, stop, expiry, self-trade), fees, trades, the book's digest and level tree, undo and snapshots | core done, not wired: held to Python on 16,800 random operations; found a consensus bug (one price in two spellings) |
 | E3 | Spot settlement | Escrow, token and QRDX moves, fees, the journal's fills: a plain limit order or cancel run natively end to end | |
 | E4 | Ledger | Token balances and nonces held natively, the database written behind the block | |
 | E5 | Router and pools | Unified liquidity (`plan_fill`): the AMM's tick math and the book together | |
@@ -55,6 +55,28 @@ Its test drives a Python book and a native book with the same random operations 
 market orders, icebergs, hidden and stop orders, expiries, self-trades, cancels, reductions,
 fills by plan, undone scopes, snapshots — and compares every trade, order, level, error and
 digest.
+
+### Where E2 stands (2026-11-05)
+
+`src/book.rs` (`NativeBook`) is the Python book, operation for operation: the same trades, the
+order as it ended, the same refusals word for word, every level's queue, the totals and the
+digest, after each of 16,800 random operations (`tests/test_native_book.py`; a fee rate changed
+by one basis point is caught). Its state is persistent, so a copy and a failed placement's
+rollback are pointer copies. Porting it found a consensus bug in the Python book, now fixed
+(docs/KNOWN_ISSUES.md: one price written two ways).
+
+It is not wired into the node, and on its own it would not make the exchange faster:
+
+* matching is about 11 µs of a spot order's ~190 in Python; the rest is the operation around
+  it (settlement, fees, undo bookkeeping, the journal), which is E3;
+* through its test interface (an order as a dict of 16 fields, in and out) it costs 20 µs an
+  order to Python's 11. Its decimals allocate every coefficient (`num-bigint`), where Python's
+  C `decimal` is fast on small values. The next step is a fast path in `dec.rs` — a 128-bit
+  coefficient while a value fits, big integers beyond — held to the same tests;
+* its full digest is twice as fast as Python's (11 ms to 23 at 10,600 resting orders).
+
+The book becomes the node's when E3 runs a plain limit order or cancel natively end to end, with
+the book behind the same interface the router and handlers use.
 
 ## What remains outside the engine
 

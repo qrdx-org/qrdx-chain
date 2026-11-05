@@ -20,6 +20,7 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyLong, PyString, Py
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
+mod book;
 mod canon;
 pub mod dec;
 mod lane;
@@ -246,6 +247,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<mtree::MNode>()?;
     m.add_function(wrap_pyfunction!(lthash::lt_mix_entries, m)?)?;
     m.add_function(wrap_pyfunction!(dec::dec_eval, m)?)?;
+    m.add_class::<book::NativeBook>()?;
+    m.add_function(wrap_pyfunction!(book::float_repr, m)?)?;
+    m.add_function(wrap_pyfunction!(book::blake2b_person, m)?)?;
     m.add_function(wrap_pyfunction!(lane::lane_judge, m)?)?;
     m.add_function(wrap_pyfunction!(lane::lane_run, m)?)?;
     m.add_class::<net::NetService>()?;

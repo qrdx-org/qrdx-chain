@@ -2,11 +2,14 @@
 
 from ._native import (
     MNode,
+    NativeBook,
     NetService,
     Unsupported,
+    blake2b_person,
     body_root_sha256,
     canonical_json,
     dec_eval,
+    float_repr,
     lane_judge,
     lane_run,
     lt_apply,
@@ -22,11 +25,14 @@ from ._native import (
 
 __all__ = [
     "MNode",
+    "NativeBook",
     "NetService",
     "Unsupported",
+    "blake2b_person",
     "body_root_sha256",
     "canonical_json",
     "dec_eval",
+    "float_repr",
     "lane_judge",
     "lane_run",
     "lt_apply",

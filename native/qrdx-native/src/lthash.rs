@@ -12,15 +12,15 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString, PyTuple};
 
-const LANES: usize = 1024;
-const SIZE: usize = 4 * LANES;
+pub(crate) const LANES: usize = 1024;
+pub(crate) const SIZE: usize = 4 * LANES;
 const WIDTH: usize = 5; // the widest committed row (state_commitment._WIDTH)
 
-type Vector = Box<[u16; LANES]>;
+pub(crate) type Vector = Box<[u16; LANES]>;
 
 /// lthash.entry: the low 16 bits of each little-endian u32 of 4,096 bytes of BLAKE3 over
 /// tag | len(data) (u32 LE) | data.
-fn entry(tag: &[u8], data: &[u8]) -> Option<Vector> {
+pub(crate) fn entry(tag: &[u8], data: &[u8]) -> Option<Vector> {
     let len = u32::try_from(data.len()).ok()?;
     let mut h = blake3::Hasher::new();
     h.update(tag);
@@ -33,6 +33,22 @@ fn entry(tag: &[u8], data: &[u8]) -> Option<Vector> {
         *lane = u16::from_le_bytes([out[4 * i], out[4 * i + 1]]);
     }
     Some(v)
+}
+
+/// ``lthash.Accumulator`` over ``items`` (each ``entry(tag, item)``): the digest's 4,096 bytes.
+pub(crate) fn accumulate<'a>(tag: &[u8], items: impl Iterator<Item = &'a [u8]>) -> Option<Vec<u8>> {
+    let mut total = [0u16; LANES];
+    for item in items {
+        let v = entry(tag, item)?;
+        for (t, x) in total.iter_mut().zip(v.iter()) {
+            *t = t.wrapping_add(*x);
+        }
+    }
+    let mut out = vec![0u8; SIZE];
+    for (i, lane) in total.iter().enumerate() {
+        out[4 * i..4 * i + 2].copy_from_slice(&lane.to_le_bytes());
+    }
+    Some(out)
 }
 
 /// Python's `str(value)`, "" for None (state_commitment._s), or None to hand the call over.

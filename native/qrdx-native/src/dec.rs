@@ -237,6 +237,34 @@ impl Dec {
         format!("{sign}{intpart}{fracpart}{exp}")
     }
 
+    /// The same value with its coefficient's trailing zeros dropped (and 0 for every zero):
+    /// equal values are equal here, whatever their spelling.
+    pub fn normalized(&self) -> Dec {
+        if self.is_zero() {
+            return Dec::zero();
+        }
+        let mut coef = self.coef.clone();
+        let mut exp = self.exp;
+        loop {
+            let (q, r) = coef.div_rem(&BigUint::from(10u32));
+            if !r.is_zero() {
+                break;
+            }
+            coef = q;
+            exp += 1;
+        }
+        Dec {
+            neg: self.neg,
+            coef,
+            exp,
+        }
+    }
+
+    /// ``orderbook.price_text``: the value's one spelling (``str`` of ``normalized``).
+    pub fn canonical_text(&self) -> String {
+        self.normalized().to_python_string()
+    }
+
     /// ``self.adjusted()``: the exponent of the most significant digit.
     pub fn adjusted(&self) -> i64 {
         self.exp + ndigits(&self.coef) as i64 - 1
