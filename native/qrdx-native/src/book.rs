@@ -14,6 +14,7 @@
 //! operations and compares every trade, order, level, error and digest.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use blake2::digest::core_api::{Buffer, UpdateCore, VariableOutputCore};
 use blake2::digest::{Update, VariableOutput};
@@ -24,6 +25,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 use crate::dec::{Dec, Rounding, EXCHANGE};
+
+/// An order id or an owner: shared, so copying a map node that holds it bumps a count rather
+/// than allocating (the state is persistent: every operation's savepoint shares it).
+pub type Id = Arc<str>;
 
 // orderbook.py's limits
 const MAX_ORDERS_PER_BLOCK_PER_ADDRESS: i64 = 50;
@@ -246,8 +251,8 @@ impl Stp {
 
 #[derive(Clone, Debug)]
 pub struct Order {
-    pub id: String,
-    pub owner: String,
+    pub id: Id,
+    pub owner: Id,
     pub side: Side,
     pub kind: Kind,
     pub price: Dec,
@@ -258,7 +263,7 @@ pub struct Order {
     pub stop_price: Option<Dec>,
     pub nonce: i64,
     pub expire_time: f64,
-    pub tif: String,
+    pub tif: Id,
     pub hidden: bool,
     pub display_size: Dec,
     pub shown: Dec,
@@ -294,14 +299,14 @@ impl Order {
 #[derive(Clone, Debug)]
 pub struct Trade {
     pub id: String,
-    pub maker_order_id: String,
-    pub taker_order_id: String,
+    pub maker_order_id: Id,
+    pub taker_order_id: Id,
     pub price: Dec,
     pub amount: Dec,
     pub maker_fee: Dec,
     pub taker_fee: Dec,
-    pub buyer: String,
-    pub seller: String,
+    pub buyer: Id,
+    pub seller: Id,
     pub sequence: u64,
 }
 
@@ -332,7 +337,7 @@ impl PartialOrd for PKey {
 #[derive(Clone, Debug)]
 struct Level {
     price: Dec,
-    orders: Vector<String>,
+    orders: Vector<Id>,
 }
 
 /// How many resting orders one placement may visit (``orderbook.MatchBudget``).
@@ -371,15 +376,15 @@ pub struct Config {
 pub struct State {
     bids: OrdMap<PKey, Level>,
     asks: OrdMap<PKey, Level>,
-    orders: IMap<String, Order>, // resting orders (``_orders``)
-    order_seq: IMap<String, u64>, // (their insertion order, for expiry)
+    orders: IMap<Id, Arc<Order>>, // resting orders (``_orders``)
+    order_seq: IMap<Id, u64>,     // (their insertion order, for expiry)
     next_seq: u64,
-    stop_ids: Vector<String>, // parked stop orders, in the order they were placed
-    stops: IMap<String, Order>,
-    owner_order_count: IMap<String, i64>,
-    owner_stop_count: IMap<String, i64>,
-    owner_nonces: IMap<String, i64>,
-    block_order_count: IMap<String, i64>,
+    stop_ids: Vector<Id>, // parked stop orders, in the order they were placed
+    stops: IMap<Id, Arc<Order>>,
+    owner_order_count: IMap<Id, i64>,
+    owner_stop_count: IMap<Id, i64>,
+    owner_nonces: IMap<Id, i64>,
+    block_order_count: IMap<Id, i64>,
     trade_sequence: u64,
     last_price: Option<Dec>,
     total_volume: Dec,
@@ -442,7 +447,7 @@ pub struct Book {
     /// Every order the operation in progress changed, as it last was: in Python the order a
     /// caller placed is the object the book indexes, so a stop triggered later in the same
     /// placement can fill it, and the caller sees it.
-    last: std::collections::HashMap<String, Order>,
+    last: std::collections::HashMap<Id, Order>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -483,7 +488,12 @@ impl Book {
             self.state.order_seq.insert(order.id.clone(), seq);
         }
         self.last.insert(order.id.clone(), order.clone());
-        self.state.orders.insert(order.id.clone(), order);
+        self.state.orders.insert(order.id.clone(), Arc::new(order));
+    }
+
+    /// A resting order, as a value to change.
+    fn resting(&self, id: &str) -> Option<Order> {
+        self.state.orders.get(id).map(|o| (**o).clone())
     }
 
     /// The order leaves the book, ``order`` as it ended.
@@ -577,7 +587,7 @@ impl Book {
             return refused("Order book is paused — emergency mode");
         }
         self.validate(order)?;
-        if order.tif == "alo" && self.would_match(order)? {
+        if &*order.tif == "alo" && self.would_match(order)? {
             return refused("post-only order would match a resting order");
         }
         if !protocol {
@@ -592,7 +602,7 @@ impl Book {
         } else {
             self.match_limit(order, budget)?
         };
-        if order.tif == "fok" && positive(&order.remaining()?) {
+        if &*order.tif == "fok" && positive(&order.remaining()?) {
             return refused("fill-or-kill order could not fill completely");
         }
         Ok(trades)
@@ -628,17 +638,17 @@ impl Book {
         if order.kind == Kind::StopLoss && !order.stop_price.as_ref().is_some_and(positive) {
             return refused("Stop-loss requires positive stop_price");
         }
-        if !matches!(order.tif.as_str(), "gtc" | "ioc" | "fok" | "alo") {
+        if !matches!(&*order.tif, "gtc" | "ioc" | "fok" | "alo") {
             return refused("unknown time in force (gtc, ioc, fok, alo)");
         }
-        if order.tif == "alo" && order.kind != Kind::Limit {
+        if &*order.tif == "alo" && order.kind != Kind::Limit {
             return refused("a post-only order must be a limit order");
         }
-        if order.tif != "gtc" && order.kind == Kind::StopLoss {
+        if &*order.tif != "gtc" && order.kind == Kind::StopLoss {
             return refused("a stop order is good till cancelled");
         }
         if (order.hidden || order.is_iceberg())
-            && (order.kind != Kind::Limit || !matches!(order.tif.as_str(), "gtc" | "alo"))
+            && (order.kind != Kind::Limit || !matches!(&*order.tif, "gtc" | "alo"))
         {
             return refused("only a resting limit order (gtc or alo) can be hidden");
         }
@@ -689,7 +699,7 @@ impl Book {
                 "Rate limit: max {MAX_ORDERS_PER_BLOCK_PER_ADDRESS} orders per block"
             ));
         }
-        self.state.block_order_count.insert(owner.to_string(), count + 1);
+        self.state.block_order_count.insert(Id::from(owner), count + 1);
         Ok(())
     }
 
@@ -700,7 +710,7 @@ impl Book {
             &mut self.state.owner_order_count
         };
         let n = counts.get(owner).copied().unwrap_or(0);
-        counts.insert(owner.to_string(), (n - 1).max(0));
+        counts.insert(Id::from(owner), (n - 1).max(0));
     }
 
     fn place_stop(&mut self, order: &mut Order) -> R<Vec<Trade>> {
@@ -716,7 +726,7 @@ impl Book {
         if !self.state.stops.contains_key(&order.id) {
             self.state.stop_ids.push_back(order.id.clone());
         }
-        self.state.stops.insert(order.id.clone(), order.clone());
+        self.state.stops.insert(order.id.clone(), Arc::new(order.clone()));
         self.state.owner_stop_count.insert(order.owner.clone(), count + 1);
         Ok(Vec::new())
     }
@@ -782,7 +792,7 @@ impl Book {
         }
         let exhausted = budget.as_ref().is_some_and(|b| b.exhausted);
         if taker.status == Status::Cancelled {
-        } else if positive(&taker.remaining()?) && (exhausted || taker.tif == "ioc" || taker.tif == "fok")
+        } else if positive(&taker.remaining()?) && (exhausted || &*taker.tif == "ioc" || &*taker.tif == "fok")
         {
             taker.status = if positive(&taker.filled) {
                 Status::Filled
@@ -818,7 +828,7 @@ impl Book {
     fn remove_from_level(&mut self, side: Side, price: &Dec, id: &str) {
         let key = PKey::of(price);
         if let Some(level) = self.side_mut(side).get_mut(&key) {
-            if let Some(i) = level.orders.iter().position(|o| o == id) {
+            if let Some(i) = level.orders.iter().position(|o| &**o == id) {
                 level.orders.remove(i);
             }
         }
@@ -832,11 +842,11 @@ impl Book {
         budget: &mut Option<Budget>,
     ) -> R<Vec<Trade>> {
         let mut trades = Vec::new();
-        let mut spent: Vec<String> = Vec::new();
+        let mut spent: Vec<Id> = Vec::new();
         self.fill_from_level(taker, side, price, budget, &mut trades, &mut spent)?;
         // a spent iceberg shows its next slice at the back of the queue
         for id in spent {
-            let Some(maker) = self.state.orders.get(&id).cloned() else {
+            let Some(maker) = self.resting(&id) else {
                 continue;
             };
             if maker.is_active() && positive(&maker.remaining()?) && !positive(&maker.shown) {
@@ -862,11 +872,11 @@ impl Book {
         price: &Dec,
         budget: &mut Option<Budget>,
         trades: &mut Vec<Trade>,
-        spent: &mut Vec<String>,
+        spent: &mut Vec<Id>,
     ) -> R<()> {
         let key = PKey::of(price);
         for shown_tier in [true, false] {
-            let queue: Vec<String> = match self.side(side).get(&key) {
+            let queue: Vec<Id> = match self.side(side).get(&key) {
                 Some(level) => level.orders.iter().cloned().collect(),
                 None => Vec::new(),
             };
@@ -874,7 +884,7 @@ impl Book {
                 if !positive(&taker.remaining()?) || taker.status == Status::Cancelled {
                     break;
                 }
-                let Some(mut maker) = self.state.orders.get(&maker_id).cloned() else {
+                let Some(mut maker) = self.resting(&maker_id) else {
                     continue; // (left the book this pass)
                 };
                 if !maker.is_active() {
@@ -1000,7 +1010,7 @@ impl Book {
             }
         }
         for id in triggered {
-            let Some(order) = self.state.stops.get(&id).cloned() else {
+            let Some(order) = self.state.stops.get(&*id).map(|o| (**o).clone()) else {
                 continue; // (already triggered by an inner check)
             };
             self.state.stops.remove(&id);
@@ -1055,12 +1065,12 @@ impl Book {
 
     /// ``cancel_order``: the cancelled order, or None if there is none to cancel.
     pub fn cancel_order(&mut self, id: &str, caller: &str) -> R<Option<Order>> {
-        if let Some(order) = self.state.stops.get(id).cloned() {
-            if !caller.is_empty() && order.owner != caller {
+        if let Some(order) = self.state.stops.get(id).map(|o| (**o).clone()) {
+            if !caller.is_empty() && &*order.owner != caller {
                 return refused("Only order owner can cancel");
             }
             self.state.stops.remove(id);
-            if let Some(i) = self.state.stop_ids.iter().position(|o| o == id) {
+            if let Some(i) = self.state.stop_ids.iter().position(|o| &**o == id) {
                 self.state.stop_ids.remove(i);
             }
             let mut order = order;
@@ -1068,10 +1078,10 @@ impl Book {
             self.decrement_owner_count(&order.owner, true);
             return Ok(Some(order));
         }
-        let Some(order) = self.state.orders.get(id).cloned() else {
+        let Some(order) = self.resting(id) else {
             return Ok(None);
         };
-        if !caller.is_empty() && order.owner != caller {
+        if !caller.is_empty() && &*order.owner != caller {
             return refused("Only order owner can cancel");
         }
         if !order.is_active() {
@@ -1088,11 +1098,11 @@ impl Book {
 
     /// ``reduce_order``.
     pub fn reduce_order(&mut self, id: &str, amount: Dec, caller: &str) -> R<Order> {
-        let order = match self.state.orders.get(id) {
-            Some(o) if o.is_active() => o.clone(),
+        let order = match self.resting(id) {
+            Some(o) if o.is_active() => o,
             _ => return refused(format!("no resting order {id}")),
         };
-        if order.owner != caller {
+        if &*order.owner != caller {
             return refused("Only order owner can modify");
         }
         if !(lt(&order.filled, &amount) && lt(&amount, &order.amount)) {
@@ -1112,8 +1122,8 @@ impl Book {
 
     /// ``fill_resting``: ``amount`` more of a resting order filled away from the book.
     pub fn fill_resting(&mut self, id: &str, amount: Dec) -> R<Order> {
-        let order = match self.state.orders.get(id) {
-            Some(o) if o.is_active() => o.clone(),
+        let order = match self.resting(id) {
+            Some(o) if o.is_active() => o,
             _ => return refused(format!("no resting order {id}")),
         };
         if !(positive(&amount) && le(&amount, &order.remaining()?)) {
@@ -1146,7 +1156,7 @@ impl Book {
         if !self.state.has_expiring {
             return Ok(());
         }
-        let mut ids: Vec<(u64, String)> = self
+        let mut ids: Vec<(u64, Id)> = self
             .state
             .order_seq
             .iter()
@@ -1157,7 +1167,7 @@ impl Book {
             let expired = self
                 .state
                 .orders
-                .get(&id)
+                .get(&*id)
                 .is_some_and(|o| o.expired(self.state.now) && o.is_active());
             if expired {
                 self.cancel_order(&id, "")?;
@@ -1212,10 +1222,10 @@ impl Book {
                 .as_ref()
                 .map_or("None".to_string(), |p| p.to_python_string()),
         ];
-        let mut ids: Vec<&String> = s.stops.keys().collect();
+        let mut ids: Vec<&Id> = s.stops.keys().collect();
         ids.sort();
         for id in ids {
-            let o = &s.stops[id];
+            let o = &s.stops[&**id];
             parts.push(format!(
                 "s{}:{}:{}:{}:{}:{}:{}:{}:{}",
                 o.id,
@@ -1303,8 +1313,8 @@ fn order_of(d: &Bound<'_, PyDict>) -> PyResult<Order> {
         }
     };
     Ok(Order {
-        id: get("id")?.extract()?,
-        owner: get("owner")?.extract()?,
+        id: Id::from(get("id")?.extract::<String>()?),
+        owner: Id::from(get("owner")?.extract::<String>()?),
         side,
         kind,
         price: dec_of(&text("price", "0")?)?,
@@ -1318,7 +1328,7 @@ fn order_of(d: &Bound<'_, PyDict>) -> PyResult<Order> {
             _ => 0,
         },
         expire_time: float("expire_time")?,
-        tif: text("tif", "gtc")?,
+        tif: Id::from(text("tif", "gtc")?),
         hidden: match d.get_item("hidden")? {
             Some(v) => v.is_truthy()?,
             None => false,
@@ -1330,8 +1340,8 @@ fn order_of(d: &Bound<'_, PyDict>) -> PyResult<Order> {
 
 fn order_dict<'py>(py: Python<'py>, o: &Order) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new_bound(py);
-    d.set_item("id", &o.id)?;
-    d.set_item("owner", &o.owner)?;
+    d.set_item("id", &*o.id)?;
+    d.set_item("owner", &*o.owner)?;
     d.set_item("side", o.side.value())?;
     d.set_item("order_type", o.kind.value())?;
     d.set_item("price", o.price.to_python_string())?;
@@ -1342,7 +1352,7 @@ fn order_dict<'py>(py: Python<'py>, o: &Order) -> PyResult<Bound<'py, PyDict>> {
     d.set_item("stop_price", o.stop_price.as_ref().map(|p| p.to_python_string()))?;
     d.set_item("nonce", o.nonce)?;
     d.set_item("expire_time", o.expire_time)?;
-    d.set_item("tif", &o.tif)?;
+    d.set_item("tif", &*o.tif)?;
     d.set_item("hidden", o.hidden)?;
     d.set_item("display_size", o.display_size.to_python_string())?;
     d.set_item("shown", o.shown.to_python_string())?;
@@ -1352,14 +1362,14 @@ fn order_dict<'py>(py: Python<'py>, o: &Order) -> PyResult<Bound<'py, PyDict>> {
 fn trade_dict<'py>(py: Python<'py>, t: &Trade) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new_bound(py);
     d.set_item("id", &t.id)?;
-    d.set_item("maker_order_id", &t.maker_order_id)?;
-    d.set_item("taker_order_id", &t.taker_order_id)?;
+    d.set_item("maker_order_id", &*t.maker_order_id)?;
+    d.set_item("taker_order_id", &*t.taker_order_id)?;
     d.set_item("price", t.price.to_python_string())?;
     d.set_item("amount", t.amount.to_python_string())?;
     d.set_item("maker_fee", t.maker_fee.to_python_string())?;
     d.set_item("taker_fee", t.taker_fee.to_python_string())?;
-    d.set_item("buyer", &t.buyer)?;
-    d.set_item("seller", &t.seller)?;
+    d.set_item("buyer", &*t.buyer)?;
+    d.set_item("seller", &*t.seller)?;
     d.set_item("sequence", t.sequence)?;
     Ok(d)
 }

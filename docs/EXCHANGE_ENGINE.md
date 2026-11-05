@@ -69,10 +69,11 @@ It is not wired into the node, and on its own it would not make the exchange fas
 
 * matching is about 11 µs of a spot order's ~190 in Python; the rest is the operation around
   it (settlement, fees, undo bookkeeping, the journal), which is E3;
-* through its test interface (an order as a dict of 16 fields, in and out) it costs 20 µs an
-  order to Python's 11. Its decimals allocate every coefficient (`num-bigint`), where Python's
-  C `decimal` is fast on small values. The next step is a fast path in `dec.rs` — a 128-bit
-  coefficient while a value fits, big integers beyond — held to the same tests;
+* through its test interface (an order as a dict of 16 fields, in and out) it costs 10 µs a
+  resting order to Python's 11, and 32 µs an order that fills. Most of that is the conversion
+  and the per-level sums Python's book does too. Its decimals keep a 128-bit coefficient while a
+  value fits (`dec.rs`), and its ids, owners and orders are shared, so the savepoint every
+  operation takes costs reference counts, not copies;
 * its full digest is twice as fast as Python's (11 ms to 23 at 10,600 resting orders).
 
 The book becomes the node's when E3 runs a plain limit order or cancel natively end to end, with

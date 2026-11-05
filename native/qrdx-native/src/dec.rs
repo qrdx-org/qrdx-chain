@@ -86,10 +86,206 @@ impl Ctx {
 /// The exchange's consensus context (`orderbook._CTX`, `clearinghouse._CONTEXT`, `amm._CTX`).
 pub const EXCHANGE: Ctx = Ctx::new(78, Rounding::HalfEven);
 
+/// A coefficient: a ``u128`` whenever the value fits (every amount, price and fee the exchange
+/// keeps does: 38 digits), a big integer only beyond. Python's C ``decimal`` is fast on small
+/// values; a coefficient that allocated made every native operation slower than it.
+#[derive(Clone, Debug)]
+pub enum Coef {
+    S(u128),
+    B(BigUint),
+}
+
+/// 10**0 … 10**38: every power of ten a ``u128`` holds.
+const P: [u128; 39] = {
+    let mut p = [1u128; 39];
+    let mut i = 1;
+    while i < 39 {
+        p[i] = p[i - 1] * 10;
+        i += 1;
+    }
+    p
+};
+
+fn digits_u128(v: u128) -> usize {
+    // the smallest k with v < 10**k (39 when it is past 10**38)
+    match P.binary_search(&v) {
+        Ok(i) => i + 1,
+        Err(i) => i.max(1),
+    }
+}
+
+impl Coef {
+    fn from_big(b: BigUint) -> Coef {
+        match b.to_u128() {
+            Some(v) => Coef::S(v),
+            None => Coef::B(b),
+        }
+    }
+
+    fn big(&self) -> BigUint {
+        match self {
+            Coef::S(v) => BigUint::from(*v),
+            Coef::B(b) => b.clone(),
+        }
+    }
+
+    pub fn zero() -> Coef {
+        Coef::S(0)
+    }
+
+    pub fn one() -> Coef {
+        Coef::S(1)
+    }
+
+    pub fn is_zero(&self) -> bool {
+        matches!(self, Coef::S(0))
+    }
+
+    /// ``len(str(c))`` (1 for zero).
+    fn digits(&self) -> usize {
+        match self {
+            Coef::S(v) => digits_u128(*v),
+            Coef::B(b) => ndigits(b),
+        }
+    }
+
+    /// ``c * 10**n``.
+    fn mul_pow10(&self, n: usize) -> Coef {
+        if let Coef::S(v) = self {
+            if n < P.len() {
+                if let Some(r) = v.checked_mul(P[n]) {
+                    return Coef::S(r);
+                }
+            }
+            if *v == 0 {
+                return Coef::S(0);
+            }
+        }
+        Coef::from_big(self.big() * pow10(n))
+    }
+
+    /// ``divmod(c, 10**n)``.
+    fn div_rem_pow10(&self, n: usize) -> (Coef, Coef) {
+        match self {
+            Coef::S(v) => {
+                if n < P.len() {
+                    (Coef::S(v / P[n]), Coef::S(v % P[n]))
+                } else {
+                    (Coef::S(0), Coef::S(*v))
+                }
+            }
+            Coef::B(b) => {
+                let (q, r) = b.div_rem(&pow10(n));
+                (Coef::from_big(q), Coef::from_big(r))
+            }
+        }
+    }
+
+    fn add(&self, o: &Coef) -> Coef {
+        if let (Coef::S(a), Coef::S(b)) = (self, o) {
+            if let Some(r) = a.checked_add(*b) {
+                return Coef::S(r);
+            }
+        }
+        Coef::from_big(self.big() + o.big())
+    }
+
+    /// ``c - o`` (``o`` ≤ ``c``).
+    fn sub(&self, o: &Coef) -> Coef {
+        if let (Coef::S(a), Coef::S(b)) = (self, o) {
+            return Coef::S(a - b);
+        }
+        Coef::from_big(self.big() - o.big())
+    }
+
+    fn mul(&self, o: &Coef) -> Coef {
+        if let (Coef::S(a), Coef::S(b)) = (self, o) {
+            if let Some(r) = a.checked_mul(*b) {
+                return Coef::S(r);
+            }
+        }
+        Coef::from_big(self.big() * o.big())
+    }
+
+    /// ``divmod(c, o)`` (``o`` ≠ 0).
+    fn div_rem(&self, o: &Coef) -> (Coef, Coef) {
+        if let (Coef::S(a), Coef::S(b)) = (self, o) {
+            return (Coef::S(a / b), Coef::S(a % b));
+        }
+        let (q, r) = self.big().div_rem(&o.big());
+        (Coef::from_big(q), Coef::from_big(r))
+    }
+
+    fn rem_small(&self, m: u32) -> u32 {
+        match self {
+            Coef::S(v) => (v % m as u128) as u32,
+            Coef::B(b) => (b % m).to_u32().expect("a remainder below m"),
+        }
+    }
+
+    fn div_small(&self, m: u32) -> Coef {
+        match self {
+            Coef::S(v) => Coef::S(v / m as u128),
+            Coef::B(b) => Coef::from_big(b / m),
+        }
+    }
+
+    fn add_one(&self) -> Coef {
+        self.add(&Coef::S(1))
+    }
+
+    fn cmp_coef(&self, o: &Coef) -> Ordering {
+        match (self, o) {
+            (Coef::S(a), Coef::S(b)) => a.cmp(b),
+            (Coef::S(_), Coef::B(_)) => Ordering::Less, // (a big one is past every u128)
+            (Coef::B(_), Coef::S(_)) => Ordering::Greater,
+            (Coef::B(a), Coef::B(b)) => a.cmp(b),
+        }
+    }
+
+    /// ``c`` against half a unit of the ``dropped``-th digit: 5 * 10**(dropped - 1).
+    fn cmp_half(&self, dropped: usize) -> Ordering {
+        if let Coef::S(v) = self {
+            return if dropped - 1 < 38 {
+                v.cmp(&(5 * P[dropped - 1]))
+            } else {
+                Ordering::Less // (5 * 10**38 is past every u128)
+            };
+        }
+        self.big().cmp(&(pow10(dropped - 1) * 5u32))
+    }
+
+    fn to_decimal_string(&self) -> String {
+        match self {
+            Coef::S(v) => v.to_string(),
+            Coef::B(b) => b.to_str_radix(10),
+        }
+    }
+
+    fn parse(digits: &[u8]) -> Option<Coef> {
+        if digits.len() <= 38 {
+            let mut v: u128 = 0;
+            for &c in digits {
+                v = v * 10 + (c - b'0') as u128;
+            }
+            return Some(Coef::S(v));
+        }
+        Some(Coef::from_big(BigUint::parse_bytes(digits, 10)?))
+    }
+}
+
+impl PartialEq for Coef {
+    fn eq(&self, o: &Coef) -> bool {
+        self.cmp_coef(o) == Ordering::Equal
+    }
+}
+
+impl Eq for Coef {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dec {
     pub neg: bool,
-    pub coef: BigUint,
+    pub coef: Coef,
     pub exp: i64,
 }
 
@@ -131,7 +327,7 @@ impl Dec {
     pub fn zero() -> Dec {
         Dec {
             neg: false,
-            coef: BigUint::zero(),
+            coef: Coef::zero(),
             exp: 0,
         }
     }
@@ -194,7 +390,7 @@ impl Dec {
             }
             exp = rest.parse::<i64>().ok()?;
         }
-        let coef = BigUint::parse_bytes(digits.as_bytes(), 10)?;
+        let coef = Coef::parse(digits.as_bytes())?;
         Dec {
             neg,
             coef,
@@ -205,7 +401,7 @@ impl Dec {
 
     /// ``str(d)``: Python's scientific string (``Decimal.__str__``, capitals).
     pub fn to_python_string(&self) -> String {
-        let int = self.coef.to_str_radix(10);
+        let int = self.coef.to_decimal_string();
         let sign = if self.neg { "-" } else { "" };
         let leftdigits = self.exp + int.len() as i64;
         let dotplace = if self.exp <= 0 && leftdigits > -6 {
@@ -245,12 +441,8 @@ impl Dec {
         }
         let mut coef = self.coef.clone();
         let mut exp = self.exp;
-        loop {
-            let (q, r) = coef.div_rem(&BigUint::from(10u32));
-            if !r.is_zero() {
-                break;
-            }
-            coef = q;
+        while coef.rem_small(10) == 0 {
+            coef = coef.div_small(10);
             exp += 1;
         }
         Dec {
@@ -267,29 +459,28 @@ impl Dec {
 
     /// ``self.adjusted()``: the exponent of the most significant digit.
     pub fn adjusted(&self) -> i64 {
-        self.exp + ndigits(&self.coef) as i64 - 1
+        self.exp + self.coef.digits() as i64 - 1
     }
 
     // ── rounding (``_pick_rounding_function``) ────────────────────────────────────────────
 
     /// Of the coefficient's digits, keep the first ``keep``: (the kept part, 1 to round up,
     /// 0 if the dropped digits are all zero, −1 to truncate). ``keep`` < its digit count.
-    fn round_digits(&self, keep: usize, rounding: Rounding) -> (BigUint, i32) {
-        let total = ndigits(&self.coef);
+    fn round_digits(&self, keep: usize, rounding: Rounding) -> (Coef, i32) {
+        let total = self.coef.digits();
         debug_assert!(keep < total);
         let dropped = total - keep;
-        let unit = pow10(dropped);
-        let (kept, rest) = self.coef.div_rem(&unit);
+        let (kept, rest) = self.coef.div_rem_pow10(dropped);
         let all_zeros = rest.is_zero();
-        let half = pow10(dropped - 1) * 5u32;
-        let first_dropped_high = rest >= half; // the first dropped digit is 5–9
-        let exact_half = rest == half;
+        let half = rest.cmp_half(dropped);
+        let first_dropped_high = half != Ordering::Less; // the first dropped digit is 5–9
+        let exact_half = half == Ordering::Equal;
         let down = if all_zeros { 0 } else { -1 };
         let half_up = if first_dropped_high { 1 } else { down };
         let last_kept = if keep == 0 {
             None
         } else {
-            Some((&kept % 10u32).to_u32().unwrap_or(0))
+            Some(kept.rem_small(10))
         };
         let changed = match rounding {
             Rounding::Down => down,
@@ -346,7 +537,7 @@ impl Dec {
             }
             return Some(self.clone());
         }
-        let len = ndigits(&self.coef) as i64;
+        let len = self.coef.digits() as i64;
         let mut exp_min = len + self.exp - ctx.prec as i64;
         if exp_min > etop || exp_min < etiny {
             return None; // (overflow, or subnormal)
@@ -358,9 +549,9 @@ impl Dec {
         let (kept, changed) = self.round_digits(digits as usize, ctx.rounding);
         let mut coef = kept;
         if changed > 0 {
-            coef += 1u32;
-            if ndigits(&coef) > ctx.prec {
-                coef /= 10u32;
+            coef = coef.add_one();
+            if coef.digits() > ctx.prec {
+                coef = coef.div_small(10);
                 exp_min += 1;
             }
         }
@@ -379,30 +570,30 @@ impl Dec {
         if self.is_zero() {
             return Dec {
                 neg: self.neg,
-                coef: BigUint::zero(),
+                coef: Coef::zero(),
                 exp,
             };
         }
         if self.exp >= exp {
             return Dec {
                 neg: self.neg,
-                coef: &self.coef * pow10((self.exp - exp) as usize),
+                coef: self.coef.mul_pow10((self.exp - exp) as usize),
                 exp,
             };
         }
-        let digits = ndigits(&self.coef) as i64 + self.exp - exp;
+        let digits = self.coef.digits() as i64 + self.exp - exp;
         let (kept, changed) = if digits < 0 {
             // (below half a unit of the target: replaced by 10**(exp-1) before rounding)
             let tiny = Dec {
                 neg: self.neg,
-                coef: BigUint::one(),
+                coef: Coef::one(),
                 exp: exp - 1,
             };
             tiny.round_digits(0, rounding)
         } else {
             self.round_digits(digits as usize, rounding)
         };
-        let coef = if changed == 1 { kept + 1u32 } else { kept };
+        let coef = if changed == 1 { kept.add_one() } else { kept };
         Dec {
             neg: self.neg,
             coef,
@@ -428,7 +619,7 @@ impl Dec {
             let neg = (self.neg && other.neg) || negativezero;
             return Dec {
                 neg,
-                coef: BigUint::zero(),
+                coef: Coef::zero(),
                 exp,
             }
             .fix(ctx);
@@ -444,20 +635,20 @@ impl Dec {
         // ``_normalize``: a much smaller operand only decides rounding
         let (a, b) = normalize(self, other, ctx.prec);
         let (result_neg, coef) = if a.neg != b.neg {
-            match a.coef.cmp(&b.coef) {
+            match a.coef.cmp_coef(&b.coef) {
                 Ordering::Equal => {
                     return Dec {
                         neg: negativezero,
-                        coef: BigUint::zero(),
+                        coef: Coef::zero(),
                         exp,
                     }
                     .fix(ctx);
                 }
-                Ordering::Greater => (a.neg, &a.coef - &b.coef),
-                Ordering::Less => (b.neg, &b.coef - &a.coef),
+                Ordering::Greater => (a.neg, a.coef.sub(&b.coef)),
+                Ordering::Less => (b.neg, b.coef.sub(&a.coef)),
             }
         } else {
-            (a.neg, &a.coef + &b.coef)
+            (a.neg, a.coef.add(&b.coef))
         };
         Dec {
             neg: result_neg,
@@ -477,9 +668,9 @@ impl Dec {
         let neg = self.neg != other.neg;
         let exp = self.exp + other.exp;
         let coef = if self.is_zero() || other.is_zero() {
-            BigUint::zero()
+            Coef::zero()
         } else {
-            &self.coef * &other.coef
+            self.coef.mul(&other.coef)
         };
         Dec { neg, coef, exp }.in_range()?.fix(ctx)
     }
@@ -491,24 +682,25 @@ impl Dec {
         }
         let neg = self.neg != other.neg;
         let (coef, exp) = if self.is_zero() {
-            (BigUint::zero(), self.exp - other.exp)
+            (Coef::zero(), self.exp - other.exp)
         } else {
-            let shift = ndigits(&other.coef) as i64 - ndigits(&self.coef) as i64 + ctx.prec as i64 + 1;
+            let shift =
+                other.coef.digits() as i64 - self.coef.digits() as i64 + ctx.prec as i64 + 1;
             let mut exp = self.exp - other.exp - shift;
             let (mut coef, remainder) = if shift >= 0 {
-                (&self.coef * pow10(shift as usize)).div_rem(&other.coef)
+                self.coef.mul_pow10(shift as usize).div_rem(&other.coef)
             } else {
-                self.coef.div_rem(&(&other.coef * pow10((-shift) as usize)))
+                self.coef.div_rem(&other.coef.mul_pow10((-shift) as usize))
             };
             if !remainder.is_zero() {
                 // not exact: a last digit of 0 or 5 would round as if it were exact
-                if (&coef % 5u32).is_zero() {
-                    coef += 1u32;
+                if coef.rem_small(5) == 0 {
+                    coef = coef.add_one();
                 }
             } else {
                 let ideal = self.exp - other.exp;
-                while exp < ideal && (&coef % 10u32).is_zero() {
-                    coef /= 10u32;
+                while exp < ideal && coef.rem_small(10) == 0 {
+                    coef = coef.div_small(10);
                     exp += 1;
                 }
             }
@@ -526,7 +718,7 @@ impl Dec {
         if self.is_zero() {
             return Dec {
                 neg: self.neg,
-                coef: BigUint::zero(),
+                coef: Coef::zero(),
                 exp,
             }
             .fix(ctx);
@@ -536,7 +728,7 @@ impl Dec {
             return None;
         }
         let ans = self.rescale(exp, rounding);
-        if ans.adjusted() > EMAX || ndigits(&ans.coef) > ctx.prec {
+        if ans.adjusted() > EMAX || ans.coef.digits() > ctx.prec {
             return None;
         }
         if !ans.is_zero() && ans.adjusted() < EMIN {
@@ -579,9 +771,9 @@ impl Dec {
             } else {
                 // equal adjusted exponents: compare the coefficients at a common exponent
                 let e = self.exp.min(other.exp);
-                let a = &self.coef * pow10((self.exp - e) as usize);
-                let b = &other.coef * pow10((other.exp - e) as usize);
-                a.cmp(&b)
+                let a = self.coef.mul_pow10((self.exp - e) as usize);
+                let b = other.coef.mul_pow10((other.exp - e) as usize);
+                a.cmp_coef(&b)
             }
         };
         if self.neg {
@@ -602,14 +794,14 @@ fn normalize(op1: &Dec, op2: &Dec, prec: usize) -> (Dec, Dec) {
     };
     let mut tmp = tmp;
     let mut other = other;
-    let tmp_len = ndigits(&tmp.coef) as i64;
-    let other_len = ndigits(&other.coef) as i64;
+    let tmp_len = tmp.coef.digits() as i64;
+    let other_len = other.coef.digits() as i64;
     let exp = tmp.exp + (-1i64).min(tmp_len - prec as i64 - 2);
     if other_len + other.exp - 1 < exp {
-        other.coef = BigUint::one();
+        other.coef = Coef::one();
         other.exp = exp;
     }
-    tmp.coef = &tmp.coef * pow10((tmp.exp - other.exp) as usize);
+    tmp.coef = tmp.coef.mul_pow10((tmp.exp - other.exp) as usize);
     tmp.exp = other.exp;
     if swapped {
         (other, tmp)
