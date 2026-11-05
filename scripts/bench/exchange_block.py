@@ -8,6 +8,11 @@ state root, storing the block; then what an importer does with the same section 
 and replay). Prints milliseconds per phase and per transaction.
 
     python scripts/bench/exchange_block.py [--txs 500] [--accounts 100] [--blocks 3]
+
+``--workload orders`` times spot order flow instead (docs/EXCHANGE_ENGINE.md): one QRDX/token
+book, resting orders on both sides, then blocks of 30% cancels, 30% orders that cross and 40%
+that rest, run through the exchange's own ``process_transaction`` (no database: execution and
+the exchange root only).
 """
 
 from __future__ import annotations
@@ -142,15 +147,107 @@ async def run(args) -> None:
           f"  → {total / (whole / 1000):,.0f} tx/s on one core")
 
 
+def orders(args) -> None:
+    """Spot order flow through the exchange (no database): execution and the exchange root."""
+    import random
+    from decimal import Decimal as D
+
+    from qrdx.exchange import ExchangeOpType as Op
+    from qrdx.exchange import ExchangeStateManager, ExchangeTransaction
+    from qrdx.exchange import block_processor as BP
+    from qrdx.exchange.tokens import NATIVE_ASSET
+
+    traders = ["0xPQ" + f"{i:064x}" for i in range(1, args.accounts + 1)]
+    issuer = "0xPQ" + "f" * 64
+    nonces = {}
+
+    def tx(sender, op, **params):
+        n = nonces.get(sender, 0)
+        nonces[sender] = n + 1
+        return ExchangeTransaction(op_type=op, sender=sender, nonce=n, params=params,
+                                   gas_limit=2_000_000, gas_price=10**9)
+
+    ExchangeStateManager.reset_instance()
+    m = ExchangeStateManager.get_instance()
+    BP.apply_enforcement(m)
+    m.begin_block(1, float(T0))
+    for who in traders + [issuer]:
+        m.set_available_balance(who, D(10**9))
+    r = m.process_transaction(tx(issuer, Op.TOKEN_DEPLOY, name="Tok", symbol="TOK",
+                                 total_supply="1000000000"))
+    token = r.data["token_address"]
+    m.set_available_token_balance(issuer, token, D(10**9))
+    for who in traders:
+        m.set_available_token_balance(who, token, D(10**6))
+    r = m.process_transaction(tx(issuer, Op.CREATE_POOL, token0="qrdx", token1=token,
+                                 fee_tier=3000, pool_type="STANDARD", initial_price="2",
+                                 stake_amount="10000"))
+    holder = m.pool_holder_address(r.data["pool_id"])
+    escrow = m.orderbook_escrow_address(f"{token}:{NATIVE_ASSET}")
+    for who in (holder, escrow):
+        m.set_available_balance(who, D(0))
+        m.set_available_token_balance(who, token, D(0))
+    pair = f"{token}:QRDX"
+    m.commit_block()
+    rng = random.Random(1)
+    resting = []
+
+    def place(who, crossing):
+        side = rng.choice(["buy", "sell"])
+        off = D(rng.randint(5, 150) if crossing else rng.randint(1, 200)) / 1000
+        price = D(2) + off if (side == "buy") == crossing else D(2) - off
+        return tx(who, Op.PLACE_ORDER, pair=pair, side=side, order_type="limit",
+                  price=str(price), amount=str(rng.randint(1, 50)))
+
+    def block(height, txs):
+        m.begin_block(height, float(T0 + height))
+        start = time.perf_counter()
+        for t in txs:
+            r = m.process_transaction(t)
+            if r.success and t.op_type == Op.PLACE_ORDER and (r.data or {}).get("order_id"):
+                resting.append((t.sender, r.data["order_id"]))
+        ran = time.perf_counter() - start
+        start = time.perf_counter()
+        m.compute_state_root()
+        root = time.perf_counter() - start
+        m.commit_block()
+        return ran, root
+
+    block(2, [place(traders[i % len(traders)], False) for i in range(2 * args.txs)])
+    ran_total = root_total = 0.0
+    for h in range(3, 3 + args.blocks):
+        txs = []
+        for _ in range(args.txs):
+            who, k = rng.choice(traders), rng.random()
+            if k < 0.3 and resting:
+                owner, oid = resting.pop(rng.randrange(len(resting)))
+                txs.append(tx(owner, Op.CANCEL_ORDER, pair=pair, order_id=oid))
+            else:
+                txs.append(place(who, crossing=k < 0.6))
+        ran, root = block(h, txs)
+        ran_total, root_total = ran_total + ran, root_total + root
+    n = args.txs * args.blocks
+    print(f"{args.blocks} blocks × {args.txs} spot operations from {len(traders)} accounts "
+          f"(30% cancels, 30% crossing, 40% resting; {2 * args.txs} resting before)")
+    print(f"  execute          {1e3 * ran_total / args.blocks:9.1f} ms a block "
+          f"{1e6 * ran_total / n:8.1f} µs an operation")
+    print(f"  exchange root    {1e3 * root_total / args.blocks:9.1f} ms a block")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--txs", type=int, default=500)
     p.add_argument("--accounts", type=int, default=100)
     p.add_argument("--blocks", type=int, default=3)
+    p.add_argument("--workload", choices=("transfers", "orders"), default="transfers")
     import logging
 
     logging.disable(logging.WARNING)
-    asyncio.run(run(p.parse_args()))
+    args = p.parse_args()
+    if args.workload == "orders":
+        orders(args)
+    else:
+        asyncio.run(run(args))
 
 
 if __name__ == "__main__":

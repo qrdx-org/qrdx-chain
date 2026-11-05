@@ -21,6 +21,7 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 mod canon;
+pub mod dec;
 mod lane;
 mod lthash;
 pub mod net;
@@ -244,6 +245,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mtree::mt_prove, m)?)?;
     m.add_class::<mtree::MNode>()?;
     m.add_function(wrap_pyfunction!(lthash::lt_mix_entries, m)?)?;
+    m.add_function(wrap_pyfunction!(dec::dec_eval, m)?)?;
     m.add_function(wrap_pyfunction!(lane::lane_judge, m)?)?;
     m.add_function(wrap_pyfunction!(lane::lane_run, m)?)?;
     m.add_class::<net::NetService>()?;

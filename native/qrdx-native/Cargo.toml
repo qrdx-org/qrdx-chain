@@ -25,6 +25,10 @@ blake2 = "0.10.6"
 blake3 = "1.5.5"
 serde_json = { version = "1.0.135", features = ["arbitrary_precision"] }
 getrandom = "0.2.15"
+# Python's Decimal for the exchange engine (src/dec.rs): coefficients of any size.
+num-bigint = "0.4.6"
+num-traits = "0.2.19"
+num-integer = "0.1.46"
 
 [profile.release]
 opt-level = 3
