@@ -100,7 +100,7 @@ def _op_create_pool(self: ExchangeStateManager, tx: ExchangeTransaction) -> Exch
         )
 
     for asset in (self.canonical_asset(p["token0"]), self.canonical_asset(p["token1"])):
-        t = self.tokens.get(asset)
+        t = self.tokens.peek(asset)
         if t is not None and (t.fee_enabled or t.non_transferable):
             # Spot moves are exact (a pool's reserves, a book's escrow): a fee withheld
             # on the way in would break their accounting; a soulbound token cannot move.
@@ -1606,7 +1606,7 @@ def fire_spot_triggers(self: ExchangeStateManager, now: Decimal) -> List[Dict[st
         raw = self._order_books[pair].last_price
         reached = self.trading.reached(pair)
         if (not raw and not reached) or any(
-            (t := self.tokens.get(tok)) is not None and t.paused for tok in pair.split(":", 1)
+            (t := self.tokens.peek(tok)) is not None and t.paused for tok in pair.split(":", 1)
         ):
             continue
         last = Decimal(str(raw)) if raw else None
@@ -1663,7 +1663,7 @@ def uncross_spot_books(self: ExchangeStateManager, now: Decimal) -> List[Dict[st
             del self.trading.uncross[pair]
             continue
         if book.is_paused or any(
-            (t := self.tokens.get(tok)) is not None and t.paused for tok in pair.split(":", 1)
+            (t := self.tokens.peek(tok)) is not None and t.paused for tok in pair.split(":", 1)
         ):
             continue  # (it waits)
         finished = True
@@ -1691,7 +1691,7 @@ def _best_resting(book: OrderBook, bids: bool) -> Optional[Order]:
     """The first resting order on one side in matching priority (best price, displayed
     before hidden, then time)."""
     levels = book._bids if bids else book._asks
-    for price in sorted(levels, reverse=bids):
+    for price in book.level_prices(bids):
         queue = book.fill_queue(levels[price])
         if queue:
             return queue[0][0]

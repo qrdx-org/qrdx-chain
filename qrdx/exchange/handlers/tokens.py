@@ -86,7 +86,7 @@ def _settle_token_move(
         if not is_native_asset(token):
             if self.tokens.is_frozen(token, frm):
                 raise ValueError(f"{frm[:16]}…'s {token[:12]}… balance is frozen")
-            t = self.tokens.get(token)
+            t = self.tokens.peek(token)
             if t is not None and t.paused and not release:
                 raise ValueError(f"{t.symbol} is paused")
         avail = None if covered else self.available_token_balance(frm, token)

@@ -686,10 +686,10 @@ def test_a_paused_token_holds_spot_triggers_back():
     s.order("0xPQb", "buy", 95, 5)
     s.trigger("0xPQa", "sell", "stop_loss", 96, 1)
     s.order("0xPQc", "sell", 95, 1)
-    real = s.m.tokens.get
-    s.m.tokens.get = lambda tok: Paused() if tok == BASE else real(tok)
+    real = s.m.tokens.peek                     # (how the trigger check reads a token)
+    s.m.tokens.peek = lambda tok: Paused() if tok == BASE else real(tok)
     assert s.block() == [] and len(s.m.trading.spot_triggers) == 1
-    s.m.tokens.get = real
+    s.m.tokens.peek = real
     assert [e["type"] for e in s.block()] == ["spot_trigger_fired"]
 
 

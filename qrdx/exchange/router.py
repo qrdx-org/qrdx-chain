@@ -275,7 +275,7 @@ class UnifiedRouter:
         selling = token_in == base
         side = OrderSide.SELL if selling else OrderSide.BUY
         levels = book._bids if selling else book._asks
-        prices = sorted(levels, reverse=selling)
+        prices = book.level_prices(bids=selling)
         size = spent = out = fees = ZERO
         limit = ZERO
         visited = 0
@@ -439,7 +439,7 @@ class UnifiedRouter:
 
         # The order book: its levels on the taker's opposite side, best first.
         side_levels = (ob._asks if buy else ob._bids) if ob is not None else {}
-        levels = sorted(side_levels, reverse=not buy)
+        levels = ob.level_prices(bids=not buy) if ob is not None else []
         li, qi = 0, 0
         queue: Optional[List[Tuple[Order, Decimal]]] = None
         book_open = ob is not None

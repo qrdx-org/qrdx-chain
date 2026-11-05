@@ -29,6 +29,7 @@ field. The trade history kept for display is bounded and never consensus state.
 
 from __future__ import annotations
 
+import bisect
 import copy
 import functools
 import hashlib
@@ -248,6 +249,95 @@ class PriceLevel:
 # ---------------------------------------------------------------------------
 
 
+class PriceLevels(dict):
+    """One side of a book: price → its level, with the prices kept in ascending order as levels
+    come and go (``prices``). Every order read its book's sides in price order three to five
+    times (the best price, matching, the router's plan), and each read sorted the side: up to
+    500 levels a sort, a cost that grew with the book. Kept in step by every way a dict changes
+    (an undo's restore and a snapshot's copy included); ``tests/test_orderbook_levels.py``
+    holds it to ``sorted(keys)`` under random changes."""
+
+    def prices(self) -> List[Decimal]:
+        """The prices, ascending — the list itself: read it, never change it."""
+        kept = self.__dict__.get("_prices")
+        if kept is None:
+            kept = self.__dict__["_prices"] = sorted(dict.keys(self))
+        return kept  # type: ignore[no-any-return]
+
+    def _drop(self, price: Decimal) -> None:
+        kept = self.__dict__.get("_prices")
+        if kept is not None:
+            i = bisect.bisect_left(kept, price)
+            if i < len(kept) and kept[i] == price:
+                del kept[i]
+            else:  # (never: rebuilt rather than trusted)
+                self.__dict__.pop("_prices", None)
+
+    def __setitem__(self, price: Decimal, level: Any) -> None:
+        if not dict.__contains__(self, price):
+            bisect.insort(self.prices(), price)
+        dict.__setitem__(self, price, level)
+
+    def __delitem__(self, price: Decimal) -> None:
+        dict.__delitem__(self, price)
+        self._drop(price)
+
+    def pop(self, price: Decimal, *default: Any) -> Any:
+        if dict.__contains__(self, price):
+            level = dict.pop(self, price)
+            self._drop(price)
+            return level
+        return dict.pop(self, price, *default)
+
+    def popitem(self) -> Tuple[Decimal, Any]:
+        price, level = dict.popitem(self)
+        self._drop(price)
+        return price, level
+
+    def setdefault(self, price: Decimal, default: Any = None) -> Any:
+        if not dict.__contains__(self, price):
+            self[price] = default
+        return dict.__getitem__(self, price)
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        for price, level in dict(*args, **kwargs).items():
+            self[price] = level
+
+    def __ior__(self, other: Any) -> "PriceLevels":  # type: ignore[override,misc]
+        self.update(other)
+        return self
+
+    def clear(self) -> None:
+        dict.clear(self)
+        self.__dict__["_prices"] = []
+
+    def copy(self) -> "PriceLevels":
+        return PriceLevels(dict.items(self))
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "PriceLevels":
+        new = PriceLevels()
+        memo[id(self)] = new
+        for price, level in dict.items(self):
+            dict.__setitem__(new, copy.deepcopy(price, memo), copy.deepcopy(level, memo))
+        new.__dict__["_prices"] = sorted(dict.keys(new))
+        return new
+
+    def __reduce__(self) -> Any:  # pickled as its levels (the order is rebuilt)
+        return (_rebuild_price_levels, (list(dict.items(self)),))
+
+
+def _rebuild_price_levels(items: List[Tuple[Decimal, Any]]) -> PriceLevels:
+    return PriceLevels(items)
+
+
+def _prices(levels: Any) -> List[Decimal]:
+    """A side's prices, ascending: kept by ``PriceLevels``, sorted for a plain dict (a book
+    restored from before them)."""
+    if isinstance(levels, PriceLevels):
+        return levels.prices()
+    return sorted(levels)
+
+
 class MatchBudget:
     """How many resting orders one placement may visit — filled, skipped or cancelled alike,
     since each costs the matching engine the same — paid for by its transaction's gas
@@ -314,8 +404,8 @@ class OrderBook:
         self.max_orders_per_address = max_orders_per_address
 
         # --- Book state ---
-        self._bids: Dict[Decimal, PriceLevel] = {}
-        self._asks: Dict[Decimal, PriceLevel] = {}
+        self._bids: Dict[Decimal, PriceLevel] = PriceLevels()
+        self._asks: Dict[Decimal, PriceLevel] = PriceLevels()
         self._orders: Dict[str, Order] = {}
         self._stop_orders: Dict[str, Order] = {}
         self._trades: Deque[Trade] = deque(maxlen=MAX_RECENT_TRADES)
@@ -353,11 +443,26 @@ class OrderBook:
 
     @property
     def best_bid(self) -> Optional[Decimal]:
-        return next((p for p, _amount in self.iter_levels(bids=True)), None)
+        return self._best(bids=True)
 
     @property
     def best_ask(self) -> Optional[Decimal]:
-        return next((p for p, _amount in self.iter_levels(bids=False)), None)
+        return self._best(bids=False)
+
+    def _best(self, bids: bool) -> Optional[Decimal]:
+        """The best price that shows something (``iter_levels``'s first)."""
+        levels = self._bids if bids else self._asks
+        prices = _prices(levels)
+        with localcontext(_CTX):
+            for price in reversed(prices) if bids else prices:
+                if levels[price].visible_amount > 0:
+                    return price
+        return None
+
+    def level_prices(self, bids: bool) -> List[Decimal]:
+        """A side's prices best first (a copy: the caller may change the book while it reads)."""
+        prices = _prices(self._bids if bids else self._asks)
+        return prices[::-1] if bids else list(prices)
 
     def iter_levels(self, bids: bool):
         """(price, displayed amount) of each level that shows something, best first, lazily: a
@@ -366,7 +471,7 @@ class OrderBook:
         reserves are left out — the depth everyone sees, and what the mark and funding prices
         read."""
         levels = self._bids if bids else self._asks
-        for price in sorted(levels, reverse=bids):
+        for price in self.level_prices(bids):
             with localcontext(_CTX):  # a generator: pinned per step, whoever iterates it
                 amount = levels[price].visible_amount
             if amount > 0:
@@ -901,11 +1006,7 @@ class OrderBook:
         """Match a market order against the book."""
         trades = []
         opposite = self._asks if taker.side == OrderSide.BUY else self._bids
-        prices = (
-            sorted(opposite.keys())
-            if taker.side == OrderSide.BUY
-            else sorted(opposite.keys(), reverse=True)
-        )
+        prices = self.level_prices(bids=taker.side != OrderSide.BUY)
 
         for price in list(prices):
             if taker.remaining <= 0 or taker.status == OrderStatus.CANCELLED:
@@ -934,10 +1035,11 @@ class OrderBook:
         trades = []
         opposite = self._asks if taker.side == OrderSide.BUY else self._bids
 
+        ascending = _prices(opposite)
         if taker.side == OrderSide.BUY:
-            matchable_prices = sorted([p for p in opposite if p <= taker.price])
+            matchable_prices = ascending[: bisect.bisect_right(ascending, taker.price)]
         else:
-            matchable_prices = sorted([p for p in opposite if p >= taker.price], reverse=True)
+            matchable_prices = ascending[bisect.bisect_left(ascending, taker.price) :][::-1]
 
         for price in list(matchable_prices):
             if taker.remaining <= 0 or taker.status == OrderStatus.CANCELLED:

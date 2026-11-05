@@ -93,7 +93,7 @@ def canonical_asset(value: Any, registry: Optional["TokenRegistry"] = None) -> s
     if text.upper() == NATIVE_ASSET:
         return NATIVE_ASSET
     if registry is not None:
-        token = registry.get(text)
+        token = registry.peek(text)
         if token is not None:
             return token.address
     return text
@@ -339,6 +339,11 @@ class TokenRegistry:
     def get(self, token: str) -> Optional[NativeToken]:
         return self.tokens.get(str(token).lower())
 
+    def peek(self, token: str) -> Optional[NativeToken]:
+        """``get`` for a caller that only reads the token: not handed out as one that may change
+        (no undo copy, no re-digest: commitment.py). Never change what it returns."""
+        return self.tokens.peek(str(token).lower())  # type: ignore[no-any-return]
+
     def require(self, token: str) -> NativeToken:
         t = self.get(token)
         if t is None:
@@ -351,7 +356,7 @@ class TokenRegistry:
         if holds_pooled_funds(holder):  # (never: it holds everyone's funds — see there)
             return False
         token = str(token).lower()
-        t = self.tokens.get(token)
+        t = self.tokens.peek(token)
         default_frozen = t is not None and t.default_frozen
         if not self.frozen and not default_frozen:
             return False
@@ -371,7 +376,7 @@ class TokenRegistry:
         h, o = account(holder), account(operator)
         if h == o or (token, h, o) in self.operators:
             return True
-        t = self.tokens.get(token)
+        t = self.tokens.peek(token)
         return (
             t is not None
             and o in {account(d) for d in t.default_operators}
