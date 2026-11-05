@@ -562,6 +562,23 @@ async def _apply_evm_section_on_import(
             "EVM section present but EVM disabled on this node — storing without applying"
         )
         return True, ""
+    from .. import post_state
+
+    if post_state.active(block_height):
+        # Deferred execution: the block was signed before it ran, so it runs whole — a
+        # transaction that cannot run is skipped — and the next block's root binds the result.
+        from ..contracts.evm_block_apply import apply_block_evm_section_total
+
+        ok, err, _ran = await apply_block_evm_section_total(
+            block_height,
+            block_hash,
+            block_timestamp,
+            evm_section,
+            _node.db,
+            _node.EVM_STATE_MANAGER,
+            _evm_defer_execute(),
+        )
+        return ok, err
     if declared_root:
         from ..contracts.evm_block_apply import apply_block_evm_section
 

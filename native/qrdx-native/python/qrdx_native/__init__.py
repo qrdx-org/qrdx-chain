@@ -1,5 +1,39 @@
 """Native hot paths for the QRDX node and validator (native/qrdx-native; docs/NATIVE.md)."""
 
-from ._native import Unsupported, body_root_sha256, canonical_json, mldsa65_verify_batch, threads
+from ._native import (
+    MNode,
+    NetService,
+    Unsupported,
+    body_root_sha256,
+    canonical_json,
+    lane_judge,
+    lane_run,
+    lt_apply,
+    lt_mix_entries,
+    mldsa65_keypair,
+    mldsa65_verify_batch,
+    mt_build,
+    mt_prove,
+    mt_update,
+    smt_update,
+    threads,
+)
 
-__all__ = ["Unsupported", "body_root_sha256", "canonical_json", "mldsa65_verify_batch", "threads"]
+__all__ = [
+    "MNode",
+    "NetService",
+    "Unsupported",
+    "body_root_sha256",
+    "canonical_json",
+    "lane_judge",
+    "lane_run",
+    "lt_apply",
+    "lt_mix_entries",
+    "mldsa65_keypair",
+    "mldsa65_verify_batch",
+    "mt_build",
+    "mt_prove",
+    "mt_update",
+    "smt_update",
+    "threads",
+]

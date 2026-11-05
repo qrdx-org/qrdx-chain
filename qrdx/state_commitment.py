@@ -148,7 +148,12 @@ async def install(conn: Any) -> None:
     off: set = set()
     conn.qrdx_lt_off = off
     await conn.create_function("qrdx_lt_on", 1, lambda domain: 0 if domain in off else 1)
-    await conn.create_function("qrdx_lt_apply", 4 + 2 * _WIDTH, _udf_apply, deterministic=True)
+    # (natively when the module is there: a block's every changed row calls it, holding the GIL
+    # on the database's thread — about 20 µs a row in Python)
+    from .native import lt_apply_function
+
+    apply = lt_apply_function() or _udf_apply
+    await conn.create_function("qrdx_lt_apply", 4 + 2 * _WIDTH, apply, deterministic=True)
     # INSERT OR REPLACE removes the conflicting row without firing its DELETE trigger unless
     # recursive triggers are on — and the accumulator would keep the replaced row.
     await conn.execute("PRAGMA recursive_triggers = ON")
@@ -179,8 +184,10 @@ async def full_accumulator(conn: Any, domain: str) -> bytes:
 
 
 async def stored_accumulator(conn: Any, domain: str) -> bytes:
-    cursor = await conn.execute("SELECT acc FROM state_commitment WHERE domain = ?", (domain,))
-    row = await cursor.fetchone()
+    rows = await conn.execute_fetchall(  # (statement and fetch: one trip)
+        "SELECT acc FROM state_commitment WHERE domain = ?", (domain,)
+    )
+    row = rows[0] if rows else None
     return bytes(row[0]) if row is not None else lthash.ZERO
 
 

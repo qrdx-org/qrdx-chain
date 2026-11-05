@@ -148,3 +148,28 @@ async def test_what_arrives_together_is_checked_and_read_together(monkeypatch):
     results = await asyncio.gather(*[sub.submit(t.to_dict()) for t in txs], sub.submit(forged))
     assert [ok for ok, _, _ in results] == [True] * 20 + [False]
     assert checked == [21] and read == [20]
+
+
+async def test_admission_waits_for_block_processing():
+    """``yield_to`` (the node's block lock, ``until_free``) is awaited before a transaction is
+    admitted: admission yields to a block being imported or built. An echo of one the mempool
+    holds is answered without waiting."""
+    net = _Net()
+    pool, _ = _submitter(net)
+    gate = asyncio.Event()
+    waited = []
+
+    async def yield_to():
+        waited.append(True)
+        await gate.wait()
+
+    sub = ExchangeSubmitter(lambda: pool, lambda: [], None, forward_batch=net.forward_batch,
+                            announce=net.announce, yield_to=yield_to)
+    t = _signed(PQPrivateKey.generate(), 0)
+    admitting = asyncio.ensure_future(sub.submit(t.to_dict()))
+    await asyncio.sleep(0.05)
+    assert waited and not admitting.done() and not pool.contains(t.tx_hash())
+    gate.set()
+    assert (await admitting)[0] and pool.contains(t.tx_hash())
+    waited.clear()
+    assert (await sub.submit(t.to_dict()))[0] and not waited       # (an echo: no wait)

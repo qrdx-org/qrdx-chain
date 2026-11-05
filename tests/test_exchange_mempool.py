@@ -198,3 +198,67 @@ class TestSelectionAndRemoval:
         table[addr] = 2
         assert mp.prune_stale() == 2
         assert mp.size() == 0
+
+    def test_a_block_prunes_only_its_own_lanes(self):
+        """``prune_lanes`` (as each block is applied): the lanes the block ran in lose what is
+        below their expected nonce; other lanes are not read. Selection no longer sweeps."""
+        (ka, a), (kb, b) = _signer(), _signer()
+        table = {a: 0, b: 0}
+        mp = ExchangeMempool(nonce_provider=_fixed_nonce_provider(table))
+        for n in range(3):
+            assert mp.admit(_order_tx(a, n, ka))[0] and mp.admit(_order_tx(b, n, kb))[0]
+        table[a] = table[b] = 2                       # (both consumed two)
+        assert [t.nonce for t in mp.select_for_block()] == [2, 2] and mp.size() == 6
+        assert mp.prune_lanes([a, a]) == 2           # (a block of a's)
+        assert sorted(t.nonce for t in mp._txs.values() if t.sender == a) == [2]
+        assert sorted(t.nonce for t in mp._txs.values() if t.sender == b) == [0, 1, 2]
+
+
+class TestSelectionIndex:
+    """Selection walks a per-lane nonce index kept by admit and remove (it rebuilt that map
+    from every queued transaction at every proposal). The index must give exactly what reading
+    the queued transactions gives, through admissions, removals and nonces moving on."""
+
+    @staticmethod
+    def _reference(mp, limit, gas_limit, nonces):
+        selected, gas = [], 0
+        for sender in sorted(mp._by_sender):
+            by_nonce = {mp._txs[h].nonce: mp._txs[h] for h in mp._by_sender[sender]}
+            n = nonces.get(sender, 0)
+            while n in by_nonce and len(selected) < limit:
+                if gas + int(by_nonce[n].gas_limit) > gas_limit:
+                    break
+                selected.append(by_nonce[n])
+                gas += int(by_nonce[n].gas_limit)
+                n += 1
+            if len(selected) >= limit:
+                break
+        return [t.tx_hash() for t in selected]
+
+    def test_the_index_selects_what_the_queued_transactions_give(self):
+        import random
+
+        rng = random.Random(11)
+        signers = [_signer() for _ in range(4)]
+        nonces = {}
+        mp = ExchangeMempool(nonce_provider=lambda a: nonces.get(a, 0))
+        txs = {addr: [_order_tx(addr, n, key) for n in range(8)] for key, addr in signers}
+        for step in range(60):
+            key, addr = rng.choice(signers)
+            action = rng.random()
+            if action < 0.55:
+                mp.admit(txs[addr][rng.randrange(8)])
+            elif action < 0.8:
+                queued = list(mp._by_sender.get(addr, ()))
+                if queued:
+                    mp.remove(rng.sample(queued, rng.randint(1, len(queued))))
+            else:
+                nonces[addr] = min(8, nonces.get(addr, 0) + rng.randint(0, 2))
+            for limit, gas_limit in ((100, 10**12), (5, 10**12), (100, 3_500_000)):
+                got = [t.tx_hash() for t in mp.select_for_block(limit=limit, gas_limit=gas_limit)]
+                assert got == self._reference(mp, limit, gas_limit, nonces), step
+            index = {lane: dict(v) for lane, v in mp._lane_nonces.items()}
+            truth = {}
+            for h, t in mp._txs.items():
+                truth.setdefault(t.nonce_key(), {})[t.nonce] = h
+            assert index == truth

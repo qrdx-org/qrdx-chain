@@ -834,8 +834,14 @@ def process_exchange_transactions(
     # which used to sit in it without paying, executing or consuming its nonce, repeatably — is
     # invalid. Each payer's fees are then reserved up front (below).
     checked = bool(exchange_txs) and is_inclusion_checked(int(block_height))
+    # Plain QRDX transfers are judged and run natively, run by run (qrdx/exchange/transfer_lane.py).
+    from . import transfer_lane
+
+    prepared = transfer_lane.prepare_all(exchange_txs) if checked else None
     if checked:
-        refused = mgr.section_errors(exchange_txs, int(block_height), block_timestamp)
+        refused = mgr.section_errors(
+            exchange_txs, int(block_height), block_timestamp, prepared=prepared
+        )
         if refused:
             i = min(refused)
             return False, f"exchange transaction {i} may not be in the block: {refused[i]}", ""
@@ -865,22 +871,38 @@ def process_exchange_transactions(
 
     # Process each exchange transaction in order
     failed_txs = []
-    for i, tx in enumerate(exchange_txs):
-        try:
-            result = mgr.process_transaction(tx, prepaid[i] if prepaid else None, checked)
-            if not result.success:
-                # Non-critical failure: tx fails but block continues
-                # (like a reverted EVM transaction — gas is still charged)
-                failed_txs.append((i, tx.tx_hash(), result.error))
-                logger.debug(
-                    "Exchange tx %d failed (non-critical): %s",
-                    i,
-                    result.error,
-                )
-        except Exception as e:
-            # Critical failure: block is invalid
-            mgr.revert_block()
-            return False, f"Critical exchange error at tx {i}: {e}", ""
+    lane_runs = (
+        dict(transfer_lane.runs(prepared)) if prepared is not None and prepaid is not None else {}
+    )
+    i = 0
+    while i < len(exchange_txs):
+        end = lane_runs.get(i)
+        if end is not None and prepaid is not None and prepared is not None:
+            results = transfer_lane.run(mgr, exchange_txs[i:end], prepared[i:end], prepaid[i:end])
+            if results is not None:
+                for k, result in enumerate(results, start=i):
+                    if not result.success:
+                        failed_txs.append((k, exchange_txs[k].tx_hash(), result.error))
+                i = end
+                continue
+        for k in range(i, end if end is not None else i + 1):
+            tx = exchange_txs[k]
+            try:
+                result = mgr.process_transaction(tx, prepaid[k] if prepaid else None, checked)
+                if not result.success:
+                    # Non-critical failure: tx fails but block continues
+                    # (like a reverted EVM transaction — gas is still charged)
+                    failed_txs.append((k, tx.tx_hash(), result.error))
+                    logger.debug(
+                        "Exchange tx %d failed (non-critical): %s",
+                        k,
+                        result.error,
+                    )
+            except Exception as e:
+                # Critical failure: block is invalid
+                mgr.revert_block()
+                return False, f"Critical exchange error at tx {k}: {e}", ""
+        i = end if end is not None else i + 1
 
     # Execute validator duties at block boundary
     try:

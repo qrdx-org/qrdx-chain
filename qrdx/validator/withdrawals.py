@@ -250,11 +250,11 @@ async def _ejected(db, block_height: int, block_epoch: int) -> List[Tuple[str, i
     from .epoch_state import state_at
 
     state = await state_at(db, int(block_epoch), int(block_height) - 1)
-    cur = await db.connection.execute(
+    rows = await db.connection.execute_fetchall(
         "SELECT DISTINCT LOWER(address) FROM validator_exits WHERE block_height < ?",
         (int(block_height),),
     )
-    exited_by_operation = {r[0] for r in await cur.fetchall()}
+    exited_by_operation = {r[0] for r in rows}
     return [
         (v.address, int(v.exit_epoch))
         for v in state.values()

@@ -246,6 +246,8 @@ async def test_the_fast_path_equals_the_full_rebuild_across_reorgs(seed):
             ancestor = tip - w.rng.randint(1, 6)
             res = await node.rollback(ancestor)
             assert "base" in res, f"round {round_}: the fast path did not run"
+            # (each block taken back out by its record: no checkpoint, no replay)
+            assert res.get("undone") == tip - ancestor and res["blocks"] == 0, res
             fast = await node.state()
             assert fast == await _full(node), f"seed {seed} round {round_}"
             w.resync()
@@ -346,9 +348,10 @@ async def test_a_checkpoint_whose_block_was_orphaned_is_not_used(monkeypatch):
 
 
 async def test_a_rejected_section_is_undone_by_the_fast_path():
-    """No per-block revert point: a section applied and then refused (a wrong declared root) is
-    undone by the restore every import path runs, rebuild_to_tip. The block is not stored, so
-    the state at the tip is the state before it — databases, exchange and journal."""
+    """A section applied and then refused (a wrong declared root) is undone: the exchange by the
+    block's own record when its context closes unstored, the database by the restore every
+    import path runs, rebuild_to_tip. The state at the tip is the state before it — databases,
+    exchange and journal."""
     from qrdx.exchange.block_processor import apply_block_exchange_section
 
     w = Workload(8)
@@ -368,7 +371,9 @@ async def test_a_rejected_section_is_undone_by_the_fast_path():
             ok, err = apply_block_exchange_section(height, float(TS0 + height * SPACING),
                                                    encode_exchange_txs(bad), "ab" * 64, node.mgr)
         assert not ok and "mismatch" in err
-        assert (await node.state())["exchange"] != before["exchange"]
+        # The block is not stored: its record takes it back out of the exchange as its context
+        # closes (qrdx/exchange/block_undo.py); the restore then undoes its database writes.
+        assert (await node.state())["exchange"] == before["exchange"]
         await rebuild_to_tip(node.db)
         assert await node.state() == before
     finally:

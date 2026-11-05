@@ -43,6 +43,14 @@ class StateModule(RPCModule):
             raise RPCError(
                 RPCErrorCode.RESOURCE_UNAVAILABLE, "state proofs are off on this network"
             )
+        if height is None:
+            # Under deferred execution the tip's state is signed by the next block, not yet
+            # made: the newest provable state is its parent's.
+            from ... import post_state
+
+            tip = int(await db.get_next_block_id()) - 1
+            if tip >= 1 and post_state.active(tip + 1):
+                height = tip - 1
         try:
             if kind in ("exchange", "exchange_part"):
                 from ...exchange.state_manager import ExchangeStateManager
@@ -62,16 +70,14 @@ class StateModule(RPCModule):
                 proof = await state_proofs.prove(db, kind, *ident, height=height)
         except ValueError as e:
             raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e)) from e
-        block = await db.get_block_by_id(proof["height"])
-        signed = None
-        if block:
-            from ...validator.block_verification import _parse_block_content
+        # The block whose signed root binds the state after ``height``: the next one under
+        # deferred execution (qrdx/post_state.py), which must exist before the proof stands.
+        from ... import post_state
 
-            try:
-                signed = _parse_block_content(block.get("content")).get("state_root")
-            except Exception:
-                signed = None
+        signed, signer = await post_state.signed_root_of_state(db, int(proof["height"]))
+        block = await db.get_block_by_id(signer) if signer is not None else None
         proof["block_hash"] = block.get("hash") if block else None
+        proof["signed_by_height"] = signer
         proof["state_root"] = signed
         # Never serve a proof this node cannot itself verify against the block it holds at that
         # height (a record that does not belong to it, or a block not stored here).

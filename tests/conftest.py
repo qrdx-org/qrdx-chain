@@ -25,6 +25,8 @@ os.environ.setdefault("QRDX_PERP_GENESIS_MARKETS", "")
 # that changes exchange state without the commitment tracking seeing it fails the test that
 # exercises it (qrdx/exchange/commitment.py).
 os.environ.setdefault("QRDX_VERIFY_STATE_COMMITMENTS", "1")
+# Every answer the chain index gives from memory, checked against its table (qrdx/chain_index.py).
+os.environ.setdefault("QRDX_VERIFY_CHAIN_INDEX", "1")
 
 
 import pytest  # noqa: E402

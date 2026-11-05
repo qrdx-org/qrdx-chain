@@ -124,7 +124,10 @@ unless every step holds:
    * Check every exchange commitment against its entries from scratch.
    * Recompute every root from the rows: the LtHash accumulators, the state-proof tree, the
      exchange tree, and the validator root, with stored log roots discarded.
-   * The unified root must equal the one block C signs.
+   * The unified root must equal the one block C signs — under deferred execution (chain-spec
+     feature `deferred_execution`) the one block C + 1 signs, since a block signs the state its
+     parent left. Block C + 1 is read before the blocks above C are removed, and the trusted
+     checkpoint must reach it.
 
    Every cache a root could be read from is discarded first, so rows and commitments cannot
    disagree. Of the validator states the snapshot stored, only the verified `S_E` is kept.

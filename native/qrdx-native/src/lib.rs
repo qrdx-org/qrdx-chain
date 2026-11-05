@@ -19,52 +19,26 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyLong, PyString, PyTuple};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use std::os::raw::c_int;
-use std::sync::Once;
+
+mod canon;
+mod lane;
+mod lthash;
+pub mod net;
+mod mtree;
+mod smt;
+mod oqs;
+mod tx;
 
 create_exception!(_native, Unsupported, PyException);
 
-// ── ML-DSA-65 through liboqs ───────────────────────────────────────────────────────────────
-
-const PUBLIC_KEY_LEN: usize = 1952;
-const SIGNATURE_LEN: usize = 3309;
-
-extern "C" {
-    fn OQS_init();
-    fn OQS_SIG_ml_dsa_65_verify(
-        message: *const u8,
-        message_len: usize,
-        signature: *const u8,
-        signature_len: usize,
-        public_key: *const u8,
-    ) -> c_int;
-}
-
-static INIT: Once = Once::new();
-
-fn verify_one(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
-    // liboqs reads a public key of its fixed length from the pointer it is given.
-    if public_key.len() != PUBLIC_KEY_LEN || signature.len() != SIGNATURE_LEN {
-        return false;
-    }
-    // SAFETY: the lengths are checked above; liboqs reads only within them.
-    unsafe {
-        OQS_SIG_ml_dsa_65_verify(
-            message.as_ptr(),
-            message.len(),
-            signature.as_ptr(),
-            signature.len(),
-            public_key.as_ptr(),
-        ) == 0
-    }
-}
+// ── ML-DSA-65 through liboqs (src/oqs.rs) ────────────────────────────────────────────────
 
 /// Whether each `(public_key, message, signature)` (each `bytes`) is a valid ML-DSA-65
 /// signature, in order. The bytes are read in place: converting each to a vector went element by
 /// element, and took longer than checking the signatures.
 #[pyfunction]
 fn mldsa65_verify_batch(py: Python<'_>, items: &Bound<'_, PyList>) -> PyResult<Vec<bool>> {
-    INIT.call_once(|| unsafe { OQS_init() });
+    oqs::init();
     let mut held: Vec<(Bound<'_, PyBytes>, Bound<'_, PyBytes>, Bound<'_, PyBytes>)> =
         Vec::with_capacity(items.len());
     for item in items.iter() {
@@ -80,9 +54,17 @@ fn mldsa65_verify_batch(py: Python<'_>, items: &Bound<'_, PyList>) -> PyResult<V
     Ok(py.allow_threads(|| {
         views
             .par_iter()
-            .map(|(pk, msg, sig)| verify_one(pk, msg, sig))
+            .map(|(pk, msg, sig)| oqs::dsa_verify(pk, msg, sig))
             .collect()
     }))
+}
+
+/// A new ML-DSA-65 key pair: (public key, secret key). For tests and tools.
+#[pyfunction]
+fn mldsa65_keypair<'py>(py: Python<'py>) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let (pk, sk) = oqs::dsa_keypair()
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("key generation failed"))?;
+    Ok((PyBytes::new_bound(py, &pk), PyBytes::new_bound(py, &sk)))
 }
 
 /// The threads a batch is checked on.
@@ -93,76 +75,7 @@ fn threads() -> usize {
 
 // ── canonical JSON (Python's json.dumps, sort_keys=True, ensure_ascii=True) ────────────────
 
-trait Sink {
-    fn put(&mut self, bytes: &[u8]);
-}
-
-impl Sink for Vec<u8> {
-    fn put(&mut self, bytes: &[u8]) {
-        self.extend_from_slice(bytes);
-    }
-}
-
-const HEX: &[u8; 16] = b"0123456789abcdef";
-
-fn write_u16_escape<S: Sink>(out: &mut S, unit: u16) {
-    out.put(&[
-        b'\\',
-        b'u',
-        HEX[(unit >> 12) as usize & 0xf],
-        HEX[(unit >> 8) as usize & 0xf],
-        HEX[(unit >> 4) as usize & 0xf],
-        HEX[unit as usize & 0xf],
-    ]);
-}
-
-/// A JSON string as Python's ensure_ascii encoder writes it: printable ASCII as is (bar `"` and
-/// `\`), the short escapes, every other character as `\uXXXX` (lowercase hex; a surrogate pair
-/// above U+FFFF).
-fn write_str<S: Sink>(out: &mut S, s: &str) {
-    out.put(b"\"");
-    let bytes = s.as_bytes();
-    // Most strings need no escape at all (hex, addresses): written in one piece.
-    if !bytes
-        .iter()
-        .any(|&b| !(0x20..=0x7e).contains(&b) || b == b'"' || b == b'\\')
-    {
-        out.put(bytes);
-        out.put(b"\"");
-        return;
-    }
-    let mut start = 0;
-    for (i, ch) in s.char_indices() {
-        let c = ch as u32;
-        let plain = (0x20..=0x7e).contains(&c) && ch != '"' && ch != '\\';
-        if plain {
-            continue;
-        }
-        if start < i {
-            out.put(&bytes[start..i]);
-        }
-        start = i + ch.len_utf8();
-        match ch {
-            '"' => out.put(b"\\\""),
-            '\\' => out.put(b"\\\\"),
-            '\n' => out.put(b"\\n"),
-            '\r' => out.put(b"\\r"),
-            '\t' => out.put(b"\\t"),
-            '\u{08}' => out.put(b"\\b"),
-            '\u{0c}' => out.put(b"\\f"),
-            _ => {
-                let mut units = [0u16; 2];
-                for unit in ch.encode_utf16(&mut units) {
-                    write_u16_escape(out, *unit);
-                }
-            }
-        }
-    }
-    if start < bytes.len() {
-        out.put(&bytes[start..]);
-    }
-    out.put(b"\"");
-}
+use crate::canon::{write_str, Sink, HEX};
 
 struct Style {
     item: &'static [u8],
@@ -321,7 +234,18 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("Unsupported", m.py().get_type_bound::<Unsupported>())?;
     m.add_function(wrap_pyfunction!(mldsa65_verify_batch, m)?)?;
     m.add_function(wrap_pyfunction!(threads, m)?)?;
+    m.add_function(wrap_pyfunction!(mldsa65_keypair, m)?)?;
     m.add_function(wrap_pyfunction!(canonical_json, m)?)?;
     m.add_function(wrap_pyfunction!(body_root_sha256, m)?)?;
+    m.add_function(wrap_pyfunction!(lthash::lt_apply, m)?)?;
+    m.add_function(wrap_pyfunction!(smt::smt_update, m)?)?;
+    m.add_function(wrap_pyfunction!(mtree::mt_build, m)?)?;
+    m.add_function(wrap_pyfunction!(mtree::mt_update, m)?)?;
+    m.add_function(wrap_pyfunction!(mtree::mt_prove, m)?)?;
+    m.add_class::<mtree::MNode>()?;
+    m.add_function(wrap_pyfunction!(lthash::lt_mix_entries, m)?)?;
+    m.add_function(wrap_pyfunction!(lane::lane_judge, m)?)?;
+    m.add_function(wrap_pyfunction!(lane::lane_run, m)?)?;
+    m.add_class::<net::NetService>()?;
     Ok(())
 }

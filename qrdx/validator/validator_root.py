@@ -38,6 +38,7 @@ block at its height, so a reorganization never reuses a stale one.
 from __future__ import annotations
 
 import json
+import weakref
 from collections import OrderedDict
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -109,24 +110,41 @@ def _row(values: Sequence[Any], columns: Sequence[str], numeric: Sequence[str]) 
     return out
 
 
+def _logs_sql() -> str:
+    """Every table's rows of a range of blocks in one query: (the table's place in ``LOGS``, the
+    height, its columns padded to the widest, then up to two sort keys), each table's rows in
+    the order its own query took them (by height, then the table's order)."""
+    width = max(len(columns) for _t, columns, _o, _n in LOGS)
+    parts = []
+    for i, (table, columns, order, _numeric) in enumerate(LOGS):
+        keys = [k.strip() for k in order.split(",")]
+        if len(keys) > 2:
+            raise ValueError(f"{table}: at most two sort keys")
+        cols = list(columns) + ["NULL"] * (width - len(columns))
+        keys += ["NULL"] * (2 - len(keys))
+        parts.append(
+            f"SELECT {i}, block_height, {', '.join(cols)}, {keys[0]}, {keys[1]} FROM {table} "
+            "WHERE block_height BETWEEN ? AND ?"
+        )
+    return " UNION ALL ".join(parts) + f" ORDER BY 2, 1, {width + 3}, {width + 4}"
+
+
+_LOGS_SQL = _logs_sql()
+
+
 async def logs_between(db: Any, low: int, high: int) -> Dict[int, List[Any]]:
     """Every logged row of the blocks ``low`` .. ``high``, per height: ``[[table, [row, ...]],
-    ...]`` for the tables with rows, in ``LOGS`` order."""
+    ...]`` for the tables with rows, in ``LOGS`` order (one query for every table)."""
     out: Dict[int, List[Any]] = {}
     if high < low:
         return out
-    conn = db.connection
+    rows = await db.connection.execute_fetchall(_LOGS_SQL, (int(low), int(high)) * len(LOGS))
     per: Dict[int, Dict[str, List[Any]]] = {}
-    for table, columns, order, numeric in LOGS:
-        cur = await conn.execute(
-            f"SELECT block_height, {', '.join(columns)} FROM {table} "
-            f"WHERE block_height BETWEEN ? AND ? ORDER BY block_height, {order}",
-            (int(low), int(high)),
+    for place, height, *values in rows:
+        table, columns, _order, numeric = LOGS[int(place)]
+        per.setdefault(int(height), {}).setdefault(table, []).append(
+            _row(values[: len(columns)], columns, numeric)
         )
-        for height, *values in await cur.fetchall():
-            per.setdefault(int(height), {}).setdefault(table, []).append(
-                _row(values, columns, numeric)
-            )
     for height, tables in per.items():
         out[height] = [[t, tables[t]] for t, *_rest in LOGS if t in tables]
     return out
@@ -155,8 +173,18 @@ def _remember(height: int, block_hash: str, root: str) -> None:
         _memo.popitem(last=False)
 
 
+_ready: "weakref.WeakKeyDictionary[Any, bool]" = weakref.WeakKeyDictionary()
+
+
 async def _ensure(db: Any) -> None:
+    """The table, once per database — again after a rollback, which can take it."""
+    if _ready.get(db):
+        return
+    from .. import chain_index
+
     await db.connection.execute(_SCHEMA)
+    chain_index.on_rollback(_ready.pop)
+    _ready[db] = True
 
 
 async def _newest_known(db: Any, height: int) -> Tuple[int, str]:

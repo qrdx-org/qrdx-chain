@@ -176,7 +176,14 @@ async def _apply_exchange_section_on_import(
             # The section is left half-applied (no per-block revert point): back to the tip.
             await _derived._restore_after_rejected_block(block_height, f"exchange section: {err}")
         return ok, err
-    # Trust-replay (sync): adopt the canonical section's computed root.
+    # Trust-replay (sync): adopt the canonical section's computed root. Under deferred execution
+    # (qrdx/post_state.py) no block declares its own exchange root, and a section that does not
+    # run (one its transactions may not be in: ``exchange_inclusion``) refuses the block on every
+    # path: its root is bound by the next block, so adopting it would bind a state the proposer
+    # never had.
+    from .. import post_state
+
+    deferred = post_state.active(block_height)
     try:
         from ..exchange.block_processor import process_exchange_transactions
 
@@ -195,12 +202,19 @@ async def _apply_exchange_section_on_import(
             )
         else:
             # Adopted without its section, as a replay does (it reverts): back to the tip.
-            logger.warning(f"Exchange section trust-replay failed at block {block_height}: {err}")
+            if not deferred:
+                logger.warning(
+                    f"Exchange section trust-replay failed at block {block_height}: {err}"
+                )
             await _derived._restore_after_rejected_block(block_height, f"exchange section: {err}")
+            if deferred:
+                return False, err
         return True, ""
     except Exception as e:
         logger.warning(f"Exchange section trust-replay error at block {block_height}: {e}")
         await _derived._restore_after_rejected_block(block_height, f"exchange section: {e}")
+        if deferred:
+            return False, f"exchange section raised: {e}"
         return True, ""
 
 
@@ -386,8 +400,22 @@ async def _verify_chain_rules(
         return False, f"chain-rule verification error: {e}"
 
 
+async def _check_deferred_root(block_content, height: int) -> Tuple[bool, str]:
+    """Before a block runs, under deferred execution (qrdx/post_state.py): its signed root must
+    be the root of the state its parent left — the state this node holds. (True, "") when the
+    feature is not in force at ``height``: the root is then checked after the block runs."""
+    from .. import post_state
+
+    if not post_state.active(height):
+        return True, ""
+    return await post_state.check(_node.db, block_content, int(height))
+
+
 async def _verify_unified_state_root(
-    block_content, enforce: Optional[bool] = None, height: Optional[int] = None
+    block_content,
+    enforce: Optional[bool] = None,
+    height: Optional[int] = None,
+    block_hash: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """
     E-D4: recompute the post-block unified state root (UTXO + account + exchange)
@@ -402,8 +430,23 @@ async def _verify_unified_state_root(
     """
     if enforce is None:
         enforce = _ED4_ENFORCE_UNIFIED_ROOT
+    from .. import post_state
     from ..crypto.hashing import unified_state_root
     from ..validator.block_verification import _parse_block_content
+
+    # Under deferred execution the block's root was checked before it ran (_check_deferred_root);
+    # what it leaves is the next block's to sign. Its root is computed now and kept for that.
+    if height is not None and post_state.active(int(height)):
+        try:
+            slot = _parse_block_content(block_content).get("slot")
+        except Exception:
+            slot = None
+        slot = None if slot is None else int(slot)
+        if block_hash:
+            await post_state.settle(_node.db, int(height), block_hash, slot)
+        else:
+            await post_state.unified_root(_node.db, int(height), slot)
+        return True, ""
 
     try:
         bc = _parse_block_content(block_content)
@@ -580,6 +623,22 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
             logger.warning(f"[SYNC] Rejecting PoS block {block_height}: {votes_err}")
             return False
 
+        # Deferred execution (qrdx/post_state.py): the block's signed root is the state its
+        # parent left, checked before it runs — under the same rule as E-D4 below.
+        ok_root, root_err = await _check_deferred_root(block_content, int(block_height))
+        if not ok_root:
+            try:
+                from ..validator.finality import finalized_block_height
+
+                final_h = await finalized_block_height(_node.db)
+                settled = final_h is not None and final_h >= 0 and block_height <= final_h
+            except Exception:
+                settled = False
+            if _sync_ed4_enforced(settled):
+                logger.warning(f"[SYNC] Refusing block {block_height} before it runs: {root_err}")
+                return False
+            logger.warning(f"[SYNC] [E-D4 observe] block {block_height} before it runs: {root_err}")
+
         # Everything the block changes from here is recorded in the undo journal under its
         # height (a checkpoint first if it opens an epoch) — what makes a later reorg cheap.
         from ..derived_state_rebuild import before_block
@@ -653,7 +712,10 @@ async def process_and_create_block(block_info: dict, is_bulk_sync: bool = False)
                 final_h = await finalized_block_height(_node.db)
                 at_finalized = final_h is not None and final_h >= 0 and block_height <= final_h
                 ok_ed4, verr_ed4 = await _verify_unified_state_root(
-                    block_content, enforce=_sync_ed4_enforced(at_finalized), height=block_height
+                    block_content,
+                    enforce=_sync_ed4_enforced(at_finalized),
+                    height=block_height,
+                    block_hash=block_hash,
                 )
                 if not ok_ed4:
                     logger.warning(f"[SYNC] Rejecting block {block_height}: E-D4 {verr_ed4}")

@@ -129,6 +129,33 @@ _FEE_INPUTS: "weakref.WeakKeyDictionary[Any, OrderedDict]" = weakref.WeakKeyDict
 _FEE_INPUTS_KEPT = 1024
 
 
+# The exchange gas each block's section declared, noted as the section is stored (by block hash,
+# for each database): a block's children read it rather than parse its section back.
+_EXCHANGE_GAS: "weakref.WeakKeyDictionary[Any, OrderedDict]" = weakref.WeakKeyDictionary()
+
+
+def note_exchange_section(db: Any, block_hash: str, section: Iterable[Any]) -> None:
+    """A block's exchange section is being stored: keep the gas it declared (``fee_gas``)."""
+    try:
+        cache = _EXCHANGE_GAS.get(db)
+        if cache is None:
+            cache = _EXCHANGE_GAS[db] = OrderedDict()
+        cache[block_hash] = fee_gas(section, ())[1]
+        cache.move_to_end(block_hash)
+        while len(cache) > _FEE_INPUTS_KEPT:
+            cache.popitem(last=False)
+    except (TypeError, ValueError, AttributeError):
+        pass  # (read back from the database instead)
+
+
+def _noted_exchange_gas(db: Any, block_hash: str) -> Optional[int]:
+    try:
+        cache = _EXCHANGE_GAS.get(db)
+    except TypeError:
+        return None
+    return None if cache is None else cache.get(block_hash)
+
+
 def _fee_cache(db: Any) -> Optional["OrderedDict"]:
     try:
         cache = _FEE_INPUTS.get(db)
@@ -142,8 +169,19 @@ def _fee_cache(db: Any) -> Optional["OrderedDict"]:
 async def _stored_block(db: Any, height: int) -> Optional[Tuple[Tuple[int, int], int, int]]:
     """(header fees, EVM gas, exchange gas) of the stored block at ``height``, or None if there
     is none."""
+    from . import chain_index
     from .validator.block_verification import _parse_block_content
 
+    # (a block's inputs are read once: its hash, from the chain index's memory, finds them)
+    try:
+        indexed = await chain_index.block_hash_at(db, int(height))
+    except Exception:
+        indexed = None
+    held = _fee_cache(db) if indexed is not None else None
+    if held is not None:
+        known = held.get(indexed)
+        if known is not None:
+            return known
     block = await db.get_block_by_id(int(height))
     if not block:
         return None
@@ -157,7 +195,9 @@ async def _stored_block(db: Any, height: int) -> Optional[Tuple[Tuple[int, int],
     except (ValueError, SyntaxError):
         content = None  # no header to read: the floors (every node reads the same bytes)
     evm_gas, _ = fee_gas((), await db.get_block_evm_txs(block_hash))
-    _, exchange_gas = fee_gas(await db.get_block_exchange_txs(block_hash), ())
+    exchange_gas = _noted_exchange_gas(db, block_hash)
+    if exchange_gas is None:
+        _, exchange_gas = fee_gas(await db.get_block_exchange_txs(block_hash), ())
     inputs = (header_fees(content), evm_gas, exchange_gas)
     if cache is not None:
         cache[block_hash] = inputs

@@ -291,8 +291,11 @@ class ExchangeStateManager:
 
     @classmethod
     def reset_instance(cls) -> None:
-        """Reset singleton (for testing)."""
+        """Reset singleton (for testing, and a rebuild from nothing)."""
         cls.instance = None
+        from . import block_undo
+
+        block_undo.invalidate()  # (no block's record describes a new exchange)
 
     # =====================================================================
     #  Block lifecycle
@@ -622,6 +625,7 @@ class ExchangeStateManager:
         block_timestamp: float,
         balance_of: Optional[Any] = None,
         base_fee: Any = "block",
+        prepared: Optional[List[Any]] = None,
     ) -> Dict[int, str]:
         """Why each of a block's exchange transactions may not be in it, by index — empty: the
         block may carry them all. Judged together, as of the block's start, before any runs:
@@ -638,8 +642,14 @@ class ExchangeStateManager:
         its nonce. Read only. The block's own height and time are the clock. ``balance_of``
         (default: the pre-loaded balances) and ``base_fee`` (default: the block's, as pre-loaded)
         are how a proposer judges its selection before pre-loading anything — the balances every
-        importer will pre-load."""
+        importer will pre-load. ``prepared``: ``transfer_lane.prepare_all(txs)``, when the caller
+        has it (plain QRDX transfers are judged natively, run by run)."""
+        from . import transfer_lane
+
         balance = balance_of or self.available_balance
+        if prepared is None:
+            prepared = transfer_lane.prepare_all(txs)
+        lane_runs = dict(transfer_lane.runs(prepared))
         nonces: Dict[str, int] = {}
         votes: Dict[str, int] = {}
         owed: Dict[str, Decimal] = {}
@@ -651,12 +661,21 @@ class ExchangeStateManager:
         if base_fee != "block":
             self.exchange_base_fee = base_fee
         try:
-            for i, tx in enumerate(txs):
-                err = self._inclusion_error(
-                    tx, balance, nonces, votes, owed, free_in_block, free_spent
-                )
-                if err:
-                    errors[i] = err
+            i = 0
+            while i < len(txs):
+                end = lane_runs.get(i)
+                if end is not None and transfer_lane.judge(
+                    self, txs[i:end], prepared[i:end], balance, nonces, owed
+                ):
+                    i = end
+                    continue
+                for k in range(i, end if end is not None else i + 1):
+                    err = self._inclusion_error(
+                        txs[k], balance, nonces, votes, owed, free_in_block, free_spent
+                    )
+                    if err:
+                        errors[k] = err
+                i = end if end is not None else i + 1
         finally:
             (
                 self._current_block_height,

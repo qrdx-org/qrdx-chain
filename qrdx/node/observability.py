@@ -31,8 +31,10 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Optional,
     Set,
+    Tuple,
     Union,
 )
 
@@ -354,15 +356,50 @@ class ChangeSignal:
 
 class SignallingLock(asyncio.Lock):
     """An asyncio lock that raises ``signal`` each time it is released: main.block_processing_lock,
-    held by every path that changes the chain (proposing, importing, syncing, a reorg)."""
+    held by every path that changes the chain (proposing, importing, syncing, a reorg).
+
+    It also says when block work is pending (``until_free``), so that work which can wait
+    (admitting transactions, indexing) yields to it. An import awaits the database dozens of
+    times, and each await resumed only after every callback queued before it: under load,
+    hundreds from admission, which more than doubled a block's import time
+    (docs/PERFORMANCE.md)."""
 
     def __init__(self, signal: ChangeSignal) -> None:
         super().__init__()
         self._signal = signal
+        self._wanted = 0  # holding it or waiting for it
+        self._free = asyncio.Event()
+        self._free.set()
+
+    async def acquire(self) -> Literal[True]:
+        self._wanted += 1
+        self._free.clear()
+        try:
+            return await super().acquire()
+        except BaseException:
+            self._unwanted()
+            raise
 
     def release(self) -> None:
         super().release()
+        self._unwanted()
         self._signal.raise_()
+
+    def _unwanted(self) -> None:
+        self._wanted -= 1
+        if self._wanted <= 0:
+            self._wanted = 0
+            self._free.set()
+
+    async def until_free(self, at_most: float) -> None:
+        """Until no one holds or waits for the lock, or ``at_most`` seconds have passed (work
+        that yields is delayed, never starved)."""
+        if self._free.is_set():
+            return
+        try:
+            await asyncio.wait_for(self._free.wait(), at_most)
+        except asyncio.TimeoutError:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -388,6 +425,7 @@ async def chain_event_poller(
     get_slashing_count: Optional[_MaybeAsync] = None,
     get_mempool_depth: Optional[_MaybeAsync] = None,
     get_gauges: Optional[_MaybeAsync] = None,
+    get_version: Optional[Callable[[], Optional[int]]] = None,
     interval: float = 1.0,
     signal: Optional[ChangeSignal] = None,
     _max_iterations: Optional[int] = None,  # test hook
@@ -401,7 +439,9 @@ async def chain_event_poller(
     subscriber can drop what it showed. The slower gauges (peers, finality, slashing, mempool,
     and ``get_gauges``: ``(name, value, labels)`` triples — the validator's signing state, the
     bridge's guardrails, oracle ages) are refreshed at most every ``interval``. Best-effort: a
-    getter error is retried on the next wake."""
+    getter error is retried on the next wake. ``get_version``: a number that changes whenever
+    the chain's blocks may have (None: unknown) — while it and the tip are as they were, the
+    hashes are not read again (the signal wakes the feed many times a block)."""
     metrics.describe("qrdx_chain_height", "Current chain tip height")
     metrics.describe("qrdx_finalized_epoch", "Highest finalized epoch")
     metrics.describe("qrdx_peer_count", "Connected peer count")
@@ -412,6 +452,7 @@ async def chain_event_poller(
     listener = signal.listener() if signal is not None else None
     announced: Dict[int, str] = {}  # recently announced height → hash
     last_height = -1
+    last_version: Optional[int] = None
     gauges_at = float("-inf")
     fin: Dict[str, Any] = {}
     iterations = 0
@@ -432,10 +473,13 @@ async def chain_event_poller(
                         get_mempool_depth,
                         get_gauges,
                     )
-                if tip != last_height or get_hashes is not None:
+                version = get_version() if get_version is not None else None
+                unchanged = version is not None and version == last_version
+                if tip != last_height or (get_hashes is not None and not unchanged):
                     last_height = await _publish_blocks(
                         hub, metrics, tip, last_height, announced, get_hashes, fin
                     )
+                    last_version = version
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -560,6 +604,47 @@ async def _publish_blocks(
 METRICS = Metrics()
 EVENT_HUB = EventHub()
 CHAIN_CHANGED = ChangeSignal()
+
+
+# Round trips to the database's thread (aiosqlite), for Phases: every statement, fetch and commit.
+DB_CALLS = [0]
+
+
+def count_db_calls(connection: Any) -> None:
+    """Count ``connection``'s round trips in DB_CALLS (its every operation goes through
+    ``_execute``)."""
+    inner = getattr(connection, "_execute", None)
+    if inner is None or getattr(inner, "_counted", False):
+        return
+
+    async def counted(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        DB_CALLS[0] += 1
+        return await inner(fn, *args, **kwargs)
+
+    counted._counted = True  # type: ignore[attr-defined]
+    connection._execute = counted
+
+
+class Phases:
+    """Wall time of a task's steps, for its log line: ``mark(name)`` ends the step called
+    ``name``. ``str()`` reads "lock 3, exchange 41, store 9, db 37" (milliseconds; steps under
+    half a millisecond left out; ``db``: the database round trips since it began)."""
+
+    __slots__ = ("_last", "_steps", "_db")
+
+    def __init__(self) -> None:
+        self._last = time.perf_counter()
+        self._steps: List[Tuple[str, float]] = []
+        self._db = DB_CALLS[0]
+
+    def mark(self, name: str) -> None:
+        now = time.perf_counter()
+        self._steps.append((name, now - self._last))
+        self._last = now
+
+    def __str__(self) -> str:
+        steps = [f"{n} {1000 * s:.0f}" for n, s in self._steps if s >= 0.0005]
+        return ", ".join(steps + [f"db {DB_CALLS[0] - self._db}"])
 
 
 def record(name: str, amount: float = 1.0, labels: Optional[Dict[str, Any]] = None) -> None:

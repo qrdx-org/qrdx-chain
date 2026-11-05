@@ -16,6 +16,9 @@ this machine.
 
     python -m integration_tests.load --force [--rates 10,25,50,100] [--seconds 30]
         [--profile]    # py-spy the proposer of node 0 at each step (needs py-spy)
+        [--hosts containers [--cpus 2] [--delay-ms 25] [--image qrdx-node:local]]
+                       # each node in a container behind a delaying link
+                       # (integration_tests/multihost.py)
 """
 
 from __future__ import annotations
@@ -388,7 +391,19 @@ async def run(args) -> int:
     for name in ("QRDX_RPC_CLIENT_RPS", "QRDX_RPC_GLOBAL_RPS"):
         os.environ.setdefault(name, "100000")
 
-    orch = TestnetOrchestrator(force_regenerate=args.force)
+    hosts = None
+    if args.hosts == "containers":
+        from integration_tests.multihost import ContainerHosts, default_mounts
+
+        hosts = ContainerHosts(
+            args.image,
+            cpus=args.cpus,
+            delay_ms=args.delay_ms,
+            jitter_ms=args.jitter_ms,
+            mbps=args.mbps,
+            extra_mounts=args.mount or default_mounts(),
+        )
+    orch = TestnetOrchestrator(force_regenerate=args.force, hosts=hosts)
     try:
         await orch.setup()
         await orch.start_all_nodes()
@@ -407,7 +422,7 @@ async def run(args) -> int:
         results = []
         for target in args.rates:
             proc = None
-            if args.profile:
+            if args.profile and hosts is None:
                 out = os.path.abspath(f"load-profile-{int(target)}.collapsed")
                 proc = _profile(orch.node_processes[0].process.pid, args.seconds, out)
             step = await load.step(accounts, target, args.seconds)
@@ -442,6 +457,14 @@ def main() -> int:
     p.add_argument("--seconds", type=float, default=30.0)
     p.add_argument("--accounts", type=int, default=64)
     p.add_argument("--profile", action="store_true")
+    # Nodes on separate machines, emulated (integration_tests/multihost.py)
+    p.add_argument("--hosts", choices=("local", "containers"), default="local")
+    p.add_argument("--image", default="qrdx-node:local", help="the node image (containers)")
+    p.add_argument("--cpus", type=float, default=2.0, help="CPUs a node (containers)")
+    p.add_argument("--delay-ms", type=float, default=25.0, help="one-way link delay (containers)")
+    p.add_argument("--jitter-ms", type=float, default=0.0)
+    p.add_argument("--mbps", type=float, default=None, help="link rate cap (containers)")
+    p.add_argument("--mount", action="append", help="also mount this directory (containers)")
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     )

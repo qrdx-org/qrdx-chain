@@ -176,10 +176,10 @@ async def _target_stakes(db: Any, view: "ChainView", target: int) -> Dict[str, D
 
 async def _stored_finalized(db: Any) -> Optional[Tuple[int, str, int]]:
     try:
-        cur = await db.connection.execute(
+        rows = await db.connection.execute_fetchall(  # (statement and fetch: one trip)
             "SELECT value FROM chain_metadata WHERE key = 'ffg_finalized'"
         )
-        row = await cur.fetchone()
+        row = rows[0] if rows else None
     except Exception:
         return None
     if not row:
@@ -256,15 +256,22 @@ class ChainView:
         return out
 
 
-async def compute(db: Any, view: Optional[ChainView] = None) -> Optional[Finality]:
+_UNREAD: Any = object()
+
+
+async def compute(
+    db: Any, view: Optional[ChainView] = None, stored: Any = _UNREAD
+) -> Optional[Finality]:
     """Justified and finalized checkpoints of the canonical chain — or of ``view`` — (None while
-    it has no blocks). Resumes from the stored finalized checkpoint while it is on the chain."""
+    it has no blocks). Resumes from the stored finalized checkpoint while it is on the chain
+    (``stored``: as ``_stored_finalized`` read it, if the caller just did)."""
     view = view or ChainView(db)
     genesis = await view.block_hash(0)
     if genesis is None:
         return None
     state = Finality(justified={0: genesis}, finalized=(0, genesis), finalized_height=0)
-    stored = await _stored_finalized(db)
+    if stored is _UNREAD:
+        stored = await _stored_finalized(db)
     if stored is not None and await view.block_hash(stored[2]) == stored[1]:
         state.justified = {stored[0]: stored[1]}
         state.finalized, state.finalized_height = (stored[0], stored[1]), stored[2]
@@ -370,10 +377,10 @@ async def update(db: Any) -> Dict[str, int]:
     """Recompute and persist: the epochs table's justified/finalized flags (what the epoch
     loop, reconstruction and the RPC read) and the finalized checkpoint (what the reorg guard
     reads). Returns ``{"justified_epoch", "finalized_epoch"}`` (-1 for none)."""
-    state = await compute(db)
+    prev = await _stored_finalized(db)
+    state = await compute(db, stored=prev)
     if state is None:
         return {"justified_epoch": -1, "finalized_epoch": -1}
-    prev = await _stored_finalized(db)
     fin_epoch, fin_root = state.finalized
     if prev is None or fin_epoch > prev[0]:
         await db.connection.execute(
@@ -409,10 +416,10 @@ async def update(db: Any) -> Dict[str, int]:
     # including any skipped since the last update); justification above it is recomputed, since
     # a reorg can change it.
     low = prev[0] if prev is not None else 0
-    cur = await db.connection.execute(
+    rows = await db.connection.execute_fetchall(
         "SELECT epoch, justified, finalized FROM epochs WHERE epoch >= ?", (low,)
     )
-    stored = {int(r[0]): (bool(r[1]), bool(r[2])) for r in await cur.fetchall()}
+    stored = {int(r[0]): (bool(r[1]), bool(r[2])) for r in rows}
     top = max([fin_epoch, *state.justified, *stored])
     for ep in range(low, top + 1):
         was = stored.get(ep, (False, False))

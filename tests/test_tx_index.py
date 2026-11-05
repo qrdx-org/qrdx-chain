@@ -243,6 +243,7 @@ async def test_the_poller_follows_the_tip(chain):
     import asyncio
     db, _, mgr, *_ = chain
     lock = asyncio.Lock()
+    # (a block a hold of the lock: one pass a block)
     await tx_index.tx_index_poller(lambda: db, lock, get_journal=lambda: mgr.journal,
-                                   interval=0, _max_iterations=1)
+                                   interval=0, _max_iterations=6)
     assert await db.tx_index_head() == 3

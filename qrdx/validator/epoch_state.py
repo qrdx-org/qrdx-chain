@@ -702,10 +702,10 @@ async def state_at(db: Any, epoch: int, up_to_height: Optional[int] = None) -> S
     from .. import chain_index
 
     await _ensure(db)
-    await chain_index.sync(db)
+    indexed = await chain_index.sync(db)  # (to the tip: so the tip, without asking again)
     epoch = max(0, int(epoch))
     if up_to_height is None:
-        up_to_height = int(await db.get_next_block_id()) - 1
+        up_to_height = indexed
     top = int(up_to_height)
     if top < 0:
         return State()

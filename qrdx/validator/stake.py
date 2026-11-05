@@ -640,11 +640,11 @@ class StakeManager:
         if not self.database or not self.database.connection:
             return None
         try:
-            cursor = await self.database.connection.execute(
+            rows = await self.database.connection.execute_fetchall(
                 "SELECT stake FROM validator_stakes WHERE validator_address = ?",
                 (validator_address,),
             )
-            row = await cursor.fetchone()
+            row = rows[0] if rows else None
             if row:
                 return {"stake": Decimal(str(row[0])) / Decimal("100000000")}
             return None

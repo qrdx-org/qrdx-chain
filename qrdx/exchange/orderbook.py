@@ -43,7 +43,13 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from ..crypto import lthash
 from . import undo
-from .commitment import CommittedDict, _apply, _vector, as_committed_dict, encode_value
+from .commitment import (
+    CommittedDict,
+    _apply_digests,
+    _vector,
+    as_committed_dict,
+    encode_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -634,7 +640,8 @@ class OrderBook:
         else:
             dirty = self.__dict__.get("_dirty_levels") or set()
         trees = trees_on()
-        removed, added = lthash.Accumulator(), lthash.Accumulator()
+        removed: List[bytes] = []
+        added: List[bytes] = []
         tree_changes = []
         for key in dirty:
             tag, price = key
@@ -646,12 +653,12 @@ class OrderBook:
                 digests[key] = new
             if old != new:
                 if old is not None:
-                    removed.add(_vector("book.level", old))
+                    removed.append(old)
                 if new is not None:
-                    added.add(_vector("book.level", new))
+                    added.append(new)
                 if trees:
                     tree_changes.append((self.level_key(tag, price), payload))
-        self._level_acc = _apply(self._level_acc, removed, added)
+        self._level_acc = _apply_digests(self._level_acc, "book.level", removed, added)
         self._level_digests = digests
         self._dirty_levels = set()
         # The levels' proof tree, from the same changes (rebuilt whole when the digests were).
@@ -703,7 +710,7 @@ class OrderBook:
         if self.cached_digest() != self.state_digest():
             raise CommitmentMismatch(f"order book {self.pool_id}: cached digest is stale")
         if trees_on():
-            full = smt.m_build(sorted(self._all_level_payloads()))
+            full = smt._py_build(sorted(self._all_level_payloads()))
             if smt.m_root(self.__dict__.get("_level_tree")) != smt.m_root(full):
                 raise CommitmentMismatch(f"order book {self.pool_id}: the level tree is stale")
 

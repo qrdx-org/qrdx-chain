@@ -25,7 +25,7 @@ from starlette.background import BackgroundTasks
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 
-from qrdx import fastjson
+from qrdx import chain_index as _chain_index, fastjson
 from qrdx.constants import (
     CHAIN_SPEC,
     CHAIN_SPEC_ENV_CONFLICTS,
@@ -39,6 +39,7 @@ from qrdx.constants import (
     LOG_INCLUDE_RESPONSE_CONTENT,
     LOG_MAX_PATH_LENGTH,
     NODE_VERSION,
+    SLOT_DURATION,
 )
 from qrdx.database_sqlite import DatabaseSQLite as Database
 from qrdx.helpers import sha256
@@ -349,6 +350,8 @@ def _get_exchange_submitter():
             announce=_announce,
             get_balances=_balances,
             forward_batch_to_all=_forward_batch_to_all,
+            # (blocks first: admission waits while one is imported or built, a slot at most)
+            yield_to=lambda: block_processing_lock.until_free(SLOT_DURATION),
         )
     return EXCHANGE_SUBMITTER
 
@@ -727,6 +730,7 @@ async def startup():
                     try:
                         validator_node.set_evm_tx_source(_get_evm_mempool())
                         validator_node.set_evm_section_producer(_evm._produce_evm_section)
+                        validator_node.set_evm_section_runner(_evm._apply_evm_section_on_import)
                         # Block production must never interleave with an import or a
                         # derived-state rebuild: share the lock they hold.
                         validator_node.set_block_processing_lock(block_processing_lock)
@@ -845,6 +849,7 @@ async def startup():
                 get_slashing_count=_poll_slashing,
                 get_mempool_depth=_poll_mempool,
                 get_gauges=_poll_gauges,
+                get_version=lambda: _chain_index.change_count(db),
                 interval=2.0,
             )
         )
@@ -939,6 +944,7 @@ async def startup():
         exchange_apply_section=_import._apply_exchange_section_on_import,  # D3/Phase E importer hook (flushes collateral)
         verify_unified_root=_import._verify_unified_state_root,  # E-D4 importer hook
         check_parent_continuity=_import._check_parent_continuity,  # parent-continuity observe hook
+        check_deferred_root=_import._check_deferred_root,  # deferred execution: root before running
         tiebreak_rollback=_forks._tiebreak_rollback,  # fork-choice mechanism-2 rollback hook
         restore_after_rejected_block=_derived._restore_after_rejected_block,  # undo a rejected block's effects
         enforce_equal_height_tiebreak=_forks._ENFORCE_EQUAL_HEIGHT_TIEBREAK,  # mechanism-2 gate
@@ -952,6 +958,10 @@ async def startup():
         block_relay=_relay,  # compact blocks: rebuilt from the mempool (qrdx/node/block_relay.py)
     )
     NodeInterface.network_identity_provider = _identity._local_network_identity
+
+    # Peers' transactions over the native transport, on threads of its own (qrdx/node/netd.py;
+    # QRDX_P2P=0 keeps them on HTTP).
+    await _netd.start(CHAIN_SPEC.chain_id, GENESIS_BLOCK_HASH, DENARO_NODE_PORT)
 
     logger.info(
         f"✅ JSON-RPC server initialized (dht_* + p2p_* always-on): {len(rpc_server.get_methods())} methods"
@@ -1136,6 +1146,7 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     """Clean shutdown"""
+    _netd.stop()
     # Stop Kademlia DHT (persists routing table to disk)
     if dht_discovery is not None:
         dht_discovery.stop()
@@ -1288,6 +1299,7 @@ from qrdx.node import (  # noqa: E402
     discovery as _discovery,
     evm_runtime as _evm,
     fork_choice as _forks,
+    netd as _netd,
     peers as _peers,
     sync as _sync,
 )

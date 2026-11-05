@@ -109,10 +109,14 @@ memory for the last 256 heights, for proofs.
 | `exchange_part` | `market:<id>`, `pool:<id>`, `oracle`, … | — |
 
 `height` defaults to the newest provable block (an exchange proof: one of the last 256). A
-database proof:
+proof of height h is of the state after block h. Under deferred execution (chain-spec feature
+`deferred_execution`, qrdx/post_state.py) a block signs the state its parent left, so that
+state is signed by block h + 1: the proof carries that block's hash and root, and
+`signed_by_height` says which block it is (h + 1, or h on a network without the feature). The
+default height is then the tip's parent, the newest state already signed. A database proof:
 
 ```json
-{"height": 1234, "block_hash": "…", "state_root": "…",
+{"height": 1234, "signed_by_height": 1235, "block_hash": "…", "state_root": "…",
  "kind": "account", "key": "…", "identity": "…",
  "entry": "01…" | null, "fields": {"balance_wei": "…", …},
  "siblings": ["…", …], "terminal": null | {"key": "…", "value_hash": "…"},
@@ -131,7 +135,8 @@ trusts.
 
 `0x0000000000000000000000000000000000000300` verifies a proof against an **ancestor** block of
 the executing chain (`1 ≤ height < block.number`), reading that block's signed `state_root` from
-its stored body — the same on every node. Input, packed:
+its stored body — the same on every node. Under deferred execution that root is of the state
+the block's parent left: pass the proof's `signed_by_height`. Input, packed:
 
 | Field | Bytes |
 |---|---|

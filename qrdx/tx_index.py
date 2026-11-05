@@ -34,7 +34,11 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
-INDEX_BATCH = 200  # blocks per pass under the lock
+INDEX_BATCH = 200  # blocks per pass (with no lock to share)
+# Blocks indexed per hold of the block-processing lock. Imports wait while it is held, and
+# indexing a loaded block (reading back and parsing its operations) takes milliseconds each:
+# 200 a pass held the lock long enough to delay the blocks that arrived meanwhile.
+HOLD_BLOCKS = 1
 REORG_CHECK_DEPTH = 64  # indexed block hashes re-checked against the chain each pass
 DETAIL_LIMIT = 4000  # bytes of JSON detail kept per transaction
 WEI = Decimal(10) ** 18
@@ -226,12 +230,17 @@ def _exchange_summary(op: str, p: Dict[str, Any], data: Dict[str, Any]) -> Dict[
 
 
 async def _exchange(db, blk: _BlockIndex, journal) -> None:
-    section = await db.get_block_exchange_txs(blk.block_hash)
-    if not section:
-        return
     from .exchange.block_processor import decode_exchange_txs
 
-    for tx in decode_exchange_txs(section):
+    # (a block this node just stored is held in memory, its operations usually decoded too)
+    recent = getattr(db, "recent_exchange_section", None)
+    held = recent(blk.block_hash) if recent is not None else None
+    section, objects = held if held is not None else (None, None)
+    if section is None:
+        section = await db.get_block_exchange_txs(blk.block_hash)
+    if not section:
+        return
+    for tx in objects if objects is not None else decode_exchange_txs(section):
         tx_hash = tx.tx_hash()
         op = tx.op_type.name
         p = dict(tx.params or {})
@@ -450,19 +459,24 @@ async def tx_index_poller(
     _max_iterations: Optional[int] = None,
 ) -> None:
     """Follow the tip: each pass indexes what is new, under ``lock`` so a block is never read
-    mid-application. Never raises (the index is a convenience; consensus does not wait on it)."""
+    mid-application — a block at a time, when no block work is pending (block processing comes
+    first). Never raises (the index is a convenience; consensus does not wait on it)."""
     iterations = 0
+    batch = INDEX_BATCH if lock is None else HOLD_BLOCKS
     while True:
         try:
             db = db_getter()
             if db is not None and hasattr(db, "tx_index_head"):
                 journal = get_journal() if get_journal is not None else None
                 if lock is not None:
+                    until_free = getattr(lock, "until_free", None)
+                    if until_free is not None:
+                        await until_free(interval)
                     async with lock:
-                        done = await sync_index(db, journal)
+                        done = await sync_index(db, journal, max_blocks=batch)
                 else:
-                    done = await sync_index(db, journal)
-                if done >= INDEX_BATCH:
+                    done = await sync_index(db, journal, max_blocks=batch)
+                if done >= batch:
                     iterations += 1
                     if _max_iterations is not None and iterations >= _max_iterations:
                         break

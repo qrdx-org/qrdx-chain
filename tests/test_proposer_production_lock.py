@@ -53,10 +53,18 @@ def test_everything_from_the_tip_recheck_to_storing_the_block_is_locked():
 
 
 def test_broadcast_and_slot_sleep_happen_outside_the_lock():
+    """The broadcast begins as soon as the block is signed (peers import while this node
+    stores it), but it is awaited only once the lock is released: a slow peer never holds up
+    imports."""
     lines = _loop_lines()
     start, end = _locked_region(lines)
     region = "\n".join(lines[start:end])
-    assert "broadcast_callback(" not in region, "a slow peer would hold up every import"
+    after = "\n".join(lines[end:])
+    assert "await self.broadcast_callback(" not in region, "a slow peer would hold up imports"
+    begun = region.index("asyncio.ensure_future(\n") if "asyncio.ensure_future(\n" in region else -1
+    assert begun > region.index("self.manager.propose_block("), "broadcast only a signed block"
+    assert begun < region.index("self.db.add_block("), "the broadcast does not wait for storing"
+    assert "await broadcast" in after
     assert "asyncio.sleep(" not in region, "never sleep while holding the lock"
 
 
@@ -95,4 +103,31 @@ def test_the_parent_is_re_checked_under_the_lock_before_any_section_runs():
     recheck = next(i for i, l in enumerate(region) if "tip_hash != parent_hash" in l)
     first_section = next(i for i, l in enumerate(region) if "process_exchange_transactions(" in l)
     assert recheck < first_section
-    assert any("continue" in l for l in region[recheck + 1:recheck + 6])
+    # (back to the top to build on the new tip, once a slot, or on to the next slot)
+    assert sum("continue" in l for l in region[recheck + 1:recheck + 14]) == 2
+
+
+def test_a_tip_that_moved_while_preparing_is_built_on_in_the_same_slot():
+    """An import that lands while the proposer waits for the lock (most often the previous
+    slot's block) used to cost the proposer its slot. It now goes back to the top once, while
+    at least half the slot is left, and builds on the new tip after every check again."""
+    src = "\n".join(_loop_lines())
+    for skip in ("was filled while preparing", "the tip changed while preparing"):
+        before = src[: src.index(skip)]
+        guard = before.rindex("retried_slot != current_slot")
+        assert "await self._slot_left(current_slot) > 0.5" in before[guard:]
+        assert "retried_slot, last_slot = current_slot, current_slot - 1" in before[guard:]
+
+
+async def test_the_share_of_a_slot_left():
+    import time
+
+    node = NI.ValidatorNode.__new__(NI.ValidatorNode)
+    slot = NI.SLOT_DURATION_SECONDS
+
+    async def genesis():
+        return time.time() - 10 * slot - 0.25 * slot      # (a quarter into slot 10)
+
+    node._genesis_timestamp = genesis
+    assert abs(await node._slot_left(10) - 0.75) < 0.1
+    assert await node._slot_left(9) == 0.0 and await node._slot_left(12) == 1.0

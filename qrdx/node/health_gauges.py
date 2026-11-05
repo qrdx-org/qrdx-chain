@@ -96,6 +96,19 @@ def oracles(mgr: Any) -> List[Gauge]:
     return out
 
 
+def transport() -> List[Gauge]:
+    """The peer transport's counters (qrdx/node/netd.py; docs/NETWORK.md): frames, bytes,
+    transactions, blocks and votes in, what was new, what was dropped, its peers."""
+    from . import netd
+
+    if netd.SERVICE is None:
+        return []
+    return [
+        ("qrdx_p2p_transport", float(value), {"counter": str(name)})
+        for name, value in dict(netd.SERVICE.stats()).items()
+    ]
+
+
 async def collect(db: Any, node: Any, mgr: Any) -> List[Gauge]:
     """Every operational gauge; a source that fails is skipped (monitoring never raises)."""
     out: List[Gauge] = []
@@ -104,6 +117,10 @@ async def collect(db: Any, node: Any, mgr: Any) -> List[Gauge]:
             out += await source()
         except Exception:
             pass
+    try:
+        out += transport()
+    except Exception:
+        pass
     for sync_source in (lambda: bridge(mgr), lambda: doomsday(mgr), lambda: oracles(mgr)):
         try:
             out += sync_source() if mgr is not None else []

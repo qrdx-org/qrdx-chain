@@ -538,8 +538,13 @@ async def restore(
         progress("genesis: building this network's own")
         genesis_hash = await _genesis(db, genesis_file, scratch)
 
+        # The block whose signed root binds the state after block ``height``: the next one under
+        # deferred execution (qrdx/post_state.py), which the trusted history must then reach.
+        from . import post_state
+
+        signer = height + 1 if post_state.active(height + 1) else height
         anchor = None
-        for h in sorted(h for h in trusted if h >= height):
+        for h in sorted(h for h in trusted if h >= signer):
             if (await db.get_block_hashes(h, h)).get(h, "").lower() == trusted[h].lower():
                 anchor = h
                 break
@@ -558,6 +563,10 @@ async def restore(
         await _verify_history(db, genesis_hash, anchor, bodies_from, progress)
         if (await db.get_block_hashes(height, height)).get(height) != checkpoint_hash:
             raise SnapshotError(f"the exchange checkpoint is not block {height} of this chain")
+        signing = await db.get_block_by_id(signer)
+        if not signing:
+            raise SnapshotError(f"the snapshot lacks block {signer}, which signs its state")
+        signed_root = _parse_block_content(signing["content"]).get("state_root")
 
         progress(f"state: stepping back to block {height}")
         if await undo_journal.rollback_to(db, height) is None:
@@ -599,10 +608,10 @@ async def restore(
             xroot = mgr.exchange_proof_root(height)
             proof = await state_proofs.proof_root(db, height, xroot)
         computed = unified_state_root(utxo or "0" * 64, account, exchange, token, proof, validators)
-        if computed != bc.get("state_root"):
+        if computed != signed_root:
             raise SnapshotError(
-                f"the snapshot's state is not the state block {height} signs: computed "
-                f"{computed[:16]}…, signed {str(bc.get('state_root'))[:16]}…"
+                f"the snapshot's state is not the state block {signer} signs: computed "
+                f"{computed[:16]}…, signed {str(signed_root)[:16]}…"
             )
 
         await _verify_code(db)

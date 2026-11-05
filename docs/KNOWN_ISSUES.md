@@ -14,31 +14,47 @@ Companions: [UNIFIED_ACCOUNT_IDENTITY.md](UNIFIED_ACCOUNT_IDENTITY.md),
 
 # Open defects
 
-## OPEN — Live throughput is about a tenth of what the protocol allows
+## OPEN — Live throughput is about a quarter of what the protocol allows
 
-**Severity: medium (capacity, not safety).** Measured 2026-11-04 (docs/PERFORMANCE.md).
+**Severity: medium (capacity, not safety).** Measured 2026-11-05 (docs/PERFORMANCE.md).
 
 The exchange gas limit allows 4,000 transfers a second sustained, 8,000 in bursts. A 4-node
-network on one host executes about 450 a second before its backlog grows; up to 300 a second it
-fills nearly every slot.
+network fills every slot at 1,000 a second, on one host and across emulated machines (2 CPUs a
+node, 25 ms apart); it was 600 before the fifth round. Past that a block carries up to about 800
+transfers at about 2.4 blocks a second on one host. Across machines at 1,500 a second one node
+fell 144 blocks behind and caught up by sync.
 
-* Every node admits, relays and imports every transaction on one Python thread, which is at
-  100% CPU at the ceiling.
-* A block of 400–500 transfers takes longer than a 250 ms slot to build and to import, so the
-  next proposer often builds beside it: forks, and the time to resolve them.
-* Nothing is unsafe at the ceiling.
+* Pipelined execution (`deferred_execution`) took the proposer's own run off the path between
+  slots: a block is signed and sent before it runs. The next proposer still runs it before it
+  can sign the next one, so one run of a block must fit the slot.
+* Every node runs every block, partly in Python: plain transfers and the commitments' trees
+  and accumulators are native, and the rest costs 5–35 µs a transaction a phase (131 µs in all
+  offline, from 225). Under load a block of 600–900 imports in 100–200 ms. An empty block's
+  fixed cost is 6–8 ms (40 database round trips; it was 12–16 ms and 132–178).
+* A block is about 10.5 KB of hex JSON a transfer, hashed for its body root and stored whole.
+* A fork now costs its rollback one undo per block taken back (qrdx/exchange/block_undo.py),
+  not an epoch of blocks replayed.
+* Past capacity the chain degrades: blocks keep coming and the backlog waits.
+* Nothing is unsafe past capacity.
   * Every admitted transaction executes or waits.
-  * The proposer's budget keeps blocks importable.
+  * The proposer's budget keeps blocks runnable within the slot.
   * The mempool bounds the backlog (65,536 operations), and refuses more when full.
-  * The base fee does not rise: budgeted blocks stay under its target. So past the ceiling,
+  * The base fee does not rise: budgeted blocks stay under its target. So past capacity,
     admission refuses rather than prices.
 
-**Closing it requires:**
-* execution, preloading, flushing and storage in native code, as the signature checks and the
-  body root already are (docs/NATIVE.md);
-* admission and relaying off the thread that imports blocks;
-* pipelined block dissemination;
+**Closing it requires** (docs/PERFORMANCE.md, "What limits it next"):
+* the exchange's state held and executed natively beyond plain transfers, with the database
+  written behind it (docs/NATIVE.md);
+* execution deferred a second block (a consensus change: the inclusion rule then needs a fee
+  reserve or a bound on what the pending block spends);
+* a binary wire format, shrinking what each block hashes and stores (a fork);
 * the geo-distributed soak (docs/MAINNET_READINESS.md §3.4) to measure it on real hosts.
+
+**Assumption the fifth round adds:** the chain index trusts its memory while the connection's
+count of writes to `blocks` and rollbacks is unchanged (qrdx/chain_index.py). That holds while
+the node's database is written only through its own connection; a snapshot is restored before
+the node starts. A tool writing `blocks` into a running node's database through another
+connection would not be seen until the next write or rollback through the node's own.
 
 ## FIXED — Any peer could stall a node with a block built to parse slowly
 
@@ -186,11 +202,17 @@ about a second to build and as long to import, four slots. The next proposers bu
 fork choice rolled back and replayed 2,000-transfer blocks, and the block rate fell to one
 every four seconds.
 
-**Fixed** (`qrdx/validator/node_integration.py`): a proposer includes what it runs in its share
-of a slot (`EXCHANGE_BUILD_SHARE`, 40% of a 250 ms slot).
+**Fixed** (`qrdx/validator/node_integration.py`): a proposer includes what it builds in its
+share of a slot (`EXCHANGE_BUILD_SHARE`, 30% of a 250 ms slot), start to signature.
 * It grows the next block by a quarter while full blocks run inside the share.
 * It cuts the next block in proportion, by at most half, when one runs over.
 * A block the mempool could not fill does not count toward growing.
+
+**Fixed again 2026-11-05.** The first fix measured only the exchange section, about 60% of a
+build, against 40% of the slot. Under a backlog, blocks still grew to 300–990 transfers. Build
+and import together outran the slot, the next proposer built beside them, and the block rate
+fell to one a second. Measured over the whole build, from when the proposer has the block
+lock, the block rate holds at about three a second past capacity.
 
 Consensus still allows the full limit; a faster node fills more of it.
 

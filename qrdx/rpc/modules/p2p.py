@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from ...constants import SLOTS_PER_EPOCH
 from ...logger import get_logger
+from ...node.observability import Phases
 from ..server import (
     RPCError,
     RPCErrorCode,
@@ -159,6 +160,9 @@ class P2PModule(RPCModule):
         self._check_parent_continuity: Any = (
             None  # parent-continuity hook (main._check_parent_continuity)
         )
+        # deferred execution: async (content, height) -> (ok, err), the signed root against the
+        # state the parent left, before the block runs (block_import._check_deferred_root)
+        self._check_deferred_root: Any = None
         self._restore_after_rejected_block: Any = None  # undo a rejected block's effects (main)
         self._tiebreak_rollback: Any = None  # mechanism-2 rollback hook (main._tiebreak_rollback)
         self._enforce_equal_height_tiebreak = False  # mechanism-2 enforce gate (observe-first)
@@ -204,6 +208,7 @@ class P2PModule(RPCModule):
         on_fork=None,
         admit_peer=None,
         block_relay=None,
+        check_deferred_root=None,
     ):
         self._db = db
         self._security = security
@@ -219,6 +224,7 @@ class P2PModule(RPCModule):
         self._exchange_apply_section = exchange_apply_section
         self._verify_unified_root = verify_unified_root
         self._check_parent_continuity = check_parent_continuity
+        self._check_deferred_root = check_deferred_root
         self._restore_after_rejected_block = restore_after_rejected_block
         self._tiebreak_rollback = tiebreak_rollback
         self._enforce_equal_height_tiebreak = enforce_equal_height_tiebreak
@@ -391,6 +397,7 @@ class P2PModule(RPCModule):
         self._require_db()
         _metric("qrdx_p2p_blocks_received_total")
         _received = time.perf_counter()
+        phases = Phases()
 
         block_content = block_data.get("block_content")
         if not block_content:
@@ -412,6 +419,7 @@ class P2PModule(RPCModule):
             return {"ok": False, "error": "Node is synchronizing"}
 
         async with self._block_processing_lock:
+            phases.mark("lock")
             next_block_id = await self._db.get_next_block_id()
 
             if next_block_id > block_no:
@@ -496,6 +504,7 @@ class P2PModule(RPCModule):
                 )
                 if not ok_prop:
                     return {"ok": False, "error": f"Proposer authentication failed: {prop_err}"}
+                phases.mark("proposer")
 
                 # Proposer must be eligible for the block's slot. Observe-first
                 # (the _enforce_proposer_eligibility flag is injected from main.py).
@@ -507,6 +516,7 @@ class P2PModule(RPCModule):
                 )
                 if not ok_elig:
                     return {"ok": False, "error": f"Proposer ineligible: {elig_err}"}
+                phases.mark("eligibility")
 
                 # Parent-hash continuity (observe-first): the block's parent_hash
                 # must match the local tip, else it is on a fork. Injected hook
@@ -521,6 +531,7 @@ class P2PModule(RPCModule):
                     if not ok_par:
                         self._signal_fork(block_no, block_data, "a block on another branch")
                         return {"ok": False, "error": f"Parent discontinuity: {par_err}"}
+                    phases.mark("parent")
 
                 # Block limits, slot progression and FFG votes (main._verify_chain_rules).
                 if self._verify_chain_rules is not None:
@@ -537,12 +548,23 @@ class P2PModule(RPCModule):
                     if not ok_votes:
                         return {"ok": False, "error": f"Chain rules: {votes_err}"}
 
+                # Deferred execution (qrdx/post_state.py): the signed root is the state the parent
+                # left, the state this node holds; checked before the block runs.
+                if self._check_deferred_root is not None:
+                    ok_root, root_err = await self._check_deferred_root(
+                        block_content, int(block_no)
+                    )
+                    if not ok_root:
+                        return {"ok": False, "error": f"Refused before running: {root_err}"}
+
                 # Everything the block changes from here is recorded in the undo journal under its
                 # height (a checkpoint first if it opens an epoch) — what makes a later reorg cheap.
                 from ...derived_state_rebuild import before_block
                 from ...validator.block_verification import epoch_from_block as _block_epoch
 
+                phases.mark("rules")
                 async with await before_block(self._db, block_no, _block_epoch(block_data)):
+                    phases.mark("journal")
                     # D3: securely validate + replay the exchange section (verify
                     # signatures, re-execute, match the declared exchange_state_root)
                     # BEFORE storing. Reject the block on any mismatch — local
@@ -582,6 +604,7 @@ class P2PModule(RPCModule):
                                 block_no, f"exchange section: {verr}"
                             )
                             return {"ok": False, "error": f"Invalid exchange section: {verr}"}
+                        phases.mark("exchange")
                     elif block_no and int(block_no) >= 1:
                         # No exchange transactions — the exchange still ticks every block (mark
                         # prices; liquidations and funding next), exactly as the other paths do.
@@ -600,6 +623,7 @@ class P2PModule(RPCModule):
                             )
                         except Exception as e:
                             logger.error(f"exchange tick failed at block {block_no}: {e}")
+                        phases.mark("tick")
 
                     # E-D3b: validate + replay the EVM section (execute-on-mine) before
                     # storing; reject on account_state_root mismatch. The apply hook is
@@ -621,6 +645,7 @@ class P2PModule(RPCModule):
                                 block_no, f"EVM section: {verr_evm}"
                             )
                             return {"ok": False, "error": f"Invalid EVM section: {verr_evm}"}
+                        phases.mark("evm")
 
                     # Stake withdrawals — same point as the proposer and the other import
                     # paths: after the EVM section, before the unified-root check.
@@ -637,19 +662,21 @@ class P2PModule(RPCModule):
                             block_no,
                             e,
                         )
+                    phases.mark("withdrawals")
 
                     # E-D4: verify the recomputed unified state root against the signed
                     # root (after section replay, before storing).
                     if self._verify_unified_root is not None:
                         try:
                             ok_root, root_err = await self._verify_unified_root(
-                                block_content, height=int(block_no)
+                                block_content, height=int(block_no), block_hash=block_hash
                             )
                         except Exception as e:
                             ok_root, root_err = True, f"unified root check error: {e}"
                         if not ok_root:
                             await self._restore_after_rejection(block_no, f"E-D4: {root_err}")
                             return {"ok": False, "error": f"Invalid state root: {root_err}"}
+                    phases.mark("root")
 
                     try:
                         await self._db.add_block(
@@ -662,7 +689,9 @@ class P2PModule(RPCModule):
                         # Persist the (validated) exchange section for durability.
                         if ex_section:
                             try:
-                                await self._db.add_block_exchange_txs(block_hash, ex_section)
+                                await self._db.add_block_exchange_txs(
+                                    block_hash, ex_section, block_data.get("_exchange_objects")
+                                )
                             except Exception as e:
                                 logger.warning(
                                     f"Failed to store exchange section for block {block_no}: {e}"
@@ -675,6 +704,12 @@ class P2PModule(RPCModule):
                                 logger.warning(
                                     f"Failed to store EVM section for block {block_no}: {e}"
                                 )
+                        phases.mark("store")
+                        if self._block_relay is not None:
+                            try:
+                                self._block_relay.settle(block_data)
+                            except Exception as e:  # (hygiene: never fails an import)
+                                logger.debug(f"mempool settle after block {block_no}: {e}")
                         # Finality (observe): record attestation votes + recompute.
                         try:
                             from ...validator.finality import record_finality_from_block
@@ -682,9 +717,11 @@ class P2PModule(RPCModule):
                             await record_finality_from_block(self._db, block_content)
                         except Exception as e:
                             logger.debug(f"finality record skipped for block {block_no}: {e}")
+                        phases.mark("finality")
                         logger.info(
                             f"Accepted PoS block {block_no} via RPC "
-                            f"({1000 * (time.perf_counter() - _received):.0f} ms). Propagating..."
+                            f"({1000 * (time.perf_counter() - _received):.0f} ms: {phases}). "
+                            f"Propagating..."
                         )
                         asyncio.create_task(
                             self._propagate_fn(
@@ -965,7 +1002,9 @@ class P2PModule(RPCModule):
             self._rebuilding.add(known)
         try:
             sender_url = self._sender_url()
-            full, why = await self._block_relay.rebuild(block_data, sender_url)
+            full, why = await self._block_relay.rebuild(
+                block_data, sender_url, sender_node=rpc_caller.get()
+            )
             if full is None:
                 return {"ok": False, "error": why}
             reply = await self.submitBlock(full)

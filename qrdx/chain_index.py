@@ -21,11 +21,31 @@ hash check on the next ``sync``.
 
 Every derived value is what the original per-call walk computed (tests/test_chain_index.py
 checks each against it, across reorgs).
+
+**In memory.** Consensus code asks the index dozens of times a block — the validator set of an
+epoch, finality, the validators' root — and each ask cost two round trips to the database's
+thread: the check that the chain had not changed, then the read. Two things make most of them
+free:
+
+* the connection counts every write to ``blocks`` (a TEMP trigger calls ``qrdx_chain_changed``)
+  and every rollback (``rollback`` is wrapped), so ``sync`` knows without a query when the chain
+  is as it last checked it;
+* the hash and slot of the newest ``RECENT`` heights are kept in memory, exactly as the index
+  rows hold them: written beside each row, cut where rows are dropped, forgotten whole on a
+  rollback (and re-read in one query).
+
+So the index is still never trusted across a change: any write to ``blocks`` and any rollback
+sends ``sync`` back to the database. That holds while the node's database is written only
+through its connection (a snapshot is restored before the node starts). With
+``QRDX_VERIFY_CHAIN_INDEX=1`` (the test suite) every answer from memory is checked against the
+database.
 """
 
 from __future__ import annotations
 
 import asyncio
+import bisect
+import os
 import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -82,6 +102,214 @@ _BATCH = 256  # blocks read per query while catching up
 
 _locks: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = weakref.WeakKeyDictionary()
 _ready: "weakref.WeakKeyDictionary[Any, bool]" = weakref.WeakKeyDictionary()
+# db → (the height the index last covered, the hash of the block it indexed there)
+_synced: "weakref.WeakKeyDictionary[Any, Tuple[int, str]]" = weakref.WeakKeyDictionary()
+
+
+# The newest heights kept in memory (hash and slot): about an hour of 250 ms slots, where the
+# validator set, finality and the validators' root look.
+RECENT = 16_384
+
+
+class _Recent:
+    """The index rows of the heights ``base`` .. ``base + len - 1`` (the index's top), as the
+    table holds them. Slot lookups are answered by bisection while the slots are ``ordered``: a
+    run of unknown ones first (genesis has none), then each known and above the one before (a
+    canonical chain's are)."""
+
+    __slots__ = ("base", "hashes", "slots", "lead", "ordered")
+
+    def __init__(self, base: int = 0) -> None:
+        self.base = base
+        self.hashes: List[str] = []
+        self.slots: List[Optional[int]] = []
+        self.lead = 0  # the leading heights without a slot
+        self.ordered = True
+
+    @property
+    def top(self) -> int:
+        return self.base + len(self.hashes) - 1
+
+    def put(self, height: int, block_hash: str, slot: Optional[int]) -> None:
+        if not self.hashes or height > self.top + 1 or height < self.base:
+            self.__init__(height)  # type: ignore[misc]  # (not contiguous: start again here)
+        elif height <= self.top:
+            self.cut(height - 1)
+        if slot is None:
+            if self.lead == len(self.slots):
+                self.lead += 1
+            else:
+                self.ordered = False
+        elif self.ordered and len(self.slots) > self.lead and int(slot) <= self.slots[-1]:  # type: ignore[operator]
+            self.ordered = False
+        self.hashes.append(block_hash)
+        self.slots.append(None if slot is None else int(slot))
+        if len(self.hashes) > RECENT:
+            drop = len(self.hashes) - RECENT
+            del self.hashes[:drop], self.slots[:drop]
+            self.base += drop
+            self.lead = max(0, self.lead - drop)
+
+    def cut(self, keep_to: int) -> None:
+        """Keep the heights at or below ``keep_to``."""
+        n = max(0, keep_to - self.base + 1)
+        del self.hashes[n:], self.slots[n:]
+        self.lead = min(self.lead, n)
+        if not self.hashes:
+            self.ordered = True
+
+    def hash_at(self, height: int) -> Tuple[bool, Optional[str]]:
+        """(answered, the hash): above the top there is none; below ``base``, unanswered."""
+        if height > self.top:
+            return True, None
+        if height < self.base:
+            return False, None
+        return True, self.hashes[height - self.base]
+
+    def slot_at(self, height: int) -> Tuple[bool, Optional[int]]:
+        if height > self.top:
+            return True, None
+        if height < self.base:
+            return False, None
+        return True, self.slots[height - self.base]
+
+    def before_slot(self, slot: int, max_height: Optional[int] = None) -> Tuple[bool, int]:
+        """(answered, the highest height ≤ ``max_height`` whose slot is known and below
+        ``slot``; -1 if none)."""
+        if not self.ordered or not self.hashes:
+            return False, -1
+        end = len(self.hashes)
+        if max_height is not None:
+            end = min(end, int(max_height) - self.base + 1)
+        if end <= 0:
+            return (True, -1) if max_height is not None and max_height < 0 else (False, -1)
+        if end <= self.lead:
+            return (True, -1) if self.base == 0 else (False, -1)
+        i = bisect.bisect_left(self.slots, int(slot), self.lead, end)  # type: ignore[type-var]
+        if i > self.lead:
+            return True, self.base + i - 1
+        # (none kept qualifies: the answer is below the heights kept, if any are)
+        return (True, -1) if self.base == 0 else (False, -1)
+
+
+_recent: "weakref.WeakKeyDictionary[Any, _Recent]" = weakref.WeakKeyDictionary()
+
+
+class _Watch:
+    """The connection's count of writes to ``blocks`` and rollbacks (see the module doc), and
+    the count and tip at the last check that found the index in step with the chain; and the
+    count and tip when the tip was last read."""
+
+    __slots__ = ("count", "clean_at", "tip", "tip_read")
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.clean_at = -1
+        self.tip = -1
+        self.tip_read: Tuple[int, int] = (-1, -1)
+
+    def bump(self) -> None:
+        self.count += 1
+
+    def clean(self) -> bool:
+        return self.clean_at == self.count
+
+
+_watches: "weakref.WeakKeyDictionary[Any, _Watch]" = weakref.WeakKeyDictionary()
+# What else forgets on a rollback (a table created once per database: created again, since the
+# rollback may have taken it). Each is called with the database.
+_rollback_hooks: List[Any] = []
+
+
+def on_rollback(hook: Any) -> None:
+    """Call ``hook(db)`` after every rollback of ``db``'s connection (once per hook)."""
+    if hook not in _rollback_hooks:
+        _rollback_hooks.append(hook)
+
+
+def change_count(db: Any) -> Optional[int]:
+    """A number that changes whenever ``blocks`` is written or a rollback happens on ``db``'s
+    connection (None while they are not counted)."""
+    watch = _watches.get(db)
+    return None if watch is None else watch.count
+
+
+def known_tip(db: Any) -> Optional[int]:
+    """The chain's tip (its highest height), if nothing was written to ``blocks`` and nothing
+    rolled back since it was last read; None to read it."""
+    watch = _watches.get(db)
+    if watch is None:
+        return None
+    if watch.clean():
+        return watch.tip
+    count, tip = watch.tip_read
+    return tip if count == watch.count else None
+
+
+def saw_tip(db: Any, read: Optional[Tuple[int, int]]) -> Optional[int]:
+    """``read`` None: the count to give back with the tip read next (None when writes are not
+    counted). ``read`` (that count, the tip read): remembered for ``known_tip``."""
+    watch = _watches.get(db)
+    if watch is None:
+        return None
+    if read is None:
+        return watch.count
+    if read[0] is not None:
+        watch.tip_read = (int(read[0]), int(read[1]))
+    return None
+
+
+def _verifying() -> bool:
+    return os.environ.get("QRDX_VERIFY_CHAIN_INDEX", "").lower() in ("1", "true", "yes")
+
+
+def _forget(db: Any) -> None:
+    """The index may differ from what memory holds of it (a rollback): ask the database."""
+    _synced.pop(db, None)
+    _recent.pop(db, None)
+    _ready.pop(db, None)  # (a rollback can take tables or triggers created in its transaction)
+    watch = _watches.get(db)
+    if watch is not None:
+        watch.bump()
+
+
+async def _watch(db: Any) -> None:
+    """Count the connection's writes to ``blocks`` and its rollbacks: one count a connection,
+    shared by every database object on it. Registered for ``db`` only once its triggers are in
+    place (without them nothing would count, and the count would be trusted)."""
+    conn = db.connection
+    watch = getattr(conn, "qrdx_chain_watch", None)
+    if watch is None:
+        create = getattr(conn, "create_function", None)
+        if create is None:
+            return  # (not counted: every sync asks the database)
+        watch = _Watch()
+        await create("qrdx_chain_changed", 0, watch.bump)
+        rollback = conn.rollback
+        if not getattr(rollback, "_qrdx_watched", False):
+
+            async def watched_rollback(*args: Any, **kwargs: Any) -> Any:
+                try:
+                    return await rollback(*args, **kwargs)
+                finally:
+                    for other in list(_watches.keys()):  # (every db on this connection)
+                        if getattr(other, "connection", None) is conn:
+                            _forget(other)
+                            for hook in list(_rollback_hooks):
+                                try:
+                                    hook(other)
+                                except Exception:
+                                    pass
+
+            watched_rollback._qrdx_watched = True  # type: ignore[attr-defined]
+            conn.rollback = watched_rollback
+    for i, event in enumerate(("INSERT", "DELETE", "UPDATE OF block_hash, block_height")):
+        await conn.execute(
+            f"CREATE TEMP TRIGGER IF NOT EXISTS qrdx_chain_changed_{i} AFTER {event} ON main.blocks "
+            "BEGIN SELECT qrdx_chain_changed(); END"
+        )
+    conn.qrdx_chain_watch = watch
+    _watches[db] = watch
 
 
 def _lock_for(db: Any) -> asyncio.Lock:
@@ -98,11 +326,20 @@ async def _ensure(db: Any) -> None:
     # has pending — another task's half-applied block, say.
     for sql in _SCHEMA:
         await db.connection.execute(sql)
-    cur = await db.connection.execute("SELECT value FROM chain_index_meta WHERE key = 'version'")
-    row = await cur.fetchone()
+    try:
+        await _watch(db)
+    except Exception as e:  # (no triggers: every sync asks the database)
+        _watches.pop(db, None)
+        logger.debug("chain index: writes to blocks not counted (%s)", e)
+    rows = await db.connection.execute_fetchall(
+        "SELECT value FROM chain_index_meta WHERE key = 'version'"
+    )
+    row = rows[0] if rows else None
     if row is None or row[0] != _VERSION:
         for table in _TABLES:
             await db.connection.execute(f"DELETE FROM {table}")
+        _recent.pop(db, None)
+        _synced.pop(db, None)
         await db.connection.execute("DROP TABLE IF EXISTS chain_index_ops")  # retired in v3
         await db.connection.execute(
             "INSERT OR REPLACE INTO chain_index_meta (key, value) VALUES ('version', ?)",
@@ -219,6 +456,9 @@ async def _index_block(db: Any, height: int, block_hash: str, content: Any, mix:
         "VALUES (?, ?, ?, ?, ?)",
         (height, block_hash, slot, epoch, mix.hex()),
     )
+    recent = _recent.get(db)
+    if recent is not None:
+        recent.put(height, block_hash, slot)
     votes = _votes(bc, epoch)
     if votes:
         await conn.executemany(
@@ -244,20 +484,20 @@ async def _index_block(db: Any, height: int, block_hash: str, content: Any, mix:
 
 
 async def _chain_hash(db: Any, height: int) -> Optional[str]:
-    cur = await db.connection.execute(
+    rows = await db.connection.execute_fetchall(
         "SELECT block_hash FROM blocks WHERE block_height = ?", (int(height),)
     )
-    row = await cur.fetchone()
+    row = rows[0] if rows else None
     return row[0] if row else None
 
 
 async def _indexed_at_or_below(db: Any, height: int) -> Optional[Tuple[int, str, str]]:
-    cur = await db.connection.execute(
+    rows = await db.connection.execute_fetchall(
         "SELECT height, block_hash, randao_mix FROM chain_index WHERE height <= ? "
         "ORDER BY height DESC LIMIT 1",
         (int(height),),
     )
-    row = await cur.fetchone()
+    row = rows[0] if rows else None
     return (int(row[0]), row[1], row[2]) if row else None
 
 
@@ -266,8 +506,8 @@ async def _valid_top(db: Any) -> int:
     it. Matching hashes form a prefix — a block's hash commits to its ancestry — so one
     comparison settles the usual case and a binary search finds the fork point after a
     reorg."""
-    cur = await db.connection.execute("SELECT MAX(height) FROM chain_index")
-    row = await cur.fetchone()
+    rows = await db.connection.execute_fetchall("SELECT MAX(height) FROM chain_index")
+    row = rows[0] if rows else None
     top = row[0] if row else None
     if top is None:
         return -1
@@ -287,37 +527,83 @@ async def _valid_top(db: Any) -> int:
             hi = entry[0] - 1
     for table in _TABLES:
         await db.connection.execute(f"DELETE FROM {table} WHERE height > ?", (good,))
+    recent = _recent.get(db)
+    if recent is not None:
+        recent.cut(good)
     logger.info("chain index: chain changed below the indexed tip — re-deriving above %d", good)
     return good
 
 
 async def sync(db: Any, up_to: Optional[int] = None) -> int:
     """Index every block up to ``up_to`` (default: the tip). Returns the highest height the
-    index now covers (-1 for an empty chain). Cheap when nothing is new."""
+    index now covers (-1 for an empty chain). One query when nothing is new: the chain still
+    has, at the top the index last covered, the block it indexed there (matching hashes form a
+    prefix), and the tip is not above it. Every chain-index read syncs first, many times a block
+    (eligibility, the validators' root, finality), and the full check cost five or six round
+    trips to the database each time: most of an empty block's."""
     async with _lock_for(db):
         await _ensure(db)
-        tip = int(await db.get_next_block_id()) - 1
-        target = tip if up_to is None else min(int(up_to), tip)
-        top = await _valid_top(db)
-        if top >= target:
-            return top
-        from .validator.randao import RANDAO_SEED
-
-        below = await _indexed_at_or_below(db, top) if top >= 0 else None
-        mix = bytes.fromhex(below[2]) if below else RANDAO_SEED
-        start = top + 1
-        while start <= target:
-            end = min(target, start + _BATCH - 1)
-            cur = await db.connection.execute(
-                "SELECT block_height, block_hash, content FROM blocks "
-                "WHERE block_height BETWEEN ? AND ? ORDER BY block_height",
-                (start, end),
+        known = _synced.get(db)
+        watch = _watches.get(db)
+        if known is not None and watch is not None and watch.clean():
+            # (nothing written to blocks, nothing rolled back, since the check below last
+            # found the index in step: no query)
+            target = watch.tip if up_to is None else min(int(up_to), watch.tip)
+            if known[0] >= target:
+                return known[0]
+        if known is not None:
+            count = watch.count if watch is not None else None
+            # (the index's own row too: a rollback of the connection's transaction can take
+            # rows it wrote while the block they index stays)
+            rows = await db.connection.execute_fetchall(  # (statement and fetch: one trip)
+                "SELECT (SELECT MAX(block_height) FROM blocks), "
+                "(SELECT block_hash FROM blocks WHERE block_height = ?), "
+                "(SELECT block_hash FROM chain_index WHERE height = ?)",
+                (known[0], known[0]),
             )
-            for height, block_hash, content in await cur.fetchall():
-                mix = await _index_block(db, int(height), block_hash, content, mix)
-            start = end + 1
-            await asyncio.sleep(0)  # let the node run between batches while catching up
-        return target
+            row = rows[0] if rows else None
+            tip = -1 if row is None or row[0] is None else int(row[0])
+            target = tip if up_to is None else min(int(up_to), tip)
+            if row is not None and row[1] == known[1] == row[2]:
+                if watch is not None and count is not None:
+                    # (counted before the query: a write since makes it unclean again)
+                    watch.clean_at, watch.tip = count, tip
+                if known[0] >= target:
+                    return known[0]
+        top = await _sync(db, up_to)
+        entry = await _indexed_at_or_below(db, top) if top >= 0 else None
+        if entry is not None and entry[0] == top:
+            _synced[db] = (top, entry[1])
+        else:
+            _synced.pop(db, None)
+        return top
+
+
+async def _sync(db: Any, up_to: Optional[int]) -> int:
+    """The full sync: check the index against the chain, drop what is no longer on it,
+    and index what is new (under the lock)."""
+    tip = int(await db.get_next_block_id()) - 1
+    target = tip if up_to is None else min(int(up_to), tip)
+    top = await _valid_top(db)
+    if top >= target:
+        return top
+    from .validator.randao import RANDAO_SEED
+
+    below = await _indexed_at_or_below(db, top) if top >= 0 else None
+    mix = bytes.fromhex(below[2]) if below else RANDAO_SEED
+    start = top + 1
+    while start <= target:
+        end = min(target, start + _BATCH - 1)
+        rows = await db.connection.execute_fetchall(
+            "SELECT block_height, block_hash, content FROM blocks "
+            "WHERE block_height BETWEEN ? AND ? ORDER BY block_height",
+            (start, end),
+        )
+        for height, block_hash, content in rows:
+            mix = await _index_block(db, int(height), block_hash, content, mix)
+        start = end + 1
+        await asyncio.sleep(0)  # let the node run between batches while catching up
+    return target
 
 
 # ── what consumers ask ───────────────────────────────────────────────────────────────────
@@ -334,13 +620,57 @@ async def randao_mix(db: Any, up_to_height: int) -> bytes:
     return bytes.fromhex(entry[2]) if entry else RANDAO_SEED
 
 
+async def _kept(db: Any) -> Optional[_Recent]:
+    """The recent heights in memory, if they are the index as ``sync`` last left it (read in
+    one query when they are not)."""
+    known = _synced.get(db)
+    if known is None:
+        return None
+    recent = _recent.get(db)
+    if recent is not None and recent.hashes and (recent.top, recent.hashes[-1]) == known:
+        return recent
+    rows = await db.connection.execute_fetchall(
+        "SELECT height, block_hash, slot FROM chain_index WHERE height > ? AND height <= ? "
+        "ORDER BY height",
+        (known[0] - RECENT, known[0]),
+    )
+    recent = _Recent()
+    for height, block_hash, slot in rows:
+        recent.put(int(height), block_hash, None if slot is None else int(slot))
+    if (
+        not recent.hashes
+        or (recent.top, recent.hashes[-1]) != known
+        or _synced.get(db) != known  # (the index moved while it was read)
+    ):
+        _recent.pop(db, None)
+        return None
+    _recent[db] = recent
+    return recent
+
+
+async def _checked(db: Any, kept: Any, sql: str, args: Tuple[Any, ...]) -> Any:
+    """``kept`` (an answer from memory), checked against the database when verifying."""
+    if _verifying():
+        rows = await db.connection.execute_fetchall(sql, args)
+        row = rows[0] if rows else None
+        value = row[0] if row else None
+        want = value if not isinstance(kept, int) or value is not None else -1
+        if want != kept:
+            raise AssertionError(f"chain index memory: {sql} {args} → {kept!r}, not {want!r}")
+    return kept
+
+
 async def highest_height_before_slot(db: Any, slot: int) -> int:
     """The highest block height whose slot is < ``slot`` (-1 if none)."""
     await sync(db)
-    cur = await db.connection.execute(
-        "SELECT MAX(height) FROM chain_index WHERE slot IS NOT NULL AND slot < ?", (int(slot),)
-    )
-    row = await cur.fetchone()
+    sql = "SELECT MAX(height) FROM chain_index WHERE slot IS NOT NULL AND slot < ?"
+    recent = await _kept(db)
+    if recent is not None:
+        answered, height = recent.before_slot(int(slot))
+        if answered:
+            return int(await _checked(db, height, sql, (int(slot),)))
+    rows = await db.connection.execute_fetchall(sql, (int(slot),))
+    row = rows[0] if rows else None
     return int(row[0]) if row and row[0] is not None else -1
 
 
@@ -348,21 +678,21 @@ async def slashed_before(db: Any, address: str, before_height: int) -> bool:
     """True if a canonical block below ``before_height`` carries a verified slashing proof
     against ``address``."""
     await sync(db, int(before_height) - 1)
-    cur = await db.connection.execute(
+    rows = await db.connection.execute_fetchall(
         "SELECT 1 FROM chain_index_offenders WHERE offender = ? AND height < ? LIMIT 1",
         (address.lower(), int(before_height)),
     )
-    return (await cur.fetchone()) is not None
+    return (rows[0] if rows else None) is not None
 
 
 async def offenders_before(db: Any, before_height: int) -> List[str]:
     """Every address a canonical block below ``before_height`` convicts (lower-cased, sorted)."""
     await sync(db, int(before_height) - 1)
-    cur = await db.connection.execute(
+    rows = await db.connection.execute_fetchall(
         "SELECT DISTINCT offender FROM chain_index_offenders WHERE height < ? ORDER BY offender",
         (int(before_height),),
     )
-    return [r[0] for r in await cur.fetchall()]
+    return [r[0] for r in rows]
 
 
 # ── Casper FFG (validator/ffg.py) ────────────────────────────────────────────────────────
@@ -370,10 +700,14 @@ async def offenders_before(db: Any, before_height: int) -> List[str]:
 
 async def block_hash_at(db: Any, height: int) -> Optional[str]:
     await sync(db, height)
-    cur = await db.connection.execute(
-        "SELECT block_hash FROM chain_index WHERE height = ?", (int(height),)
-    )
-    row = await cur.fetchone()
+    sql = "SELECT block_hash FROM chain_index WHERE height = ?"
+    recent = await _kept(db)
+    if recent is not None:
+        answered, found = recent.hash_at(int(height))
+        if answered:
+            return await _checked(db, found, sql, (int(height),))  # type: ignore[no-any-return]
+    rows = await db.connection.execute_fetchall(sql, (int(height),))
+    row = rows[0] if rows else None
     return row[0] if row else None
 
 
@@ -403,18 +737,22 @@ async def ffg_votes(
     if up_to_height is not None:
         sql += " AND height <= ?"
         args.append(int(up_to_height))
-    cur = await db.connection.execute(sql + " ORDER BY height, rowid", args)
-    return [tuple(r) for r in await cur.fetchall()]  # type: ignore[misc]
+    rows = await db.connection.execute_fetchall(sql + " ORDER BY height, rowid", args)
+    return [tuple(r) for r in rows]  # type: ignore[misc]
 
 
 async def height_before_slot_at_or_below(db: Any, slot: int, max_height: int) -> int:
     """The highest canonical height ≤ ``max_height`` whose slot is < ``slot`` (-1 if none)."""
     await sync(db, max_height)
-    cur = await db.connection.execute(
-        "SELECT MAX(height) FROM chain_index WHERE slot IS NOT NULL AND slot < ? AND height <= ?",
-        (int(slot), int(max_height)),
-    )
-    row = await cur.fetchone()
+    sql = "SELECT MAX(height) FROM chain_index WHERE slot IS NOT NULL AND slot < ? AND height <= ?"
+    args = (int(slot), int(max_height))
+    recent = await _kept(db)
+    if recent is not None:
+        answered, height = recent.before_slot(int(slot), int(max_height))
+        if answered:
+            return int(await _checked(db, height, sql, args))
+    rows = await db.connection.execute_fetchall(sql, args)
+    row = rows[0] if rows else None
     return int(row[0]) if row and row[0] is not None else -1
 
 
@@ -432,9 +770,9 @@ async def voted_targets(
     if up_to_height is not None:
         sql += " AND height <= ?"
         args.append(int(up_to_height))
-    cur = await db.connection.execute(sql + " ORDER BY height, rowid", args)
+    rows = await db.connection.execute_fetchall(sql + " ORDER BY height, rowid", args)
     out: Dict[Tuple[str, int], Tuple[int, str, int, str]] = {}
-    for validator, te, se, sr, tr in await cur.fetchall():
+    for validator, te, se, sr, tr in rows:
         out.setdefault((validator, int(te)), (int(se), sr, int(te), tr))
     return out
 
@@ -463,12 +801,12 @@ async def validator_public_key(db: Any, address: str, before_height: int) -> Opt
     except Exception:
         pass
     try:
-        cur = await db.connection.execute(
+        rows = await db.connection.execute_fetchall(
             "SELECT public_key FROM validator_deposits WHERE address = ? AND block_height < ? "
             "ORDER BY block_height, id",
             (address, int(before_height)),
         )
-        rows = await cur.fetchall()
+        rows = rows
     except Exception:
         return None  # no deposit log (a database without validators)
     for (key_hex,) in rows:
@@ -481,8 +819,12 @@ async def validator_public_key(db: Any, address: str, before_height: int) -> Opt
 async def slot_at(db: Any, height: int) -> Optional[int]:
     """The slot of the canonical block at ``height`` (None if unknown)."""
     await sync(db, height)
-    cur = await db.connection.execute(
-        "SELECT slot FROM chain_index WHERE height = ?", (int(height),)
-    )
-    row = await cur.fetchone()
+    sql = "SELECT slot FROM chain_index WHERE height = ?"
+    recent = await _kept(db)
+    if recent is not None:
+        answered, found = recent.slot_at(int(height))
+        if answered:
+            return await _checked(db, found, sql, (int(height),))  # type: ignore[no-any-return]
+    rows = await db.connection.execute_fetchall(sql, (int(height),))
+    row = rows[0] if rows else None
     return int(row[0]) if row and row[0] is not None else None

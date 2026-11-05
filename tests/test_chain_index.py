@@ -190,3 +190,97 @@ async def test_a_synced_index_does_no_work(db, offender_key, monkeypatch):
     for _ in range(5):
         await randao.compute_randao_mix(db)
     assert calls == []
+
+
+async def test_an_unchanged_chain_is_checked_without_a_round_trip(db, offender_key):
+    """Every chain-index read syncs first, many times a block. After one query has found the
+    index in step (the chain's block at the indexed top, the index's row there, the tip), no
+    query at all while nothing is written to ``blocks`` and nothing is rolled back — and the
+    reads come from memory. A new block, a replaced one and an index row rolled back with its
+    transaction are each still seen."""
+    from qrdx.node.observability import DB_CALLS, count_db_calls
+
+    rng = random.Random(3)
+    slot = await _build(db, rng, 20, offender_key)
+    count_db_calls(db.connection)
+    assert await chain_index.sync(db) == 19
+    assert await chain_index.block_hash_at(db, 0) is not None      # (memory filled: one read)
+    before = DB_CALLS[0]
+    for _ in range(5):
+        assert await chain_index.sync(db) == 19
+        assert await chain_index.block_hash_at(db, 7) is not None
+        assert await chain_index.highest_height_before_slot(db, slot + 1) == 19
+    if os.environ.get("QRDX_VERIFY_CHAIN_INDEX") != "1":
+        assert DB_CALLS[0] - before == 0
+    slot = await _build(db, rng, 1, offender_key, start=20, slot0=slot)          # (a new block)
+    assert await chain_index.sync(db) == 20
+    await db.connection.execute("DELETE FROM blocks WHERE block_height = 20")      # (replaced)
+    await db.connection.commit()
+    await _build(db, rng, 1, offender_key, tag="b", start=20, slot0=slot)
+    assert await chain_index.sync(db) == 20
+    await _assert_matches_the_walk(db, rng, offender_key)
+    await db.connection.commit()
+    body = {"number": 21, "slot": slot + 3, "epoch": (slot + 3) // SLOTS_PER_EPOCH,
+            "randao_reveal": "cd" * 48, "attestations": []}
+    await db.connection.execute(
+        "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, 21, ?, 0)",
+        ("y" * 64, str(body)))
+    await db.connection.commit()                                   # (the block stays…)
+    assert await chain_index.sync(db) == 21
+    await db.connection.rollback()                                 # (…its index row does not)
+    assert await chain_index.sync(db) == 21
+    cur = await db.connection.execute("SELECT block_hash FROM chain_index WHERE height = 21")
+    assert (await cur.fetchone())[0] == "y" * 64
+
+
+async def test_what_memory_holds_follows_every_change_to_the_chain(db, offender_key, monkeypatch):
+    """The heights kept in memory (a window of 8 here, so reads below it go to the table) give
+    what the table gives — checked on every read (QRDX_VERIFY_CHAIN_INDEX) — through blocks
+    deleted by hand, a rollback that brings them back, a hash changed in place, and a new
+    chain from a lower height."""
+    monkeypatch.setattr(chain_index, "RECENT", 8)
+    monkeypatch.setenv("QRDX_VERIFY_CHAIN_INDEX", "1")
+    rng = random.Random(9)
+    slot = await _build(db, rng, 30, offender_key)
+
+    async def every_read(top):
+        assert await chain_index.sync(db) == top
+        for h in range(-1, top + 3):
+            await chain_index.block_hash_at(db, h)
+            await chain_index.slot_at(db, h)
+        for s in range(0, slot + 4):
+            await chain_index.highest_height_before_slot(db, s)
+            for cap in (0, 3, top - 5, top, top + 2):
+                await chain_index.height_before_slot_at_or_below(db, s, cap)
+
+    await every_read(29)
+    kept = await chain_index.block_hash_at(db, 27)
+    await db.connection.execute("DELETE FROM blocks WHERE block_height >= 25")    # (by hand)
+    await every_read(24)
+    assert await chain_index.block_hash_at(db, 27) is None
+    await db.connection.rollback()                                    # (…and back again)
+    await every_read(29)
+    assert await chain_index.block_hash_at(db, 27) == kept
+    await db.connection.execute("UPDATE blocks SET block_hash = ? WHERE block_height = 29",
+                                ("e" * 64,))
+    await every_read(29)
+    assert await chain_index.block_hash_at(db, 29) == "e" * 64
+    await db.connection.commit()
+    await db.connection.execute("DELETE FROM blocks WHERE block_height >= 12")
+    await db.connection.commit()
+    slot = await _build(db, rng, 10, offender_key, tag="r", start=12, slot0=slot)
+    await every_read(21)
+
+
+async def test_two_databases_on_one_connection_share_its_count(db, offender_key):
+    """Writes through either object on a connection are seen by both."""
+    from qrdx.database_sqlite import DatabaseSQLite
+
+    rng = random.Random(4)
+    slot = await _build(db, rng, 6, offender_key)
+    other = DatabaseSQLite.__new__(DatabaseSQLite)
+    other.connection = db.connection
+    assert await chain_index.sync(db) == 5 and await chain_index.sync(other) == 5
+    await _build(other, rng, 2, offender_key, start=6, slot0=slot)
+    assert await chain_index.sync(db) == 7 and await chain_index.sync(other) == 7
+    assert await db.get_block_height() == 7

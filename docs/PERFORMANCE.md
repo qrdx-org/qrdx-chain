@@ -17,6 +17,32 @@ each. For each rate it reports:
 With `--profile` it also records py-spy over node 0 for each step, counting only samples that
 hold the GIL, which is the node's Python CPU time.
 
+Every block a node builds or imports logs its time by phase, which is the first thing to read
+when blocks are slow:
+
+```
+Accepted PoS block 141 via RPC (175 ms: proposer 5, eligibility 3, parent 1, rules 13, journal 1,
+    exchange 48, withdrawals 7, root 38, store 8, finality 52)
+📦 Proposed block #142 at slot 362: d9b0… (158 ms: checks 4, select 18, preload 57, execute 15,
+    flush 9, evm+withdrawals 10, root 35, sign 9)
+```
+
+**Across machines, emulated.** `--hosts containers` runs each node in a Docker container of its
+own CPUs (`--cpus`, default 2), behind a relay that delays every connection into it both ways
+(`--delay-ms`, default 25, so a round trip between nodes is 50 ms; `--jitter-ms`, `--mbps`).
+Peers reach a node only through its relay, over HTTP and the peer transport alike
+(`integration_tests/multihost.py`, `integration_tests/delay_proxy.py`). Latency is added in user
+space because the kernel this ran on (WSL2's) has no netem. It is an emulation: the containers
+still share one machine's memory bandwidth and disk.
+
+```
+python -m integration_tests.load --force --rates 300,600,1000 --seconds 30 --accounts 2048 \
+    --hosts containers --image qrdx-node:multihost --cpus 2 --delay-ms 25
+```
+
+The image must hold the node's dependencies, liboqs and the native module (docker/Dockerfile
+builds one). Each container mounts the test tree at its own path and runs as the invoking user.
+
 ```
 python -m integration_tests.load --force --rates 100,200,300,400 --seconds 30 --accounts 512 --profile
 ```
@@ -42,10 +68,104 @@ was fixed in five places:
   which scans both to match them. Sends are now bounded at 256 in flight. Measurement calls
   have a client of their own, so the queue of sends does not delay them.
 
-## Results (2026-11-04, dev container, all four nodes on one host)
+## Results (2026-11-05)
 
-After the second round of changes (below: compact blocks, announced gossip, the native
-module, the C HTTP stack, the proposer's budget, the raised limit):
+After the fifth round (below, 26–29: plain transfers and the exchange's commitments native, a
+block's fixed costs in memory, blocks and votes over the peer transport). Four nodes on one host,
+2,048 accounts, 30 s a step:
+
+| Load (transfers/s) | Executed | Blocks/s (slots: 4/s) | Latency p50 / p95 |
+|---|---|---|---|
+| 600 | 600.0 | 3.98 | 0.26 s / 0.31 s |
+| 1,000 | 1,000.0 | 3.96 | 0.31 s / 0.73 s |
+| 1,500 | 1,462 | 2.52 | 15.8 s / 38.5 s |
+| 2,000 | 1,909 | 2.38 | 45.1 s / 66.5 s |
+
+**Across emulated machines** (2 CPUs a node, 25 ms each way between nodes):
+
+| Load (transfers/s) | Executed | Blocks/s | Latency p50 / p95 |
+|---|---|---|---|
+| 600 | 599.6 | 4.03 | 0.26 s / 0.49 s |
+| 1,000 | 1,000.0 | 3.89 | 0.34 s / 0.80 s |
+| 1,500 | 882.6 | 1.42 | 42.4 s / 73.9 s |
+
+* **1,000 a second fills every slot, on one host and across machines**, at a third of a second
+  to inclusion. Before this round it was past capacity on both (782 executed at 3.00 blocks a
+  second on one host, 593 at 2.57 across machines). On one host with 64 accounts, 1,200 a
+  second filled every slot too (p50 0.29 s, p95 0.59 s).
+* **Across machines, 1,500 a second is past what two CPUs a node import:** one node fell 144
+  blocks behind during that step and was catching up by sync when the run ended, on the same
+  chain as the others.
+* **Past it, a block carries up to about 800 transfers** (it was about 570): the 2,000 step
+  executes 1,909 a second at 2.38 blocks a second.
+* **An idle block imports in 6–8 ms with 40 database round trips** (it was 12–16 ms and
+  132–178), and the chain makes all four blocks a second idle.
+* **Blocks and votes travel on the transport.** Each node took every block from its three
+  peers and set the copies aside before Python read them (about 820 blocks in, 180–280 new, in
+  the first minutes); no peer exceeded its budget.
+* The forks under overload (8–17 a node at 1,500 and 2,000 a second, none at 1,000) were each
+  taken back out by their blocks' records; the four nodes ended on the same tip, hash and state
+  commitments.
+
+After the fourth round (22–25: pipelined execution, blocks taken back out by their own
+records, the fixed costs of a block). Four nodes, 2,048 accounts, 30 s a step.
+
+**On one host** (the dev container, loopback between nodes):
+
+| Load (transfers/s) | Executed | Blocks/s (slots: 4/s) | Latency p50 / p95 |
+|---|---|---|---|
+| 600 | 599.5 | 3.99 | 0.29 s / 0.51 s |
+| 1,000 | 782.4 | 3.00 | 1.6 s / 26.9 s |
+| 1,500 | 1,349 | 2.37 | 23.8 s / 45.7 s |
+
+**Across emulated machines** (2 CPUs a node, 25 ms each way between nodes):
+
+| Load (transfers/s) | Executed | Blocks/s | Latency p50 / p95 |
+|---|---|---|---|
+| 300 | 299.9 | 4.01 | 0.26 s / 0.49 s |
+| 600 | 600.0 | 3.90 | 0.29 s / 0.58 s |
+| 1,000 | 592.8 | 2.57 | 4.4 s / 30.0 s |
+
+* **600 a second fills every slot, on one host and across machines**, at a third of a second
+  to inclusion. Before this round it was past capacity on both (across machines: 463 executed
+  at 3.54 blocks a second).
+* **Past it, a block carries up to about 570 transfers** (the 1,500 step drains the 1,000
+  step's backlog at 1,349 a second, 2.37 blocks a second).
+* **Every reorg in these runs took its blocks back out by their records** (4–8 a node), none
+  through a checkpoint.
+* An idle block imports in 12–16 ms (it took 30–47 ms) and a proposer sends its block 4–9 ms
+  after it starts (it ran the block first: 17 ms idle, 100–290 ms under load).
+
+After the third round (below, 14–21: the peer transport, blocks before transactions, the
+proposer sized by its whole build, the mempool's selection, the native trigger function):
+
+**On one host:**
+
+| Load (transfers/s) | Executed | Blocks/s (slots: 4/s) | Latency p50 / p95 |
+|---|---|---|---|
+| 400 | 399.9 | 3.99 | 0.28 s / 0.51 s |
+| 700 | 412.2 | 3.16 | 5.2 s / 29.8 s |
+| 1,000 | 618.6 | 3.13 | 22.4 s / 41.7 s |
+
+**Across emulated machines** (2 CPUs a node, 25 ms each way between nodes):
+
+| Load (transfers/s) | Executed | Blocks/s | Latency p50 / p95 |
+|---|---|---|---|
+| 300 | 287–300 | 3.43–3.86 | 0.27–0.34 s / 0.58–4.4 s |
+| 600 | 462.6 | 3.54 | 0.61 s / 26.5 s |
+| 1,000 | 507.8 | 2.76 | 22.0 s / 45.3 s |
+
+* **Up to 400 a second on one host, and 300 across machines,** every slot gets its block.
+* **Past capacity the chain degrades instead of stalling.** Blocks keep coming at three a
+  second and more while the backlog waits in the mempool. Before this round, past capacity
+  the block rate fell to one a second and the executed rate fell with it.
+* **Capacity is about 600 a second on one host** and about 460–510 across machines: Python's
+  cost per transaction in every block, built and imported (below, "Why the ceiling").
+* Across machines, 300 a second varied between runs: the two runs had 0 and 4–9 forks a node,
+  and each fork costs its rollback about a second (below).
+
+After the second round (compact blocks, announced gossip, the native module, the C HTTP
+stack, the proposer's budget, the raised limit), on one host:
 
 | Load (transfers/s) | Executed | Blocks/s (slots: 4/s) | Latency p50 / p95 |
 |---|---|---|---|
@@ -67,7 +187,20 @@ Before that round:
 | 300 | 265.0 | 1.50 | 2.63 s / 15.99 s |
 | 400 | 237.7 | 1.90 | 2.55 s / 7.77 s |
 
-### Why the ceiling is about 450 a second, not 4,000
+### Why the ceiling is about 600–800 a second at full block rate, not 4,000
+
+What follows was measured after the second round, at about 450 a second. The third round
+removed the stalls (a node frozen by its transport, blocks that grew past the slot, a selection
+that read the whole mempool); the fourth took the proposer's run of its own block off the path
+between slots, and a fork's replay. What remains is the cost per transaction:
+
+* **Each phase of a block costs Python 30–65 µs a transaction** (offline: preload 53, execute
+  66, flush 32, unified root 50, store 41, inclusion 15), and every node builds or imports every
+  block. No phase dominates, so no single optimization moves the ceiling far.
+* **A block must be run once within a slot,** because the next proposer runs it before it
+  signs its own (pipelined execution took the proposer's run off that path; before it, a block
+  had to be built and imported in one slot). A block that arrives late becomes a fork; its
+  rollback now costs one undo a block.
 
 The protocol allows 4,000 transfers a second sustained (below, "Against Hyperliquid"). One
 node's Python does not keep up.
@@ -174,6 +307,101 @@ The second round, toward 2,000–4,000 a second:
     built or imported on it. A block's fee inputs are now kept by its hash.
 13. **The mempool swept itself on every proposal.** It now sweeps at most once a second.
 
+The third round, toward 4 blocks a second at load (2026-11-05):
+
+14. **A peer transport, in Rust** (docs/NETWORK.md). Transactions travel between peers over
+    one encrypted connection per pair (ML-DSA-65 node keys, an ML-KEM-768 session key).
+    Reading them, setting duplicates aside, checking signatures and relaying run on its threads;
+    Python only admits. Under load its first version froze a node: two locks taken in opposite
+    orders, one while holding the GIL. It now has one lock and releases the GIL.
+15. **Blocks before transactions.** An import awaits the database dozens of times, and each
+    await resumed only after every callback queued before it: under load, hundreds from
+    admission. Admission now waits while a block is imported or built (a slot at most,
+    `SignallingLock.until_free`). The transaction index used to index up to 200 blocks a pass
+    holding the block lock; it indexes one a hold, when no block is pending.
+16. **A block is broadcast as soon as it is signed,** while its proposer stores it.
+17. **A proposer sizes its block by its whole build,** start to signature, against 30% of the
+    slot (`QRDX_EXCHANGE_BUILD_SHARE`). It measured only the exchange section, about 60% of a
+    build, so a backlog grew blocks to 300–990 transfers, build and import outran the slot, the
+    next proposer built beside them, and the block rate fell to one a second. At 1,000 a second
+    offered, the chain now executes 619 at 3.13 blocks a second, where it executed 558 at 1.01.
+18. **A proposer whose tip moved while it waited for the lock builds on the new tip,** in the
+    same slot, while half the slot is left. It used to give the slot up.
+19. **The mempool's selection read every queued transaction,** per proposal, and swept the pool
+    once a second inside the build (30–90 ms with a backlog). Each nonce lane is now indexed by
+    nonce, and a block clears the lanes it consumed as it is applied.
+20. **The state commitment's trigger function is native** (17.5 µs a changed row to 7.8 µs;
+    docs/NATIVE.md).
+21. **A compact block reads the peer transport** for operations its node received but has not
+    admitted yet. Across machines, blocks often arrived before their operations were admitted,
+    and the whole section was fetched again from the sender: a round trip and a megabyte. At
+    600 a second across machines, this took the executed rate from 273 to 463.
+
+The fourth round, consensus changes for the regenesis (2026-11-05):
+
+22. **Pipelined execution** (chain-spec feature `deferred_execution`, a genesis default;
+    qrdx/post_state.py). A block's signed root is the root of the state its parent left, not of
+    its own, so:
+    * a proposer judges its block on its parent's state (the inclusion rule needs nothing
+      more), signs it with that state's root — computed when it applied the parent — and sends
+      it, then runs it. It sends 4–9 ms after starting;
+    * every importer checks the root against the state it holds before running the block, then
+      runs it and keeps the root of what it leaves for the next block;
+    * running a signed block cannot make it invalid: an EVM transaction that cannot run (a nonce
+      or a balance it no longer has) is skipped and changes nothing. Otherwise a transaction the
+      mempool admitted but the block could not run would cost every proposer its slot in turn;
+    * the state after block h is signed by block h + 1: state proofs and snapshots are checked
+      against it (docs/STATE_PROOFS.md, docs/CHECKPOINT_SYNC.md).
+
+    The next proposer still runs the parent before it can sign, so a slot holds one run of a
+    block, not a build and an import: the proposer sizes its block by its whole work against
+    half the slot (`QRDX_DEFERRED_BUILD_SHARE`).
+23. **A reorg takes its blocks back out** (qrdx/exchange/block_undo.py). Each block runs in an
+    exchange undo scope, with what no scope records (the manager's own fields, the plain
+    attributes of each engine, book and market) kept beside it, and the indexes derived from
+    the state dropped by an undo, to be rebuilt. A rollback undoes the database by its journal
+    and the exchange by these records, newest first; each must reproduce the exchange root its
+    block found, or the checkpoint and replay run as before. A block that runs and is not stored
+    is taken back out the same way. A one-block fork cost up to an epoch of blocks replayed,
+    about a second under load.
+24. **The chain index was checked against the chain on every read**, five or six database round
+    trips each time, and eligibility, the validators' root and finality read it many times a
+    block. It is now one query when nothing changed: the chain still holds, at the index's top,
+    the block it indexed there, and the index still holds its row. Reads that fetched in a
+    second round trip (aiosqlite's `execute`, then `fetchone`) now take one. An empty block's
+    import made 427 round trips; it makes 132–178.
+25. **Every feature check deep-copied the whole chain spec** (`chain_spec.is_active`); it now
+    reads the genesis features the spec keeps.
+
+26. **Plain transfers run natively** (`qrdx/exchange/transfer_lane.py`, `lane.rs`;
+    docs/NATIVE.md). Python checks each one's form, fee floor, amount and recipient once; the
+    inclusion judgment and the run over consecutive transfers (nonces, what each payer owes,
+    balances, deltas, fees) are Rust, in Python's `Decimal` arithmetic exactly, bailing to
+    Python for anything it would not reproduce.
+27. **The proof trees and the exchange's accumulators are native.** The database's tree update
+    walked its nodes one awaited read at a time (23 ms a block of 500); the exchange's
+    in-memory trees allocated a Python object per level of every changed path (22 ms for 1,000
+    changes to a collection of 100,000 entries, now 4–7). The accumulators' 4 KB vectors are
+    built in parallel. A commitment of 1,000 changed entries went from 33.6 ms to 15.
+28. **A block's fixed costs are in memory.** The chain index answered dozens of questions a
+    block (an epoch's validator set, finality, the validators' root), each a check that the
+    chain had not changed and a read: two round trips to aiosqlite's thread. The connection now
+    counts its writes to `blocks` and its rollbacks (a TEMP trigger and a wrapped
+    `rollback`), so the check costs nothing while nothing changed, and the newest 16,384
+    heights' hashes and slots are kept beside the index (qrdx/chain_index.py). The tip, the
+    finalized checkpoint, the validators' log tables (one query, not six), the undo journal's
+    missing tables (looked for again only when the schema changes), the parent's fee inputs
+    and the realtime feed's hashes followed. With `QRDX_VERIFY_CHAIN_INDEX=1` (the test suite)
+    every answer from memory is checked against the database. An idle node made 87,000 round
+    trips in its first 105 s; now 32,000.
+29. **Blocks and votes over the peer transport** (docs/NETWORK.md). A block goes compact to
+    every peer on the transport, its copies set aside before Python reads them; a compact
+    block's missing operations are asked of its sender there before HTTP. The transaction index
+    reads a block it just stored from memory (it re-read and parsed the section, a megabyte a
+    block at load, holding the block lock).
+
+Each block's phase line ends with its database round trips (`db N`).
+
 ## The block pipeline, measured offline
 
 `scripts/bench/exchange_block.py` times one block's exchange section on a real SQLite database.
@@ -186,7 +414,20 @@ transaction.
 python scripts/bench/exchange_block.py --txs 2000 --accounts 400 --blocks 3
 ```
 
-2,000 transfers a block from 400 accounts (2026-11-04):
+2,000 transfers a block from 400 accounts, after the fifth round (2026-11-05):
+
+| Phase | ms a block | µs a transaction |
+|---|---:|---:|
+| verify signatures | 62.5 | 31.3 |
+| inclusion judgment | 31.6 | 15.8 |
+| preload balances | 12.3 | 6.2 |
+| execute | 34.9 | 17.5 |
+| flush to the database | 39.6 | 19.8 |
+| unified state root | 10.6 | 5.3 |
+| store the block | 70.3 | 35.1 |
+| **total** | **261.8** | **130.9**, about 7,640 transactions a second |
+
+Before it (2026-11-04):
 
 | Phase | ms a block | µs a transaction |
 |---|---:|---:|
@@ -235,12 +476,12 @@ Peer traffic changed too:
 Hyperliquid reports about 200,000 orders a second. At 250 ms slots, QRDX is bounded well below
 that by three things.
 
-* **The protocol's own cap.** `BLOCK_EXCHANGE_GAS_LIMIT` is 20 million gas a block, a chain-spec
-  parameter. A transfer or spot order costs 40,000 gas and a perp order 60,000. That is 500
-  transfers or 333 perp orders a block: **2,000 transfers or 1,333 perp orders a second**,
-  however fast the node is.
+* **The protocol's own cap.** `BLOCK_EXCHANGE_GAS_LIMIT` is 80 million gas a block for new
+  networks (docs/BLOCK_LIMITS.md), a chain-spec parameter. A transfer or spot order costs 40,000
+  gas and a perp order 60,000. That is 2,000 transfers or 1,333 perp orders a block: **8,000
+  transfers or 5,333 perp orders a second**, however fast the node is.
   * **Sustained, half that.** The exchange's base fee targets half the limit, as EIP-1559
-    does. Demand above 1,000 transfers a second raises the price, block after block, until
+    does. Demand above 4,000 transfers a second raises the price, block after block, until
     demand falls back to the target.
   * A block counts the gas each transaction *declares*, not what it uses. A wallet that
     declares more than an operation costs takes more of the block than it uses.
@@ -253,10 +494,11 @@ that by three things.
   * At 200,000 a second, it would be 2 GB a second.
   * Hyperliquid's Ethereum-style signature is 65 bytes, and the key is recovered from it
     rather than sent.
-* **The node.** One core runs about 4,450 transfers a second through the block pipeline
-  (above), twice the protocol cap. Live, on one host, the network tops out near 250 a second,
-  because blocks of post-quantum transactions take longer than a 250 ms slot to propagate
-  under load. The binding limit today is propagation, not execution.
+* **The node.** One core runs about 3,400–4,450 transfers a second through the block pipeline
+  offline (above). Live, the network tops out near 600 a second on one host and 460 across
+  emulated machines, because every node builds or imports every block in Python and a block
+  must be built, sent and imported within a 250 ms slot. The binding limit today is the
+  Python cost per transaction in each block.
 
 What would close the gap, in the order it pays:
 
@@ -281,13 +523,23 @@ batching is the lever that moves it.
 
 ## What limits it next
 
-* **Block propagation against 250 ms slots.** Live, forks cost a quarter of node 0's time at
-  200 a second. The compact wire format above cuts the bytes to propagate by two thirds, which
-  is the first lever. Sending a block's header and transaction hashes, rather than transactions
-  every peer already holds from gossip, removes most of the rest.
-* **Re-gossip.** Each transaction reaches a node once from every peer
-  (docs/KNOWN_ISSUES.md). Announcing hashes and fetching only what is missing would cut that.
-* **The protocol cap and transaction size,** above.
-* **One host.** Four nodes on one machine share its cores, and their network has no latency.
-  The geo-distributed soak (§3.4) must measure 250 ms slots with real round trips. Since time
-  parameters live in the chain spec, a longer slot is a spec change if it is needed.
+In the order they would pay, toward four blocks a second at 2,000–4,000 transfers:
+
+1. **Native state, and the database behind it.** Plain transfers and the commitments' trees and
+   accumulators are native now; the exchange's other operations, each entry's encoding for its
+   commitment, the flush and the store are Python (5–35 µs a transaction each, above). Under
+   load a block's import is now 100–200 ms at 600–900 transfers: the exchange section 40–95,
+   storing it 15–35 (about 11 KB of JSON an operation), its body root and rules 10–22. Holding
+   the exchange's state natively, with the database written behind it, is still the change
+   that moves the ceiling by a multiple.
+2. **Execution deferred further.** A block still signs its parent's state, so the next proposer
+   must run the parent before it can sign. Signing the state two blocks back would take that
+   run off the path too, but the inclusion rule then needs a balance no block has computed
+   yet: a reserve each account keeps for fees, as some chains do, or fees judged against a
+   bound of what the pending block can spend.
+3. **The size of what a block stores and hashes.** A transfer is about 10.5 KB of hex JSON, so
+   a block of 900 is about 10 MB to hash for its body root, write to the database and keep.
+   A binary wire format (below) shrinks all three; it changes what is signed, so it is a fork.
+4. **The protocol cap and transaction size,** above.
+5. **Real machines.** The emulation shares one machine's memory and disk; the geo-distributed
+   soak (§3.4) is the real measure.

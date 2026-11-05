@@ -153,6 +153,7 @@ class ExchangeSubmitter:
         forward_batch_to_all: Optional[
             Callable[[List[str], List[Dict[str, Any]]], Awaitable[Any]]
         ] = None,
+        yield_to: Optional[Callable[[], Awaitable[None]]] = None,
     ):
         self._get_mempool = get_mempool
         self._get_peer_urls = get_peer_urls
@@ -165,6 +166,10 @@ class ExchangeSubmitter:
             self._get_balance = _Coalesced(get_balances)
         self._verify_queue: List[Tuple[ExchangeTransaction, "asyncio.Future[None]"]] = []
         self._verifier: Optional[asyncio.Future] = None
+        # The native peer transport's relay (qrdx/node/netd.py), when it runs: what is admitted
+        # goes to peers through it, not as signed HTTP batches.
+        self._transport: Optional[Callable[[List[Tuple[str, Any, bool, Any]]], Any]] = None
+        self._to_relay: List[Tuple[str, Any, bool, Any]] = []
         # Gossip in batches (integration_tests/load.py): what was admitted in the last
         # ``gossip_interval`` goes to each peer in one signed request. One request a transaction
         # a peer — a signature to make and one to check, each time — kept a loaded node's event
@@ -182,10 +187,22 @@ class ExchangeSubmitter:
         self._announcements: List[str] = []
         self._seen: "OrderedDict[str, None]" = OrderedDict()
         self._flusher: Optional[asyncio.Future] = None
+        # Awaited before admitting: until no block is being imported or built (the node's
+        # block-processing lock). Admitting a batch queues hundreds of steps on the event loop,
+        # and every step of a block import waited behind them.
+        self._yield_to = yield_to
 
-    async def submit(self, tx: Any, propagated: bool = False) -> Tuple[bool, str, Optional[str]]:
+    def use_transport(self, relay: Callable[[List[Tuple[str, Any, bool, Any]]], Any]) -> None:
+        """Relay through the native peer transport from now on (qrdx/node/netd.py)."""
+        self._transport = relay
+
+    async def submit(
+        self, tx: Any, propagated: bool = False, origin: Optional[str] = None, raw: Any = None
+    ) -> Tuple[bool, str, Optional[str]]:
         """Returns (ok, error, tx_hash). Re-submitting a transaction the mempool already holds
-        is not an error (it is idempotent) and is not gossiped again."""
+        is not an error (it is idempotent) and is not gossiped again. ``origin``: the peer it
+        came from, over the native transport; ``raw``: its bytes, when the transport does not
+        hold them."""
         try:
             tx = parse_exchange_tx(tx)
         except Exception as e:
@@ -194,6 +211,8 @@ class ExchangeSubmitter:
         mempool = self._get_mempool()
         if mempool.contains(tx_hash):
             return True, "", tx_hash  # (a peer's echo: nothing to read or forward)
+        if self._yield_to is not None:
+            await self._yield_to()
         self._saw(tx_hash)
         await self._preverify(tx)
         short = await self._unaffordable(tx)
@@ -204,6 +223,15 @@ class ExchangeSubmitter:
             if err.startswith("duplicate"):
                 return True, "", tx_hash
             return False, err, None
+        if self._transport is not None:
+            if not propagated and raw is None:
+                from .. import fastjson
+
+                raw = fastjson.dumps(tx.to_dict()).encode()
+            self._to_relay.append((tx_hash, raw, not propagated, origin))
+            if len(self._to_relay) == 1:  # (what is admitted together goes in one call)
+                asyncio.get_running_loop().call_soon(self._relay_now)
+            return True, "", tx_hash
         if self._forward_batch is not None:
             if propagated and self._announce is not None:
                 self._announcements.append(tx_hash)
@@ -241,6 +269,14 @@ class ExchangeSubmitter:
                 f"cost {need} (gas_limit × gas_price)"
             )
         return ""
+
+    def _relay_now(self) -> None:
+        items, self._to_relay = self._to_relay, []
+        if items and self._transport is not None:
+            try:
+                self._transport(items)
+            except Exception as e:  # (a relay must never fail an admission)
+                logger.warning("exchange relay through the transport failed: %s", e)
 
     async def _preverify(self, tx: ExchangeTransaction) -> None:
         """Check this transaction's signature with the others arriving now (a peer's gossip

@@ -8,7 +8,8 @@ travels with its exchange section named by hash (``exchange_tx_hashes``), about 
 
 * the receiver rebuilds the section from its own mempool, the operations its mempool already
   checked (``block_processor.is_verified``);
-* it asks the sender only for what it lacks (``p2p_getBlockTxs``, by position). A node keeps
+* it asks the sender only for what it lacks: over the peer transport by hash when the block came
+  over it (qrdx/node/netd.py), then over HTTP (``p2p_getBlockTxs``, by position). A node keeps
   the sections of the blocks it recently sent;
 * then the rebuilt block goes through ``p2p_submitBlock`` exactly as a whole one does: its
   body must hash to the ``body_root`` its proposer signed. A rebuilt section that differs in
@@ -21,6 +22,7 @@ The node's state (the exchange mempool) lives in qrdx.node.main and is read from
 time, as ``_node.<name>``.
 """
 
+import json
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -86,11 +88,24 @@ def compact_form(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return out
 
 
+def settle(block_data: Dict[str, Any]) -> None:
+    """What an applied block consumed leaves this node's mempool: its operations' lanes are
+    pruned below their new expected nonces (``ExchangeMempool.prune_lanes``). A whole block
+    (rare: compact relay is the rule) is left to the mempool's own sweep."""
+    objects = block_data.get("_exchange_objects")
+    if objects:
+        _node._get_exchange_mempool().prune_lanes(t.nonce_key() for t in objects)
+
+
 async def rebuild(
-    block_data: Dict[str, Any], sender_url: Optional[str], whole: bool = False
+    block_data: Dict[str, Any],
+    sender_url: Optional[str],
+    whole: bool = False,
+    sender_node: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     """A compact block's whole form (with its operations decoded beside it), or (None, why).
-    ``whole``: fetch every operation from the sender rather than reading the mempool."""
+    ``whole``: fetch every operation from the sender (over HTTP, by position) rather than
+    reading the mempool. ``sender_node``: the sender's node id, asked over the transport."""
     from qrdx.exchange.transactions import ExchangeTransaction
 
     hashes = block_data.get("exchange_tx_hashes")
@@ -103,6 +118,16 @@ async def rebuild(
         [None] * len(hashes) if whole else [mempool.get(h) for h in hashes]
     )
     missing = [i for i, t in enumerate(txs) if t is None]
+    if missing and not whole:
+        held = _from_transport([hashes[i] for i in missing])
+        for i, tx in zip(missing, held, strict=True):
+            txs[i] = tx
+        missing = [i for i, t in enumerate(txs) if t is None]
+    if missing and not whole and sender_node:
+        held = await _from_sender(sender_node, [hashes[i] for i in missing])
+        for i, tx in zip(missing, held, strict=True):
+            txs[i] = tx
+        missing = [i for i, t in enumerate(txs) if t is None]
     if missing:
         fetched = await _fetch(sender_url, block_data.get("block_hash"), missing)
         if fetched is None or len(fetched) != len(missing):
@@ -126,6 +151,47 @@ async def rebuild(
             f"operations from its sender"
         )
     return full, ""
+
+
+def _read(raws: List[Optional[bytes]], hashes: List[str]) -> List[Any]:
+    """Each raw operation read, if it is the one named; else None. (The block's import verifies
+    its signature, as it does any operation's.)"""
+    from qrdx.exchange.submission import parse_exchange_tx
+
+    out: List[Any] = []
+    for h, raw in zip(hashes, raws, strict=True):
+        tx = None
+        if raw is not None:
+            try:
+                tx = parse_exchange_tx(json.loads(raw))
+                if tx.tx_hash() != h:
+                    tx = None
+            except Exception:
+                tx = None
+        out.append(tx)
+    return out
+
+
+async def _from_sender(sender_node: str, hashes: List[str]) -> List[Any]:
+    """What the block's sender holds of ``hashes``, asked over the transport."""
+    from qrdx.node import netd
+
+    return _read(await netd.ask_block_txs(sender_node, hashes), hashes)
+
+
+def _from_transport(hashes: List[str]) -> List[Any]:
+    """What the peer transport holds of ``hashes`` (qrdx/node/netd.py), read: operations that
+    reached this node but are not admitted yet (admission waits while a block is processed), so
+    they are not in the mempool. Under latency a block often arrived before its operations were
+    admitted, and its whole section was fetched again from the sender, a round trip and a
+    megabyte. Each is checked as any operation in a block is: its hash must be the one named,
+    and the block's import verifies its signature."""
+    from qrdx.node import netd
+
+    service = netd.SERVICE
+    if service is None:
+        return [None] * len(hashes)
+    return _read(list(service.lookup(hashes)), hashes)
 
 
 async def _fetch(

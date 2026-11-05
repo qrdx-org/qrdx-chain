@@ -28,7 +28,7 @@ the mempool is testable without any node or database.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from .block_processor import verify_exchange_tx
 from .transactions import ExchangeOpType, ExchangeTransaction
@@ -97,6 +97,10 @@ class ExchangeMempool:
         # nonce lane -> {tx_hash}: the account's own transactions, and each agent's (or a
         # sub-account master's) for it, are separate nonce sequences (``nonce_key``).
         self._by_sender: Dict[str, Set[str]] = {}
+        # nonce lane -> {nonce: tx_hash}: selection walks each lane's run nonce by nonce. It
+        # rebuilt this map from every queued transaction at every proposal: with a backlog,
+        # most of building a block.
+        self._lane_nonces: Dict[str, Dict[int, str]] = {}
         # Oracle votes: their own lane, the newest per voter. A vote's nonce is its own
         # sequence (state_manager: not the account nonce), so it neither waits in a sender's
         # nonce run nor moves the validator's exchange nonce.
@@ -175,13 +179,13 @@ class ExchangeMempool:
                 f"+ gap {self.max_nonce_gap}"
             )
         # No nonce replacement in D1: one tx per (sender, nonce).
-        for h in sender_hashes:
-            if self._txs[h].nonce == tx.nonce:
-                return False, f"nonce {tx.nonce} already queued for sender"
+        if tx.nonce in self._lane_nonces.get(lane, ()):
+            return False, f"nonce {tx.nonce} already queued for sender"
 
         # Admit.
         self._txs[tx_hash] = tx
         self._by_sender.setdefault(lane, set()).add(tx_hash)
+        self._lane_nonces.setdefault(lane, {})[tx.nonce] = tx_hash
         return True, ""
 
     def admit_hex(self, hex_str: str) -> Tuple[bool, str, Optional[str]]:
@@ -258,7 +262,8 @@ class ExchangeMempool:
             from ..block_limits import exchange_gas_limit_at
 
             gas_limit = exchange_gas_limit_at(height)
-        self.prune_stale(force=False)
+        # (no sweep here: each sender's run starts at its expected nonce, so what a block took
+        # is passed over; it leaves as blocks are applied, ``prune_lanes``)
         selected: List[ExchangeTransaction] = []
         gas = 0
         for vote in self.votes():  # prices first
@@ -267,17 +272,18 @@ class ExchangeMempool:
             selected.append(vote)
             gas += int(vote.gas_limit)
         for sender in sorted(self._by_sender.keys()):
-            by_nonce = {self._txs[h].nonce: self._txs[h] for h in self._by_sender[sender]}
+            by_nonce = self._lane_nonces.get(sender, {})
             n = self._nonce_provider(sender)
             while n in by_nonce and len(selected) < limit:
-                if gas + int(by_nonce[n].gas_limit) > gas_limit:
+                tx = self._txs[by_nonce[n]]
+                if gas + int(tx.gas_limit) > gas_limit:
                     break
-                if int(by_nonce[n].gas_price) < min_price and not (
-                    by_nonce[n].free_eligible() and not self._free_check(by_nonce[n])
+                if int(tx.gas_price) < min_price and not (
+                    tx.free_eligible() and not self._free_check(tx)
                 ):
                     break  # (a free-lane operation its account may still send free goes in)
-                selected.append(by_nonce[n])
-                gas += int(by_nonce[n].gas_limit)
+                selected.append(tx)
+                gas += int(tx.gas_limit)
                 n += 1
             if len(selected) >= limit:
                 break
@@ -303,7 +309,20 @@ class ExchangeMempool:
                 s.discard(h)
                 if not s:
                     del self._by_sender[lane]
+            nonces = self._lane_nonces.get(lane)
+            if nonces is not None:
+                if nonces.get(tx.nonce) == h:
+                    del nonces[tx.nonce]
+                if not nonces:
+                    del self._lane_nonces[lane]
         return removed
+
+    def prune_lanes(self, lanes: Iterable[str]) -> int:
+        """Drop what a block just consumed: the transactions below the expected nonce of the
+        lanes its operations ran in. Called as each block is applied, it keeps the pool free of
+        what blocks took at the cost of the block, not of the pool (a sweep of the whole pool,
+        at every proposal, was a share of building each block)."""
+        return sum(self._prune_sender(lane) for lane in set(lanes))
 
     def _prune_sender(self, sender: str) -> int:
         hashes = self._by_sender.get(sender)
@@ -312,9 +331,10 @@ class ExchangeMempool:
         expected = self._nonce_provider(sender)
         return self.remove([h for h in hashes if self._txs[h].nonce < expected])
 
-    # The most often ``prune_stale`` sweeps the whole pool when a proposer selects. A sweep reads
-    # every transaction; at every proposal, with a backlog of tens of thousands, it was a share of
-    # building each block. It is hygiene: selection starts each sender at its expected nonce,
+    # The most often an unforced ``prune_stale`` sweeps the whole pool (when admission finds it
+    # full). A sweep reads every transaction; it ran at every proposal once, and with a backlog
+    # of tens of thousands it was a share of building each block. It is hygiene: selection
+    # starts each sender at its expected nonce, blocks clear their own lanes (``prune_lanes``),
     # and a block judges expiry by its own time.
     PRUNE_INTERVAL = 1.0
 

@@ -437,6 +437,14 @@ FEATURES: Dict[str, str] = {
         "refused before it runs — which used to sit in the block without paying, consuming its "
         "nonce or executing — is invalid."
     ),
+    "deferred_execution": (
+        "A block commits to the state its parent left (its signed state root is the unified "
+        "root after the parent), not to its own: a proposer judges and signs a block before "
+        "running it, and runs it after it is on its way to peers (qrdx/post_state.py). Running "
+        "a signed block cannot make it invalid: an EVM transaction that cannot run (a nonce or "
+        "a balance it no longer has) is skipped and changes nothing. The state a block leaves is "
+        "bound by the next block's root."
+    ),
 }
 
 # The rules a network created by this release has from genesis unless its spec says otherwise
@@ -450,6 +458,7 @@ GENESIS_DEFAULT_FEATURES: Tuple[str, ...] = (
     "validator_state_root",
     "exchange_inclusion",
     "evm_conformance",
+    "deferred_execution",
 )
 
 
@@ -865,6 +874,11 @@ class ChainSpec:
                 break
             active_set = feats
         return active_set
+
+    @property
+    def genesis_features(self) -> frozenset:
+        """The features in force from genesis."""
+        return self._steps[0][1]
 
     def is_scheduled(self, feature: str, height: int) -> bool:
         """Does the schedule switch ``feature`` on by ``height``? (Not whether it is in force:
@@ -1372,7 +1386,9 @@ def is_active(feature: str, height: int) -> bool:
     spec = active()
     if not spec.is_scheduled(feature, height):
         return False
-    if feature in spec.to_dict()["features"]:
+    # (not ``to_dict()["features"]``: a deep copy of the whole spec, on every call — and this is
+    # asked many times a block)
+    if feature in spec.genesis_features:
         return True
     fork = spec.fork_of(feature)
     return fork is not None and fork_approval(spec, fork)["approved"]
@@ -1381,7 +1397,7 @@ def is_active(feature: str, height: int) -> bool:
 def active_features(height: int, spec: Optional[ChainSpec] = None) -> List[str]:
     """Every feature in force at ``height`` (genesis features + approved, reached forks)."""
     spec = spec or active()
-    out = set(spec.to_dict()["features"])
+    out = set(spec.genesis_features)
     for f in spec.forks:
         if f["height"] <= height and fork_approval(spec, f)["approved"]:
             out.update(f["features"])

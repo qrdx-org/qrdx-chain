@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 EMPTY = bytes(32)
 _LEAF = b"qrdx/smt/leaf/v1\x00"
@@ -281,6 +281,11 @@ def verify(
 # immutable and shared, so a copy of a tree costs nothing and an update allocates only the
 # path it changes; a node no root reaches is freed by Python. Same shape and hashes as the
 # stored tree above (``verify`` checks both).
+#
+# With the native module (native/qrdx-native/src/mtree.rs) ``m_build``, ``m_update`` and
+# ``m_prove`` run natively on its own immutable nodes (``qrdx_native.MNode``: the same
+# attributes, shape and hashes), about twenty times faster; ``_py_build``, ``_py_update`` and
+# ``_py_prove`` are the reference, which the commitments' ``verify`` checks against.
 
 
 class MNode:
@@ -321,7 +326,35 @@ def m_internal(left: Optional[MNode], right: Optional[MNode]) -> MNode:
     return MNode(h, left=left, right=right)
 
 
-def m_build(live: Sequence[Change], depth: int = 0) -> Optional[MNode]:
+def _tree_module() -> Any:
+    from .. import native
+
+    return native.tree_module()
+
+
+def m_build(live: Sequence[Change]) -> Optional[MNode]:
+    """The tree of ``live`` (sorted, distinct 32-byte keys, all present)."""
+    t = _tree_module()
+    if t is not None:
+        return t.mt_build(list(live))  # type: ignore[no-any-return]
+    return _py_build(live)
+
+
+def m_update(node: Optional[MNode], changes: Sequence[Change]) -> Optional[MNode]:
+    """``node``'s tree with ``changes`` (sorted by key, distinct) applied; the original is
+    untouched."""
+    t = _tree_module()
+    if t is not None and (node is None or isinstance(node, t.MNode)):
+        return t.mt_update(node, list(changes))  # type: ignore[no-any-return]
+    return _py_update(node, changes)
+
+
+def m_from_entries(entries: Sequence[Tuple[bytes, bytes]]) -> Optional[MNode]:
+    """The tree of ``entries`` [(key, payload)] (how a native tree is pickled)."""
+    return m_build(sorted((bytes(k), bytes(v)) for k, v in entries))
+
+
+def _py_build(live: Sequence[Change], depth: int = 0) -> Optional[MNode]:
     """The tree of ``live`` (sorted, distinct keys, all present) below ``depth``."""
     if not live:
         return None
@@ -331,29 +364,29 @@ def m_build(live: Sequence[Change], depth: int = 0) -> Optional[MNode]:
         return m_leaf(key, payload)
     left = [c for c in live if not bit(c[0], depth)]
     right = [c for c in live if bit(c[0], depth)]
-    return m_internal(m_build(left, depth + 1), m_build(right, depth + 1))
+    return m_internal(_py_build(left, depth + 1), _py_build(right, depth + 1))
 
 
-def m_update(node: Optional[MNode], changes: Sequence[Change], depth: int = 0) -> Optional[MNode]:
+def _py_update(node: Any, changes: Sequence[Change], depth: int = 0) -> Optional[MNode]:
     """``node``'s subtree with ``changes`` (sorted by key, distinct) applied; the original is
     untouched."""
     if not changes:
-        return node
+        return node  # type: ignore[no-any-return]
     if node is None:
-        return m_build([c for c in changes if c[1] is not None], depth)
+        return _py_build([c for c in changes if c[1] is not None], depth)
     if node.is_leaf:
         merged: Dict[bytes, Optional[bytes]] = {node.key: node.payload}
         merged.update(changes)
         live = sorted((k, v) for k, v in merged.items() if v is not None)
         if live == [(node.key, node.payload)]:
-            return node
-        return m_build(live, depth)
+            return node  # type: ignore[no-any-return]
+        return _py_build(live, depth)
     left = [c for c in changes if not bit(c[0], depth)]
     right = [c for c in changes if bit(c[0], depth)]
-    lnode = m_update(node.left, left, depth + 1) if left else node.left
-    rnode = m_update(node.right, right, depth + 1) if right else node.right
+    lnode = _py_update(node.left, left, depth + 1) if left else node.left
+    rnode = _py_update(node.right, right, depth + 1) if right else node.right
     if lnode is node.left and rnode is node.right:
-        return node
+        return node  # type: ignore[no-any-return]
     if lnode is None and rnode is None:
         return None
     lone = rnode if lnode is None else lnode if rnode is None else None
@@ -366,6 +399,15 @@ def m_prove(
     root: Optional[MNode], key: bytes
 ) -> Tuple[List[bytes], Optional[Tuple[bytes, bytes]], Optional[bytes]]:
     """As ``Tree.prove``: (siblings, the leaf the walk ends at, its payload)."""
+    t = _tree_module()
+    if t is not None and (root is None or isinstance(root, t.MNode)):
+        return t.mt_prove(root, key)  # type: ignore[no-any-return]
+    return _py_prove(root, key)
+
+
+def _py_prove(
+    root: Any, key: bytes
+) -> Tuple[List[bytes], Optional[Tuple[bytes, bytes]], Optional[bytes]]:
     siblings: List[bytes] = []
     node, depth = root, 0
     while node is not None:

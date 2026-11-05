@@ -36,9 +36,10 @@ Deliberately NOT replayed here
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +64,15 @@ async def rebuild_derived_state_interleaved(db, evm_state_manager=None, execute_
     from .history_pruning import require_history
 
     await require_history(db, 1, "a replay from genesis")  # (before anything is reset)
-    from . import undo_journal
+    # ── Reset every domain ────────────────────────────────────────────────
+    from . import post_state, undo_journal
+    from .exchange import block_undo
     from .exchange.block_processor import apply_enforcement
     from .exchange.state_manager import ExchangeStateManager
 
-    # ── Reset every domain ────────────────────────────────────────────────
     await undo_journal.reset(db)
+    post_state.forget()  # (the roots after each block are recomputed from the rebuilt state)
+    block_undo.invalidate()  # (the exchange is rebuilt: the replay records each block again)
     CHECKPOINTS.clear()
     _LAST_EPOCH.clear()
     await drop_persisted_checkpoint(db)  # re-taken from the rebuilt state as finality moves
@@ -106,18 +110,69 @@ async def rebuild_derived_state_interleaved(db, evm_state_manager=None, execute_
 
 
 async def rebuild_to_tip(db, evm_state_manager=None, execute_tx=None) -> dict:
-    """Bring derived state to the current tip after a rollback (or a rejected block): the fast
-    path when it applies, else the full rebuild. Same result either way.
+    """Bring derived state to the current tip after a rollback (or a rejected block): the
+    fastest path that applies, else the full rebuild. Same result either way.
 
-    Fast path: undo the journal back to the newest exchange checkpoint at or below the tip,
-    restore the exchange from that checkpoint, and replay only the blocks above it — the cost
-    of the changes since the checkpoint plus less than an epoch of blocks, not of the chain."""
-    from . import undo_journal
+    Fastest: take the blocks above the tip back out — the database by its undo journal, the
+    exchange by each block's record (qrdx/exchange/block_undo.py) — at the cost of what they
+    changed. Each undo must reproduce the exchange root its block found.
+
+    Else: undo the journal back to the newest exchange checkpoint at or below the tip, restore
+    the exchange from that checkpoint, and replay only the blocks above it — the cost of the
+    changes since the checkpoint plus less than an epoch of blocks, not of the chain."""
+    from .exchange import block_undo
     from .exchange.state_manager import ExchangeStateManager
 
     tip = (await db.get_next_block_id()) - 1
     for height in sorted((h for h in CHECKPOINTS if h > tip), reverse=True):
         del CHECKPOINTS[height]  # the state of blocks no longer on the chain
+    token = block_undo.suspended()  # (a refused block's scope may be open: nothing records)
+    try:
+        counts = await _take_back(db, ExchangeStateManager.get_instance(), evm_state_manager, tip)
+        if counts is not None:
+            return counts
+        block_undo.invalidate()
+        return await _rebuild_from_checkpoint(db, evm_state_manager, execute_tx, tip)
+    finally:
+        block_undo.resume(token)
+
+
+async def _take_back(db, mgr, sm, tip: int) -> Optional[dict]:
+    """The blocks above ``tip`` taken back out by their records, or None if they cannot be (no
+    record, or an undo that does not reproduce its root: the exchange is then restored from a
+    checkpoint, whatever the undo left)."""
+    from . import undo_journal
+    from .exchange import block_undo
+
+    if block_undo.take_back_open(mgr, tip) is False:
+        return None
+    undone = block_undo.take_back(mgr, tip)
+    if undone is None:
+        return None
+    reversed_entries = await undo_journal.rollback_to(db, tip)
+    if reversed_entries is None:
+        return None
+    mgr.journal.rollback_to(tip)
+    _LAST_EPOCH.clear()
+    _clear_evm_caches(sm)
+    await db.connection.commit()
+    counts: Dict[str, Any] = {"tip": tip, "base": tip, "blocks": 0, "undone": undone}
+    counts["account_root"] = await db.get_account_state_root(tip)
+    logger.info(
+        "[reorg] block undo: tip=%d (%d block(s) taken back, %d journal entries undone) "
+        "account_root=%s",
+        tip,
+        undone,
+        reversed_entries,
+        counts["account_root"][:16],
+    )
+    return counts
+
+
+async def _rebuild_from_checkpoint(db, evm_state_manager, execute_tx, tip: int) -> dict:
+    from . import undo_journal
+    from .exchange.state_manager import ExchangeStateManager
+
     base = None
     for height in sorted(CHECKPOINTS, reverse=True):
         if CHECKPOINTS[height][0] == await _block_hash(db, height) and (
@@ -316,6 +371,9 @@ async def load_persisted_checkpoint(db) -> Optional[int]:
     snapshot = pickle.loads(zlib.decompress(state_blob))
     journal = pickle.loads(zlib.decompress(journal_blob))
     journal.rollback_to(height)
+    from .exchange import block_undo
+
+    block_undo.invalidate()  # (the exchange is the checkpoint now: no record describes it)
     CHECKPOINTS.clear()
     CHECKPOINTS[height] = (root, snapshot)
     _LAST_EPOCH.clear()
@@ -326,11 +384,27 @@ async def load_persisted_checkpoint(db) -> Optional[int]:
 
 async def before_block(db, height: int, epoch: Optional[int]):
     """Every block-application path opens its block with this: a checkpoint if the block starts
-    a new epoch, then the undo journal recording the block's writes (an async context)."""
-    from . import undo_journal
-
+    a new epoch, then the undo journal recording the block's writes and the exchange's record of
+    what the block changes (qrdx/exchange/block_undo.py), kept if the block is stored (an async
+    context)."""
     await checkpoint_before(db, height, epoch)
-    return undo_journal.recording(db, height)
+    return _applying(db, height)
+
+
+@contextlib.asynccontextmanager
+async def _applying(db, height: int) -> AsyncIterator[None]:
+    from . import undo_journal
+    from .exchange import block_undo
+    from .exchange.state_manager import ExchangeStateManager
+
+    opened = block_undo.open_block(ExchangeStateManager.get_instance(), height)
+    applied = False
+    try:
+        async with undo_journal.recording(db, height):
+            yield
+        applied = (await _block_hash(db, int(height))) is not None
+    finally:
+        block_undo.close_block(opened, applied)
 
 
 # ── the per-block replay ──────────────────────────────────────────────────────────────────
@@ -351,8 +425,12 @@ def _clear_evm_caches(sm) -> None:
 async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, Any]:
     """Apply blocks ``start``..``end`` to derived state, per block in the importer's order
     (exchange section, EVM section, withdrawals), each recorded in the undo journal."""
-    from . import undo_journal
-    from .contracts.evm_block_apply import produce_block_evm_section
+    from . import post_state, undo_journal
+    from .contracts.evm_block_apply import (
+        apply_block_evm_section_total,
+        produce_block_evm_section,
+    )
+    from .exchange import block_undo
     from .exchange.block_processor import (
         ENFORCE_EXCHANGE_COLLATERAL,
         decode_exchange_txs,
@@ -422,58 +500,71 @@ async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, An
         # would abort the rebuild at height 0 — after account_state was already cleared.
         raw_ts = timestamp or 0
 
-        async with undo_journal.recording(db, height):
-            # 1. Exchange section.
-            try:
-                section = (
-                    await db.get_block_exchange_txs(block_hash)
-                    if block_hash in with_exchange
-                    else None
-                )
-            except Exception:
-                section = None
-            if section:
-                txs = decode_exchange_txs(section)
-                await preload_sender_balances(db, txs, mgr, height)
-                await preload_token_balances(db, txs, mgr)
-                ok, err, _root = process_exchange_transactions(
-                    height, float(raw_ts), txs, mgr, revertible=True
-                )
-                if ok:
-                    mgr.commit_block()
-                    await flush_exchange_balance_deltas(
-                        db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL
+        opened = block_undo.open_block(mgr, height)
+        try:
+            async with undo_journal.recording(db, height):
+                # 1. Exchange section.
+                try:
+                    section = (
+                        await db.get_block_exchange_txs(block_hash)
+                        if block_hash in with_exchange
+                        else None
                     )
-                    await flush_token_balance_deltas(db, mgr)
-                    counts["exchange"] += 1
-                else:
-                    logger.error("rebuild: exchange section at %d failed: %s", height, err)
-            elif height >= 1:
-                # No exchange transactions: the exchange still ticks, as on every forward path,
-                # judged by the committee forward judged it by.
-                await ensure_oracle_committee(db, mgr, height)
-                await tick_and_flush(db, height, float(raw_ts), mgr)
+                except Exception:
+                    section = None
+                if section:
+                    txs = decode_exchange_txs(section)
+                    await preload_sender_balances(db, txs, mgr, height)
+                    await preload_token_balances(db, txs, mgr)
+                    ok, err, _root = process_exchange_transactions(
+                        height, float(raw_ts), txs, mgr, revertible=True
+                    )
+                    if ok:
+                        mgr.commit_block()
+                        await flush_exchange_balance_deltas(
+                            db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL
+                        )
+                        await flush_token_balance_deltas(db, mgr)
+                        counts["exchange"] += 1
+                    else:
+                        logger.error("rebuild: exchange section at %d failed: %s", height, err)
+                elif height >= 1:
+                    # No exchange transactions: the exchange still ticks, as on every forward path,
+                    # judged by the committee forward judged it by.
+                    await ensure_oracle_committee(db, mgr, height)
+                    await tick_and_flush(db, height, float(raw_ts), mgr)
 
-            # 2. EVM section — sees the exchange effects of this and every earlier block.
-            try:
-                evm_section = (
-                    await db.get_block_evm_txs(block_hash) if block_hash in with_evm else None
-                )
-            except Exception:
-                evm_section = None
-            if evm_section:
-                root, _included = await produce_block_evm_section(
-                    height, block_hash, int(raw_ts), evm_section, db, sm, execute_tx
-                )
-                if root is not None:
-                    counts["evm"] += 1
-                else:
-                    logger.error("rebuild: EVM section at %d could not execute", height)
+                # 2. EVM section — sees the exchange effects of this and every earlier block.
+                try:
+                    evm_section = (
+                        await db.get_block_evm_txs(block_hash) if block_hash in with_evm else None
+                    )
+                except Exception:
+                    evm_section = None
+                if evm_section and post_state.active(height):
+                    # (deferred execution: each transaction runs or is skipped, as forward ran it)
+                    ok_evm, why, _ran = await apply_block_evm_section_total(
+                        height, block_hash, int(raw_ts), evm_section, db, sm, execute_tx
+                    )
+                    if ok_evm:
+                        counts["evm"] += 1
+                    else:
+                        logger.error("rebuild: EVM section at %d refused: %s", height, why)
+                elif evm_section:
+                    root, _included = await produce_block_evm_section(
+                        height, block_hash, int(raw_ts), evm_section, db, sm, execute_tx
+                    )
+                    if root is not None:
+                        counts["evm"] += 1
+                    else:
+                        logger.error("rebuild: EVM section at %d could not execute", height)
 
-            # 3. Withdrawals this block paid.
-            for address, amount in paid_by_block.get(height, ()):
-                await db.apply_account_balance_delta(address, amount)
-                counts["withdrawals"] += 1
+                # 3. Withdrawals this block paid.
+                for address, amount in paid_by_block.get(height, ()):
+                    await db.apply_account_balance_delta(address, amount)
+                    counts["withdrawals"] += 1
+        finally:
+            block_undo.close_block(opened, True)
     return counts
 
 

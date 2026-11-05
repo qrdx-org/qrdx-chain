@@ -192,6 +192,15 @@ async def submit_block(
             if not ok_votes:
                 return {"ok": False, "error": f"Chain rules: {votes_err}"}
 
+            # Deferred execution (qrdx/post_state.py): the signed root is the state the parent left,
+            # checked before the block runs.
+            ok_pre, pre_err = await _import._check_deferred_root(block_content, int(block_no))
+            if not ok_pre:
+                await _node.security.reputation_manager.record_violation(
+                    verified_sender, "invalid_signed_root", severity=8
+                )
+                return {"ok": False, "error": f"Refused before running: {pre_err}"}
+
             # Everything the block changes from here is recorded in the undo journal under its
             # height (a checkpoint first if it opens an epoch) — what makes a later reorg cheap.
             from qrdx.derived_state_rebuild import before_block
@@ -255,7 +264,7 @@ async def submit_block(
 
                 # E-D4: verify the recomputed unified state root against the signed root.
                 ok_root, root_err = await _import._verify_unified_state_root(
-                    block_content, height=block_no
+                    block_content, height=block_no, block_hash=block_hash
                 )
                 if not ok_root:
                     await _node.security.reputation_manager.record_violation(

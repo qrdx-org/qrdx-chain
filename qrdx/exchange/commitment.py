@@ -40,9 +40,10 @@ import copy
 import hashlib
 import json
 import os
-from typing import Any, Callable, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..crypto import lthash, smt
+from ..native import lt_mix_entries_function
 from .undo import (
     active as _undo_active,
     restore_into as _undo_restore_into,
@@ -105,6 +106,25 @@ def _apply(acc: bytes, removed: "lthash.Accumulator", added: "lthash.Accumulator
         int.from_bytes(removed.digest(), "little") if removed.count else None,
         int.from_bytes(added.digest(), "little") if added.count else None,
     )
+
+
+def _apply_digests(acc: bytes, tag: str, removed: List[bytes], added: List[bytes]) -> bytes:
+    """``_apply`` of the vectors of entries' digests: natively where the module is (the vectors
+    were most of a commitment's time), else in Python. ``full_commitment`` stays Python's, so
+    ``verify`` checks one against the other."""
+    if not removed and not added:
+        return acc
+    mix = lt_mix_entries_function()
+    if mix is not None:
+        out = mix(acc, b"qrdx/exchange/" + tag.encode(), removed, added)
+        if out is not None:
+            return bytes(out)
+    r, a = lthash.Accumulator(), lthash.Accumulator()
+    for d in removed:
+        r.add(_vector(tag, d))
+    for d in added:
+        a.add(_vector(tag, d))
+    return _apply(acc, r, a)
 
 
 class CommitmentMismatch(AssertionError):
@@ -337,7 +357,8 @@ class CommittedDict(dict):
         elif not trees:
             self._tree, self._tree_on = None, False
         if self._dirty:
-            removed, added = lthash.Accumulator(), lthash.Accumulator()
+            removed: List[bytes] = []
+            added: List[bytes] = []
             tree_changes = []
             for key in self._dirty:
                 old = self._digests.pop(key, None)
@@ -348,12 +369,12 @@ class CommittedDict(dict):
                     self._digests[key] = new
                 if old != new:
                     if old is not None:
-                        removed.add(_vector(self._tag, old))
+                        removed.append(old)
                     if new is not None:
-                        added.add(_vector(self._tag, new))
+                        added.append(new)
                     if trees:
                         tree_changes.append((tree_key(key), raw))
-            self._acc = _apply(self._acc, removed, added)
+            self._acc = _apply_digests(self._acc, self._tag, removed, added)
             self._dirty.clear()
             if tree_changes and not rebuilt:
                 self._tree = smt.m_update(self._tree, sorted(tree_changes))
@@ -382,7 +403,7 @@ class CommittedDict(dict):
                 f"{'y' if len(stale) == 1 else 'ies'} (e.g. {stale[:3]!r})"
             )
         if trees_on():
-            full = smt.m_build(
+            full = smt._py_build(
                 sorted((tree_key(k), self._entry_raw(k, v)) for k, v in dict.items(self))
             )
             if smt.m_root(self.__dict__.get("_tree")) != smt.m_root(full):
@@ -534,22 +555,23 @@ class CommittedSet(set):
         elif not trees:
             self._tree, self._tree_on = None, False
         if self._dirty:
-            removed, added = lthash.Accumulator(), lthash.Accumulator()
+            removed: List[bytes] = []
+            added: List[bytes] = []
             tree_changes = []
             for item in self._dirty:
                 had, has = item in self._members, set.__contains__(self, item)
                 if had == has:
                     continue
-                vec = _vector(self._tag, self._entry_digest(item))
+                digest = self._entry_digest(item)
                 if has:
-                    added.add(vec)
+                    added.append(digest)
                     self._members.add(item)
                 else:
-                    removed.add(vec)
+                    removed.append(digest)
                     self._members.discard(item)
                 if trees:
                     tree_changes.append((tree_key(item), canonical_bytes(item) if has else None))
-            self._acc = _apply(self._acc, removed, added)
+            self._acc = _apply_digests(self._acc, self._tag, removed, added)
             self._dirty.clear()
             if tree_changes and not rebuilt:
                 self._tree = smt.m_update(self._tree, sorted(tree_changes))
@@ -570,7 +592,7 @@ class CommittedSet(set):
         if self.commitment() != self.full_commitment():
             raise CommitmentMismatch(f"{self._tag}: incremental set commitment is stale")
         if trees_on():
-            full = smt.m_build(
+            full = smt._py_build(
                 sorted((tree_key(i), canonical_bytes(i)) for i in set.__iter__(self))
             )
             if smt.m_root(self.__dict__.get("_tree")) != smt.m_root(full):

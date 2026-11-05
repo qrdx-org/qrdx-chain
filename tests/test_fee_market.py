@@ -185,3 +185,34 @@ async def test_the_basefee_opcode_reads_the_executing_blocks_base_fee(db, monkey
     finally:
         F.CURRENT_EVM_BASE_FEE.reset(token)
     assert int.from_bytes(r.output, "big") == want
+
+
+async def test_a_stored_sections_gas_is_noted_not_parsed_back(db, monkeypatch):
+    """A block's children read the exchange gas its section declared. It used to be read back
+    and parsed (a megabyte at full load) for every block; it is noted as the section is stored,
+    and the fee is the one the section read back gives."""
+    floors = F.floors()
+    await _store(db, 0, floors)
+    await _store(db, 1, floors)
+    section = [{"op_type": 22, "gas_limit": 3_000_000, "sender": "a"} for _ in range(20)]
+    section.append({"op_type": 9, "gas_limit": 7, "sender": "v"})       # (a vote: not counted)
+    from qrdx.exchange.transactions import ExchangeOpType
+
+    section[-1]["op_type"] = int(ExchangeOpType.ORACLE_VOTE)
+    await db.add_block_exchange_txs(f"{1:064x}", section)
+    noted = await F.base_fees_at(db, 2)
+
+    reads = []
+    real = db.get_block_exchange_txs
+
+    async def counting(block_hash):
+        reads.append(block_hash)
+        return await real(block_hash)
+
+    monkeypatch.setattr(db, "get_block_exchange_txs", counting)
+    F._FEE_INPUTS.clear()
+    assert await F.base_fees_at(db, 2) == noted and reads == []
+    F._FEE_INPUTS.clear()
+    F._EXCHANGE_GAS.clear()                                            # (a restart: not noted)
+    assert await F.base_fees_at(db, 2) == noted and len(reads) == 1
+    assert noted[1] > floors[1]                                        # (the section counted)

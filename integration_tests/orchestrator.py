@@ -171,10 +171,15 @@ class TestnetOrchestrator:
         num_nodes: int = NUM_NODES,
         num_validators: int = NUM_VALIDATORS,
         force_regenerate: bool = False,
+        hosts=None,
     ):
         self.num_nodes = num_nodes
         self.num_validators = num_validators
         self.force_regenerate = force_regenerate
+        # Where nodes run: None, processes on this machine; or a placement such as
+        # integration_tests.multihost.ContainerHosts (``configure(spec, env)`` → its env,
+        # ``process(spec, env, root)`` → a NodeProcess-like object).
+        self.hosts = hosts
         self.node_specs = build_node_specs(num_nodes, num_validators)
         self.node_processes: List[NodeProcess] = []
         self.wallets: Dict[str, dict] = {}
@@ -305,6 +310,9 @@ class TestnetOrchestrator:
             "QRDX_ENABLE_STREAMING": "true",
         }
 
+        if self.hosts is not None:
+            env = self.hosts.configure(spec, env)
+
         if spec.is_validator and spec.validator_index is not None:
             # Find the validator wallet
             validator_label = f"Validator {spec.validator_index}"
@@ -346,7 +354,8 @@ class TestnetOrchestrator:
                         k, v = line.split("=", 1)
                         env[k] = v
 
-            node_proc = NodeProcess(spec, env, str(PROJECT_ROOT))
+            make = self.hosts.process if self.hosts is not None else NodeProcess
+            node_proc = make(spec, env, str(PROJECT_ROOT))
             await node_proc.start()
             self.node_processes.append(node_proc)
 

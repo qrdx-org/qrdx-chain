@@ -85,10 +85,15 @@ def test_the_recheck_runs_before_any_section_execution():
 
 
 def test_the_recheck_skips_rather_than_proposing_stale():
-    """It must `continue` to the next slot, not fall through and propose anyway."""
+    """It must `continue`, never fall through and propose anyway: back to the top of the loop
+    to build on the new tip (once a slot, while half of it is left; every check runs again
+    there), or on to the next slot."""
     body = _loop_source()
     idx = body.index("get_next_block_id()) != next_block_id")
-    following = body[idx:idx + 400]
-    assert re.search(r"\bcontinue\b", following), (
+    branch = body[idx:body.index("# The same height can come back", idx)]
+    retry, skip = (m.start() for m in re.finditer(r"\bcontinue\b", branch))
+    assert "retried_slot, last_slot = current_slot, current_slot - 1" in branch[:retry]
+    assert "Skipping slot" in branch[retry:skip], (
         "the re-check does not skip the slot — it must not fall through and propose "
         "against a height it just learned was filled")
+    assert not branch[skip:].strip("\n ").replace("continue", "").strip()

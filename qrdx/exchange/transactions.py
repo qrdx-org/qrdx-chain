@@ -241,9 +241,41 @@ class ExchangeTransaction:
     # -- Hashing ------------------------------------------------------------
 
     def tx_hash(self) -> str:
-        """Deterministic transaction hash (consensus-critical)."""
+        """Deterministic transaction hash (consensus-critical). Remembered while every field the
+        canonical bytes are made of is as it was (``_fingerprint``): a block's transaction is
+        hashed by admission, selection, the journal and storage alike."""
+        key = self._fingerprint()
+        memo = self.__dict__.get("_hash_memo")
+        if key is not None and memo is not None and memo[0] == key:
+            return memo[1]  # type: ignore[no-any-return]
         raw = self._canonical_bytes()
-        return hashlib.blake2b(raw, digest_size=32).hexdigest()
+        h = hashlib.blake2b(raw, digest_size=32).hexdigest()
+        if key is not None:
+            self.__dict__["_hash_memo"] = (key, h)
+        return h
+
+    def _fingerprint(self) -> Optional[Tuple[Any, ...]]:
+        """Every input of ``_canonical_bytes``, as a comparable value — None when the params are
+        not flat (strings, numbers, booleans, None), which are hashed afresh every time."""
+        p = self.params
+        if not isinstance(p, dict):
+            return None
+        items = []
+        for k, v in p.items():
+            if type(v) not in (str, int, float, bool, type(None)) or type(k) is not str:
+                return None
+            items.append((k, type(v), v))
+        return (
+            self.chain_id,
+            self.op_type,
+            self.sender,
+            self.nonce,
+            tuple(items),
+            self.gas_limit,
+            type(self.gas_price),
+            self.gas_price,
+            self.signer,
+        )
 
     def _canonical_bytes(self) -> bytes:
         """Canonical byte representation for hashing and signing."""
@@ -364,12 +396,22 @@ class ExchangeTransaction:
             "gas_limit": self.gas_limit,
             "gas_price": str(self.gas_price),
             "timestamp": self.timestamp,
-            "signature": self.signature.hex() if self.signature else "",
-            "public_key": self.public_key.hex() if self.public_key else "",
+            "signature": self._hex()[0],
+            "public_key": self._hex()[1],
             "chain_id": self.chain_id,
             **({"signer": self.signer} if self.signer else {}),
             "tx_hash": self.tx_hash(),
         }
+
+    def _hex(self) -> Tuple[str, str]:
+        """The signature's and public key's hex, remembered while both are the same objects (5
+        KB, hexed for the block body, its store and gossip alike)."""
+        sig, key = self.signature, self.public_key
+        memo = self.__dict__.get("_hex_memo")
+        if memo is None or memo[0] is not sig or memo[1] is not key:
+            memo = (sig, key, sig.hex() if sig else "", key.hex() if key else "")
+            self.__dict__["_hex_memo"] = memo
+        return memo[2], memo[3]
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> ExchangeTransaction:

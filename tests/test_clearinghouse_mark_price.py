@@ -165,8 +165,10 @@ def test_every_path_ticks_blocks_without_exchange_transactions():
     # Every path ticks through tick_and_flush: the tick, then its ledger moves flushed (a fired
     # spot trigger or a TWAP slice settles real tokens in the tick).
     assert "tick_and_flush(" in inspect.getsource(p2p)
-    assert "tick_and_flush(self.db, next_height" in inspect.getsource(
-        NI.ValidatorNode._block_production_loop)
+    loop = "".join(inspect.getsource(NI.ValidatorNode._block_production_loop).split())
+    assert "tick_and_flush(self.db,next_height" in loop
+    # (deferred execution: the proposer runs its signed block, and ticks it, here)
+    assert "tick_and_flush(self.db, height" in inspect.getsource(NI.ValidatorNode._run_signed_block)
     assert "tick_and_flush(db, height" in inspect.getsource(derived_state_rebuild._replay)
     assert "tick_and_flush(" in inspect.getsource(BP.rebuild_exchange_state_from_chain)
     flush_src = inspect.getsource(BP.tick_and_flush)

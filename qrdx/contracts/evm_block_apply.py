@@ -143,6 +143,80 @@ async def produce_block_evm_section(
     return root, list(raw_txs)
 
 
+async def apply_block_evm_section_total(
+    block_height: int,
+    block_hash: str,
+    block_timestamp: int,
+    raw_txs: Optional[List[str]],
+    db: Any,
+    state_manager: ContractStateManager,
+    execute_tx: ExecuteTx,
+) -> Tuple[bool, str, List[str]]:
+    """A block's EVM section under deferred execution (chain-spec feature
+    ``deferred_execution``, qrdx/post_state.py): the block was signed before it ran, so running
+    it must not be able to make it invalid. Every path runs it this way: the proposer after
+    sending its block, importers, sync and the rebuild.
+
+    * What needs no state is still a rule of the block: the section's gas, and every
+      transaction's signature and (for a delegated spend) authority. A proposer checks those
+      before signing, so a block failing them is its proposer's own.
+    * A transaction that cannot run (a nonce or a balance it no longer has: the executor answers
+      None) is skipped: the state and the section's pending records go back to what they were
+      before it. A transaction that runs and reverts is included, as always.
+
+    There is no declared account root to compare: the next block's signed root binds the state
+    this one leaves. Returns ``(ok, error, the transactions that ran)``; ``ok`` is False only for
+    a rule above, before anything changed."""
+    import copy
+
+    if not raw_txs:
+        return True, "", []
+    gas_error = section_gas_error(raw_txs, block_height)
+    if gas_error:
+        return False, f"block {block_height}: {gas_error}", []
+    for i, raw in enumerate(raw_txs):
+        try:
+            parse_eth_raw_tx(raw)
+        except Exception as e:  # ValueError on malformed/forged/typed tx
+            return False, f"evm tx {i} in block {block_height} failed verification: {e}", []
+        ok, why = await verify_delegated_spend(db, raw, block_height)
+        if not ok:
+            return False, f"evm tx {i} in block {block_height}: {why}", []
+
+    state_manager.reset_cache()  # (fresh reads: the exchange wrote to the database first)
+    section = EvmSection()
+    token = CURRENT_SECTION.set(section)
+    fee_token = CURRENT_EVM_BASE_FEE.set((await base_fees_at(db, block_height))[0])  # BASEFEE
+    ran: List[str] = []
+    try:
+        for raw in raw_txs:
+            snap = await state_manager.snapshot()
+            pending = copy.deepcopy(section.__dict__)
+            try:
+                res = await execute_tx(raw, block_height, block_hash, block_timestamp)
+            except Exception as e:  # (cannot run here: as the executor's None)
+                logger.warning("evm tx in block %s raised, skipped: %s", block_height, e)
+                res = None
+            if res is None or res.get("tx_hash") is None:
+                await state_manager.revert(snap)
+                section.__dict__.clear()
+                section.__dict__.update(pending)
+                continue
+            ran.append(raw)
+    finally:
+        CURRENT_SECTION.reset(token)
+        CURRENT_EVM_BASE_FEE.reset(fee_token)
+
+    await state_manager.commit(block_height, flush_only=True)
+    await db.connection.commit()
+    state_manager._dirty_accounts.clear()
+    state_manager._dirty_storage.clear()
+    state_manager._destroyed.clear()
+    state_manager._snapshots.clear()
+    await section.commit(db)
+    return True, "", ran
+
+
 async def rebuild_account_state_from_chain(
     db: Any,
     state_manager: ContractStateManager,

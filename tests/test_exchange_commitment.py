@@ -125,8 +125,13 @@ def test_a_quiet_block_re_digests_no_account(monkeypatch):
     ch.tick(D(1001), funding_interval=10**9)
     ch.commitment()
     vectors = []
-    real = C._vector
-    monkeypatch.setattr(C, "_vector", lambda tag, dg: vectors.append(tag) or real(tag, dg))
+    real = C._apply_digests
+
+    def counting(acc, tag, removed, added):
+        vectors.extend([tag] * (len(removed) + len(added)))
+        return real(acc, tag, removed, added)
+
+    monkeypatch.setattr(C, "_apply_digests", counting)
     ch.tick(D(1002), funding_interval=10**9)  # marks, EMAs, the liquidation scan of all 500
     ch.commitment()
     assert [t for t in vectors if t == "ch.accounts"] == []

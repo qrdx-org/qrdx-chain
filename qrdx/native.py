@@ -17,7 +17,7 @@ it off. What the module does:
 import hashlib
 import json
 import os
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 
 def _load() -> Any:
@@ -71,3 +71,35 @@ def mldsa65_verify_batch(items: Sequence[Tuple[bytes, bytes, bytes]]) -> Optiona
     if _native is None:
         return None
     return list(_native.mldsa65_verify_batch(list(items)))
+
+
+def lt_apply_function() -> Optional[Callable[..., Any]]:
+    """The native ``qrdx_lt_apply`` trigger function (qrdx/state_commitment.py), or None
+    without the module. It answers as ``state_commitment._udf_apply`` does, handing it what it
+    does not reproduce exactly."""
+    if _native is None or not hasattr(_native, "lt_apply"):
+        return None
+    return _native.lt_apply  # type: ignore[no-any-return]
+
+
+def tree_module() -> Optional[Any]:
+    """The module, if it has the exchange's in-memory proof trees (qrdx/crypto/smt.py ``m_*``)."""
+    if _native is None or not hasattr(_native, "mt_update"):
+        return None
+    return _native
+
+
+def lt_mix_entries_function() -> Optional[Callable[..., Any]]:
+    """The native ``_apply`` of entries' digests (qrdx/exchange/commitment.py), or None."""
+    if _native is None or not hasattr(_native, "lt_mix_entries"):
+        return None
+    return _native.lt_mix_entries  # type: ignore[no-any-return]
+
+
+def smt_update_function() -> Optional[Callable[..., Any]]:
+    """The native state-proof tree update (qrdx/crypto/smt.py ``Tree.update``), or None without
+    the module: ``(encoded root, changes, version, cache) → ("ok", root, writes, stale)`` or
+    ``("missing", [nkey, ...])``."""
+    if _native is None or not hasattr(_native, "smt_update"):
+        return None
+    return _native.smt_update  # type: ignore[no-any-return]

@@ -82,6 +82,12 @@ async def propagate(
             if not await _node.security.reputation_manager.is_banned(peer["node_id"]):
                 non_banned_peers.append(peer)
 
+        # Blocks and votes go over the native transport to the peers connected on it
+        # (qrdx/node/netd.py); HTTP carries them to the rest.
+        reached = _over_transport(path, data, ignore_node_id)
+        if reached:
+            non_banned_peers = [p for p in non_banned_peers if p["node_id"] not in reached]
+
         # Limit number of peers
         max_peers_to_propagate = min(len(non_banned_peers), 20)
         if len(non_banned_peers) > max_peers_to_propagate:
@@ -178,6 +184,33 @@ async def propagate(
             tasks.append(communication_task(peer, path, data))
 
         await gather(*tasks)
+
+
+def _over_transport(path: str, data: dict, ignore_node_id: Optional[str]) -> Set[str]:
+    """Send a block or a vote over the transport: the peers it went to."""
+    from qrdx.node import netd
+
+    if netd.SERVICE is None:
+        return set()
+    try:
+        if path == "submit_block":
+            from qrdx.fastjson import dumps
+            from qrdx.node import block_relay
+
+            form = block_relay.compact_form(data)
+            if form is not None:
+                netd.hold_section(
+                    form["exchange_tx_hashes"], data.get("exchange_transactions") or []
+                )
+            raw = dumps(form if form is not None else block_relay.wire_form(data)).encode()
+            return set(netd.send_block(raw, ignore_node_id))
+        if path == "push_attestation":
+            from qrdx.fastjson import dumps
+
+            return set(netd.send_votes([dumps(data["attestation"]).encode()], ignore_node_id))
+    except Exception as e:
+        logger.debug(f"transport relay of {path} failed: {e}")
+    return set()
 
 
 def _cannot_rebuild(response: dict) -> bool:

@@ -151,6 +151,45 @@ async def test_releasing_the_block_lock_raises_the_signal():
     assert await ChangeSignal.wait(listener, 0.01) is False
 
 
+@pytest.mark.asyncio
+async def test_work_that_yields_waits_while_blocks_are_processed():
+    """``until_free``: until no one holds the block lock or waits for it (an import queued behind
+    the proposer counts), and never longer than asked."""
+    lock = SignallingLock(ChangeSignal())
+    await asyncio.wait_for(lock.until_free(5), 0.1)               # (free: no wait)
+    order = []
+
+    async def block(name, hold):
+        async with lock:
+            order.append(name)
+            await asyncio.sleep(hold)
+
+    async def admission():
+        await lock.until_free(5)
+        order.append("admission")
+
+    first = asyncio.ensure_future(block("proposer", 0.05))
+    await asyncio.sleep(0)
+    second = asyncio.ensure_future(block("import", 0.05))         # (waiting for the lock)
+    waiting = asyncio.ensure_future(admission())
+    await asyncio.gather(first, second, waiting)
+    assert order == ["proposer", "import", "admission"]
+
+    held = asyncio.ensure_future(block("long", 1.0))
+    await asyncio.sleep(0)
+    started = asyncio.get_running_loop().time()
+    await lock.until_free(0.05)                                    # (delayed, never starved)
+    assert asyncio.get_running_loop().time() - started < 0.5 and lock.locked()
+    await held
+
+    cancelled = asyncio.ensure_future(block("cancelled", 0))      # (cancelled while waiting)
+    async with lock:
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        await asyncio.sleep(0)
+    await asyncio.wait_for(lock.until_free(5), 0.1)
+
+
 async def _drain(q):
     out = []
     while not q.empty():
@@ -252,3 +291,28 @@ async def test_exchange_channels_wake_on_the_signal():
         await asyncio.gather(task, return_exceptions=True)
     finally:
         stream.PerpStreamPublisher = original
+
+
+async def test_the_feed_reads_hashes_again_only_when_the_chain_may_have_changed():
+    """Woken many times a block, the feed re-read the recent hashes each time (to see a
+    replaced block). With ``get_version`` it reads them only when the version or tip moved."""
+    hub, m = EventHub(), Metrics()
+    q = hub.subscribe()
+    reads, version = [], [7]
+
+    async def hashes(lo, hi):
+        reads.append((lo, hi))
+        return {h: f"h{h}" for h in range(lo, hi + 1)}
+
+    await chain_event_poller(hub, m, get_tip=lambda: 3, get_hashes=hashes,
+                             get_version=lambda: version[0], interval=0, _max_iterations=5)
+    assert len(reads) == 1
+    events = [q.get_nowait()["type"] for _ in range(q.qsize())]
+    assert events.count("block") == 1                  # (a feed starts at the tip)
+    version[0] = 8                                     # (a write to blocks, or a rollback)
+    await chain_event_poller(hub, m, get_tip=lambda: 3, get_hashes=hashes,
+                             get_version=lambda: version[0], interval=0, _max_iterations=3)
+    assert len(reads) == 2                             # (a new feed: its first read, then none)
+    await chain_event_poller(hub, m, get_tip=lambda: 3, get_hashes=hashes,
+                             get_version=lambda: None, interval=0, _max_iterations=3)
+    assert len(reads) == 5                             # (not counted: every wake reads)

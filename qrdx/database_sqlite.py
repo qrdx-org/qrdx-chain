@@ -7,6 +7,7 @@ For production, use the full PostgreSQL database.py implementation.
 
 import json
 import os
+from collections import OrderedDict
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Optional, Tuple
@@ -68,6 +69,12 @@ class DatabaseSQLite:
         # Open connection
         self.connection = await aiosqlite.connect(db_path)
         self.connection.row_factory = aiosqlite.Row
+        # Every statement, fetch and commit is a round trip to aiosqlite's thread, and a
+        # block's fixed cost is mostly those round trips: counted for its phase log line
+        # (observability.Phases).
+        from .node.observability import count_db_calls
+
+        count_db_calls(self.connection)
 
         # Enable WAL mode for better concurrency
         await self.connection.execute("PRAGMA journal_mode=WAL")
@@ -742,10 +749,24 @@ class DatabaseSQLite:
         return _block_row(row)
 
     async def get_block_height(self):
-        """Get current block height"""
-        cursor = await self.connection.execute("SELECT MAX(block_height) as height FROM blocks")
-        row = await cursor.fetchone()
-        return row["height"] if row and row["height"] is not None else -1
+        """Get current block height. Remembered while nothing is written to ``blocks`` and
+        nothing rolled back (qrdx/chain_index.py counts both): the tip is asked for many times
+        a slot (each peer request's identity header, the producer, the status)."""
+        from .chain_index import _verifying, known_tip, saw_tip
+
+        tip = known_tip(self)
+        if tip is not None and not _verifying():
+            return tip
+        count = saw_tip(self, None)
+        rows = await self.connection.execute_fetchall(
+            "SELECT MAX(block_height) as height FROM blocks"
+        )
+        row = rows[0] if rows else None
+        height = row["height"] if row and row["height"] is not None else -1
+        if tip is not None and tip != height:
+            raise AssertionError(f"remembered tip {tip}, but the chain's is {height}")
+        saw_tip(self, (count, height))
+        return height
 
     async def get_next_block_id(self):
         """Get next block ID"""
@@ -1804,28 +1825,55 @@ class DatabaseSQLite:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
-    async def add_block_exchange_txs(self, block_hash: str, items: list):
+    async def add_block_exchange_txs(self, block_hash: str, items: list, objects=None):
         """
         Persist a block's exchange-transaction section (Phase D2.2b).
 
         ``items`` is the encoded list (each an ``ExchangeTransaction.to_dict()``)
         in the proposer's canonical order. Idempotent per (block_hash, tx_index).
         Stored as protocol-level state (Whitepaper §3.6) for deterministic replay
-        during block import (D3).
+        during block import (D3). ``objects``: the same operations decoded, if the
+        caller holds them (kept for ``recent_exchange_section``).
         """
         if not items:
             return
-        import json
+        self._remember_section(block_hash, items, objects)
+        # (read back only by get_block_exchange_txs, as JSON: orjson writes it several times
+        # faster, and a block of 1,000 operations is ~11 MB of signatures and keys)
+        from .fastjson import dumps
+        from .fee_market import note_exchange_section
+
+        # (its children's base fee reads the gas it declared: noted now, not parsed back)
+        note_exchange_section(self, block_hash, items)
 
         await self.connection.executemany(
             "INSERT OR IGNORE INTO block_exchange_transactions "
             "(block_hash, tx_index, tx_hash, tx_data) VALUES (?, ?, ?, ?)",
             [
-                (block_hash, idx, item.get("tx_hash", ""), json.dumps(item, sort_keys=True))
+                (block_hash, idx, item.get("tx_hash", ""), dumps(item))
                 for idx, item in enumerate(items)
             ],
         )
         await self.connection.commit()
+
+    # The sections of the last blocks stored, and their operations decoded where the caller held
+    # them: the transaction index (qrdx/tx_index.py) read each back and parsed it — a megabyte a
+    # block at load — holding the block-processing lock.
+    RECENT_SECTIONS = 16
+
+    def _remember_section(self, block_hash: str, items: list, objects) -> None:
+        recent = self.__dict__.setdefault("_recent_sections", OrderedDict())
+        if objects is not None and len(objects) != len(items):
+            objects = None
+        recent[block_hash] = (items, None if objects is None else list(objects))
+        recent.move_to_end(block_hash)
+        while len(recent) > self.RECENT_SECTIONS:
+            recent.popitem(last=False)
+
+    def recent_exchange_section(self, block_hash: str):
+        """(the section as stored, its operations decoded or None) of one of the last blocks
+        stored by this process; None for any other. For reading only."""
+        return self.__dict__.get("_recent_sections", {}).get(block_hash)
 
     async def get_block_exchange_txs(self, block_hash: str) -> list:
         """Return a block's exchange-transaction section in canonical order."""

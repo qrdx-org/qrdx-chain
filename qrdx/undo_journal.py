@@ -63,6 +63,9 @@ class _ConnState:
         self.suspended = 0
         self.columns: Dict[str, List[str]] = {}
         self.rowid_alias: Dict[str, bool] = {}  # an INTEGER PRIMARY KEY column is the rowid
+        # The schema's version when the tables still missing were last looked for: they are
+        # looked for again only once the schema has changed (a table created).
+        self.schema_seen: Optional[int] = None
 
 
 def _state(conn: Any) -> _ConnState:
@@ -86,19 +89,37 @@ async def install(conn: Any) -> None:
         return UNATTRIBUTED if st.height is None else st.height
 
     await conn.create_function("qrdx_undo_h", 0, height)
+    from . import chain_index
+
+    chain_index.on_rollback(_forget_tables)
     await conn.create_function("qrdx_undo_pack", -1, lambda *cols: marshal.dumps(cols))
     await ensure(conn)
 
 
+def _forget_tables(db: Any) -> None:
+    """After a rollback: it may have taken a table created in its transaction, and with it the
+    table's triggers, so every table is looked for again."""
+    st = getattr(getattr(db, "connection", None), "qrdx_undo", None)
+    if st is not None:
+        st.columns.clear()
+        st.schema_seen = None
+
+
 async def ensure(conn: Any) -> None:
     """Install the triggers for every journaled table that now exists (some are created later,
-    when the EVM initialises)."""
+    when the EVM initialises). While some are missing, they are looked for again only when the
+    schema has changed since (one query a block, not two a missing table)."""
     st = _state(conn)
+    if len(st.columns) == len(JOURNALED):
+        return
+    rows = await conn.execute_fetchall("PRAGMA schema_version")
+    version = int(rows[0][0]) if rows else None
+    if version is not None and version == st.schema_seen:
+        return
     for table in JOURNALED:
         if table in st.columns:
             continue
-        cur = await conn.execute(f"PRAGMA table_info({table})")
-        info = await cur.fetchall()
+        info = await conn.execute_fetchall(f"PRAGMA table_info({table})")
         cols = [r[1] for r in info]
         if not cols:
             continue
@@ -118,6 +139,7 @@ async def ensure(conn: Any) -> None:
         ):
             await conn.execute(sql)
         st.columns[table] = cols
+    st.schema_seen = version
 
 
 @contextlib.asynccontextmanager

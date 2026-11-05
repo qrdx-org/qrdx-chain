@@ -41,6 +41,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .crypto import smt
 from .logger import get_logger
+from .native import smt_update_function
 
 logger = get_logger(__name__)
 
@@ -305,6 +306,38 @@ def _loader(conn: Any):
     return load, cache
 
 
+async def _native_update(
+    update: Any,
+    conn: Any,
+    cache: Any,
+    root_ref: Optional[smt.Ref],
+    changes: List[smt.Change],
+    version: int,
+) -> Tuple[Optional[smt.Ref], List[Tuple[str, bytes]], List[str]]:
+    """``smt.Tree(load, version).update(root_ref, changes)``, natively (qrdx/native.py): the same
+    writes, stale nodes and root. The nodes it needs that are not cached are named in one pass,
+    loaded in one query, and the update runs again; at most a pass a level of the tree."""
+    encoded = smt.encode_ref(root_ref)
+    for _ in range(300):
+        out = update(encoded, changes, version, cache)
+        if out[0] == "ok":
+            return smt.Ref.decode(out[1])[0], list(out[2]), list(out[3])
+        missing = list(out[1])
+        found = 0
+        for i in range(0, len(missing), 500):
+            chunk = missing[i : i + 500]
+            rows = await conn.execute_fetchall(
+                f"SELECT nkey, data FROM smt_nodes WHERE nkey IN ({','.join('?' * len(chunk))})",
+                chunk,
+            )
+            for nkey, data in rows:
+                cache[str(nkey)] = bytes(data)
+                found += 1
+        if found < len(missing):
+            raise KeyError(f"state tree nodes missing (pruned?): {sorted(set(missing))[:3]}")
+    raise RuntimeError("the state tree update did not settle")
+
+
 async def _changes(conn: Any, dirty: Sequence[Tuple[str, str]]) -> List[smt.Change]:
     """The marked rows' entries as they are now: (key, payload or None)."""
     out: Dict[bytes, Optional[bytes]] = {}
@@ -350,30 +383,41 @@ async def proof_root(db: Any, height: int, exchange_root: Optional[bytes] = None
         return None
     conn = db.connection
     async with _lock(conn):
-        cur = await conn.execute("SELECT version, root FROM smt_meta WHERE id = 1")
-        meta = await cur.fetchone()
+        rows = await conn.execute_fetchall("SELECT version, root FROM smt_meta WHERE id = 1")
+        meta = rows[0] if rows else None
         if meta is None:
             await install(conn)
-            cur = await conn.execute("SELECT version, root FROM smt_meta WHERE id = 1")
-            meta = await cur.fetchone()
+            rows = await conn.execute_fetchall("SELECT version, root FROM smt_meta WHERE id = 1")
+            meta = rows[0]
         version, root_ref = int(meta[0]), smt.Ref.decode(bytes(meta[1]))[0]
-        cur = await conn.execute("SELECT DISTINCT kind, ident FROM smt_dirty ORDER BY kind, ident")
-        dirty = [(str(k), str(i)) for k, i in await cur.fetchall()]
+        dirty = [
+            (str(k), str(i))
+            for k, i in await conn.execute_fetchall(
+                "SELECT DISTINCT kind, ident FROM smt_dirty ORDER BY kind, ident"
+            )
+        ]
         if dirty:
             version = max(version, _versions.get(conn, 0)) + 1
             _versions[conn] = version
             load, cache = _loader(conn)
-            tree = smt.Tree(load, version)
-            root_ref = await tree.update(root_ref, await _changes(conn, dirty))
+            changes = await _changes(conn, dirty)
+            native_update = smt_update_function()
+            if native_update is not None:
+                root_ref, writes, stale = await _native_update(
+                    native_update, conn, cache, root_ref, changes, version
+                )
+            else:
+                tree = smt.Tree(load, version)
+                root_ref = await tree.update(root_ref, changes)
+                writes, stale = list(tree.writes.items()), tree.stale
             await conn.executemany(
-                "INSERT OR REPLACE INTO smt_nodes (nkey, data) VALUES (?, ?)",
-                list(tree.writes.items()),
+                "INSERT OR REPLACE INTO smt_nodes (nkey, data) VALUES (?, ?)", writes
             )
             await conn.executemany(
                 "INSERT INTO smt_stale (version, nkey) VALUES (?, ?)",
-                [(version, k) for k in tree.stale],
+                [(version, k) for k in stale],
             )
-            cache.update(tree.writes)
+            cache.update(writes)
             await conn.execute(
                 "UPDATE smt_meta SET version = ?, root = ? WHERE id = 1",
                 (version, smt.encode_ref(root_ref)),
@@ -392,8 +436,10 @@ async def proof_root(db: Any, height: int, exchange_root: Optional[bytes] = None
 
 async def database_root(db: Any, height: int) -> Optional[str]:
     """The database tree's root recorded for ``height`` (hex)."""
-    cur = await db.connection.execute("SELECT root FROM smt_roots WHERE height = ?", (int(height),))
-    row = await cur.fetchone()
+    rows = await db.connection.execute_fetchall(
+        "SELECT root FROM smt_roots WHERE height = ?", (int(height),)
+    )
+    row = rows[0] if rows else None
     return smt.root_hash(smt.Ref.decode(bytes(row[0]))[0]).hex() if row else None
 
 
