@@ -23,9 +23,10 @@ PYTEST_ARGS=("$@")
 # unchanged. /src is read-only, so nothing a test does can touch the checkout.
 # Passed through when set: a deep fuzz run (tests/test_fuzz_decoders.py), the EVM conformance
 # fixtures (tests/test_evm_conformance.py; a path inside the container, e.g. /tmp/repo/.eest/fixtures),
-# and the nightly integration run's attacks and soak (tests/test_testnet_integration.py).
+# the nightly integration run's attacks and soak (tests/test_testnet_integration.py), and CI so
+# tests that relax under Actions (e.g. Dilithium timing noise) see the same env inside the image.
 EXTRA_ENV=()
-for name in QRDX_FUZZ_EXAMPLES QRDX_EEST_FIXTURES QRDX_ADVERSARIAL QRDX_SOAK_SECONDS; do
+for name in CI QRDX_FUZZ_EXAMPLES QRDX_EEST_FIXTURES QRDX_ADVERSARIAL QRDX_SOAK_SECONDS; do
   [[ -n "${!name:-}" ]] && EXTRA_ENV+=(-e "$name=${!name}")
 done
 
