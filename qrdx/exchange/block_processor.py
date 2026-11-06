@@ -23,30 +23,784 @@ Validator Duties:
 from __future__ import annotations
 
 import logging
-import time
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, List, Optional, Tuple
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .state_manager import ExchangeExecResult, ExchangeStateManager
+from ..constants import UNBONDING_PERIOD_EPOCHS
+from .state_manager import ExchangeStateManager
 from .transactions import ExchangeOpType, ExchangeTransaction
 
 logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
 
-# Funding settlement happens every epoch (32 slots × 12s = 384s ≈ 6.4 min)
-FUNDING_SETTLEMENT_INTERVAL = 32  # slots
+# Phase E collateral rollout gate. False = OBSERVE (deltas computed/logged, not
+# applied; positions not rejected). True = ENFORCE (reject under-collateralized
+# opens + flush margin debits to account_state).
+#
+# ENABLED after the ledger unification: genesis now funds account_state for ALL
+# addresses (PQ and 0x alike — see genesis_init._create_genesis_outputs), so a PQ
+# trader's collateral lives in the same ledger the flush debits. The earlier
+# dual-ledger no-op (flush found no account_state row for a PQ trader → debited
+# nothing) is resolved. The flush is now wired into EVERY import path — proposer,
+# bulk-sync, AND the live-broadcast paths (p2p submitBlock / REST submit_block via
+# _apply_exchange_section_on_import) — so the margin debit lands in account_state
+# before each node computes/verifies its E-D4 unified root, keeping account_state
+# convergent across nodes (a flush on only the proposer/sync paths would diverge).
+ENFORCE_EXCHANGE_COLLATERAL = True
+
+# Phase E spot-settlement rollout gate. False = OBSERVE (a TOKEN_TRANSFER / swap
+# that overspends warns but still executes). True = ENFORCE (reject the overspend).
+# This gate is independent of whether token balances MOVE: token deploy/transfer
+# always flush to the ledger (new consensus domain — see flush_token_balance_deltas);
+# the gate only governs rejection strictness. ENABLED (inc6): token state is
+# consensus-replicated (inc4) with its root bound + enforced in the unified root
+# (inc3-final), and the spot-sufficiency checks read pre-loaded token balances
+# (preload_token_balances) on every path, so rejection is deterministic + convergent.
+ENFORCE_SPOT_SETTLEMENT = True
+
+# CLOB order-book settlement gate (observe-first, SEPARATE from the AMM
+# ENFORCE_SPOT_SETTLEMENT so it can be soaked independently). OFF: the book matches as
+# before and moves no value (behaviour-neutral). ON: PLACE_ORDER escrows + matched
+# trades settle real token moves + CANCEL refunds, with unaffordable/MARKET orders
+# rejected before they mutate the book. Stays OFF until the escrow settlement is soaked.
+ENFORCE_ORDERBOOK_SETTLEMENT = True
+
+# Pool-creation stake gate (observe-first, SEPARATE gate so it soaks independently).
+# OFF (default): CREATE_POOL is created as before and debits nothing (behaviour-neutral,
+# but pool creation is "free"). ON: the creator's declared QRDX stake is debited from
+# account_state (via the same collateral flush path) and held in pool.state.stake_amount
+# for a future remove-pool return (staking pools) / forfeit (subsidized = burn); a creator
+# who cannot afford the stake is rejected. ENABLED after the reorg-rebuild spot-enforce fix
+# (9649931) unblocked it: a 6-run soak was 6/6 with 5 runs fully 4-node-converged (the debit
+# is deterministic + reorg-safe), and the rebuild-vs-forward equivalence test proves the reorg
+# rebuild reconstructs it byte-identically. See item 7 in docs/CONSENSUS_REMAINING_WORK.md.
+ENFORCE_POOL_STAKE = True
+
+# Validator-stake gate. A STAKE_DEPOSIT's CLAIMED stake_amount becomes the validator's
+# effective_stake in the consensus `validators` table, and that figure weights BOTH
+# stake-weighted proposer selection (consensus.select_proposer) and fork-choice
+# attesting weight. The join path checked neither ownership nor the MIN_VALIDATOR_STAKE
+# floor that the local registration API and epoch activation already apply — so an
+# account holding NOTHING could register with an arbitrary stake and outweigh the whole
+# honest set. That is a consensus-capture vector, not an accounting rounding error.
+#
+# ON: a deposit must clear MIN_VALIDATOR_STAKE, be backed by the sender's real
+# account_state balance, and is DEBITED through the same collateral flush; the principal
+# is refunded at the deterministic finalized exit epoch (epoch_loop). A SLASHED
+# validator never reaches 'exited', so it forfeits the stake — which is what gives
+# slashing teeth. Genesis validators are exempt: their stake is declared by the genesis
+# file, the chain's trust root.
+#
+# ENABLED: every input is deterministic (a constant floor, and a balance pre-loaded from
+# account_state by preload_sender_balances on every path), and the debit rides the
+# already-enforced collateral flush, so it lands before each node computes its E-D4
+# unified root. The reorg rebuild sets this flag identically — see the note at
+# rebuild_exchange_state_from_chain, and tests/test_validator_stake_enforcement.py.
+ENFORCE_VALIDATOR_STAKE = True
+
+# Exchange fees (ExchangeStateManager.enforce_fees): every executed operation pays
+# gas_used × gas_price wei in QRDX, burned; operations priced under
+# constants.EXCHANGE_MIN_GAS_PRICE_WEI, or whose sender cannot cover gas_limit × gas_price, are
+# refused before they execute. Deterministic (a constant floor, balances preloaded on every
+# path); the debit rides the enforced collateral flush. Every path sets it, rebuilds included.
+ENFORCE_EXCHANGE_FEES = True
+
+
+def apply_enforcement(mgr: "ExchangeStateManager") -> None:
+    """Set every consensus enforcement gate exactly as the network runs it. Every path that
+    executes exchange sections — the proposer, each importer, both rebuilds — calls this and sets
+    no gate itself, so a gate cannot be on for one path and off for another: a rebuild that
+    accepts an operation the forward path refused diverges at equal tip, this codebase's most
+    repeated consensus bug. Reads the module's flags at call time (tests patch them)."""
+    mgr.enforce_collateral = ENFORCE_EXCHANGE_COLLATERAL
+    mgr.enforce_spot_settlement = ENFORCE_SPOT_SETTLEMENT
+    mgr.enforce_orderbook_settlement = ENFORCE_ORDERBOOK_SETTLEMENT
+    mgr.enforce_pool_stake = ENFORCE_POOL_STAKE
+    mgr.enforce_validator_stake = ENFORCE_VALIDATOR_STAKE
+    mgr.enforce_fees = ENFORCE_EXCHANGE_FEES
+
+
+INCLUSION_FEATURE = "exchange_inclusion"
+
+
+def is_inclusion_checked(height: int) -> bool:
+    """Whether a block at ``height`` may carry only exchange transactions that run
+    (``ExchangeStateManager.section_errors``)."""
+    from .. import chain_spec
+
+    return chain_spec.is_active(INCLUSION_FEATURE, int(height))
+
+
+async def _balances(db, holders: List[str]) -> Dict[str, Decimal]:
+    """Each holder's QRDX (account_state): one query a few hundred holders at a time
+    (``get_address_balances``), or one read each where the database has no batched read. A
+    holder whose read fails is left out, as before."""
+    if not holders:
+        return {}
+    if hasattr(db, "get_address_balances"):
+        try:
+            return {h: Decimal(b) for h, b in (await db.get_address_balances(holders)).items()}
+        except Exception as e:  # noqa: BLE001 — read them one at a time instead
+            logger.debug("batched balance read failed, reading one at a time: %s", e)
+    out: Dict[str, Decimal] = {}
+    for holder in holders:
+        try:
+            out[holder] = Decimal(await db.get_address_balance(holder))
+        except Exception as e:
+            logger.debug("balance of %s not read: %s", str(holder)[:20], e)
+    return out
+
+
+async def _token_balances(db, pairs: List[Tuple[str, str]]) -> Dict[Tuple[str, str], Decimal]:
+    """Each (token, holder)'s token balance, batched like ``_balances``."""
+    if not pairs:
+        return {}
+    if hasattr(db, "get_token_balances_of"):
+        try:
+            return dict(await db.get_token_balances_of(pairs))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("batched token balance read failed, reading one at a time: %s", e)
+    out: Dict[Tuple[str, str], Decimal] = {}
+    for token, holder in pairs:
+        try:
+            out[(token, holder)] = await db.get_token_balance(token, holder)
+        except Exception as e:
+            logger.debug("token balance (%s,%s) not read: %s", str(holder)[:16], token[:16], e)
+    return out
+
+
+async def includable_exchange_txs(
+    db,
+    txs: List[ExchangeTransaction],
+    height: int,
+    timestamp: float,
+    base_fee: Optional[int],
+    state_manager: Optional[ExchangeStateManager] = None,
+) -> Tuple[List[ExchangeTransaction], List[Tuple[ExchangeTransaction, str]]]:
+    """The proposer's side of ``exchange_inclusion``: of its selection, the transactions its
+    block may carry, and those it may not with why. Judged by ``section_errors`` on the
+    balances every importer will pre-load (account_state now) and the block's base fee, BEFORE
+    anything is pre-loaded or executed — so the block's pre-loads are exactly its importers'
+    (dropping a transaction after executing it would leave its sender's, and the pools' and
+    escrows' it named, in the proposer's run only). Read only.
+
+    A proposer runs this on every network, the rule active or not: a transaction refused before
+    it runs is no use in any block, and the ones kept run as they would have."""
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    if not txs:
+        return [], []
+    apply_enforcement(mgr)
+    holders = list(dict.fromkeys(h for tx in txs for h in (tx.sender, mgr.fee_payer(tx))))
+    balances = await _balances(db, holders)
+    errors = mgr.section_errors(txs, int(height), float(timestamp), balances.get, base_fee)
+    if not errors:
+        return list(txs), []
+    kept = [tx for i, tx in enumerate(txs) if i not in errors]
+    from .. import chain_spec
+    from .fair_ordering import FEATURE, ordering_error
+
+    if chain_spec.is_active(FEATURE, int(height)) and ordering_error(kept):
+        # Cannot happen: a refused transaction's lane-mates after it are refused too (its nonce
+        # is not consumed), so what is left keeps its order. Never ship an unfair block.
+        logger.warning("exchange selection: dropping refused transactions broke the order")
+        return [], []
+    return kept, [(txs[i], errors[i]) for i in sorted(errors)]
+
+
+async def ensure_oracle_committee(
+    db, mgr: ExchangeStateManager, height: Optional[int] = None
+) -> None:
+    """Set the committee that weighs block ``height``'s oracle votes, bridge attestations and
+    governance votes (default: the next block): the validator set in force at its parent, by
+    weight (validator/epoch_state.py ``committee_for_block``), less the members a slashing
+    proof below the block convicts. Every path calls this before every block — its section
+    and its tick — so every node judges each block by the same committee, whatever it
+    processed before. (The committee used to be its own record — the genesis set plus executed
+    deposits and exits — a second definition of the validator set: a validator voted prices
+    and governance while still pending, kept voting after ejection, and its delegators' stake
+    did not count. The convictions were read up to the node's TIP, so a rebuild of history
+    excluded a validator from blocks before its conviction.)"""
+    if getattr(db, "connection", None) is not None:
+        if height is None:
+            height = int(await db.get_next_block_id())
+        try:
+            from .. import chain_index
+            from ..validator.epoch_state import committee_for_block
+
+            mgr.oracle_committee = await committee_for_block(db, int(height))
+            mgr.oracle_excluded = set(await chain_index.offenders_before(db, int(height)))
+            # Each account's stake, for the block's staking fee discounts (same parent state).
+            from ..validator.epoch_state import stakes_for_block
+
+            mgr.clearinghouse.set_stakes(await stakes_for_block(db, int(height)))
+        except Exception as e:
+            logger.warning("validator committee not refreshed for block %s: %s", height, e)
+    if mgr.governance.genesis_loaded:
+        return
+    try:
+        genesis = await db.get_block_by_id(0)
+        if genesis:
+            # Governance's genesis facts (whether system wallets exist) come from block 0.
+            mgr.governance.load_genesis(genesis.get("content") or genesis.get("block_content"))
+    except Exception as e:
+        logger.debug("governance genesis not loaded: %s", e)
+
+
+async def preload_sender_balances(
+    db, txs, state_manager: Optional[ExchangeStateManager] = None, height: Optional[int] = None
+) -> None:
+    """
+    Phase E: pre-load each exchange-tx sender's real account_state balance into the
+    state manager's balance bridge BEFORE the (sync) section is processed, so the
+    collateral check can read it. Called by the async block paths (proposer +
+    importer). Deterministic: ``db.get_address_balance`` reads the same
+    account_state every node has at this point in block application.
+    """
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    mgr.clear_available_balances()
+    await ensure_oracle_committee(db, mgr, height)
+    # The block's exchange base fee: whether the free trading lane is open in it (blocks running
+    # full close it — state_manager.free_lane_open). Read from the chain, as every path reads it.
+    mgr.exchange_base_fee = None
+    if height is not None and getattr(db, "connection", None) is not None:
+        try:
+            from ..fee_market import base_fees_at
+
+            mgr.exchange_base_fee = (await base_fees_at(db, int(height)))[1]
+        except Exception as e:  # noqa: BLE001 — every node reads the same stored chain
+            logger.warning("exchange base fee unread for block %s: %s", height, e)
+    # The exchange actions EVM contracts sent run first (process_exchange_transactions).
+    txs = mgr.evm_action_txs() + list(txs or [])
+    seen: Dict[str, None] = {}
+    for tx in txs:
+        sender = getattr(tx, "sender", None)
+        if not sender:
+            continue
+        # The sender's, and whoever pays its gas (a user vault's leader: ``fee_payer``).
+        payer = mgr.fee_payer(tx) if isinstance(tx, ExchangeTransaction) else sender
+        for holder in (sender, payer):
+            seen.setdefault(holder)
+    for holder, balance in (await _balances(db, list(seen))).items():
+        mgr.set_available_balance(holder, balance)
+    # A governance system_spend debits a system wallet, not its sender: pre-load that wallet's
+    # balance too, under the key the execution debits (the wallet's lowercase address).
+    for tx in txs or []:
+        if getattr(tx, "op_type", None) != ExchangeOpType.GOV_EXECUTE:
+            continue
+        try:
+            raw_id = (tx.params or {}).get("proposal_id")
+            proposal = mgr.governance.proposals.get(int(raw_id)) if raw_id is not None else None
+        except (TypeError, ValueError):
+            proposal = None
+        if proposal is None or proposal.action != "system_spend":
+            continue
+        wallet = proposal.params["wallet"]
+        if wallet in seen:
+            continue
+        seen[wallet] = None
+        try:
+            mgr.set_available_balance(wallet, await db.get_address_balance(wallet))
+        except Exception as e:
+            logger.debug("preload_sender_balances: %s for system wallet %s", e, wallet)
+
+
+def _swap_paths(op, p: Dict[str, Any], asset, hubs: Iterable[str] = ()) -> List[List[str]]:
+    """The paths a SWAP may take, canonical (none for anything else, or a malformed path — the
+    swap fails before it moves anything): its ``path``, or the pair itself and, when it chooses
+    its own path, two hops through each routing hub (``ExchangeStateManager.swap_paths``)."""
+    if op != ExchangeOpType.SWAP:
+        return []
+    explicit = p.get("path") is not None
+    raw = p.get("path") if explicit else [p.get("token_in"), p.get("token_out")]
+    if not isinstance(raw, list) or not all(isinstance(t, str) and t for t in raw):
+        return []
+    path = [asset(t) for t in raw]
+    if explicit or p.get("pool_id") or str(p.get("venue", "auto")).lower() != "auto":
+        return [path]
+    return [path] + [[path[0], h, path[-1]] for h in hubs if h not in path]
+
+
+def _operations(txs) -> Iterable[Tuple[Any, Any, Dict[str, Any]]]:
+    """(sender, operation, params) of every operation the transactions run — a batch's
+    actions included (a malformed batch: none; it fails before executing anything)."""
+    from .transactions import batch_actions
+
+    for tx in txs or []:
+        sender = getattr(tx, "sender", None)
+        op = getattr(tx, "op_type", None)
+        p = getattr(tx, "params", None) or {}
+        if op == ExchangeOpType.BATCH:
+            try:
+                actions = batch_actions(p)
+            except ValueError:
+                continue
+            for action_op, action_params in actions:
+                yield sender, action_op, action_params or {}
+        else:
+            yield sender, op, p
+
+
+async def preload_token_balances(
+    db, txs, state_manager: Optional[ExchangeStateManager] = None
+) -> None:
+    """
+    Phase E (spot): pre-load the (holder, token) balances the block's spot ops will
+    spend, from the real token ledger, BEFORE the (sync) section runs — so the
+    sufficiency checks (swap token_in, transfer amount, add-liquidity token0/token1)
+    can read them. Deterministic: ``db.get_token_balance`` reads the same ledger on
+    every node at this point. Scans op params for the (sender, token) pairs to load.
+    """
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    mgr.clear_available_token_balances()
+    from .transactions import ExchangeOpType
+
+    wanted = set()
+    # The exchange actions EVM contracts sent run first (process_exchange_transactions).
+    for sender, op, p in _operations(mgr.evm_action_txs() + list(txs or [])):
+        if not sender:
+            continue
+        asset = mgr.canonical_asset  # "QRDX" for native, canonical token addresses
+        paths = _swap_paths(op, p, asset, mgr.routing_hubs())
+        if paths:
+            # A multi-hop swap spends what each hop bought: every token but the last.
+            for path in paths:
+                for token in path[:-1]:
+                    wanted.add((sender, token))
+        elif op in (ExchangeOpType.TOKEN_TRANSFER, ExchangeOpType.TOKEN_BURN) and p.get(
+            "token_address"
+        ):
+            # Native tokens are keyed by their canonical (lowercase) address. A burn may name
+            # another holder (``from``: an operator's or the permanent delegate's burn).
+            wanted.add((str(p.get("from") or sender), str(p["token_address"]).lower()))
+        elif op == ExchangeOpType.BRIDGE_WITHDRAW and p.get("token_address"):
+            wanted.add((sender, str(p["token_address"]).lower()))  # the bridged token burned
+        elif op == ExchangeOpType.TOKEN_WITHDRAW_FEES and p.get("token_address"):
+            # Withheld transfer fees are held by the token's own address.
+            token = str(p["token_address"]).lower()
+            wanted.add((token, token))
+        elif op == ExchangeOpType.TOKEN_TRANSFER_FROM and p.get("token_address") and p.get("from"):
+            wanted.add((str(p["from"]), str(p["token_address"]).lower()))
+        elif op == ExchangeOpType.ADD_LIQUIDITY:
+            for k in ("token0", "token1"):
+                if p.get(k):
+                    wanted.add((sender, asset(p[k])))
+            # Named by pool id alone: the deposit spends that pool's two tokens.
+            pool = mgr.pool_manager.get_pool(str(p["pool_id"])) if p.get("pool_id") else None
+            if pool is not None:
+                wanted.add((sender, pool.state.token0))
+                wanted.add((sender, pool.state.token1))
+        elif op in (ExchangeOpType.PLACE_ORDER, ExchangeOpType.MODIFY_ORDER) and ":" in str(
+            p.get("pair", "")
+        ):
+            # CLOB sufficiency: a buy spends quote, a sell spends base — load both.
+            b, q = mgr._canonical_pair(str(p["pair"])).split(":", 1)
+            wanted.add((sender, b))
+            wanted.add((sender, q))
+        elif op == ExchangeOpType.SUBACCOUNT_TRANSFER and p.get("asset") and p.get("subaccount"):
+            # Either side may pay: the master (the sender) or its sub-account.
+            for holder in (sender, str(p["subaccount"])):
+                wanted.add((holder, asset(p["asset"])))
+        elif op == ExchangeOpType.TWAP_ORDER and p.get("token_in"):
+            wanted.add((sender, asset(p["token_in"])))  # a spot TWAP escrows what it will spend
+        elif op == ExchangeOpType.PERP_DEPOSIT and p.get("asset"):
+            wanted.add((sender, asset(p["asset"])))  # a portfolio-margin token deposited
+        elif op == ExchangeOpType.PERP_WITHDRAW and p.get("asset"):
+            wanted.add((mgr.perps_holder_address(), asset(p["asset"])))
+        elif op == ExchangeOpType.PERP_DEPOSIT:
+            # Perps settled in a token (the stablecoin): the deposit spends it.
+            collateral = mgr.perp_collateral_token()
+            if collateral and collateral.upper() != "QRDX":
+                wanted.add((sender, collateral))
+        elif op == ExchangeOpType.PERP_WITHDRAW:
+            collateral = mgr.perp_collateral_token()
+            if collateral and collateral.upper() != "QRDX":
+                wanted.add((mgr.perps_holder_address(), collateral))
+        # The protocol's holders this operation may DEBIT — a pool's reserves, a book's
+        # escrow — so the manager can refuse an operation they cannot cover.
+        if paths:
+            for path in paths:
+                for a, b in zip(path, path[1:], strict=False):
+                    for pool in mgr.pool_manager.get_pools_for_pair(a, b):
+                        holder = mgr.pool_holder_address(pool.state.id)
+                        wanted.add((holder, a))
+                        wanted.add((holder, b))
+                    escrow = mgr.orderbook_escrow_address(min(a, b) + ":" + max(a, b))
+                    wanted.add((escrow, a))
+                    wanted.add((escrow, b))
+        elif op in (ExchangeOpType.REMOVE_LIQUIDITY, ExchangeOpType.REMOVE_POOL) and p.get(
+            "pool_id"
+        ):
+            pool = mgr.pool_manager.get_pool(str(p["pool_id"]))
+            if pool is not None:
+                holder = mgr.pool_holder_address(pool.state.id)
+                wanted.add((holder, pool.state.token0))
+                wanted.add((holder, pool.state.token1))
+        elif op in (
+            ExchangeOpType.PLACE_ORDER,
+            ExchangeOpType.CANCEL_ORDER,
+            ExchangeOpType.MODIFY_ORDER,
+        ):
+            pair = mgr._canonical_pair(str(p.get("pair", "")))
+            if ":" in pair:
+                escrow = mgr.orderbook_escrow_address(pair)
+                b, q = pair.split(":", 1)
+                for tok in (b, q):
+                    wanted.add((escrow, tok))
+                # An order takes from the pair's pools first (docs/UNIFIED_SPOT_LIQUIDITY.md 3).
+                if op != ExchangeOpType.CANCEL_ORDER:
+                    for pool in mgr.pool_manager.get_pools_for_pair(b, q):
+                        holder = mgr.pool_holder_address(pool.state.id)
+                        wanted.add((holder, b))
+                        wanted.add((holder, q))
+        elif op == ExchangeOpType.CANCEL_ALL:
+            # Refunds come out of the escrow of every book the sender has orders in.
+            for pair in sorted(mgr._order_books):
+                if mgr._order_books[pair]._owner_order_count.get(sender):
+                    escrow = mgr.orderbook_escrow_address(pair)
+                    for tok in pair.split(":", 1):
+                        wanted.add((escrow, tok))
+    from .tokens import is_native_asset
+
+    ordered = sorted(wanted)
+    native = [holder for holder, token in ordered if is_native_asset(token)]
+    native_balances = await _balances(db, native)
+    tokens = await _token_balances(db, [(t, h) for h, t in ordered if not is_native_asset(t)])
+    for holder, token in ordered:
+        if is_native_asset(token):  # native QRDX: the account balance
+            if holder in native_balances:
+                mgr.set_available_balance(holder, native_balances[holder])
+        elif (token, holder) in tokens:
+            mgr.set_available_token_balance(holder, token, tokens[(token, holder)])
+
+
+async def flush_exchange_balance_deltas(
+    db, state_manager: Optional[ExchangeStateManager] = None, enforce: bool = False
+) -> None:
+    """
+    Phase E: apply this block's accumulated exchange balance deltas (e.g. locked
+    margin) to real ``account_state``. Called by the async block paths AFTER the
+    section commits and BEFORE the unified state root is computed, so the root
+    reflects the moved funds on every node. Does not commit — the block's
+    ``add_block`` commits atomically.
+
+    ``enforce=False`` (default) is OBSERVE: deltas are computed/logged but NOT
+    applied, so there is no consensus impact during rollout.
+    """
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    if enforce and hasattr(db, "log_staker_fee_income"):
+        # The stakers' fee income the block took in, for its epoch's share-out
+        # (validator/epoch_state.py) — written alongside the moves that brought it in, by
+        # every path that applies them. Written for every block, nothing included (which
+        # removes the row): a block replacing an orphan at its height must not inherit its row.
+        await db.log_staker_fee_income(mgr._current_block_height, mgr.block_staker_fees())
+    deltas = mgr.balance_deltas()
+    if not deltas:
+        return
+    if not enforce:
+        logger.info(
+            "[Phase E observe] would apply %d balance delta(s): %s",
+            len(deltas),
+            {a[:12]: str(d) for a, d in deltas.items()},
+        )
+        return
+    applied_all = None
+    if hasattr(db, "apply_account_balance_deltas"):
+        try:
+            applied_all = await db.apply_account_balance_deltas(list(deltas.items()))
+        except ValueError as e:  # an address no account id is made from: one at a time
+            logger.debug("batched balance flush refused, applying one at a time: %s", e)
+    if applied_all is not None:
+        for addr, delta in deltas.items():
+            if not applied_all.get(addr) and delta < 0:
+                logger.error(
+                    "[VALUE-LOST] flush_exchange_balance_deltas: debit of %s on %s "
+                    "found no account_state row",
+                    delta,
+                    str(addr)[:24],
+                )
+        return
+    for addr, delta in deltas.items():
+        try:
+            applied = await db.apply_account_balance_delta(addr, delta)
+            if not applied and delta < 0:
+                # A debit on an account with no ledger row: nothing was taken, while the
+                # paired credit (if any) still lands — value created from nothing.
+                logger.error(
+                    "[VALUE-LOST] flush_exchange_balance_deltas: debit of %s on %s "
+                    "found no account_state row",
+                    delta,
+                    str(addr)[:24],
+                )
+        except Exception as e:
+            # A dropped delta LOSES VALUE silently. It is deterministic (every node
+            # drops the same one, so no fork) which is exactly why it can hide: the
+            # paired delta still applies, so funds vanish with only a log line.
+            # ERROR-level and explicitly marked so a log scan or soak catches it —
+            # this is how the 0xPOOL/0xCLOB holder break went unnoticed through a
+            # green integration run.
+            logger.error(
+                "[VALUE-LOST] flush_exchange_balance_deltas dropped %s for %s: %s",
+                delta,
+                str(addr)[:24],
+                e,
+            )
+
+
+async def flush_token_balance_deltas(
+    db, state_manager: Optional[ExchangeStateManager] = None
+) -> None:
+    """
+    Phase E (spot): apply this block's token-registry changes (deploys, supply, authorities
+    — the DB mirror of the manager's registry) + token-balance deltas (token ops, spot,
+    perps) to the durable token ledger. Called by the async block paths AFTER the section commits and
+    BEFORE the unified state root is computed, so the token root reflects the moved
+    tokens on every node. Does not commit — the block's ``add_block`` commits.
+
+    Unlike the collateral flush this is NOT gated by an observe flag: token state
+    is a brand-new consensus domain (additive — there is no prior balance to
+    protect), so it always applies, which is what makes the ledger converge across
+    nodes. The ``enforce_spot_settlement`` gate lives on the op (reject an
+    over-spend), not here.
+    """
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    registry_ops = mgr.token_registry_ops()
+    deltas = mgr.token_balance_deltas()
+    if not registry_ops and not deltas:
+        return
+    for op in registry_ops:
+        try:
+            await db.apply_token_registry_op(op)
+        except Exception as e:
+            logger.warning("flush_token: registry %s for %s", e, str(op.get("token_address"))[:20])
+    if hasattr(db, "apply_token_balance_deltas"):
+        try:
+            await db.apply_token_balance_deltas(list(deltas.items()))
+            return
+        except ValueError as e:  # a holder no account id is made from: one at a time
+            logger.debug("batched token flush refused, applying one at a time: %s", e)
+    for (holder, token), delta in deltas.items():
+        try:
+            await db.apply_token_balance_delta(token, holder, delta)
+        except Exception as e:
+            # See the note in flush_exchange_balance_deltas: a dropped token delta
+            # BURNS tokens while its paired debit applies. Loud and marked.
+            logger.error(
+                "[VALUE-LOST] flush_token dropped %s of %s for holder %s: %s",
+                delta,
+                str(token)[:24],
+                str(holder)[:24],
+                e,
+            )
+
+
+async def flush_validator_lifecycle_deltas(
+    db,
+    state_manager: Optional[ExchangeStateManager] = None,
+    block_epoch: Optional[int] = None,
+    block_height: Optional[int] = None,
+    block_hash: Optional[str] = None,
+) -> None:
+    """
+    Log this block's EXECUTED staking operations against the block: a STAKE_DEPOSIT in
+    ``validator_deposits``, a STAKE_EXIT in ``validator_exits`` (with the exit epoch the
+    block's epoch implies: ``block_epoch + UNBONDING_PERIOD_EPOCHS``). Called after the
+    section commits, before the unified root, on every path; the logs are reversed when the
+    block is rolled back.
+
+    These logs are the validator set's stake inputs (validator/epoch_state.py) and the
+    withdrawals' (validator/withdrawals.py). Only operations the exchange executed are here
+    (``validator_lifecycle_ops`` holds only those); a refused deposit — one naming more stake
+    than the sender holds — must register nothing, and the per-block index, which records
+    every STAKE_DEPOSIT a block carries, cannot tell them apart. Nothing else is written: the
+    ``validators`` table is a display copy of the epoch state. Does not commit.
+    """
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    ops = mgr.validator_lifecycle_ops()
+    if not ops or block_height is None:
+        return
+    exit_epoch = (int(block_epoch) + UNBONDING_PERIOD_EPOCHS) if block_epoch is not None else None
+    for op in ops:
+        try:
+            if op.get("type") == "deposit":
+                await db.log_validator_deposit(
+                    op["address"], op["public_key"], op["stake"], block_height, block_hash
+                )
+            elif op.get("type") == "exit" and exit_epoch is not None:
+                from ..validator.withdrawals import record_validator_exit
+
+                await record_validator_exit(db, op["address"], exit_epoch, block_height)
+            elif op.get("type") == "delegate":
+                await db.log_staking_op(
+                    "delegate", op["address"], op["validator"], op["amount"], block_height
+                )
+            elif op.get("type") == "undelegate":
+                await db.log_staking_op(
+                    "undelegate", op["address"], op["validator"], op["shares"], block_height
+                )
+            elif op.get("type") == "commission":
+                await db.log_staking_op(
+                    "commission", op["address"], None, op["commission_bps"], block_height
+                )
+        except Exception as e:
+            logger.warning("flush_validator_lifecycle: %s for %s", e, str(op.get("address"))[:20])
+
+
+# ---------------------------------------------------------------------------
+# Admission: authenticate exchange transactions
+# ---------------------------------------------------------------------------
+
+
+def verify_exchange_tx(tx: ExchangeTransaction) -> Tuple[bool, str]:
+    """
+    Authenticate an exchange transaction for mempool admission / block validation.
+
+    The deterministic execution core (``ExchangeStateManager.process_transaction``)
+    trusts ``tx.sender`` and does NOT verify signatures, so this MUST be enforced
+    before a transaction is admitted to the mempool and again when validating a
+    received block — otherwise any party can act as any address.
+
+    Checks, in order:
+      1. structural validity (``validate_basic``),
+      2. post-quantum signature + sender-address binding (``tx.verify()``).
+
+    Returns:
+        (ok, error). ``error`` is empty on success.
+
+    A transaction that passed is not checked again: every check here is a property of the
+    transaction alone, so the verdict is remembered on it, with the exact bytes it was reached
+    for: the signed payload, the signature and the key. Change any of them and it is checked
+    afresh. A node checked each transaction when its mempool admitted it and again when a block
+    carried it.
+    """
+    if is_verified(tx):
+        return True, ""
+    try:
+        tx.validate_basic()
+    except ValueError as e:
+        return False, f"invalid structure: {e}"
+    chain_err = tx.chain_error()
+    if chain_err:
+        return False, chain_err
+    from .transactions import EXCHANGE_GAS_COSTS
+
+    need = EXCHANGE_GAS_COSTS.get(tx.op_type, 100_000) + tx.signature_gas()
+    if int(tx.gas_limit) < need:  # (checked before the signatures are: they cost the work)
+        return False, f"gas limit {tx.gas_limit} does not cover {need} (its signatures included)"
+    if not tx.verify():
+        return False, "signature verification failed (bad signature or sender mismatch)"
+    tx.__dict__["_verified"] = _verified_form(tx)
+    return True, ""
+
+
+def _verified_form(tx: ExchangeTransaction) -> Tuple[Any, ...]:
+    return (tx._canonical_bytes(), tx.signature, tx.public_key, tx.chain_id)
+
+
+def is_verified(tx: ExchangeTransaction) -> bool:
+    """Whether ``verify_exchange_tx`` has passed this transaction, as it is now."""
+    passed = tx.__dict__.get("_verified")
+    if passed is None:
+        return False
+    try:
+        return bool(passed == _verified_form(tx))
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
 # Block-level exchange processing
 # ---------------------------------------------------------------------------
 
+
+# A section this large is verified on threads (``verify_exchange_txs``): liboqs checks a
+# signature in C without Python's lock, so the checks run side by side and the event loop stays
+# free meanwhile. Smaller ones are not worth the hand-off.
+PARALLEL_VERIFY_MIN = 64
+_verify_pool = None
+
+
+def _pool():
+    global _verify_pool
+    if _verify_pool is None:
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+
+        workers = int(os.environ.get("QRDX_VERIFY_THREADS") or min(8, os.cpu_count() or 2))
+        _verify_pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="verify")
+    return _verify_pool
+
+
+def _verify_chunk(txs: List[ExchangeTransaction]) -> List[Tuple[bool, str]]:
+    return [verify_exchange_tx(tx) for tx in txs]
+
+
+async def _verify_natively(txs: List[ExchangeTransaction]) -> List[Tuple[bool, str]]:
+    """``verify_exchange_tx`` of each, with every ML-DSA-65 signature among them checked first in
+    one batch by the native module, on its threads and off the event loop. The checks are the
+    Python ones; only the signature verdicts come from the batch (the same liboqs)."""
+    import asyncio
+
+    from .. import native
+    from ..crypto import multisig_wire
+    from ..crypto.pq import dilithium
+
+    items = [
+        (bytes(tx.public_key), tx.signing_bytes(), bytes(tx.signature))
+        for tx in txs
+        if tx.public_key
+        and tx.signature
+        and len(tx.public_key) == dilithium.PUBLIC_KEY_SIZE
+        and not multisig_wire.is_multisig_material(tx.public_key)
+    ]
+    verdicts = await asyncio.get_running_loop().run_in_executor(
+        None, native.mldsa65_verify_batch, items
+    )
+    if verdicts is None:
+        return _verify_chunk(txs)
+    with dilithium.precomputed(dict(zip(items, verdicts, strict=True))):
+        return _verify_chunk(txs)
+
+
+async def verify_exchange_txs(txs: List[ExchangeTransaction]) -> List[Tuple[bool, str]]:
+    """``verify_exchange_tx`` of each transaction, in order — on the verification threads when
+    there are many (docs/PERFORMANCE.md). The verdicts are the same as one at a time."""
+    todo = [i for i, tx in enumerate(txs) if not is_verified(tx)]
+    if len(todo) < len(txs):  # (those already passed: only the rest go to the threads)
+        verdicts: List[Tuple[bool, str]] = [(True, "")] * len(txs)
+        if todo:
+            for i, verdict in zip(
+                todo, await verify_exchange_txs([txs[i] for i in todo]), strict=True
+            ):
+                verdicts[i] = verdict
+        return verdicts
+    from .. import native
+
+    if native.AVAILABLE and len(txs) >= native.BATCH_MIN:
+        return await _verify_natively(txs)
+    if len(txs) < PARALLEL_VERIFY_MIN:
+        return _verify_chunk(txs)
+    import asyncio
+
+    pool = _pool()
+    workers = pool._max_workers
+    size = max(16, -(-len(txs) // workers))
+    loop = asyncio.get_running_loop()
+    parts = await asyncio.gather(
+        *[
+            loop.run_in_executor(pool, _verify_chunk, txs[at : at + size])
+            for at in range(0, len(txs), size)
+        ]
+    )
+    return [verdict for part in parts for verdict in part]
+
+
 def process_exchange_transactions(
     block_height: int,
     block_timestamp: float,
     exchange_txs: List[ExchangeTransaction],
     state_manager: Optional[ExchangeStateManager] = None,
+    revertible: bool = False,
 ) -> Tuple[bool, str, str]:
     """
     Process all exchange transactions in a block.
@@ -64,29 +818,91 @@ def process_exchange_transactions(
     """
     mgr = state_manager or ExchangeStateManager.get_instance()
 
-    # Take snapshot for potential revert
-    mgr.take_snapshot()
+    # Fair ordering (qrdx/exchange/fair_ordering.py): a block whose exchange transactions are
+    # not in it is invalid — refused before anything runs.
+    if exchange_txs:
+        from .. import chain_spec
+        from .fair_ordering import FEATURE, ordering_error
+
+        if chain_spec.is_active(FEATURE, int(block_height)):
+            unfair = ordering_error(exchange_txs)
+            if unfair:
+                return False, f"unfair exchange order: {unfair}", ""
+
+    # Only transactions that run (chain-spec feature ``exchange_inclusion``): the block's are
+    # judged together before anything runs, and a block carrying one that would be refused —
+    # which used to sit in it without paying, executing or consuming its nonce, repeatably — is
+    # invalid. Each payer's fees are then reserved up front (below).
+    checked = bool(exchange_txs) and is_inclusion_checked(int(block_height))
+    # Plain QRDX transfers are judged and run natively, run by run (qrdx/exchange/transfer_lane.py).
+    from . import transfer_lane
+
+    prepared = transfer_lane.prepare_all(exchange_txs) if checked else None
+    if checked:
+        refused = mgr.section_errors(
+            exchange_txs, int(block_height), block_timestamp, prepared=prepared
+        )
+        if refused:
+            i = min(refused)
+            return False, f"exchange transaction {i} may not be in the block: {refused[i]}", ""
+
+    # A revert point only for a replay (``revertible``), which must undo a section that fails
+    # exactly where forward application undid it. It is a deep copy of the whole exchange: on
+    # every block with transactions it was the most expensive thing a node did (115 ms at
+    # 10,000 accounts). A live path that sees a section fail restores through the reorg fast
+    # path instead (main._restore_after_rejected_block): the block is not stored, so the state
+    # at the tip is the state before it. Without a revert point, revert_block() is a no-op.
+    if exchange_txs and revertible:
+        mgr.take_snapshot()
 
     # Begin block processing
     mgr.begin_block(block_height, block_timestamp)
+    prepaid = mgr.reserve_section_fees(exchange_txs) if checked else None
+
+    # The perp markets the network starts with (PERP_GENESIS_MARKETS): made by the first block,
+    # on every path, before anything could trade them.
+    mgr.create_genesis_markets()
+
+    # Then the exchange actions EVM contracts sent in the blocks before
+    # (qrdx/contracts/exchange_evm.py), each as an operation of its contract's account.
+    if len(mgr.trading.evm_actions):
+        for ev in mgr.run_evm_actions():
+            logger.debug("Block %d: EVM action %s", block_height, ev)
 
     # Process each exchange transaction in order
     failed_txs = []
-    for i, tx in enumerate(exchange_txs):
-        try:
-            result = mgr.process_transaction(tx)
-            if not result.success:
-                # Non-critical failure: tx fails but block continues
-                # (like a reverted EVM transaction — gas is still charged)
-                failed_txs.append((i, tx.tx_hash(), result.error))
-                logger.debug(
-                    "Exchange tx %d failed (non-critical): %s",
-                    i, result.error,
-                )
-        except Exception as e:
-            # Critical failure: block is invalid
-            mgr.revert_block()
-            return False, f"Critical exchange error at tx {i}: {e}", ""
+    lane_runs = (
+        dict(transfer_lane.runs(prepared)) if prepared is not None and prepaid is not None else {}
+    )
+    i = 0
+    while i < len(exchange_txs):
+        end = lane_runs.get(i)
+        if end is not None and prepaid is not None and prepared is not None:
+            results = transfer_lane.run(mgr, exchange_txs[i:end], prepared[i:end], prepaid[i:end])
+            if results is not None:
+                for k, result in enumerate(results, start=i):
+                    if not result.success:
+                        failed_txs.append((k, exchange_txs[k].tx_hash(), result.error))
+                i = end
+                continue
+        for k in range(i, end if end is not None else i + 1):
+            tx = exchange_txs[k]
+            try:
+                result = mgr.process_transaction(tx, prepaid[k] if prepaid else None, checked)
+                if not result.success:
+                    # Non-critical failure: tx fails but block continues
+                    # (like a reverted EVM transaction — gas is still charged)
+                    failed_txs.append((k, tx.tx_hash(), result.error))
+                    logger.debug(
+                        "Exchange tx %d failed (non-critical): %s",
+                        k,
+                        result.error,
+                    )
+            except Exception as e:
+                # Critical failure: block is invalid
+                mgr.revert_block()
+                return False, f"Critical exchange error at tx {k}: {e}", ""
+        i = end if end is not None else i + 1
 
     # Execute validator duties at block boundary
     try:
@@ -101,7 +917,9 @@ def process_exchange_transactions(
     if failed_txs:
         logger.info(
             "Block %d: %d/%d exchange txs failed (non-critical)",
-            block_height, len(failed_txs), len(exchange_txs),
+            block_height,
+            len(failed_txs),
+            len(exchange_txs),
         )
 
     return True, "", state_root
@@ -130,7 +948,11 @@ def validate_exchange_state_root(
         Tuple of (is_valid, error_message)
     """
     success, error, computed_root = process_exchange_transactions(
-        block_height, block_timestamp, exchange_txs, state_manager,
+        block_height,
+        block_timestamp,
+        exchange_txs,
+        state_manager,
+        revertible=True,  # it reverts on a mismatch itself
     )
 
     if not success:
@@ -146,9 +968,275 @@ def validate_exchange_state_root(
     return True, ""
 
 
+async def rebuild_exchange_state_from_chain(
+    db,
+    state_manager: Optional[ExchangeStateManager] = None,
+    flush_to_account_state: bool = False,
+) -> str:
+    """
+    Reconstruct exchange state by replaying every canonical block's exchange
+    section in height order (Phase D3 — reorg safety + restart durability).
+
+    Exchange state is thereby a deterministic function of the canonical chain:
+      - **Restart durability:** on node startup, rebuild from the stored sections
+        so account/exchange state survives a process restart or fresh resync.
+      - **Reorg safety:** after the base layer rolls back to a common ancestor,
+        rebuild to the new canonical tip — orphaned-block effects vanish and the
+        canonical effects are re-applied, with no stale state left behind.
+
+    Resets the singleton (when ``state_manager`` is None) and replays from
+    genesis. O(total exchange txs); checkpointing is a future optimization.
+
+    ``flush_to_account_state`` (Phase E reorg safety): when True, each block's
+    accumulated collateral deltas (e.g. locked margin) are also flushed to the
+    durable ``account_state`` ledger, mirroring live import. This MUST be used
+    only when ``account_state`` has just been cleared + reseeded to genesis (the
+    reorg path), because the durable ledger already holds these debits on a plain
+    restart — flushing then would double-debit. ``begin_block`` (inside
+    ``process_exchange_transactions``) resets the per-block deltas, so each flush
+    applies exactly that block's debits; the per-block flush is uncommitted but
+    same-connection-visible, so a later block's collateral preload reads the
+    correct running balance. A single commit is issued at the end.
+
+    Returns the resulting exchange_state_root.
+    """
+    if state_manager is None:
+        ExchangeStateManager.reset_instance()
+        mgr = ExchangeStateManager.get_instance()
+    else:
+        mgr = state_manager
+
+    if flush_to_account_state:
+        # Reorg rebuild (token_balances + account_state were just cleared+reseeded):
+        # the replay must reconstruct the SAME ledger live import produced. Gated on
+        # flush_to_account_state (like the collateral flush) because the plain-restart
+        # path does NOT re-flush token deltas — the durable ledger already holds them,
+        # and apply_token_balance_delta is additive, so re-applying would double them.
+        #
+        # CRITICAL: the rebuild MUST set the SAME enforce flags the forward import path
+        # (_apply_exchange_section_on_import) uses, so it makes byte-identical accept/
+        # reject decisions during replay. A canonical block can contain a spot op the
+        # forward path REJECTS (an op unaffordable at that point — common under reorg
+        # churn when re-queued orphan txs are re-included): forward moves no value for
+        # it, so a rebuild that runs WITHOUT enforce_spot_settlement would instead
+        # EXECUTE it → the reorged node's token ledger diverges from the network at
+        # equal tip (the equal-tip derived-state divergence; token roots differ, E-D4
+        # stays 0 because block history matches). enforce_orderbook_settlement gates the
+        # CLOB escrow MOVE itself; enforce_pool_stake gates the stake debit. A canonical
+        # op that forward ACCEPTED had sufficient balance, and the in-order preload
+        # reconstructs that same balance, so enforcing here re-accepts it (no false
+        # reject) — the flags only make the REJECTIONS match too. Verified by
+        # tests/test_reorg_rebuild_equivalence.py.
+        apply_enforcement(mgr)
+
+    try:
+        tip = (await db.get_next_block_id()) - 1
+    except Exception as e:
+        logger.warning("rebuild_exchange_state: cannot read chain tip: %s", e)
+        return mgr.compute_state_root()
+
+    applied = 0
+    flushed = 0
+    for height in range(0, tip + 1):
+        try:
+            block = await db.get_block_by_id(height)
+        except Exception:
+            block = None
+        if not block:
+            continue
+        block_hash = block.get("hash") or block.get("block_hash")
+        if not block_hash:
+            continue
+        if height >= 1:
+            await ensure_oracle_committee(db, mgr, height)  # as forward judged this block
+        try:
+            section = await db.get_block_exchange_txs(block_hash)
+        except Exception:
+            section = None
+        if not section:
+            if height >= 1:
+                # No exchange transactions: the exchange still ticks, as on every forward
+                # path (see run_exchange_tick).
+                try:
+                    await tick_and_flush(
+                        db,
+                        height,
+                        float(block.get("timestamp", 0) or 0),
+                        mgr,
+                        flush=flush_to_account_state,
+                    )
+                except Exception as e:
+                    logger.error("rebuild_exchange_state: tick at %d failed: %s", height, e)
+            continue
+        txs = decode_exchange_txs(section)
+        ts = float(block.get("timestamp", 0) or 0)
+        # Phase E reorg safety: preload senders' (running) account_state balances
+        # so the per-block collateral check reads the same view a live importer
+        # would at this height. Must run BEFORE process_exchange_transactions.
+        if flush_to_account_state:
+            try:
+                await preload_sender_balances(db, txs, mgr, height)
+                await preload_token_balances(db, txs, mgr)
+            except Exception as e:
+                logger.debug("rebuild_exchange_state preload skipped at %d: %s", height, e)
+        ok, err, _root = process_exchange_transactions(height, ts, txs, mgr, revertible=True)
+        if ok:
+            mgr.commit_block()
+            applied += 1
+            if flush_to_account_state:
+                # Re-apply this block's collateral debits to the freshly reseeded
+                # account_state ledger (enforce mode applies; observe just logs)
+                # AND its token moves to the freshly cleared token ledger.
+                await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
+                await flush_token_balance_deltas(db, mgr)
+                flushed += 1
+        else:
+            logger.error("rebuild_exchange_state: block %d section failed: %s", height, err)
+
+    if flush_to_account_state and flushed:
+        try:
+            await db.connection.commit()
+        except Exception as e:
+            logger.warning("rebuild_exchange_state: account_state flush commit failed: %s", e)
+
+    # [reorg-diag] log UNCONDITIONALLY (incl. applied=0) so a heavy-reorg run reveals
+    # whether the reflush re-applied the activity sections after a rollback+reseed.
+    logger.info(
+        "[reorg-diag] rebuild_exchange: tip=%d applied=%d flushed=%d (flush_to_account=%s)",
+        tip,
+        applied,
+        flushed,
+        flush_to_account_state,
+    )
+    return mgr.compute_state_root()
+
+
+def apply_block_exchange_section(
+    block_height: int,
+    block_timestamp: float,
+    section_items: Optional[List[Any]],  # (wire dicts, or transactions already decoded)
+    declared_state_root: Optional[str],
+    state_manager: Optional[ExchangeStateManager] = None,
+    verified: bool = False,
+) -> Tuple[bool, str]:
+    """
+    Securely validate and apply a block's exchange section on import (Phase D3).
+
+    This is the consensus enforcement an importing node runs before accepting a
+    block. It is intentionally stricter than ``validate_exchange_state_root``:
+
+      1. **Authenticate first** — every transaction must pass ``verify_exchange_tx``
+         (PQ signature + sender binding) BEFORE any state is touched, so a
+         malicious proposer cannot smuggle forged exchange txs into a block.
+      2. **Require a declared root** — a section without a declared
+         ``exchange_state_root`` is unverifiable and therefore rejected.
+      3. **Execute + compare** — replay deterministically and compute the root.
+      4. **Revert on any mismatch/failure** — restore the pre-block snapshot so a
+         rejected block leaves the local exchange state untouched (the existing
+         ``validate_exchange_state_root`` commits before comparing, which would
+         corrupt state on a bad block).
+      5. **Commit on success** — the replayed state is kept and finalized.
+
+    An empty/absent section is a no-op success (nothing to apply).
+
+    Returns:
+        (ok, error). On ``False`` the block MUST be rejected and local exchange
+        state is unchanged.
+    """
+    if not section_items:
+        return True, ""
+
+    if not declared_state_root:
+        return False, "exchange section present but block declares no exchange_state_root"
+
+    mgr = state_manager or ExchangeStateManager.get_instance()
+
+    # 1. Authenticate every tx before mutating any state (``verified``: the caller just did,
+    #    on these very items — main._apply_exchange_section_on_import — and checking each
+    #    signature twice was a third of an import's work).
+    txs = decode_exchange_txs(section_items)
+    if not verified:
+        for i, tx in enumerate(txs):
+            ok, err = verify_exchange_tx(tx)
+            if not ok:
+                return False, f"exchange tx {i} in block {block_height} failed verification: {err}"
+
+    # 2–4. Execute (snapshots internally), compare, revert on mismatch.
+    success, error, computed_root = process_exchange_transactions(
+        block_height,
+        block_timestamp,
+        txs,
+        mgr,
+    )
+    if not success:
+        # The caller restores the pre-block state (the reorg fast path): there is no revert
+        # point (process_exchange_transactions).
+        return False, error
+    if computed_root != declared_state_root:
+        return False, (
+            f"exchange_state_root mismatch at block {block_height}: "
+            f"declared {declared_state_root[:16]}..., computed {computed_root[:16]}..."
+        )
+
+    # 5. Accept: keep the replayed state, discard the revert point.
+    mgr.commit_block()
+    return True, ""
+
+
 # ---------------------------------------------------------------------------
 # Block boundary duties (executed by every validator)
 # ---------------------------------------------------------------------------
+
+
+def run_exchange_tick(
+    block_height: int, block_timestamp: float, state_manager: Optional[ExchangeStateManager] = None
+) -> str:
+    """
+    The exchange's per-block tick for a block that carries no exchange transactions.
+
+    Clearinghouse duties — mark prices (docs/PERPS_CLEARINGHOUSE.md Phase 2), and later
+    liquidations and funding — must advance on EVERY block, not only on blocks that happen to
+    carry exchange transactions; otherwise prices, liquidations and funding freeze through a
+    quiet stretch. Every path runs this for every block from height 1 (genesis is never
+    processed by the exchange): the proposer, the sync/REST/p2p importers and both rebuilds.
+    Returns the exchange state root.
+    """
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    ok, err, root = process_exchange_transactions(block_height, block_timestamp, [], mgr)
+    if not ok:
+        logger.error("exchange tick failed at block %d: %s", block_height, err)
+    mgr.commit_block()
+    return root
+
+
+async def tick_and_flush(
+    db,
+    block_height: int,
+    block_timestamp: float,
+    state_manager: Optional[ExchangeStateManager] = None,
+    *,
+    flush: bool = True,
+) -> str:
+    """``run_exchange_tick``, then apply what the tick moved on the ledgers — as a block with
+    exchange transactions flushes its section (whose tick is part of it). A fired spot trigger,
+    a spot TWAP slice and the backstop vault's sale of margin tokens settle real tokens in the
+    tick; dropped, the ledger would disagree with the exchange's own records. Every path ticks a
+    block without exchange transactions through this, at the point its section would flush.
+    Returns the exchange state root."""
+    mgr = state_manager or ExchangeStateManager.get_instance()
+    if len(mgr.trading.evm_actions):
+        # Exchange actions EVM contracts sent run in this block (process_exchange_transactions):
+        # judged as a section's transactions are, on the balances they may spend.
+        if flush:
+            apply_enforcement(mgr)
+        await preload_sender_balances(db, [], mgr, block_height)
+        await preload_token_balances(db, [], mgr)
+    root = run_exchange_tick(block_height, block_timestamp, mgr)
+    if flush:
+        await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
+        await flush_token_balance_deltas(db, mgr)
+    return root
+
 
 def _execute_block_boundary_duties(
     mgr: ExchangeStateManager,
@@ -159,50 +1247,50 @@ def _execute_block_boundary_duties(
     Execute protocol-level duties at block boundaries.
 
     These are NOT user-submitted transactions — they are deterministic
-    protocol operations that every validator executes identically.
+    protocol operations that every validator executes identically. They run on every block
+    (see ``run_exchange_tick``).
     """
-    # 1. Funding rate settlement (every FUNDING_SETTLEMENT_INTERVAL slots)
-    if block_height > 0 and block_height % FUNDING_SETTLEMENT_INTERVAL == 0:
-        _settle_funding_rates(mgr, block_timestamp)
+    # Perps clearinghouse: mark prices, funding at interval boundaries, then liquidations at
+    # the new marks — all judged by block time.
+    from .. import constants
 
-    # 2. Liquidation checks (every block)
-    _check_liquidations(mgr)
-
-
-def _settle_funding_rates(
-    mgr: ExchangeStateManager,
-    block_timestamp: float,
-) -> None:
-    """Apply funding rates on all perp markets."""
-    for market_id in list(mgr.perp_engine._markets.keys()):
-        try:
-            snapshot = mgr.perp_engine.apply_funding(market_id)
-            if snapshot is not None:
-                logger.debug(
-                    "Funding settled for %s: rate=%s",
-                    market_id, snapshot.funding_rate,
-                )
-        except Exception as e:
-            logger.error("Funding settlement failed for %s: %s", market_id, e)
-
-
-def _check_liquidations(mgr: ExchangeStateManager) -> None:
-    """Check and execute liquidations on all perp markets."""
-    for market_id in list(mgr.perp_engine._markets.keys()):
-        try:
-            results = mgr.perp_engine.check_all_liquidations(market_id)
-            for liq in results:
-                logger.info(
-                    "Liquidation: %s pos=%s pnl=%s adl=%s",
-                    market_id, liq.position_id, liq.pnl, liq.adl_triggered,
-                )
-        except Exception as e:
-            logger.error("Liquidation check failed for %s: %s", market_id, e)
+    mgr.apply_oracle_votes(Decimal(str(block_timestamp)))
+    now = Decimal(str(block_timestamp))
+    spot = mgr.update_spot_oracles(now)  # native-token markets read their spot markets
+    events = spot + mgr.apply_policy_changes(now)
+    events += mgr.run_scheduled_cancels(now)  # (first: a switch pulls orders before anything fires)
+    events += mgr.uncross_spot_books(now)  # resting orders new pool liquidity crossed fill
+    events += mgr.fire_spot_triggers(now)
+    perps = mgr.clearinghouse.tick(now, funding_interval=constants.PERP_FUNDING_INTERVAL_SECONDS)
+    events += perps
+    events += mgr.unwind_vault_assets(now)
+    events += mgr.run_twaps(now, liquidations=perps)
+    # Last: the block's perps fees are all in (its transactions' and the tick's); then the
+    # stakers' fee share in other assets is sold for QRDX when due.
+    mgr.move_perps_staker_fees()
+    events += mgr.convert_staker_fees(now)
+    for ev in events:
+        if ev["type"] == "liquidation":
+            logger.info(
+                "Perp liquidation at height %d: %s %s (%s, filled %s on the book) "
+                "equity=%s maintenance=%s",
+                block_height,
+                ev["owner"],
+                ",".join(ev["markets"]),
+                ev["stage"],
+                ev["filled"],
+                ev["equity"],
+                ev["maintenance"],
+            )
+    # The node-local journal (receipts + events for wallets, the API and streams) records them
+    # once the block commits.
+    mgr.record_tick_events(events)
 
 
 # ---------------------------------------------------------------------------
 # Utility: extract exchange transactions from a block
 # ---------------------------------------------------------------------------
+
 
 def extract_exchange_transactions(block: Any) -> List[ExchangeTransaction]:
     """
@@ -217,7 +1305,7 @@ def extract_exchange_transactions(block: Any) -> List[ExchangeTransaction]:
     Returns:
         List of ExchangeTransaction objects
     """
-    exchange_txs = []
+    exchange_txs: List[Any] = []
     if not hasattr(block, "transactions") or not block.transactions:
         return exchange_txs
 
@@ -231,39 +1319,71 @@ def extract_exchange_transactions(block: Any) -> List[ExchangeTransaction]:
 
 
 # ---------------------------------------------------------------------------
-# Validator duty: build oracle update transactions
+# Block-body codec for exchange transactions  (Phase D2, sub-step 1)
 # ---------------------------------------------------------------------------
+#
+# Exchange transactions ride in a dedicated, backward-compatible block-body
+# section: ``block["exchange_transactions"] = [tx.to_dict(), ...]`` in the
+# canonical order chosen by the proposer (ExchangeMempool.select_for_block).
+# A block with no exchange activity simply omits the key. These helpers are the
+# wire codec that the proposer (D2) and importing nodes (D3) will share; they do
+# NOT yet touch live block production.
 
-def build_oracle_update_tx(
-    validator_address: str,
-    pair: str,
-    price: Decimal,
-    nonce: int,
-) -> ExchangeTransaction:
+BLOCK_EXCHANGE_TXS_KEY = "exchange_transactions"
+
+
+def encode_exchange_txs(txs: List[ExchangeTransaction]) -> List[Dict[str, Any]]:
     """
-    Build an oracle price update transaction for a validator to submit.
+    Encode an ordered list of exchange transactions for the block body.
 
-    Validators are responsible for submitting price updates for pairs
-    they are assigned to.  The price is sourced from external feeds
-    and submitted as a signed ExchangeTransaction.
-
-    Args:
-        validator_address: The validator's PQ address
-        pair: Trading pair (e.g., "BTC:USDC")
-        price: Current price from external oracle feed
-        nonce: The validator's current exchange nonce
-
-    Returns:
-        An unsigned ExchangeTransaction (caller must sign)
+    Order is preserved exactly (it is consensus-relevant — the proposer's
+    canonical selection order). Per-tx ``to_dict`` already serializes the PQ
+    signature + public key, so authentication survives the round trip.
     """
-    return ExchangeTransaction(
-        op_type=ExchangeOpType.UPDATE_ORACLE,
-        sender=validator_address,
-        nonce=nonce,
-        params={"pair": pair, "price": str(price)},
-        gas_limit=20_000,
-        gas_price=Decimal("1"),
-    )
+    return [tx.to_dict() for tx in txs]
+
+
+def decode_exchange_txs(items: Optional[List[Any]]) -> List[ExchangeTransaction]:
+    """
+    Decode the block-body exchange section back into transactions.
+
+    Backward compatible: a missing/empty section yields an empty list. A transaction already
+    decoded passes through (the import path decodes a section once; a compact block's come from
+    the mempool, docs/PERFORMANCE.md).
+    """
+    if not items:
+        return []
+    return [
+        d if isinstance(d, ExchangeTransaction) else ExchangeTransaction.from_dict(d) for d in items
+    ]
+
+
+def exchange_txs_canonical_bytes(txs: List[ExchangeTransaction]) -> bytes:
+    """
+    Deterministic byte encoding of the exchange section, for hashing / equality.
+
+    Two validators with the same ordered transaction list MUST produce identical
+    bytes. Uses each transaction's consensus-critical ``tx_hash`` in order, so
+    any reordering or mutation changes the result. BLAKE3 per Whitepaper §3.6.
+    """
+    import blake3
+
+    h = blake3.blake3()
+    for tx in txs:
+        h.update(bytes.fromhex(tx.tx_hash()))
+    return h.digest(length=32)
+
+
+def extract_exchange_transactions_from_dict(block: Dict[str, Any]) -> List[ExchangeTransaction]:
+    """
+    Recover exchange transactions from a serialized block dict (the wire form).
+
+    Reads ``block[BLOCK_EXCHANGE_TXS_KEY]``; absent ⇒ empty list. Counterpart to
+    ``extract_exchange_transactions`` (which scans an in-memory block object).
+    """
+    if not isinstance(block, dict):
+        return []
+    return decode_exchange_txs(block.get(BLOCK_EXCHANGE_TXS_KEY))
 
 
 def get_validator_fee_share(
@@ -283,6 +1403,8 @@ def get_validator_fee_share(
         The validator's fee share in QRDX
     """
     from ..constants import EXCHANGE_FEE_VALIDATOR_SHARE
+
     return (block_fees * EXCHANGE_FEE_VALIDATOR_SHARE).quantize(
-        Decimal("0.00000001"), rounding=ROUND_HALF_UP,
+        Decimal("0.00000001"),
+        rounding=ROUND_HALF_UP,
     )

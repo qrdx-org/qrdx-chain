@@ -1,176 +1,168 @@
 #!/bin/bash
-
 ###############################################################################
-# qrdx Node Container Entrypoint
+# QRDX Node — container entrypoint
 #
-# Overview
-#   This script launches a qrdx node inside a container. It prepares runtime
-#   configuration, optionally acquires a public URL via Pinggy, coordinates
-#   bootstrap peer discovery through a registry file, ensures the SQLite
-#   database directory exists, then starts the qrdx node process.
+# Responsibilities
+#   1. Apply container-appropriate defaults for the QRDX_* environment the node
+#      reads (qrdx/constants.py takes os.environ over the .env file, so this
+#      script only exports — it never writes /app/.env).
+#   2. Ensure the writable paths the node needs exist: the SQLite directory and
+#      the per-node PQ identity key directory.
+#   3. Optionally expose the node on the public Internet via a Pinggy.io SSH
+#      reverse tunnel, publishing the resulting URL to a shared peer registry.
+#   4. Optionally resolve a bootstrap peer from that registry.
+#   5. exec the node so it becomes PID 1 and receives signals directly.
 #
-# Lifecycle and responsibilities
-#   1. Initialization:
-#        - The shared peer registry directory is created
-#        - A deterministic internal self URL is derived.
-#        - Bootstrap intent is normalized when unset.
+# Environment (all optional unless noted)
+#   NODE_NAME              Label used in logs and for the default self URL.
+#   QRDX_NODE_HOST         Bind address inside the container   [0.0.0.0]
+#   QRDX_NODE_PORT         Listen port inside the container    [3007]
+#   QRDX_SELF_URL          Publicly reachable URL of this node [http://$NODE_NAME:$PORT]
+#   QRDX_BOOTSTRAP_NODE    'self', 'discover', or an explicit URL
+#   QRDX_BOOTSTRAP_NODES   Comma-separated peer list (defaults to the above)
+#   QRDX_DATABASE_PATH     SQLite path                         [/app/data/qrdx.db]
+#   QRDX_NODE_KEY_DIR      PQ node identity key directory      [/app/data/keys]
+#   ENABLE_PINGGY_TUNNEL   'true' to open a public reverse tunnel
 #
-#   2. Public URL acquisition and publication:
-#        - If tunneling is enabled, a reverse tunnel is established via ssh
-#          using Pinggy free tunneling service (free.pinggy.io).
-#
-#   3. Peer discovery:
-#        - Public bootstrap nodes wait for the appearance of another public peer.
-#        - Private nodes in discovery mode wait for any public node.
-#
-#   4. Env generation, database directory creation, and application launch:
-#        - An application .env file is generated with the required variables.
-#        - The SQLite database directory is created if it does not exist.
-#        - The qrdx node is started via python run_node.py.
-#
-# Inputs via environment:
-#   NODE_NAME                   Name of this node
-#   qrdx_NODE_HOST            Hostname or IP the node binds to or advertises
-#   qrdx_NODE_PORT            Port that the node listens on inside the container
-#   ENABLE_PINGGY_TUNNEL        When "true", Pinggy tunneling is enabled
-#   qrdx_BOOTSTRAP_NODE       "self", "discover", or any explicit URL
-#   QRDX_DATABASE_PATH          Path to the SQLite database file
-#
+# NOTE: every QRDX_* variable is UPPERCASE. The node reads uppercase names only;
+#       the lowercase `qrdx_*` spelling used by older revisions of this script was
+#       silently ignored, leaving nodes bound to 127.0.0.1 and unreachable.
 ###############################################################################
 
-set -e
+set -euo pipefail
 
-echo "--- qrdx Node Container Entrypoint for ${NODE_NAME} ---"
+NODE_NAME="${NODE_NAME:-qrdx-node}"
 
-# --- CONFIGURATION ---
-REGISTRY_DIR="/shared/node-registry"
+echo "--- QRDX Node Container Entrypoint: ${NODE_NAME} ---"
+
+# ---------------------------------------------------------------------------
+# STAGE 1 — Defaults and writable paths
+# ---------------------------------------------------------------------------
+export QRDX_NODE_HOST="${QRDX_NODE_HOST:-0.0.0.0}"
+export QRDX_NODE_PORT="${QRDX_NODE_PORT:-3007}"
+export QRDX_DATABASE_PATH="${QRDX_DATABASE_PATH:-/app/data/qrdx.db}"
+# Default the identity key directory into the data volume. Without this the node
+# writes node_key.pq next to qrdx/node/main.py — inside the image layer, so the
+# identity is lost on every redeploy (and fails outright on a read-only rootfs).
+export QRDX_NODE_KEY_DIR="${QRDX_NODE_KEY_DIR:-/app/data/keys}"
+
+export LOG_LEVEL="${LOG_LEVEL:-INFO}"
+# Matches LOGGER_DEFAULTS in qrdx/constants.py; the logger already marks UTC.
+export LOG_FORMAT="${LOG_FORMAT:-%(asctime)s - %(levelname)s - %(name)s - %(message)s}"
+export LOG_DATE_FORMAT="${LOG_DATE_FORMAT:-%Y-%m-%dT%H:%M:%S}"
+export LOG_CONSOLE_HIGHLIGHTING="${LOG_CONSOLE_HIGHLIGHTING:-True}"
+export LOG_INCLUDE_REQUEST_CONTENT="${LOG_INCLUDE_REQUEST_CONTENT:-False}"
+export LOG_INCLUDE_RESPONSE_CONTENT="${LOG_INCLUDE_RESPONSE_CONTENT:-False}"
+export LOG_INCLUDE_BLOCK_SYNC_MESSAGES="${LOG_INCLUDE_BLOCK_SYNC_MESSAGES:-False}"
+
+mkdir -p "$(dirname "${QRDX_DATABASE_PATH}")" "${QRDX_NODE_KEY_DIR}"
+echo "Data directory:  $(dirname "${QRDX_DATABASE_PATH}")"
+echo "Key directory:   ${QRDX_NODE_KEY_DIR}"
+
+# The peer registry is only used by the Pinggy/discover flow; it lives on an
+# optional shared volume, so a missing or read-only mount must not be fatal.
+REGISTRY_DIR="${QRDX_PEER_REGISTRY_DIR:-/shared/node-registry}"
 REGISTRY_FILE="${REGISTRY_DIR}/public_nodes.txt"
-mkdir -p "$REGISTRY_DIR"
-
-# Default database path
-if [ -z "${QRDX_DATABASE_PATH}" ]; then
-  export QRDX_DATABASE_PATH="/app/data/qrdx.db"
+REGISTRY_AVAILABLE=false
+if mkdir -p "${REGISTRY_DIR}" 2>/dev/null && touch "${REGISTRY_FILE}" 2>/dev/null; then
+    REGISTRY_AVAILABLE=true
 fi
 
-# Default to internal URL if unset
-if [ -z "${qrdx_SELF_URL}" ]; then
-  export qrdx_SELF_URL="http://${NODE_NAME}:${qrdx_NODE_PORT}"
-fi
+# Default self URL to the container's in-network address.
+export QRDX_SELF_URL="${QRDX_SELF_URL:-http://${NODE_NAME}:${QRDX_NODE_PORT}}"
 
-# Normalize bootstrap intent default if unset
-if [ -z "${qrdx_BOOTSTRAP_NODE}" ]; then
-  export qrdx_BOOTSTRAP_NODE="https://node.qrdx.network"
-fi
+# ---------------------------------------------------------------------------
+# STAGE 2 — Optional public tunnel via Pinggy
+# ---------------------------------------------------------------------------
+if [ "${ENABLE_PINGGY_TUNNEL:-false}" = "true" ]; then
+    echo "Pinggy tunnel enabled. Starting SSH reverse tunnel..."
+    ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -p 443 -R0:localhost:"${QRDX_NODE_PORT}" free.pinggy.io > /tmp/pinggy.log 2>&1 &
 
-if [ -z "${LOG_LEVEL}" ]; then export LOG_LEVEL="INFO"; fi
-if [ -z "${LOG_FORMAT}" ]; then export LOG_FORMAT="%(asctime)s UTC - %(levelname)s - %(name)s - %(message)s"; fi
-if [ -z "${LOG_DATE_FORMAT}" ]; then export LOG_DATE_FORMAT="%Y-%m-%dT%H:%M:%S"; fi
-if [ -z "${LOG_INCLUDE_REQUEST_CONTENT}" ]; then export LOG_INCLUDE_REQUEST_CONTENT="False"; fi
-if [ -z "${LOG_INCLUDE_RESPONSE_CONTENT}" ]; then export LOG_INCLUDE_RESPONSE_CONTENT="False"; fi
-if [ -z "${LOG_INCLUDE_BLOCK_SYNC_MESSAGES}" ]; then export LOG_INCLUDE_BLOCK_SYNC_MESSAGES="False"; fi
-if [ -z "${LOG_CONSOLE_HIGHLIGHTING}" ]; then export LOG_CONSOLE_HIGHLIGHTING="True"; fi
+    PUBLIC_ADDRESS=""
+    for _ in $(seq 1 30); do
+        PUBLIC_ADDRESS="$(grep -o 'https://[a-zA-Z0-9-]*\.a\.free\.pinggy\.link' /tmp/pinggy.log | head -n 1 || true)"
+        [ -n "${PUBLIC_ADDRESS}" ] && break
+        sleep 1
+    done
 
-
-# --- STAGE 1: OPTIONAL PUBLIC TUNNEL VIA PINGGY ---
-if [ "${ENABLE_PINGGY_TUNNEL}" = "true" ]; then
-  echo "Pinggy tunnel enabled. Starting tunnel..."
-  ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      -p 443 -R0:localhost:${qrdx_NODE_PORT} free.pinggy.io > /tmp/pinggy.log 2>&1 &
-
-  echo "Waiting for Pinggy to provide a public URL..."
-  COUNTER=0
-  PUBLIC_ADDRESS=""
-  while [ $COUNTER -lt 30 ]; do
-    PUBLIC_ADDRESS=$(grep -o 'https://[a-zA-Z0-9-]*\.a\.free\.pinggy\.link' /tmp/pinggy.log | head -n 1 || true)
-    if [ -n "$PUBLIC_ADDRESS" ]; then
-      echo "SUCCESS: Captured public URL: ${PUBLIC_ADDRESS}"
-      export qrdx_SELF_URL="${PUBLIC_ADDRESS}"
-      echo "${PUBLIC_ADDRESS}" >> "${REGISTRY_FILE}"
-      echo "Published public URL to registry."
-      break
-    fi
-    sleep 1
-    COUNTER=$((COUNTER+1))
-  done
-
-  if [ -z "$PUBLIC_ADDRESS" ]; then
-    echo "WARNING: Could not get public URL from Pinggy. Falling back to internal URL."
-    export qrdx_SELF_URL="http://${NODE_NAME}:${qrdx_NODE_PORT}"
-    export ENABLE_PINGGY_TUNNEL="false"
-    tail -n 50 /tmp/pinggy.log || true
-  fi
-else
-  echo "Pinggy tunnel not enabled. Using internal URL for self."
-fi
-
-# --- STAGE 2 AND 3: BOOTSTRAP DISCOVERY WHEN REQUESTED ---
-if [ "${qrdx_BOOTSTRAP_NODE}" = "discover" ]; then
-  EXPECTED_URLS=1
-  if [ "${ENABLE_PINGGY_TUNNEL}" = "true" ]; then
-    EXPECTED_URLS=2
-    echo "Discovery requested and tunneling enabled. Waiting for a second public node..."
-  else
-    echo "Discovery requested. Waiting for any public node to register..."
-  fi
-
-  COUNTER=0
-  MAX_WAIT_ITERATIONS=60
-
-  while [ "$(wc -l < "${REGISTRY_FILE}" 2>/dev/null || echo 0)" -lt "${EXPECTED_URLS}" ] && [ $COUNTER -lt $MAX_WAIT_ITERATIONS ]; do
-    CURRENT=$(wc -l < "${REGISTRY_FILE}" 2>/dev/null || echo 0)
-    echo "Waiting for public nodes... found ${CURRENT}/${EXPECTED_URLS}"
-    sleep 2
-    COUNTER=$((COUNTER+1))
-  done
-
-  if [ "$(wc -l < "${REGISTRY_FILE}" 2>/dev/null || echo 0)" -lt "${EXPECTED_URLS}" ]; then
-    echo "WARNING: Timed out waiting for enough public nodes."
-    export qrdx_BOOTSTRAP_NODE="${qrdx_SELF_URL}"
-  else
-    OTHER_PUBLIC_ADDRESS=$(grep -v "${qrdx_SELF_URL}" "${REGISTRY_FILE}" | head -n 1 || true)
-    if [ -n "${OTHER_PUBLIC_ADDRESS}" ]; then
-      export qrdx_BOOTSTRAP_NODE="${OTHER_PUBLIC_ADDRESS}"
-      echo "Discovered and selected bootstrap peer: ${qrdx_BOOTSTRAP_NODE}"
+    if [ -n "${PUBLIC_ADDRESS}" ]; then
+        echo "SUCCESS: public URL ${PUBLIC_ADDRESS}"
+        export QRDX_SELF_URL="${PUBLIC_ADDRESS}"
+        if [ "${REGISTRY_AVAILABLE}" = true ]; then
+            echo "${PUBLIC_ADDRESS}" >> "${REGISTRY_FILE}"
+            echo "Published public URL to the peer registry."
+        fi
     else
-      echo "WARNING: Could not discover a different bootstrap peer. Falling back to self."
-      export qrdx_BOOTSTRAP_NODE="${qrdx_SELF_URL}"
+        echo "WARNING: Pinggy did not return a public URL; falling back to the internal URL."
+        export ENABLE_PINGGY_TUNNEL="false"
+        tail -n 20 /tmp/pinggy.log || true
     fi
-  fi
 fi
 
-if [ "${qrdx_BOOTSTRAP_NODE}" = "self" ]; then
-  export qrdx_BOOTSTRAP_NODE="${qrdx_SELF_URL}"
-fi
+# ---------------------------------------------------------------------------
+# STAGE 3 — Bootstrap peer resolution
+# ---------------------------------------------------------------------------
+# An EMPTY QRDX_BOOTSTRAP_NODE is NOT the same as "no bootstrap": qrdx/constants.py
+# treats an empty string as unset and falls back to the public seed node. A node
+# that must not dial out (a local genesis bootstrap) therefore points at itself.
+BOOTSTRAP="${QRDX_BOOTSTRAP_NODE:-}"
 
-# --- STAGE 4: CONFIGURE AND LAUNCH ---
-echo "Configuring .env file for ${NODE_NAME}..."
+case "${BOOTSTRAP}" in
+    "" | "self")
+        BOOTSTRAP="${QRDX_SELF_URL}"
+        ;;
+    "discover")
+        EXPECTED_URLS=1
+        [ "${ENABLE_PINGGY_TUNNEL:-false}" = "true" ] && EXPECTED_URLS=2
 
-# Ensure SQLite database directory exists
-DB_DIR=$(dirname "${QRDX_DATABASE_PATH}")
-mkdir -p "${DB_DIR}"
-echo "SQLite database directory ensured: ${DB_DIR}"
+        if [ "${REGISTRY_AVAILABLE}" != true ]; then
+            echo "WARNING: discovery requested but no peer registry is mounted; using self."
+            BOOTSTRAP="${QRDX_SELF_URL}"
+        else
+            echo "Discovery requested. Waiting for ${EXPECTED_URLS} public node(s)..."
+            for _ in $(seq 1 60); do
+                CURRENT="$(wc -l < "${REGISTRY_FILE}" 2>/dev/null || echo 0)"
+                [ "${CURRENT}" -ge "${EXPECTED_URLS}" ] && break
+                echo "  waiting... ${CURRENT}/${EXPECTED_URLS}"
+                sleep 2
+            done
 
-cat << EOF > /app/.env
-qrdx_NODE_HOST=${qrdx_NODE_HOST}
-qrdx_NODE_PORT=${qrdx_NODE_PORT}
-qrdx_SELF_URL=${qrdx_SELF_URL}
-qrdx_BOOTSTRAP_NODE=${qrdx_BOOTSTRAP_NODE}
+            PEER="$(grep -v -F "${QRDX_SELF_URL}" "${REGISTRY_FILE}" 2>/dev/null | head -n 1 || true)"
+            if [ -n "${PEER}" ]; then
+                BOOTSTRAP="${PEER}"
+                echo "Discovered bootstrap peer: ${BOOTSTRAP}"
+            else
+                echo "WARNING: no distinct peer discovered; using self."
+                BOOTSTRAP="${QRDX_SELF_URL}"
+            fi
+        fi
+        ;;
+esac
 
-QRDX_DATABASE_PATH=${QRDX_DATABASE_PATH}
+export QRDX_BOOTSTRAP_NODE="${BOOTSTRAP}"
+export QRDX_BOOTSTRAP_NODES="${QRDX_BOOTSTRAP_NODES:-${BOOTSTRAP}}"
 
-LOG_LEVEL=${LOG_LEVEL}
-LOG_FORMAT=${LOG_FORMAT}
-LOG_DATE_FORMAT=${LOG_DATE_FORMAT}
-LOG_CONSOLE_HIGHLIGHTING=${LOG_CONSOLE_HIGHLIGHTING}
-LOG_INCLUDE_REQUEST_CONTENT=${LOG_INCLUDE_REQUEST_CONTENT}
-LOG_INCLUDE_RESPONSE_CONTENT=${LOG_INCLUDE_RESPONSE_CONTENT}
-LOG_INCLUDE_BLOCK_SYNC_MESSAGES=${LOG_INCLUDE_BLOCK_SYNC_MESSAGES}
+# ---------------------------------------------------------------------------
+# STAGE 4 — Launch
+# ---------------------------------------------------------------------------
+cat <<EOF
+----------------------------------------
+Node:       ${NODE_NAME}
+Bind:       ${QRDX_NODE_HOST}:${QRDX_NODE_PORT}
+Self URL:   ${QRDX_SELF_URL}
+Bootstrap:  ${QRDX_BOOTSTRAP_NODE}
+Database:   ${QRDX_DATABASE_PATH}
+Validator:  ${QRDX_VALIDATOR_ENABLED:-false}
+RPC (EVM):  ${QRDX_RPC_ENABLED:-false}
+Streaming:  ${QRDX_ENABLE_STREAMING:-off}
+----------------------------------------
 EOF
 
-echo "Generated .env file:"
-cat /app/.env
-echo "----------------------------------------"
+# A custom command (e.g. `docker compose run <svc> python -m qrdx.cli.wallet`)
+# wins over the default node launch.
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+fi
 
-# Launch the qrdx Node
-echo "Starting qrdx node on 0.0.0.0:${qrdx_NODE_PORT}..."
 exec python /app/run_node.py

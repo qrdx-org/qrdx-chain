@@ -1,0 +1,407 @@
+"""
+Atomic EVM block-section apply / validate (E-D3b).
+
+The account/EVM analog of ``qrdx.exchange.block_processor.apply_block_exchange_section``.
+This is the consensus enforcement an importing node runs before accepting a
+block's EVM section, and the same routine the proposer uses to execute the
+section it is about to declare a root for. It is the linchpin that makes the
+EVM "execute-on-mine" flip safe: a block whose ``account_state_root`` does not
+match the deterministic replay is REJECTED with local state left untouched.
+
+Why this is safe without coordinating every scattered ``conn.commit()``:
+
+  * ``account_state`` (and ``contract_storage``) has a **single writer**:
+    ``ContractStateManager.commit()``. The mid-execution ``conn.commit()`` calls
+    on the shared connection (balance-sync registry, balance-change audit,
+    content-addressed contract_code) never write the consensus tables, so they
+    cannot persist a rejected block's account changes.
+  * Execution runs with ``defer_commit=True`` so successful txs accumulate only
+    in the EVM cache.
+  * The block boundary is a single flush-read-decide on one connection:
+      1. ``commit(block_height, flush_only=True)`` writes the dirty rows but does
+         NOT ``conn.commit()`` and keeps the dirty sets / snapshots.
+      2. ``db.get_account_state_root()`` reads those same-connection,
+         not-yet-committed rows and computes the canonical BLAKE3-512 root.
+      3. match  → ``conn.commit()`` (persist) and clear the cache bookkeeping.
+         mismatch → ``conn.rollback()`` (discard the flushed rows) + cache
+         ``revert`` to the block-start snapshot (which also removes accounts
+         *created* during the rejected block).
+
+The executor is injected (``execute_tx``) rather than imported, because EVM
+execution needs the live py-evm executor + state manager wired in the node; the
+exchange equivalent could call its pure state manager directly. Injection also
+keeps this module unit-testable with a lightweight fake executor.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Awaitable, Callable, List, Optional, Tuple
+
+from ..fee_market import CURRENT_EVM_BASE_FEE, base_fees_at
+from .evm_mempool import parse_eth_raw_tx, verify_delegated_spend
+from .native_token_evm import CURRENT_SECTION, EvmSection
+from .state import ContractStateManager
+
+logger = logging.getLogger(__name__)
+
+
+def section_gas_error(raw_txs: Optional[List[str]], height: Optional[int] = None) -> str:
+    """Why an EVM section may not be in a block, or "" if it may: its transactions' declared gas
+    limits must sum to at most the block's EVM gas limit — ``BLOCK_GAS_LIMIT``, or a big block's
+    at ``height`` (docs/BLOCK_LIMITS.md). Checked before any of them runs, on every import path,
+    so a block cannot make every node execute more than the limit allows. Each transaction must
+    authenticate (``parse_eth_raw_tx``) to be counted."""
+    from ..block_limits import evm_gas_limit_at
+
+    limit = evm_gas_limit_at(height)
+    total = 0
+    for i, raw in enumerate(raw_txs or ()):
+        try:
+            total += int(parse_eth_raw_tx(raw)["gas"])
+        except Exception as e:
+            return f"evm tx {i} failed verification: {e}"
+        if total > limit:
+            return f"evm section exceeds the block gas limit ({total} > {limit} at tx {i})"
+    return ""
+
+
+# execute_tx(raw_tx_hex, block_height, block_hash, block_timestamp) -> result dict
+#   The callable MUST execute the tx with deferred commit (changes stay in the
+#   ContractStateManager cache, not flushed to the DB).
+ExecuteTx = Callable[[str, int, str, int], Awaitable[Optional[dict]]]
+
+
+async def produce_block_evm_section(
+    block_height: int,
+    block_hash: str,
+    block_timestamp: int,
+    raw_txs: Optional[List[str]],
+    db: Any,
+    state_manager: ContractStateManager,
+    execute_tx: ExecuteTx,
+) -> Tuple[Optional[str], List[str]]:
+    """
+    Proposer-side execution of a block's EVM section (E-D3b).
+
+    The symmetric counterpart of ``apply_block_evm_section``: the proposer
+    executes the selected txs to obtain the ``account_state_root`` it will declare
+    in the block. So the proposer ships exactly what an importer would accept, the
+    flush-read-**commit** here is byte-identical to the importer's
+    flush-read-**decide**, just without a pre-declared root to compare against.
+
+    On ANY tx that cannot execute, the whole section is reverted and dropped
+    (returns ``(None, [])``) so the proposer ships a block *without* an EVM section
+    rather than one importers would reject — mirroring the exchange proposer's
+    "drop the section rather than ship a bad block" policy.
+
+    Returns ``(account_state_root, included_raw_txs)``. When no section is
+    produced, returns ``(None, [])`` and local state is untouched.
+    """
+    if not raw_txs:
+        return None, []
+
+    # A delegated spend admitted earlier may no longer be authorised in THIS block (the master
+    # controller's sunset height arrived, or governance froze it since). Importers would refuse
+    # the whole block for it (apply_block_evm_section), so leave it out here.
+    authorised = []
+    for raw in raw_txs:
+        ok, _why = await verify_delegated_spend(db, raw, block_height)
+        if ok:
+            authorised.append(raw)
+    raw_txs = authorised
+    if not raw_txs:
+        return None, []
+
+    # Fresh reads: other writers (the exchange, withdrawals) changed the database directly.
+    state_manager.reset_cache()
+    section = EvmSection()  # this section's native token moves, pending
+    token = CURRENT_SECTION.set(section)
+    fee_token = CURRENT_EVM_BASE_FEE.set((await base_fees_at(db, block_height))[0])  # BASEFEE
+    block_snap = await state_manager.snapshot()
+    try:
+        for _i, raw in enumerate(raw_txs):
+            res = await execute_tx(raw, block_height, block_hash, block_timestamp)
+            if res is None or res.get("tx_hash") is None:
+                await state_manager.revert(block_snap)
+                return None, []
+    except Exception:
+        await state_manager.revert(block_snap)
+        return None, []
+    finally:
+        CURRENT_SECTION.reset(token)
+        CURRENT_EVM_BASE_FEE.reset(fee_token)
+
+    await state_manager.commit(block_height, flush_only=True)
+    root = await db.get_account_state_root(block_height)
+    await db.connection.commit()
+    state_manager._dirty_accounts.clear()
+    state_manager._dirty_storage.clear()
+    state_manager._destroyed.clear()
+    state_manager._snapshots.clear()
+    await section.commit(db)
+    return root, list(raw_txs)
+
+
+async def apply_block_evm_section_total(
+    block_height: int,
+    block_hash: str,
+    block_timestamp: int,
+    raw_txs: Optional[List[str]],
+    db: Any,
+    state_manager: ContractStateManager,
+    execute_tx: ExecuteTx,
+) -> Tuple[bool, str, List[str]]:
+    """A block's EVM section under deferred execution (chain-spec feature
+    ``deferred_execution``, qrdx/post_state.py): the block was signed before it ran, so running
+    it must not be able to make it invalid. Every path runs it this way: the proposer after
+    sending its block, importers, sync and the rebuild.
+
+    * What needs no state is still a rule of the block: the section's gas, and every
+      transaction's signature and (for a delegated spend) authority. A proposer checks those
+      before signing, so a block failing them is its proposer's own.
+    * A transaction that cannot run (a nonce or a balance it no longer has: the executor answers
+      None) is skipped: the state and the section's pending records go back to what they were
+      before it. A transaction that runs and reverts is included, as always.
+
+    There is no declared account root to compare: the next block's signed root binds the state
+    this one leaves. Returns ``(ok, error, the transactions that ran)``; ``ok`` is False only for
+    a rule above, before anything changed."""
+    import copy
+
+    if not raw_txs:
+        return True, "", []
+    gas_error = section_gas_error(raw_txs, block_height)
+    if gas_error:
+        return False, f"block {block_height}: {gas_error}", []
+    for i, raw in enumerate(raw_txs):
+        try:
+            parse_eth_raw_tx(raw)
+        except Exception as e:  # ValueError on malformed/forged/typed tx
+            return False, f"evm tx {i} in block {block_height} failed verification: {e}", []
+        ok, why = await verify_delegated_spend(db, raw, block_height)
+        if not ok:
+            return False, f"evm tx {i} in block {block_height}: {why}", []
+
+    state_manager.reset_cache()  # (fresh reads: the exchange wrote to the database first)
+    section = EvmSection()
+    token = CURRENT_SECTION.set(section)
+    fee_token = CURRENT_EVM_BASE_FEE.set((await base_fees_at(db, block_height))[0])  # BASEFEE
+    ran: List[str] = []
+    try:
+        for raw in raw_txs:
+            snap = await state_manager.snapshot()
+            pending = copy.deepcopy(section.__dict__)
+            try:
+                res = await execute_tx(raw, block_height, block_hash, block_timestamp)
+            except Exception as e:  # (cannot run here: as the executor's None)
+                logger.warning("evm tx in block %s raised, skipped: %s", block_height, e)
+                res = None
+            if res is None or res.get("tx_hash") is None:
+                await state_manager.revert(snap)
+                section.__dict__.clear()
+                section.__dict__.update(pending)
+                continue
+            ran.append(raw)
+    finally:
+        CURRENT_SECTION.reset(token)
+        CURRENT_EVM_BASE_FEE.reset(fee_token)
+
+    await state_manager.commit(block_height, flush_only=True)
+    await db.connection.commit()
+    state_manager._dirty_accounts.clear()
+    state_manager._dirty_storage.clear()
+    state_manager._destroyed.clear()
+    state_manager._snapshots.clear()
+    await section.commit(db)
+    return True, "", ran
+
+
+async def rebuild_account_state_from_chain(
+    db: Any,
+    state_manager: ContractStateManager,
+    execute_tx: ExecuteTx,
+) -> str:
+    """
+    Reconstruct EVM/account state by replaying every canonical block's EVM
+    section in height order (E-D3b — reorg safety).
+
+    Unlike the in-memory exchange state, ``account_state`` is **durable in
+    SQLite**, so a plain restart needs NO rebuild (the table is already correct).
+    This is for **reorg safety**: after the base layer rolls back to a common
+    ancestor, the orphaned blocks' account changes are still committed in the
+    table, so we clear EVM state and replay the canonical sections up to the
+    current (rolled-back) tip. Incoming canonical blocks then re-apply normally
+    via ``apply_block_evm_section`` as they sync in.
+
+    Clears ``account_state`` + ``contract_storage`` and the manager cache, then
+    replays. O(total EVM txs); checkpointing is a future optimization. Returns the
+    resulting canonical ``account_state_root``.
+    """
+    # Clear durable EVM tables + in-memory cache so the replay is authoritative.
+    await db.clear_account_state()
+    state_manager._accounts_cache.clear()
+    state_manager._storage_cache.clear()
+    state_manager._code_cache.clear()
+    state_manager._dirty_accounts.clear()
+    state_manager._dirty_storage.clear()
+    state_manager._destroyed.clear()
+    state_manager._snapshots.clear()
+
+    # Phase E (unified ledger): re-seed the genesis allocations that form the
+    # durable BASE of account_state. They are not produced by any EVM section, so
+    # without this the clear above would wipe every genesis balance on a reorg.
+    try:
+        seeded = await db.seed_genesis_account_state()
+        await db.connection.commit()
+        if seeded:
+            logger.info("rebuild_account_state: re-seeded %d genesis account(s)", seeded)
+    except Exception as e:
+        logger.warning("rebuild_account_state: genesis re-seed failed: %s", e)
+
+    try:
+        tip = (await db.get_next_block_id()) - 1
+    except Exception:
+        return await db.get_account_state_root()
+
+    applied = 0
+    for height in range(0, tip + 1):
+        try:
+            block = await db.get_block_by_id(height)
+        except Exception:
+            block = None
+        if not block:
+            continue
+        block_hash = block.get("hash") or block.get("block_hash")
+        if not block_hash:
+            continue
+        try:
+            section = await db.get_block_evm_txs(block_hash)
+        except Exception:
+            section = None
+        if not section:
+            continue
+        ts = int(block.get("timestamp", 0) or 0)
+        root, _included = await produce_block_evm_section(
+            height,
+            block_hash,
+            ts,
+            section,
+            db,
+            state_manager,
+            execute_tx,
+        )
+        if root is not None:
+            applied += 1
+    root = await db.get_account_state_root(tip)
+    logger.info(
+        "[reorg-diag] rebuild_account_state: tip=%d evm_sections_applied=%d acct_root=%s",
+        tip,
+        applied,
+        root[:16],
+    )
+    return root
+
+
+async def apply_block_evm_section(
+    block_height: int,
+    block_hash: str,
+    block_timestamp: int,
+    raw_txs: Optional[List[str]],
+    declared_state_root: Optional[str],
+    db: Any,
+    state_manager: ContractStateManager,
+    execute_tx: ExecuteTx,
+) -> Tuple[bool, str]:
+    """
+    Securely validate and apply a block's EVM section on import (E-D3b).
+
+    Steps (mirrors the exchange D3 enforcement):
+      1. **Authenticate first** — recover the sender of every tx via
+         ``parse_eth_raw_tx`` BEFORE touching state; a forged/typed/malformed tx
+         rejects the whole block so a proposer cannot smuggle unverifiable txs.
+      2. **Require a declared root** — a section with no ``account_state_root`` is
+         unverifiable and rejected.
+      3. **Execute deterministically** under a block-start cache snapshot, with
+         each tx deferring its commit.
+      4. **Flush-read-decide** — flush the cache, read the canonical root, and on
+         any mismatch ``rollback`` the DB + ``revert`` the cache so a rejected
+         block leaves local state untouched.
+      5. **Commit on success.**
+
+    An empty/absent section is a no-op success.
+
+    Returns ``(ok, error)``. On ``False`` the block MUST be rejected and local
+    EVM/account state is unchanged.
+    """
+    if not raw_txs:
+        return True, ""
+
+    if not declared_state_root:
+        return False, "evm section present but block declares no account_state_root"
+
+    gas_error = section_gas_error(raw_txs, block_height)
+    if gas_error:
+        return False, f"block {block_height}: {gas_error}"
+
+    # 1. Authenticate every tx before mutating any state.
+    for i, raw in enumerate(raw_txs):
+        try:
+            parse_eth_raw_tx(raw)
+        except Exception as e:  # ValueError on malformed/forged/typed tx
+            return False, f"evm tx {i} in block {block_height} failed verification: {e}"
+        # A DELEGATED spend (system wallet) must be authorised here too, not only at
+        # submission — otherwise a proposer could smuggle an unauthorised one into a
+        # block, exactly the hole the signature check above sits here to close.
+        ok, why = await verify_delegated_spend(db, raw, block_height)
+        if not ok:
+            return False, f"evm tx {i} in block {block_height}: {why}"
+
+    # 2. Block-start snapshot (revert point for reject-on-mismatch), on fresh reads (other
+    #    writers changed the database directly), with a pending section for token moves.
+    state_manager.reset_cache()
+    section = EvmSection()
+    token = CURRENT_SECTION.set(section)
+    fee_token = CURRENT_EVM_BASE_FEE.set((await base_fees_at(db, block_height))[0])  # BASEFEE
+    block_snap = await state_manager.snapshot()
+
+    # 3. Replay deterministically, deferring per-tx commits.
+    try:
+        for i, raw in enumerate(raw_txs):
+            res = await execute_tx(raw, block_height, block_hash, block_timestamp)
+            # A tx that *reverts* (out of gas / EVM revert) is still validly
+            # included and still mutates state (nonce/gas); the root comparison
+            # below — not per-tx success — is the authoritative gate. Only a hard
+            # inability to run the tx (None / no tx_hash) indicates a node that
+            # cannot validate the block, so we conservatively reject.
+            if res is None or res.get("tx_hash") is None:
+                await state_manager.revert(block_snap)
+                err = res.get("error") if isinstance(res, dict) else "no result"
+                return False, f"evm tx {i} in block {block_height} could not execute: {err}"
+    except Exception as e:
+        await state_manager.revert(block_snap)
+        return False, f"evm execution raised in block {block_height}: {e}"
+    finally:
+        CURRENT_SECTION.reset(token)
+        CURRENT_EVM_BASE_FEE.reset(fee_token)
+
+    # 4. Flush-read-decide on a single connection (no competing commit here).
+    await state_manager.commit(block_height, flush_only=True)
+    computed_root = await db.get_account_state_root(block_height)
+    if computed_root != declared_state_root:
+        await db.connection.rollback()  # discard the flushed (uncommitted) rows
+        await state_manager.revert(block_snap)  # discard cache + created accounts
+        return False, (
+            f"account_state_root mismatch at block {block_height}: "
+            f"declared {declared_state_root[:16]}..., computed {computed_root[:16]}..."
+        )
+
+    # 5. Accept: persist atomically and discard the revert bookkeeping; the section's token
+    #    moves go to the ledger (committed with the block).
+    await db.connection.commit()
+    state_manager._dirty_accounts.clear()
+    state_manager._dirty_storage.clear()
+    state_manager._destroyed.clear()
+    state_manager._snapshots.clear()
+    await section.commit(db)
+    return True, ""

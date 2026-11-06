@@ -19,9 +19,8 @@ import logging
 import os
 import ssl
 import tempfile
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +28,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # TLS context builder
 # ---------------------------------------------------------------------------
+
 
 class TLSContextBuilder:
     """
@@ -205,6 +205,7 @@ class TLSContextBuilder:
 # HSTS header helper
 # ---------------------------------------------------------------------------
 
+
 def hsts_header(max_age: int = 31536000, include_subdomains: bool = True) -> str:
     """
     Generate an HTTP Strict-Transport-Security header value.
@@ -226,6 +227,7 @@ def hsts_header(max_age: int = 31536000, include_subdomains: bool = True) -> str
 # Self-signed certificate generation (for dev/test only)
 # ---------------------------------------------------------------------------
 
+
 def generate_self_signed_cert(
     common_name: str = "localhost",
     days_valid: int = 365,
@@ -240,16 +242,17 @@ def generate_self_signed_cert(
         Tuple of (cert_path, key_path) as temp file paths
     """
     try:
+        import datetime
+
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.x509.oid import NameOID
-        import datetime
-    except ImportError:
+    except ImportError as exc:
         raise ImportError(
             "cryptography package required for self-signed cert generation. "
             "Install: pip install cryptography"
-        )
+        ) from exc
 
     # Generate RSA key
     key = rsa.generate_private_key(
@@ -258,10 +261,12 @@ def generate_self_signed_cert(
     )
 
     # Build certificate
-    subject = issuer = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "QRDX Dev"),
-    ])
+    subject = issuer = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "QRDX Dev"),
+        ]
+    )
 
     now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
@@ -273,10 +278,12 @@ def generate_self_signed_cert(
         .not_valid_before(now)
         .not_valid_after(now + datetime.timedelta(days=days_valid))
         .add_extension(
-            x509.SubjectAlternativeName([
-                x509.DNSName("localhost"),
-                x509.DNSName("127.0.0.1"),
-            ]),
+            x509.SubjectAlternativeName(
+                [
+                    x509.DNSName("localhost"),
+                    x509.DNSName("127.0.0.1"),
+                ]
+            ),
             critical=False,
         )
         .sign(key, hashes.SHA256())
@@ -290,11 +297,13 @@ def generate_self_signed_cert(
         f.write(cert.public_bytes(serialization.Encoding.PEM))
 
     with os.fdopen(key_fd, "wb") as f:
-        f.write(key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption(),
-        ))
+        f.write(
+            key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            )
+        )
 
     logger.warning(
         "Generated self-signed certificate for '%s' (dev only!): %s",

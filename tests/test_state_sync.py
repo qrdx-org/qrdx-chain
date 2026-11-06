@@ -8,6 +8,8 @@ import pytest
 import asyncio
 from decimal import Decimal
 from eth_utils import to_checksum_address, keccak
+
+from qrdx.crypto.account_id import to_account_id
 import sys
 import os
 
@@ -143,52 +145,65 @@ class MockPoolContext:
 
 
 class MockDatabase:
-    """Mock database for testing."""
-    
+    """Mock database for testing.
+
+    Keys balances by canonical ACCOUNT ID, exactly as the real
+    ``account_state`` ledger does — so a checksummed 0x address, its lowercase
+    form, and the 0xPQ credential for the same account all resolve to one entry.
+    A mock that keyed on the literal string would silently disagree with
+    production and make these tests meaningless.
+    """
+
     def __init__(self):
         self.balances = {}
         self.pool = MockPool(self)
         self.last_insert = None
         self.connection = MockConnection(self)
-        
+
     async def get_address_balance(self, address: str) -> Decimal:
         """Mock balance lookup."""
-        return self.balances.get(address, Decimal("0"))
-    
+        return self.balances.get(to_account_id(address), Decimal("0"))
+
     def set_balance(self, address: str, balance: Decimal):
         """Set balance for testing."""
-        self.balances[address] = balance
+        self.balances[to_account_id(address)] = balance
 
 
 class MockEVMState:
-    """Mock EVM state manager for testing."""
-    
+    """Mock EVM state manager for testing.
+
+    Account-id keyed, mirroring ``ContractStateManager``.
+    """
+
     def __init__(self):
         self.accounts = {}
         self.snapshots = []
-        
+
     async def get_balance(self, address: str) -> int:
         """Get account balance."""
-        if address in self.accounts:
-            return self.accounts[address]['balance']
+        key = to_account_id(address)
+        if key in self.accounts:
+            return self.accounts[key]['balance']
         return 0
-    
+
     async def get_account(self, address: str):
         """Get account object."""
-        if address not in self.accounts:
-            self.accounts[address] = {
+        key = to_account_id(address)
+        if key not in self.accounts:
+            self.accounts[key] = {
                 'balance': 0,
                 'nonce': 0,
-                'address': address
+                'address': key
             }
-        return type('Account', (), self.accounts[address])()
+        return type('Account', (), self.accounts[key])()
     
     async def set_account(self, account):
         """Update account."""
-        self.accounts[account.address] = {
+        key = to_account_id(account.address)
+        self.accounts[key] = {
             'balance': account.balance,
             'nonce': getattr(account, 'nonce', 0),
-            'address': account.address
+            'address': key
         }
     
     async def snapshot(self) -> int:

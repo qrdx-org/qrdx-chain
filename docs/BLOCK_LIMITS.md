@@ -1,0 +1,183 @@
+# What a block may carry, and what its gas costs
+
+Every node executes every block, within the slot clock. So what a block may carry is bounded
+by what a node can execute, not only by its size in bytes, and what it costs to fill a block
+rises with demand.
+
+| Part | Where |
+|---|---|
+| The limits, checked on every import path | `qrdx/block_limits.py` (from `_verify_chain_rules` in `qrdx/node/block_import.py`) |
+| EVM gas of a section | `qrdx/contracts/evm_block_apply.py` `section_gas_error` |
+| Matching paid per resting order | `qrdx/exchange/orderbook.py` `MatchBudget`, `EXCHANGE_GAS_PER_MAKER` |
+| Base fees | `qrdx/fee_market.py` |
+| Precompile surcharges | `qrdx/contracts/evm_world.py` |
+| Calibration | `scripts/bench/evm_gas.py` |
+| Tests | `tests/test_block_limits.py`, `tests/test_match_budget.py`, `tests/test_fee_market.py`, `tests/test_evm_world_equivalence.py` |
+
+## The limits
+
+A block is refused, before anything in it is verified or executed, if it carries more than:
+
+| What | Limit | Parameter |
+|---|---|---|
+| EVM gas: its transactions' declared gas limits, summed | 1,000,000 | `BLOCK_GAS_LIMIT` (chain spec) |
+| EVM gas in a big block (every 240th, by height) | 3,000,000 | `BIG_BLOCK_GAS_LIMIT`, `BIG_BLOCK_INTERVAL` |
+| Exchange gas: its operations' declared gas limits, summed | 80,000,000 (was 20,000,000) | `BLOCK_EXCHANGE_GAS_LIMIT` (chain spec, height-aware) |
+| Votes, each a Dilithium signature to verify | 128 | `MAX_ATTESTATIONS_PER_BLOCK` |
+| Slashing proofs, each two signatures | 16 | `MAX_SLASHING_EVIDENCE_PER_BLOCK` |
+| Structure in its content: the characters `,:[{('"+-`, counted | 25,600 (1,024 + 128 a vote + 512 a slashing proof) | `block_verification.max_content_structure` |
+
+The structure limit is checked before the content is parsed. A parse costs in proportion to the
+structure it builds, so content built to be slow to parse could hold a node for seconds. It
+allows twice what a full block uses; a proposer's graffiti is cut to 64 characters, so honest
+blocks stay far inside it.
+
+Declared limits are summed, not gas used, so a block can be judged before any of it runs. The
+proposer fills blocks to the limits (`select_for_block`). The mempools refuse a transaction with
+a gas limit no block could carry. `eth_call` and gas estimation run on the node's own time, so
+they get no more than `BLOCK_GAS_LIMIT` either.
+
+### Why these numbers
+
+`scripts/bench/evm_gas.py` runs the EVM's slowest workloads per unit of gas through the node's
+own executor. On the development machine:
+
+| Workload | Mgas/s |
+|---|---|
+| JUMPDEST in a loop (1 gas each: the cheapest instruction) | ~1.7 |
+| bn128 multiplication / pairing (surcharged, below) | ~1.7 / ~2.4 |
+| identity 4 KB / sha256 4 KB / ecrecover | ~5 / ~18 / ~15 |
+| BALANCE of accounts not yet loaded | ~9 |
+
+py-evm runs its cheapest instructions at ~1.7 Mgas/s. A 1,000,000-gas block of them takes about
+0.6 s, two or three 250 ms slots. That is a burst the chain absorbs: blocks come more slowly for
+a moment, and the base fee (below) makes a sustained run of them prohibitively expensive within
+seconds. A smaller limit would forbid deploying a token contract, typically 0.6–1.2M gas. Ordinary
+transactions run far faster per unit of gas: a transfer is about 1 ms.
+
+Exchange operations run in the node's own code, about 200 times faster per unit of gas. An
+order is ~75 µs, most of it verifying its Dilithium signature, against 40,000–60,000 gas.
+
+80,000,000 gas is 2,000 transfers or spot orders a block, or 1,333 perp orders. The base fee
+targets half of it, so at 250 ms slots the sustained rate is 4,000 transfers a second, with
+bursts to 8,000 (docs/PERFORMANCE.md). It was 20,000,000: 500 a block, 1,000 a second
+sustained. A node verifies a block's signatures in one parallel batch (docs/NATIVE.md) and runs
+the rest of the block's pipeline at about 4,450 transfers a second on one core.
+
+### Raising the exchange limit on a running network
+
+New networks start at 80,000,000. A network keeps the limit its genesis committed to, so
+existing testnets keep 20,000,000 until a fork changes it. `BLOCK_EXCHANGE_GAS_LIMIT` is a
+height-aware parameter: a fork in the network's chain spec may set it from a height on
+(docs/PROTOCOL_UPGRADES.md). Every consumer reads it for the height of the block it judges:
+
+* block checks (`block_limits.exchange_gas_limit_at`);
+* the proposer's selection;
+* the base fee, which uses the parent's limit.
+
+```json
+"forks": [{"name": "wider-blocks", "height": 250000, "features": [],
+           "params": {"BLOCK_EXCHANGE_GAS_LIMIT": 80000000}}]
+```
+
+A mempool admits any operation that fits the largest limit the schedule reaches.
+
+Run the script on the slowest hardware a network's validators use before setting its limits.
+
+### Matching is paid for by the order that does it
+
+An order visiting a resting order costs `EXCHANGE_GAS_PER_MAKER` (10,000) on top of its base
+gas, whether the resting order fills, is skipped (self-trade prevention) or is cancelled (the
+margin check at match time). An order visits no more resting orders than its gas limit pays for.
+When the budget runs out the order stops matching, and its remainder is cancelled, not rested: it
+could still cross the book. A visit takes ~25 µs. An order used to sweep any number of makers for
+its base gas: 1,600 makers in one `PERP_ORDER` took 38 ms for 60,000 gas.
+
+The same holds for a `SWAP` routed through an order book (the router quotes the book within what
+the gas limit pays for, and execution runs on exactly that budget), and for an order that fails
+after matching — a fill-or-kill that cannot fill whole pays for the makers it visited.
+
+### Work the tick does is paid for when it is placed, and bounded per block
+
+Trigger orders and TWAP slices run in the tick at the end of a block, outside any transaction
+(docs/TRADING_FEATURES.md). Their matching is paid for when they are placed: a trigger prepays
+`max_makers` (1–100) resting-order visits, a TWAP each slice's work and `max_makers` (1–20) visits.
+A block fires at most 64 perps triggers and 64 spot triggers (1,000 visits each), runs at most 64
+TWAP slices (640 visits); the rest wait for the next blocks. A 60-slice TWAP costs 3.64M gas at 5
+makers a slice, so no TWAP can prepay more than a block's exchange gas.
+
+### Precompiles priced for what they cost here
+
+py-evm runs bn128 in pure Python, where Ethereum clients run it natively. At Ethereum's prices
+a block of pairings took ~6 s. On QRDX, ecMul costs 18,000 gas (6,000 + 12,000) and a pairing
+350,000 a pair (34,000 + 316,000). That is what keeps them no slower per unit of gas than the
+cheapest instruction. **A zk-SNARK verification (3–4 pairings) does not fit a block** until a
+native pairing backend replaces py_ecc.
+
+ecrecover needs `coincurve`, which is in the release lock. Without it, eth-keys recovers
+signatures in pure Python, at 0.2 Mgas/s, and recovering every EVM transaction's sender costs
+~15 ms. A node without it logs an error at startup.
+
+### Big blocks
+
+A contract deployment typically needs 0.6–1.2M gas, so the larger ones fit no ordinary block.
+Every `BIG_BLOCK_INTERVAL`-th block (by height: 240, once a minute) may carry
+`BIG_BLOCK_GAS_LIMIT` (3,000,000) of EVM gas. This is HyperEVM's big block. Unlike HyperEVM's,
+it runs inline with the slot clock: a big block of the slowest work takes ~1.8 s. It is priced
+on an EVM fee track of its own that moves up to 1/2 per big block (below). A transaction may
+declare up to the big limit; one above the ordinary limit waits for a big block.
+`BIG_BLOCK_INTERVAL` 0 turns them off. Code: `qrdx/block_limits.py` (`evm_gas_limit_at`).
+Tests: `tests/test_big_blocks.py`.
+
+## Loading state is linear
+
+The EVM loads the accounts and storage it reads on demand. It used to start the transaction
+over on every miss, on a state rebuilt and re-hashed from everything loaded so far. That made a
+transaction touching n new accounts O(n²): 800,000 gas of BALANCE calls took 2.8 s, and a
+transaction's 10M gas took minutes, on every node. Now execution runs in a greenlet and switches
+out to load what it misses. Each account and slot is loaded once, where the execution stopped for
+it. The state is a journaled dictionary store with py-evm's semantics: who exists, original
+values, warm and cold access. `tests/test_evm_world_equivalence.py` runs random contracts on
+both stores and requires identical results, gas, logs and state roots.
+
+## Base fees
+
+Each block's signed header carries two base fees, in wei per unit of gas: the EVM's
+(`base_fee`) and the exchange's (`exchange_base_fee`). The parent sets each one, as Ethereum's
+EIP-1559 does:
+
+    next = parent_fee × (1 + (parent_gas − target) / target / 8),   target = limit / 2
+
+`parent_gas` is what the parent's sections declared, oracle votes excluded. The fee is never
+below its floor: `EVM_MIN_GAS_PRICE_WEI` or `EXCHANGE_MIN_GAS_PRICE_WEI`, both 1 gwei by default.
+When the parent was over target, the fee rises by at least one wei. A block must declare exactly
+these fees, and every transaction in it must offer at least them. Validators' oracle votes are
+exempt, so a burst of traffic can never stall the prices the exchange runs on. All of it is
+burned, as before.
+
+Trading operations in the free lane are exempt too (`gas_price` 0, docs/TOKENOMICS.md): they
+pay nothing within their account's budget. Their gas still counts toward the block's exchange
+limit and toward the base fee, so a flood of them raises it. Above twice its floor
+(`FREE_TRADING_MAX_BASE_FEE_BPS`) only cancels go free, and everyone else pays until the blocks
+clear.
+
+Before this, gas cost the floor however full blocks were, and EVM transactions had no floor at
+all: a gas price of 0 executed for free. Now a run of full blocks raises the price 12.5% a
+block. Thirty seconds of them at 250 ms slots multiply it about 1.4 million times, and it comes
+back down as fast.
+
+With big blocks, the EVM fee runs on two tracks. A big block's EVM base fee is set by the big
+block before it, an ordinary block's by the ordinary block before it, so neither kind moves the
+other's price. The big track moves up to 1/2 per big block (`BIG_BLOCK_CHANGE_DENOMINATOR`), not
+1/8, because big blocks come once an interval: twenty full ones multiply its price about 3,300
+times. The exchange fee is always set by the parent.
+
+`eth_gasPrice` and `exchange_gasPrice` return the next block's base fee plus one block's worth
+of headroom. `exchange_getSigningPayload` fills that in when no price is given. `eth_feeHistory`
+reads the fees from the headers. A transaction priced below the current base fee waits in the
+mempool until the fee comes down to it.
+
+The EVM's `BASEFEE` opcode (EIP-3198) reads the executing block's EVM base fee
+(`fee_market.CURRENT_EVM_BASE_FEE`). The section functions set it from the stored chain, so the
+proposer, every importer and a rebuild from history agree. Outside a block (`eth_call`) it is the
+floor.

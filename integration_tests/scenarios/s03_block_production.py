@@ -1,0 +1,77 @@
+"""
+S03 — Block Production & Consensus
+
+Verifies:
+  - Blocks are being produced (height advances)
+  - All nodes agree on blocks (height consistency)
+  - Block production rate is reasonable for the slot (250 ms standard)
+  - Consensus state is accessible
+"""
+
+import asyncio
+from integration_tests.scenarios.base import Scenario
+from integration_tests.rpc_client import MultiNodeClient
+
+
+class S03BlockProduction(Scenario):
+    name = "s03_block_production"
+    description = "Verify block production and consensus"
+    depends_on = ["s02_peer_mesh"]
+
+    async def execute(self) -> None:
+        node_urls = self.ctx.node_urls
+
+        async with MultiNodeClient(node_urls) as clients:
+            # Record initial heights
+            heights_before = await clients.get_block_heights()
+            self._log.info("Heights before: %s", heights_before)
+
+            # Wait for blocks to be produced (6 seconds = ~3 slots)
+            await asyncio.sleep(6)
+
+            # Record heights after
+            heights_after = await clients.get_block_heights()
+            self._log.info("Heights after: %s", heights_after)
+
+            # Check that at least one node advanced
+            any_advanced = any(
+                after > before
+                for before, after in zip(heights_before, heights_after)
+                if before >= 0 and after >= 0
+            )
+            self.check(any_advanced, "At least one node produced blocks")
+
+            # Check heights are consistent across the quorum. Tolerate one
+            # lagging node (the testnet's non-validator syncs a few blocks behind
+            # the validators): dropping the single lowest height still catches a
+            # real split (>=2 nodes apart) without failing on one benign laggard.
+            valid_heights = [h for h in heights_after if h >= 0]
+            if valid_heights:
+                full_spread = max(valid_heights) - min(valid_heights)
+                quorum = sorted(valid_heights, reverse=True)[: max(2, len(valid_heights) - 1)]
+                spread = max(quorum) - min(quorum)
+                self.check(
+                    spread <= 5,
+                    f"Block heights consistent across quorum (spread={spread}, full={full_spread})",
+                )
+
+            # Check max height advanced
+            max_before = max(h for h in heights_before if h >= 0) if any(h >= 0 for h in heights_before) else 0
+            max_after = max(valid_heights) if valid_heights else 0
+            blocks_produced = max_after - max_before
+            self.check_gte(blocks_produced, 1, f"Blocks produced in 6s ({blocks_produced})")
+
+            # Check block rate is reasonable: at most one block per slot (with a little slack
+            # for the measurement window's edges).
+            if blocks_produced > 0:
+                from qrdx.constants import SLOT_DURATION
+
+                rate = blocks_produced / 6.0
+                ceiling = 1.0 / SLOT_DURATION + 0.5
+                self.check(
+                    rate <= ceiling,
+                    f"Block rate reasonable ({rate:.2f} blk/s, at most {ceiling:.2f} per slot clock)",
+                )
+
+            # Store max height for dependent scenarios
+            self.ctx.artifacts["max_height_after_s03"] = max_after

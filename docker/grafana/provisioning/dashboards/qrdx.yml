@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: QRDX
+    folder: QRDX
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

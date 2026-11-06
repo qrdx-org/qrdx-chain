@@ -1,0 +1,195 @@
+"""
+Phase E — CLOB order-book settlement (escrow-on-place / settle-on-match / refund-on-cancel).
+
+Gated by ExchangeStateManager.enforce_orderbook_settlement (observe-first, default off →
+behaviour-neutral). When on, a placed LIMIT order escrows its funds into a per-book escrow
+holder, matched trades move real base/quote token balances maker↔taker (maker side from
+escrow, taker side live), and cancel refunds the resting remainder. These pin conservation
+(no token created/destroyed) + the affordability/market guards.
+"""
+
+from decimal import Decimal
+from types import SimpleNamespace
+
+import pytest
+
+from qrdx.exchange.state_manager import ExchangeStateManager
+from qrdx.exchange.orderbook import OrderBook, OrderSide
+
+
+@pytest.fixture(autouse=True)
+def _fee_free(no_trading_fees):
+    """Escrow and settlement mechanics, amounts exact: fees off (tests/test_spot_fees.py)."""
+
+
+PAIR = "TKA:TKB"   # base:quote
+BASE, QUOTE = "TKA", "TKB"
+
+
+def _mgr():
+    mgr = ExchangeStateManager()
+    mgr.enforce_orderbook_settlement = True
+    mgr._order_books[PAIR] = OrderBook(pool_id=PAIR)
+    mgr.begin_block(1, 0.0)
+    return mgr
+
+
+def _order_tx(sender, side, price, amount, oid, order_type="limit"):
+    return SimpleNamespace(
+        sender=sender, nonce=0, tx_hash=lambda _o=oid: _o,
+        params={"pair": PAIR, "side": side, "order_type": order_type,
+                "price": str(price), "amount": str(amount)})
+
+
+def _escrow(mgr):
+    return mgr.orderbook_escrow_address(PAIR)
+
+
+def _assert_conserves(mgr):
+    sums = {}
+    for (holder, token), d in mgr.token_balance_deltas().items():
+        sums[token] = sums.get(token, Decimal(0)) + d
+    for token, s in sums.items():
+        assert s == Decimal(0), f"{token} not conserved: net {s}"
+
+
+def test_place_sell_escrows_base():
+    mgr = _mgr()
+    mgr.set_available_token_balance("0xPQm", BASE, Decimal("100"))
+    res = mgr._op_place_order(_order_tx("0xPQm", "sell", 5, 10, "m" * 16))
+    assert res.success
+    d = mgr.token_balance_deltas()
+    assert d[("0xPQm", BASE)] == Decimal("-10")
+    assert d[(_escrow(mgr), BASE)] == Decimal("10")
+    _assert_conserves(mgr)
+
+
+def test_full_match_settles_and_conserves():
+    mgr = _mgr()
+    mgr.set_available_token_balance("0xPQm", BASE, Decimal("100"))
+    mgr.set_available_token_balance("0xPQt", QUOTE, Decimal("100000"))
+    mgr._op_place_order(_order_tx("0xPQm", "sell", 5, 10, "m" * 16))   # rests, escrows 10 base
+    mgr._op_place_order(_order_tx("0xPQt", "buy", 5, 10, "t" * 16))    # matches fully @ 5
+    d = mgr.token_balance_deltas()
+    esc = _escrow(mgr)
+    assert d[("0xPQt", BASE)] == Decimal("10")          # buyer gets base
+    assert d[(esc, BASE)] == Decimal("0")               # escrow released (+10 then -10)
+    assert d[("0xPQm", BASE)] == Decimal("-10")         # seller gave base
+    assert d[("0xPQt", QUOTE)] == Decimal("-50")        # buyer paid 10*5
+    assert d[("0xPQm", QUOTE)] == Decimal("50")         # seller received 50
+    _assert_conserves(mgr)
+
+
+def test_taker_keeps_price_improvement():
+    mgr = _mgr()
+    mgr.set_available_token_balance("0xPQm", BASE, Decimal("100"))
+    mgr.set_available_token_balance("0xPQt", QUOTE, Decimal("100000"))
+    mgr._op_place_order(_order_tx("0xPQm", "sell", 5, 10, "m" * 16))   # ask @ 5
+    mgr._op_place_order(_order_tx("0xPQt", "buy", 6, 10, "t" * 16))    # bid @ 6 → fills @ 5
+    d = mgr.token_balance_deltas()
+    assert d[("0xPQt", QUOTE)] == Decimal("-50")        # pays maker's 5, not its 6
+    _assert_conserves(mgr)
+
+
+def test_unmatched_buy_escrows_quote():
+    mgr = _mgr()
+    mgr.set_available_token_balance("0xPQt", QUOTE, Decimal("100000"))
+    mgr._op_place_order(_order_tx("0xPQt", "buy", 5, 10, "t" * 16))    # no asks → rests
+    d = mgr.token_balance_deltas()
+    assert d[("0xPQt", QUOTE)] == Decimal("-50")        # escrow 10*5
+    assert d[(_escrow(mgr), QUOTE)] == Decimal("50")
+    _assert_conserves(mgr)
+
+
+def test_cancel_refunds_escrow():
+    mgr = _mgr()
+    mgr.set_available_token_balance("0xPQt", QUOTE, Decimal("100000"))
+    mgr._op_place_order(_order_tx("0xPQt", "buy", 5, 10, "t" * 16))    # escrow 50 quote
+    cancel = SimpleNamespace(sender="0xPQt", nonce=1,
+                             params={"order_id": "t" * 16, "pair": PAIR})
+    res = mgr._op_cancel_order(cancel)
+    assert res.success
+    d = mgr.token_balance_deltas()
+    assert d[("0xPQt", QUOTE)] == Decimal("0")          # escrow(50) then refund(50)
+    assert d[(_escrow(mgr), QUOTE)] == Decimal("0")
+    _assert_conserves(mgr)
+
+
+def test_enforce_rejects_unaffordable_limit():
+    mgr = _mgr()
+    mgr.set_available_token_balance("0xPQt", QUOTE, Decimal("10"))     # needs 50
+    res = mgr._op_place_order(_order_tx("0xPQt", "buy", 5, 10, "t" * 16))
+    assert not res.success and "insufficient" in res.error
+    assert mgr.token_balance_deltas() == {}              # no match, no settlement
+
+
+def test_enforce_market_order_settles_live_and_escrows_nothing():
+    """A market order takes what the book has and never rests: each fill is paid live."""
+    mgr = _mgr()
+    mgr.set_available_token_balance("0xPQm", BASE, Decimal("100"))
+    mgr._op_place_order(_order_tx("0xPQm", "sell", 5, 10, "m" * 16))   # rests, escrows 10 base
+    mgr.set_available_token_balance("0xPQt", QUOTE, Decimal("100000"))
+    res = mgr._op_place_order(_order_tx("0xPQt", "buy", 0, 15, "t" * 16, order_type="market"))
+    assert res.success and res.data["filled"] == "10"
+    d = mgr.token_balance_deltas()
+    assert d[("0xPQt", BASE)] == Decimal("10") and d[("0xPQt", QUOTE)] == Decimal("-50")
+    assert d[(_escrow(mgr), BASE)] == 0 and d.get((_escrow(mgr), QUOTE), 0) == 0
+    assert mgr._order_books[PAIR].get_order("t" * 16) is None
+    _assert_conserves(mgr)
+
+
+def test_enforce_market_order_the_taker_cannot_pay_fails_whole():
+    mgr = _mgr()
+    mgr.enforce_spot_settlement = True
+    mgr.set_available_token_balance("0xPQm", BASE, Decimal("100"))
+    mgr.set_available_token_balance(_escrow(mgr), BASE, Decimal("0"))
+    mgr._op_place_order(_order_tx("0xPQm", "sell", 5, 10, "m" * 16))
+    before = (mgr.token_balance_deltas(), mgr._order_books[PAIR].state_digest())
+    mgr.set_available_token_balance("0xPQt", QUOTE, Decimal("10"))     # 10 base cost 50
+    res = mgr._op_place_order(_order_tx("0xPQt", "buy", 0, 10, "t" * 16, order_type="market"))
+    assert not res.success and "cannot cover" in res.error
+    assert (mgr.token_balance_deltas(), mgr._order_books[PAIR].state_digest()) == before
+
+
+def test_observe_off_is_behaviour_neutral():
+    mgr = ExchangeStateManager()  # enforce_orderbook_settlement defaults False
+    mgr._order_books[PAIR] = OrderBook(pool_id=PAIR)
+    mgr.begin_block(1, 0.0)
+    res = mgr._op_place_order(_order_tx("0xPQt", "buy", 5, 10, "t" * 16))
+    assert res.success
+    assert mgr.token_balance_deltas() == {}             # matches as before, moves no value
+
+
+# ── self-trade prevention never crosses the book or strands escrow ─────────
+
+def _stp_mgr():
+    from qrdx.exchange.orderbook import SelfTradeAction
+    mgr = _mgr()
+    mgr._order_books[PAIR] = OrderBook(pool_id=PAIR,
+                                       self_trade_action=SelfTradeAction.CANCEL_TAKER)
+    return mgr
+
+
+def test_consensus_books_are_created_with_cancel_taker():
+    import inspect
+    from qrdx.exchange.clearinghouse import Clearinghouse
+    assert "SelfTradeAction.CANCEL_TAKER" in inspect.getsource(ExchangeStateManager._op_create_pool)
+    assert "SelfTradeAction.CANCEL_TAKER" in inspect.getsource(Clearinghouse.create_market)
+
+
+def test_an_order_into_its_own_resting_order_is_cancelled_not_escrowed():
+    mgr = _stp_mgr()
+    mgr.set_available_token_balance("0xPQm", BASE, Decimal("100"))
+    mgr.set_available_token_balance("0xPQm", QUOTE, Decimal("100000"))
+    mgr.set_available_token_balance("0xPQt", BASE, Decimal("100"))
+    mgr._op_place_order(_order_tx("0xPQt", "sell", 5, 3, "t" * 16))        # best ask, 3 @ 5
+    mgr._op_place_order(_order_tx("0xPQm", "sell", "5.5", 10, "a" * 16))   # m's own ask
+    res = mgr._op_place_order(_order_tx("0xPQm", "buy", 6, 10, "b" * 16))
+    assert res.success and res.data["filled"] == "3"     # takes t's 3 @ 5, stops at its own
+    book = mgr._order_books[PAIR]
+    assert book.best_bid is None and book.best_ask == Decimal("5.5"), "the book crossed"
+    d = mgr.token_balance_deltas()
+    assert d[("0xPQm", QUOTE)] == Decimal("-15")         # paid the fill only: nothing escrowed
+    assert d[("0xPQm", BASE)] == Decimal("-10") + Decimal("3")
+    assert d[(_escrow(mgr), BASE)] == Decimal("10")      # m's resting ask, untouched
+    _assert_conserves(mgr)

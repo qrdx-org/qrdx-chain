@@ -1,0 +1,245 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+
+# Every tool CI runs is pinned: Python tools by version and sha256 (release/*.lock, refreshed
+# with scripts/release/lock-deps.sh). A new upstream release can therefore never change CI's
+# verdict on its own.
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint & format
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install the pinned lint tools
+        run: pip install --require-hashes --no-deps -r release/lint-requirements.lock
+
+      - name: ruff
+        run: ruff check qrdx/
+
+      - name: black
+        run: black --check qrdx/
+
+      - name: isort
+        run: isort --check-only qrdx/
+
+  # ---------------------------------------------------------------------------
+  # Type check — against the dependency versions the node image ships
+  # ---------------------------------------------------------------------------
+  type-check:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch the py-evm submodule (its types are checked against)
+        run: git submodule update --init --depth 1 py-evm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install system deps (source-only packages build against GMP)
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends libgmp-dev
+
+      - name: Install the shipped dependencies, the QRDX EVM and the pinned checkers
+        run: |
+          pip install --require-hashes --no-deps -r release/build-requirements.lock
+          pip install --require-hashes --no-deps --no-build-isolation -r release/requirements.lock
+          pip install --no-deps --no-build-isolation ./py-evm
+          pip install --require-hashes --no-deps -r release/lint-requirements.lock
+
+      - name: mypy
+        run: mypy qrdx/
+
+  # ---------------------------------------------------------------------------
+  # Release locks — the image installs exactly release/*.lock; they must match their inputs
+  # ---------------------------------------------------------------------------
+  locks:
+    name: Dependency locks are current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch the py-evm submodule (its dependencies are part of the lock)
+        run: git submodule update --init --depth 1 py-evm
+
+      - name: Install uv (pinned — lock output is checked byte for byte)
+        run: pip install uv==0.12.24
+
+      - name: Check
+        run: bash scripts/release/lock-deps.sh --check
+
+  # ---------------------------------------------------------------------------
+  # Security scan — known vulnerabilities in what the image ships
+  # ---------------------------------------------------------------------------
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # What the image ships, exactly. A known vulnerability fails the build: upgrade the
+      # package (scripts/release/lock-deps.sh --upgrade-package NAME), or, if it cannot affect
+      # the node, add `--ignore-vuln ID` here with the reason beside it.
+      - name: pip-audit (the release lock)
+        run: |
+          pip install --require-hashes --no-deps -r release/lint-requirements.lock
+          pip-audit --require-hashes --disable-pip --progress-spinner off -r release/requirements.lock
+
+  # ---------------------------------------------------------------------------
+  # Tests — run INSIDE the node image built from this commit, so CI tests what would ship:
+  # the locked dependencies, the liboqs build and the packaged code (docs/RELEASES.md)
+  # ---------------------------------------------------------------------------
+  tests:
+    name: Tests (in the node image)
+    runs-on: ubuntu-latest
+    needs: [lint, type-check]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch the py-evm submodule (the image builds the EVM from it)
+        run: git submodule update --init py-evm
+
+      - name: Build the image from this commit
+        run: bash scripts/release/build-image.sh --ref HEAD --load qrdx-node:ci
+
+      - name: Unit tests
+        run: bash scripts/release/test-image.sh qrdx-node:ci
+
+      - name: Integration tests (pull requests to main)
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        run: bash scripts/release/test-image.sh qrdx-node:ci tests -m integration --timeout=300 -q
+
+      # Ethereum's state tests through QRDX's EVM (docs/EVM_CONFORMANCE.md). The fixtures
+      # release is pinned by version and sha256 in fetch_eest.sh, and cached by that version.
+      - name: Cache the EVM conformance fixtures
+        uses: actions/cache@v4
+        with:
+          path: .eest
+          key: eest-${{ hashFiles('scripts/conformance/fetch_eest.sh') }}
+
+      - name: EVM conformance (Ethereum's state tests)
+        run: |
+          bash scripts/conformance/fetch_eest.sh
+          QRDX_EEST_FIXTURES=/tmp/repo/.eest/fixtures \
+            bash scripts/release/test-image.sh qrdx-node:ci tests/test_evm_conformance.py -q
+
+      - name: Deep fuzzing (pull requests to main)
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        run: |
+          QRDX_FUZZ_EXAMPLES=3000 \
+            bash scripts/release/test-image.sh qrdx-node:ci tests/test_fuzz_decoders.py -q
+
+  # ---------------------------------------------------------------------------
+  # TypeScript SDK — pinned dependencies (package-lock.json), type check, tests against the
+  # node's vectors (tests/test_sdk_vectors.py keeps those current)
+  # ---------------------------------------------------------------------------
+  sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.12.0"
+
+      - name: Install the locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Tests
+        run: npm test
+
+  # ---------------------------------------------------------------------------
+  # Docker build — development images from main only. Release images (v* tags) are built,
+  # tested, signed and published ONLY by release.yml (docs/RELEASES.md); publishing a second,
+  # unsigned image under a release's version here would let operators pull the wrong one.
+  # ---------------------------------------------------------------------------
+  docker-build:
+    name: Docker build (development image)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: [tests, security]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch the py-evm submodule (the image builds the EVM from it)
+        run: git submodule update --init --depth 1 py-evm
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Docker meta (tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: qrdx/qrdx-chain
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

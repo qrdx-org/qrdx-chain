@@ -6,17 +6,17 @@ Ethereum-compatible smart contract execution with dual VM support:
 - QRDX VM: Modern, lightweight VM with quantum-resistant features
 """
 
-from .state import ContractStateManager, Account
 from .evm_executor_v2 import QRDXEVMExecutor  # New 100% compatible executor
+from .state import Account, ContractStateManager
 from .vm_executor import QRDXVMExecutor
 
 # Legacy alias for backward compatibility
 EVMExecutor = QRDXEVMExecutor
 
 __all__ = [
-    'ContractStateManager',
-    'Account',
-    'QRDXEVMExecutor',  # Primary EVM executor
-    'EVMExecutor',      # Legacy alias
-    'QRDXVMExecutor',   # Alternative VM
+    "ContractStateManager",
+    "Account",
+    "QRDXEVMExecutor",  # Primary EVM executor
+    "EVMExecutor",  # Legacy alias
+    "QRDXVMExecutor",  # Alternative VM
 ]

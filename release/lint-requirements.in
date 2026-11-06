@@ -1,0 +1,8 @@
+# Lint and type-check tools for CI (.github/workflows/ci.yml): exact versions, hash-checked,
+# so a new release of a checker never turns CI red (or green) by itself. Bump them here, run
+# scripts/release/lock-deps.sh, and fix what the new versions report in the same change.
+ruff==0.15.16
+black==26.5.1
+isort==8.0.1
+mypy==2.1.0
+pip-audit==2.10.0

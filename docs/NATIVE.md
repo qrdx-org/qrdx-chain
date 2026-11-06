@@ -1,0 +1,177 @@
+# The native module (Rust)
+
+`native/qrdx-native` is a Rust extension (PyO3) for the work in a block that Python does
+slowly: checking its signatures, committing to its body and to the state it changes, running its
+plain transfers, and carrying transactions, blocks and votes between peers. The node and the validator call it through `qrdx/native.py`, and
+each function there has a pure-Python path that gives the same result. A node without the
+module, or with `QRDX_NATIVE=0`, runs those paths and agrees with every other node byte for
+byte.
+
+## What it does
+
+| Function | Stands in for | Used by |
+|---|---|---|
+| `mldsa65_verify_batch(items)` | liboqs through `oqs-python`, one signature at a time | `block_processor.verify_exchange_txs`: a block's section on import; a gossip batch on admission (`ExchangeSubmitter`) |
+| `canonical_json(obj, compact, default_str)` | `json.dumps(obj, sort_keys=True, ensure_ascii=True)` | `qrdx/native.py` |
+| `body_root_sha256(prefix, body)` | `sha256(prefix + json.dumps(body, ...))` | `block_verification.body_root`, on every block |
+| `lt_apply(acc, kind, has_old, has_new, *old_row, *new_row)` | `state_commitment._udf_apply` | the `qrdx_lt_apply` SQLite trigger function: every row a block changes in `account_state`, `contract_storage`, `token_balances` and `unspent_outputs` |
+| `smt_update(root, changes, version, cache)` | `smt.Tree.update` | the database's proof tree, once a block (`state_proofs.proof_root`) |
+| `mt_build`, `mt_update`, `mt_prove`, `MNode` | `smt._py_build`, `_py_update`, `_py_prove`, `smt.MNode` | the exchange's in-memory proof trees, every collection and order book a block touches (`smt.m_*`) |
+| `lt_mix_entries(acc, tag, removed, added)` | `commitment._apply` of each entry's `lthash.entry` | the exchange's accumulators, every collection a block touches (`commitment._apply_digests`) |
+| `lane_judge`, `lane_run` | `section_errors` and `process_transaction` for plain QRDX transfers | a block's runs of plain transfers, judged and run (`qrdx/exchange/transfer_lane.py`) |
+| `NetService` | signed HTTP batches of JSON between peers | the peer transport for transactions, blocks and votes (docs/NETWORK.md, `qrdx/node/netd.py`) |
+
+On a block of 2,000 transfers (`scripts/bench/exchange_block.py`, 24 cores):
+
+| | Python | Native |
+|---|---:|---:|
+| Its 2,000 signatures | 130 ms (threads did not help) | 7 ms |
+| Its body root (a 22 MB body) | 50 ms | 26 ms (16 ms of it SHA-256) |
+
+### Signatures
+
+The module links the system liboqs, the same library `oqs-python` loads (`ldd` shows
+`liboqs.so.9`), and calls `OQS_SIG_ml_dsa_65_verify` on a thread pool (rayon), without Python's
+lock. A signature is therefore judged by the same code either way.
+
+Only the signature verdicts come from the batch. `verify_exchange_tx` still runs every other
+check in Python: structure, chain id, gas, the key's binding to the sender, and multisig. It
+reads each verdict where it would have asked liboqs (`dilithium.precomputed`). A transaction
+that passed is marked with the exact bytes it passed for, so it is not checked again
+(`block_processor.is_verified`). Change its payload, signature or key and it is checked afresh.
+
+Python reached a block's signatures one at a time even on eight threads: `oqs-python` holds the
+lock for its own work around each call. The first native version was no faster either, and the
+reason was in the module itself: PyO3 converted each `bytes` to a vector element by element.
+It now reads the bytes in place.
+
+### The state commitment's trigger function
+
+Every row a block writes in the database's state domains fires a trigger that folds the row's
+change into its domain's LtHash accumulator (qrdx/state_commitment.py): the hash of the old row
+out, the new row in. SQLite calls the function on the database's thread, holding the GIL, two or
+three times a transfer. In Python it took 17.5 µs a call (two 4 KB BLAKE3 outputs, then
+big-integer lane arithmetic); natively 7.8 µs, most of it PyO3 reading the fourteen arguments.
+A block of 500 transfers flushes in 15.9 ms instead of 21.2.
+
+It computes what Python computes, and what it would not compute exactly it hands to Python, all
+of it: an accumulator that is not 4,096 well-formed bytes, a value that is not text or an
+integer (Python's `str` of it is what is hashed), a token balance that is not a plain decimal
+numeral (whose zeroness Python's `Decimal` judges), an unknown kind.
+
+### The proof trees
+
+The database's proof tree (`smt.Tree`, nodes stored by `version:depth:path`) is updated once a
+block from the rows it changed. In Python the update walked the tree one awaited node at a
+time, about 1,200 nodes for a block of 500 transfers: 23 ms. `smt_update` is the same walk,
+with the same node encoding, hashes, writes (in Python's dict order, deleted keys re-inserted at
+the end) and stale list. A node that is neither among its writes nor in the caller's cache is
+not loaded by it: it names every missing node, the caller reads them in one query, and the
+update runs again.
+
+The exchange keeps a tree per collection and order book in memory, deep-copied with the state
+every block. Each Python update allocated and hashed a node object per level of each changed
+path: 22 ms for 1,000 changes to a collection of 100,000 entries. The native tree has the same
+shape and hashes, its nodes immutable and shared (`Arc`), so copying a tree is returning it;
+1,000 changes cost 4–7 ms. A native node has a Python node's attributes, pickles as its entries
+(`smt.m_from_entries`), and is refused by the native functions if it is a Python one (that tree
+stays in Python). Keys must be 32 bytes and distinct in a call, which every caller's are; the
+native functions raise `ValueError` otherwise rather than give the input a meaning.
+
+### The exchange's accumulators
+
+A collection's commitment is an LtHash of its entries' digests. Python built each changed
+entry's 4 KB vector as a big integer: about 6 ms for 1,000 changed entries, plus the sums.
+`lt_mix_entries` builds the vectors in parallel, without Python's lock, and mixes them into the
+accumulator lane by lane. An accumulator that is not well formed is handed back to Python.
+
+Together, a commitment of 1,000 changed entries in a collection of 100,000 went from 33.6 ms
+to 15 ms; the rest is Python encoding each entry, which stays Python's.
+
+### Plain transfers
+
+Most of a loaded block is transfers of native QRDX, each signed by its own account's key.
+`qrdx/exchange/transfer_lane.py` prepares each with Python's own checks (its form, fee floor,
+amount, recipient and memo, under the exchange's decimal context) and hands runs of them to
+`lane_judge` (the inclusion judgment: nonces and what each payer owes) and `lane_run` (the
+execution: nonces, available balances, balance deltas, fees). The arithmetic is Python's
+`Decimal` exactly: values travel as `<coefficient>E<exponent>`, and a value past 128 bits, a
+negative zero or a nonce out of sequence makes the call bail, and Python runs the run. What it
+writes back goes through the same dicts and undo records, new keys in the order Python's would
+have inserted them. Anything else in a block (another token, another operation, an agent's or a
+multisig's signature) is Python's.
+
+### Canonical JSON
+
+The encoder writes what Python's `json` writes:
+
+* keys sorted by code point;
+* `\uXXXX` escapes in lowercase, with surrogate pairs above U+FFFF;
+* the short escapes, and DEL escaped;
+* integers of any size, as `int.__repr__` writes them;
+* floats as `float.__repr__` writes them, and `NaN`, `Infinity`, `-Infinity`;
+* tuples as arrays, and subclasses of str, int, float, dict and list.
+
+Anything it does not reproduce exactly raises `Unsupported`, and `qrdx/native.py` encodes the
+object with Python's `json` instead: a key that is not a string, an unpaired surrogate, nesting
+past 900. An object `json` cannot serialize raises `TypeError`, as in Python.
+
+## How it is held to Python
+
+`tests/test_native.py` checks it against Python itself, on random inputs:
+
+* 4,000 random structures, in both separator styles;
+* `default=str` with `Decimal`, the fallbacks, and the errors;
+* body roots with the module and without it;
+* 60 signatures, valid and tampered (another message, a flipped bit, another key, a short
+  signature), against liboqs through Python;
+* a section of transactions, some tampered and some bound to the wrong sender, with the
+  module and without it;
+* the trigger function on 2,400 random calls (text, integers, None, floats and bytes; plain,
+  odd and invalid decimals; malformed accumulators; unknown kinds), result or exception, and
+  through SQLite's triggers on random writes to every domain, against the accumulators
+  recomputed from the rows;
+* the database tree's update over 39 versions of random changes from an empty cache (the same
+  root, writes in the same order and stale nodes), and a malformed root or key refused;
+* the in-memory tree over 60 rounds of random changes (deep shared prefixes too): the same root
+  each round as Python's, the same proof of held, deleted and never-held keys, the same entries,
+  an old root unchanged by later updates, a pickle round trip;
+* the accumulator mix against Python's over random digests, and a malformed accumulator handed
+  back;
+* the transfer lane over random blocks (tests/test_transfer_lane.py), run with and without it:
+  the same judgment and refusals, results, fees, nonces, deltas (and the order they entered),
+  available balances and root, and every block taken back out by its undo record.
+
+The test suite also runs with `QRDX_VERIFY_STATE_COMMITMENTS=1`, which checks every exchange
+commitment against Python's from-scratch recomputation: the accumulator by Python's vectors, the
+tree by Python's `_py_build`.
+
+The transport has its own tests (tests/test_net_transport.py, docs/NETWORK.md).
+
+The tests skip when the module is not installed. CI builds it, so they run there.
+
+## Building it
+
+```
+curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain 1.86.0
+pip install maturin==1.7.4
+cd native/qrdx-native
+maturin build --release --auditwheel skip -o dist
+pip install --no-deps dist/qrdx_native-0.1.0-cp310-abi3-linux_x86_64.whl
+```
+
+* **Toolchain:** pinned to Rust 1.86.0 by `rust-toolchain.toml`; `Cargo.lock` pins every crate.
+* **liboqs:** the module links the liboqs in `/usr/local/lib` (`QRDX_OQS_LIB_DIR` to look
+  elsewhere). That is why the wheel is not "repaired" to bundle it: the node must check
+  signatures with one library, the one `oqs-python` uses.
+* **Wheel:** abi3, so one wheel serves Python 3.10 and later.
+* **Threads:** `RAYON_NUM_THREADS` caps the threads a batch uses. By default it uses every core.
+
+## What is not native yet
+
+Execution beyond plain transfers (the order book, perps, pools, tokens), each entry's encoding
+for the exchange's commitments, and the database writes still run in Python. So do sync between
+peers, fork choice and the validator client. The exchange's state held natively, with the
+database written behind it, is the next candidate and the largest (docs/PERFORMANCE.md, "What
+limits it next"). The Python versions stay as the reference the native ones are tested
+against.

@@ -5,10 +5,14 @@ This module consolidates all global constants and environment configuration
 used throughout the codebase. Constants are organized by category for easy
 reference and maintenance.
 """
+
 import ast
 import os
 import re
 from decimal import Decimal
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
+from urllib.parse import urlparse
+
 from dotenv import dotenv_values
 from fastecdsa import curve
 
@@ -20,26 +24,26 @@ from fastecdsa import curve
 _config = dotenv_values(".env")
 
 NODE_DEFAULTS = {
-    'QRDX_DATABASE_PATH':              'data/qrdx.db',  # SQLite database path
-    'QRDX_NODE_HOST':                  '127.0.0.1',
-    'QRDX_NODE_PORT':                  '3007',
-    'QRDX_SELF_URL':                   '',
-    'QRDX_BOOTSTRAP_NODE':             'http://node.qrdx.org',
+    "QRDX_DATABASE_PATH": "data/qrdx.db",  # SQLite database path
+    "QRDX_NODE_HOST": "127.0.0.1",
+    "QRDX_NODE_PORT": "3007",
+    "QRDX_SELF_URL": "",
+    "QRDX_BOOTSTRAP_NODE": "http://node.qrdx.org",
     # Comma-separated list of bootstrap nodes
-    'QRDX_BOOTSTRAP_NODES':            'http://node.qrdx.org,http://node2.qrdx.org,http://node3.qrdx.org',
+    "QRDX_BOOTSTRAP_NODES": "http://node.qrdx.org,http://node2.qrdx.org,http://node3.qrdx.org",
 }
 
-LOGGER_DEFAULTS = {    
-    'LOG_LEVEL':                       'INFO',
-    'LOG_FORMAT':                      '%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-    'LOG_DATE_FORMAT':                 '%Y-%m-%dT%H:%M:%S',
-    'LOG_CONSOLE_HIGHLIGHTING':        'True',
-    'LOG_INCLUDE_RESPONSE_CONTENT':    'False',
-    'LOG_INCLUDE_REQUEST_CONTENT':     'False',
-    'LOG_INCLUDE_BLOCK_SYNC_MESSAGES': 'False',
+LOGGER_DEFAULTS = {
+    "LOG_LEVEL": "INFO",
+    "LOG_FORMAT": "%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    "LOG_DATE_FORMAT": "%Y-%m-%dT%H:%M:%S",
+    "LOG_CONSOLE_HIGHLIGHTING": "True",
+    "LOG_INCLUDE_RESPONSE_CONTENT": "False",
+    "LOG_INCLUDE_REQUEST_CONTENT": "False",
+    "LOG_INCLUDE_BLOCK_SYNC_MESSAGES": "False",
 }
 
-LOG_MAX_FILE_SIZE = 10 * 1024 * 1024 # 10MB
+LOG_MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 LOG_MAX_PATH_LENGTH = 320  # Maximum URL path length to log (truncates longer paths)
 LOG_BACKUP_COUNT = 5
 
@@ -52,8 +56,8 @@ LOG_BACKUP_COUNT = 5
 # ==================================================================================
 # CORE PROTOCOL CONSTANTS
 # ==================================================================================
-NODE_VERSION = '2.0.1'
-ENDIAN = 'little'
+NODE_VERSION = "3.0.0"
+ENDIAN: Final = "little"
 CURVE = curve.P256
 SMALLEST = 1000000  # Smallest unit divisor
 
@@ -61,10 +65,9 @@ SMALLEST = 1000000  # Smallest unit divisor
 # ==================================================================================
 # BLOCKCHAIN PARAMETERS
 # ==================================================================================
-START_DIFFICULTY = Decimal('6.0')
+START_DIFFICULTY = Decimal("6.0")
 BLOCK_TIME = 180  # 180 seconds / 3 minute block time
 BLOCKS_PER_ADJUSTMENT = 512  # Difficulty adjustment every 512 blocks
-MAX_SUPPLY = 33_554_432  # Maximum coin supply (2^25)
 MAX_BLOCK_SIZE_HEX = 4096 * 1024  # 4MB in HEX format, 2MB in raw bytes
 
 
@@ -135,22 +138,28 @@ SYSTEM_WALLET_ADDRESSES = {
     "AIRDROP": "0x000000000000000000000000000000000000000a",
 }
 
-# System wallet genesis balances (in QRDX)
+# The genesis supply: every QRDX that exists at genesis — prefunded accounts, validators' stakes
+# and system wallets together (a mainnet genesis must allocate exactly this: validator/genesis.py).
+# ~$4B at the targeted ~$400 a QRDX (docs/TOKENOMICS.md). Staking rewards are minted after it.
+GENESIS_SUPPLY = Decimal("10000000")
+
+# System wallet genesis balances (in QRDX): each $25,000–$1,000,000 at ~$400 a QRDX
+# (docs/TOKENOMICS.md) — the system wallets are operating budgets, not the supply's owners.
 SYSTEM_WALLET_GENESIS_BALANCES = {
     "GARBAGE_COLLECTOR": Decimal("0"),  # Burner wallet, starts empty
-    "COMMUNITY_GRANTS": Decimal("5000000"),  # 5M QRDX
-    "DEVELOPER_FUND": Decimal("10000000"),  # 10M QRDX
-    "ECOSYSTEM_FUND": Decimal("8000000"),  # 8M QRDX
-    "STAKING_REWARDS": Decimal("15000000"),  # 15M QRDX
-    "MARKETING": Decimal("3000000"),  # 3M QRDX
-    "LIQUIDITY_RESERVE": Decimal("7000000"),  # 7M QRDX
-    "TREASURY_MULTISIG": Decimal("20000000"),  # 20M QRDX
-    "BUG_BOUNTY": Decimal("1000000"),  # 1M QRDX
-    "AIRDROP": Decimal("6000000"),  # 6M QRDX
+    "COMMUNITY_GRANTS": Decimal("625"),  # ~$250,000
+    "DEVELOPER_FUND": Decimal("2500"),  # ~$1,000,000
+    "ECOSYSTEM_FUND": Decimal("1250"),  # ~$500,000
+    "STAKING_REWARDS": Decimal("2500"),  # ~$1,000,000 (rewards themselves are minted)
+    "MARKETING": Decimal("250"),  # ~$100,000
+    "LIQUIDITY_RESERVE": Decimal("2500"),  # ~$1,000,000
+    "TREASURY_MULTISIG": Decimal("2500"),  # ~$1,000,000
+    "BUG_BOUNTY": Decimal("625"),  # ~$250,000
+    "AIRDROP": Decimal("1250"),  # ~$500,000
 }
 
 # Total system wallet allocation
-TOTAL_SYSTEM_WALLET_ALLOCATION = Decimal("75000000")  # 75M QRDX
+TOTAL_SYSTEM_WALLET_ALLOCATION = sum(SYSTEM_WALLET_GENESIS_BALANCES.values())  # 14,000 QRDX
 
 # System wallet metadata
 SYSTEM_WALLET_METADATA = {
@@ -231,14 +240,16 @@ MAX_TX_DATA_SIZE = 1_900_000
 # VALIDATION PATTERNS
 # ==================================================================================
 # Regex pattern for validating hexadecimal strings
-VALID_HEX_PATTERN = re.compile(r'^[0-9a-fA-F]+$')
+VALID_HEX_PATTERN = re.compile(r"^[0-9a-fA-F]+$")
 
 # Regex pattern for validating QRDX addresses
 # Supports:
 # - Traditional QRDX: Q/R + 44 base58 chars
-# - PQ addresses: 0xPQ + 64 hex chars  
+# - PQ addresses: 0xPQ + 64 hex chars
 # - Ethereum addresses: 0x + 40 hex chars
-VALID_ADDRESS_PATTERN = re.compile(r'^(?:[QR][1-9A-HJ-NP-Za-km-z]{44}|0xPQ[0-9a-fA-F]{64}|0x[0-9a-fA-F]{40})$')
+VALID_ADDRESS_PATTERN = re.compile(
+    r"^(?:[QR][1-9A-HJ-NP-Za-km-z]{44}|0xPQ[0-9a-fA-F]{64}|0x[0-9a-fA-F]{40})$"
+)
 
 
 # ==================================================================================
@@ -248,6 +259,7 @@ class ConfigString(str):
     """
     String subclass that stores a default value.
     """
+
     def __new__(cls, value, default):
         obj = str.__new__(cls, value)
         obj._default = default
@@ -256,10 +268,12 @@ class ConfigString(str):
     def default(self):
         return self._default
 
+
 class ConfigBool(int):
     """
     Int subclass acting as a boolean that stores a default value.
     """
+
     def __new__(cls, value, default):
         obj = int.__new__(cls, bool(value))
         obj._default = default
@@ -281,8 +295,9 @@ class ConfigBool(int):
 # ==================================================================================
 # DYNAMIC CONFIGURATION LOADING
 # ==================================================================================
-DEFAULTS = NODE_DEFAULTS | LOGGER_DEFAULTS 
+DEFAULTS = NODE_DEFAULTS | LOGGER_DEFAULTS
 namespace = globals()
+
 
 def parse_bool(v):
     """
@@ -299,6 +314,24 @@ def parse_bool(v):
         # ast.literal_eval expects "True"/"False"
         return ast.literal_eval(s.title())
     return v
+
+
+if TYPE_CHECKING:
+    # Created dynamically by the loop below (a ConfigBool for a boolean literal, otherwise a
+    # ConfigString), so declared here for type checkers. Keep in step with the DEFAULTS keys.
+    QRDX_DATABASE_PATH: Any
+    QRDX_NODE_HOST: Any
+    QRDX_NODE_PORT: Any
+    QRDX_SELF_URL: Any
+    QRDX_BOOTSTRAP_NODE: Any
+    QRDX_BOOTSTRAP_NODES: Any
+    LOG_LEVEL: Any
+    LOG_FORMAT: Any
+    LOG_DATE_FORMAT: Any
+    LOG_CONSOLE_HIGHLIGHTING: Any
+    LOG_INCLUDE_RESPONSE_CONTENT: Any
+    LOG_INCLUDE_REQUEST_CONTENT: Any
+    LOG_INCLUDE_BLOCK_SYNC_MESSAGES: Any
 
 for key, default_raw in DEFAULTS.items():
     # Check environment variables first (highest priority),
@@ -323,11 +356,11 @@ for key, default_raw in DEFAULTS.items():
 # ==================================================================================
 # These aliases maintain backward compatibility with older code references.
 # New code should use the QRDX_* prefixed versions.
-DENARO_SELF_URL = namespace.get('QRDX_SELF_URL', '')
-DENARO_BOOTSTRAP_NODE = namespace.get('QRDX_BOOTSTRAP_NODE', 'http://node.qrdx.org')
-DENARO_DATABASE_PATH = namespace.get('QRDX_DATABASE_PATH', 'data/qrdx.db')  # SQLite path
-DENARO_NODE_HOST = namespace.get('QRDX_NODE_HOST', '127.0.0.1')
-DENARO_NODE_PORT = namespace.get('QRDX_NODE_PORT', '3007')
+DENARO_SELF_URL = namespace.get("QRDX_SELF_URL", "")
+DENARO_BOOTSTRAP_NODE = namespace.get("QRDX_BOOTSTRAP_NODE", "http://node.qrdx.org")
+DENARO_DATABASE_PATH = namespace.get("QRDX_DATABASE_PATH", "data/qrdx.db")  # SQLite path
+DENARO_NODE_HOST = namespace.get("QRDX_NODE_HOST", "127.0.0.1")
+DENARO_NODE_PORT = namespace.get("QRDX_NODE_PORT", "3007")
 
 # ==================================================================================
 # BOOTSTRAP NODES CONFIGURATION
@@ -339,46 +372,41 @@ DENARO_NODE_PORT = namespace.get('QRDX_NODE_PORT', '3007')
 #
 # @-schema provides the PQ node ID for identity verification during handshake
 
-import re
-from typing import NamedTuple
-from urllib.parse import urlparse
-
 
 class ParsedBootstrapNode(NamedTuple):
     """Parsed bootstrap node information."""
-    url: str              # HTTP URL for connection (http://host:port)
-    public_key: str       # Node's public key (hex) if provided, empty string otherwise
-    host: str             # Hostname
-    port: int             # Port number
-    original: str         # Original URI string
-    is_qnode: bool        # True if parsed from qnode:// URI
-    node_id: str = ''     # PQ node ID (e.g. 'qx1a2b3c…') from @-schema
-    algo: str = ''        # PQ algorithm from @-schema (e.g. 'dilithium3')
+
+    url: str  # HTTP URL for connection (http://host:port)
+    public_key: str  # Node's public key (hex) if provided, empty string otherwise
+    host: str  # Hostname
+    port: int  # Port number
+    original: str  # Original URI string
+    is_qnode: bool  # True if parsed from qnode:// URI
+    node_id: str = ""  # PQ node ID (e.g. 'qx1a2b3c…') from @-schema
+    algo: str = ""  # PQ algorithm from @-schema (e.g. 'dilithium3')
 
 
 # @-schema regex: algo@qx<hex40+>@host:port
-_BOOTSTRAP_AT_SCHEMA_RE = re.compile(
-    r'^([a-zA-Z0-9-]+)@(qx[a-fA-F0-9]{40,})@([^:]+):(\d+)$'
-)
+_BOOTSTRAP_AT_SCHEMA_RE = re.compile(r"^([a-zA-Z0-9-]+)@(qx[a-fA-F0-9]{40,})@([^:]+):(\d+)$")
 
 
 def parse_bootstrap_node(uri: str) -> ParsedBootstrapNode:
     """
     Parse a bootstrap node URI.
-    
+
     Supports:
     - @-schema: dilithium3@qx<node_id>@host:port  (PQ, preferred)
     - qnode URIs: qnode://<pubkey>@host:port       (legacy)
     - HTTP URLs: http://host:port                  (fallback)
-    
+
     Args:
         uri: Bootstrap node URI string
-        
+
     Returns:
         ParsedBootstrapNode with connection details
     """
     uri = uri.strip()
-    
+
     # Check for @-schema format: algo@qx<hex>@host:port
     at_match = _BOOTSTRAP_AT_SCHEMA_RE.match(uri)
     if at_match:
@@ -389,7 +417,7 @@ def parse_bootstrap_node(uri: str) -> ParsedBootstrapNode:
         http_url = f"http://{host}:{port}"
         return ParsedBootstrapNode(
             url=http_url,
-            public_key="",   # public key obtained during handshake
+            public_key="",  # public key obtained during handshake
             host=host,
             port=port,
             original=uri,
@@ -397,13 +425,10 @@ def parse_bootstrap_node(uri: str) -> ParsedBootstrapNode:
             node_id=node_id,
             algo=algo,
         )
-    if uri.startswith('qnode://'):
+    if uri.startswith("qnode://"):
         # Format: qnode://<pubkey>@<host>:<port>
         # pubkey is hex-encoded, typically 64+ chars
-        match = re.match(
-            r'^qnode://([a-fA-F0-9]+)@([^:]+):(\d+)$',
-            uri
-        )
+        match = re.match(r"^qnode://([a-fA-F0-9]+)@([^:]+):(\d+)$", uri)
         if match:
             pubkey = match.group(1)
             host = match.group(2)
@@ -420,7 +445,7 @@ def parse_bootstrap_node(uri: str) -> ParsedBootstrapNode:
             )
         else:
             # Try simpler qnode format without pubkey: qnode://host:port
-            match = re.match(r'^qnode://([^:]+):(\d+)$', uri)
+            match = re.match(r"^qnode://([^:]+):(\d+)$", uri)
             if match:
                 host = match.group(1)
                 port = int(match.group(2))
@@ -433,24 +458,24 @@ def parse_bootstrap_node(uri: str) -> ParsedBootstrapNode:
                     original=uri,
                     is_qnode=True,
                 )
-    
+
     # Standard HTTP(S) URL
     parsed = urlparse(uri)
-    if parsed.scheme in ('http', 'https'):
-        host = parsed.hostname or 'localhost'
-        port = parsed.port or (443 if parsed.scheme == 'https' else 3007)
+    if parsed.scheme in ("http", "https"):
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (443 if parsed.scheme == "https" else 3007)
         return ParsedBootstrapNode(
-            url=uri.rstrip('/'),
+            url=uri.rstrip("/"),
             public_key="",
             host=host,
             port=port,
             original=uri,
             is_qnode=False,
         )
-    
+
     # Fallback: assume it's a host:port without scheme
-    if ':' in uri:
-        parts = uri.rsplit(':', 1)
+    if ":" in uri:
+        parts = uri.rsplit(":", 1)
         host = parts[0]
         try:
             port = int(parts[1])
@@ -459,7 +484,7 @@ def parse_bootstrap_node(uri: str) -> ParsedBootstrapNode:
     else:
         host = uri
         port = 3007
-    
+
     return ParsedBootstrapNode(
         url=f"http://{host}:{port}",
         public_key="",
@@ -473,18 +498,18 @@ def parse_bootstrap_node(uri: str) -> ParsedBootstrapNode:
 def parse_bootstrap_nodes(nodes_str: str) -> list:
     """
     Parse a comma-separated list of bootstrap node URIs.
-    
+
     Args:
         nodes_str: Comma-separated bootstrap node URIs
-        
+
     Returns:
         List of ParsedBootstrapNode objects
     """
     if not nodes_str:
         return []
-    
+
     nodes = []
-    for uri in nodes_str.split(','):
+    for uri in nodes_str.split(","):
         uri = uri.strip()
         if uri:
             nodes.append(parse_bootstrap_node(uri))
@@ -492,15 +517,44 @@ def parse_bootstrap_nodes(nodes_str: str) -> list:
 
 
 # Parse bootstrap nodes from environment
-_bootstrap_nodes_raw = namespace.get('QRDX_BOOTSTRAP_NODES', '')
+_bootstrap_nodes_raw = namespace.get("QRDX_BOOTSTRAP_NODES", "")
 
 # BOOTSTRAP_NODES_PARSED contains full node info including public keys
-BOOTSTRAP_NODES_PARSED = parse_bootstrap_nodes(_bootstrap_nodes_raw) if _bootstrap_nodes_raw else [
-    parse_bootstrap_node(DENARO_BOOTSTRAP_NODE)
-]
+BOOTSTRAP_NODES_PARSED = (
+    parse_bootstrap_nodes(_bootstrap_nodes_raw)
+    if _bootstrap_nodes_raw
+    else [parse_bootstrap_node(DENARO_BOOTSTRAP_NODE)]
+)
 
 # BOOTSTRAP_NODES contains just the HTTP URLs for backward compatibility
 BOOTSTRAP_NODES = [node.url for node in BOOTSTRAP_NODES_PARSED]
+
+
+# ==================================================================================
+# CHAIN SPEC — network identity, consensus parameters, upgrade schedule
+# ==================================================================================
+# Every consensus parameter below that a network may choose comes from the network's chain
+# spec (the ``chain_spec`` section of its genesis file; qrdx/chain_spec.py,
+# docs/PROTOCOL_UPGRADES.md). A node started without a genesis file runs a DEV network whose
+# spec is built from the environment, as these values always were. On any other network the
+# environment cannot change them: CHAIN_SPEC_ENV_CONFLICTS lists attempts, and the node refuses
+# to start while it is non-empty. A genesis file that exists but cannot be used raises here —
+# a node never falls back to rules other than its network's.
+from . import chain_spec as _chain_spec  # noqa: E402  (needs the configuration above)
+
+_PROCESS_SPEC = _chain_spec.load_process_spec(
+    dotenv=_config, database_path=str(namespace.get("QRDX_DATABASE_PATH") or "") or None
+)
+CHAIN_SPEC = _PROCESS_SPEC.spec
+CHAIN_SPEC_FILE = _PROCESS_SPEC.genesis_file
+CHAIN_SPEC_ENV_CONFLICTS = _PROCESS_SPEC.env_conflicts
+_chain_spec.set_active(CHAIN_SPEC)
+_NETWORK_PARAMS = CHAIN_SPEC.params
+
+# The EVM / EIP-155 chain id, and the network's name. Every signed transaction is bound to the
+# chain id, which is what stops a transaction signed for one network executing on another.
+CHAIN_ID = CHAIN_SPEC.chain_id
+NETWORK_NAME = CHAIN_SPEC.network
 
 
 # ==================================================================================
@@ -510,114 +564,279 @@ BOOTSTRAP_NODES = [node.url for node in BOOTSTRAP_NODES_PARSED]
 # WARNING: Changing these values will break consensus with mainnet nodes!
 
 # --- Slot and Epoch Configuration ---
-SLOT_DURATION = 2                      # 2 seconds per slot
-SLOTS_PER_EPOCH = 32                   # 32 slots = 64 seconds per epoch
-EPOCHS_PER_SYNC_COMMITTEE = 256        # ~4.5 hours per sync committee period
+# Milliseconds per slot. All nodes on a network MUST agree (it defines the slot clock + the
+# backup-proposer wait = half a slot). A network sizes the slot above worst-case block-production
+# + propagation time — which is what makes RANDAO selection cleanly convergent (backups then
+# never fire competing blocks). Chain-spec parameter (standard 250).
+SLOT_DURATION_MS = _NETWORK_PARAMS["SLOT_DURATION_MS"]
+# The same, in seconds (a float: slots may be shorter than a second). Derived, never set.
+SLOT_DURATION = SLOT_DURATION_MS / 1000
+# Network parameter: all nodes on a network MUST agree on this (it defines epoch
+# boundaries → finality + validator-lifecycle processing). Test networks choose small
+# values so epochs fire several times within a short run; the standard is 32 (8 s epochs).
+SLOTS_PER_EPOCH = _NETWORK_PARAMS["SLOTS_PER_EPOCH"]
+EPOCHS_PER_SYNC_COMMITTEE = 256  # ~4.5 hours per sync committee period
 
 # --- Sync Committee ---
-SYNC_COMMITTEE_SIZE = 512              # Number of validators in sync committee
-SYNC_COMMITTEE_SUBNET_COUNT = 4        # Number of subnets for distribution
+SYNC_COMMITTEE_SIZE = 512  # Number of validators in sync committee
+SYNC_COMMITTEE_SUBNET_COUNT = 4  # Number of subnets for distribution
 
 # --- Validator Set ---
-MIN_VALIDATORS = int(os.environ.get('QRDX_MIN_VALIDATORS', '4'))  # Mainnet: 4, testnet override via env
-MAX_VALIDATORS = 150                   # Maximum active validators
-MIN_VALIDATOR_STAKE = Decimal('100000')  # 100,000 QRDX minimum stake
-MAX_EFFECTIVE_STAKE = Decimal('1000000')  # 1,000,000 QRDX max effective stake
+MIN_VALIDATORS = _NETWORK_PARAMS["MIN_VALIDATORS"]  # Chain-spec parameter (mainnet: 4)
+# Validators proposing and voting at once; more wait in the activation queue
+# (validator/epoch_state.py). Chain-spec parameter.
+MAX_VALIDATORS = _NETWORK_PARAMS["MAX_VALIDATORS"]
+# QRDX amounts are sized for ~$400 a QRDX (docs/TOKENOMICS.md).
+MIN_VALIDATOR_STAKE = Decimal("1000")  # 1,000 QRDX (~$400,000) minimum stake to ACTIVATE
+MAX_EFFECTIVE_STAKE = Decimal("100000")  # 100,000 QRDX (1 % of genesis supply) max weight
+
+# Stake at which an ACTIVE validator is ejected — deliberately well BELOW the activation
+# threshold, mirroring Ethereum's 16 ETH ejection vs 32 ETH activation.
+#
+# The hysteresis is the point. Attestation penalties make effective_stake drift a little
+# below the activation floor during normal operation (observed live: 99,840 against a
+# 100,000 floor), and ejecting at the activation threshold would churn the validator set
+# on ordinary missed attestations — on a small set that means repeatedly losing
+# proposers, and in the worst case emptying the set and halting the chain. Requiring a
+# validator to have lost HALF its stake before it loses its slot means only sustained
+# inactivity (or slashing, which ejects on its own) removes it.
+VALIDATOR_EJECTION_STAKE = MIN_VALIDATOR_STAKE / 2  # 500 QRDX
 
 # --- Staking Parameters ---
-UNBONDING_PERIOD_EPOCHS = 5040         # ~7 days (5040 epochs * 64 sec)
-MIN_DEPOSIT = Decimal('10000')         # Minimum deposit amount
-MAX_DEPOSIT = Decimal('10000000')      # Maximum single deposit
-ACTIVATION_DELAY_EPOCHS = 4            # Epochs until deposit becomes active
-WITHDRAWAL_DELAY_EPOCHS = 256          # Epochs until withdrawal finalizes
+# Chain-spec parameter (test networks shorten it so a soak observes the full exiting→exited
+# unbonding completion); standard 40,320 epochs, ~3.7 days of 8 s epochs.
+UNBONDING_PERIOD_EPOCHS = _NETWORK_PARAMS["UNBONDING_PERIOD_EPOCHS"]
+ACTIVATION_DELAY_EPOCHS = _NETWORK_PARAMS[
+    "ACTIVATION_DELAY_EPOCHS"
+]  # Epochs until deposit becomes active
+# Epochs between a validator's exit_epoch and the first block that may return its principal
+# (Ethereum's MIN_VALIDATOR_WITHDRAWABILITY_DELAY). An exiting validator stays eligible until
+# the FINALIZED epoch reaches exit_epoch, and evidence of an offence needs time to be carried
+# in a block; paying before both would let it misbehave after its stake had left. Enforced by
+# qrdx/validator/withdrawals.py. Chain-spec parameter (a fast testnet shortens it to observe a
+# payout); standard 2,048, ~4.6 hours of 8 s epochs.
+WITHDRAWAL_DELAY_EPOCHS = _NETWORK_PARAMS["WITHDRAWAL_DELAY_EPOCHS"]
+
+# Staking rewards and delegation pools (docs/STAKING.md, qrdx/validator/epoch_state.py). Each
+# epoch a validator whose vote the chain carried earns STAKING_REWARD_RATE_BPS a year (minted)
+# on its principal and on the QRDX delegated to its pool; it keeps its own share and its
+# commission on the pool's, and the rest compounds into the pool. A chain-spec parameter.
+STAKING_REWARD_RATE_BPS = _NETWORK_PARAMS["STAKING_REWARD_RATE_BPS"]
+STAKING_DEFAULT_COMMISSION_BPS = 1_000  # a pool's commission until its validator sets one
+STAKE_MIN_DELEGATION = Decimal("0.01")  # QRDX (~$4): smaller delegations are refused (dust)
+
+# The perp markets a network starts with, BASE:MAX_LEVERAGE:SZ_DECIMALS (chain_spec
+# ``parse_genesis_market``), priced by the validators' votes; more come by governance. No single
+# key ever prices a market (there used to be ORACLE_REPORTERS, and deployers' oracles).
+PERP_GENESIS_MARKETS = tuple(_NETWORK_PARAMS["PERP_GENESIS_MARKETS"])
+
+# Perps backstop vault (docs/PERPS_CLEARINGHOUSE.md). Deposits are locked for this much block
+# time (Hyperliquid's HLP: 4 days) so capital cannot leave the moment a loss is in sight.
+# Chain-spec parameters: every node must hold the same values (a fast testnet shortens the
+# lockup to exercise a withdrawal).
+PERP_VAULT_LOCKUP_SECONDS = _NETWORK_PARAMS["PERP_VAULT_LOCKUP_SECONDS"]
+# Treasury seeders: a VAULT_DEPOSIT from one of these is the protocol's own capital — its shares
+# belong to the protocol and never unlock. (The treasury multisig cannot sign exchange
+# transactions, which are PQ-only, so a designated PQ key seeds on its behalf.)
+PERP_VAULT_SEEDERS = tuple(_NETWORK_PARAMS["PERP_VAULT_SEEDERS"])
+# Perps settlement asset (docs/PERPS_CLEARINGHOUSE.md §2). Production: the bridged USD
+# stablecoin's QRC-20 token address — Hyperliquid's USDC model: prices, PnL, fees and funding are
+# all in USD, which validators can observe on any exchange. "QRDX" settles in native QRDX
+# (development and tests only). Empty (the default): no collateral is configured and perps
+# deposits are refused. Chain-spec parameters, like the two below.
+PERP_COLLATERAL_TOKEN = _NETWORK_PARAMS["PERP_COLLATERAL_TOKEN"]
+# Portfolio margin: tokens accepted as perps margin beside the settlement token, each
+# "TOKEN:MARKET_ID:HAIRCUT" (qrdx/exchange/clearinghouse.py ``portfolio_assets``). Chain-spec.
+PERP_PORTFOLIO_ASSETS = tuple(_NETWORK_PARAMS["PERP_PORTFOLIO_ASSETS"])
+# The unit perp markets are quoted in: "BTC-USD-PERP", priced by oracle pair "BTC:USD".
+PERP_QUOTE = _NETWORK_PARAMS["PERP_QUOTE"] or "USD"
+# Validator price oracle (docs/PERPS_CLEARINGHOUSE.md §8). Each block, a market's oracle is the
+# stake-weighted median of the committee's votes no older than PERP_ORACLE_VOTE_MAX_AGE seconds
+# of block time, provided they carry a majority of the committee's stake. A market whose oracle
+# has not been set for PERP_ORACLE_STALE_SECONDS refuses new exposure (reduce-only orders still
+# work). Chain-spec parameters.
+PERP_ORACLE_VOTE_MAX_AGE = _NETWORK_PARAMS["PERP_ORACLE_VOTE_MAX_AGE"]
+PERP_ORACLE_STALE_SECONDS = _NETWORK_PARAMS["PERP_ORACLE_STALE_SECONDS"]
+# Perp funding is paid at every boundary of this much block time (Hyperliquid: hourly). A
+# chain-spec parameter (a fast testnet shortens it to see several settlements).
+PERP_FUNDING_INTERVAL_SECONDS = _NETWORK_PARAMS["PERP_FUNDING_INTERVAL_SECONDS"]
+# What one block may carry (docs/BLOCK_LIMITS.md): the sum of its EVM transactions' gas limits,
+# and of its exchange operations'. Checked on every import path before anything executes; a
+# transaction over the limit is refused at admission (it could never be included). Chain-spec
+# parameters.
+BLOCK_GAS_LIMIT = _NETWORK_PARAMS["BLOCK_GAS_LIMIT"]
+BLOCK_EXCHANGE_GAS_LIMIT = _NETWORK_PARAMS["BLOCK_EXCHANGE_GAS_LIMIT"]
+# Every BIG_BLOCK_INTERVAL-th block may carry BIG_BLOCK_GAS_LIMIT of EVM gas (qrdx/block_limits.py).
+BIG_BLOCK_INTERVAL = _NETWORK_PARAMS["BIG_BLOCK_INTERVAL"]
+BIG_BLOCK_GAS_LIMIT = _NETWORK_PARAMS["BIG_BLOCK_GAS_LIMIT"]
+# QRDX burned by CREATE_MARKET, a token perp's listing (with the fee gate on). Every market costs
+# every node work in every block (its oracle, mark, funding and liquidation duties), so listing
+# one must not be nearly free. A chain-spec parameter.
+PERP_MARKET_LISTING_FEE = _NETWORK_PARAMS["PERP_MARKET_LISTING_FEE"]
+# A perp market's maximum leverage at most. Chain-spec.
+PERP_MARKET_MAX_LEVERAGE = _NETWORK_PARAMS["PERP_MARKET_MAX_LEVERAGE"]
+# A token perp's lister seeds the market's liquidity vault with at least this much of its perps
+# collateral, locked for the lockup (qrdx/exchange/clearinghouse.py MARKET_MAKER_*). Chain-spec.
+PERP_MARKET_MIN_LIQUIDITY = _NETWORK_PARAMS["PERP_MARKET_MIN_LIQUIDITY"]
+# Stakers' share of the protocol's QRDX fee income (validator/epoch_state.py). Chain-spec.
+STAKER_FEE_SHARE_BPS = _NETWORK_PARAMS["STAKER_FEE_SHARE_BPS"]
+# Oracle hardening (state_manager._aggregate_votes). Chain-spec.
+ORACLE_MIN_VOTERS = _NETWORK_PARAMS["ORACLE_MIN_VOTERS"]
+ORACLE_MAX_STEP_BPS = _NETWORK_PARAMS["ORACLE_MAX_STEP_BPS"]
+ORACLE_OUTLIER_BAND_BPS = _NETWORK_PARAMS["ORACLE_OUTLIER_BAND_BPS"]
+# Perp order grid: minimum order value, default size decimals (clearinghouse._check_grid).
+PERP_MIN_ORDER_VALUE = _NETWORK_PARAMS["PERP_MIN_ORDER_VALUE"]
+PERP_DEFAULT_SZ_DECIMALS = _NETWORK_PARAMS["PERP_DEFAULT_SZ_DECIMALS"]
+# Perp price band and circuit breaker (qrdx/exchange/clearinghouse.py). Chain-spec; 0 is off.
+PERP_PRICE_BAND_BPS = _NETWORK_PARAMS["PERP_PRICE_BAND_BPS"]
+PERP_BREAKER_MOVE_BPS = _NETWORK_PARAMS["PERP_BREAKER_MOVE_BPS"]
+PERP_BREAKER_WINDOW_SECONDS = _NETWORK_PARAMS["PERP_BREAKER_WINDOW_SECONDS"]
+PERP_BREAKER_COOLDOWN_SECONDS = _NETWORK_PARAMS["PERP_BREAKER_COOLDOWN_SECONDS"]
+# A perp market's open-interest floor (qrdx/exchange/clearinghouse.py ``oi_cap``). Chain-spec.
+PERP_MIN_OI_CAP = _NETWORK_PARAMS["PERP_MIN_OI_CAP"]
+# Token perps, priced off the token's own spot market (docs/HYPERLIQUID_PARITY.md 13).
+PERP_SPOT_MAX_LEVERAGE = _NETWORK_PARAMS["PERP_SPOT_MAX_LEVERAGE"]
+SPOT_ORACLE_TWAP_SECONDS = _NETWORK_PARAMS["SPOT_ORACLE_TWAP_SECONDS"]
+SPOT_ORACLE_DEPTH_BAND_BPS = _NETWORK_PARAMS["SPOT_ORACLE_DEPTH_BAND_BPS"]
+SPOT_ORACLE_MIN_DEPTH = _NETWORK_PARAMS["SPOT_ORACLE_MIN_DEPTH"]
+SPOT_OI_DEPTH_BPS = _NETWORK_PARAMS["SPOT_OI_DEPTH_BPS"]
+# Ticker auction (docs/HYPERLIQUID_PARITY.md 11). Chain-spec.
+TICKER_OPENING_PRICE = _NETWORK_PARAMS["TICKER_OPENING_PRICE"]
+TICKER_MIN_PRICE = _NETWORK_PARAMS["TICKER_MIN_PRICE"]
+TICKER_AUCTION_SECONDS = _NETWORK_PARAMS["TICKER_AUCTION_SECONDS"]
+# Free trading and its anti-spam budget (qrdx/exchange/state_manager.py ``free_action_error``,
+# docs/TOKENOMICS.md). Chain-spec.
+EXCHANGE_FREE_TRADING = _NETWORK_PARAMS["EXCHANGE_FREE_TRADING"]
+FREE_ACTIONS_INITIAL = _NETWORK_PARAMS["FREE_ACTIONS_INITIAL"]
+FREE_ACTIONS_PER_VOLUME = Decimal(_NETWORK_PARAMS["FREE_ACTIONS_PER_VOLUME"])
+FREE_ACTION_REFILL_SECONDS = _NETWORK_PARAMS["FREE_ACTION_REFILL_SECONDS"]
+FREE_ACTIONS_PER_BLOCK = _NETWORK_PARAMS["FREE_ACTIONS_PER_BLOCK"]
+FREE_ACTION_MIN_QRDX = Decimal(_NETWORK_PARAMS["FREE_ACTION_MIN_QRDX"])
+FREE_ACTION_MIN_EQUITY = _NETWORK_PARAMS["FREE_ACTION_MIN_EQUITY"]
+FREE_TRADING_MAX_BASE_FEE_BPS = _NETWORK_PARAMS["FREE_TRADING_MAX_BASE_FEE_BPS"]
+# QNS: QRDX a name costs a year (docs/QNS.md). Chain-spec.
+QNS_PRICE_PER_YEAR = Decimal(_NETWORK_PARAMS["QNS_PRICE_PER_YEAR"])
+PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS = _NETWORK_PARAMS["PERP_MARKET_LIQUIDITY_LOCKUP_SECONDS"]
+# Tokens the consensus bridge carries from other chains (docs/BRIDGE.md), each
+# "SYMBOL:CHAIN_ID:SOURCE_TOKEN:DECIMALS". Validators attest deposits into the lockbox there; a
+# quorum mints them here. Empty: no bridge. A chain-spec parameter (adding an asset is a fork).
+BRIDGE_ASSETS = tuple(_NETWORK_PARAMS["BRIDGE_ASSETS"])
+BRIDGE_DEPOSIT_WINDOW = int(_NETWORK_PARAMS["BRIDGE_DEPOSIT_WINDOW"])
+BRIDGE_MINT_LIMITS = tuple(_NETWORK_PARAMS["BRIDGE_MINT_LIMITS"])
+BRIDGE_LOCKBOXES = tuple(_NETWORK_PARAMS["BRIDGE_LOCKBOXES"])
+MIGRATION_REGISTRIES = tuple(_NETWORK_PARAMS["MIGRATION_REGISTRIES"])
+DOOMSDAY_CANARIES = tuple(_NETWORK_PARAMS["DOOMSDAY_CANARIES"])
+
+# --- Exchange fees ---
+# Exchange transactions pay gas like EVM ones: gas_price is in WEI (1 QRDX = 10^18 wei), at least
+# this floor (1 gwei, eth_gasPrice's answer). Every executed operation pays gas_used × gas_price
+# in QRDX, and the fee is burned, as EVM gas is. A chain-spec parameter.
+EXCHANGE_MIN_GAS_PRICE_WEI = _NETWORK_PARAMS["EXCHANGE_MIN_GAS_PRICE_WEI"]
+# The EVM's floor, likewise. Above the floors each block's base fees rise and fall with demand
+# (qrdx/fee_market.py, docs/BLOCK_LIMITS.md). A chain-spec parameter.
+EVM_MIN_GAS_PRICE_WEI = _NETWORK_PARAMS["EVM_MIN_GAS_PRICE_WEI"]
+
+# --- On-chain governance (qrdx/exchange/governance.py, docs/GOVERNANCE.md) ---
+# Chain-spec parameters, in blocks. Validators propose and decide by stake; holders veto by
+# locking QRDX during the timelock.
+GOV_VOTING_PERIOD_BLOCKS = _NETWORK_PARAMS["GOV_VOTING_PERIOD_BLOCKS"]
+GOV_TIMELOCK_BLOCKS = _NETWORK_PARAMS["GOV_TIMELOCK_BLOCKS"]
+GOV_EXECUTION_WINDOW_BLOCKS = _NETWORK_PARAMS["GOV_EXECUTION_WINDOW_BLOCKS"]
+GOV_APPROVAL_THRESHOLD_BPS = _NETWORK_PARAMS["GOV_APPROVAL_THRESHOLD_BPS"]
+GOV_VETO_THRESHOLD_QRDX = _NETWORK_PARAMS["GOV_VETO_THRESHOLD_QRDX"]
+GOV_FORK_APPROVAL_LEAD_BLOCKS = _NETWORK_PARAMS["GOV_FORK_APPROVAL_LEAD_BLOCKS"]
+# The genesis master controller may move system-wallet funds only below this height (and only
+# until governance freezes it). Chain-spec parameter; 100,000 by default.
+SYSTEM_WALLET_MASTER_SUNSET_HEIGHT = _NETWORK_PARAMS["SYSTEM_WALLET_MASTER_SUNSET_HEIGHT"]
+WEI_PER_QRDX = 10**18
 
 # --- Finality ---
-ATTESTATION_THRESHOLD = Decimal('0.667')  # 2/3 + 1 of stake for finality
-MIN_ATTESTATION_INCLUSION_DELAY = 1    # Minimum slots before attestation included
-MAX_ATTESTATION_INCLUSION_DELAY = 32   # Maximum slots for attestation inclusion
-MAX_ATTESTATIONS_PER_BLOCK = 128       # Maximum attestations in a block
+ATTESTATION_THRESHOLD = Decimal("0.667")  # 2/3 + 1 of stake for finality
+MIN_ATTESTATION_INCLUSION_DELAY = 1  # Minimum slots before attestation included
+MAX_ATTESTATION_INCLUSION_DELAY = 32  # Maximum slots for attestation inclusion
+MAX_ATTESTATIONS_PER_BLOCK = 128  # Maximum attestations in a block
+# Every validator votes once an epoch and its vote must fit in the epoch's blocks.
+if MAX_VALIDATORS > MAX_ATTESTATIONS_PER_BLOCK * SLOTS_PER_EPOCH:
+    raise ValueError(
+        f"MAX_VALIDATORS {MAX_VALIDATORS} exceeds the votes an epoch's blocks can carry "
+        f"({MAX_ATTESTATIONS_PER_BLOCK} x {SLOTS_PER_EPOCH} slots)"
+    )
 
 # --- Rewards ---
-BASE_REWARD_FACTOR = 64                # Base reward calculation factor
-PROPOSER_REWARD_QUOTIENT = 8           # Proposer gets 1/8 of attestation rewards
-ATTESTATION_REWARD_QUOTIENT = 4        # Attestation reward divisor
-SYNC_REWARD_QUOTIENT = 2               # Sync committee reward divisor
-INACTIVITY_PENALTY_QUOTIENT = 2**26    # ~67M - penalty scaling factor
+BASE_REWARD_FACTOR = 64  # Base reward calculation factor
+PROPOSER_REWARD_QUOTIENT = 8  # Proposer gets 1/8 of attestation rewards
+ATTESTATION_REWARD_QUOTIENT = 4  # Attestation reward divisor
+SYNC_REWARD_QUOTIENT = 2  # Sync committee reward divisor
+INACTIVITY_PENALTY_QUOTIENT = 2**26  # ~67M - penalty scaling factor
 
 # --- Slashing Penalties (percentage of stake) ---
-SLASHING_DOUBLE_SIGN = Decimal('0.50')          # 50% for double-signing
-SLASHING_INVALID_ATTESTATION = Decimal('0.30')  # 30% for invalid attestation
-SLASHING_SURROUND_VOTE = Decimal('0.50')        # 50% for surround voting
-SLASHING_DOWNTIME = Decimal('0.05')             # 5% for extended downtime
-SLASHING_BRIDGE_FRAUD = Decimal('1.00')         # 100% for bridge fraud
+SLASHING_DOUBLE_SIGN = Decimal("0.50")  # 50% for double-signing
+SLASHING_INVALID_ATTESTATION = Decimal("0.30")  # 30% for invalid attestation
+SLASHING_SURROUND_VOTE = Decimal("0.50")  # 50% for surround voting
+SLASHING_DOWNTIME = Decimal("0.05")  # 5% for extended downtime
+SLASHING_BRIDGE_FRAUD = Decimal("1.00")  # 100% for bridge fraud
 
 # --- Whistleblower Rewards ---
-WHISTLEBLOWER_REWARD_QUOTIENT = 512    # Reporter gets 1/512 of slashed amount
-PROPOSER_SLASHING_REWARD_QUOTIENT = 32 # Proposer gets 1/32 for including slash
+WHISTLEBLOWER_REWARD_QUOTIENT = 512  # Reporter gets 1/512 of slashed amount
+PROPOSER_SLASHING_REWARD_QUOTIENT = 32  # Proposer gets 1/32 for including slash
 
 # --- Performance Thresholds ---
-MAX_MISSED_BLOCKS_PER_EPOCH = 2        # Max missed proposals before warning
-MIN_ATTESTATION_RATE = Decimal('0.95') # 95% attestation rate expected
-INACTIVITY_LEAK_EPOCHS = 4             # Epochs of inactivity before leak starts
+MAX_MISSED_BLOCKS_PER_EPOCH = 2  # Max missed proposals before warning
+MIN_ATTESTATION_RATE = Decimal("0.95")  # 95% attestation rate expected
+INACTIVITY_LEAK_EPOCHS = 4  # Epochs of inactivity before leak starts
 
 # --- Block Timing ---
-BLOCK_PROPOSAL_DEADLINE = 1            # Seconds into slot for proposal deadline
-ATTESTATION_DEADLINE = 2               # Seconds into slot for attestation deadline
+BLOCK_PROPOSAL_DEADLINE = 1  # Seconds into slot for proposal deadline
+ATTESTATION_DEADLINE = 2  # Seconds into slot for attestation deadline
 
 # --- Genesis ---
 GENESIS_SLOT = 0
 GENESIS_EPOCH = 0
-GENESIS_FORK_VERSION = b'\x00\x00\x00\x01'
+GENESIS_FORK_VERSION = b"\x00\x00\x00\x01"
 
 # --- Domain Types for Signatures ---
-DOMAIN_BEACON_PROPOSER = b'\x00\x00\x00\x00'
-DOMAIN_BEACON_ATTESTER = b'\x01\x00\x00\x00'
-DOMAIN_RANDAO = b'\x02\x00\x00\x00'
-DOMAIN_DEPOSIT = b'\x03\x00\x00\x00'
-DOMAIN_VOLUNTARY_EXIT = b'\x04\x00\x00\x00'
-DOMAIN_SELECTION_PROOF = b'\x05\x00\x00\x00'
+DOMAIN_BEACON_PROPOSER = b"\x00\x00\x00\x00"
+DOMAIN_BEACON_ATTESTER = b"\x01\x00\x00\x00"
+DOMAIN_RANDAO = b"\x02\x00\x00\x00"
+DOMAIN_DEPOSIT = b"\x03\x00\x00\x00"
+DOMAIN_VOLUNTARY_EXIT = b"\x04\x00\x00\x00"
+DOMAIN_SELECTION_PROOF = b"\x05\x00\x00\x00"
 
 # --- Consolidated PoS Constants Dict (for validator module) ---
 POS_CONSTANTS = {
     # Timing
-    'SLOT_DURATION': SLOT_DURATION,
-    'SLOTS_PER_EPOCH': SLOTS_PER_EPOCH,
-    'EPOCHS_PER_SYNC_COMMITTEE': EPOCHS_PER_SYNC_COMMITTEE,
-    
+    "SLOT_DURATION": SLOT_DURATION,
+    "SLOT_DURATION_MS": SLOT_DURATION_MS,
+    "SLOTS_PER_EPOCH": SLOTS_PER_EPOCH,
+    "EPOCHS_PER_SYNC_COMMITTEE": EPOCHS_PER_SYNC_COMMITTEE,
     # Validators
-    'MIN_VALIDATORS': MIN_VALIDATORS,
-    'MAX_VALIDATORS': MAX_VALIDATORS,
-    'MIN_VALIDATOR_STAKE': MIN_VALIDATOR_STAKE,
-    'MAX_EFFECTIVE_STAKE': MAX_EFFECTIVE_STAKE,
-    
+    "MIN_VALIDATORS": MIN_VALIDATORS,
+    "MAX_VALIDATORS": MAX_VALIDATORS,
+    "MIN_VALIDATOR_STAKE": MIN_VALIDATOR_STAKE,
+    "VALIDATOR_EJECTION_STAKE": VALIDATOR_EJECTION_STAKE,
+    "MAX_EFFECTIVE_STAKE": MAX_EFFECTIVE_STAKE,
     # Staking
-    'UNBONDING_PERIOD_EPOCHS': UNBONDING_PERIOD_EPOCHS,
-    'MIN_DEPOSIT': MIN_DEPOSIT,
-    'MAX_DEPOSIT': MAX_DEPOSIT,
-    'ACTIVATION_DELAY_EPOCHS': ACTIVATION_DELAY_EPOCHS,
-    'WITHDRAWAL_DELAY_EPOCHS': WITHDRAWAL_DELAY_EPOCHS,
-    
+    "UNBONDING_PERIOD_EPOCHS": UNBONDING_PERIOD_EPOCHS,
+    "ACTIVATION_DELAY_EPOCHS": ACTIVATION_DELAY_EPOCHS,
+    "WITHDRAWAL_DELAY_EPOCHS": WITHDRAWAL_DELAY_EPOCHS,
     # Finality
-    'ATTESTATION_THRESHOLD': ATTESTATION_THRESHOLD,
-    'MIN_ATTESTATION_INCLUSION_DELAY': MIN_ATTESTATION_INCLUSION_DELAY,
-    'MAX_ATTESTATION_INCLUSION_DELAY': MAX_ATTESTATION_INCLUSION_DELAY,
-    'MAX_ATTESTATIONS_PER_BLOCK': MAX_ATTESTATIONS_PER_BLOCK,
-    
+    "ATTESTATION_THRESHOLD": ATTESTATION_THRESHOLD,
+    "MIN_ATTESTATION_INCLUSION_DELAY": MIN_ATTESTATION_INCLUSION_DELAY,
+    "MAX_ATTESTATION_INCLUSION_DELAY": MAX_ATTESTATION_INCLUSION_DELAY,
+    "MAX_ATTESTATIONS_PER_BLOCK": MAX_ATTESTATIONS_PER_BLOCK,
     # Rewards
-    'BASE_REWARD_FACTOR': BASE_REWARD_FACTOR,
-    'PROPOSER_REWARD_QUOTIENT': PROPOSER_REWARD_QUOTIENT,
-    'ATTESTATION_REWARD_QUOTIENT': ATTESTATION_REWARD_QUOTIENT,
-    
+    "BASE_REWARD_FACTOR": BASE_REWARD_FACTOR,
+    "PROPOSER_REWARD_QUOTIENT": PROPOSER_REWARD_QUOTIENT,
+    "ATTESTATION_REWARD_QUOTIENT": ATTESTATION_REWARD_QUOTIENT,
     # Slashing
-    'SLASHING_DOUBLE_SIGN': SLASHING_DOUBLE_SIGN,
-    'SLASHING_INVALID_ATTESTATION': SLASHING_INVALID_ATTESTATION,
-    'SLASHING_SURROUND_VOTE': SLASHING_SURROUND_VOTE,
-    'SLASHING_DOWNTIME': SLASHING_DOWNTIME,
-    'SLASHING_BRIDGE_FRAUD': SLASHING_BRIDGE_FRAUD,
-    
+    "SLASHING_DOUBLE_SIGN": SLASHING_DOUBLE_SIGN,
+    "SLASHING_INVALID_ATTESTATION": SLASHING_INVALID_ATTESTATION,
+    "SLASHING_SURROUND_VOTE": SLASHING_SURROUND_VOTE,
+    "SLASHING_DOWNTIME": SLASHING_DOWNTIME,
+    "SLASHING_BRIDGE_FRAUD": SLASHING_BRIDGE_FRAUD,
     # Genesis
-    'GENESIS_SLOT': GENESIS_SLOT,
-    'GENESIS_EPOCH': GENESIS_EPOCH,
+    "GENESIS_SLOT": GENESIS_SLOT,
+    "GENESIS_EPOCH": GENESIS_EPOCH,
 }
 
 
@@ -626,163 +845,33 @@ POS_CONSTANTS = {
 # ==================================================================================
 
 # Threshold Dilithium limits
-MULTISIG_MAX_SIGNERS = 150       # Maximum n (total signers in a keyset)
-MULTISIG_MAX_THRESHOLD = 100     # Maximum m (required signers)
-MULTISIG_MIN_THRESHOLD = 1       # Minimum m (1-of-n is the simplest multisig)
+MULTISIG_MAX_SIGNERS = 150  # Maximum n (total signers in a keyset)
+MULTISIG_MAX_THRESHOLD = 100  # Maximum m (required signers)
+MULTISIG_MIN_THRESHOLD = 1  # Minimum m (1-of-n is the simplest multisig)
 MULTISIG_ADDRESS_PREFIX = "0xPQMS"  # Prefix for derived multisig addresses
 
 # Domain separator for threshold signing (prevents cross-wallet replay)
 MULTISIG_DOMAIN_SEPARATOR = b"QRDX-THRESHOLD-DILITHIUM-v1"
 
 # Spending Scope bitmask (Whitepaper §6.2)
-SPENDING_SCOPE_NONE     = 0
-SPENDING_SCOPE_TRANSFER = 1   # Basic token transfers
-SPENDING_SCOPE_SWAP     = 2   # Exchange / DEX operations
-SPENDING_SCOPE_STAKE    = 4   # Staking deposits / withdrawals
-SPENDING_SCOPE_BRIDGE   = 8   # Cross-chain bridge operations
-SPENDING_SCOPE_ALL      = 15  # All operations
+SPENDING_SCOPE_NONE = 0
+SPENDING_SCOPE_TRANSFER = 1  # Basic token transfers
+SPENDING_SCOPE_SWAP = 2  # Exchange / DEX operations
+SPENDING_SCOPE_STAKE = 4  # Staking deposits / withdrawals
+SPENDING_SCOPE_BRIDGE = 8  # Cross-chain bridge operations
+SPENDING_SCOPE_ALL = 15  # All operations
 
 
 # ==================================================================================
-# CROSS-CHAIN BRIDGE & ORACLE (Whitepaper §8, §10)
+# CROSS-CHAIN BRIDGE: chain-spec parameters (BRIDGE_ASSETS, BRIDGE_DEPOSIT_WINDOW,
+# BRIDGE_MINT_LIMITS) and the rules in qrdx/exchange/bridge.py (docs/BRIDGE.md).
 # ==================================================================================
-
-# Chain identifiers (matches bridge.types.ChainId)
-BRIDGE_CHAIN_QRDX     = 0
-BRIDGE_CHAIN_ETHEREUM  = 1
-BRIDGE_CHAIN_BITCOIN   = 2
-BRIDGE_CHAIN_SOLANA    = 3
-BRIDGE_CHAIN_COSMOS    = 4
-
-# Confirmation requirements per chain (source chain finality)
-BRIDGE_CONFIRMATIONS_ETH = 12    # ~3 minutes (Ethereum PoS)
-BRIDGE_CONFIRMATIONS_BTC = 6     # ~60 minutes (Bitcoin PoW)
-BRIDGE_CONFIRMATIONS_SOL = 32    # ~12.8 seconds (Solana finality)
-BRIDGE_CONFIRMATIONS_COSMOS = 1  # Instant finality (Tendermint)
-
-# Bridge fees (basis points: 10 bps = 0.1%)
-BRIDGE_FEE_BPS = 10
-
-# Doomsday Protocol (§8.5)
-DOOMSDAY_CANARY_ADDRESS = "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
-DOOMSDAY_CANARY_BOUNTY = Decimal("1000000")  # 1M QRDX
-
-# Fraud proof window for high-value unshields (§8.2)
-FRAUD_PROOF_WINDOW_SECONDS = 604800  # 7 days
-HIGH_VALUE_THRESHOLD_USD = Decimal("100000")  # $100K
-
-# Oracle attestation threshold (§10.2)
-# Minimum fraction of validators required: ≥ 2/3+1
-ORACLE_ATTESTATION_QUORUM_NUMERATOR = 2
-ORACLE_ATTESTATION_QUORUM_DENOMINATOR = 3
-
-# Oracle precompile addresses (Step 4.5)
-ORACLE_PRECOMPILE_GET_CHAIN_STATE = 0x0200
-ORACLE_PRECOMPILE_VERIFY_PROOF = 0x0201
-ORACLE_PRECOMPILE_SUBMIT_CROSS_CHAIN_TX = 0x0202
-
-# Oracle precompile gas costs
-ORACLE_GAS_GET_CHAIN_STATE = 100_000
-ORACLE_GAS_VERIFY_PROOF = 200_000
-ORACLE_GAS_SUBMIT_CROSS_CHAIN_TX = 500_000
-
-# Bridge token minimum/maximum amounts
-BRIDGE_MIN_AMOUNT_ETH = Decimal("0.01")
-BRIDGE_MAX_AMOUNT_ETH = Decimal("10000")
-BRIDGE_MIN_AMOUNT_BTC = Decimal("0.0001")
-BRIDGE_MAX_AMOUNT_BTC = Decimal("1000")
-BRIDGE_MIN_AMOUNT_SOL = Decimal("0.01")
-BRIDGE_MAX_AMOUNT_SOL = Decimal("100000")
 
 # Default institutional custody thresholds (Whitepaper §6.3)
-TREASURY_MULTISIG_THRESHOLD = 5    # 5-of-9 for main treasury
-TREASURY_MULTISIG_TOTAL     = 9
-EMERGENCY_RECOVERY_THRESHOLD = 3   # 3-of-5 for emergency
-EMERGENCY_RECOVERY_TOTAL     = 5
-
-
-# ==================================================================================
-# qRC20 TOKEN STANDARD (Whitepaper §9)
-# ==================================================================================
-
-# Maximum supply for a single qRC20 token (2^96 - 1 raw units)
-QRC20_MAX_SUPPLY = Decimal("79228162514264337593543950335")
-
-# Default token decimals (same as ERC-20 convention)
-QRC20_DEFAULT_DECIMALS = 18
-
-# Maximum tokens that can be registered in one registry
-QRC20_MAX_REGISTRY_SIZE = 10_000
-
-# Batch transfer limit per call
-QRC20_MAX_BATCH_SIZE = 256
-
-# Domain separators for PQ signature verification
-QRC20_DOMAIN_TRANSFER = b"QRDX-QRC20-TRANSFER-v1"
-QRC20_DOMAIN_APPROVE  = b"QRDX-QRC20-APPROVE-v1"
-QRC20_DOMAIN_PERMIT   = b"QRDX-QRC20-PERMIT-v1"
-
-# Well-known shielded tokens (§9.4) — mapped to bridge source chains
-QRC20_SHIELDED_TOKENS = {
-    "qETH":  {"source_chain": "ETHEREUM", "post_doomsday_trade": True},
-    "qBTC":  {"source_chain": "BITCOIN",  "post_doomsday_trade": True},
-    "qSOL":  {"source_chain": "SOLANA",   "post_doomsday_trade": True},
-    "qUSDC": {"source_chain": "ETHEREUM", "post_doomsday_trade": True},
-    "qUSDT": {"source_chain": "ETHEREUM", "post_doomsday_trade": True},
-    "QRDX":  {"source_chain": "NATIVE",   "post_doomsday_trade": True},
-}
-
-
-# ==================================================================================
-# ON-CHAIN GOVERNANCE (Whitepaper §13)
-# ==================================================================================
-
-# --- Proposal Thresholds ---
-GOVERNANCE_PROPOSAL_DEPOSIT = Decimal("10000000")     # 10M QRDX to submit proposal
-GOVERNANCE_TEMPERATURE_SUPPORT = Decimal("1000000")   # 1M QRDX temperature-check min
-GOVERNANCE_MIN_DISCUSSION_DAYS = 3                    # Days before formal proposal
-
-# --- Voting Configuration ---
-GOVERNANCE_VOTING_PERIOD_DAYS = 7                     # 7-day voting window
-GOVERNANCE_VOTING_PERIOD_EPOCHS = 7 * 24 * 60         # ~7 days in epochs (1 epoch ≈ 64s)
-GOVERNANCE_QUORUM_THRESHOLD = Decimal("0.10")         # 10% of circulating supply
-GOVERNANCE_APPROVAL_THRESHOLD = Decimal("0.60")       # 60% for parameter changes
-GOVERNANCE_SUPERMAJORITY_THRESHOLD = Decimal("0.75")  # 75% for protocol upgrades
-
-# --- Vote Types ---
-GOVERNANCE_VOTE_FOR = 1
-GOVERNANCE_VOTE_AGAINST = 2
-GOVERNANCE_VOTE_ABSTAIN = 3
-
-# --- Timelock ---
-GOVERNANCE_TIMELOCK_MIN_DELAY_SECONDS = 2 * 24 * 3600   # 2 days minimum
-GOVERNANCE_TIMELOCK_MAX_DELAY_SECONDS = 14 * 24 * 3600  # 14 days maximum
-GOVERNANCE_TIMELOCK_DEFAULT_DELAY_SECONDS = 2 * 24 * 3600  # 2 days default
-
-# --- Guardian Council (§13.4) ---
-GOVERNANCE_GUARDIAN_THRESHOLD = 3   # 3-of-5 PQ multisig
-GOVERNANCE_GUARDIAN_TOTAL = 5
-
-# --- Governable Parameter Defaults (§13.5) ---
-GOVERNANCE_DEFAULT_PARAMETERS = {
-    "trading_fee_tiers":           [Decimal("0.0001"), Decimal("0.0005"),
-                                    Decimal("0.003"), Decimal("0.01")],
-    "orderbook_maker_fee":         Decimal("0.0002"),
-    "orderbook_taker_fee":         Decimal("0.0005"),
-    "bridge_fee_bps":              10,
-    "min_validator_stake":         Decimal("100000"),
-    "pool_creation_stake":         Decimal("10000"),
-    "pool_creation_subsidy_burn":  Decimal("5000"),
-    "validator_set_size":          150,
-    "block_time_seconds":          2,
-    "proposal_threshold":          Decimal("10000000"),
-    "voting_period_days":          7,
-    "oracle_attestation_threshold": Decimal("0.667"),
-    "min_chain_adapters":          1,
-}
-
-# Domain separator for governance signatures
-GOVERNANCE_DOMAIN_SEPARATOR = b"QRDX-GOVERNANCE-v1"
+TREASURY_MULTISIG_THRESHOLD = 5  # 5-of-9 for main treasury
+TREASURY_MULTISIG_TOTAL = 9
+EMERGENCY_RECOVERY_THRESHOLD = 3  # 3-of-5 for emergency
+EMERGENCY_RECOVERY_TOTAL = 5
 
 
 # ==================================================================================
@@ -790,46 +879,52 @@ GOVERNANCE_DOMAIN_SEPARATOR = b"QRDX-GOVERNANCE-v1"
 # ==================================================================================
 
 # --- Fee Tiers (basis-point notation) ---
-EXCHANGE_FEE_TIER_ULTRA_LOW = 100     # 0.01 %
-EXCHANGE_FEE_TIER_LOW       = 500     # 0.05 %
-EXCHANGE_FEE_TIER_MEDIUM    = 3000    # 0.30 %
-EXCHANGE_FEE_TIER_HIGH      = 10000   # 1.00 %
+EXCHANGE_FEE_TIER_ULTRA_LOW = 100  # 0.01 %
+EXCHANGE_FEE_TIER_LOW = 500  # 0.05 %
+EXCHANGE_FEE_TIER_MEDIUM = 3000  # 0.30 %
+EXCHANGE_FEE_TIER_HIGH = 10000  # 1.00 %
 
 # --- Fee Distribution (§7.6) ---
-EXCHANGE_FEE_LP_SHARE        = Decimal("0.70")
-EXCHANGE_FEE_CREATOR_SHARE   = Decimal("0.15")
-EXCHANGE_FEE_TREASURY_SHARE  = Decimal("0.10")
+EXCHANGE_FEE_LP_SHARE = Decimal("0.70")
+EXCHANGE_FEE_CREATOR_SHARE = Decimal("0.15")
+EXCHANGE_FEE_TREASURY_SHARE = Decimal("0.10")
 EXCHANGE_FEE_VALIDATOR_SHARE = Decimal("0.05")
 
 # --- Order Book (§7.2) ---
-EXCHANGE_ORDERBOOK_MAKER_FEE = Decimal("0.0002")   # 0.02 %
-EXCHANGE_ORDERBOOK_TAKER_FEE = Decimal("0.0005")   # 0.05 %
-EXCHANGE_ORDERBOOK_MAX_DEPTH = 500                   # price levels per side
+EXCHANGE_ORDERBOOK_MAKER_FEE = Decimal("0.0002")  # 0.02 %
+EXCHANGE_ORDERBOOK_TAKER_FEE = Decimal("0.0005")  # 0.05 %
+EXCHANGE_ORDERBOOK_MAX_DEPTH = 500  # price levels per side
 
-# --- Pool Types & Stake Requirements (§7.3) ---
-EXCHANGE_POOL_STAKE_STANDARD      = Decimal("10000")
-EXCHANGE_POOL_STAKE_BOOTSTRAP     = Decimal("25000")
-EXCHANGE_POOL_BURN_SUBSIDIZED     = Decimal("5000")
-EXCHANGE_POOL_STAKE_INSTITUTIONAL = Decimal("100000")
+# --- Pool Types & Stake Requirements (§7.3) --- (qrdx/exchange/amm.py POOL_STAKE_REQUIREMENTS)
+# QRDX staked (burned, for a subsidized pool) to create an AMM pool: ~$10,000 / $20,000 / $4,000 /
+# $100,000 at $400 a QRDX (docs/TOKENOMICS.md).
+EXCHANGE_POOL_STAKE_STANDARD = Decimal("25")
+EXCHANGE_POOL_STAKE_BOOTSTRAP = Decimal("50")
+EXCHANGE_POOL_BURN_SUBSIDIZED = Decimal("10")
+EXCHANGE_POOL_STAKE_INSTITUTIONAL = Decimal("250")
 
 # --- Tick Math Bounds ---
 EXCHANGE_MIN_TICK = -887272
-EXCHANGE_MAX_TICK =  887272
+EXCHANGE_MAX_TICK = 887272
 
-# --- Perpetual Contracts (roadmap extension) ---
-PERP_MAX_LEVERAGE               = Decimal("20")
-PERP_DEFAULT_INITIAL_MARGIN     = Decimal("0.05")    # 5 %
-PERP_DEFAULT_MAINTENANCE_MARGIN = Decimal("0.025")   # 2.5 %
-PERP_FUNDING_INTERVAL_SECONDS   = 8 * 3600           # 8 hours
-PERP_MAX_FUNDING_RATE           = Decimal("0.01")     # ±1 % cap
-PERP_INSURANCE_CLAWBACK_PCT     = Decimal("0.20")     # ADL trigger
+# --- Perpetual Contracts (roadmap extension; the retired PerpEngine's figures) ---
+# The live perps rules are in qrdx/exchange/clearinghouse.py (leverage, margin, funding cap) and
+# PERP_FUNDING_INTERVAL_SECONDS / PERP_VAULT_* above. This block once ALSO defined
+# PERP_FUNDING_INTERVAL_SECONDS (8 hours); being later in the file, it silently replaced the
+# env-driven one, so no node could be configured. Never define a protocol constant twice
+# (tests/test_constants_single_definition.py).
+PERP_MAX_LEVERAGE = Decimal("20")
+PERP_DEFAULT_INITIAL_MARGIN = Decimal("0.05")  # 5 %
+PERP_DEFAULT_MAINTENANCE_MARGIN = Decimal("0.025")  # 2.5 %
+PERP_MAX_FUNDING_RATE = Decimal("0.01")  # ±1 % cap
+PERP_INSURANCE_CLAWBACK_PCT = Decimal("0.20")  # ADL trigger
 
 # --- Gas Costs (§7.7) ---
-EXCHANGE_GAS_SWAP           = 65_000
-EXCHANGE_GAS_ADD_LIQUIDITY  = 90_000
-EXCHANGE_GAS_LIMIT_ORDER    = 40_000
-EXCHANGE_GAS_CANCEL_ORDER   = 25_000
-EXCHANGE_GAS_CREATE_POOL    = 150_000
+EXCHANGE_GAS_SWAP = 65_000
+EXCHANGE_GAS_ADD_LIQUIDITY = 90_000
+EXCHANGE_GAS_LIMIT_ORDER = 40_000
+EXCHANGE_GAS_CANCEL_ORDER = 25_000
+EXCHANGE_GAS_CREATE_POOL = 150_000
 
 
 # ==================================================================================
@@ -839,19 +934,22 @@ EXCHANGE_GAS_CREATE_POOL    = 150_000
 # Format: {address: (balance, label)}
 # The treasury and foundation addresses receive their allocations at network launch.
 
+# The rest of the genesis supply beyond the system wallets, in the old 10 : 5 : 3 : 2 shares.
+# Placeholder holders: a launch names the real ones (and funds genesis validators' stakes out of
+# the validator incentive fund), so that everything sums to GENESIS_SUPPLY.
 GENESIS_PREFUNDED_ACCOUNTS = {
     # Treasury - ecosystem development, grants, partnerships
-    'Qrdx_treasury_00000000000000000000000000000001': (Decimal('10000000'), 'Treasury'),
-    
+    "Qrdx_treasury_00000000000000000000000000000001": (Decimal("4993000"), "Treasury"),
     # Foundation - long-term development and maintenance
-    'Qrdx_foundation_000000000000000000000000000001': (Decimal('5000000'), 'Foundation'),
-    
-    # Validator incentive fund - bootstrapping initial validators
-    'Qrdx_validator_incentive_0000000000000000001': (Decimal('2000000'), 'Validator Incentive Fund'),
-    
+    "Qrdx_foundation_000000000000000000000000000001": (Decimal("2496500"), "Foundation"),
+    # Validator incentive fund - bootstrapping initial validators (their genesis stakes)
+    "Qrdx_validator_incentive_0000000000000000001": (
+        Decimal("998600"),
+        "Validator Incentive Fund",
+    ),
     # Community fund - airdrops, community initiatives
-    'Qrdx_community_fund_00000000000000000000001': (Decimal('3000000'), 'Community Fund'),
+    "Qrdx_community_fund_00000000000000000000001": (Decimal("1497900"), "Community Fund"),
 }
 
-# Total genesis allocation (20M QRDX)
+# Total genesis allocation (with the system wallets: GENESIS_SUPPLY)
 GENESIS_TOTAL_PREFUNDED = sum(amount for amount, _ in GENESIS_PREFUNDED_ACCOUNTS.values())

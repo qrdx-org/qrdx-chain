@@ -1,0 +1,693 @@
+"""
+Operational-readiness surface: health/readiness probes, Prometheus metrics, and a realtime
+event stream (WebSocket + SSE) fed by an in-process pub/sub hub.
+
+Design goals:
+  * ZERO coupling to the consensus/import path. Every path that changes the chain raises
+    ``CHAIN_CHANGED`` when it releases the block-processing lock (``SignallingLock``): setting a
+    flag, never awaiting. Background publishers wake on it, read the chain tip, finality and the
+    exchange, and publish, so a block reaches subscribers as soon as it is applied. Nothing here
+    can stall or diverge block processing. A timer is only the fallback.
+  * Bounded memory under load — each subscriber has a bounded queue that DROPS OLDEST on overflow
+    (telemetry favors the freshest data; a slow client never grows the node's memory).
+  * Toggleable streaming — the WebSocket/SSE endpoints are opt-in (a node operator enables them),
+    while health + metrics are always available for monitoring.
+
+Pure + framework-agnostic (no FastAPI import here) so the core is unit-testable; main.py wires the
+endpoints and the poller's data getters.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from collections import defaultdict
+from typing import (
+    AbstractSet,
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pub/sub event hub
+# ─────────────────────────────────────────────────────────────────────────────
+# Channels a stream client may subscribe to. Every event names its ``channel`` (block events:
+# "blocks") and may carry a ``key`` (a market id, an address); a subscription to "<channel>"
+# receives every event on it, one to "<channel>:<key>" only that key's. A client that never
+# subscribes receives DEFAULT_CHANNELS — the block feed, exactly as before channels existed.
+DEFAULT_CHANNELS = frozenset({"blocks"})
+STREAM_CHANNELS = frozenset(
+    {
+        "blocks",
+        "perp_markets",
+        "perp_book",
+        "perp_events",
+        "perp_account",
+        "spot_pools",
+        "spot_book",
+        "spot_account",
+        "tokens",
+        "orderbook",
+        "trades",
+        "tickers",
+    }
+)
+# Channels that only make sense for one market / pair / address.
+KEYED_CHANNELS = frozenset({"perp_book", "perp_account", "spot_book", "spot_account", "orderbook"})
+# Channels keyed by a market: a spot pair "a:b" (either order) or a perps market id.
+MARKET_CHANNELS = frozenset({"spot_book", "orderbook", "trades", "tickers"})
+MAX_CHANNELS_PER_CLIENT = 64
+MAX_CHANNEL_LEN = 160
+
+
+def valid_channel(name: Any) -> bool:
+    if not isinstance(name, str) or not name or len(name) > MAX_CHANNEL_LEN:
+        return False
+    base, _, key = name.partition(":")
+    if base not in STREAM_CHANNELS:
+        return False
+    if base in KEYED_CHANNELS and not key:
+        return False  # a book / account stream is per market or address
+    return all(c.isalnum() or c in "-_:." for c in key)
+
+
+def canonical_channel(name: str) -> str:
+    """The form events are published under: a spot pair in sorted order (token0:token1, as
+    pools and books key it), so either order subscribes to the same book; a token address in
+    lowercase."""
+    base, _, key = name.partition(":")
+    if base in MARKET_CHANNELS and key.count(":") == 1:
+        a, b = (_asset_key(x) for x in key.split(":"))
+        return f"{base}:{min(a, b)}:{max(a, b)}"
+    if base == "tokens" and key:
+        return f"{base}:{key.lower()}"  # token addresses are lowercase
+    return name
+
+
+def _asset_key(asset: str) -> str:
+    """An asset as spot names it: native QRDX in capitals, a token address in lowercase."""
+    if asset.upper() == "QRDX":
+        return "QRDX"
+    return asset.lower() if asset.lower().startswith("0x") else asset
+
+
+def event_matches(channels: AbstractSet[str], event: Dict[str, Any]) -> bool:
+    channel = event.get("channel", "blocks")
+    if channel in channels:
+        return True
+    key = event.get("key")
+    if key is None:
+        return False
+    return any(f"{channel}:{k}" in channels for k in str(key).split(","))
+
+
+class EventHub:
+    """In-process fan-out of realtime events to any number of subscribers (WebSocket/SSE clients).
+
+    Each subscriber gets its own bounded ``asyncio.Queue`` and its own channel set (see
+    STREAM_CHANNELS); on overflow the OLDEST queued event is dropped so a slow consumer can never
+    grow node memory or back-pressure the publisher."""
+
+    def __init__(self, max_queue: int = 256):
+        self._max_queue = max_queue
+        self._subs: Set[asyncio.Queue] = set()
+        self._channels: Dict[asyncio.Queue, AbstractSet[str]] = {}
+        self._dropped = 0
+
+    def subscribe(self, channels: Optional[Set[str]] = None) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=self._max_queue)
+        self._subs.add(q)
+        self._channels[q] = set(channels) if channels else set(DEFAULT_CHANNELS)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subs.discard(q)
+        self._channels.pop(q, None)
+
+    def channels(self, q: asyncio.Queue) -> Set[str]:
+        return set(self._channels.get(q, DEFAULT_CHANNELS))
+
+    def set_channels(self, q: asyncio.Queue, channels: Set[str]) -> None:
+        if q in self._subs:
+            self._channels[q] = set(channels)
+
+    def wants(self, channel: str, key: Optional[str] = None) -> bool:
+        """Whether any subscriber would receive an event on ``channel`` (for ``key``) — so a
+        publisher can skip building events nobody listens to."""
+        probe = {"channel": channel, "key": key}
+        return any(event_matches(ch, probe) for ch in self._channels.values())
+
+    def keys(self, channel: str) -> Set[str]:
+        """Every key subscribed to on ``channel`` ("perp_account:0xPQ…" → "0xPQ…")."""
+        prefix = channel + ":"
+        return {
+            c[len(prefix) :]
+            for chans in self._channels.values()
+            for c in chans
+            if c.startswith(prefix)
+        }
+
+    @property
+    def subscriber_count(self) -> int:
+        return len(self._subs)
+
+    @property
+    def dropped_count(self) -> int:
+        return self._dropped
+
+    def _offer(self, q: asyncio.Queue, event: Dict[str, Any]) -> None:
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            try:
+                q.get_nowait()  # drop oldest
+                self._dropped += 1
+                q.put_nowait(event)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def publish_nowait(self, event: Dict[str, Any]) -> None:
+        """Fan ``event`` out to every subscriber whose channels match it (drop-oldest on a full
+        queue). Never raises, never waits."""
+        for q in list(self._subs):
+            if event_matches(self._channels.get(q, DEFAULT_CHANNELS), event):
+                self._offer(q, event)
+
+    async def publish(self, event: Dict[str, Any]) -> None:
+        self.publish_nowait(event)
+
+    def deliver(self, q: asyncio.Queue, event: Dict[str, Any]) -> None:
+        """Send ``event`` to one subscriber only (e.g. the reply to its subscribe request)."""
+        if q in self._subs:
+            self._offer(q, event)
+
+
+def handle_client_frame(hub: EventHub, q: asyncio.Queue, frame: Any) -> Dict[str, Any]:
+    """A stream client's control message → the reply to send it.
+
+    ``{"op": "subscribe" | "unsubscribe" | "set", "channels": [...]}`` adds, removes or replaces
+    channels; ``{"op": "channels"}`` lists them. Unknown channels are refused, and a client may
+    hold at most MAX_CHANNELS_PER_CLIENT."""
+    if not isinstance(frame, dict):
+        return {"type": "error", "error": "expected a JSON object"}
+    op = frame.get("op")
+    current = hub.channels(q)
+    if op == "channels":
+        return {"type": "channels", "channels": sorted(current)}
+    if op not in ("subscribe", "unsubscribe", "set"):
+        return {"type": "error", "error": f"unknown op {op!r}"}
+    requested = frame.get("channels")
+    if isinstance(requested, str):
+        requested = [requested]
+    if not isinstance(requested, list) or not requested:
+        return {"type": "error", "error": "channels must be a non-empty list"}
+    bad = [c for c in requested if not valid_channel(c)]
+    if bad:
+        return {"type": "error", "error": f"invalid channel(s): {bad[:5]}"}
+    requested = [canonical_channel(c) for c in requested]
+    if op == "subscribe":
+        updated = current | set(requested)
+    elif op == "unsubscribe":
+        updated = current - set(requested)
+    else:
+        updated = set(requested)
+    if len(updated) > MAX_CHANNELS_PER_CLIENT:
+        return {"type": "error", "error": f"at most {MAX_CHANNELS_PER_CLIENT} channels"}
+    hub.set_channels(q, updated)
+    return {"type": "subscribed", "channels": sorted(updated)}
+
+
+def parse_channels(spec: Optional[str]) -> Optional[Set[str]]:
+    """A comma-separated channel list (the SSE ``?channels=`` query) → a valid set, or None for
+    the default. Invalid names are dropped; the list is capped."""
+    if not spec:
+        return None
+    chans = [canonical_channel(c.strip()) for c in spec.split(",") if valid_channel(c.strip())]
+    return set(chans[:MAX_CHANNELS_PER_CLIENT]) or None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metrics registry (Prometheus text exposition)
+# ─────────────────────────────────────────────────────────────────────────────
+class Metrics:
+    """Minimal counter/gauge registry rendered in Prometheus text format, with optional LABELS
+    (e.g. per-RPC-method, per-p2p-event breakdowns). Counters only increase; gauges are set to a
+    current value. Thread-safety is not needed — the event loop is single-threaded.
+
+    Labels are passed as a dict; a metric name may carry many label series. Keep label VALUE
+    cardinality bounded (method names, event kinds) — never user-supplied unbounded strings."""
+
+    def __init__(self):
+        self._counters: Dict[tuple, float] = defaultdict(float)  # (name, labelkey) -> value
+        self._gauges: Dict[tuple, float] = {}  # (name, labelkey) -> value
+        self._help: Dict[str, str] = {}
+
+    @staticmethod
+    def _lk(labels: Optional[Dict[str, Any]]) -> tuple:
+        return tuple(sorted((str(k), str(v)) for k, v in (labels or {}).items()))
+
+    def describe(self, name: str, help_text: str) -> None:
+        self._help[name] = help_text
+
+    def inc(self, name: str, amount: float = 1.0, labels: Optional[Dict[str, Any]] = None) -> None:
+        self._counters[(name, self._lk(labels))] += amount
+
+    def set(self, name: str, value: float, labels: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            self._gauges[(name, self._lk(labels))] = float(value)
+        except (TypeError, ValueError):
+            pass
+
+    @staticmethod
+    def _series(name: str, labelkey: tuple) -> str:
+        if not labelkey:
+            return name
+        inner = ",".join(f'{k}="{_esc(v)}"' for k, v in labelkey)
+        return f"{name}{{{inner}}}"
+
+    def snapshot(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for (name, lk), v in self._gauges.items():
+            out[self._series(name, lk)] = v
+        for (name, lk), v in self._counters.items():
+            out[self._series(name, lk)] = v
+        return out
+
+    def _render_group(self, store: Dict[tuple, float], kind: str) -> list:
+        by_name: Dict[str, list] = defaultdict(list)
+        for (name, lk), v in store.items():
+            by_name[name].append((lk, v))
+        lines = []
+        for name in sorted(by_name):
+            if name in self._help:
+                lines.append(f"# HELP {name} {self._help[name]}")
+            lines.append(f"# TYPE {name} {kind}")
+            for lk, v in sorted(by_name[name]):
+                lines.append(f"{self._series(name, lk)} {_fmt(v)}")
+        return lines
+
+    def render_prometheus(self) -> str:
+        lines = self._render_group(self._counters, "counter")
+        lines += self._render_group(self._gauges, "gauge")
+        return "\n".join(lines) + "\n"
+
+
+def _fmt(v: float) -> str:
+    # Prometheus wants a plain number; render integers without a trailing .0.
+    if v == int(v):
+        return str(int(v))
+    return repr(v)
+
+
+def _esc(v: str) -> str:
+    return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# "The chain changed" — what the publishers wake on
+# ─────────────────────────────────────────────────────────────────────────────
+class ChangeSignal:
+    """Raised (never awaited) whenever the chain may have changed; each publisher waits on its own
+    listener. The publishers used to wake on timers (the block feed every 2 s, the exchange every
+    1 s), so at 250 ms slots subscribers received blocks and trades in bursts of four to eight."""
+
+    def __init__(self) -> None:
+        self._listeners: List[asyncio.Event] = []
+        self.raised = 0
+
+    def listener(self) -> asyncio.Event:
+        event = asyncio.Event()
+        self._listeners.append(event)
+        return event
+
+    def drop(self, listener: asyncio.Event) -> None:
+        if listener in self._listeners:
+            self._listeners.remove(listener)
+
+    def raise_(self) -> None:
+        self.raised += 1
+        for event in self._listeners:
+            event.set()
+
+    @staticmethod
+    async def wait(listener: asyncio.Event, timeout: float) -> bool:
+        """Until the signal is raised (True) or ``timeout`` passes (False). The listener is reset
+        before returning, so a change raised while the caller works wakes its next wait."""
+        try:
+            await asyncio.wait_for(listener.wait(), timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            listener.clear()
+
+
+class SignallingLock(asyncio.Lock):
+    """An asyncio lock that raises ``signal`` each time it is released: main.block_processing_lock,
+    held by every path that changes the chain (proposing, importing, syncing, a reorg).
+
+    It also says when block work is pending (``until_free``), so that work which can wait
+    (admitting transactions, indexing) yields to it. An import awaits the database dozens of
+    times, and each await resumed only after every callback queued before it: under load,
+    hundreds from admission, which more than doubled a block's import time
+    (docs/PERFORMANCE.md)."""
+
+    def __init__(self, signal: ChangeSignal) -> None:
+        super().__init__()
+        self._signal = signal
+        self._wanted = 0  # holding it or waiting for it
+        self._free = asyncio.Event()
+        self._free.set()
+
+    async def acquire(self) -> Literal[True]:
+        self._wanted += 1
+        self._free.clear()
+        try:
+            return await super().acquire()
+        except BaseException:
+            self._unwanted()
+            raise
+
+    def release(self) -> None:
+        super().release()
+        self._unwanted()
+        self._signal.raise_()
+
+    def _unwanted(self) -> None:
+        self._wanted -= 1
+        if self._wanted <= 0:
+            self._wanted = 0
+            self._free.set()
+
+    async def until_free(self, at_most: float) -> None:
+        """Until no one holds or waits for the lock, or ``at_most`` seconds have passed (work
+        that yields is delayed, never starved)."""
+        if self._free.is_set():
+            return
+        try:
+            await asyncio.wait_for(self._free.wait(), at_most)
+        except asyncio.TimeoutError:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Realtime chain-event publisher (the consensus-decoupled event source)
+# ─────────────────────────────────────────────────────────────────────────────
+_MaybeAsync = Union[Callable[[], Any], Callable[[], Awaitable[Any]]]
+
+
+async def _maybe_await(v: Any) -> Any:
+    if asyncio.iscoroutine(v):
+        return await v
+    return v
+
+
+async def chain_event_poller(
+    hub: EventHub,
+    metrics: Metrics,
+    *,
+    get_tip: _MaybeAsync,
+    get_hashes: Optional[Callable[[int, int], Any]] = None,
+    get_peer_count: Optional[_MaybeAsync] = None,
+    get_finality: Optional[_MaybeAsync] = None,
+    get_slashing_count: Optional[_MaybeAsync] = None,
+    get_mempool_depth: Optional[_MaybeAsync] = None,
+    get_gauges: Optional[_MaybeAsync] = None,
+    get_version: Optional[Callable[[], Optional[int]]] = None,
+    interval: float = 1.0,
+    signal: Optional[ChangeSignal] = None,
+    _max_iterations: Optional[int] = None,  # test hook
+) -> None:
+    """Publish every new block to ``hub`` as soon as ``signal`` says the chain changed (or every
+    ``interval`` without one), and keep ``metrics`` current. Reads only, never the import path.
+
+    Each block is one ``block`` event with its height and hash (``get_hashes(lo, hi)`` →
+    {height: hash}). When blocks this feed already announced are replaced, it first publishes a
+    ``reorg`` event naming the last block that survived, then the new blocks above it, so a
+    subscriber can drop what it showed. The slower gauges (peers, finality, slashing, mempool,
+    and ``get_gauges``: ``(name, value, labels)`` triples — the validator's signing state, the
+    bridge's guardrails, oracle ages) are refreshed at most every ``interval``. Best-effort: a
+    getter error is retried on the next wake. ``get_version``: a number that changes whenever
+    the chain's blocks may have (None: unknown) — while it and the tip are as they were, the
+    hashes are not read again (the signal wakes the feed many times a block)."""
+    metrics.describe("qrdx_chain_height", "Current chain tip height")
+    metrics.describe("qrdx_finalized_epoch", "Highest finalized epoch")
+    metrics.describe("qrdx_peer_count", "Connected peer count")
+    metrics.describe("qrdx_blocks_streamed_total", "Blocks emitted to the realtime stream")
+    metrics.describe("qrdx_reorgs_streamed_total", "Reorgs announced on the realtime stream")
+    metrics.set("qrdx_up", 1)
+
+    listener = signal.listener() if signal is not None else None
+    announced: Dict[int, str] = {}  # recently announced height → hash
+    last_height = -1
+    last_version: Optional[int] = None
+    gauges_at = float("-inf")
+    fin: Dict[str, Any] = {}
+    iterations = 0
+    try:
+        while True:
+            try:
+                tip = int(await _maybe_await(get_tip()))
+                metrics.set("qrdx_chain_height", tip)
+                now = time.monotonic()
+                if now - gauges_at >= interval:
+                    gauges_at = now
+                    fin = await _refresh_gauges(
+                        hub,
+                        metrics,
+                        get_peer_count,
+                        get_finality,
+                        get_slashing_count,
+                        get_mempool_depth,
+                        get_gauges,
+                    )
+                version = get_version() if get_version is not None else None
+                unchanged = version is not None and version == last_version
+                if tip != last_height or (get_hashes is not None and not unchanged):
+                    last_height = await _publish_blocks(
+                        hub, metrics, tip, last_height, announced, get_hashes, fin
+                    )
+                    last_version = version
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            iterations += 1
+            if _max_iterations is not None and iterations >= _max_iterations:
+                break
+            if listener is not None:
+                await ChangeSignal.wait(listener, interval)
+            else:
+                await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if listener is not None and signal is not None:
+            signal.drop(listener)
+
+
+async def _refresh_gauges(
+    hub: EventHub,
+    metrics: Metrics,
+    get_peer_count: Optional[_MaybeAsync],
+    get_finality: Optional[_MaybeAsync],
+    get_slashing_count: Optional[_MaybeAsync],
+    get_mempool_depth: Optional[_MaybeAsync],
+    get_gauges: Optional[_MaybeAsync] = None,
+) -> Dict[str, Any]:
+    metrics.set("qrdx_stream_subscribers", hub.subscriber_count)
+    metrics.set("qrdx_stream_dropped_total", hub.dropped_count)
+    if get_peer_count is not None:
+        metrics.set("qrdx_peer_count", int(await _maybe_await(get_peer_count())))
+    fin: Dict[str, Any] = {}
+    if get_finality is not None:
+        fin = (await _maybe_await(get_finality())) or {}
+        fin_ep = int(fin.get("finalized_epoch", -1))
+        metrics.set("qrdx_finalized_epoch", fin_ep)
+        metrics.set("qrdx_justified_epoch", int(fin.get("justified_epoch", -1)))
+        # Finality lag = how many epochs the tip is ahead of the finalized boundary. A healthy
+        # chain keeps this small and bounded; a growing lag means finality is falling behind
+        # (the key production alert). Before anything is finalized the lag is 0.
+        max_ep = int(fin.get("max_epoch", -1))
+        metrics.set("qrdx_finality_lag_epochs", max(0, max_ep - fin_ep) if fin_ep >= 0 else 0)
+    if get_slashing_count is not None:
+        metrics.set("qrdx_slashing_events", int(await _maybe_await(get_slashing_count())))
+    if get_mempool_depth is not None:
+        metrics.set("qrdx_mempool_pending", int(await _maybe_await(get_mempool_depth())))
+    if get_gauges is not None:
+        for name, value, labels in (await _maybe_await(get_gauges())) or ():
+            metrics.set(name, float(value), labels)
+    return fin
+
+
+_ANNOUNCED_KEEP = 512  # heights whose hash the feed remembers, to recognise a reorg
+_CATCH_UP_MAX = 64  # blocks published at most per wake (a node that jumps far is not replayed)
+
+
+async def _publish_blocks(
+    hub: EventHub,
+    metrics: Metrics,
+    tip: int,
+    last_height: int,
+    announced: Dict[int, str],
+    get_hashes: Optional[Callable[[int, int], Any]],
+    fin: Dict[str, Any],
+) -> int:
+    """Publish the blocks above what was announced (after a ``reorg`` event if announced blocks
+    were replaced). Returns the new last announced height."""
+    start = last_height + 1 if last_height >= 0 else tip
+    hashes: Dict[int, str] = {}
+    if get_hashes is not None:
+        lo = max(0, min(start, last_height if last_height >= 0 else tip) - _CATCH_UP_MAX)
+        hashes = {int(h): bh for h, bh in ((await _maybe_await(get_hashes(lo, tip))) or {}).items()}
+        # The highest announced block still on the chain: the reorg's surviving ancestor.
+        ancestor = last_height
+        for h in sorted((h for h in announced if h >= lo), reverse=True):
+            if h <= tip and hashes.get(h) == announced[h]:
+                ancestor = h
+                break
+            ancestor = h - 1
+        if last_height >= 0 and ancestor < last_height:
+            hub.publish_nowait(
+                {
+                    "type": "reorg",
+                    "channel": "blocks",
+                    "ancestor": ancestor,
+                    "ancestor_hash": hashes.get(ancestor),
+                    "orphaned": [announced[h] for h in sorted(announced) if h > ancestor],
+                    "ts": time.time(),
+                }
+            )
+            metrics.inc("qrdx_reorgs_streamed_total")
+            for h in [h for h in announced if h > ancestor]:
+                del announced[h]
+            start = ancestor + 1
+    for h in range(max(start, tip - _CATCH_UP_MAX + 1), tip + 1):
+        event = {
+            "type": "block",
+            "channel": "blocks",
+            "height": h,
+            "ts": time.time(),
+            "finalized_epoch": int(fin.get("finalized_epoch", -1)) if fin else None,
+        }
+        if h in hashes:
+            event["hash"] = hashes[h]
+            announced[h] = hashes[h]
+        hub.publish_nowait(event)
+        metrics.inc("qrdx_blocks_streamed_total")
+    for h in [h for h in announced if h <= tip - _ANNOUNCED_KEEP]:
+        del announced[h]
+    return max(tip, last_height) if not hashes else tip
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stream framing helpers (shared by WebSocket + SSE)
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Process-wide singletons — shared by main.py (endpoints + poller) AND the RPC / p2p layers, which
+# record into them WITHOUT importing main.py (observability imports only stdlib, so it is safe to
+# import from anywhere with no cycle). Recording is best-effort; a metrics error never breaks a
+# request or block-propagation path.
+# ─────────────────────────────────────────────────────────────────────────────
+METRICS = Metrics()
+EVENT_HUB = EventHub()
+CHAIN_CHANGED = ChangeSignal()
+
+
+# Round trips to the database's thread (aiosqlite), for Phases: every statement, fetch and commit.
+DB_CALLS = [0]
+
+
+def count_db_calls(connection: Any) -> None:
+    """Count ``connection``'s round trips in DB_CALLS (its every operation goes through
+    ``_execute``)."""
+    inner = getattr(connection, "_execute", None)
+    if inner is None or getattr(inner, "_counted", False):
+        return
+
+    async def counted(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        DB_CALLS[0] += 1
+        return await inner(fn, *args, **kwargs)
+
+    counted._counted = True  # type: ignore[attr-defined]
+    connection._execute = counted
+
+
+class Phases:
+    """Wall time of a task's steps, for its log line: ``mark(name)`` ends the step called
+    ``name``. ``str()`` reads "lock 3, exchange 41, store 9, db 37" (milliseconds; steps under
+    half a millisecond left out; ``db``: the database round trips since it began)."""
+
+    __slots__ = ("_last", "_steps", "_db")
+
+    def __init__(self) -> None:
+        self._last = time.perf_counter()
+        self._steps: List[Tuple[str, float]] = []
+        self._db = DB_CALLS[0]
+
+    def mark(self, name: str) -> None:
+        now = time.perf_counter()
+        self._steps.append((name, now - self._last))
+        self._last = now
+
+    def __str__(self) -> str:
+        steps = [f"{n} {1000 * s:.0f}" for n, s in self._steps if s >= 0.0005]
+        return ", ".join(steps + [f"db {DB_CALLS[0] - self._db}"])
+
+
+def record(name: str, amount: float = 1.0, labels: Optional[Dict[str, Any]] = None) -> None:
+    """Best-effort counter increment on the shared registry (never raises into a caller)."""
+    try:
+        METRICS.inc(name, amount, labels)
+    except Exception:
+        pass
+
+
+def gauge(name: str, value: float, labels: Optional[Dict[str, Any]] = None) -> None:
+    """Best-effort gauge set on the shared registry (never raises into a caller)."""
+    try:
+        METRICS.set(name, value, labels)
+    except Exception:
+        pass
+
+
+def sse_frame(event: Dict[str, Any]) -> str:
+    """Format an event as a Server-Sent-Events frame."""
+    return f"data: {json.dumps(event, default=str)}\n\n"
+
+
+async def sse_stream(
+    hub: EventHub,
+    *,
+    keepalive: float = 15.0,
+    channels: Optional[Set[str]] = None,
+    initial: Optional[list] = None,
+) -> AsyncIterator[str]:
+    """Yield SSE frames from the hub for ``channels`` (None: the default block feed) — first any
+    ``initial`` snapshot events — with periodic keepalive comments so idle proxies don't cut the
+    connection. Always unsubscribes on exit."""
+    q = hub.subscribe(channels)
+    try:
+        yield sse_frame({"type": "hello", "ts": time.time(), "channels": sorted(hub.channels(q))})
+        for event in initial or ():
+            yield sse_frame(event)
+        while True:
+            try:
+                event = await asyncio.wait_for(q.get(), timeout=keepalive)
+                yield sse_frame(event)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+    finally:
+        hub.unsubscribe(q)

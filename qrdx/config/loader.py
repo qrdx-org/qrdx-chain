@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class NodeSectionConfig:
     """[node] section."""
+
     node_id: str = ""
     chain_id: int = 1
     network_name: str = "qrdx-mainnet"
@@ -68,15 +69,19 @@ class NodeSectionConfig:
 
 # -- P2P ---------------------------------------------------------------
 
+DEFAULT_BOOTNODES = (
+    "http://node.qrdx.network:3007",
+    "http://node2.qrdx.network:3007",
+    "http://node3.qrdx.network:3007",
+)
+
+
 @dataclass
 class DiscoveryConfig:
     """[p2p.discovery]."""
+
     enabled: bool = True
-    bootnodes: List[str] = field(default_factory=lambda: [
-        "http://node.qrdx.network:3007",
-        "http://node2.qrdx.network:3007",
-        "http://node3.qrdx.network:3007",
-    ])
+    bootnodes: List[str] = field(default_factory=lambda: list(DEFAULT_BOOTNODES))
     dns_discovery: bool = False
     dns_networks: List[str] = field(default_factory=list)
 
@@ -84,7 +89,7 @@ class DiscoveryConfig:
     def from_dict(cls, data: Dict[str, Any]) -> "DiscoveryConfig":
         return cls(
             enabled=data.get("enabled", True),
-            bootnodes=data.get("bootnodes", cls.__dataclass_fields__["bootnodes"].default_factory()),
+            bootnodes=data.get("bootnodes", list(DEFAULT_BOOTNODES)),
             dns_discovery=data.get("dns_discovery", False),
             dns_networks=data.get("dns_networks", []),
         )
@@ -97,17 +102,28 @@ class DiscoveryConfig:
 @dataclass
 class P2PSecurityConfig:
     """[p2p.security]."""
+
     post_quantum_enabled: bool = True
-    pq_kem_algorithm: str = "Kyber768"
-    pq_sig_algorithm: str = "Dilithium3"
+    pq_kem_algorithm: str = "ML-KEM-768"
+    pq_sig_algorithm: str = "ML-DSA-65"
     pq_required: bool = False
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "P2PSecurityConfig":
+        from ..crypto.pq.algorithms import KEM_ALGORITHM, SIG_ALGORITHM
+
+        kem = data.get("pq_kem_algorithm", KEM_ALGORITHM)
+        sig = data.get("pq_sig_algorithm", SIG_ALGORITHM)
+        # The algorithms are the protocol's, not a node's choice: another one cannot talk to
+        # the network (qrdx/crypto/pq/algorithms.py). Refuse rather than ignore the setting.
+        if (kem, sig) != (KEM_ALGORITHM, SIG_ALGORITHM):
+            raise ValueError(
+                f"[p2p.security] names {kem}/{sig}; QRDX runs only {KEM_ALGORITHM}/{SIG_ALGORITHM}"
+            )
         return cls(
             post_quantum_enabled=data.get("post_quantum_enabled", True),
-            pq_kem_algorithm=data.get("pq_kem_algorithm", "Kyber768"),
-            pq_sig_algorithm=data.get("pq_sig_algorithm", "Dilithium3"),
+            pq_kem_algorithm=kem,
+            pq_sig_algorithm=sig,
             pq_required=data.get("pq_required", False),
         )
 
@@ -115,6 +131,7 @@ class P2PSecurityConfig:
 @dataclass
 class P2PConfig:
     """[p2p] section."""
+
     enabled: bool = True
     listen_addr: str = "0.0.0.0"
     listen_port: int = 30303
@@ -149,9 +166,11 @@ class P2PConfig:
 
 # -- Database -----------------------------------------------------------
 
+
 @dataclass
 class SQLiteConfig:
     """[database.sqlite]."""
+
     path: str = "data/qrdx.db"
     wal_mode: bool = True
 
@@ -170,6 +189,7 @@ class SQLiteConfig:
 @dataclass
 class DatabaseConfig:
     """[database] section."""
+
     type: str = "sqlite"
     sqlite: SQLiteConfig = field(default_factory=SQLiteConfig)
 
@@ -187,9 +207,11 @@ class DatabaseConfig:
 
 # -- Genesis ------------------------------------------------------------
 
+
 @dataclass
 class GenesisConfig:
     """[genesis] section."""
+
     chain_id: int = 1
     network_name: str = "qrdx-mainnet"
     initial_supply: int = 100_000_000
@@ -209,17 +231,19 @@ class GenesisConfig:
 
 # -- Consensus ----------------------------------------------------------
 
+
 @dataclass
 class PoSConfig:
     """[consensus.pos]."""
-    slot_duration: int = 2
+
+    slot_duration: float = 0.25  # informational: nodes take the slot from the chain spec
     slots_per_epoch: int = 32
     attestation_threshold: float = 0.667
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PoSConfig":
         return cls(
-            slot_duration=data.get("slot_duration", 2),
+            slot_duration=data.get("slot_duration", 0.25),
             slots_per_epoch=data.get("slots_per_epoch", 32),
             attestation_threshold=data.get("attestation_threshold", 0.667),
         )
@@ -228,6 +252,7 @@ class PoSConfig:
 @dataclass
 class ConsensusConfig:
     """[consensus] section."""
+
     mechanism: str = "pos"
     pos: PoSConfig = field(default_factory=PoSConfig)
 
@@ -242,9 +267,11 @@ class ConsensusConfig:
 
 # -- Sync ---------------------------------------------------------------
 
+
 @dataclass
 class SyncConfig:
     """[sync] section."""
+
     mode: str = "full"
     batch_size: int = 128
 
@@ -258,9 +285,11 @@ class SyncConfig:
 
 # -- Metrics / Health ---------------------------------------------------
 
+
 @dataclass
 class MetricsConfig:
     """[metrics] section."""
+
     enabled: bool = False
     host: str = "127.0.0.1"
     port: int = 9090
@@ -283,6 +312,7 @@ class MetricsConfig:
 @dataclass
 class HealthConfig:
     """[health] section."""
+
     enabled: bool = True
     path: str = "/health"
 
@@ -296,9 +326,11 @@ class HealthConfig:
 
 # -- TLS ----------------------------------------------------------------
 
+
 @dataclass
 class TLSConfig:
     """TLS configuration for all external interfaces."""
+
     enabled: bool = False
     cert_file: str = ""
     key_file: str = ""
@@ -349,6 +381,7 @@ class TLSConfig:
 # Top-level unified config
 # -----------------------------------------------------------------------
 
+
 @dataclass
 class NodeConfig:
     """
@@ -357,13 +390,14 @@ class NodeConfig:
     Loads every section of config.toml and applies environment variable
     overrides.  This is the single source of truth at runtime.
     """
+
     node: NodeSectionConfig = field(default_factory=NodeSectionConfig)
     p2p: P2PConfig = field(default_factory=P2PConfig)
-    rpc: Optional[Any] = None          # qrdx.rpc.config.RPCConfig
+    rpc: Optional[Any] = None  # qrdx.rpc.config.RPCConfig
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     genesis: GenesisConfig = field(default_factory=GenesisConfig)
     consensus: ConsensusConfig = field(default_factory=ConsensusConfig)
-    validator: Optional[Any] = None    # qrdx.validator.config.ValidatorConfig
+    validator: Optional[Any] = None  # qrdx.validator.config.ValidatorConfig
     sync: SyncConfig = field(default_factory=SyncConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
@@ -408,8 +442,7 @@ class NodeConfig:
         """
         if tomli is None:
             raise ImportError(
-                "tomli is required for TOML config loading. "
-                "Install it: pip install tomli"
+                "tomli is required for TOML config loading. " "Install it: pip install tomli"
             )
 
         path = Path(config_path)
@@ -522,6 +555,7 @@ class NodeConfig:
 # -----------------------------------------------------------------------
 # Convenience function
 # -----------------------------------------------------------------------
+
 
 def load_config(path: Optional[str] = None) -> NodeConfig:
     """

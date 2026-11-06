@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import Tuple
+from typing import Optional, Tuple
 
 from fastecdsa import ecdsa
 from fastecdsa.point import Point
@@ -11,10 +11,18 @@ from ..helpers import point_to_string, string_to_point
 class TransactionInput:
     public_key = None
 
-    signed: Tuple[int, int] = None
-    amount: Decimal = None
+    signed: Optional[Tuple[int, int]] = None
+    amount: Optional[Decimal] = None
 
-    def __init__(self, input_tx_hash: str, index: int, private_key: int = None, transaction=None, amount: Decimal = None, public_key: Point = None):
+    def __init__(
+        self,
+        input_tx_hash: str,
+        index: int,
+        private_key: Optional[int] = None,
+        transaction=None,
+        amount: Optional[Decimal] = None,
+        public_key: Point = None,
+    ):
         self.tx_hash = input_tx_hash
         self.index = index
         self.private_key = private_key
@@ -28,13 +36,17 @@ class TransactionInput:
     async def get_transaction(self):
         if self.transaction is None:
             from .. import Database
-            self.transaction = await Database.instance.get_transaction(self.tx_hash, check_signatures=False)
+
+            self.transaction = await Database.instance.get_transaction(
+                self.tx_hash, check_signatures=False
+            )
             assert self.transaction is not None
         return self.transaction
 
     async def get_transaction_info(self):
         if self.transaction_info is None:
             from .. import Database
+
             self.transaction_info = await Database.instance.get_transaction_info(self.tx_hash)
         assert self.transaction_info is not None
         return self.transaction_info
@@ -47,8 +59,11 @@ class TransactionInput:
 
     async def get_related_output_info(self):
         tx = await self.get_transaction_info()
-        related_output = {'address': tx['outputs_addresses'][self.index], 'amount': Decimal(tx['outputs_amounts'][self.index]) / SMALLEST}
-        self.amount = related_output['amount']
+        related_output = {
+            "address": tx["outputs_addresses"][self.index],
+            "amount": Decimal(tx["outputs_amounts"][self.index]) / SMALLEST,
+        }
+        self.amount = related_output["amount"]
         return related_output
 
     async def get_amount(self):
@@ -62,9 +77,9 @@ class TransactionInput:
     async def get_address(self):
         if self.transaction is not None:
             return (await self.get_related_output()).address
-        return (await self.get_related_output_info())['address']
+        return (await self.get_related_output_info())["address"]
 
-    def sign(self, tx_hex: str, private_key: int = None):
+    def sign(self, tx_hex: str, private_key: Optional[int] = None):
         private_key = private_key if private_key is not None else self.private_key
         self.signed = ecdsa.sign(bytes.fromhex(tx_hex), private_key)
 
@@ -84,21 +99,22 @@ class TransactionInput:
             return False
         # print('verifying with', point_to_string(public_key))
 
-        return \
-            ecdsa.verify(self.signed, bytes.fromhex(input_tx), public_key, CURVE) or \
-            ecdsa.verify(self.signed, input_tx, public_key, CURVE)
+        return ecdsa.verify(
+            self.signed, bytes.fromhex(input_tx), public_key, CURVE
+        ) or ecdsa.verify(self.signed, input_tx, public_key, CURVE)
 
     @property
     def as_dict(self):
         self_dict = vars(self).copy()
-        self_dict['signed'] = self_dict['signed'] is not None
-        if 'public_key' in self_dict: self_dict['public_key'] = point_to_string(self_dict['public_key'])
-        if 'transaction' in self_dict: del self_dict['transaction']
-        if 'private_key' in self_dict: del self_dict['private_key']
+        self_dict["signed"] = self_dict["signed"] is not None
+        if "public_key" in self_dict:
+            self_dict["public_key"] = point_to_string(self_dict["public_key"])
+        if "transaction" in self_dict:
+            del self_dict["transaction"]
+        if "private_key" in self_dict:
+            del self_dict["private_key"]
         return self_dict
 
     def __eq__(self, other):
         assert isinstance(other, self.__class__)
         return (self.tx_hash, self.index) == (other.tx_hash, other.index)
-
-

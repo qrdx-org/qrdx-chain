@@ -1,0 +1,44 @@
+[package]
+name = "qrdx-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+description = "Native hot paths for the QRDX node and validator (docs/NATIVE.md)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "qrdx_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22.6", features = ["extension-module", "abi3-py310"] }
+rayon = "1.10.0"
+sha2 = "0.10.8"
+# The peer-to-peer transport (src/net): async I/O, the session cipher and key schedule, the
+# node id (BLAKE3) and transaction hash (BLAKE2b), and transactions read as JSON (keeping each
+# number's exact text, as Python reads integers of any size).
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+chacha20poly1305 = "0.10.1"
+hkdf = "0.12.4"
+blake2 = "0.10.6"
+blake3 = "1.5.5"
+serde_json = { version = "1.0.135", features = ["arbitrary_precision"] }
+getrandom = "0.2.15"
+# Python's Decimal for the exchange engine (src/dec.rs): coefficients of any size.
+num-bigint = "0.4.6"
+num-traits = "0.2.19"
+num-integer = "0.1.46"
+# The exchange engine's state (src/book.rs): persistent maps, so a copy or an undo is a pointer.
+im = "15.1.0"
+# Python's repr of a float (src/book.rs): the shortest digits that read back, the closest of them.
+ryu = "1.0.18"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[lints.rust]
+# (pyo3 0.22's create_exception! names a feature of pyo3's own)
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("gil-refs"))'] }

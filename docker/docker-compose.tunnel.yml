@@ -1,0 +1,285 @@
+# =============================================================================
+# QRDX — public node behind a Cloudflare Tunnel
+#
+# Runs a QRDX node plus a `cloudflared` sidecar, so the node is reachable on a
+# real hostname over HTTPS without opening a single inbound port on the host.
+# Both services are `restart: unless-stopped` — they come back after a crash or
+# a host reboot and stay up until you explicitly stop them.
+#
+#   export CLOUDFLARE_TUNNEL_TOKEN='eyJhIjoi...'     # from the Cloudflare dashboard
+#   export QRDX_PUBLIC_HOSTNAME='node.example.com'   # hostname routed to the tunnel
+#   docker compose -f docker/docker-compose.tunnel.yml up --build -d
+#
+# This node STARTS ITS OWN CHAIN — it is the genesis node, not a node that joins
+# an existing network. On first start:
+#
+#   1. `validator-init` generates an ML-DSA-65 validator keypair into the data
+#      volume (or validates the wallet you mounted) and logs its address;
+#   2. `genesis-init` writes genesis_config.json onto the same volume, funding
+#      QRDX_GENESIS_ALLOCATIONS and making this node's validator the genesis
+#      validator;
+#   3. the node creates block 0 from that file and starts proposing.
+#
+# Default genesis allocation:
+#
+#   0xPQ4Bd03Abf07B8302EA2547c881F597530638848a3d245296da543A40F8b05884C
+#     = 1,000,000,000 QRDX
+#
+#   docker compose -f docker/docker-compose.tunnel.yml logs validator-init genesis-init
+#
+#   docker compose -f docker/docker-compose.tunnel.yml logs -f
+#   docker compose -f docker/docker-compose.tunnel.yml down        # stop, keep chain data
+#   docker compose -f docker/docker-compose.tunnel.yml down -v     # stop and wipe chain data
+#
+# -----------------------------------------------------------------------------
+# ONE-TIME CLOUDFLARE SETUP
+# -----------------------------------------------------------------------------
+# A token-based tunnel takes its routing from the Cloudflare dashboard, not from
+# this file. In Zero Trust -> Networks -> Tunnels:
+#
+#   1. Create a tunnel (type: Cloudflared) and copy the token it shows you.
+#      That token IS a credential — it can proxy traffic into this network.
+#      Export it in your shell; never commit it or bake it into an image.
+#   2. Under the tunnel's "Public Hostname" tab, add a hostname pointing at the
+#      node's in-network address:
+#
+#        Subdomain/Domain : node.example.com
+#        Service type     : HTTP
+#        URL              : node:3007        <- the compose service name + port
+#
+#   3. Export that same hostname as QRDX_PUBLIC_HOSTNAME below so the node
+#      advertises the correct public URL to its peers.
+#
+# Cloudflare terminates TLS at the edge; the tunnel leg to the node is plain
+# HTTP inside the compose network, which never leaves the Docker bridge.
+#
+# -----------------------------------------------------------------------------
+# GENESIS — fixed once the chain exists
+# -----------------------------------------------------------------------------
+# Genesis is written once and never regenerated. Changing
+# QRDX_GENESIS_ALLOCATIONS after the first start only logs a warning; a different
+# genesis needs a fresh chain (`down -v`, which ALSO deletes the validator key on
+# the volume — back it up first).
+#
+# The validator is in the genesis set with QRDX_GENESIS_VALIDATOR_STAKE (default
+# 100,000 QRDX = MIN_VALIDATOR_STAKE), so it proposes from block 1 with no
+# STAKE_DEPOSIT. Its stake is separate from the allocations above.
+#
+# Every OTHER node that joins this chain must start from this same
+# genesis_config.json (copy it out with
+#   docker compose -f docker/docker-compose.tunnel.yml cp node:/app/data/genesis_config.json .
+# and place it two directories above that node's QRDX_DATABASE_PATH). A node that
+# builds its own default genesis has a different block 0 and rejects this
+# chain's blocks.
+#
+# KEY CUSTODY: the wallet format this node loads is UNENCRYPTED — the Dilithium
+# secret key is plain hex in the JSON, and QRDX_VALIDATOR_PASSWORD is accepted by
+# that code path but never used to encrypt it. The `node-data` volume therefore
+# holds a live private key. Back it up, restrict access to the Docker host, and
+# do not put this volume on shared storage.
+#
+# To use your OWN wallet instead of a generated one, add the wallet overlay --
+# it mounts a host directory read-only at /app/wallet:
+#
+#   mkdir -p /secure/path && cp my-validator.json /secure/path/
+#   export QRDX_VALIDATOR_WALLET_DIR=/secure/path
+#   export QRDX_VALIDATOR_WALLET=/app/wallet/my-validator.json
+#   docker compose -f docker/docker-compose.tunnel.yml \
+#                  -f docker/docker-compose.tunnel-wallet.yml up -d
+#
+# validator-init will validate that wallet and leave it alone. The directory MUST
+# already exist on the host; Compose will not create it for you.
+#
+# -----------------------------------------------------------------------------
+# EXPOSURE — read before pointing this at a real domain
+# -----------------------------------------------------------------------------
+# The hostname you route publishes the node's ENTIRE HTTP surface: the REST API,
+# JSON-RPC at /rpc, /metrics, /healthz, /readyz and the /ws + /stream feeds. The
+# host port below is bound to 127.0.0.1 so the tunnel is the only public path.
+# Restrict what the public gets with a Cloudflare WAF rule or Cloudflare Access
+# policy on paths you do not want open (/metrics is the usual first one), and
+# set QRDX_RPC_ADMIN_TOKEN if you enable admin RPC methods.
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Validator identity bootstrap (runs once, then exits)
+  # ---------------------------------------------------------------------------
+  # Generates the validator wallet into the data volume if it is not there yet,
+  # or validates the one you mounted. Never overwrites an existing wallet, so a
+  # restart always reuses the same validator identity.
+  validator-init:
+    build:
+      context: ".."
+      dockerfile: "docker/Dockerfile"
+    image: qrdx-node:local
+    container_name: qrdx-validator-init
+    restart: "no"
+    networks: [qrdx-net]
+    entrypoint: ["python", "/app/docker/validator-init.py"]
+    volumes:
+      - node-data:/app/data
+    environment:
+      QRDX_VALIDATOR_ENABLED: "${QRDX_VALIDATOR_ENABLED:-true}"
+      QRDX_VALIDATOR_WALLET: "${QRDX_VALIDATOR_WALLET:-/app/data/validator/validator.json}"
+      QRDX_VALIDATOR_LABEL: "${QRDX_VALIDATOR_LABEL:-QRDX Validator}"
+
+  # ---------------------------------------------------------------------------
+  # Genesis (runs once, then exits)
+  # ---------------------------------------------------------------------------
+  # Writes genesis_config.json next to the database directory (the node looks two
+  # directories up from QRDX_DATABASE_PATH, so both read the same variable). A
+  # no-op once the file exists.
+  genesis-init:
+    build:
+      context: ".."
+      dockerfile: "docker/Dockerfile"
+    image: qrdx-node:local
+    container_name: qrdx-genesis-init
+    restart: "no"
+    networks: [qrdx-net]
+    entrypoint: ["python", "/app/docker/genesis-init.py"]
+    volumes:
+      - node-data:/app/data
+    environment:
+      QRDX_DATABASE_PATH: "/app/data/databases/qrdx.db"
+      # The chain id is bound into every signed transaction, so it must be one no other EVM
+      # network uses (1 is Ethereum's). genesis-init writes it into the genesis chain spec.
+      QRDX_CHAIN_ID: "${QRDX_CHAIN_ID:?set QRDX_CHAIN_ID to this chain's id, one no other EVM network uses}"
+      # Empty: genesis-init names the chain after its id (762 qrdx-mainnet, 7620 qrdx-testnet),
+      # any other id qrdx-mainnet. Set it to name a chain on another id.
+      QRDX_NETWORK_NAME: "${QRDX_NETWORK_NAME:-}"
+      # address:amount[,address:amount...], amounts in QRDX.
+      QRDX_GENESIS_ALLOCATIONS: "${QRDX_GENESIS_ALLOCATIONS:-0xPQ4Bd03Abf07B8302EA2547c881F597530638848a3d245296da543A40F8b05884C:1000000000}"
+      QRDX_GENESIS_VALIDATOR_STAKE: "${QRDX_GENESIS_VALIDATOR_STAKE:-100000}"
+      # Network parameters (qrdx/chain_spec.py PARAMS) are written into the genesis chain
+      # spec, so they are set HERE, never on the node: a node whose environment sets one to a
+      # different value than the spec refuses to start.
+      QRDX_PERP_COLLATERAL_TOKEN: "${QRDX_PERP_COLLATERAL_TOKEN:-QRDX}"
+      QRDX_VALIDATOR_ENABLED: "${QRDX_VALIDATOR_ENABLED:-true}"
+      QRDX_VALIDATOR_WALLET: "${QRDX_VALIDATOR_WALLET:-/app/data/validator/validator.json}"
+    depends_on:
+      validator-init: { condition: service_completed_successfully }
+
+  # ---------------------------------------------------------------------------
+  # QRDX Node
+  # ---------------------------------------------------------------------------
+  node:
+    build:
+      context: ".."
+      dockerfile: "docker/Dockerfile"
+    image: qrdx-node:local
+    container_name: qrdx-node-tunnel
+    hostname: node
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks: [qrdx-net]
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+
+    # Loopback-bound on purpose: public reachability comes from the tunnel, not
+    # from an open host port. Drop the 127.0.0.1 prefix only if you deliberately
+    # want the node exposed on the host's LAN address as well.
+    ports:
+      - "127.0.0.1:${QRDX_NODE_PORT:-3007}:${QRDX_NODE_PORT:-3007}"
+
+    volumes:
+      # Named volume only. This stack deliberately has NO host bind mounts: a
+      # bind mount whose source directory does not exist makes Docker create it,
+      # and on Docker Desktop / WSL two services binding the same missing path
+      # race in the bind-mount shim and the stack fails to start. To supply your
+      # own validator wallet, overlay docker-compose.tunnel-wallet.yml.
+      - node-data:/app/data
+
+    environment:
+      NODE_NAME: "node"
+      QRDX_NODE_HOST: "0.0.0.0"
+      QRDX_NODE_PORT: "${QRDX_NODE_PORT:-3007}"
+      # In a subdirectory on purpose: the node reads its genesis from two
+      # directories up, /app/data/genesis_config.json — written by genesis-init.
+      QRDX_DATABASE_PATH: "/app/data/databases/qrdx.db"
+      QRDX_NODE_KEY_DIR: "/app/data/keys"
+
+      # The public URL peers should dial. This MUST match the hostname you routed
+      # in the Cloudflare dashboard, or peers will record an address they cannot
+      # reach and this node will look unreachable to the rest of the network.
+      QRDX_SELF_URL: "https://${QRDX_PUBLIC_HOSTNAME:?set QRDX_PUBLIC_HOSTNAME to the hostname you routed to this tunnel, e.g. node.example.com}"
+
+      # 'self': this is the chain's first node, so there is nobody to sync from.
+      # A peer on another chain has a different block 0. Leave this alone unless
+      # the peer was started from this node's genesis_config.json.
+      QRDX_BOOTSTRAP_NODE: "${QRDX_BOOTSTRAP_NODE:-self}"
+      # Must match the genesis chain spec (the node refuses to start otherwise).
+      QRDX_CHAIN_ID: "${QRDX_CHAIN_ID:?set QRDX_CHAIN_ID to this chain's id, one no other EVM network uses}"
+      # Empty: the node takes the name from the chain spec.
+      QRDX_NETWORK_NAME: "${QRDX_NETWORK_NAME:-}"
+      QRDX_RPC_ENABLED: "${QRDX_RPC_ENABLED:-true}"
+      QRDX_ENABLE_STREAMING: "true"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+
+      # Validator. Must be on for the first start: this node is the chain's genesis
+      # validator, and genesis-init refuses to write a genesis without one. The
+      # wallet is the one validator-init prepared, unless you point
+      # QRDX_VALIDATOR_WALLET at your own file under /app/wallet.
+      QRDX_VALIDATOR_ENABLED: "${QRDX_VALIDATOR_ENABLED:-true}"
+      QRDX_VALIDATOR_WALLET: "${QRDX_VALIDATOR_WALLET:-/app/data/validator/validator.json}"
+      # Accepted by the wallet loader but unused: this wallet format is not
+      # encrypted. See the KEY CUSTODY note in the header.
+      QRDX_VALIDATOR_PASSWORD: "${QRDX_VALIDATOR_PASSWORD:-}"
+      QRDX_RPC_ADMIN_TOKEN: "${QRDX_RPC_ADMIN_TOKEN:-}"
+
+      QRDX_ORACLE_FEED: "exchanges"
+      # The perp collateral token is a network parameter: genesis-init writes it into the
+      # chain spec (see that service), and the node reads it from there.
+
+    # Do not start the node until the validator identity and the genesis exist on
+    # the volume. Without the genesis file the node silently builds its built-in
+    # default genesis, which funds none of QRDX_GENESIS_ALLOCATIONS.
+    depends_on:
+      validator-init: { condition: service_completed_successfully }
+      genesis-init: { condition: service_completed_successfully }
+
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # Cloudflare Tunnel
+  # ---------------------------------------------------------------------------
+  # The image's entrypoint is already `cloudflared --no-autoupdate`, so the
+  # command here is just the subcommand. The token is passed as TUNNEL_TOKEN
+  # rather than `--token` so it does not sit in the container's argv.
+  cloudflared:
+    image: cloudflare/cloudflared:2026.9.1
+    container_name: qrdx-cloudflared
+    restart: unless-stopped
+    networks: [qrdx-net]
+    command: ["tunnel", "run"]
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+
+    environment:
+      TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN:?export CLOUDFLARE_TUNNEL_TOKEN with the token from Cloudflare Zero Trust -> Networks -> Tunnels}"
+      # cloudflared's own metrics + /ready endpoint, reachable from the host at
+      # http://127.0.0.1:2000/ready for debugging.
+      TUNNEL_METRICS: "0.0.0.0:2000"
+      TUNNEL_LOGLEVEL: "${CLOUDFLARE_TUNNEL_LOGLEVEL:-info}"
+
+    ports:
+      - "127.0.0.1:2000:2000"
+
+    # Wait until the node can actually serve chain data before advertising it to
+    # the edge, so the public hostname never briefly serves a dead backend.
+    depends_on:
+      node: { condition: service_healthy }
+
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  node-data:
+
+networks:
+  qrdx-net:
+    driver: bridge

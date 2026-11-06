@@ -1,0 +1,128 @@
+"""
+Phase D2.2a — proposer-side block-body assembly with the exchange section.
+
+`assemble_pos_block_data` builds the broadcast/storage payload for a proposed
+PoS block. The exchange section must be:
+  - present only when exchange txs are included (additive / backward compatible);
+  - encoded so importers can recover the txs (and they still authenticate);
+  - absent for empty input (legacy blocks unaffected).
+"""
+
+from decimal import Decimal
+
+from qrdx.crypto.pq.dilithium import PQPrivateKey
+from qrdx.validator.node_integration import assemble_pos_block_data
+from qrdx.exchange import (
+    ExchangeTransaction,
+    ExchangeOpType,
+    extract_exchange_transactions_from_dict,
+    verify_exchange_tx,
+    BLOCK_EXCHANGE_TXS_KEY,
+)
+from qrdx.constants import CHAIN_ID  # the network's chain id (chain spec)
+
+
+class _FakeBlock:
+    """Minimal stand-in for PoSBlock (only what the assembler reads)."""
+    def __init__(self, hash_, proposer, timestamp=123):
+        self.hash = hash_
+        self.proposer_address = proposer
+        self.timestamp = timestamp
+
+    def to_dict(self):
+        return {"hash": self.hash, "proposer_address": self.proposer_address,
+                "timestamp": self.timestamp}
+
+
+def _signed_tx(nonce):
+    key = PQPrivateKey.generate()
+    addr = key.public_key.to_address()
+    tx = ExchangeTransaction(
+        op_type=ExchangeOpType.PLACE_ORDER, sender=addr, nonce=nonce,
+        params={"pair": "qBTC:qUSD", "side": "buy", "order_type": "limit",
+                "price": "30000", "amount": "1"},
+        gas_limit=1_000_000, gas_price=10**9,
+    )
+    tx.public_key = key.public_key.to_bytes()
+    tx.signature = key.sign(tx.signing_bytes()).to_bytes()
+    return tx
+
+
+def test_no_exchange_section_when_empty():
+    block = _FakeBlock("ab" * 32, "0xPQ" + "11" * 32)
+    for arg in (None, []):
+        data = assemble_pos_block_data(block, 7, arg)
+        assert BLOCK_EXCHANGE_TXS_KEY not in data, "empty input must not add the section"
+        assert data["id"] == 7
+        assert data["block_hash"] == block.hash
+        assert data["validator_address"] == block.proposer_address
+
+
+def test_exchange_section_present_and_recoverable():
+    block = _FakeBlock("cd" * 32, "0xPQ" + "22" * 32)
+    txs = [_signed_tx(0), _signed_tx(1)]
+    data = assemble_pos_block_data(block, 9, txs)
+    assert BLOCK_EXCHANGE_TXS_KEY in data
+    recovered = extract_exchange_transactions_from_dict(data)
+    assert [t.tx_hash() for t in recovered] == [t.tx_hash() for t in txs]
+
+
+def test_included_exchange_txs_still_authenticate():
+    """Authentication must survive proposer assembly → import recovery."""
+    block = _FakeBlock("ef" * 32, "0xPQ" + "33" * 32)
+    txs = [_signed_tx(0)]
+    data = assemble_pos_block_data(block, 3, txs)
+    recovered = extract_exchange_transactions_from_dict(data)
+    ok, err = verify_exchange_tx(recovered[0])
+    assert ok, f"included exchange tx failed to authenticate after assembly: {err}"
+
+
+def test_core_fields_match_legacy_shape():
+    """The non-exchange fields must match the existing broadcast payload shape."""
+    block = _FakeBlock("aa" * 32, "0xPQ" + "44" * 32, timestamp=999)
+    data = assemble_pos_block_data(block, 12, None)
+    assert set(data) >= {"id", "block_content", "block_hash", "validator_address"}
+    assert data["block_content"] == str(block.to_dict())
+
+
+# ── E-D3b: EVM section in the proposer payload ──────────────────────────────
+
+def _signed_evm_raw(i, nonce=0):
+    from eth_account import Account as EthAccount
+    key = "0x" + f"{i:064x}"
+    acct = EthAccount.from_key(key)
+    tx = {"nonce": nonce, "gasPrice": 10 ** 9, "gas": 21000,
+          "to": acct.address, "value": 1, "data": b"", "chainId": CHAIN_ID}
+    signed = EthAccount.sign_transaction(tx, key)
+    raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+    return "0x" + bytes(raw).hex()
+
+
+def test_no_evm_section_when_empty():
+    from qrdx.contracts.evm_block import BLOCK_EVM_TXS_KEY
+    block = _FakeBlock("ba" * 32, "0xPQ" + "55" * 32)
+    data = assemble_pos_block_data(block, 4, None, None, evm_txs=None, account_state_root=None)
+    assert BLOCK_EVM_TXS_KEY not in data
+    assert "account_state_root" not in data
+
+
+def test_evm_section_present_and_recoverable_with_root():
+    from qrdx.contracts.evm_block import BLOCK_EVM_TXS_KEY, extract_evm_transactions_from_dict
+    block = _FakeBlock("bb" * 32, "0xPQ" + "66" * 32)
+    raws = [_signed_evm_raw(1), _signed_evm_raw(2)]
+    data = assemble_pos_block_data(block, 8, None, None,
+                                   evm_txs=raws, account_state_root="d" * 128)
+    assert BLOCK_EVM_TXS_KEY in data
+    assert data["account_state_root"] == "d" * 128
+    assert extract_evm_transactions_from_dict(data) == raws
+
+
+def test_exchange_and_evm_sections_coexist():
+    from qrdx.contracts.evm_block import BLOCK_EVM_TXS_KEY
+    block = _FakeBlock("bc" * 32, "0xPQ" + "77" * 32)
+    ex = [_signed_tx(0)]
+    raws = [_signed_evm_raw(3)]
+    data = assemble_pos_block_data(block, 5, ex, "e" * 128, raws, "f" * 128)
+    assert BLOCK_EXCHANGE_TXS_KEY in data and BLOCK_EVM_TXS_KEY in data
+    assert data["exchange_state_root"] == "e" * 128
+    assert data["account_state_root"] == "f" * 128

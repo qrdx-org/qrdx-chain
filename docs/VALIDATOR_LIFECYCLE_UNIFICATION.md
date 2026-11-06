@@ -1,0 +1,225 @@
+# Validator Lifecycle Unification — Design
+
+> **Superseded (2026-10-12).** The validator set is no longer a table rebuilt from the chain
+> when finality advances: it is a pure function of the chain, `S_E` per epoch, computed by
+> `qrdx/validator/epoch_state.py` and described in [STAKING.md](STAKING.md). The reconstruction
+> and the import-time registration this document describes are removed; the history below is kept
+> for the reasoning.
+
+> **Status:** design (June 2026). `CONSENSUS_REMAINING_WORK.md` item 4. Makes the
+> consensus validator set a runtime-converged function of the chain (activations,
+> exits, stake updates) instead of the static genesis set — the prerequisite for
+> dynamic validator membership.
+> **Consensus-critical:** proposer selection + slot eligibility are ENFORCED off the
+> `validators` table, so a validator set that diverges across nodes HALTS the
+> diverging node. Roll out observe → soak → enforce, with the decisive probe being
+> *the `validators` table is byte-identical on every node after each epoch*.
+
+## Starting state (June 2026) — three gaps, all since closed (see the implementation log)
+
+1. **Two epoch processors, only the wrong one is wired.**
+   - `validator/epoch_processing.py` computes rewards/penalties/activations/exits and
+     writes them INTO the consensus `validators` table (effective_stake, status,
+     activation/exit epoch — L545–578). This is the consensus-aware processor — but
+     its SQL is **PostgreSQL-only** (`$1/$3`, `NOW()`, `GREATEST/LEAST`,
+     `pool.acquire()`), so it raises on the SQLite testnet, and it is **not called**
+     by the running node.
+   - `validator/lifecycle.py` `ValidatorLifecycleManager.process_epoch` IS wired
+     (`node_integration._epoch_processing_loop`, every epoch boundary) and IS
+     SQLite-compatible — but it reads/writes separate `lifecycle_validators /
+     lifecycle_deposits / lifecycle_exits / lifecycle_withdrawals` tables + in-memory
+     state, and **never touches the `validators` table consensus reads**.
+   - Net: the wired processor doesn't reach consensus; the consensus-aware processor
+     doesn't run. The active set stays at genesis.
+
+2. **No staking-transaction entry.** There is no tx type / endpoint to deposit stake
+   (join) or signal a voluntary exit on the testnet. Validators only ever enter via
+   `genesis_init` / `manager.register_validator`. So even with a working processor,
+   the set can't grow or shrink from real activity.
+
+3. **Schema gaps.** `epoch_processing.py` references `validators.total_slashed` /
+   `total_rewards`; the SQLite `validators` schema has neither (only `slashed BOOL`).
+
+## Consensus source of truth (keep it)
+
+The `validators` table already feeds everything consensus-critical:
+`db.get_validators()` → `block_verification.expected_proposer_for_slot` (proposer
+selection + eligibility) and `finality` (stake weights). **Keep `validators` as the
+single canonical source.** Unification = make ONE deterministic epoch processor write
+the lifecycle results into it; retire or subordinate the parallel `lifecycle_*` model.
+
+## Determinism requirement (the safety crux)
+
+Epoch processing MUST be a pure deterministic function of the canonical chain so the
+`validators` table converges byte-identically on every node — same property as the
+unified state root / RANDAO mix. Inputs are already on-chain: attestations (in block
+bodies → `attestation_votes`) drive rewards/penalties; deposits/exits will ride in
+blocks as txs. No wall-clock, no per-node ordering. (This is why `NOW()` must go and
+why the processing runs at a deterministic epoch boundary, not on a timer that could
+fire at different chain states per node.)
+
+## Plan (phased, observe → soak → enforce)
+
+**Phase 0 — schema.** Add `total_slashed`, `total_rewards` (and any other columns the
+processor needs) to the `validators` table, default 0. Pure additive migration.
+
+**Phase 1 — one SQLite, consensus-aware processor (OBSERVE).** Port
+`epoch_processing.py`'s validator-update SQL to SQLite (`?` params, `MIN/MAX` for
+`LEAST/GREATEST`, drop `NOW()` → a deterministic constant, single-connection no
+`pool.acquire`). Run it in OBSERVE: compute the would-be `validators` updates and LOG
+them (per node) WITHOUT applying. Confirm every node computes the *same* deltas at the
+same epoch (determinism) before any write. Retire the unwired duplication or make
+`lifecycle.py.process_epoch` delegate to this single processor.
+
+**Phase 2 — apply + soak convergence.** Wire `node_integration._epoch_processing_loop`
+to the ported processor; let it WRITE the `validators` table at each epoch boundary.
+Soak ≥6–8 runs; the decisive probe each run: **hash of the `validators` table is
+identical across all 4 nodes after every processed epoch** (and proposer selection /
+eligibility never halt a node). Reuse the genesis validator set + rewards/penalties of
+existing validators (no new joiners yet) so this phase isolates *processor
+convergence* from *membership change*.
+
+**Phase 3 — staking-tx entry.** Add a consensus deposit / voluntary-exit op (mirror
+the Phase E exchange-op or a native tx type): a deposit creates a `pending` validator
+row + enqueues activation; an exit enqueues exit. Replayed on every node (deterministic
+address/stake), so the set change is consensus. Observe → enforce.
+
+**Phase 4 — ENFORCE dynamic membership.** With the set converging and staking txs
+flowing, the dynamic `validators` set fully drives proposer selection + eligibility +
+finality weights. Verify a deposited validator activates and proposes; an exited one
+stops; slashing reduces stake; integration green.
+
+## Implementation log (June 2026)
+
+- **Phase 0/1a/1b done + committed:** schema columns; `db.apply_epoch_validator_updates`
+  (SQLite persistence port) + `db.get_validators_table_hash`; `epoch_rewards.compute_epoch_reward_deltas`
+  (deterministic, sqrt-free); wired into the epoch loop (observe).
+- **Root-cause fix:** the epoch loop imported `ValidatorLifecycleManager` (nonexistent —
+  it's `LifecycleManager`); the ImportError silently crashed the loop, so epoch processing
+  had NEVER run — the actual reason the set was frozen at genesis. Fixed + made the
+  boundary detection robust (process completed epochs, not `slot % N == 0`).
+- **Phase 2a/2b:** `SLOTS_PER_EPOCH` env-overridable so epochs fire often in a test run.
+  A multi-epoch observe soak showed the deltas DIVERGED across nodes for just-completed
+  epochs (still-propagating attestations → different attester sets). Fixed by **gating on
+  the FINALIZED epoch** (drain up to `finalized_epoch`): finalized epochs have converged
+  attestations, so all nodes compute identical deltas. Verified: epochs 0–4 identical
+  rewarded/penalized on all validators.
+- **Phase 2c (enforce soak):** 15/15, 0 eligibility halts; the 3 VALIDATORS produced a
+  byte-identical validators table (perfect deterministic convergence). **GAP: the full
+  node stays at genesis** — the epoch loop is a `ValidatorNode`-only task, so non-validator
+  nodes never process epochs. A full node verifies proposer eligibility off its frozen
+  table, so once stake changes enough to alter stake-weighted selection it would reject
+  validator blocks. → **Phase 2d (DONE):** extracted the finality-gated update into
+  `validator/epoch_loop.py` `epoch_validator_update_loop`, started in `node.main` for
+  EVERY node (the loop needs only `db` — no validator context); removed the duplicate
+  call from the `ValidatorNode` loop. Now all 4 nodes (incl. the full node) process the
+  same finalized epochs. Enforce soak (3 runs): 15/15, 0 eligibility halts; 2/3 runs
+  PERFECT 4/4 convergence (1 unique validators-table hash across all nodes), 1/3 showed
+  3 distinct hashes with 0 halts — a benign EVENTUAL-CONSISTENCY snapshot artifact
+  (nodes mid-drain to the common finalized epoch at the snapshot moment → different
+  *count* of epochs applied, not different processing; the per-epoch deltas are
+  deterministic, so they reconverge as the lagging node catches up). Enabled
+  (`epoch_loop._ENFORCE_EPOCH_VALIDATOR_UPDATES=True`).
+
+  **Future hardening (stronger than eventual consistency):** apply the epoch update
+  during BLOCK IMPORT at the boundary block (so every node mutates the `validators`
+  table at the exact same chain event, eliminating the wall-clock drain window). Needed
+  before large stake moves (big deposits / slashing) where a transient stake gap could
+  flip stake-weighted selection. With the current tiny rewards it never flips (0 halts).
+- **Phase 3a (DONE + committed):** membership machinery on the consensus table —
+  `db.register_pending_validator` (deposit → `'pending'` row), `db.get_validators_to_activate(epoch)`
+  / `get_validators_to_exit(epoch)` (schedule-respecting selection), and the end-to-end
+  pending→active activation via `apply_epoch_validator_updates` at the scheduled epoch.
+- **Phase 3b (DONE — deposit/JOIN path):** a consensus `STAKE_DEPOSIT` exchange op
+  (`ExchangeOpType.STAKE_DEPOSIT=15`, validated for `validator_public_key` + positive
+  `stake_amount`, gas 150k) records a deterministic `{type:'deposit', address, public_key,
+  stake}` entry in the per-block `_validator_lifecycle_ops` list. `block_processor.flush_validator_lifecycle_deltas`
+  (wired into every import path — `main._apply_exchange_section_on_import` both branches,
+  the proposer, and the reorg rebuild) calls `register_pending_validator(activation_epoch=None)`,
+  inserting the new validator as `'pending'` with an UNSCHEDULED activation. The epoch loop
+  then assigns the activation epoch deterministically at the FINALIZED epoch
+  (`schedule_pending_activations(epoch + ACTIVATION_DELAY_EPOCHS)`) so every node picks the
+  same activation epoch — never at deposit-import time (which would drift across nodes).
+  Activation/exit selection runs each finalized epoch via `get_validators_to_activate/_to_exit`.
+  Tests: `test_stake_deposit_op_records_and_flush_registers_pending`,
+  `test_stake_deposit_rejects_nonpositive` (+ existing membership suite, 7/7); op-count
+  integration assert 14→16. Clean `--force` integration run **15/15 (100%)**, 0 eligibility
+  halts; `STAKE_EXIT=16` op is defined but its flush is **DEFERRED to Phase 3c** (removing a
+  live validator at import opens a transient-window/halt risk — needs the deterministic
+  active→exiting transition at a finalized epoch, not at import).
+- **Phase 3c (DONE — voluntary exit/LEAVE path):** the symmetry-breaker for exit is that
+  removing a validator from the eligible set is far more dangerous than adding one — if node
+  A drops an active proposer at import but node B hasn't, B still expects that proposer for
+  its slots → guaranteed halt in the window. The fix: split exit into a label flip (safe at
+  import) and an eligibility removal (only at a FINALIZED epoch). **`'exiting'` is now an
+  ELIGIBLE status** — added to the ACTIVE/PENDING filter in BOTH the proposer
+  (`node_integration`) and the verifier (`block_verification`), matching real-PoS semantics
+  (a validator keeps validating through unbonding). This filter change is a **no-op on the
+  current network** (no row is ever `'exiting'` until an exit flush runs), so it lands safely
+  ahead of use. The `STAKE_EXIT` flush now calls `mark_validator_exiting` (active→`'exiting'`)
+  at import: SAFE because the eligible SET is unchanged (only a label flips — benign
+  table-hash churn, no proposer-selection flip). The eligibility-REMOVING transition
+  (`exiting`→`exited`) runs in the all-nodes epoch loop, which assigns
+  `exit_epoch = finalized_epoch + UNBONDING_PERIOD_EPOCHS` (`schedule_pending_exits`) and at
+  the finalized `exit_epoch` moves the validator to `'exited'` (`get_validators_to_exit` →
+  `apply_epoch_validator_updates(exited=…)`) — so every node drops it at the same converged
+  chain point, no transient window. `UNBONDING_PERIOD_EPOCHS` + `ACTIVATION_DELAY_EPOCHS` made
+  env-overridable (`QRDX_UNBONDING_PERIOD_EPOCHS` / `QRDX_ACTIVATION_DELAY_EPOCHS`) so a short
+  soak can observe full `exiting→exited` completion. (Note: `compute_epoch_reward_deltas` still
+  rewards only `status='active'`, so an exiting validator proposes but stops earning — a
+  conservative, deterministic simplification; refine later if exiting validators should earn
+  through unbonding.) Tests: `test_stake_exit_op_records_and_flush_marks_exiting`,
+  `test_stake_exit_noop_when_not_active`, `test_exiting_completes_at_finalized_exit_epoch`
+  (membership suite 10/10; proposer-verification + selection-determinism + consensus-pos
+  206/206). Clean `--force` integration run **15/15 (100%)**, 0 eligibility halts.
+- **Phase 4 (live cross-node verification — scenario `s16_validator_membership`):** added a
+  live multi-node scenario (a non-validator account stakes in via `STAKE_DEPOSIT`, should
+  activate, then exit). Building it surfaced two issues and one hard external dependency:
+  - **Determinism bug (FIXED):** the activation/exit epoch was assigned by the epoch loop
+    when it *happened to observe* the pending validator (`schedule_pending_activations` /
+    `schedule_pending_exits` on a loop tick) — so two nodes assigned different epochs (saw
+    one node at `act=10`, others `NULL`). Fixed: the schedule is now derived
+    DETERMINISTICALLY from the carrying block's epoch at IMPORT
+    (`activation_epoch = block_epoch + ACTIVATION_DELAY_EPOCHS`,
+    `exit_epoch = block_epoch + UNBONDING_PERIOD_EPOCHS`), threaded through EVERY import path
+    (proposer uses `current_epoch`; the sync / REST / p2p importers + the hook use the new
+    `block_verification.epoch_from_block`, which extracts the epoch from either a parsed
+    block dict or a `block_content` wire envelope). The loop-tick schedulers were removed; the
+    epoch loop now only ACTIVATES/REMOVES validators whose pre-assigned epoch the FINALIZED
+    epoch has reached. Tests: `test_deposit_flush_schedules_activation_from_block_epoch`,
+    `test_exit_flush_schedules_exit_from_block_epoch`, `test_epoch_from_block_handles_all_import_shapes`.
+  - **Wiring gap (FIXED):** the p2p live-broadcast importer called the section hook without
+    the epoch, so peers registered with `activation_epoch=NULL`. Now all four import paths
+    pass it.
+  - **External blocker (fork-choice):** the FULL round-trip — a single agreed
+    `activation_epoch` across nodes AND the finality-gated `pending→active→exiting→exited`
+    completion — is gated by **block-history convergence**. A deposit/exit tx can be orphaned
+    + re-included at a different epoch on competing forked tips (→ different `block_epoch` →
+    different `activation_epoch`, and peers can miss it), and forked histories split the
+    per-epoch attestation quorum below 2/3 so **finality stalls** (observed: finalized frozen
+    at epoch 8 while the chain reached ~29). Both resolve with **fork-choice active
+    reconciliation** (the next item). So `s16` HARD-asserts what is robust today — the live
+    JOIN pipeline (admit→include→flush→register), a deterministic non-NULL schedule on the
+    submission node, and propagation to peers — and OBSERVES (non-failing) the
+    fork-choice-gated convergence/completion, to be flipped to hard asserts once fork-choice
+    lands. Clean `--force` integration run **16/16 (100%)** incl. `s16` 6/6; full unit suite
+    **2144 passed**.
+
+## Success criteria
+
+- `validators` table **byte-identical across all nodes** after each epoch (a
+  per-epoch table hash, like the RANDAO-mix probe) across ≥6–8 `--force` runs.
+- Integration suite green every run; **0 proposer-eligibility halts** (the failure
+  mode of a divergent set).
+- A staking deposit → the validator activates after the delay and is selected to
+  propose; a voluntary exit → it stops being selected; both converge on all nodes.
+- Rewards/penalties move `effective_stake` deterministically and identically per node.
+
+## Prerequisites already in place
+
+The earlier consensus-hardening arc makes this safe to attempt: validator-set
+convergence + the Dilithium key-identity fix (set built from the consistent
+`validators` table, order-independent selection, reorgs ~0), enforced proposer
+auth + slot eligibility, and finality (justified/finalized from on-chain
+attestations) — so the inputs this processor needs are already deterministic and
+converged.

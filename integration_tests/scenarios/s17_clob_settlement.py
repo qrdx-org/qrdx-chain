@@ -1,0 +1,162 @@
+"""
+S17 — CLOB order-book settlement against the real token ledger (Phase E, ENFORCE_
+ORDERBOOK_SETTLEMENT). A PQ trader deploys two QRC-20 tokens, creates the order book
+over their addresses (via CREATE_POOL), then places a RESTING limit BUY order — which
+ESCROWS quote tokens (amount*price) into the book's deterministic escrow holder — and
+finally CANCELS it, refunding the escrow.
+
+Validates the core new CLOB consensus logic cross-node:
+  * escrow-on-place moves real token balances (the token root advances + CONVERGES on
+    every node, so the escrow is deterministic), and
+  * cancel refunds EXACTLY (the token root returns to its pre-place value → conservation).
+Match settlement (needs two wallets vs self-trade prevention) is a follow-up.
+"""
+
+import asyncio
+from collections import Counter
+from decimal import Decimal
+
+from integration_tests.scenarios.base import Scenario
+from integration_tests.rpc_client import NodeRPCClient
+from integration_tests.config import CHAIN_ID  # exchange txs are signed for the testnet's chain
+
+
+class S17ClobSettlement(Scenario):
+    name = "s17_clob_settlement"
+    description = "CLOB limit-order escrow-on-place + cancel-refund settle real token balances cross-node"
+    depends_on = ["s15_spot_settlement"]
+
+    async def _token_roots(self, node_urls):
+        out = {}
+        for url in node_urls:
+            try:
+                async with NodeRPCClient(url) as c:
+                    r = await c._get("/get_unified_state_root")
+                    if r and r.get("ok"):
+                        out[url] = r["result"].get("token_root")
+            except Exception:
+                pass
+        return out
+
+    def _modal_root(self, roots):
+        nz = [v for v in roots.values() if v and v != "0" * 128]
+        return Counter(nz).most_common(1)[0] if nz else (None, 0)
+
+    async def _wait_converge(self, node_urls, predicate, attempts):
+        """Poll (2s/step) until the modal token root satisfies ``predicate`` AND at least
+        all-but-one node agree on it (tolerating a single trailing node); return that root,
+        or None if it never converged. Robust to reorg settling."""
+        for _ in range(attempts):
+            await asyncio.sleep(2)
+            m, nm = self._modal_root(await self._token_roots(node_urls))
+            if nm >= max(2, len(node_urls) - 1) and predicate(m):
+                return m
+        return None
+
+    async def _submit_and_wait(self, node_urls, target, tx_hex, base_root, label):
+        async with NodeRPCClient(target) as c:
+            r = await c._post("/submit_exchange_tx", json_data={"tx_hex": tx_hex})
+            self.check(bool(r and r.get("ok")), f"{label}: admitted")
+            if not (r and r.get("ok")):
+                self._log.error("%s submit rejected: %s", label, r)
+        for _ in range(25):  # ~50s
+            await asyncio.sleep(2)
+            cur = await self._token_roots(node_urls)
+            if cur.get(target) and cur[target] != base_root:
+                return cur[target]
+        return None
+
+    async def execute(self) -> None:
+        node_urls = self.ctx.node_urls
+        wallets = self.ctx.wallets
+
+        # A PQ wallet with a CLEAN exchange nonce, used by no other scenario (validators vote
+        # oracle prices, so their exchange nonces move on their own).
+        w = wallets.get("CLOB Trader")
+        if not w or not w.get("private_key") or "PQ" not in str(w.get("address", "")):
+            self.check(False, "funded PQ wallet available")
+            return
+
+        from qrdx.crypto.pq.dilithium import PQPrivateKey
+        from qrdx.exchange import ExchangeTransaction, ExchangeOpType
+        from qrdx.exchange.amm import FeeTier, PoolType
+        from qrdx.exchange.state_manager import ExchangeStateManager
+        from integration_tests.amm_math import price_to_sqrt_price_q96
+
+        key = PQPrivateKey.from_hex(w["private_key"], w["public_key"])
+        sender = w["address"]
+        target = node_urls[0]
+
+        def _sign(tx):
+            tx.public_key = key.public_key.to_bytes()
+            tx.signature = key.sign(tx.signing_bytes()).to_bytes()
+            return tx.to_hex()
+
+        def _tx(op, nonce, params):
+            return ExchangeTransaction(chain_id=CHAIN_ID, op_type=op, sender=sender, nonce=nonce,
+                                       params=params, gas_limit=2_000_000, gas_price=10**9)
+
+        base = await self._token_roots(node_urls)
+        base_root = next(iter(set(base.values())), None) if base else None
+        self.check_not_none(base_root, "Baseline token root readable")
+
+        # 1-2. Deploy base + quote tokens (trader holds full supply of each).
+        addrA = ExchangeStateManager.derive_token_address(sender, 0, "qCLOBA")  # base (token0)
+        addrB = ExchangeStateManager.derive_token_address(sender, 1, "qCLOBB")  # quote (token1)
+        r1 = await self._submit_and_wait(node_urls, target, _sign(_tx(
+            ExchangeOpType.TOKEN_DEPLOY, 0,
+            {"name": "CLOB A", "symbol": "qCLOBA", "total_supply": "1000000", "decimals": 18})),
+            base_root, "TOKEN_DEPLOY A")
+        self.check_not_none(r1, "Token A (base) deployed")
+        r2 = await self._submit_and_wait(node_urls, target, _sign(_tx(
+            ExchangeOpType.TOKEN_DEPLOY, 1,
+            {"name": "CLOB B", "symbol": "qCLOBB", "total_supply": "1000000", "decimals": 18})),
+            r1, "TOKEN_DEPLOY B")
+        self.check_not_none(r2, "Token B (quote) deployed")
+
+        # 3. Create the order book over the token addresses (CREATE_POOL makes the matching
+        #    OrderBook for the pair "token0:token1"). Moves no tokens.
+        pair = f"{addrA}:{addrB}"
+        sqrt_price = price_to_sqrt_price_q96(Decimal("1"))
+        async with NodeRPCClient(target) as c:
+            rp = await c._post("/submit_exchange_tx", json_data={"tx_hex": _sign(_tx(
+                ExchangeOpType.CREATE_POOL, 2,
+                {"token0": addrA, "token1": addrB, "fee_tier": int(FeeTier.MEDIUM),
+                 "pool_type": int(PoolType.STANDARD), "initial_sqrt_price": str(sqrt_price),
+                 "stake_amount": "10000"}))})
+            self.check(bool(rp and rp.get("ok")), "CREATE_POOL (order book): admitted")
+        # Stable, CONVERGED baseline after the deploys + pool (poll so it is not a mid-reorg
+        # transient — the escrow/refund below compare against it).
+        pre_place = await self._wait_converge(node_urls, lambda m: m and m != base_root, 20)
+        self.check_not_none(pre_place, "Baseline token root converged after deploys + pool")
+        pre_place = pre_place or r2
+
+        # 4. Place a RESTING limit BUY: buy 100 base @ price 2 → escrows 100*2 = 200 quote
+        #    (token B) from the trader into the book escrow holder. No asks exist, so it rests.
+        place_tx = _tx(ExchangeOpType.PLACE_ORDER, 3,
+                       {"pair": pair, "side": "buy", "order_type": "limit",
+                        "price": "2", "amount": "100"})
+        order_id = place_tx.tx_hash()[:16]  # the node derives the order id the same way
+        async with NodeRPCClient(target) as c:
+            rp = await c._post("/submit_exchange_tx", json_data={"tx_hex": _sign(place_tx)})
+            self.check(bool(rp and rp.get("ok")), "PLACE_ORDER (resting buy): admitted")
+
+        # 5. The escrow is a STABLE end-state (the order rests until cancelled) — poll
+        #    GENEROUSLY for ALL nodes to converge on ONE token root DIFFERENT from pre_place.
+        #    That proves the escrow moved real quote tokens AND every node replayed it to the
+        #    same ledger. Robust to reorg settling (unlike catching the transient advance).
+        escrowed = await self._wait_converge(node_urls, lambda m: m and m != pre_place, 45)
+        self.check(escrowed is not None,
+                   "Escrow-on-place settled: all nodes converge on a NEW token root != pre_place "
+                   "(real quote tokens escrowed, deterministically)")
+
+        # 6. Cancel → refund. Poll for ALL nodes to converge BACK to pre_place — the escrow was
+        #    refunded EXACTLY, so the token ledger returns to its pre-place state (conservation).
+        async with NodeRPCClient(target) as c:
+            rc = await c._post("/submit_exchange_tx", json_data={"tx_hex": _sign(_tx(
+                ExchangeOpType.CANCEL_ORDER, 4, {"order_id": order_id, "pair": pair}))})
+            self.check(bool(rc and rc.get("ok")), "CANCEL_ORDER: admitted")
+        refunded = await self._wait_converge(node_urls, lambda m: m == pre_place, 30) is not None
+        self.check(refunded,
+                   "Cancel refunded escrow EXACTLY — token root converged back to pre-place "
+                   "on all nodes (CLOB settlement conserves value)")

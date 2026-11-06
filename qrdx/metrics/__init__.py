@@ -5,10 +5,10 @@ Prometheus-compatible metrics for monitoring.
 """
 
 from .collector import (
-    MetricsCollector,
     Counter,
     Gauge,
     Histogram,
+    MetricsCollector,
     MetricsRegistry,
 )
 

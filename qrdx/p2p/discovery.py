@@ -17,25 +17,22 @@ Reference: Kademlia §2.3 — iterative lookup algorithm.
 """
 
 import asyncio
-import os
-import secrets
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 
-from .node import Node, NodeID, Address, derive_node_id, node_id_to_hex, hex_to_node_id
-from .routing import (
-    RoutingTable,
-    KBucketEntry,
-    K_BUCKET_SIZE,
-    ALPHA,
-    MAX_FIND_RESULTS,
-    BUCKET_REFRESH_INTERVAL,
-)
 from ..logger import get_logger
+from .node import Node, NodeID, derive_node_id, hex_to_node_id, node_id_to_hex
+from .routing import (
+    ALPHA,
+    K_BUCKET_SIZE,
+    MAX_FIND_RESULTS,
+    KBucketEntry,
+    RoutingTable,
+)
 
 logger = get_logger(__name__)
 
@@ -65,13 +62,19 @@ MAX_STORE_VALUE_SIZE = 8192
 # Store TTL (seconds) — stored values expire after 24 hours
 STORE_TTL = 24 * 60 * 60
 
+# Most values held at once. STORE needs no identity, so without a bound anyone could fill a node's
+# memory 8 KB at a time; when full, new keys are refused until entries expire.
+MAX_STORE_ENTRIES = 1024
+
 
 # ---------------------------------------------------------------------------
 # DHT Message Types
 # ---------------------------------------------------------------------------
 
+
 class DHTMessageType(str, Enum):
     """DHT RPC message types."""
+
     PING = "ping"
     PONG = "pong"
     FIND_NODE = "find_node"
@@ -86,39 +89,52 @@ class DHTMessageType(str, Enum):
 # DHT Messages
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class DHTMessage:
     """A DHT protocol message."""
 
     type: DHTMessageType
-    sender_id: str          # 'qx'-prefixed node ID hex
-    sender_host: str        # Sender's host
-    sender_port: int        # Sender's port
+    sender_id: str  # 'qx'-prefixed node ID hex
+    sender_host: str  # Sender's host
+    sender_port: int  # Sender's port
     payload: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
-            'type': self.type.value,
-            'sender_id': self.sender_id,
-            'sender_host': self.sender_host,
-            'sender_port': self.sender_port,
-            'payload': self.payload,
+            "type": self.type.value,
+            "sender_id": self.sender_id,
+            "sender_host": self.sender_host,
+            "sender_port": self.sender_port,
+            "payload": self.payload,
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> 'DHTMessage':
+    def from_dict(cls, d: dict) -> "DHTMessage":
+        """ValueError unless ``d`` is a message: anyone may send one (``dht_message``)."""
+        if not isinstance(d, dict):
+            raise ValueError("a DHT message is an object")
+        payload = d.get("payload", {})
+        port = d["sender_port"]
+        if not isinstance(d["sender_id"], str) or not isinstance(d["sender_host"], str):
+            raise ValueError("sender_id and sender_host are text")
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+            raise ValueError("sender_port is a port number")
+        if not isinstance(payload, dict):
+            raise ValueError("payload is an object")
         return cls(
-            type=DHTMessageType(d['type']),
-            sender_id=d['sender_id'],
-            sender_host=d['sender_host'],
-            sender_port=d['sender_port'],
-            payload=d.get('payload', {}),
+            type=DHTMessageType(d["type"]),
+            sender_id=d["sender_id"],
+            sender_host=d["sender_host"],
+            sender_port=port,
+            payload=payload,
         )
 
 
 # ---------------------------------------------------------------------------
 # KademliaProtocol (handles incoming DHT RPCs)
 # ---------------------------------------------------------------------------
+
 
 class KademliaProtocol:
     """
@@ -137,9 +153,9 @@ class KademliaProtocol:
         """Build sender identification fields."""
         addr = self._local_node.address
         return {
-            'sender_id': self._local_node.node_id_hex,
-            'sender_host': addr.ip if addr else '127.0.0.1',
-            'sender_port': addr.tcp_port if addr else 30303,
+            "sender_id": self._local_node.node_id_hex,
+            "sender_host": addr.ip if addr else "127.0.0.1",
+            "sender_port": addr.tcp_port if addr else 30303,
         }
 
     def _entry_from_message(self, msg: DHTMessage) -> KBucketEntry:
@@ -150,8 +166,8 @@ class KademliaProtocol:
             node_id_hex=msg.sender_id,
             host=msg.sender_host,
             port=msg.sender_port,
-            public_key_hex='',
-            at_schema='',
+            public_key_hex="",
+            at_schema="",
             last_seen=time.monotonic(),
             added_at=time.monotonic(),
             is_inbound=True,
@@ -179,7 +195,7 @@ class KademliaProtocol:
             return DHTMessage(
                 type=DHTMessageType.PONG,
                 **self._make_sender_info(),
-                payload={'error': f'Unknown message type: {msg.type}'},
+                payload={"error": f"Unknown message type: {msg.type}"},
             )
 
     def _handle_ping(self, msg: DHTMessage) -> DHTMessage:
@@ -191,14 +207,14 @@ class KademliaProtocol:
 
     def _handle_find_node(self, msg: DHTMessage) -> DHTMessage:
         """Handle FIND_NODE → return k closest nodes to target."""
-        target_hex = msg.payload.get('target', '')
+        target_hex = msg.payload.get("target", "")
         try:
             target_id = hex_to_node_id(target_hex)
         except (ValueError, TypeError):
             return DHTMessage(
                 type=DHTMessageType.FIND_NODE_RESPONSE,
                 **self._make_sender_info(),
-                payload={'nodes': [], 'error': 'Invalid target'},
+                payload={"nodes": [], "error": "Invalid target"},
             )
 
         closest = self._rt.find_closest(
@@ -209,10 +225,10 @@ class KademliaProtocol:
 
         nodes = [
             {
-                'node_id': e.node_id_hex,
-                'host': e.host,
-                'port': e.port,
-                'public_key_hex': e.public_key_hex,
+                "node_id": e.node_id_hex,
+                "host": e.host,
+                "port": e.port,
+                "public_key_hex": e.public_key_hex,
             }
             for e in closest
         ]
@@ -220,30 +236,43 @@ class KademliaProtocol:
         return DHTMessage(
             type=DHTMessageType.FIND_NODE_RESPONSE,
             **self._make_sender_info(),
-            payload={'nodes': nodes},
+            payload={"nodes": nodes},
         )
 
     def _handle_store(self, msg: DHTMessage) -> DHTMessage:
         """Handle STORE → store a key-value pair."""
-        key = msg.payload.get('key', '')
-        value = msg.payload.get('value', '')
+        key = msg.payload.get("key", "")
+        value = msg.payload.get("value", "")
 
         if not key or not value:
             return DHTMessage(
                 type=DHTMessageType.STORE_RESPONSE,
                 **self._make_sender_info(),
-                payload={'stored': False, 'error': 'Missing key or value'},
+                payload={"stored": False, "error": "Missing key or value"},
             )
 
         if len(value) > MAX_STORE_VALUE_SIZE:
             return DHTMessage(
                 type=DHTMessageType.STORE_RESPONSE,
                 **self._make_sender_info(),
-                payload={'stored': False, 'error': 'Value too large'},
+                payload={"stored": False, "error": "Value too large"},
+            )
+
+        if not isinstance(key, str) or not isinstance(value, (str, bytes)):
+            return DHTMessage(
+                type=DHTMessageType.STORE_RESPONSE,
+                **self._make_sender_info(),
+                payload={"stored": False, "error": "key and value are text"},
             )
 
         # Clean expired entries
         self._cleanup_store()
+        if key not in self._store and len(self._store) >= MAX_STORE_ENTRIES:
+            return DHTMessage(
+                type=DHTMessageType.STORE_RESPONSE,
+                **self._make_sender_info(),
+                payload={"stored": False, "error": "Store full"},
+            )
 
         expiry = time.time() + STORE_TTL
         self._store[key] = (value.encode() if isinstance(value, str) else value, expiry)
@@ -251,12 +280,14 @@ class KademliaProtocol:
         return DHTMessage(
             type=DHTMessageType.STORE_RESPONSE,
             **self._make_sender_info(),
-            payload={'stored': True},
+            payload={"stored": True},
         )
 
     def _handle_find_value(self, msg: DHTMessage) -> DHTMessage:
         """Handle FIND_VALUE → return value if found, else closest nodes."""
-        key = msg.payload.get('key', '')
+        key = msg.payload.get("key", "")
+        if not isinstance(key, str):
+            key = ""
 
         if key in self._store:
             value, expiry = self._store[key]
@@ -265,8 +296,8 @@ class KademliaProtocol:
                     type=DHTMessageType.FIND_VALUE_RESPONSE,
                     **self._make_sender_info(),
                     payload={
-                        'found': True,
-                        'value': value.decode() if isinstance(value, bytes) else value,
+                        "found": True,
+                        "value": value.decode() if isinstance(value, bytes) else value,
                     },
                 )
             else:
@@ -286,9 +317,9 @@ class KademliaProtocol:
 
         nodes = [
             {
-                'node_id': e.node_id_hex,
-                'host': e.host,
-                'port': e.port,
+                "node_id": e.node_id_hex,
+                "host": e.host,
+                "port": e.port,
             }
             for e in closest
         ]
@@ -296,7 +327,7 @@ class KademliaProtocol:
         return DHTMessage(
             type=DHTMessageType.FIND_VALUE_RESPONSE,
             **self._make_sender_info(),
-            payload={'found': False, 'nodes': nodes},
+            payload={"found": False, "nodes": nodes},
         )
 
     def _cleanup_store(self) -> None:
@@ -310,6 +341,7 @@ class KademliaProtocol:
 # ---------------------------------------------------------------------------
 # KademliaDiscovery (client-side iterative lookups)
 # ---------------------------------------------------------------------------
+
 
 class KademliaDiscovery:
     """
@@ -383,10 +415,10 @@ class KademliaDiscovery:
             if response.status_code == 200:
                 rpc_resp = response.json()
                 # JSON-RPC: result is in "result" key, errors in "error"
-                if isinstance(rpc_resp, dict) and 'result' in rpc_resp:
-                    return DHTMessage.from_dict(rpc_resp['result'])
+                if isinstance(rpc_resp, dict) and "result" in rpc_resp:
+                    return DHTMessage.from_dict(rpc_resp["result"])
                 # Handle non-standard response (raw dict) for backward compat
-                if isinstance(rpc_resp, dict) and 'type' in rpc_resp:
+                if isinstance(rpc_resp, dict) and "type" in rpc_resp:
                     return DHTMessage.from_dict(rpc_resp)
             return None
         except (httpx.RequestError, httpx.HTTPStatusError, Exception) as e:
@@ -406,7 +438,7 @@ class KademliaDiscovery:
         msg = DHTMessage(
             type=DHTMessageType.PING,
             sender_id=self._local.node_id_hex,
-            sender_host=addr.ip if addr else '127.0.0.1',
+            sender_host=addr.ip if addr else "127.0.0.1",
             sender_port=addr.tcp_port if addr else 30303,
         )
         response = await self._send_rpc(host, port, msg)
@@ -427,9 +459,9 @@ class KademliaDiscovery:
         msg = DHTMessage(
             type=DHTMessageType.FIND_NODE,
             sender_id=self._local.node_id_hex,
-            sender_host=addr.ip if addr else '127.0.0.1',
+            sender_host=addr.ip if addr else "127.0.0.1",
             sender_port=addr.tcp_port if addr else 30303,
-            payload={'target': node_id_to_hex(target)},
+            payload={"target": node_id_to_hex(target)},
         )
 
         response = await self._send_rpc(host, port, msg)
@@ -437,16 +469,16 @@ class KademliaDiscovery:
             return []
 
         entries = []
-        for node_data in response.payload.get('nodes', []):
+        for node_data in response.payload.get("nodes", []):
             try:
-                nid = hex_to_node_id(node_data['node_id'])
+                nid = hex_to_node_id(node_data["node_id"])
                 entry = KBucketEntry(
                     node_id=nid,
-                    node_id_hex=node_data['node_id'],
-                    host=node_data['host'],
-                    port=node_data['port'],
-                    public_key_hex=node_data.get('public_key_hex', ''),
-                    at_schema='',
+                    node_id_hex=node_data["node_id"],
+                    host=node_data["host"],
+                    port=node_data["port"],
+                    public_key_hex=node_data.get("public_key_hex", ""),
+                    at_schema="",
                     last_seen=time.monotonic(),
                     added_at=time.monotonic(),
                     is_inbound=False,
@@ -477,7 +509,7 @@ class KademliaDiscovery:
         Returns:
             Up to `count` closest nodes to target.
         """
-        target_int = int.from_bytes(target, 'big')
+        target_int = int.from_bytes(target, "big")
 
         # Seed shortlist from local routing table
         initial = self._rt.find_closest(target, count=ALPHA)
@@ -490,13 +522,13 @@ class KademliaDiscovery:
             shortlist[entry.node_id] = entry
 
         queried: Set[bytes] = set()
-        closest_seen = float('inf')
+        closest_seen = float("inf")
 
         for _round in range(MAX_LOOKUP_ROUNDS):
             # Pick α closest unqueried nodes
             candidates = sorted(
                 [e for nid, e in shortlist.items() if nid not in queried],
-                key=lambda e: target_int ^ int.from_bytes(e.node_id, 'big'),
+                key=lambda e: target_int ^ int.from_bytes(e.node_id, "big"),
             )[:ALPHA]
 
             if not candidates:
@@ -506,15 +538,14 @@ class KademliaDiscovery:
             tasks = []
             for candidate in candidates:
                 queried.add(candidate.node_id)
-                tasks.append(
-                    self.find_node(candidate.host, candidate.port, target)
-                )
+                tasks.append(self.find_node(candidate.host, candidate.port, target))
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             new_nodes_found = False
             for result in results:
-                if isinstance(result, Exception) or not result:
+                # BaseException, not Exception: a cancelled lookup comes back as CancelledError.
+                if isinstance(result, BaseException) or not result:
                     continue
                 for entry in result:
                     if entry.node_id not in shortlist and entry.node_id != self._local.node_id:
@@ -525,8 +556,8 @@ class KademliaDiscovery:
 
             # Check convergence: has our closest node improved?
             current_closest = min(
-                (target_int ^ int.from_bytes(nid, 'big') for nid in shortlist),
-                default=float('inf'),
+                (target_int ^ int.from_bytes(nid, "big") for nid in shortlist),
+                default=float("inf"),
             )
             if current_closest >= closest_seen and not new_nodes_found:
                 break  # Converged
@@ -535,7 +566,7 @@ class KademliaDiscovery:
         # Return the `count` closest from shortlist
         sorted_entries = sorted(
             shortlist.values(),
-            key=lambda e: target_int ^ int.from_bytes(e.node_id, 'big'),
+            key=lambda e: target_int ^ int.from_bytes(e.node_id, "big"),
         )
         return sorted_entries[:count]
 
@@ -657,8 +688,8 @@ class KademliaDiscovery:
             return response.to_dict()
         except (KeyError, ValueError) as e:
             return {
-                'type': 'error',
-                'error': f'Invalid DHT message: {e}',
+                "type": "error",
+                "error": f"Invalid DHT message: {e}",
             }
 
     # -- Statistics ----------------------------------------------------------
@@ -667,8 +698,8 @@ class KademliaDiscovery:
         """Get DHT discovery statistics."""
         rt_stats = self._rt.get_stats()
         return {
-            'running': self._running,
-            'local_node_id': self._local.node_id_hex,
-            'routing_table': rt_stats,
-            'store_entries': len(self._protocol._store),
+            "running": self._running,
+            "local_node_id": self._local.node_id_hex,
+            "routing_table": rt_stats,
+            "store_entries": len(self._protocol._store),
         }

@@ -18,14 +18,13 @@ Information System Based on the XOR Metric" (2002)
 
 import json
 import os
-import time
 import threading
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Tuple, Set
-
-from .node import Node, NodeID, Address, derive_node_id, node_id_to_hex, hex_to_node_id
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..logger import get_logger
+from .node import Address, Node, NodeID, node_id_to_hex
 
 logger = get_logger(__name__)
 
@@ -68,63 +67,64 @@ STALE_NODE_TIMEOUT = 60 * 60  # 1 hour
 # KBucketEntry
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class KBucketEntry:
     """A single entry in a k-bucket."""
 
-    node_id: bytes          # 20-byte node ID
-    node_id_hex: str        # 'qx'-prefixed hex string
-    host: str               # IP / hostname
-    port: int               # TCP port
-    public_key_hex: str     # Dilithium public key hex (empty if unresolved)
-    at_schema: str          # Full @-schema address (empty if unknown)
-    last_seen: float        # Monotonic timestamp of last contact
-    added_at: float         # When this entry was first added
-    is_inbound: bool        # True if this peer connected to us (vs us to them)
-    failures: int = 0       # Consecutive communication failures
+    node_id: bytes  # 20-byte node ID
+    node_id_hex: str  # 'qx'-prefixed hex string
+    host: str  # IP / hostname
+    port: int  # TCP port
+    public_key_hex: str  # Dilithium public key hex (empty if unresolved)
+    at_schema: str  # Full @-schema address (empty if unknown)
+    last_seen: float  # Monotonic timestamp of last contact
+    added_at: float  # When this entry was first added
+    is_inbound: bool  # True if this peer connected to us (vs us to them)
+    failures: int = 0  # Consecutive communication failures
 
     @classmethod
-    def from_node(cls, node: Node, *, is_inbound: bool = False) -> 'KBucketEntry':
+    def from_node(cls, node: Node, *, is_inbound: bool = False) -> "KBucketEntry":
         """Create from a Node object."""
         addr = node.address
         return cls(
             node_id=node.node_id,
             node_id_hex=node.node_id_hex,
-            host=addr.ip if addr else '',
+            host=addr.ip if addr else "",
             port=addr.tcp_port if addr else 0,
-            public_key_hex=node.public_key_hex or '',
-            at_schema='',
+            public_key_hex=node.public_key_hex or "",
+            at_schema="",
             last_seen=time.monotonic(),
             added_at=time.monotonic(),
             is_inbound=is_inbound,
         )
 
     @classmethod
-    def from_dict(cls, d: dict) -> 'KBucketEntry':
+    def from_dict(cls, d: dict) -> "KBucketEntry":
         """Deserialize from a dict (JSON persistence)."""
         return cls(
-            node_id=bytes.fromhex(d['node_id_hex'].replace('qx', '')),
-            node_id_hex=d['node_id_hex'],
-            host=d['host'],
-            port=d['port'],
-            public_key_hex=d.get('public_key_hex', ''),
-            at_schema=d.get('at_schema', ''),
+            node_id=bytes.fromhex(d["node_id_hex"].replace("qx", "")),
+            node_id_hex=d["node_id_hex"],
+            host=d["host"],
+            port=d["port"],
+            public_key_hex=d.get("public_key_hex", ""),
+            at_schema=d.get("at_schema", ""),
             last_seen=time.monotonic(),  # Reset on load
-            added_at=d.get('added_at', time.monotonic()),
-            is_inbound=d.get('is_inbound', False),
-            failures=d.get('failures', 0),
+            added_at=d.get("added_at", time.monotonic()),
+            is_inbound=d.get("is_inbound", False),
+            failures=d.get("failures", 0),
         )
 
     def to_dict(self) -> dict:
         """Serialize to dict for JSON persistence."""
         return {
-            'node_id_hex': self.node_id_hex,
-            'host': self.host,
-            'port': self.port,
-            'public_key_hex': self.public_key_hex,
-            'at_schema': self.at_schema,
-            'is_inbound': self.is_inbound,
-            'failures': self.failures,
+            "node_id_hex": self.node_id_hex,
+            "host": self.host,
+            "port": self.port,
+            "public_key_hex": self.public_key_hex,
+            "at_schema": self.at_schema,
+            "is_inbound": self.is_inbound,
+            "failures": self.failures,
         }
 
     def to_node(self) -> Node:
@@ -136,7 +136,7 @@ class KBucketEntry:
         else:
             # Create unresolved node from ID
             node = Node.__new__(Node)
-            node._public_key = None
+            node._public_key = None  # type: ignore[assignment]  # unknown until handshake
             node._secret_key = None
             node._address = addr
             node._node_id = self.node_id
@@ -150,7 +150,7 @@ class KBucketEntry:
         For IPv4 addresses: first two octets (e.g. '192.168').
         For hostnames: the full hostname (treated as unique subnet).
         """
-        parts = self.host.split('.')
+        parts = self.host.split(".")
         if len(parts) == 4:
             try:
                 # Validate it's a real IPv4
@@ -164,6 +164,7 @@ class KBucketEntry:
 # ---------------------------------------------------------------------------
 # KBucket
 # ---------------------------------------------------------------------------
+
 
 class KBucket:
     """
@@ -325,10 +326,7 @@ class KBucket:
     def get_stale_entries(self) -> List[KBucketEntry]:
         """Get entries that haven't been seen recently."""
         now = time.monotonic()
-        return [
-            e for e in self.entries
-            if (now - e.last_seen) > STALE_NODE_TIMEOUT
-        ]
+        return [e for e in self.entries if (now - e.last_seen) > STALE_NODE_TIMEOUT]
 
     def _add_to_replacement_cache(self, entry: KBucketEntry) -> None:
         """Add to the replacement cache (FIFO, bounded)."""
@@ -344,6 +342,7 @@ class KBucket:
 # ---------------------------------------------------------------------------
 # RoutingTable
 # ---------------------------------------------------------------------------
+
 
 class RoutingTable:
     """
@@ -370,7 +369,7 @@ class RoutingTable:
             raise ValueError(f"Node ID must be 20 bytes, got {len(local_node_id)}")
 
         self._local_id = local_node_id
-        self._local_int = int.from_bytes(local_node_id, 'big')
+        self._local_int = int.from_bytes(local_node_id, "big")
         self._buckets: List[KBucket] = [KBucket(i) for i in range(NUM_BUCKETS)]
         self._lock = threading.Lock()
         self._persist_path = persist_path
@@ -386,7 +385,7 @@ class RoutingTable:
         Bucket index = floor(log2(distance)) = bit_length(XOR) - 1
         Same node → bucket 0.
         """
-        distance = self._local_int ^ int.from_bytes(node_id, 'big')
+        distance = self._local_int ^ int.from_bytes(node_id, "big")
         if distance == 0:
             return 0
         return min(distance.bit_length() - 1, NUM_BUCKETS - 1)
@@ -456,8 +455,9 @@ class RoutingTable:
 
     # -- Lookups ------------------------------------------------------------
 
-    def find_closest(self, target: NodeID, *, count: int = MAX_FIND_RESULTS,
-                     exclude: Optional[Set[bytes]] = None) -> List[KBucketEntry]:
+    def find_closest(
+        self, target: NodeID, *, count: int = MAX_FIND_RESULTS, exclude: Optional[Set[bytes]] = None
+    ) -> List[KBucketEntry]:
         """
         Find the `count` closest nodes to a target ID by XOR distance.
 
@@ -474,14 +474,14 @@ class RoutingTable:
         if exclude is None:
             exclude = set()
 
-        target_int = int.from_bytes(target, 'big')
+        target_int = int.from_bytes(target, "big")
 
         with self._lock:
             all_entries = []
             for bucket in self._buckets:
                 for entry in bucket.entries:
                     if entry.node_id not in exclude:
-                        dist = target_int ^ int.from_bytes(entry.node_id, 'big')
+                        dist = target_int ^ int.from_bytes(entry.node_id, "big")
                         all_entries.append((dist, entry))
 
         all_entries.sort(key=lambda x: x[0])
@@ -537,7 +537,7 @@ class RoutingTable:
         target_int = self._local_int ^ distance
         # Clamp to 160 bits
         target_int &= (1 << 160) - 1
-        return target_int.to_bytes(20, 'big')
+        return target_int.to_bytes(20, "big")
 
     def mark_bucket_refreshed(self, bucket_index: int) -> None:
         """Mark a bucket as just refreshed."""
@@ -562,20 +562,20 @@ class RoutingTable:
         os.makedirs(save_path, exist_ok=True)
 
         with self._lock:
-            data = {
-                'local_node_id': node_id_to_hex(self._local_id),
-                'saved_at': time.time(),
-                'total_added': self._total_added,
-                'total_evicted': self._total_evicted,
-                'buckets': {},
+            data: Dict[str, Any] = {
+                "local_node_id": node_id_to_hex(self._local_id),
+                "saved_at": time.time(),
+                "total_added": self._total_added,
+                "total_evicted": self._total_evicted,
+                "buckets": {},
             }
             for i, bucket in enumerate(self._buckets):
                 if bucket.entries:
-                    data['buckets'][str(i)] = [e.to_dict() for e in bucket.entries]
+                    data["buckets"][str(i)] = [e.to_dict() for e in bucket.entries]
 
         try:
-            tmp_path = filepath + '.tmp'
-            with open(tmp_path, 'w') as f:
+            tmp_path = filepath + ".tmp"
+            with open(tmp_path, "w") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp_path, filepath)
             logger.debug(f"Saved routing table: {self.total_nodes} nodes to {filepath}")
@@ -583,7 +583,7 @@ class RoutingTable:
             logger.warning(f"Failed to save routing table: {e}")
 
     @classmethod
-    def load(cls, local_node_id: NodeID, persist_path: str) -> 'RoutingTable':
+    def load(cls, local_node_id: NodeID, persist_path: str) -> "RoutingTable":
         """
         Load a routing table from a JSON file.
 
@@ -597,11 +597,11 @@ class RoutingTable:
             return rt
 
         try:
-            with open(filepath, 'r') as f:
+            with open(filepath, "r") as f:
                 data = json.load(f)
 
             loaded = 0
-            for idx_str, entries_data in data.get('buckets', {}).items():
+            for _idx_str, entries_data in data.get("buckets", {}).items():
                 for entry_data in entries_data:
                     try:
                         entry = KBucketEntry.from_dict(entry_data)
@@ -646,17 +646,15 @@ class RoutingTable:
                         stale += 1
 
             return {
-                'total_nodes': total,
-                'inbound_nodes': inbound,
-                'outbound_nodes': outbound,
-                'unique_subnets': len(subnets),
-                'stale_nodes': stale,
-                'non_empty_buckets': sum(1 for b in self._buckets if b.size > 0),
-                'total_added': self._total_added,
-                'total_evicted': self._total_evicted,
-                'replacement_cache_size': sum(
-                    len(b.replacement_cache) for b in self._buckets
-                ),
+                "total_nodes": total,
+                "inbound_nodes": inbound,
+                "outbound_nodes": outbound,
+                "unique_subnets": len(subnets),
+                "stale_nodes": stale,
+                "non_empty_buckets": sum(1 for b in self._buckets if b.size > 0),
+                "total_added": self._total_added,
+                "total_evicted": self._total_evicted,
+                "replacement_cache_size": sum(len(b.replacement_cache) for b in self._buckets),
             }
 
     def __repr__(self) -> str:
