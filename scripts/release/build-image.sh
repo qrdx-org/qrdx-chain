@@ -80,15 +80,23 @@ docker buildx create --name "$BUILDER" --driver docker-container \
   --driver-opt "image=${BUILDKIT_IMAGE}" >/dev/null
 docker buildx inspect "$BUILDER" --bootstrap >/dev/null
 
-# Everything but a push is exported as an OCI archive — the exporter that always reports the
-# config digest — and --load then loads that archive. (BuildKit's docker exporter omits the
-# config digest from its metadata.) The name is an index annotation: it is not part of the
-# image, so it changes no digest.
+# Local exports: type=oci always reports containerimage.config.digest in the metadata file
+# (BuildKit's docker exporter often omits it). But `docker load` only accepts a docker-archive;
+# feeding it an OCI layout fails with: open .../blobs/json: no such file or directory.
+# So --load writes type=docker (and backfills the config digest from the loaded image Id);
+# digest-only / --oci builds keep type=oci. The image name is an annotation, not image bytes.
 OCI_DEST="${OCI:-$WORK/image.oci.tar}"
+DOCKER_DEST="$WORK/image.docker.tar"
+EXTRA_OUTPUT=()
 if [[ -n "$PUSH" ]]; then
   OUTPUT="type=image,name=${PUSH}:${VERSION},push=true,oci-mediatypes=true,rewrite-timestamp=true"
+elif [[ -n "$LOAD" ]]; then
+  OUTPUT="type=docker,dest=${DOCKER_DEST},rewrite-timestamp=true,name=${LOAD}"
+  if [[ -n "$OCI" ]]; then
+    EXTRA_OUTPUT=(--output "type=oci,dest=${OCI_DEST},rewrite-timestamp=true,name=${LOAD}")
+  fi
 else
-  OUTPUT="type=oci,dest=${OCI_DEST},rewrite-timestamp=true${LOAD:+,name=${LOAD}}"
+  OUTPUT="type=oci,dest=${OCI_DEST},rewrite-timestamp=true"
 fi
 METADATA="${META:-$WORK/metadata.json}"
 
@@ -105,6 +113,7 @@ docker buildx build \
   --file "$CONTEXT/docker/Dockerfile" \
   --metadata-file "$METADATA" \
   --output "$OUTPUT" \
+  ${EXTRA_OUTPUT[@]+"${EXTRA_OUTPUT[@]}"} \
   "$CONTEXT" 1>&2
 
 meta() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$METADATA" "$1"; }
@@ -115,13 +124,19 @@ if [[ -n "$PUSH" ]]; then
   CONFIG="$(docker buildx imagetools inspect "${PUSH}@${DIGEST}" --raw \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["config"]["digest"])')"
 fi
-[[ "$CONFIG" == sha256:* ]] || { echo "the build reported no image config digest" >&2; exit 1; }
 if [[ -n "$LOAD" ]]; then
-  docker load -i "$OCI_DEST" >&2
+  docker load -i "$DOCKER_DEST" >&2
   LOADED="$(docker image inspect "$LOAD" --format '{{.Id}}')"
+  # Docker exporter may omit config digest from metadata; the loaded image Id is that digest.
+  if [[ "$CONFIG" != sha256:* ]]; then
+    CONFIG="$LOADED"
+    python3 -c 'import json,sys; p,d=sys.argv[1],sys.argv[2]; m=json.load(open(p)); m["containerimage.config.digest"]=d; json.dump(m, open(p,"w"), indent=2, sort_keys=True); open(p,"a").write("\n")' \
+      "$METADATA" "$CONFIG"
+  fi
   [[ "$LOADED" == "$DIGEST" || "$LOADED" == "$CONFIG" ]] \
-    || { echo "loaded $LOAD is $LOADED, not the image just built ($DIGEST)" >&2; exit 1; }
+    || { echo "loaded $LOAD is $LOADED, not the image just built (${DIGEST:-$CONFIG})" >&2; exit 1; }
 fi
+[[ "$CONFIG" == sha256:* ]] || { echo "the build reported no image config digest" >&2; exit 1; }
 if [[ "$PRINT_ONLY" == 1 ]]; then
   echo "$CONFIG"
 else
