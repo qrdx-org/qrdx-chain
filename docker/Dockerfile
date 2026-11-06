@@ -180,6 +180,8 @@ RUN pip wheel --no-deps --no-build-isolation --wheel-dir /wheels /build/py-evm
 FROM base AS app
 ARG SOURCE_DATE_EPOCH
 COPY qrdx /app/qrdx
+# Lockbox tooling resolves contracts/ relative to the app root (qrdx/bridge/lockbox.py).
+COPY contracts /app/contracts
 COPY run_node.py /app/
 COPY docker/docker-entrypoint.sh docker/docker-healthcheck.py docker/testnet-init.py \
      docker/validator-init.py docker/genesis-init.py /app/docker/
