@@ -6,7 +6,7 @@
 # config digest, byte for byte (docs/RELEASES.md). Every input is pinned:
 #
 #   * the base image by digest;
-#   * Debian packages from deb.debian.org (bookworm + security), with apt retries;
+#   * Debian packages through a fixed snapshot.debian.org timestamp (with apt retries);
 #   * liboqs by release tag AND commit (checked);
 #   * the Rust toolchain by version, its installer by sha256, and every crate by Cargo.lock;
 #   * every Python package by version AND sha256 (release/requirements.lock), and the build
@@ -30,9 +30,11 @@
 
 # python:3.11.17-slim-bookworm (multi-arch index digest).
 ARG BASE_IMAGE=python:3.11.17-slim-bookworm@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89
-# Apt installs from the live Debian bookworm mirrors (deb.debian.org + debian-security).
-# Package pins for reproducibility live in release/*.lock; SOURCE_DATE_EPOCH still drives
-# timestamps. Snapshot mirrors were dropped after repeated 503/504 CI failures.
+# Debian archive state every apt-get in this file installs from. Must be no older than the base
+# image (it was built 2026-10-06): an older snapshot lacks the versions the image already has,
+# and apt refuses. Bump the two together. Snapshot hosts sometimes return 503/504; apt retries
+# and apt-get-reproducible (below) absorb that without falling back to a live mirror.
+ARG DEBIAN_SNAPSHOT=20261008T000000Z
 # liboqs C library: the post-quantum implementation every node signs and verifies with.
 # The same pair everywhere (release/requirements.lock pins liboqs-python 0.16.0.1, and
 # .devcontainer/install-liboqs.sh builds this tag and checks this commit). Every node also proves
@@ -46,28 +48,53 @@ ARG QRDX_VERSION=dev
 ARG QRDX_GIT_COMMIT=unknown
 
 # -----------------------------------------------------------------------------
-# base — the pinned base image with apt pointed at live Debian bookworm mirrors
+# base — the pinned base image with apt pointed at a fixed Debian snapshot
 # -----------------------------------------------------------------------------
 FROM ${BASE_IMAGE} AS base
+ARG DEBIAN_SNAPSHOT
 RUN set -eux; \
     rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; \
     printf '%s\n' \
       'Types: deb' \
-      'URIs: http://deb.debian.org/debian' \
+      "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}" \
       'Suites: bookworm bookworm-updates' \
       'Components: main' \
       'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
       '' \
       'Types: deb' \
-      'URIs: http://deb.debian.org/debian-security' \
+      "URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}" \
       'Suites: bookworm-security' \
       'Components: main' \
       'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
       > /etc/apt/sources.list.d/debian.sources; \
     printf '%s\n' \
-      'Acquire::Retries "5";' \
+      'Acquire::Check-Valid-Until "false";' \
+      'Acquire::Retries "10";' \
+      'Acquire::http::Timeout "30";' \
+      'Acquire::https::Timeout "30";' \
       'APT::Install-Recommends "false";' \
       > /etc/apt/apt.conf.d/10-reproducible; \
+    printf '%s\n' '#!/bin/sh' \
+      '# apt-get against the pinned snapshot, with backoff on transient 503/504.' \
+      '# Never switches mirrors — reproducibility requires the fixed snapshot only.' \
+      'set -eu' \
+      'n=0' \
+      'delay=5' \
+      'until apt-get update -o Acquire::Retries=10 \' \
+      '      && apt-get install -y -o Acquire::Retries=10 "$@"; do' \
+      '  n=$((n + 1))' \
+      '  if [ "$n" -ge 8 ]; then' \
+      '    echo "apt-get-reproducible: failed after 8 attempts (snapshot only)" >&2' \
+      '    exit 1' \
+      '  fi' \
+      '  echo "apt-get-reproducible: attempt ${n}/8 failed; retrying in ${delay}s" >&2' \
+      '  sleep "$delay"' \
+      '  delay=$((delay * 2))' \
+      '  if [ "$delay" -gt 120 ]; then delay=120; fi' \
+      'done' \
+      'apt-clean-reproducible' \
+      > /usr/local/sbin/apt-get-reproducible; \
+    chmod 0755 /usr/local/sbin/apt-get-reproducible; \
     printf '%s\n' '#!/bin/sh' \
       '# Remove what apt/dpkg/ldconfig write that differs between two otherwise identical builds.' \
       'rm -rf /var/lib/apt/lists/* /var/cache/apt/*.bin /var/cache/apt/archives/*.deb \' \
@@ -84,9 +111,8 @@ ARG LIBOQS_VERSION
 ARG LIBOQS_COMMIT
 ARG SOURCE_DATE_EPOCH
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
-RUN apt-get update -o Acquire::Retries=5 && apt-get install -y -o Acquire::Retries=5 \
-        build-essential cmake ninja-build git libssl-dev ca-certificates \
-    && apt-clean-reproducible
+RUN apt-get-reproducible \
+        build-essential cmake ninja-build git libssl-dev ca-certificates
 RUN set -eux; \
     git clone --depth 1 --branch "${LIBOQS_VERSION}" https://github.com/open-quantum-safe/liboqs /src/liboqs; \
     test "$(git -C /src/liboqs rev-parse HEAD)" = "${LIBOQS_COMMIT}" \
@@ -118,7 +144,7 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     RUSTFLAGS="--remap-path-prefix=/build/native=. --remap-path-prefix=/opt/cargo=cargo -C debuginfo=0"
-RUN apt-get update -o Acquire::Retries=5 && apt-get install -y -o Acquire::Retries=5 curl && apt-clean-reproducible
+RUN apt-get-reproducible curl
 RUN set -eux; \
     curl -sSf -o /tmp/rustup-init \
         "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"; \
@@ -147,8 +173,7 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     PIP_NO_CACHE_DIR=1 \
     CFLAGS="-g0 -O2" \
     LDFLAGS="-Wl,--build-id=sha1"
-RUN apt-get update -o Acquire::Retries=5 && apt-get install -y -o Acquire::Retries=5 build-essential libgmp-dev \
-    && apt-clean-reproducible
+RUN apt-get-reproducible build-essential libgmp-dev
 
 WORKDIR /build
 COPY release/requirements.lock release/build-requirements.lock ./
@@ -218,8 +243,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 #   libssl3         : liboqs
 #   openssh-client  : optional Pinggy reverse tunnel (ENABLE_PINGGY_TUNNEL)
 #   curl            : convenience for operators debugging the node from inside
-RUN apt-get update -o Acquire::Retries=5 && apt-get install -y -o Acquire::Retries=5 libgmp10 libssl3 openssh-client curl ca-certificates \
-    && apt-clean-reproducible
+RUN apt-get-reproducible libgmp10 libssl3 openssh-client curl ca-certificates
 
 COPY --from=liboqs /opt/liboqs/lib/ /usr/local/lib/
 COPY --from=liboqs /opt/liboqs/include/oqs /usr/local/include/oqs
