@@ -22,7 +22,8 @@ use crate::smt::{bit, leaf_hash, node_hash, value_hash, EMPTY};
 const KEY_BYTES: usize = 32;
 const MAX_DEPTH: usize = 8 * KEY_BYTES;
 
-struct Node {
+#[derive(Debug)]
+pub(crate) struct Node {
     hash: [u8; 32],
     key: Vec<u8>, // a leaf's key; empty for an internal node (Python's ``is_leaf``)
     payload: Vec<u8>,
@@ -36,10 +37,10 @@ impl Node {
     }
 }
 
-type Tree = Option<Arc<Node>>;
-type Change = (Vec<u8>, Option<Vec<u8>>);
+pub(crate) type Tree = Option<Arc<Node>>;
+pub(crate) type Change = (Vec<u8>, Option<Vec<u8>>);
 
-fn hash_of(t: &Tree) -> &[u8; 32] {
+pub(crate) fn hash_of(t: &Tree) -> &[u8; 32] {
     t.as_ref().map_or(&EMPTY, |n| &n.hash)
 }
 
@@ -88,7 +89,7 @@ fn build(live: &[(&[u8], &[u8])], depth: usize) -> Tree {
 
 /// ``m_update``: ``node``'s subtree with ``changes`` (sorted, distinct, sharing the subtree's
 /// first ``depth`` bits) applied; ``node`` itself where nothing below it changed.
-fn update(node: &Tree, changes: &[Change], depth: usize) -> Tree {
+pub(crate) fn update(node: &Tree, changes: &[Change], depth: usize) -> Tree {
     if changes.is_empty() {
         return node.clone();
     }
@@ -156,7 +157,7 @@ fn sorted_changes(mut changes: Vec<Change>) -> PyResult<Vec<Change>> {
 
 /// A node of a tree (Python's ``smt.MNode``): immutable, so copying one is returning it.
 #[pyclass(frozen, module = "qrdx_native", name = "MNode")]
-pub struct MNode(Arc<Node>);
+pub struct MNode(pub(crate) Arc<Node>);
 
 fn wrap(t: Tree) -> Option<MNode> {
     t.map(MNode)

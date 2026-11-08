@@ -30,6 +30,11 @@ pub(crate) fn h(parts: &[&[u8]]) -> [u8; 32] {
     d.finalize().into()
 }
 
+/// ``smt.key_of``: an entry's 32-byte key in a tree.
+pub(crate) fn key_of(identity: &[u8]) -> [u8; 32] {
+    h(&[b"qrdx/smt/key/v1\x00", identity])
+}
+
 pub(crate) fn value_hash(payload: &[u8]) -> [u8; 32] {
     h(&[VALUE, payload])
 }

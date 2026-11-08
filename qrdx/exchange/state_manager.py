@@ -339,9 +339,7 @@ class ExchangeStateManager:
         (rebuilt after a restore) and kept as orders are placed."""
         pairs = self.__dict__.get("_expiring_pairs")
         if pairs is None:
-            pairs = {
-                p for p, b in self._order_books.items() if b.__dict__.get("_has_expiring", True)
-            }
+            pairs = {p for p, b in self._order_books.items() if b.has_expiring}
             self._expiring_pairs = pairs
         return sorted(p for p in pairs if p in self._order_books)
 
@@ -1448,7 +1446,12 @@ class ExchangeStateManager:
 
         # Order books + oracles: put the SAME restored objects into both the
         # manager and the router registries so they remain consistent.
-        restored_books = copy.deepcopy(snapshot["order_books"])
+        from .native_book import as_spot_book
+
+        restored_books = {
+            pair: as_spot_book(book)
+            for pair, book in copy.deepcopy(snapshot["order_books"]).items()
+        }
         self._order_books.clear()
         self._order_books.update(restored_books)
         self.router._order_books.clear()

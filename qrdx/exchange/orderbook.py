@@ -530,6 +530,11 @@ class OrderBook:
         return len([p for p, lvl in self._asks.items() if lvl.visible_amount > 0])
 
     @property
+    def has_expiring(self) -> bool:
+        """Whether an order with an expiry was ever added (then every block starts the book)."""
+        return bool(self.__dict__.get("_has_expiring", True))
+
+    @property
     def is_paused(self) -> bool:
         return self._paused
 
@@ -569,6 +574,23 @@ class OrderBook:
         self._cleanup_expired()
 
     # -- Atomicity and commitment -------------------------------------------
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "OrderBook":
+        # (explicit, so that pickling can leave out what a copy keeps: ``__getstate__``)
+        new = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new
+        new.__dict__.update(copy.deepcopy(self.__dict__, memo))
+        return new
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """A pickle leaves out the levels' proof tree: it is derived (rebuilt from the levels on
+        the next digest), and a tree's nodes are not what a snapshot loader reads — a published
+        snapshot of a network with proof trees could not be loaded (docs/KNOWN_ISSUES.md)."""
+        state = dict(self.__dict__)
+        state.pop("_level_tree", None)
+        state["_level_tree_on"] = False
+        state["_digest"] = None  # (so the next digest rebuilds it)
+        return state
 
     def snapshot(self) -> Any:
         """Everything but the display history, which is append-only and copied shallowly."""

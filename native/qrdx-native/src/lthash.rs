@@ -208,6 +208,12 @@ pub fn lt_mix_entries<'py>(
     removed: Vec<Vec<u8>>,
     added: Vec<Vec<u8>>,
 ) -> Option<Bound<'py, PyBytes>> {
+    let out = py.allow_threads(|| mix(acc, tag, &removed, &added))?;
+    Some(PyBytes::new_bound(py, &out))
+}
+
+/// ``lt_mix_entries`` without Python: the new accumulator, or None if ``acc`` is not well formed.
+pub(crate) fn mix(acc: &[u8], tag: &[u8], removed: &[Vec<u8>], added: &[Vec<u8>]) -> Option<Vec<u8>> {
     use rayon::prelude::*;
 
     if acc.len() != SIZE || acc.chunks(4).any(|slot| slot[2] != 0 || slot[3] != 0) {
@@ -237,18 +243,15 @@ pub fn lt_mix_entries<'py>(
                 },
             )
     };
-    let out = py.allow_threads(|| -> Option<Vec<u8>> {
-        let (minus, plus) = (sum(&removed)?, sum(&added)?);
-        let mut out = acc.to_vec();
-        for i in 0..LANES {
-            let lane = u16::from_le_bytes([acc[4 * i], acc[4 * i + 1]])
-                .wrapping_sub(minus[i])
-                .wrapping_add(plus[i]);
-            out[4 * i..4 * i + 2].copy_from_slice(&lane.to_le_bytes());
-        }
-        Some(out)
-    })?;
-    Some(PyBytes::new_bound(py, &out))
+    let (minus, plus) = (sum(removed)?, sum(added)?);
+    let mut out = acc.to_vec();
+    for i in 0..LANES {
+        let lane = u16::from_le_bytes([acc[4 * i], acc[4 * i + 1]])
+            .wrapping_sub(minus[i])
+            .wrapping_add(plus[i]);
+        out[4 * i..4 * i + 2].copy_from_slice(&lane.to_le_bytes());
+    }
+    Some(out)
 }
 
 #[cfg(test)]

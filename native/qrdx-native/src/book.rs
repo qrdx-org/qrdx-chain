@@ -308,6 +308,7 @@ pub struct Trade {
     pub buyer: Id,
     pub seller: Id,
     pub sequence: u64,
+    pub timestamp: f64, // (the wall clock, as the Python book's: display only, never hashed)
 }
 
 /// A price as a map key: equal values are one key, whatever their spelling.
@@ -383,7 +384,6 @@ pub struct State {
     stops: IMap<Id, Arc<Order>>,
     owner_order_count: IMap<Id, i64>,
     owner_stop_count: IMap<Id, i64>,
-    owner_nonces: IMap<Id, i64>,
     block_order_count: IMap<Id, i64>,
     trade_sequence: u64,
     last_price: Option<Dec>,
@@ -394,6 +394,13 @@ pub struct State {
     has_expiring: bool,
     block_height: Option<i64>,
     recent: Vector<Trade>, // the display history (never consensus)
+    // The incremental commitment (``cached_digest``): each level's digest, their LtHash, the
+    // levels touched since, the levels' proof tree. ``level_digests`` None: recompute in full.
+    level_digests: Option<OrdMap<(u8, PKey), [u8; 32]>>,
+    level_acc: Arc<Vec<u8>>,
+    dirty: im::OrdSet<(u8, PKey)>,
+    level_tree: crate::mtree::Tree,
+    tree_on: bool,
 }
 
 impl State {
@@ -408,7 +415,6 @@ impl State {
             stops: IMap::new(),
             owner_order_count: IMap::new(),
             owner_stop_count: IMap::new(),
-            owner_nonces: IMap::new(),
             block_order_count: IMap::new(),
             trade_sequence: 0,
             last_price: None,
@@ -419,6 +425,11 @@ impl State {
             has_expiring: false,
             block_height: None,
             recent: Vector::new(),
+            level_digests: None,
+            level_acc: Arc::new(vec![0u8; crate::lthash::SIZE]),
+            dirty: im::OrdSet::new(),
+            level_tree: None,
+            tree_on: false,
         }
     }
 }
@@ -448,6 +459,10 @@ pub struct Book {
     /// caller placed is the object the book indexes, so a stop triggered later in the same
     /// placement can fill it, and the caller sees it.
     last: std::collections::HashMap<Id, Order>,
+    /// The placing owner's last book nonce, read from Python's committed nonces (``_nonces``),
+    /// and the one this placement set: the book's nonces stay Python's, committed and provable.
+    last_nonce: i64,
+    new_nonce: Option<i64>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -464,6 +479,8 @@ impl Book {
             config,
             state,
             last: std::collections::HashMap::new(),
+            last_nonce: 0,
+            new_nonce: None,
         }
     }
 
@@ -488,6 +505,7 @@ impl Book {
             self.state.order_seq.insert(order.id.clone(), seq);
         }
         self.last.insert(order.id.clone(), order.clone());
+        self.touch(order.side, &order.price);
         self.state.orders.insert(order.id.clone(), Arc::new(order));
     }
 
@@ -499,6 +517,7 @@ impl Book {
     /// The order leaves the book, ``order`` as it ended.
     fn drop_order(&mut self, order: &Order) {
         self.last.insert(order.id.clone(), order.clone());
+        self.touch(order.side, &order.price);
         self.state.orders.remove(&order.id);
         self.state.order_seq.remove(&order.id);
     }
@@ -554,15 +573,17 @@ impl Book {
     // ── placement ───────────────────────────────────────────────────────────────────────────
 
     /// ``place_order``: the trades it made and the order as it ended. A failure leaves the book
-    /// as it was.
+    /// as it was, and gives the order as it stood when it failed (in Python the caller's object
+    /// keeps what matching did to it: a fill-or-kill that matched, then failed).
     pub fn place_order(
         &mut self,
         order: Order,
         protocol: bool,
         budget: &mut Option<Budget>,
-    ) -> R<(Vec<Trade>, Order)> {
+    ) -> Result<(Vec<Trade>, Order), (Fail, Order)> {
         let saved = self.state.clone();
         self.last.clear();
+        self.new_nonce = None;
         let mut order = order;
         match self.place(&mut order, protocol, budget) {
             Ok(trades) => {
@@ -572,7 +593,7 @@ impl Book {
             }
             Err(e) => {
                 self.state = saved;
-                Err(e)
+                Err((e, order))
             }
         }
     }
@@ -680,16 +701,23 @@ impl Book {
 
     fn check_nonce(&mut self, order: &Order) -> R<()> {
         if order.nonce > 0 {
-            let last = self.state.owner_nonces.get(&order.owner).copied().unwrap_or(0);
+            let last = self.last_nonce;
             if order.nonce <= last {
                 return refused(format!(
                     "Nonce replay: got {}, expected > {}",
                     order.nonce, last
                 ));
             }
-            self.state.owner_nonces.insert(order.owner.clone(), order.nonce);
+            self.new_nonce = Some(order.nonce);
         }
         Ok(())
+    }
+
+    /// A level changed (an order added, filled, cancelled, reduced, re-queued, or the level
+    /// gone): its digest is redone at the next commitment (``_touch``).
+    fn touch(&mut self, side: Side, price: &Dec) {
+        let tag = if side == Side::Buy { b'b' } else { b'a' };
+        self.state.dirty.insert((tag, PKey::of(price)));
     }
 
     fn check_rate_limit(&mut self, owner: &str) -> R<()> {
@@ -820,12 +848,14 @@ impl Book {
             None => false,
         };
         if empty {
+            self.touch(side, price);
             self.side_mut(side).remove(&key);
         }
         Ok(())
     }
 
     fn remove_from_level(&mut self, side: Side, price: &Dec, id: &str) {
+        self.touch(side, price);
         let key = PKey::of(price);
         if let Some(level) = self.side_mut(side).get_mut(&key) {
             if let Some(i) = level.orders.iter().position(|o| &**o == id) {
@@ -951,6 +981,9 @@ impl Book {
                     buyer,
                     seller,
                     sequence: seq,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0.0, |d| d.as_secs_f64()),
                 };
                 self.state.recent.push_back(trade.clone());
                 while self.state.recent.len() > MAX_RECENT_TRADES {
@@ -1022,6 +1055,7 @@ impl Book {
             order.kind = Kind::Market;
             order.status = Status::Triggered;
             self.match_market(&mut order, &mut None)?;
+            self.last.insert(order.id.clone(), order);
         }
         Ok(())
     }
@@ -1244,8 +1278,31 @@ impl Book {
         parts
     }
 
-    /// ``state_digest()``: the header, the levels' LtHash, the owners' nonces' commitment.
-    pub fn state_digest(&self) -> R<Vec<u8>> {
+    /// The owners' nonces' commitment (``CommittedDict.full_commitment`` of ``book.nonces``).
+    fn nonces_commitment(nonces: &[(String, i64)]) -> R<Vec<u8>> {
+        let mut digests = Vec::new();
+        for (owner, nonce) in nonces {
+            let mut raw = Vec::new();
+            raw.push(b'[');
+            crate::canon::write_str(&mut raw, owner);
+            raw.push(b',');
+            crate::canon::write_str(&mut raw, &nonce.to_string());
+            raw.push(b']');
+            digests.push(blake2b_personal(&raw, b"qrdx-exch-v1"));
+        }
+        crate::lthash::accumulate(b"qrdx/exchange/book.nonces", digests.iter().map(|d| d.as_slice()))
+            .ok_or(Fail::Native)
+    }
+
+    fn compose(&self, levels: &[u8], nonces: &[u8]) -> Vec<u8> {
+        let mut all = self.header().join("|").into_bytes();
+        all.extend_from_slice(levels);
+        all.extend_from_slice(nonces);
+        blake2b(&all, 32)
+    }
+
+    /// ``state_digest()`` from scratch, given the owners' nonces.
+    pub fn state_digest(&self, nonces: &[(String, i64)]) -> R<Vec<u8>> {
         let mut level_digests = Vec::new();
         for (tag, levels) in [('b', &self.state.bids), ('a', &self.state.asks)] {
             for level in levels.values() {
@@ -1257,25 +1314,96 @@ impl Book {
             level_digests.iter().map(|d| d.as_slice()),
         )
         .ok_or(Fail::Native)?;
-        let mut nonce_digests = Vec::new();
-        for (owner, nonce) in self.state.owner_nonces.iter() {
-            let mut raw = Vec::new();
-            raw.push(b'[');
-            crate::canon::write_str(&mut raw, owner);
-            raw.push(b',');
-            crate::canon::write_str(&mut raw, &nonce.to_string());
-            raw.push(b']');
-            nonce_digests.push(blake2b_personal(&raw, b"qrdx-exch-v1"));
+        Ok(self.compose(&levels, &Self::nonces_commitment(nonces)?))
+    }
+
+    fn level_key(tag: u8, price: &Dec) -> [u8; 32] {
+        let mut identity = vec![0x21u8, tag];
+        identity.extend_from_slice(price.canonical_text().as_bytes());
+        crate::smt::key_of(&identity)
+    }
+
+    /// ``cached_digest``'s levels part, brought up to date: the levels' LtHash, redoing only
+    /// the levels touched since the last call, and their proof tree from the same changes
+    /// (``trees``: the network keeps proof trees; rebuilt whole when the digests were).
+    pub fn commitment(&mut self, trees: bool) -> R<Vec<u8>> {
+        let full = self.state.level_digests.is_none();
+        let mut digests = self.state.level_digests.take().unwrap_or_default();
+        let dirty: Vec<(u8, PKey)> = if full {
+            let mut all: Vec<(u8, PKey)> = Vec::new();
+            all.extend(self.state.bids.keys().map(|k| (b'b', k.clone())));
+            all.extend(self.state.asks.keys().map(|k| (b'a', k.clone())));
+            all
+        } else {
+            self.state.dirty.iter().cloned().collect()
+        };
+        let acc = if full {
+            vec![0u8; crate::lthash::SIZE]
+        } else {
+            self.state.level_acc.as_ref().clone()
+        };
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        let mut tree_changes: Vec<crate::mtree::Change> = Vec::new();
+        for (tag, key) in dirty {
+            let old = digests.remove(&(tag, key.clone()));
+            let side = if tag == b'b' { &self.state.bids } else { &self.state.asks };
+            let payload = side
+                .get(&key)
+                .map(|level| self.level_payload(tag as char, level));
+            let new = payload.as_ref().map(|p| {
+                let d = blake2b(p, 32);
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&d);
+                out
+            });
+            if let Some(d) = new {
+                digests.insert((tag, key.clone()), d);
+            }
+            if old != new {
+                if let Some(d) = old {
+                    removed.push(d.to_vec());
+                }
+                if let Some(d) = new {
+                    added.push(d.to_vec());
+                }
+                if trees {
+                    tree_changes.push((Self::level_key(tag, &key.0).to_vec(), payload));
+                }
+            }
         }
-        let nonces = crate::lthash::accumulate(
-            b"qrdx/exchange/book.nonces",
-            nonce_digests.iter().map(|d| d.as_slice()),
-        )
-        .ok_or(Fail::Native)?;
-        let mut all = self.header().join("|").into_bytes();
-        all.extend_from_slice(&levels);
-        all.extend_from_slice(&nonces);
-        Ok(blake2b(&all, 32))
+        let acc = crate::lthash::mix(&acc, b"qrdx/exchange/book.level", &removed, &added)
+            .ok_or(Fail::Native)?;
+        self.state.level_acc = Arc::new(acc.clone());
+        self.state.level_digests = Some(digests);
+        self.state.dirty = im::OrdSet::new();
+        if !trees {
+            self.state.level_tree = None;
+            self.state.tree_on = false;
+        } else if full || !self.state.tree_on {
+            let mut all: Vec<crate::mtree::Change> = Vec::new();
+            for (tag, levels) in [(b'b', &self.state.bids), (b'a', &self.state.asks)] {
+                for level in levels.values() {
+                    all.push((
+                        Self::level_key(tag, &level.price).to_vec(),
+                        Some(self.level_payload(tag as char, level)),
+                    ));
+                }
+            }
+            all.sort_by(|a, b| a.0.cmp(&b.0));
+            self.state.level_tree = crate::mtree::update(&None, &all, 0);
+            self.state.tree_on = true;
+        } else if !tree_changes.is_empty() {
+            tree_changes.sort_by(|a, b| a.0.cmp(&b.0));
+            self.state.level_tree = crate::mtree::update(&self.state.level_tree, &tree_changes, 0);
+        }
+        Ok(acc)
+    }
+
+    /// ``cached_digest()``: the commitment, composed with the nonces' accumulator.
+    pub fn cached_digest(&mut self, trees: bool, nonces_acc: &[u8]) -> R<Vec<u8>> {
+        let levels = self.commitment(trees)?;
+        Ok(self.compose(&levels, nonces_acc))
     }
 }
 
@@ -1371,6 +1499,7 @@ fn trade_dict<'py>(py: Python<'py>, t: &Trade) -> PyResult<Bound<'py, PyDict>> {
     d.set_item("buyer", &*t.buyer)?;
     d.set_item("seller", &*t.seller)?;
     d.set_item("sequence", t.sequence)?;
+    d.set_item("timestamp", t.timestamp)?;
     Ok(d)
 }
 
@@ -1381,12 +1510,46 @@ fn fail(e: Fail) -> PyErr {
     }
 }
 
-/// The native book, as Python holds it (qrdx/exchange/orderbook.py's interface, in plain data:
-/// orders and trades as dicts, decimals as Python's ``str`` of them).
+/// The native book, as Python holds it (``qrdx/exchange/native_book.py`` puts the Python
+/// book's interface over it): orders and trades as dicts, decimals as Python's ``str`` of them.
+/// Every call that changes orders reports each order it changed, as it ended, so the ``Order``
+/// objects Python handed out stay what the book holds.
 #[pyclass(module = "qrdx_native._native")]
 pub struct NativeBook {
     book: Book,
 }
+
+fn changed_list<'py>(py: Python<'py>, book: &mut Book) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty_bound(py);
+    for (_, o) in book.last.drain() {
+        out.append(order_dict(py, &o)?)?;
+    }
+    Ok(out)
+}
+
+impl NativeBook {
+    /// Run ``f``; on a failure the book is as it was (its savepoint restored).
+    fn atomic<T>(&mut self, f: impl FnOnce(&mut Book) -> R<T>) -> PyResult<T> {
+        let saved = self.book.state.clone();
+        self.book.last.clear();
+        match f(&mut self.book) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.book.state = saved;
+                self.book.last.clear();
+                Err(fail(e))
+            }
+        }
+    }
+}
+
+type Placed<'py> = (
+    Bound<'py, PyList>,
+    Bound<'py, PyDict>,
+    Option<(i64, bool)>,
+    Bound<'py, PyList>,
+    Option<i64>,
+);
 
 #[pymethods]
 impl NativeBook {
@@ -1422,34 +1585,50 @@ impl NativeBook {
         }
     }
 
-    /// ``place_order``: (trades, the order as it ended, (budget visited, exhausted) or None).
-    #[pyo3(signature = (order, protocol=false, budget=None))]
+    /// ``place_order``: (trades, the order as it ended, (makers visited, budget exhausted) or
+    /// None, every order it changed, the owner's new book nonce or None). ``last_nonce``: the
+    /// owner's last book nonce (Python keeps them).
+    #[pyo3(signature = (order, protocol=false, budget=None, last_nonce=0))]
     fn place_order<'py>(
         &mut self,
         py: Python<'py>,
         order: &Bound<'py, PyDict>,
         protocol: bool,
         budget: Option<i64>,
-    ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>, Option<(i64, bool)>)> {
+        last_nonce: i64,
+    ) -> PyResult<Placed<'py>> {
         let order = order_of(order)?;
         let mut budget = budget.map(|makers| Budget {
             left: makers.max(0),
             visited: 0,
             exhausted: false,
         });
-        let (trades, order) = self
-            .book
-            .place_order(order, protocol, &mut budget)
-            .map_err(fail)?;
+        self.book.last_nonce = last_nonce;
+        let result = self.book.place_order(order, protocol, &mut budget);
+        let used = budget.map(|b| (b.visited, b.exhausted));
+        let (trades, order) = match result {
+            Ok(v) => v,
+            Err((Fail::Refused(m), at)) => {
+                // (the makers it visited before failing are paid for, and the order is as it
+                // stood: both carried on the error)
+                let e = PyValueError::new_err(m);
+                e.value_bound(py).setattr("makers_visited", used.map_or(0, |u| u.0))?;
+                e.value_bound(py).setattr("order_state", order_dict(py, &at)?)?;
+                self.book.last.clear();
+                return Err(e);
+            }
+            Err((e, _)) => {
+                self.book.last.clear();
+                return Err(fail(e));
+            }
+        };
         let list = PyList::empty_bound(py);
         for t in &trades {
             list.append(trade_dict(py, t)?)?;
         }
-        Ok((
-            list,
-            order_dict(py, &order)?,
-            budget.map(|b| (b.visited, b.exhausted)),
-        ))
+        let ended = order_dict(py, &order)?;
+        let changed = changed_list(py, &mut self.book)?;
+        Ok((list, ended, used, changed, self.book.new_nonce))
     }
 
     #[pyo3(signature = (order_id, caller=""))]
@@ -1459,15 +1638,9 @@ impl NativeBook {
         order_id: &str,
         caller: &str,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let saved = self.book.state.clone();
-        match self.book.cancel_order(order_id, caller) {
-            Ok(Some(o)) => Ok(Some(order_dict(py, &o)?)),
-            Ok(None) => Ok(None),
-            Err(e) => {
-                self.book.state = saved;
-                Err(fail(e))
-            }
-        }
+        let o = self.atomic(|b| b.cancel_order(order_id, caller))?;
+        self.book.last.clear();
+        o.map(|o| order_dict(py, &o)).transpose()
     }
 
     fn reduce_order<'py>(
@@ -1477,10 +1650,9 @@ impl NativeBook {
         amount: &str,
         caller: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let o = self
-            .book
-            .reduce_order(order_id, dec_of(amount)?, caller)
-            .map_err(fail)?;
+        let amount = dec_of(amount)?;
+        let o = self.atomic(|b| b.reduce_order(order_id, amount, caller))?;
+        self.book.last.clear();
         order_dict(py, &o)
     }
 
@@ -1490,10 +1662,9 @@ impl NativeBook {
         order_id: &str,
         amount: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let o = self
-            .book
-            .fill_resting(order_id, dec_of(amount)?)
-            .map_err(fail)?;
+        let amount = dec_of(amount)?;
+        let o = self.atomic(|b| b.fill_resting(order_id, amount))?;
+        self.book.last.clear();
         order_dict(py, &o)
     }
 
@@ -1502,21 +1673,39 @@ impl NativeBook {
         Ok(())
     }
 
-    #[pyo3(signature = (now=None))]
-    fn new_block(&mut self, now: Option<f64>) -> PyResult<()> {
-        let saved = self.book.state.clone();
-        self.book.new_block(now).map_err(|e| {
-            self.book.state = saved;
-            fail(e)
-        })
+    /// A fee settlement charged on a trade (``maker``: the maker's, else the taker's), into the
+    /// display history — the newest trade with that id. Whether there was one.
+    fn set_trade_fee(&mut self, id: &str, maker: bool, fee: &str) -> PyResult<bool> {
+        let fee = dec_of(fee)?;
+        let recent = &mut self.book.state.recent;
+        let Some(i) = (0..recent.len()).rev().find(|&i| recent[i].id == id) else {
+            return Ok(false);
+        };
+        let mut t = recent[i].clone();
+        if maker {
+            t.maker_fee = fee;
+        } else {
+            t.taker_fee = fee;
+        }
+        recent.set(i, t);
+        Ok(true)
     }
 
-    fn enter_block(&mut self, height: i64, now: f64) -> PyResult<()> {
-        if self.book.state.block_height != Some(height) {
-            self.new_block(Some(now))?;
-            self.book.state.block_height = Some(height);
+    /// ``new_block``: every order it changed (expired orders, cancelled).
+    #[pyo3(signature = (now=None))]
+    fn new_block<'py>(&mut self, py: Python<'py>, now: Option<f64>) -> PyResult<Bound<'py, PyList>> {
+        self.atomic(|b| b.new_block(now))?;
+        changed_list(py, &mut self.book)
+    }
+
+    /// ``enter_block``: every order it changed.
+    fn enter_block<'py>(&mut self, py: Python<'py>, height: i64, now: f64) -> PyResult<Bound<'py, PyList>> {
+        if self.book.state.block_height == Some(height) {
+            return Ok(PyList::empty_bound(py));
         }
-        Ok(())
+        let changed = self.new_block(py, Some(now))?;
+        self.book.state.block_height = Some(height);
+        Ok(changed)
     }
 
     fn pause(&mut self) {
@@ -1532,6 +1721,21 @@ impl NativeBook {
         self.book.state.paused
     }
 
+    #[getter]
+    fn has_expiring(&self) -> bool {
+        self.book.state.has_expiring
+    }
+
+    #[getter]
+    fn now(&self) -> Option<f64> {
+        self.book.state.now
+    }
+
+    #[getter]
+    fn block_height(&self) -> Option<i64> {
+        self.book.state.block_height
+    }
+
     fn best(&self, bids: bool) -> PyResult<Option<String>> {
         Ok(self.book.best(bids).map_err(fail)?.map(|p| p.to_python_string()))
     }
@@ -1544,23 +1748,56 @@ impl NativeBook {
             .collect()
     }
 
-    /// The resting orders at a level, in time priority.
+    /// (price, what it shows) of each level that shows something, best first (``iter_levels``).
+    fn iter_levels(&self, bids: bool) -> PyResult<Vec<(String, String)>> {
+        let side = if bids { Side::Buy } else { Side::Sell };
+        let levels: Vec<&Level> = if bids {
+            self.book.side(side).values().rev().collect()
+        } else {
+            self.book.side(side).values().collect()
+        };
+        let mut out = Vec::new();
+        for level in levels {
+            let shown = self.book.level_visible(level).map_err(fail)?;
+            if positive(&shown) {
+                out.push((level.price.to_python_string(), shown.to_python_string()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The resting orders at a level, in time priority (None: no such level).
     fn level_orders<'py>(
         &self,
         py: Python<'py>,
         bids: bool,
         price: &str,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let out = PyList::empty_bound(py);
+    ) -> PyResult<Option<Bound<'py, PyList>>> {
         let side = if bids { Side::Buy } else { Side::Sell };
-        if let Some(level) = self.book.side(side).get(&PKey::of(&dec_of(price)?)) {
-            for id in level.orders.iter() {
-                if let Some(o) = self.book.state.orders.get(id) {
-                    out.append(order_dict(py, o)?)?;
-                }
+        let Some(level) = self.book.side(side).get(&PKey::of(&dec_of(price)?)) else {
+            return Ok(None);
+        };
+        let out = PyList::empty_bound(py);
+        for id in level.orders.iter() {
+            if let Some(o) = self.book.state.orders.get(id) {
+                out.append(order_dict(py, o)?)?;
             }
         }
-        Ok(out)
+        Ok(Some(out))
+    }
+
+    /// The price a level is keyed by (its first order's spelling), or None.
+    fn level_price(&self, bids: bool, price: &str) -> PyResult<Option<String>> {
+        let side = if bids { Side::Buy } else { Side::Sell };
+        Ok(self
+            .book
+            .side(side)
+            .get(&PKey::of(&dec_of(price)?))
+            .map(|l| l.price.to_python_string()))
+    }
+
+    fn level_count(&self, bids: bool) -> usize {
+        self.book.side(if bids { Side::Buy } else { Side::Sell }).len()
     }
 
     fn get_order<'py>(&self, py: Python<'py>, order_id: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
@@ -1569,6 +1806,59 @@ impl NativeBook {
             Some(o) => Ok(Some(order_dict(py, o)?)),
             None => Ok(None),
         }
+    }
+
+    fn resting_order<'py>(&self, py: Python<'py>, order_id: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
+        match self.book.state.orders.get(order_id) {
+            Some(o) => Ok(Some(order_dict(py, o)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn stop_order<'py>(&self, py: Python<'py>, order_id: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
+        match self.book.state.stops.get(order_id) {
+            Some(o) => Ok(Some(order_dict(py, o)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The resting orders' ids, in the order they were indexed.
+    fn order_ids(&self) -> Vec<String> {
+        let mut ids: Vec<(u64, &Id)> = self
+            .book
+            .state
+            .order_seq
+            .iter()
+            .map(|(id, seq)| (*seq, id))
+            .collect();
+        ids.sort();
+        ids.into_iter().map(|(_, id)| id.to_string()).collect()
+    }
+
+    fn order_count(&self) -> usize {
+        self.book.state.orders.len()
+    }
+
+    fn has_order(&self, order_id: &str) -> bool {
+        self.book.state.orders.contains_key(order_id)
+    }
+
+    /// The parked stop orders' ids, in the order they were placed.
+    fn stop_ids(&self) -> Vec<String> {
+        self.book.state.stop_ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    fn owner_count(&self, owner: &str) -> i64 {
+        self.book.state.owner_order_count.get(owner).copied().unwrap_or(0)
+    }
+
+    fn owner_counts(&self) -> Vec<(String, i64)> {
+        self.book
+            .state
+            .owner_order_count
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect()
     }
 
     /// (trade sequence, total trades, total volume, last price or None)
@@ -1582,8 +1872,226 @@ impl NativeBook {
         )
     }
 
-    fn state_digest<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        Ok(PyBytes::new_bound(py, &self.book.state_digest().map_err(fail)?))
+    /// The display history's last ``count`` trades (never consensus).
+    fn recent_trades<'py>(&self, py: Python<'py>, count: usize) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty_bound(py);
+        let n = self.book.state.recent.len();
+        for t in self.book.state.recent.iter().skip(n.saturating_sub(count)) {
+            out.append(trade_dict(py, t)?)?;
+        }
+        Ok(out)
+    }
+
+    fn header(&self) -> Vec<String> {
+        self.book.header()
+    }
+
+    /// The levels' LtHash, brought up to date (``trees``: their proof tree too).
+    fn commitment<'py>(&mut self, py: Python<'py>, trees: bool) -> PyResult<Bound<'py, PyBytes>> {
+        Ok(PyBytes::new_bound(py, &self.book.commitment(trees).map_err(fail)?))
+    }
+
+    /// The levels' proof tree as of the last ``commitment`` (None: empty, or trees off).
+    #[getter]
+    fn level_tree(&self) -> Option<crate::mtree::MNode> {
+        self.book.state.level_tree.clone().map(crate::mtree::MNode)
+    }
+
+    /// Every level's (proof-tree key, payload): what ``verify_digest`` rebuilds the tree from.
+    fn level_entries<'py>(&self, py: Python<'py>) -> Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+        let mut out = Vec::new();
+        for (tag, side) in [(b'b', &self.book.state.bids), (b'a', &self.book.state.asks)] {
+            for level in side.values() {
+                out.push((
+                    PyBytes::new_bound(py, &Book::level_key(tag, &level.price)),
+                    PyBytes::new_bound(py, &self.book.level_payload(tag as char, level)),
+                ));
+            }
+        }
+        out
+    }
+
+    /// ``cached_digest()``, given the nonces' accumulator.
+    fn cached_digest<'py>(
+        &mut self,
+        py: Python<'py>,
+        trees: bool,
+        nonces_acc: &[u8],
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        Ok(PyBytes::new_bound(
+            py,
+            &self.book.cached_digest(trees, nonces_acc).map_err(fail)?,
+        ))
+    }
+
+    /// ``state_digest()`` from scratch, given the owners' nonces: [(owner, nonce)].
+    fn state_digest<'py>(
+        &self,
+        py: Python<'py>,
+        nonces: Vec<(String, i64)>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        Ok(PyBytes::new_bound(py, &self.book.state_digest(&nonces).map_err(fail)?))
+    }
+
+    /// Everything the book holds, as data (a pickle of it): the levels' orders in time
+    /// priority, the order index's order, the stop orders, the counts, the book's own fields,
+    /// the display history.
+    fn export<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let s = &self.book.state;
+        let d = PyDict::new_bound(py);
+        let levels = PyList::empty_bound(py);
+        for (tag, side) in [("b", &s.bids), ("a", &s.asks)] {
+            for level in side.values() {
+                let orders = PyList::empty_bound(py);
+                for id in level.orders.iter() {
+                    if let Some(o) = s.orders.get(id) {
+                        orders.append(order_dict(py, o)?)?;
+                    }
+                }
+                levels.append((tag, level.price.to_python_string(), orders))?;
+            }
+        }
+        d.set_item("levels", levels)?;
+        d.set_item("order_ids", self.order_ids())?;
+        let stops = PyList::empty_bound(py);
+        for id in s.stop_ids.iter() {
+            if let Some(o) = s.stops.get(id) {
+                stops.append(order_dict(py, o)?)?;
+            }
+        }
+        d.set_item("stops", stops)?;
+        let counts = |m: &IMap<Id, i64>| -> Vec<(String, i64)> {
+            m.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        };
+        d.set_item("owner_order_count", counts(&s.owner_order_count))?;
+        d.set_item("owner_stop_count", counts(&s.owner_stop_count))?;
+        d.set_item("block_order_count", counts(&s.block_order_count))?;
+        d.set_item("trade_sequence", s.trade_sequence)?;
+        d.set_item("last_price", s.last_price.as_ref().map(|p| p.to_python_string()))?;
+        d.set_item("total_volume", s.total_volume.to_python_string())?;
+        d.set_item("total_trades", s.total_trades)?;
+        d.set_item("paused", s.paused)?;
+        d.set_item("now", s.now)?;
+        d.set_item("has_expiring", s.has_expiring)?;
+        d.set_item("block_height", s.block_height)?;
+        let recent = PyList::empty_bound(py);
+        for t in s.recent.iter() {
+            recent.append(trade_dict(py, t)?)?;
+        }
+        d.set_item("recent", recent)?;
+        Ok(d)
+    }
+
+    /// A book from ``export``'s data (its commitment is recomputed in full).
+    #[staticmethod]
+    #[allow(clippy::too_many_arguments)]
+    fn from_export(
+        pool_id: String,
+        max_depth: usize,
+        maker_fee_rate: &str,
+        taker_fee_rate: &str,
+        self_trade_action: &str,
+        min_order_size: &str,
+        max_orders_per_address: i64,
+        data: &Bound<'_, PyDict>,
+    ) -> PyResult<Self> {
+        let mut nb = NativeBook::new(
+            pool_id,
+            max_depth,
+            maker_fee_rate,
+            taker_fee_rate,
+            self_trade_action,
+            min_order_size,
+            max_orders_per_address,
+        )?;
+        let need = |k: &str| -> PyResult<Bound<'_, PyAny>> {
+            data.get_item(k)?
+                .ok_or_else(|| PyValueError::new_err(format!("a book's data needs {k}")))
+        };
+        let s = &mut nb.book.state;
+        let mut by_id: std::collections::HashMap<String, Order> = std::collections::HashMap::new();
+        for item in need("levels")?.iter()? {
+            let (tag, price, orders): (String, String, Vec<Bound<'_, PyDict>>) = item?.extract()?;
+            let price = dec_of(&price)?;
+            let mut ids = Vector::new();
+            for od in orders {
+                let o = order_of(&od)?;
+                ids.push_back(o.id.clone());
+                by_id.insert(o.id.to_string(), o);
+            }
+            let level = Level {
+                price: price.clone(),
+                orders: ids,
+            };
+            let side = if tag == "b" { &mut s.bids } else { &mut s.asks };
+            side.insert(PKey::of(&price), level);
+        }
+        for id in need("order_ids")?.extract::<Vec<String>>()? {
+            let o = by_id
+                .remove(&id)
+                .ok_or_else(|| PyValueError::new_err(format!("an indexed order {id} rests nowhere")))?;
+            s.order_seq.insert(o.id.clone(), s.next_seq);
+            s.next_seq += 1;
+            s.orders.insert(o.id.clone(), Arc::new(o));
+        }
+        if let Some(id) = by_id.keys().min() {
+            return Err(PyValueError::new_err(format!("a resting order {id} is not indexed")));
+        }
+        for od in need("stops")?.iter()? {
+            let o = order_of(od?.downcast::<PyDict>()?)?;
+            s.stop_ids.push_back(o.id.clone());
+            s.stops.insert(o.id.clone(), Arc::new(o));
+        }
+        let counts = |k: &str| -> PyResult<IMap<Id, i64>> {
+            Ok(need(k)?
+                .extract::<Vec<(String, i64)>>()?
+                .into_iter()
+                .map(|(o, n)| (Id::from(o), n))
+                .collect())
+        };
+        s.owner_order_count = counts("owner_order_count")?;
+        s.owner_stop_count = counts("owner_stop_count")?;
+        s.block_order_count = counts("block_order_count")?;
+        s.trade_sequence = need("trade_sequence")?.extract()?;
+        s.last_price = match need("last_price")?.extract::<Option<String>>()? {
+            Some(p) => Some(dec_of(&p)?),
+            None => None,
+        };
+        s.total_volume = dec_of(&need("total_volume")?.extract::<String>()?)?;
+        s.total_trades = need("total_trades")?.extract()?;
+        s.paused = need("paused")?.extract()?;
+        s.now = need("now")?.extract()?;
+        s.has_expiring = need("has_expiring")?.extract()?;
+        s.block_height = need("block_height")?.extract()?;
+        for td in need("recent")?.iter()? {
+            let td = td?;
+            let td = td.downcast::<PyDict>()?;
+            let text = |k: &str| -> PyResult<String> {
+                td.get_item(k)?
+                    .ok_or_else(|| PyValueError::new_err(format!("a trade needs {k}")))?
+                    .extract()
+            };
+            s.recent.push_back(Trade {
+                id: text("id")?,
+                maker_order_id: Id::from(text("maker_order_id")?),
+                taker_order_id: Id::from(text("taker_order_id")?),
+                price: dec_of(&text("price")?)?,
+                amount: dec_of(&text("amount")?)?,
+                maker_fee: dec_of(&text("maker_fee")?)?,
+                taker_fee: dec_of(&text("taker_fee")?)?,
+                buyer: Id::from(text("buyer")?),
+                seller: Id::from(text("seller")?),
+                sequence: td
+                    .get_item("sequence")?
+                    .ok_or_else(|| PyValueError::new_err("a trade needs sequence"))?
+                    .extract()?,
+                timestamp: match td.get_item("timestamp")? {
+                    Some(v) => v.extract()?,
+                    None => 0.0,
+                },
+            });
+        }
+        Ok(nb)
     }
 }
 

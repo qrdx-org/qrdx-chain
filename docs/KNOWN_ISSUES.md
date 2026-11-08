@@ -56,6 +56,24 @@ the node's database is written only through its own connection; a snapshot is re
 the node starts. A tool writing `blocks` into a running node's database through another
 connection would not be seen until the next write or rollback through the node's own.
 
+## FIXED — A published snapshot of a network with proof trees could not be loaded
+
+**Severity: medium (availability of checkpoint sync).** Found 2026-11-08 while moving the spot
+books into Rust (docs/EXCHANGE_ENGINE.md, E3a).
+
+Where `provable_state` is scheduled, each book keeps a proof tree of its price levels
+(`_level_tree`). A snapshot pickles the books whole, tree included, and the tree pickles as a
+call to `qrdx.crypto.smt` (`m_from_entries`), which the snapshot loader (`safe_loads`) refuses:
+it is not a module a snapshot may name. So a published snapshot of any such network with a
+resting order could not be loaded, and a node could not join it by checkpoint sync.
+
+**Fixed** (`OrderBook.__getstate__`): a pickle leaves the tree out (it is derived from the
+levels) and the next digest rebuilds it; a deep copy still shares it. A native book pickles as
+its data (`export`, no tree), which a node without native books loads as the same book in
+Python. `tests/test_orderbook_levels.py` loads a pickled book with a tree and checks its digest
+and root; `tests/test_native_book.py` pickles native books with trees on and off and loads them
+both ways.
+
 ## FIXED — One price written two ways could split the network
 
 **Severity: high (consensus).** Found 2026-11-05 while porting the order book to Rust

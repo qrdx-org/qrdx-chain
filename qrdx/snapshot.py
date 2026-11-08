@@ -96,6 +96,7 @@ SAFE_MODULES: frozenset = frozenset(
         "qrdx.exchange.clearinghouse",
         "qrdx.exchange.commitment",
         "qrdx.exchange.governance",
+        "qrdx.exchange.native_book",
         "qrdx.exchange.handlers.common",
         "qrdx.exchange.nfts",
         "qrdx.exchange.oracle",

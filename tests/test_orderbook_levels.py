@@ -146,3 +146,23 @@ def test_one_price_in_any_spelling_is_one_level_to_the_digest():
     assert len(book._asks) == 1
     assert book.cached_digest() == book.state_digest()
     book.verify_digest()                                       # (the level tree too)
+
+
+def test_a_book_with_a_proof_tree_loads_from_a_snapshot(monkeypatch):
+    """A book pickled its levels' proof tree, whose nodes the snapshot loader refuses: a
+    published snapshot of a network with proof trees could not be loaded. The tree is derived:
+    a pickle leaves it out and the next digest rebuilds it; a deep copy still shares it."""
+    from qrdx.crypto import smt
+    from qrdx.exchange import commitment
+
+    monkeypatch.setattr(commitment, "_TREES", True)
+    book = _book()
+    for i, px in enumerate(["1", "1.1", "0.9"]):
+        book.place_order(Order(id=f"s{i}", owner="0xPQa", side=OrderSide.SELL,
+                               order_type=OrderType.LIMIT, price=D(px), amount=D(3),
+                               timestamp=1.0), protocol=True)
+    digest, root = book.cached_digest(), smt.m_root(book.level_tree)
+    loaded = safe_loads(pickle.dumps(book))
+    assert loaded.cached_digest() == digest and smt.m_root(loaded.level_tree) == root
+    twin = copy.deepcopy(book)
+    assert twin.__dict__["_level_tree"] is book.__dict__["_level_tree"]

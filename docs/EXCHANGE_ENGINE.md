@@ -26,8 +26,9 @@ the plan for moving the exchange into Rust, and what is done.
 |---|---|---|---|
 | E0 | Reference speed-ups | Sorted book sides (no sort per read), read-only token lookups, copy-free undo where nothing changes | done: orders 260–290 → 185–210 µs |
 | E1 | Exact decimal (`src/dec.rs`) | Python's `Decimal` — add, subtract, multiply, divide, quantize, compare, `str` — under any context, every rounding | done: held to `decimal` on 116,000 random cases |
-| E2 | Order book | Price levels, orders, matching (limit, market, iceberg, hidden, stop, expiry, self-trade), fees, trades, the book's digest and level tree, undo and snapshots | core done, not wired: held to Python on 16,800 random operations; found a consensus bug (one price in two spellings) |
-| E3 | Spot settlement | Escrow, token and QRDX moves, fees, the journal's fills: a plain limit order or cancel run natively end to end | |
+| E2 | Order book | Price levels, orders, matching (limit, market, iceberg, hidden, stop, expiry, self-trade), fees, trades, the book's digest and level tree, undo and snapshots | done: held to Python on 16,800 random operations; found a consensus bug (one price in two spellings) |
+| E3a | Spot books held natively | Every spot pair's book is a native one behind the Python book's interface: the router, handlers, triggers, views, undo, snapshots and proofs run unchanged | done (2026-11-08): the exchange with native books is the exchange with Python's, block for block; found a snapshot bug (proof trees) |
+| E3b | Spot settlement | Escrow, token and QRDX moves, fees, the journal's fills: a run of plain limit orders and cancels executed natively end to end | next |
 | E4 | Ledger | Token balances and nonces held natively, the database written behind the block | |
 | E5 | Router and pools | Unified liquidity (`plan_fill`): the AMM's tick math and the book together | |
 | E6 | Perps | The clearinghouse: margin, funding, liquidation | |
@@ -65,7 +66,8 @@ by one basis point is caught). Its state is persistent, so a copy and a failed p
 rollback are pointer copies. Porting it found a consensus bug in the Python book, now fixed
 (docs/KNOWN_ISSUES.md: one price written two ways).
 
-It is not wired into the node, and on its own it would not make the exchange faster:
+It was not wired into the node then (E3a wired it in), and on its own it would not make the
+exchange faster:
 
 * matching is about 11 µs of a spot order's ~190 in Python; the rest is the operation around
   it (settlement, fees, undo bookkeeping, the journal), which is E3;
@@ -76,8 +78,55 @@ It is not wired into the node, and on its own it would not make the exchange fas
   operation takes costs reference counts, not copies;
 * its full digest is twice as fast as Python's (11 ms to 23 at 10,600 resting orders).
 
-The book becomes the node's when E3 runs a plain limit order or cancel natively end to end, with
-the book behind the same interface the router and handlers use.
+## E3a: the spot books held natively (2026-11-08)
+
+Every spot pair's book is now a native one (`qrdx/exchange/native_book.py`, `NativeSpotBook`),
+wherever the module is present; `QRDX_NATIVE_BOOK=0` (or `QRDX_NATIVE=0`) keeps Python's. It
+puts the Python book's interface over `NativeBook`, so nothing that reaches a book changed:
+
+* **Orders handed out** (`get_order`, `_orders`, a level's queue, `cancel_order`…) are `Order`
+  objects kept current: each native call reports the orders it changed and the objects handed
+  out are updated in place. A placed order is the object its caller passed.
+* **Trades handed out** write the fees settlement charges on them back into the book's display
+  history, as a Python book's trade objects are its history's own (the history is never
+  committed, but the two kinds of book show the same).
+* **Views** (`_orders`, `_stop_orders`, `_bids`, `_asks`, `_owner_order_count`) are read-only
+  mappings over the native state.
+* **Undo**: an operation's first change records the native state (a pointer copy) and a failed
+  scope puts it back. A failed native call changes nothing and records nothing.
+* **Nonces** stay a Python committed dict, so they stay provable as before; the digest composes
+  the native header and levels with their commitment.
+* **Snapshots and checkpoints**: a copy is a pointer copy; a pickle is the book's data
+  (`export`), which a node without native books loads as the same Python book, and a Python
+  book restored on a node with them becomes native (`as_spot_book`). A perps book stays Python:
+  it runs a Python callback inside matching (`maker_guard`), which a native book refuses.
+
+Tests: `tests/test_native_book.py` drives both kinds of book through the Python interface (four
+self-trade rules, 10,000 random operations, failed scopes, copies, pickles loaded both ways, the
+per-block limit across a conversion) and compares every result, view, digest, level tree and
+handed-out order. `tests/test_native_spot_equivalence.py` runs the same spot traffic through
+`process_transaction` with each kind (orders of every type and time in force, cancels,
+modifications, swaps across book and pool, each block's uncross and triggers) and compares every
+result, tick event, root, balance change and book history, block by block, including across a checkpoint
+written with one kind and loaded with the other. Changing the self-trade rule or the per-owner
+cap of the native books only is caught. The full suite passes in both modes.
+
+Porting found a pre-existing bug: a published snapshot of a network with proof trees could not be
+loaded (docs/KNOWN_ISSUES.md).
+
+It is not faster yet: a spot order costs 241 µs with native books against 203 with Python's
+(`scripts/bench/exchange_block.py --workload orders`). Matching is a small part of an order; the
+rest is the Python around it, which now also converts each order it hands across. That is E3b.
+
+## E3b: plain orders natively, end to end (next)
+
+A block's runs of plain spot orders and cancels, executed by Rust over the native books without
+a Python object per order: the nonce and fee wrapper (as the transfer lane does it), the
+order's checks, escrow, matching, each fill's settlement (token and QRDX moves, fees with each
+owner's rate and referrer computed once in Python, staker and treasury parts), the result and
+the journal. Anything else — a pair whose pool has liquidity in range, a bracket, a builder fee,
+a trigger, a paused token, a modification — goes to Python whole, as an operation, never half
+of one. Held to Python by a manager-level differential test, and measured live.
 
 ## What remains outside the engine
 

@@ -133,10 +133,9 @@ def _op_create_pool(self: ExchangeStateManager, tx: ExchangeTransaction) -> Exch
     pair_key = f"{pool.state.token0}:{pool.state.token1}"
     self._keep_pair_registries(pair_key)
     if pair_key not in self._order_books:
-        book = OrderBook(
-            pool_id=pair_key,
-            self_trade_action=SelfTradeAction.CANCEL_TAKER,
-        )
+        from ..native_book import new_spot_book
+
+        book = new_spot_book(pair_key, SelfTradeAction.CANCEL_TAKER)
         self._order_books[pair_key] = book
         self.router.register_order_book(pair_key, book)
 
@@ -927,7 +926,7 @@ def _op_place_order(self: ExchangeStateManager, tx: ExchangeTransaction) -> Exch
                 order.filled += filled
             book.enter_block(self._current_block_height, self._block_clock())
             trades = book.place_order(order, budget=budget)
-            if book.__dict__.get("_has_expiring"):  # (it now starts every block)
+            if book.has_expiring:  # (it now starts every block)
                 self._note_expiring(pair)
             if self.enforce_orderbook_settlement:
                 self._settle_orderbook(order, trades, base, quote, pair)

@@ -30,7 +30,8 @@ pytestmark = pytest.mark.usefixtures("genesis_btc")  # BTC from the first block 
 # Caches the commitments and books keep beside the state (recomputed from it), and the indexes
 # derived from it (an undo drops them: rebuilt in full on their next use).
 CACHES = {"_digests", "_dirty", "_acc", "_tree", "_tree_on", "_changes", "_index_token",
-          "_expiring_pairs", "_digest", "_digest_version", "_version"} | block_undo.DERIVED
+          "_expiring_pairs", "_digest", "_digest_version", "_version",
+          "_handed"} | block_undo.DERIVED   # (_handed: a native book's orders handed out)
 
 
 def norm(x, depth=0, stack=frozenset()):
@@ -48,6 +49,9 @@ def norm(x, depth=0, stack=frozenset()):
         return ("set", sorted(repr(norm(v, depth + 1, stack)) for v in set.__iter__(x)))
     if isinstance(x, (list, tuple)):
         return (type(x).__name__, [norm(v, depth + 1, stack) for v in x])
+    canonical = getattr(x, "canonical_state", None)   # (a native book: its state as data)
+    if canonical is not None and not isinstance(x, type):
+        return (type(x).__name__, norm(canonical(), depth + 1, stack))
     d = getattr(x, "__dict__", None)
     if d is not None and not isinstance(x, type) and not callable(x):
         return (type(x).__name__,
