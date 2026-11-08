@@ -16,8 +16,9 @@ consecutive plain orders and cancels at a time, and this module is the Python ar
   transaction is judged for the block natively, as a plain transfer is
   (``transfer_lane.judge``: its nonce, and its payer's fees).
 * ``run``: per stretch of a run, what no operation in it can change — each pair's book and
-  where its pools start to fill, whether a fill could reach a trigger or a bracket or count
-  toward fee tiers, which tokens are paused or freeze a sender, who pays each sender's gas.
+  where its pools start to fill, where its waiting triggers fire, whether a fill could reach a
+  bracket, whether its fills count toward fee tiers, which tokens are paused or freeze a
+  sender, who pays each sender's gas, each trader's fee tier inputs.
   The native run stops before the first operation it would not run exactly as Python does;
   Python runs that one (``process_transaction``) and the run continues after it.
 
@@ -29,6 +30,7 @@ and compares everything. ``QRDX_ORDER_LANE=0`` turns it off (``QRDX_NATIVE=0`` a
 
 from __future__ import annotations
 
+import dataclasses
 import time
 import weakref
 from decimal import Decimal, localcontext
@@ -241,13 +243,8 @@ class _Pairs:
         self.rows: List[Tuple[Any, ...]] = []
         self.books: List[Any] = []
         self.names: List[str] = []
-        idx = mgr.trading.spot_index() if len(mgr.trading.spot_triggers) else None
-        self.triggered = (
-            set()
-            if idx is None
-            else {pair for side in ("above", "below") for pair, lst in idx[side].items() if lst}
-        )
-        self.parents = set() if idx is None else set(idx["parents"])
+        self.spot_index = mgr.trading.spot_index() if len(mgr.trading.spot_triggers) else None
+        self.parents = set() if self.spot_index is None else set(self.spot_index["parents"])
 
     def pair_of(self, raw: str) -> Optional[str]:
         if raw not in self.canonical:
@@ -293,6 +290,24 @@ class _Pairs:
                     sell = eff if sell is None or eff > sell else sell
         return (None if buy is None else str(buy)), (None if sell is None else str(sell))
 
+    def _triggers(self, pair: str) -> Tuple[Optional[str], Optional[str]]:
+        """Where the pair's waiting triggers fire: the lowest price a rising one waits for, the
+        highest a falling one waits for. A fill that reaches one marks it (Python's)."""
+        idx = self.spot_index
+        if idx is None:
+            return None, None
+        triggers = self.mgr.trading.spot_triggers
+
+        def waiting(tid: str) -> bool:
+            t = triggers.peek(tid)
+            return t is not None and not t.reached and t.amount > 0
+
+        above = next((p for p, _s, tid in idx["above"].get(pair, ()) if waiting(tid)), None)
+        below = next(
+            (p for p, _s, tid in reversed(idx["below"].get(pair, ())) if waiting(tid)), None
+        )
+        return (None if above is None else str(above)), (None if below is None else str(below))
+
     def _row(self, pair: str) -> Tuple[Any, ...]:
         mgr = self.mgr
         book = mgr._order_books[pair]
@@ -301,7 +316,7 @@ class _Pairs:
         buy_pool, sell_pool = self._pools(base, quote)
         has_stops = len(book._stop_orders) > 0
         places_bail = b[2] or q[2] or has_stops
-        trades_bail = pair in self.triggered or mgr._settles_in_tier_unit(quote)
+        tier = bool(mgr._settles_in_tier_unit(quote))
         handed = list(book._handed.keys())
         return (
             book._native,
@@ -312,25 +327,46 @@ class _Pairs:
             mgr.orderbook_escrow_address(pair),
             buy_pool,
             sell_pool,
-            (places_bail, trades_bail, has_stops),
+            (places_bail, tier, has_stops),
             handed,
+            self._triggers(pair),
         )
 
 
-def _fee_info(mgr: Any) -> Callable[[str], Tuple[str, str, Optional[str], bool]]:
-    from .clearinghouse import REFERRAL_VOLUME_CAP
-
+def _owner_info(mgr: Any) -> Callable[[str], Tuple[Any, ...]]:
+    """What decides an owner's spot fee and what its fills count toward, read once a stretch: its
+    staking discount, its volume by day, its lifetime volume, its referral (referrer, volume)."""
     ch = mgr.clearinghouse
 
-    def info(owner: str) -> Tuple[str, str, Optional[str], bool]:
+    def info(owner: str) -> Tuple[Any, ...]:
         with localcontext(_CTX):
-            taker, maker = ch.fee_rates(owner)
-            ref = ch.referrals.peek(owner)
-        if ref is None:
-            return str(taker), str(maker), None, False
-        return str(taker), str(maker), ref.referrer, ref.volume < REFERRAL_VOLUME_CAP
+            discount = ch.stake_discount(owner)
+        days = [(int(d), str(n)) for d, n in ch.volumes.peek(owner, ())]
+        lifetime = ch.lifetime_volume.peek(owner)
+        ref = ch.referrals.peek(owner)
+        return (
+            str(discount),
+            days,
+            None if lifetime is None else str(lifetime),
+            None if ref is None else (ref.referrer, str(ref.volume)),
+        )
 
     return info
+
+
+def _tiers(mgr: Any) -> Tuple[Any, ...]:
+    """The fee tiers and what volume counts toward them (``Clearinghouse.fee_rates``,
+    ``_record_volume``)."""
+    from .clearinghouse import FEE_TIERS, FEE_VOLUME_DAYS, PROTOCOL, REFERRAL_VOLUME_CAP, VAULT
+
+    return (
+        [(str(f), str(t), str(m)) for f, t, m in FEE_TIERS],
+        FEE_VOLUME_DAYS,
+        mgr.clearinghouse._day(),
+        VAULT,
+        PROTOCOL,
+        str(REFERRAL_VOLUME_CAP),
+    )
 
 
 def _consts(mgr: Any) -> Tuple[Any, ...]:
@@ -458,8 +494,9 @@ def _stretch(mgr, fn, txs, prepared, prepaid, payers, start, results) -> int:  #
             ),
             mgr._nonces,
             mgr.fee_tokens,
-            _fee_info(mgr),
+            _owner_info(mgr),
             _consts(mgr),
+            _tiers(mgr),
             (str(mgr._block_fees), str(mgr._block_staker_fees)),
         )
     except Exception:
@@ -479,10 +516,12 @@ def _stretch(mgr, fn, txs, prepared, prepaid, payers, start, results) -> int:  #
         placed,
         handed,
         detached,
+        volumes,
     ) = out
     for book, s in zip(books, saved, strict=True):
         book._kept(s)  # (the undo scope's record of the book: no-op outside one)
     _write_back(mgr, qrdx, tokens, lanes, book_nonces, fee_tokens, totals, placed, books)
+    _write_volumes(mgr, *volumes)
     for slot, d in handed:
         o = books[slot]._handed.get(d["id"])
         if o is not None:
@@ -522,6 +561,18 @@ def _frozen(mgr: Any, senders: Dict[Tuple[str, str], None]) -> List[Tuple[str, s
         if registry.is_frozen(token, sender):
             out.append((sender, token))
     return out
+
+
+def _write_volumes(mgr: Any, volumes: Any, lifetimes: Any, referrals: Any) -> None:
+    """The clearinghouse's volumes the fills counted toward (``_record_volume``), each dict's
+    keys in the order first written."""
+    ch = mgr.clearinghouse
+    for owner, days in volumes:
+        ch.volumes[owner] = tuple((d, Decimal(n)) for d, n in days)
+    for owner, value in lifetimes:
+        ch.lifetime_volume[owner] = Decimal(value)
+    for owner, value in referrals:
+        ch.referrals[owner] = dataclasses.replace(ch.referrals.peek(owner), volume=Decimal(value))
 
 
 def _write_back(mgr, qrdx, tokens, lanes, book_nonces, fee_tokens, totals, placed, books) -> None:

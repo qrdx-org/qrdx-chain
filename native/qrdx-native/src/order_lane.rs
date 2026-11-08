@@ -8,10 +8,12 @@
 //! rest to the treasury), the resting remainder into the book's escrow; or a cancelled order's
 //! escrow back to its owner — then the gas. Python prepares each operation with its own parsing
 //! and checks, and gathers what no operation of a run can change: where each pair's pools
-//! start to fill (an order that reaches one takes from a pool, which is Python's), whether a
-//! fill could reach a trigger or a bracket, which tokens are paused or freeze a sender. This
-//! runs the operations in order, and stops before the first one it would not run exactly as
-//! Python does — which Python runs, and the run continues after it.
+//! start to fill (an order that reaches one takes from a pool, which is Python's), where its
+//! waiting triggers fire (a fill that reaches one marks it: Python's), whether a fill could
+//! reach a bracket, which tokens are paused or freeze a sender. Fills on a pair quoted in the
+//! perps' settlement asset count toward each side's fee tier (``_record_volume``), here too.
+//! This runs the operations in order, and stops before the first one it would not run exactly
+//! as Python does — which Python runs, and the run continues after it.
 //!
 //! The ledger stays Python's. An entry (a block delta, a loaded balance) is read from Python's
 //! own dict the first time an operation needs it, and every entry written goes back in the
@@ -157,15 +159,28 @@ struct Changes {
     fee_tokens: IMap<Id, Dec>,
     fee_token_order: Vector<Id>,
     staker_fees: Dec,
+    owners: IMap<Id, Owner>,
+    // the clearinghouse's volume dicts the run wrote, each in the order first written
+    volume_order: Vector<Id>,
+    lifetime_order: Vector<Id>,
+    referral_order: Vector<Id>,
 }
 
+/// What decides an owner's spot fee, and what its fills count toward: its staking discount (fixed
+/// for the block), its volume by day (``volumes``), its lifetime volume, its referral (referrer,
+/// volume since it joined).
 #[derive(Clone)]
-struct FeeInfo {
-    taker: Dec,
-    maker: Dec,
-    referrer: Option<Id>,
-    discounted: bool,
+struct Owner {
+    discount: Dec,
+    days: Vector<(i64, Dec)>,
+    lifetime: Dec,
+    referral: Option<(Id, Dec)>,
+    written: u8, // VOLUME | LIFETIME | REFERRAL
 }
+
+const VOLUME: u8 = 1;
+const LIFETIME: u8 = 2;
+const REFERRAL: u8 = 4;
 
 struct Pair<'py> {
     nonces: Bound<'py, PyDict>,
@@ -176,9 +191,13 @@ struct Pair<'py> {
     buy_pool: Option<Dec>,
     sell_pool: Option<Dec>,
     places_bail: bool,
-    trades_bail: bool,
+    tier: bool,
     has_stops: bool,
     handed: HashSet<String>,
+    // where its waiting triggers fire: the lowest price a rising one waits for, the highest a
+    // falling one waits for
+    min_above: Option<Dec>,
+    max_below: Option<Dec>,
 }
 
 struct Consts {
@@ -193,6 +212,12 @@ struct Consts {
     place_gas: i64,
     cancel_gas: i64,
     per_maker: i64,
+    tiers: Vec<(Dec, Dec, Dec)>,
+    volume_days: i64,
+    day: i64,
+    vault: Id,
+    protocol: Id,
+    referral_cap: Dec,
 }
 
 struct Run<'a, 'py> {
@@ -201,11 +226,10 @@ struct Run<'a, 'py> {
     pairs: &'a [Pair<'py>],
     dicts: Dicts<'py>,
     fee_tokens_dict: Bound<'py, PyDict>,
-    fee_info_fn: Bound<'py, PyAny>,
+    owner_fn: Bound<'py, PyAny>,
     frozen: HashSet<(String, String)>,
     parents: HashSet<String>,
     c: Consts,
-    fees: HashMap<Id, FeeInfo>,
     changes: Changes,
     // what the operation in progress changed of its book's orders: (book, order) as it last was
     changed: Vec<(usize, Order)>,
@@ -290,46 +314,126 @@ impl Run<'_, '_> {
         self.record(asset.key(to), amount)
     }
 
-    fn fee_info(&mut self, owner: &Id) -> R<FeeInfo> {
-        if let Some(f) = self.fees.get(owner) {
-            return Ok(f.clone());
+    fn owner(&mut self, owner: &Id) -> R<Owner> {
+        if let Some(o) = self.changes.owners.get(owner) {
+            return Ok(o.clone());
         }
-        let got = self
-            .fee_info_fn
+        type Got = (String, Vec<(i64, String)>, Option<String>, Option<(String, String)>);
+        let got: Got = self
+            .owner_fn
             .call1((&**owner,))
-            .and_then(|v| v.extract::<(String, String, Option<String>, bool)>())
+            .and_then(|v| v.extract())
             .map_err(|_| Stop::Python)?;
-        let f = FeeInfo {
-            taker: parse(&got.0)?,
-            maker: parse(&got.1)?,
-            referrer: got.2.map(Id::from),
-            discounted: got.3,
+        let mut days = Vector::new();
+        for (d, n) in got.1 {
+            days.push_back((d, parse(&n)?));
+        }
+        let o = Owner {
+            discount: parse(&got.0)?,
+            days,
+            lifetime: match got.2 {
+                Some(v) => parse(&v)?,
+                None => Dec::zero(),
+            },
+            referral: match got.3 {
+                Some((r, v)) => Some((Id::from(r.as_str()), parse(&v)?)),
+                None => None,
+            },
+            written: 0,
         };
-        self.fees.insert(owner.clone(), f.clone());
-        Ok(f)
+        self.changes.owners.insert(owner.clone(), o.clone());
+        Ok(o)
+    }
+
+    /// ``Clearinghouse.fee_rates``: (taker, maker) for the owner's volume of the last
+    /// FEE_VOLUME_DAYS days, less its staking discount (a rebate is kept whole).
+    fn fee_rates(&self, o: &Owner) -> R<(Dec, Dec)> {
+        let first = self.c.day - self.c.volume_days + 1;
+        let mut volume = Dec::zero();
+        for (d, n) in o.days.iter() {
+            if *d >= first {
+                volume = add(&volume, n)?;
+            }
+        }
+        let (mut taker, mut maker) = (self.c.tiers[0].1.clone(), self.c.tiers[0].2.clone());
+        for (floor, t, mk) in &self.c.tiers {
+            if !lt(&volume, floor) {
+                taker = t.clone();
+                maker = mk.clone();
+            }
+        }
+        if positive(&o.discount) {
+            let keep = sub(&Dec::parse("1").expect("one"), &o.discount)?;
+            taker = mul(&taker, &keep)?;
+            if positive(&maker) {
+                maker = mul(&maker, &keep)?;
+            }
+        }
+        Ok((taker, maker))
     }
 
     /// ``_spot_fee``: (fee, referral reward, referrer) on ``value`` ``owner`` receives.
     fn spot_fee(&mut self, owner: &Id, is_maker: bool, value: &Dec) -> R<(Dec, Dec, Option<Id>)> {
-        let info = self.fee_info(owner)?;
+        let o = self.owner(owner)?;
+        let (taker, maker) = self.fee_rates(&o)?;
         let rate = if !is_maker {
-            info.taker
-        } else if positive(&info.maker) {
-            info.maker
+            taker
+        } else if positive(&maker) {
+            maker
         } else {
             Dec::zero()
         };
         let fee = q18(&mul(value, &rate)?, Rounding::HalfUp)?;
-        let Some(referrer) = info.referrer.filter(|_| positive(&fee)) else {
+        let Some((referrer, volume)) = o.referral.filter(|_| positive(&fee)) else {
             return Ok((fee, Dec::zero(), None));
         };
-        let fee = if info.discounted {
+        let fee = if lt(&volume, &self.c.referral_cap) {
             q18(&mul(&fee, &self.c.referee_keep)?, Rounding::HalfUp)?
         } else {
             fee
         };
         let reward = q18(&mul(&fee, &self.c.referrer_share)?, Rounding::Down)?;
         Ok((fee, reward, Some(referrer)))
+    }
+
+    /// ``Clearinghouse._record_volume``: a fill's notional counts toward the owner's fee tier,
+    /// its lifetime volume and (under the cap) its referral's.
+    fn record_volume(&mut self, owner: &Id, notional: &Dec) -> R<()> {
+        if *owner == self.c.vault || *owner == self.c.protocol {
+            return Ok(());
+        }
+        let mut o = self.owner(owner)?;
+        let day = self.c.day;
+        let mut days: Vector<(i64, Dec)> =
+            o.days.iter().filter(|(d, _)| *d > day - self.c.volume_days).cloned().collect();
+        match days.back().cloned() {
+            Some((d, n)) if d == day => {
+                let i = days.len() - 1;
+                days.set(i, (day, add(&n, notional)?));
+            }
+            _ => days.push_back((day, notional.clone())),
+        }
+        o.days = days;
+        o.lifetime = add(&o.lifetime, notional)?;
+        let mut wrote = VOLUME | LIFETIME;
+        if let Some((r, v)) = &o.referral {
+            if lt(v, &self.c.referral_cap) {
+                o.referral = Some((r.clone(), add(v, notional)?));
+                wrote |= REFERRAL;
+            }
+        }
+        for (bit, order) in [
+            (VOLUME, &mut self.changes.volume_order),
+            (LIFETIME, &mut self.changes.lifetime_order),
+            (REFERRAL, &mut self.changes.referral_order),
+        ] {
+            if wrote & bit != 0 && o.written & bit == 0 {
+                order.push_back(owner.clone());
+            }
+        }
+        o.written |= wrote;
+        self.changes.owners.insert(owner.clone(), o);
+        Ok(())
     }
 
     /// ``_accrue_staker_fee``.
@@ -459,7 +563,7 @@ impl Run<'_, '_> {
             (pr.base.clone(), amount.clone())
         };
         let (base, quote, escrow) = (pr.base.clone(), pr.quote.clone(), pr.escrow.clone());
-        let trades_bail = pr.trades_bail;
+        let (min_above, max_below, tier) = (pr.min_above.clone(), pr.max_below.clone(), pr.tier);
         if !need_asset.native
             && self.frozen.contains(&(op.sender.clone(), need_asset.name.to_string()))
         {
@@ -534,8 +638,22 @@ impl Run<'_, '_> {
             self.set_book_nonce(pair, &sender, n);
         }
         self.take_changed(pair);
-        if !trades.is_empty() && trades_bail {
-            return Err(Stop::Python); // (a trigger could be reached, or the volume counts)
+        // ``_record_spot_prices``: fills that reach a waiting trigger mark it (Python's).
+        if let Some(first) = trades.first() {
+            let (mut lo, mut hi) = (&first.price, &first.price);
+            for t in &trades[1..] {
+                if lt(&t.price, lo) {
+                    lo = &t.price;
+                }
+                if lt(hi, &t.price) {
+                    hi = &t.price;
+                }
+            }
+            let rises = min_above.as_ref().is_some_and(|p| !lt(hi, p));
+            let falls = max_below.as_ref().is_some_and(|p| !lt(p, lo));
+            if rises || falls {
+                return Err(Stop::Python);
+            }
         }
         // ``_settle_orderbook``: each fill, then the unfilled remainder into the escrow.
         for tr in trades.iter_mut() {
@@ -551,6 +669,15 @@ impl Run<'_, '_> {
             let book = &mut self.books[pair].book;
             book.set_trade_fee(&tr.id, false, tr.taker_fee.clone());
             book.set_trade_fee(&tr.id, true, tr.maker_fee.clone());
+        }
+        // ``_record_spot_volume``: once every fill settled, on a pair quoted in the settlement
+        // asset, each fill's notional counts toward both sides' tiers.
+        if tier {
+            for tr in &trades {
+                let notional = mul(&tr.amount, &tr.price)?;
+                self.record_volume(&tr.buyer, &notional)?;
+                self.record_volume(&tr.seller, &notional)?;
+            }
         }
         let rest = exact(ended.remaining().ok())?;
         if positive(&rest) && ended.is_active() {
@@ -696,6 +823,7 @@ type PairTuple<'py> = (
     Option<String>,
     (bool, bool, bool),
     Vec<String>,
+    (Option<String>, Option<String>),
 );
 
 type Written = (String, String, Option<String>);
@@ -705,7 +833,8 @@ type TokenWritten = ((String, String), String, Option<String>);
 /// entries written, then token entries, each (key, delta, loaded balance or None) in the order
 /// first written; the lanes' new nonces; the books' new owner nonces (pair, owner, nonce); the
 /// fee tokens' new pending amounts; the block's fees and staker fees; orders placed; the orders
-/// handed out that changed (pair, order); the pairs whose handed-out orders a failure detached).
+/// handed out that changed (pair, order); the pairs whose handed-out orders a failure detached;
+/// the clearinghouse's volumes, lifetime volumes and referral volumes written, each in order).
 type RunOut<'py> = (
     usize,
     Vec<(bool, i64, String, String, Option<Bound<'py, PyDict>>)>,
@@ -718,6 +847,13 @@ type RunOut<'py> = (
     usize,
     Vec<(usize, Bound<'py, PyDict>)>,
     Vec<usize>,
+    VolumesOut,
+);
+
+type VolumesOut = (
+    Vec<(String, Vec<(i64, String)>)>,
+    Vec<(String, String)>,
+    Vec<(String, String)>,
 );
 
 /// ``process_transaction`` over a run of plain spot orders and cancels judged includable (the
@@ -733,15 +869,18 @@ pub fn order_lane_run<'py>(
     dicts: (Bound<'py, PyDict>, Bound<'py, PyDict>, Bound<'py, PyDict>, Bound<'py, PyDict>),
     lanes: Bound<'py, PyDict>,
     fee_tokens: Bound<'py, PyDict>,
-    fee_info: Bound<'py, PyAny>,
+    owner_info: Bound<'py, PyAny>,
     consts: (String, String, String, String, String, String, i64, f64, i64, i64, i64),
+    tiers: (Vec<(String, String, String)>, i64, i64, String, String, String),
     totals: (String, String),
 ) -> PyResult<RunOut<'py>> {
     let bad = |what: &str| pyo3::exceptions::PyValueError::new_err(format!("order lane: {what}"));
     let dec = |s: &str| Dec::parse(s).ok_or_else(|| bad(s));
     let mut books = Vec::with_capacity(pairs.len());
     let mut pair_list = Vec::with_capacity(pairs.len());
-    for (book, nonces, name, base, quote, escrow, buy_pool, sell_pool, flags, handed) in pairs {
+    for (book, nonces, name, base, quote, escrow, buy_pool, sell_pool, flags, handed, triggers) in
+        pairs
+    {
         books.push(book.try_borrow_mut()?);
         let asset = |a: (String, bool, bool)| Asset {
             name: Id::from(a.0.as_str()),
@@ -757,9 +896,11 @@ pub fn order_lane_run<'py>(
             buy_pool: buy_pool.as_deref().map(dec).transpose()?,
             sell_pool: sell_pool.as_deref().map(dec).transpose()?,
             places_bail: flags.0,
-            trades_bail: flags.1,
+            tier: flags.1,
             has_stops: flags.2,
             handed: handed.into_iter().collect(),
+            min_above: triggers.0.as_deref().map(dec).transpose()?,
+            max_below: triggers.1.as_deref().map(dec).transpose()?,
         });
     }
     let c = Consts {
@@ -774,7 +915,20 @@ pub fn order_lane_run<'py>(
         place_gas: consts.8,
         cancel_gas: consts.9,
         per_maker: consts.10,
+        tiers: tiers
+            .0
+            .iter()
+            .map(|(f, t, m)| Ok((dec(f)?, dec(t)?, dec(m)?)))
+            .collect::<PyResult<Vec<_>>>()?,
+        volume_days: tiers.1,
+        day: tiers.2,
+        vault: Id::from(tiers.3.as_str()),
+        protocol: Id::from(tiers.4.as_str()),
+        referral_cap: dec(&tiers.5)?,
     };
+    if c.tiers.is_empty() {
+        return Err(bad("fee tiers"));
+    }
     let mut block_fees = dec(&totals.0)?;
     let mut run = Run {
         py,
@@ -787,11 +941,10 @@ pub fn order_lane_run<'py>(
             token_avail: dicts.3,
         },
         fee_tokens_dict: fee_tokens,
-        fee_info_fn: fee_info,
+        owner_fn: owner_info,
         frozen: frozen.into_iter().collect(),
         parents,
         c,
-        fees: HashMap::new(),
         changes: Changes {
             entries: IMap::new(),
             written: IMap::new(),
@@ -801,6 +954,10 @@ pub fn order_lane_run<'py>(
             fee_tokens: IMap::new(),
             fee_token_order: Vector::new(),
             staker_fees: dec(&totals.1)?,
+            owners: IMap::new(),
+            volume_order: Vector::new(),
+            lifetime_order: Vector::new(),
+            referral_order: Vector::new(),
         },
         changed: Vec::new(),
     };
@@ -947,6 +1104,18 @@ pub fn order_lane_run<'py>(
     for ((pair, _), o) in handed {
         handed_out.push((pair, crate::book::order_dict(py, &o)?));
     }
+    let owner = |id: &Id| &ch.owners[id];
+    let volumes = (
+        ch.volume_order
+            .iter()
+            .map(|id| (id.to_string(), owner(id).days.iter().map(|(d, n)| (*d, text(n))).collect()))
+            .collect(),
+        ch.lifetime_order.iter().map(|id| (id.to_string(), text(&owner(id).lifetime))).collect(),
+        ch.referral_order
+            .iter()
+            .map(|id| (id.to_string(), text(&owner(id).referral.as_ref().expect("a referral").1)))
+            .collect(),
+    );
     Ok((
         done,
         results,
@@ -959,5 +1128,6 @@ pub fn order_lane_run<'py>(
         placed,
         handed_out,
         detached,
+        volumes,
     ))
 }

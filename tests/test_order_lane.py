@@ -7,10 +7,12 @@ native lane, the other runs every operation through ``process_transaction``. The
 plain limit orders in every time in force (hidden, iceberg, crossing and resting, too large for
 the balance, too small for the book, from an account whose token balance was not loaded) and
 cancels (one's own, another's, unknown, already gone), on three pairs — one whose pool has
-liquidity and triggers waiting (an order that reaches the pool, a fill a trigger could see, is
-Python's), one quoted in QRDX — among what only Python runs: market and trigger orders, swaps,
-modifications, brackets, builder fees. Traders pay their
-fee tier's rates, a staking discount, a referee's discount, a referrer's reward. After every
+liquidity (an order that reaches the pool is Python's), two with triggers waiting near the price
+(a fill that reaches one is Python's), one quoted in QRDX (on odd seeds the perps' settlement
+asset: its fills count toward fee tiers) — among what only Python runs: market and trigger
+orders, swaps, modifications, brackets, builder fees. Traders pay their fee tier's rates (one
+crosses a tier, another a referral's cap, mid-run), a staking discount, a referee's discount, a
+referrer's reward. After every
 block everything must be the same: the block's outcome and root, every result (success, gas,
 data, error, fee) and transaction field, the nonces, every balance delta and loaded balance (and
 the order keys entered their dicts), the block's fees and staker fees, the fee tokens, the
@@ -88,12 +90,15 @@ def _setup():
     ch.register_referral_code(TRADERS[0], "alpha")
     ch.join_referral(TRADERS[1], "alpha")
     ch.join_referral(TRADERS[2], "alpha")
-    ch.referrals[TRADERS[2]] = dataclasses.replace(ch.referrals[TRADERS[2]],
-                                                   volume=REFERRAL_VOLUME_CAP)
+    for who, volume in ((TRADERS[1], REFERRAL_VOLUME_CAP - 8), (TRADERS[2], REFERRAL_VOLUME_CAP)):
+        ch.referrals[who] = dataclasses.replace(ch.referrals[who], volume=volume)  # (one crosses)
     day = ch._day()
     for who, volume in ((TRADERS[3], 30_000_000), (TRADERS[4], 2_500_000_000),
                         (TRADERS[5], 8_000_000_000)):
         ch.volumes[who] = ((day, D(volume)),)
+    # (just below a tier: fills on a pair quoted in the settlement asset lift it mid-run; and a
+    # day past the window, dropped when the volume is next written)
+    ch.volumes[TRADERS[0]] = ((day - 30, D(10 ** 9)), (day - 1, D(5_000_000) - D(25)))
     ch.set_stakes({TRADERS[1].lower(): D(150), TRADERS[3].lower(): D(2)})
     m.commit_block()
     return m, pairs, {ISSUER: nonce}
@@ -156,10 +161,13 @@ def _block(rng, pairs, nonces, known):
                                             token_out=base if buy else quote,
                                             amount_in=str(D(rng.randint(1, 50)) / D(10)),
                                             min_amount_out="0"), gas))
-        elif k < 0.88 and label == "A":  # (a pair with triggers: its fills are Python's)
+        elif k < 0.88 and label != "C":
+            # (triggers waiting near the price: a fill that reaches one is Python's)
+            at = mid * D(rng.randint(930, 1070)) / D(1000)
             ops.append((Op.PLACE_ORDER, who, dict(
-                pair=pair, side=rng.choice(["buy", "sell"]), order_type="stop_loss",
-                trigger_price=str(mid * D("0.9")), amount=str(rng.randint(1, 20))), gas))
+                pair=pair, side=rng.choice(["buy", "sell"]),
+                order_type=rng.choice(["stop_loss", "take_profit"]),
+                trigger_price=str(at.quantize(D("0.0001"))), amount=str(rng.randint(1, 20))), gas))
         elif known:
             owner, oid, p = rng.choice(known)
             ops.append((Op.MODIFY_ORDER, owner, dict(pair=p, order_id=oid,
@@ -246,14 +254,18 @@ def test_random_blocks_run_as_python_runs_them(seed, monkeypatch):
     py, pairs, nonces = _setup()
     nat, _, _ = _setup()
     known = []
-    ran = {"native": 0, "fills": 0}
+    ran = {"native": 0, "fills": 0, "B": 0, "C": 0}
     stretch = order_lane._stretch
 
     def counted(mgr, fn, txs, prepared, prepaid, payers, start, results):
         n = len(results)
         done = stretch(mgr, fn, txs, prepared, prepaid, payers, start, results)
         ran["native"] += done
-        ran["fills"] += sum(len(r.data.get("fills", ())) for r in results[n:])
+        for r in results[n : n + done]:
+            for f in r.data.get("fills", ()):
+                ran["fills"] += 1
+                for label in ("B", "C"):
+                    ran[label] += f["market"] == pairs[label]
         return done
 
     monkeypatch.setattr(order_lane, "_stretch", counted)
@@ -274,7 +286,9 @@ def test_random_blocks_run_as_python_runs_them(seed, monkeypatch):
         again, _ = _run_block(nat, height, _copies(txs), True, monkeypatch)
         assert again["root"] == a["root"] and again["deltas"] == a["deltas"]
         assert again["books"] == a["books"]
-    assert ran["native"] > 300 and ran["fills"] > 30, ran  # (run natively, fills settled)
+    # run natively, fills settled — on the pair with triggers waiting, and on the QRDX pair
+    # (quoted in the settlement asset on odd seeds: its fills count toward fee tiers)
+    assert ran["native"] > 300 and ran["fills"] > 30 and ran["B"] > 5 and ran["C"] > 5, ran
     trades = sum(b.total_trades for b in nat._order_books.values())
     assert trades > 100, trades
 

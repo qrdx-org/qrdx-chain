@@ -111,11 +111,13 @@ judged with the plain transfers (`lane_judge`: its nonce, its payer's fees). `or
 then runs a run of them over the native books: the nonce, the operation all or nothing —
 matching (`book.rs`), each fill's settlement (base and quote moved, each side's fee by its fee
 tier, staking discount and referral, the referrer's reward, the stakers' part, the treasury's),
-the remainder into the book's escrow, or a cancelled order's escrow back — then the gas. Python
-gathers per pair what no operation of a run can change: where its pools start to fill, whether a
-fill could reach a trigger or a bracket or count toward fee tiers, paused and freezing tokens,
-each sender's payer. The run stops before the first operation it would not reproduce exactly (an
-order reaching a pool, a fill a trigger could see, a frozen sender, a value past its decimals);
+the remainder into the book's escrow, or a cancelled order's escrow back, and on a pair quoted in
+the perps' settlement asset each fill's volume toward fee tiers — then the gas. Python gathers
+per pair what no operation of a run can change: where its pools start to fill, where its
+waiting triggers fire, which orders have brackets, paused and freezing tokens, each sender's
+payer, each trader's fee inputs. The run stops before the first operation it would not reproduce
+exactly (an order reaching a pool, a fill reaching a trigger's price, a frozen sender, a value
+past its decimals);
 Python runs that one and the run goes on. Ledger entries are read from Python's dicts when first
 needed and written back through them with the same undo records, new keys in the order Python's
 would have inserted them. Anything else (market and trigger orders, brackets, builder fees, an

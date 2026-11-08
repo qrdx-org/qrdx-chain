@@ -127,32 +127,39 @@ an operation does is Python's `process_transaction` around `_op_place_order` /
 book, the balance check, matching, each fill's settlement (base and quote moved, each side's fee
 by its tier, staking discount and referral, the referrer's reward, the stakers' part, the
 treasury's), the trades' fees into the book's history, the remainder into the escrow, or a
-cancelled order's escrow back; then the gas and the reservation's rest. Errors are Python's,
-word for word.
+cancelled order's escrow back; on a pair quoted in the perps' settlement asset, each fill's
+notional toward both sides' fee tiers, lifetime volume and referral volume (`_record_volume`:
+the fee tier and the referee's discount move with it mid-run); then the gas and the
+reservation's rest. Errors are Python's, word for word.
 
 Python keeps what decides anything else, once a transaction or once a run: parsing and its
 checks (`prepare`; the same checks let the section be judged natively, with plain transfers),
-and per pair where its pools start to fill, whether a fill could reach a trigger or a bracket or
-count toward fee tiers, paused tokens, freezing tokens' senders, each sender's payer. The run
+and per pair where its pools start to fill, where its waiting triggers fire (the lowest price a
+rising one waits for, the highest a falling one waits for), which orders have brackets, paused
+tokens, freezing tokens' senders, each sender's payer, each trader's fee inputs (staking
+discount, volume by day, referral). The run
 stops before the first operation it would not reproduce exactly; Python runs that one and the
 run goes on. The ledger stays Python's: entries are read from its dicts when first needed and
 written back through them with the same undo records, keys entering in the same order.
 
-What is still Python's: an order that reaches a pool's price (unified liquidity, E5), a fill on a
-pair with spot triggers or quoted in the perps' settlement asset (its volume counts toward fee
-tiers), market and trigger orders, brackets, builder fees, modifications, an agent's or a
-multisig's signature, the free lane, a book with stop orders.
+What is still Python's: an order that reaches a pool's price (unified liquidity, E5), fills that
+reach a waiting trigger's price (they mark it) or a bracketed order, market and trigger orders,
+brackets, builder fees, modifications, an agent's or a multisig's signature, the free lane, a
+book with stop orders.
 
 Tests: `tests/test_order_lane.py` runs random blocks both ways — plain orders in every time in
 force (hidden, iceberg, too large, too small, from an account whose balance was not loaded) and
-cancels (one's own, another's, unknown), on a pair with pool liquidity and triggers, a plain one
-and one quoted in QRDX, among what only Python runs; traders with fee tiers, a negative maker
-rate, staking discounts, referrals capped and not — and compares every result and field, nonce,
+cancels (one's own, another's, unknown), on a pair with pool liquidity, two with triggers waiting
+near the price, one quoted in QRDX (on half the seeds the settlement asset), among what only
+Python runs; traders with fee tiers (one crossing a floor mid-run, with a day past the window),
+a negative maker rate, staking discounts, referrals capped, uncapped and crossing the cap — and
+compares every result and field, nonce,
 delta and balance (with the order keys entered), the fees, staker fees and fee tokens, the books
 and their history, the root, and takes every block back out by its undo record; and judges
 random sections with refusals both ways. Breaking it is caught: a referrer's reward not paid, a
 move's two sides recorded in the other order, a negative maker rate not floored, the history's
-fees not written, the write-back reordered or missing a dict.
+fees not written, the write-back reordered or missing a dict, the volume not recorded, a
+trigger's price ignored, the staking discount ignored, old volume days kept.
 
 Measured (`scripts/bench/exchange_block.py --workload orders`, a block's section as a node runs
 it — judged, run, its root — 500 operations a block, 30% cancels, 30% crossing, 40% resting):
