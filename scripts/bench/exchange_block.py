@@ -14,7 +14,8 @@ book, resting orders on both sides, then blocks of 30% cancels, 30% orders that 
 that rest, run as a node runs a block's exchange section (``process_exchange_transactions``:
 judged, then run — plain orders and cancels by the native lane where it is on — and the
 exchange root; no database). ``QRDX_ORDER_LANE=0`` turns the lane off, ``QRDX_NATIVE_BOOK=0``
-the native books too.
+the native books too. ``--liquidity`` gives the pair's pool liquidity around the price (orders
+that cross reach it), ``--swaps 0.2`` makes a fifth of the operations swaps.
 """
 
 from __future__ import annotations
@@ -194,6 +195,10 @@ def orders(args) -> None:
     for who in (holder, escrow):
         m.set_available_balance(who, D(0))
         m.set_available_token_balance(who, token, D(0))
+    if args.liquidity:  # (price 2 is near tick 6931: a range around it)
+        r = m.process_transaction(tx(issuer, Op.ADD_LIQUIDITY, pool_id=r.data["pool_id"],
+                                     tick_lower=6000, tick_upper=7800, amount="200000"))
+        assert r.success, r.error
     pair = f"{token}:QRDX"
     m.commit_block()
     rng = random.Random(1)
@@ -227,7 +232,12 @@ def orders(args) -> None:
         txs = []
         for _ in range(args.txs):
             who, k = rng.choice(traders), rng.random()
-            if k < 0.3 and resting:
+            if args.swaps and rng.random() < args.swaps:
+                buy = rng.random() < 0.5
+                txs.append(tx(who, Op.SWAP, token_in="QRDX" if buy else token,
+                              token_out=token if buy else "QRDX",
+                              amount_in=str(rng.randint(1, 20)), min_amount_out="0"))
+            elif k < 0.3 and resting:
                 owner, oid = resting.pop(rng.randrange(len(resting)))
                 txs.append(tx(owner, Op.CANCEL_ORDER, pair=pair, order_id=oid))
             else:
@@ -248,6 +258,8 @@ def main() -> None:
     p.add_argument("--accounts", type=int, default=100)
     p.add_argument("--blocks", type=int, default=3)
     p.add_argument("--workload", choices=("transfers", "orders"), default="transfers")
+    p.add_argument("--liquidity", action="store_true", help="orders: pool liquidity at the price")
+    p.add_argument("--swaps", type=float, default=0.0, help="orders: the share that are swaps")
     import logging
 
     logging.disable(logging.WARNING)

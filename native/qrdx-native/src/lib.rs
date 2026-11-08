@@ -28,6 +28,7 @@ mod lthash;
 pub mod net;
 mod mtree;
 mod order_lane;
+mod router;
 mod smt;
 mod oqs;
 mod tx;

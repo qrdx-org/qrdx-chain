@@ -30,7 +30,7 @@ the plan for moving the exchange into Rust, and what is done.
 | E3a | Spot books held natively | Every spot pair's book is a native one behind the Python book's interface: the router, handlers, triggers, views, undo, snapshots and proofs run unchanged | done (2026-11-08): the exchange with native books is the exchange with Python's, block for block; found a snapshot bug (proof trees) |
 | E3b | Spot settlement | Escrow, token and QRDX moves, fees, the journal's fills: a run of plain limit orders and cancels executed natively end to end | done (2026-11-08): 210 → 72 µs an order on a block's path |
 | E4 | Ledger | Token balances and nonces held natively, the database written behind the block | |
-| E5 | Router and pools | Unified liquidity (`plan_fill`): the AMM's tick math and the book together | |
+| E5 | Router and pools | Unified liquidity (`plan_fill`): the AMM's tick math and the book together | done (2026-11-08): orders that reach a pool and swaps (hub routing too) run natively; 240 → 113 µs an order, 331 → 155 with swaps |
 | E6 | Perps | The clearinghouse: margin, funding, liquidation | |
 
 Each phase is wired in only when its differential tests hold, and measured live.
@@ -142,10 +142,10 @@ stops before the first operation it would not reproduce exactly; Python runs tha
 run goes on. The ledger stays Python's: entries are read from its dicts when first needed and
 written back through them with the same undo records, keys entering in the same order.
 
-What is still Python's: an order that reaches a pool's price (unified liquidity, E5), fills that
-reach a waiting trigger's price (they mark it) or a bracketed order, market and trigger orders,
-brackets, builder fees, modifications, an agent's or a multisig's signature, the free lane, a
-book with stop orders.
+What is still Python's: fills that reach a waiting trigger's price (they mark it) or a bracketed
+order, trigger orders, brackets, builder fees, modifications, an agent's or a multisig's
+signature, the free lane, a book with stop orders. (Orders that reach a pool, market orders and
+swaps run natively since E5, below.)
 
 Tests: `tests/test_order_lane.py` runs random blocks both ways — plain orders in every time in
 force (hidden, iceberg, too large, too small, from an account whose balance was not loaded) and
@@ -174,6 +174,50 @@ Of the 72: the native run about 25 (matching, settlement, reading Python's dicts
 results), Python's preparation about 12 plus hashing each new transaction for its order id (a
 node has hashed it on admission already), and the rest the section's judgment, its fee
 reservations and the exchange root.
+
+## E5: pools and the router natively (2026-11-08)
+
+`native/qrdx-native/src/router.rs` is the pools' swap math and the router's walk of a pair's
+combined market, step for step: `ConcentratedLiquidityPool.quote` (partial, continuing a plan),
+`_swap_step` / `_swap_step_out` and the amount and √price functions under their own rounding
+contexts (ceiling, floor, half-even), `liquid_sqrt`, `SwapPlan.then`, and `Router.plan_fill`
+(the book maker by maker, the pools at one price moving together, a split by bisection, the
+rest to the deepest pool, self-trade, budget and dust stops), exact-out for an order and
+exact-in for a swap. Three values are Python's own, asked for: the tick at a √price (a
+logarithm), a limit's square root, a pool's end price (a power) — exactly what Python computes,
+rather than a port of `decimal`'s transcendental functions. Values keep Python's spelling where
+it travels on (`min` takes the first of equal values, sorts are stable).
+
+The order lane uses it for limit and market orders that reach a pool — each pool's leg applied
+and paid (taker into the pool's holder, the pool out to the taker), the book matching the rest,
+the pair's last price from fills and pools together, `_flag_self_pass` — and for swaps: the
+pair, or two hops through a routing hub when that pays more (`choose_swap_path`), each hop
+planned within the gas and executed (the book's leg as the router's immediate-or-cancel order,
+its id from the router's sequence, which a failed swap does not take back, as Python's does
+not). Each stretch hands the native run every candidate pool with its initialized ticks (read
+unmarked); the plans applied come back and Python applies them with the pool's own `apply`
+(its oracle observation, the crossed ticks' fee growth), after keeping the pool for the undo
+scope as `_atomic` does.
+
+Tests: `tests/test_order_lane.py` now trades on two pools of one pair (two fee tiers, five
+positions, so fills cross ticks and split between pools), a pair with liquidity only above its
+price, and hub pairs (A:QRDX, USD:QRDX) through which a swap may go; market orders, swaps with
+minimums, deadlines, amounts too large and too small, tight gas. Over four seeds: 252 orders
+filled by pools natively (43 split between two), 118 plans crossing ticks, 186 swaps (33 through
+QRDX), each identical to Python. Breaking it is caught: one bisection step fewer, a pool fee
+rounded half-even, the deepest pool reversed, self-trade ignored, the LP fee growth rounded
+half-even, the pool's price not recorded, the self-pass not flagged, pools beyond the first not
+charged, the exact-in bound not rounded down, the router's sequence taken back on failure, the
+first path taken instead of the best.
+
+Measured (`scripts/bench/exchange_block.py --workload orders`, a block's section, µs an
+operation):
+
+| | Python's books | native books and lanes |
+|---|---:|---:|
+| orders, the pool without liquidity | 204 | 75 |
+| orders, `--liquidity` (crossing orders reach the pool) | 240 | 113 |
+| orders and swaps, `--liquidity --swaps 0.3` | 331 | 155 |
 
 ## What remains outside the engine
 

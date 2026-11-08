@@ -54,6 +54,8 @@ _PLACE_PARAMS = frozenset(
     {"pair", "side", "order_type", "price", "amount", "tif", "hidden", "display_size"}
 )
 _CANCEL_PARAMS = frozenset({"pair", "order_id"})
+_SWAP_PARAMS = frozenset({"token_in", "token_out", "amount_in", "min_amount_out", "deadline"})
+SWAP = EXCHANGE_GAS_COSTS[ExchangeOpType.SWAP]
 _MAX_GAS_PRICE = 1 << 62
 
 
@@ -78,6 +80,7 @@ class Prepared:
 
     __slots__ = (
         "place",
+        "market",
         "pair",
         "order_id",
         "side",
@@ -88,6 +91,7 @@ class Prepared:
         "display",
         "makers",
         "max_fee",
+        "swap",
     )
 
     def __init__(
@@ -103,18 +107,25 @@ class Prepared:
         hidden=False,
         display="0",
         makers=0,
+        market=False,
+        swap=None,
     ) -> None:
         self.place, self.pair, self.order_id, self.max_fee = place, pair, order_id, max_fee
+        self.market = market
+        # a swap's (token_in, token_out, amount_in, min_amount_out, deadline)
+        self.swap: Optional[Tuple[str, str, str, str, float]] = swap
         self.side, self.price, self.amount, self.tif = side, price, amount, tif
         self.hidden, self.display, self.makers = hidden, display, makers
 
 
 def prepare(tx: Any) -> Optional[Prepared]:
-    """A plain limit order or cancel, as Python's handler reads it; None for anything else.
+    """A plain limit or market order or a cancel, as Python's handler reads it; None for
+    anything else.
     Remembered while every field it read is as it was."""
     if type(tx) is not ExchangeTransaction or tx.op_type not in (
         ExchangeOpType.PLACE_ORDER,
         ExchangeOpType.CANCEL_ORDER,
+        ExchangeOpType.SWAP,
     ):
         return None
     fingerprint = tx._fingerprint()
@@ -160,6 +171,8 @@ def _prepare(tx: Any) -> Optional[Prepared]:
             max_fee = tx.max_fee()
     except (ValueError, ArithmeticError, TypeError):
         return None
+    if tx.op_type == ExchangeOpType.SWAP:
+        return _prepare_swap(p, gl, max_fee)
     pair = p.get("pair")
     if not isinstance(pair, str) or not pair.isascii() or ":" not in pair:
         return None
@@ -173,13 +186,13 @@ def _prepare(tx: Any) -> Optional[Prepared]:
     side, kind = p.get("side"), p.get("order_type")
     if not isinstance(side, str) or not isinstance(kind, str) or not _ascii(side, kind):
         return None
-    if side.lower() not in ("buy", "sell") or kind.lower() != "limit":
+    if side.lower() not in ("buy", "sell") or kind.lower() not in ("limit", "market"):
         return None
     hidden = p.get("hidden", False)
     tif = str(p.get("tif", "gtc")).lower()
     if not isinstance(hidden, bool) or not tif.isascii():
         return None
-    price, amount = _text(p.get("price")), _text(p.get("amount"))
+    price, amount = _text(p.get("price", "0")), _text(p.get("amount"))
     display = _text(p.get("display_size", "0"))
     if price is None or amount is None or display is None:
         return None
@@ -196,6 +209,28 @@ def _prepare(tx: Any) -> Optional[Prepared]:
         hidden,
         display,
         makers or 0,
+        kind.lower() == "market",
+    )
+
+
+def _prepare_swap(p: Dict[str, Any], gas_limit: int, max_fee: Decimal) -> Optional[Prepared]:
+    """A swap between two tokens on its best path (no ``path``, ``pool_id`` or ``venue``), as
+    ``_op_swap`` reads it."""
+    if not _SWAP_PARAMS.issuperset(p) or gas_limit < SWAP:
+        return None
+    token_in, token_out = p.get("token_in"), p.get("token_out")
+    if not _ascii(token_in, token_out):
+        return None
+    amount_in = _text(p.get("amount_in"))
+    min_out = _text(p.get("min_amount_out", "0") or "0")
+    try:
+        deadline = float(p.get("deadline", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if amount_in is None or min_out is None or deadline != deadline:
+        return None
+    return Prepared(
+        False, "", "", max_fee, swap=(token_in, token_out, amount_in, min_out, deadline)
     )
 
 
@@ -243,6 +278,7 @@ class _Pairs:
         self.rows: List[Tuple[Any, ...]] = []
         self.books: List[Any] = []
         self.names: List[str] = []
+        self.pools: List[List[Any]] = []  # each pair's candidate pools (``plan_fill``'s)
         self.spot_index = mgr.trading.spot_index() if len(mgr.trading.spot_triggers) else None
         self.parents = set() if self.spot_index is None else set(self.spot_index["parents"])
 
@@ -271,24 +307,42 @@ class _Pairs:
         t = self.mgr.tokens.peek(token)
         return (token, False, bool(t is not None and t.paused))
 
-    def _pools(self, base: str, quote: str) -> Tuple[Optional[str], Optional[str]]:
-        """Where the pair's pools start to fill a buyer (the lowest price, fee included) and a
-        seller (the highest): an order that reaches one is Python's (the router's plan)."""
-        buy: Optional[Decimal] = None
-        sell: Optional[Decimal] = None
-        with localcontext(_CTX):
-            for pool in self.mgr.pool_manager.get_pools_for_pair(base, quote):
-                if pool.is_paused or (pool.state.token0, pool.state.token1) != (base, quote):
-                    continue
-                f = pool.state.fee_tier.rate
-                up, down = pool.liquid_sqrt(False), pool.liquid_sqrt(True)
-                if up is not None:
-                    eff = up * up / (1 - f)
-                    buy = eff if buy is None or eff < buy else buy
-                if down is not None:
-                    eff = down * down * (1 - f)
-                    sell = eff if sell is None or eff > sell else sell
-        return (None if buy is None else str(buy)), (None if sell is None else str(sell))
+    def _pools(self, base: str, quote: str) -> Tuple[List[Any], List[Tuple[Any, ...]]]:
+        """The pair's pools the router walks (``plan_fill``: by id, not paused, the base their
+        token0), each with what the walk reads of it: its state, and its initialized ticks with
+        their liquidity and √ratio (read unmarked: planning changes nothing)."""
+        from .amm import MAX_TICK, MIN_TICK, _sqrt_ratio
+
+        pools = [
+            pool
+            for pool in sorted(
+                self.mgr.pool_manager.get_pools_for_pair(base, quote), key=lambda p: p.state.id
+            )
+            if not pool.is_paused and (pool.state.token0, pool.state.token1) == (base, quote)
+        ]
+        ends = (str(_sqrt_ratio(MIN_TICK)), str(_sqrt_ratio(MAX_TICK)), MIN_TICK, MAX_TICK)
+        rows = []
+        for pool in pools:
+            st = pool.state
+            ticks = [
+                (t, str(st.ticks.peek(t).liquidity_net), str(_sqrt_ratio(t)))
+                for t in pool._tick_index
+            ]
+            rows.append(
+                (
+                    st.id,
+                    self.mgr.pool_holder_address(st.id),
+                    str(st.fee_tier.rate),
+                    str(st.sqrt_price),
+                    int(st.tick),
+                    str(st.liquidity),
+                    str(st.fee_growth_global_0),
+                    str(st.fee_growth_global_1),
+                    ticks,
+                    ends,
+                )
+            )
+        return pools, rows
 
     def _triggers(self, pair: str) -> Tuple[Optional[str], Optional[str]]:
         """Where the pair's waiting triggers fire: the lowest price a rising one waits for, the
@@ -313,7 +367,8 @@ class _Pairs:
         book = mgr._order_books[pair]
         base, quote = pair.split(":", 1)
         b, q = self._asset(base), self._asset(quote)
-        buy_pool, sell_pool = self._pools(base, quote)
+        pools, pool_rows = self._pools(base, quote)
+        self.pools.append(pools)
         has_stops = len(book._stop_orders) > 0
         places_bail = b[2] or q[2] or has_stops
         tier = bool(mgr._settles_in_tier_unit(quote))
@@ -325,8 +380,7 @@ class _Pairs:
             b,
             q,
             mgr.orderbook_escrow_address(pair),
-            buy_pool,
-            sell_pool,
+            pool_rows,
             (places_bail, tier, has_stops),
             handed,
             self._triggers(pair),
@@ -366,6 +420,7 @@ def _tiers(mgr: Any) -> Tuple[Any, ...]:
         VAULT,
         PROTOCOL,
         str(REFERRAL_VOLUME_CAP),
+        SWAP,
     )
 
 
@@ -446,8 +501,21 @@ def _stretch(mgr, fn, txs, prepared, prepaid, payers, start, results) -> int:  #
     for k in range(start, len(txs)):
         tx, pr, paid = txs[k], prepared[k], prepaid[k]
         payer = payers.get(tx.sender)
+        if payer is None or paid[0] != payer:
+            break
+        if pr.swap is not None:
+            swap = _swap_paths(mgr, pairs, pr.swap)
+            if swap is None:
+                break
+            for path in swap[5]:
+                for token_in, _token_out, _slot in path:
+                    senders.setdefault((tx.sender, token_in))
+            head = (2, tx.nonce_key(), tx.nonce, tx.sender, payer, str(paid[1]), tx.gas_limit,
+                    tx.gas_price, 0, "")  # fmt: skip
+            ops.append((head, None, swap))
+            continue
         pair = pairs.pair_of(pr.pair)
-        if payer is None or paid[0] != payer or pair is None:
+        if pair is None:
             break
         if (
             not pr.place
@@ -457,7 +525,7 @@ def _stretch(mgr, fn, txs, prepared, prepaid, payers, start, results) -> int:  #
             break
         slot = pairs.slot(pair)
         head = (
-            pr.place,
+            1 if pr.place else 0,
             tx.nonce_key(),
             tx.nonce,
             tx.sender,
@@ -469,12 +537,22 @@ def _stretch(mgr, fn, txs, prepared, prepaid, payers, start, results) -> int:  #
             pr.order_id,
         )
         if pr.place:
-            body = (pr.side, pr.price, pr.amount, pr.tif, pr.hidden, pr.display, now, pr.makers)
-            ops.append((head, body))
+            body = (
+                pr.market,
+                pr.side,
+                pr.price,
+                pr.amount,
+                pr.tif,
+                pr.hidden,
+                pr.display,
+                now,
+                pr.makers,
+            )
+            ops.append((head, body, None))
             for token in pair.split(":", 1):
                 senders.setdefault((tx.sender, token))
         else:
-            ops.append((head, None))
+            ops.append((head, None, None))
     if not ops:
         return 0
     frozen = _frozen(mgr, senders)
@@ -495,6 +573,7 @@ def _stretch(mgr, fn, txs, prepared, prepaid, payers, start, results) -> int:  #
             mgr._nonces,
             mgr.fee_tokens,
             _owner_info(mgr),
+            (_amm_math, bool(mgr.router._paused), int(mgr.router._clob_sequence)),
             _consts(mgr),
             _tiers(mgr),
             (str(mgr._block_fees), str(mgr._block_staker_fees)),
@@ -516,12 +595,15 @@ def _stretch(mgr, fn, txs, prepared, prepaid, payers, start, results) -> int:  #
         placed,
         handed,
         detached,
-        volumes,
+        (volumes, (applied, uncross, swaps, clob_sequence)),
     ) = out
     for book, s in zip(books, saved, strict=True):
         book._kept(s)  # (the undo scope's record of the book: no-op outside one)
     _write_back(mgr, qrdx, tokens, lanes, book_nonces, fee_tokens, totals, placed, books)
     _write_volumes(mgr, *volumes)
+    _write_pools(mgr, pairs, applied, uncross)
+    mgr._total_swaps += swaps
+    mgr.router._clob_sequence = clob_sequence
     for slot, d in handed:
         o = books[slot]._handed.get(d["id"])
         if o is not None:
@@ -561,6 +643,86 @@ def _frozen(mgr: Any, senders: Dict[Tuple[str, str], None]) -> List[Tuple[str, s
         if registry.is_frozen(token, sender):
             out.append((sender, token))
     return out
+
+
+def _swap_paths(mgr: Any, pairs: "_Pairs", swap: Tuple[str, str, str, str, float]) -> Any:
+    """A swap as the native run takes it: (token_in, it is native QRDX, amount_in,
+    min_amount_out, deadline, the paths ``choose_swap_path`` weighs — each hop (token in, token
+    out, its pair's slot, or -1 where no book trades it)); None to have Python run it (the same
+    token at both ends, a pair whose book is not native)."""
+    from .tokens import is_native_asset
+
+    token_in, token_out, amount_in, min_out, deadline = swap
+    ends = mgr.canonical_asset(token_in), mgr.canonical_asset(token_out)
+    if ends[0] == ends[1] or not _ascii(*ends):
+        return None
+    paths = []
+    for path in mgr.swap_paths(ends[0], ends[1]):
+        hops = []
+        for a, b in zip(path, path[1:], strict=False):
+            key = mgr.router._pair_key(a, b)
+            if key not in mgr._order_books:
+                hops.append((a, b, -1))
+                continue
+            if pairs.pair_of(key) is None:
+                return None
+            hops.append((a, b, pairs.slot(key)))
+        paths.append(hops)
+    return (ends[0], is_native_asset(ends[0]), amount_in, min_out, deadline, paths)
+
+
+def _amm_math(op: str, value: str) -> Any:
+    """Python's own values for the native router (``router::Transcendental``)."""
+    from .amm import Q96, _tick_at
+
+    with localcontext(_CTX):
+        x = Decimal(value)
+        if op == "tick_at":
+            return _tick_at(x)
+        if op == "sqrt":
+            return str(x.sqrt())
+        return str((x / Q96) ** 2)
+
+
+def _write_pools(mgr: Any, pairs: "_Pairs", applied: Any, uncross: Any) -> None:
+    """The pools' legs the run filled, applied as ``_fill_from_pools`` applies them (each pool
+    kept for the undo scope first, as ``_atomic`` keeps it), and the pairs ``_flag_self_pass``
+    marks."""
+    from .amm import SwapPlan
+
+    now = int(mgr._block_clock())
+    kept: set = set()
+    for slot, i, pl in applied:
+        pool = pairs.pools[slot][i]
+        if id(pool) not in kept:
+            kept.add(id(pool))
+            _keep_pool(pool)
+        zfo, a_in, a_out, fee, protocol, sqrt, tick, liquidity, fg, crossings, exhausted = pl
+        plan = SwapPlan(
+            zero_for_one=zfo,
+            amount_in=Decimal(a_in),
+            amount_out=Decimal(a_out),
+            fee=Decimal(fee),
+            protocol_fee=Decimal(protocol),
+            sqrt_price=Decimal(sqrt),
+            tick=tick,
+            liquidity=Decimal(liquidity),
+            fee_growth_global=Decimal(fg),
+            crossings=[(t, Decimal(a), Decimal(b)) for t, a, b in crossings],
+            exhausted=exhausted,
+        )
+        pool.apply(plan, now)
+    for slot in dict.fromkeys(uncross):
+        mgr.trading.uncross[pairs.names[slot]] = 1
+
+
+def _keep_pool(pool: Any) -> None:
+    """``_atomic``'s record of an engine: a snapshot the undo scope puts back."""
+    scope = undo.active()
+    if scope is None or not scope.first(pool, "engine"):
+        return
+    snap = pool.snapshot()
+    scope.record(pool, "engine", lambda: pool.restore(snap))
 
 
 def _write_volumes(mgr: Any, volumes: Any, lifetimes: Any, referrals: Any) -> None:

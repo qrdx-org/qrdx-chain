@@ -20,7 +20,7 @@ byte.
 | `lt_mix_entries(acc, tag, removed, added)` | `commitment._apply` of each entry's `lthash.entry` | the exchange's accumulators, every collection a block touches (`commitment._apply_digests`) |
 | `lane_judge`, `lane_run` | `section_errors` and `process_transaction` for plain QRDX transfers | a block's runs of plain transfers, judged and run (`qrdx/exchange/transfer_lane.py`); `lane_judge` judges plain spot orders and cancels too |
 | `NativeBook` | `orderbook.OrderBook` | every spot pair's book, behind the Python book's interface (`qrdx/exchange/native_book.py`; docs/EXCHANGE_ENGINE.md) |
-| `order_lane_run` | `process_transaction` for plain spot limit orders and cancels: matching, settlement, fees, escrow | a block's runs of them over the native books (`qrdx/exchange/order_lane.py`) |
+| `order_lane_run` | `process_transaction` for plain spot orders (limit and market), cancels and swaps: matching, the pools and the router (`router.rs`), settlement, fees, escrow | a block's runs of them over the native books (`qrdx/exchange/order_lane.py`) |
 | `NetService` | signed HTTP batches of JSON between peers | the peer transport for transactions, blocks and votes (docs/NETWORK.md, `qrdx/node/netd.py`) |
 
 On a block of 2,000 transfers (`scripts/bench/exchange_block.py`, 24 cores):
@@ -105,23 +105,24 @@ multisig's signature) is Python's.
 
 ### Plain spot orders and cancels
 
-A plain limit order (any time in force, hidden or iceberg) or a cancel, signed by its account's
-own key, is prepared by `qrdx/exchange/order_lane.py` with Python's own parsing and checks, and
+A plain limit or market order (any time in force, hidden or iceberg), a cancel or a swap
+between two tokens (its best path), signed by its account's own key, is prepared by `qrdx/exchange/order_lane.py` with Python's own parsing and checks, and
 judged with the plain transfers (`lane_judge`: its nonce, its payer's fees). `order_lane_run`
 then runs a run of them over the native books: the nonce, the operation all or nothing —
-matching (`book.rs`), each fill's settlement (base and quote moved, each side's fee by its fee
+the pools' legs where they price better than the book (`router.rs`: the pools' swap math and the
+router's walk, Python's own logarithm, square root and power asked for), matching (`book.rs`),
+each fill's settlement (base and quote moved, each side's fee by its fee
 tier, staking discount and referral, the referrer's reward, the stakers' part, the treasury's),
 the remainder into the book's escrow, or a cancelled order's escrow back, and on a pair quoted in
 the perps' settlement asset each fill's volume toward fee tiers — then the gas. Python gathers
 per pair what no operation of a run can change: where its pools start to fill, where its
 waiting triggers fire, which orders have brackets, paused and freezing tokens, each sender's
 payer, each trader's fee inputs. The run stops before the first operation it would not reproduce
-exactly (an order reaching a pool, a fill reaching a trigger's price, a frozen sender, a value
-past its decimals);
+exactly (a fill reaching a trigger's price, a frozen sender, a value past its decimals);
 Python runs that one and the run goes on. Ledger entries are read from Python's dicts when first
 needed and written back through them with the same undo records, new keys in the order Python's
-would have inserted them. Anything else (market and trigger orders, brackets, builder fees, an
-agent's or a multisig's signature, the free lane) is Python's.
+would have inserted them. Anything else (trigger orders, brackets, builder fees, a swap's
+explicit path, pool or venue, an agent's or a multisig's signature, the free lane) is Python's.
 
 ### Canonical JSON
 
@@ -198,7 +199,7 @@ pip install --no-deps dist/qrdx_native-0.1.0-cp310-abi3-linux_x86_64.whl
 
 ## What is not native yet
 
-Execution beyond plain transfers and plain spot orders (pools, market and trigger orders, perps,
+Execution beyond plain transfers, plain spot orders and swaps (liquidity, trigger orders, perps,
 tokens), each entry's encoding for the exchange's commitments, and the database writes still run
 in Python. So do sync between
 peers, fork choice and the validator client. The exchange's state held natively, with the

@@ -555,6 +555,40 @@ impl Book {
         }
     }
 
+    /// ``record_price``: the pair's last price, set from a fill outside the book (a pool's).
+    pub(crate) fn record_price(&mut self, price: Dec) {
+        self.state.last_price = Some(price);
+    }
+
+    /// ``OrderBook.fill_queue`` of the level at ``price``: its active orders' displayed amounts
+    /// in time order, then their hidden ones — (owner, what it offers).
+    pub(crate) fn fill_queue(&self, bids: bool, price: &Dec) -> R<Vec<(Id, Dec)>> {
+        let side = if bids { &self.state.bids } else { &self.state.asks };
+        let Some(level) = side.get(&PKey::of(price)) else {
+            return Ok(Vec::new());
+        };
+        let orders: Vec<&Arc<Order>> = level
+            .orders
+            .iter()
+            .filter_map(|id| self.state.orders.get(id))
+            .filter(|o| o.is_active())
+            .collect();
+        let mut queue = Vec::new();
+        for o in &orders {
+            let v = o.visible()?;
+            if positive(&v) {
+                queue.push((o.owner.clone(), v));
+            }
+        }
+        for o in &orders {
+            let r = o.reserve()?;
+            if positive(&r) {
+                queue.push((o.owner.clone(), r));
+            }
+        }
+        Ok(queue)
+    }
+
     /// The best price that shows something (``_best``).
     pub fn best(&self, bids: bool) -> R<Option<Dec>> {
         let levels: Box<dyn Iterator<Item = &Level>> = if bids {

@@ -44,7 +44,7 @@ ISSUER = KEYS[6].public_key.to_address()
 PK = KEYS[0].public_key.to_bytes()
 A, B, C, USD = ("0x" + h * 20 for h in ("11", "22", "44", "33"))
 T0 = 1_800_000_000
-MIDS = {"A": D(2), "B": D(5), "C": D("0.5")}
+MIDS = {"A": D(2), "B": D(5), "C": D("0.5"), "Q": D("0.25"), "AQ": D("0.5")}
 
 
 def _tx(op, sender, nonce, params, gas_limit=600_000, gas_price=10 ** 9):
@@ -55,8 +55,10 @@ def _tx(op, sender, nonce, params, gas_limit=600_000, gas_price=10 ** 9):
 
 
 def _setup():
-    """An exchange with three pairs (A:USD with pool liquidity, B:USD, C:QRDX), funded traders
-    (one with no B balance loaded), referrals, fee tiers and a staking discount."""
+    """An exchange with three pairs — A:USD with two pools (fee tiers 0.3% and 0.05%) holding
+    liquidity around the price in several ranges, B:USD with liquidity only above the price,
+    C:QRDX with none — funded traders (one with no B balance loaded), referrals, fee tiers and a
+    staking discount."""
     m = ExchangeStateManager()
     BP.apply_enforcement(m)
     m.begin_block(1, float(T0 + 1))
@@ -67,9 +69,18 @@ def _setup():
                 m.set_available_token_balance(who, tok, D(10 ** 7))
     pairs = {}
     nonce = 0
-    for label, t0, t1 in (("A", A, USD), ("B", B, USD), ("C", C, "QRDX")):
+    # (label, token0, token1, fee tier, [(tick_lower, tick_upper, liquidity)]): A's price 2 is
+    # near tick 6931, B's 5 near 16094
+    pools = (("A", A, USD, 3000, [(6600, 7260, "2000"), (6900, 6960, "500"), (5400, 8400, "300")]),
+             ("A", A, USD, 500, [(6800, 7000, "800"), (6930, 6940, "400")]),
+             ("B", B, USD, 3000, [(16200, 16800, "1500")]),
+             ("C", C, "QRDX", 3000, []),
+             # (QRDX at 4 USD: a swap between A and USD may go through QRDX)
+             ("Q", USD, "QRDX", 3000, [(-14400, -13200, "3000")]),
+             ("AQ", A, "QRDX", 3000, [(-7260, -6600, "3000")]))
+    for label, t0, t1, tier, positions in pools:
         r = m.process_transaction(_tx(Op.CREATE_POOL, ISSUER, nonce, dict(
-            token0=t0, token1=t1, fee_tier=3000, pool_type="STANDARD",
+            token0=t0, token1=t1, fee_tier=tier, pool_type="STANDARD",
             initial_price=str(MIDS[label]), stake_amount="10000"), gas_limit=2_000_000))
         nonce += 1
         assert r.success, r.error
@@ -80,9 +91,9 @@ def _setup():
             m.set_available_balance(holder, D(0))
             for tok in (t0, t1):
                 m.set_available_token_balance(holder, tok, D(0))
-        if label == "A":
+        for lower, upper, liquidity in positions:
             r = m.process_transaction(_tx(Op.ADD_LIQUIDITY, ISSUER, nonce, dict(
-                pool_id=pid, tick_lower=-1200, tick_upper=1200, amount="1000"),
+                pool_id=pid, tick_lower=lower, tick_upper=upper, amount=liquidity),
                 gas_limit=2_000_000))
             nonce += 1
             assert r.success, r.error
@@ -156,11 +167,23 @@ def _block(rng, pairs, nonces, known):
             ops.append((Op.CANCEL_ORDER, caller, params, gas))
         elif k < 0.82:
             base, quote = pair.split(":", 1)
+            if rng.random() < 0.3:
+                base, quote = A, USD  # (direct, or through QRDX when that pays more)
             buy = rng.random() < 0.5
-            ops.append((Op.SWAP, who, dict(token_in=quote if buy else base,
-                                            token_out=base if buy else quote,
-                                            amount_in=str(D(rng.randint(1, 50)) / D(10)),
-                                            min_amount_out="0"), gas))
+            params = dict(token_in=quote if buy else base, token_out=base if buy else quote,
+                          amount_in=str(D(rng.randint(1, 50)) / D(10)), min_amount_out="0")
+            r = rng.random()
+            if r < 0.1:
+                params["min_amount_out"] = "1000"  # (slippage: refused)
+            elif r < 0.15:
+                params["deadline"] = T0 - 1  # (expired)
+            elif r < 0.2:
+                params["amount_in"] = "50000000"  # (more than the balance)
+            elif r < 0.25:
+                params["amount_in"] = "0.000000000000000001"  # (too small to buy anything)
+            elif r < 0.3:
+                gas = 65_000 + rng.randint(0, 2) * 10_000  # (a budget of a few makers)
+            ops.append((Op.SWAP, who, params, gas))
         elif k < 0.88 and label != "C":
             # (triggers waiting near the price: a fill that reaches one is Python's)
             at = mid * D(rng.randint(930, 1070)) / D(1000)
@@ -290,7 +313,7 @@ def test_random_blocks_run_as_python_runs_them(seed, monkeypatch):
     # (quoted in the settlement asset on odd seeds: its fills count toward fee tiers)
     assert ran["native"] > 300 and ran["fills"] > 30 and ran["B"] > 5 and ran["C"] > 5, ran
     trades = sum(b.total_trades for b in nat._order_books.values())
-    assert trades > 100, trades
+    assert trades > 40, trades
 
 
 def test_what_is_not_a_plain_order_or_cancel_is_left_to_python():
@@ -298,7 +321,8 @@ def test_what_is_not_a_plain_order_or_cancel_is_left_to_python():
     plain = dict(pair=f"{A}:{USD}", side="buy", order_type="limit", price="2", amount="1")
     assert order_lane.prepare(_tx(Op.PLACE_ORDER, s, 0, plain)) is not None
     assert order_lane.prepare(_tx(Op.CANCEL_ORDER, s, 0, dict(pair="a:b", order_id="x")))
-    for change in (dict(order_type="market"), dict(order_type="stop_loss"), dict(price="abc"),
+    assert order_lane.prepare(_tx(Op.PLACE_ORDER, s, 0, {**plain, "order_type": "market"}))
+    for change in (dict(order_type="stop_loss"), dict(price="abc"),
                    dict(amount="NaN"), dict(hidden="yes"), dict(builder={"b": s, "f": "0.1"}),
                    dict(tp={"trigger_price": "3"}), dict(side="long"), dict(pair="AUSD"),
                    dict(stop_price="1")):
