@@ -834,13 +834,18 @@ def process_exchange_transactions(
     # which used to sit in it without paying, executing or consuming its nonce, repeatably — is
     # invalid. Each payer's fees are then reserved up front (below).
     checked = bool(exchange_txs) and is_inclusion_checked(int(block_height))
-    # Plain QRDX transfers are judged and run natively, run by run (qrdx/exchange/transfer_lane.py).
-    from . import transfer_lane
+    # Plain QRDX transfers are judged and run natively, run by run (qrdx/exchange/transfer_lane.py),
+    # and so are plain spot orders and cancels (qrdx/exchange/order_lane.py).
+    from . import order_lane, transfer_lane
 
     prepared = transfer_lane.prepare_all(exchange_txs) if checked else None
+    orders = order_lane.prepare_all(exchange_txs) if checked else None
     if checked:
         refused = mgr.section_errors(
-            exchange_txs, int(block_height), block_timestamp, prepared=prepared
+            exchange_txs,
+            int(block_height),
+            block_timestamp,
+            prepared=order_lane.judged_together(prepared or [], orders or []),
         )
         if refused:
             i = min(refused)
@@ -874,17 +879,28 @@ def process_exchange_transactions(
     lane_runs = (
         dict(transfer_lane.runs(prepared)) if prepared is not None and prepaid is not None else {}
     )
+    order_runs = (
+        dict(transfer_lane.runs(orders)) if orders is not None and prepaid is not None else {}
+    )
     i = 0
     while i < len(exchange_txs):
         end = lane_runs.get(i)
+        results = None
         if end is not None and prepaid is not None and prepared is not None:
             results = transfer_lane.run(mgr, exchange_txs[i:end], prepared[i:end], prepaid[i:end])
-            if results is not None:
-                for k, result in enumerate(results, start=i):
-                    if not result.success:
-                        failed_txs.append((k, exchange_txs[k].tx_hash(), result.error))
-                i = end
-                continue
+        elif order_runs.get(i) is not None and prepaid is not None and orders is not None:
+            end = order_runs[i]
+            try:
+                results = order_lane.run(mgr, exchange_txs[i:end], orders[i:end], prepaid[i:end])
+            except order_lane.Critical as e:  # (an operation Python ran raised: as below)
+                mgr.revert_block()
+                return False, f"Critical exchange error at tx {i + e.index}: {e.error}", ""
+        if results is not None and end is not None:
+            for k, result in enumerate(results, start=i):
+                if not result.success:
+                    failed_txs.append((k, exchange_txs[k].tx_hash(), result.error))
+            i = end
+            continue
         for k in range(i, end if end is not None else i + 1):
             tx = exchange_txs[k]
             try:

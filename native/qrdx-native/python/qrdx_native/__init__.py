@@ -19,6 +19,7 @@ from ._native import (
     mt_build,
     mt_prove,
     mt_update,
+    order_lane_run,
     smt_update,
     threads,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "mt_build",
     "mt_prove",
     "mt_update",
+    "order_lane_run",
     "smt_update",
     "threads",
 ]

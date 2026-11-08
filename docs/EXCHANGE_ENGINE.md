@@ -28,7 +28,7 @@ the plan for moving the exchange into Rust, and what is done.
 | E1 | Exact decimal (`src/dec.rs`) | Python's `Decimal` — add, subtract, multiply, divide, quantize, compare, `str` — under any context, every rounding | done: held to `decimal` on 116,000 random cases |
 | E2 | Order book | Price levels, orders, matching (limit, market, iceberg, hidden, stop, expiry, self-trade), fees, trades, the book's digest and level tree, undo and snapshots | done: held to Python on 16,800 random operations; found a consensus bug (one price in two spellings) |
 | E3a | Spot books held natively | Every spot pair's book is a native one behind the Python book's interface: the router, handlers, triggers, views, undo, snapshots and proofs run unchanged | done (2026-11-08): the exchange with native books is the exchange with Python's, block for block; found a snapshot bug (proof trees) |
-| E3b | Spot settlement | Escrow, token and QRDX moves, fees, the journal's fills: a run of plain limit orders and cancels executed natively end to end | next |
+| E3b | Spot settlement | Escrow, token and QRDX moves, fees, the journal's fills: a run of plain limit orders and cancels executed natively end to end | done (2026-11-08): 210 → 72 µs an order on a block's path |
 | E4 | Ledger | Token balances and nonces held natively, the database written behind the block | |
 | E5 | Router and pools | Unified liquidity (`plan_fill`): the AMM's tick math and the book together | |
 | E6 | Perps | The clearinghouse: margin, funding, liquidation | |
@@ -118,15 +118,55 @@ It is not faster yet: a spot order costs 241 µs with native books against 203 w
 (`scripts/bench/exchange_block.py --workload orders`). Matching is a small part of an order; the
 rest is the Python around it, which now also converts each order it hands across. That is E3b.
 
-## E3b: plain orders natively, end to end (next)
+## E3b: plain orders natively, end to end (2026-11-08)
 
-A block's runs of plain spot orders and cancels, executed by Rust over the native books without
-a Python object per order: the nonce and fee wrapper (as the transfer lane does it), the
-order's checks, escrow, matching, each fill's settlement (token and QRDX moves, fees with each
-owner's rate and referrer computed once in Python, staker and treasury parts), the result and
-the journal. Anything else — a pair whose pool has liquidity in range, a bracket, a builder fee,
-a trigger, a paused token, a modification — goes to Python whole, as an operation, never half
-of one. Held to Python by a manager-level differential test, and measured live.
+A block's runs of plain spot limit orders and cancels run in Rust over the native books
+(`native/qrdx-native/src/order_lane.rs`, `qrdx/exchange/order_lane.py`; docs/NATIVE.md). What
+an operation does is Python's `process_transaction` around `_op_place_order` /
+`_op_cancel_order`, step for step: the nonce; then all or nothing — the block's start for the
+book, the balance check, matching, each fill's settlement (base and quote moved, each side's fee
+by its tier, staking discount and referral, the referrer's reward, the stakers' part, the
+treasury's), the trades' fees into the book's history, the remainder into the escrow, or a
+cancelled order's escrow back; then the gas and the reservation's rest. Errors are Python's,
+word for word.
+
+Python keeps what decides anything else, once a transaction or once a run: parsing and its
+checks (`prepare`; the same checks let the section be judged natively, with plain transfers),
+and per pair where its pools start to fill, whether a fill could reach a trigger or a bracket or
+count toward fee tiers, paused tokens, freezing tokens' senders, each sender's payer. The run
+stops before the first operation it would not reproduce exactly; Python runs that one and the
+run goes on. The ledger stays Python's: entries are read from its dicts when first needed and
+written back through them with the same undo records, keys entering in the same order.
+
+What is still Python's: an order that reaches a pool's price (unified liquidity, E5), a fill on a
+pair with spot triggers or quoted in the perps' settlement asset (its volume counts toward fee
+tiers), market and trigger orders, brackets, builder fees, modifications, an agent's or a
+multisig's signature, the free lane, a book with stop orders.
+
+Tests: `tests/test_order_lane.py` runs random blocks both ways — plain orders in every time in
+force (hidden, iceberg, too large, too small, from an account whose balance was not loaded) and
+cancels (one's own, another's, unknown), on a pair with pool liquidity and triggers, a plain one
+and one quoted in QRDX, among what only Python runs; traders with fee tiers, a negative maker
+rate, staking discounts, referrals capped and not — and compares every result and field, nonce,
+delta and balance (with the order keys entered), the fees, staker fees and fee tokens, the books
+and their history, the root, and takes every block back out by its undo record; and judges
+random sections with refusals both ways. Breaking it is caught: a referrer's reward not paid, a
+move's two sides recorded in the other order, a negative maker rate not floored, the history's
+fees not written, the write-back reordered or missing a dict.
+
+Measured (`scripts/bench/exchange_block.py --workload orders`, a block's section as a node runs
+it — judged, run, its root — 500 operations a block, 30% cancels, 30% crossing, 40% resting):
+
+| | µs an operation |
+|---|---:|
+| Python's books | 210 |
+| native books, through the Python interface (E3a) | 260 |
+| native books and the order lane | 72 |
+
+Of the 72: the native run about 25 (matching, settlement, reading Python's dicts, building the
+results), Python's preparation about 12 plus hashing each new transaction for its order id (a
+node has hashed it on admission already), and the rest the section's judgment, its fee
+reservations and the exchange root.
 
 ## What remains outside the engine
 

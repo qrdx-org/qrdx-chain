@@ -640,13 +640,16 @@ class ExchangeStateManager:
         its nonce. Read only. The block's own height and time are the clock. ``balance_of``
         (default: the pre-loaded balances) and ``base_fee`` (default: the block's, as pre-loaded)
         are how a proposer judges its selection before pre-loading anything — the balances every
-        importer will pre-load. ``prepared``: ``transfer_lane.prepare_all(txs)``, when the caller
-        has it (plain QRDX transfers are judged natively, run by run)."""
-        from . import transfer_lane
+        importer will pre-load. ``prepared``: the transactions prepared for the native lanes, when
+        the caller has them (plain QRDX transfers, spot orders and cancels are judged natively, run
+        by run: ``order_lane.judged_together``)."""
+        from . import order_lane, transfer_lane
 
         balance = balance_of or self.available_balance
         if prepared is None:
-            prepared = transfer_lane.prepare_all(txs)
+            prepared = order_lane.judged_together(
+                transfer_lane.prepare_all(txs), order_lane.prepare_all(txs)
+            )
         lane_runs = dict(transfer_lane.runs(prepared))
         nonces: Dict[str, int] = {}
         votes: Dict[str, int] = {}

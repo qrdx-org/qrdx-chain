@@ -122,8 +122,8 @@ def prepare_all(txs: Sequence[Any]) -> List[Optional[Prepared]]:
     return [prepare(tx) for tx in txs]
 
 
-def runs(prepared: Sequence[Optional[Prepared]]) -> List[Tuple[int, int]]:
-    """The maximal [start, end) runs of prepared transfers."""
+def runs(prepared: Sequence[Optional[Any]]) -> List[Tuple[int, int]]:
+    """The maximal [start, end) runs of prepared transactions."""
     out, i = [], 0
     while i < len(prepared):
         if prepared[i] is None:

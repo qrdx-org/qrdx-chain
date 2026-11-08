@@ -11,8 +11,10 @@ and replay). Prints milliseconds per phase and per transaction.
 
 ``--workload orders`` times spot order flow instead (docs/EXCHANGE_ENGINE.md): one QRDX/token
 book, resting orders on both sides, then blocks of 30% cancels, 30% orders that cross and 40%
-that rest, run through the exchange's own ``process_transaction`` (no database: execution and
-the exchange root only).
+that rest, run as a node runs a block's exchange section (``process_exchange_transactions``:
+judged, then run — plain orders and cancels by the native lane where it is on — and the
+exchange root; no database). ``QRDX_ORDER_LANE=0`` turns the lane off, ``QRDX_NATIVE_BOOK=0``
+the native books too.
 """
 
 from __future__ import annotations
@@ -152,20 +154,25 @@ def orders(args) -> None:
     import random
     from decimal import Decimal as D
 
+    from qrdx.crypto.pq.dilithium import PQPrivateKey
     from qrdx.exchange import ExchangeOpType as Op
     from qrdx.exchange import ExchangeStateManager, ExchangeTransaction
     from qrdx.exchange import block_processor as BP
+    from qrdx.exchange.fair_ordering import fair_order
     from qrdx.exchange.tokens import NATIVE_ASSET
 
     traders = ["0xPQ" + f"{i:064x}" for i in range(1, args.accounts + 1)]
     issuer = "0xPQ" + "f" * 64
     nonces = {}
+    pk = PQPrivateKey.generate().public_key.to_bytes()  # (signatures are checked on admission)
 
     def tx(sender, op, **params):
         n = nonces.get(sender, 0)
         nonces[sender] = n + 1
-        return ExchangeTransaction(op_type=op, sender=sender, nonce=n, params=params,
-                                   gas_limit=2_000_000, gas_price=10**9)
+        t = ExchangeTransaction(op_type=op, sender=sender, nonce=n, params=params,
+                                gas_limit=2_000_000, gas_price=10**9)
+        t.public_key, t.signature = pk, b"\x01" * 3309
+        return t
 
     ExchangeStateManager.reset_instance()
     m = ExchangeStateManager.get_instance()
@@ -200,13 +207,14 @@ def orders(args) -> None:
                   price=str(price), amount=str(rng.randint(1, 50)))
 
     def block(height, txs):
-        m.begin_block(height, float(T0 + height))
+        txs = fair_order(txs)
         start = time.perf_counter()
-        for t in txs:
-            r = m.process_transaction(t)
-            if r.success and t.op_type == Op.PLACE_ORDER and (r.data or {}).get("order_id"):
-                resting.append((t.sender, r.data["order_id"]))
+        ok, error, _root = BP.process_exchange_transactions(height, float(T0 + height), txs, m)
         ran = time.perf_counter() - start
+        assert ok, error
+        for t in txs:
+            if t.success and t.op_type == Op.PLACE_ORDER and (t.result or {}).get("order_id"):
+                resting.append((t.sender, t.result["order_id"]))
         start = time.perf_counter()
         m.compute_state_root()
         root = time.perf_counter() - start
@@ -229,9 +237,9 @@ def orders(args) -> None:
     n = args.txs * args.blocks
     print(f"{args.blocks} blocks × {args.txs} spot operations from {len(traders)} accounts "
           f"(30% cancels, 30% crossing, 40% resting; {2 * args.txs} resting before)")
-    print(f"  execute          {1e3 * ran_total / args.blocks:9.1f} ms a block "
-          f"{1e6 * ran_total / n:8.1f} µs an operation")
-    print(f"  exchange root    {1e3 * root_total / args.blocks:9.1f} ms a block")
+    print(f"  the section      {1e3 * ran_total / args.blocks:9.1f} ms a block "
+          f"{1e6 * ran_total / n:8.1f} µs an operation (judged, run, its root)")
+    print(f"  root again       {1e3 * root_total / args.blocks:9.1f} ms a block (cached)")
 
 
 def main() -> None:

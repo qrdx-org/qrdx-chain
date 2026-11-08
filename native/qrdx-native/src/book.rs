@@ -158,7 +158,7 @@ pub enum Side {
 }
 
 impl Side {
-    fn value(self) -> &'static str {
+    pub(crate) fn value(self) -> &'static str {
         match self {
             Side::Buy => "buy",
             Side::Sell => "sell",
@@ -270,7 +270,7 @@ pub struct Order {
 }
 
 impl Order {
-    fn remaining(&self) -> R<Dec> {
+    pub(crate) fn remaining(&self) -> R<Dec> {
         sub(&self.amount, &self.filled)
     }
     fn is_iceberg(&self) -> bool {
@@ -288,7 +288,7 @@ impl Order {
     fn reserve(&self) -> R<Dec> {
         sub(&self.remaining()?, &self.visible()?)
     }
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         matches!(self.status, Status::Open | Status::PartiallyFilled)
     }
     fn expired(&self, now: Option<f64>) -> bool {
@@ -380,7 +380,7 @@ pub struct State {
     orders: IMap<Id, Arc<Order>>, // resting orders (``_orders``)
     order_seq: IMap<Id, u64>,     // (their insertion order, for expiry)
     next_seq: u64,
-    stop_ids: Vector<Id>, // parked stop orders, in the order they were placed
+    pub(crate) stop_ids: Vector<Id>, // parked stop orders, in the order they were placed
     stops: IMap<Id, Arc<Order>>,
     owner_order_count: IMap<Id, i64>,
     owner_stop_count: IMap<Id, i64>,
@@ -392,7 +392,7 @@ pub struct State {
     paused: bool,
     now: Option<f64>,
     has_expiring: bool,
-    block_height: Option<i64>,
+    pub(crate) block_height: Option<i64>,
     recent: Vector<Trade>, // the display history (never consensus)
     // The incremental commitment (``cached_digest``): each level's digest, their LtHash, the
     // levels touched since, the levels' proof tree. ``level_digests`` None: recompute in full.
@@ -458,11 +458,11 @@ pub struct Book {
     /// Every order the operation in progress changed, as it last was: in Python the order a
     /// caller placed is the object the book indexes, so a stop triggered later in the same
     /// placement can fill it, and the caller sees it.
-    last: std::collections::HashMap<Id, Order>,
+    pub(crate) last: std::collections::HashMap<Id, Order>,
     /// The placing owner's last book nonce, read from Python's committed nonces (``_nonces``),
     /// and the one this placement set: the book's nonces stay Python's, committed and provable.
-    last_nonce: i64,
-    new_nonce: Option<i64>,
+    pub(crate) last_nonce: i64,
+    pub(crate) new_nonce: Option<i64>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1098,6 +1098,23 @@ impl Book {
     // ── other operations ────────────────────────────────────────────────────────────────────
 
     /// ``cancel_order``: the cancelled order, or None if there is none to cancel.
+    /// A fee settlement charged on a trade (``maker``: the maker's, else the taker's), into the
+    /// display history — the newest trade with that id. Whether there was one.
+    pub(crate) fn set_trade_fee(&mut self, id: &str, maker: bool, fee: Dec) -> bool {
+        let recent = &mut self.state.recent;
+        let Some(i) = (0..recent.len()).rev().find(|&i| recent[i].id == id) else {
+            return false;
+        };
+        let mut t = recent[i].clone();
+        if maker {
+            t.maker_fee = fee;
+        } else {
+            t.taker_fee = fee;
+        }
+        recent.set(i, t);
+        true
+    }
+
     pub fn cancel_order(&mut self, id: &str, caller: &str) -> R<Option<Order>> {
         if let Some(order) = self.state.stops.get(id).map(|o| (**o).clone()) {
             if !caller.is_empty() && &*order.owner != caller {
@@ -1466,7 +1483,7 @@ fn order_of(d: &Bound<'_, PyDict>) -> PyResult<Order> {
     })
 }
 
-fn order_dict<'py>(py: Python<'py>, o: &Order) -> PyResult<Bound<'py, PyDict>> {
+pub(crate) fn order_dict<'py>(py: Python<'py>, o: &Order) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new_bound(py);
     d.set_item("id", &*o.id)?;
     d.set_item("owner", &*o.owner)?;
@@ -1516,7 +1533,7 @@ fn fail(e: Fail) -> PyErr {
 /// objects Python handed out stay what the book holds.
 #[pyclass(module = "qrdx_native._native")]
 pub struct NativeBook {
-    book: Book,
+    pub(crate) book: Book,
 }
 
 fn changed_list<'py>(py: Python<'py>, book: &mut Book) -> PyResult<Bound<'py, PyList>> {
@@ -1676,19 +1693,7 @@ impl NativeBook {
     /// A fee settlement charged on a trade (``maker``: the maker's, else the taker's), into the
     /// display history — the newest trade with that id. Whether there was one.
     fn set_trade_fee(&mut self, id: &str, maker: bool, fee: &str) -> PyResult<bool> {
-        let fee = dec_of(fee)?;
-        let recent = &mut self.book.state.recent;
-        let Some(i) = (0..recent.len()).rev().find(|&i| recent[i].id == id) else {
-            return Ok(false);
-        };
-        let mut t = recent[i].clone();
-        if maker {
-            t.maker_fee = fee;
-        } else {
-            t.taker_fee = fee;
-        }
-        recent.set(i, t);
-        Ok(true)
+        Ok(self.book.set_trade_fee(id, maker, dec_of(fee)?))
     }
 
     /// ``new_block``: every order it changed (expired orders, cancelled).

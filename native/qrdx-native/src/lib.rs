@@ -27,6 +27,7 @@ mod lane;
 mod lthash;
 pub mod net;
 mod mtree;
+mod order_lane;
 mod smt;
 mod oqs;
 mod tx;
@@ -252,6 +253,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(book::blake2b_person, m)?)?;
     m.add_function(wrap_pyfunction!(lane::lane_judge, m)?)?;
     m.add_function(wrap_pyfunction!(lane::lane_run, m)?)?;
+    m.add_function(wrap_pyfunction!(order_lane::order_lane_run, m)?)?;
     m.add_class::<net::NetService>()?;
     Ok(())
 }

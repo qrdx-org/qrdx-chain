@@ -18,7 +18,9 @@ byte.
 | `smt_update(root, changes, version, cache)` | `smt.Tree.update` | the database's proof tree, once a block (`state_proofs.proof_root`) |
 | `mt_build`, `mt_update`, `mt_prove`, `MNode` | `smt._py_build`, `_py_update`, `_py_prove`, `smt.MNode` | the exchange's in-memory proof trees, every collection and order book a block touches (`smt.m_*`) |
 | `lt_mix_entries(acc, tag, removed, added)` | `commitment._apply` of each entry's `lthash.entry` | the exchange's accumulators, every collection a block touches (`commitment._apply_digests`) |
-| `lane_judge`, `lane_run` | `section_errors` and `process_transaction` for plain QRDX transfers | a block's runs of plain transfers, judged and run (`qrdx/exchange/transfer_lane.py`) |
+| `lane_judge`, `lane_run` | `section_errors` and `process_transaction` for plain QRDX transfers | a block's runs of plain transfers, judged and run (`qrdx/exchange/transfer_lane.py`); `lane_judge` judges plain spot orders and cancels too |
+| `NativeBook` | `orderbook.OrderBook` | every spot pair's book, behind the Python book's interface (`qrdx/exchange/native_book.py`; docs/EXCHANGE_ENGINE.md) |
+| `order_lane_run` | `process_transaction` for plain spot limit orders and cancels: matching, settlement, fees, escrow | a block's runs of them over the native books (`qrdx/exchange/order_lane.py`) |
 | `NetService` | signed HTTP batches of JSON between peers | the peer transport for transactions, blocks and votes (docs/NETWORK.md, `qrdx/node/netd.py`) |
 
 On a block of 2,000 transfers (`scripts/bench/exchange_block.py`, 24 cores):
@@ -101,6 +103,24 @@ writes back goes through the same dicts and undo records, new keys in the order 
 have inserted them. Anything else in a block (another token, another operation, an agent's or a
 multisig's signature) is Python's.
 
+### Plain spot orders and cancels
+
+A plain limit order (any time in force, hidden or iceberg) or a cancel, signed by its account's
+own key, is prepared by `qrdx/exchange/order_lane.py` with Python's own parsing and checks, and
+judged with the plain transfers (`lane_judge`: its nonce, its payer's fees). `order_lane_run`
+then runs a run of them over the native books: the nonce, the operation all or nothing —
+matching (`book.rs`), each fill's settlement (base and quote moved, each side's fee by its fee
+tier, staking discount and referral, the referrer's reward, the stakers' part, the treasury's),
+the remainder into the book's escrow, or a cancelled order's escrow back — then the gas. Python
+gathers per pair what no operation of a run can change: where its pools start to fill, whether a
+fill could reach a trigger or a bracket or count toward fee tiers, paused and freezing tokens,
+each sender's payer. The run stops before the first operation it would not reproduce exactly (an
+order reaching a pool, a fill a trigger could see, a frozen sender, a value past its decimals);
+Python runs that one and the run goes on. Ledger entries are read from Python's dicts when first
+needed and written back through them with the same undo records, new keys in the order Python's
+would have inserted them. Anything else (market and trigger orders, brackets, builder fees, an
+agent's or a multisig's signature, the free lane) is Python's.
+
 ### Canonical JSON
 
 The encoder writes what Python's `json` writes:
@@ -140,7 +160,14 @@ past 900. An object `json` cannot serialize raises `TypeError`, as in Python.
   back;
 * the transfer lane over random blocks (tests/test_transfer_lane.py), run with and without it:
   the same judgment and refusals, results, fees, nonces, deltas (and the order they entered),
-  available balances and root, and every block taken back out by its undo record.
+  available balances and root, and every block taken back out by its undo record;
+* the native book against Python's (tests/test_native_book.py) and the exchange with each
+  (tests/test_native_spot_equivalence.py) — docs/EXCHANGE_ENGINE.md;
+* the order lane over random blocks of orders and cancels among what only Python runs
+  (tests/test_order_lane.py), with and without it: every result and field, nonces, deltas and
+  balances (and the order keys entered), fees, staker fees, fee tokens, the books and their
+  history, the root, every block taken back out; and random sections with refusals judged the
+  same.
 
 The test suite also runs with `QRDX_VERIFY_STATE_COMMITMENTS=1`, which checks every exchange
 commitment against Python's from-scratch recomputation: the accumulator by Python's vectors, the
@@ -169,8 +196,9 @@ pip install --no-deps dist/qrdx_native-0.1.0-cp310-abi3-linux_x86_64.whl
 
 ## What is not native yet
 
-Execution beyond plain transfers (the order book, perps, pools, tokens), each entry's encoding
-for the exchange's commitments, and the database writes still run in Python. So do sync between
+Execution beyond plain transfers and plain spot orders (pools, market and trigger orders, perps,
+tokens), each entry's encoding for the exchange's commitments, and the database writes still run
+in Python. So do sync between
 peers, fork choice and the validator client. The exchange's state held natively, with the
 database written behind it, is the next candidate and the largest (docs/PERFORMANCE.md, "What
 limits it next"). The Python versions stay as the reference the native ones are tested
