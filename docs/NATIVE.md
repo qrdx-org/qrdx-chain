@@ -21,6 +21,8 @@ byte.
 | `lane_judge`, `lane_run` | `section_errors` and `process_transaction` for plain QRDX transfers | a block's runs of plain transfers, judged and run (`qrdx/exchange/transfer_lane.py`); `lane_judge` judges plain spot orders and cancels too |
 | `NativeBook` | `orderbook.OrderBook` | every spot pair's book, behind the Python book's interface (`qrdx/exchange/native_book.py`; docs/EXCHANGE_ENGINE.md) |
 | `order_lane_run` | `process_transaction` for plain spot orders (limit and market), cancels and swaps: matching, the pools and the router (`router.rs`), settlement, fees, escrow | a block's runs of them over the native books (`qrdx/exchange/order_lane.py`) |
+| `wire_parse`, `wire_build`, `wire_text` | `wire.py_decode`, `py_encode`, `base64` | exchange transactions' binary form: every block section decoded on import, encoded by its proposer (`qrdx/exchange/wire.py`) |
+| `tx_read` | the transport's own reading of a relayed transaction (its JSON or binary form): its hash and signed bytes | tests (`tests/test_exchange_wire.py`) |
 | `NetService` | signed HTTP batches of JSON between peers | the peer transport for transactions, blocks and votes (docs/NETWORK.md, `qrdx/node/netd.py`) |
 
 On a block of 2,000 transfers (`scripts/bench/exchange_block.py`, 24 cores):

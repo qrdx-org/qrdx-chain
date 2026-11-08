@@ -145,7 +145,7 @@ async def _admit(peer: str, items: List[Tuple[bytes, Optional[str], Any, Any, An
     verdicts: Dict[Tuple[bytes, bytes, bytes], bool] = {}
     for raw, tx_hash, signed, verdict, _reason in items:
         try:
-            tx = parse_exchange_tx(json.loads(raw))
+            tx = parse_exchange_tx(raw)
         except Exception:
             continue
         if signed is not None and verdict is not None and tx.public_key and tx.signature:
@@ -230,21 +230,28 @@ def send_votes(raws: List[bytes], except_node: Optional[str] = None) -> List[str
         return []
 
 
-def hold_section(hashes: List[str], section: List[Dict[str, Any]]) -> None:
+def _held(item: Any) -> bytes:
+    """An operation as the transport hands it to a peer: its binary form (a section item in the
+    binary form's text), or its JSON."""
+    if isinstance(item, str):
+        from qrdx.exchange.wire import from_text
+
+        return from_text(item)
+    from qrdx.fastjson import dumps
+
+    return dumps(item).encode()
+
+
+def hold_section(hashes: List[str], section: List[Any]) -> None:
     """Keep a block's operations where a peer can ask for them (those the pool lacks)."""
     if SERVICE is None or not hashes or len(hashes) != len(section):
         return
-    from qrdx.fastjson import dumps
 
     try:
         missing = set(SERVICE.missing(list(hashes)))
         if missing:
             SERVICE.hold(
-                [
-                    (h, dumps(item).encode())
-                    for h, item in zip(hashes, section, strict=True)
-                    if h in missing
-                ]
+                [(h, _held(item)) for h, item in zip(hashes, section, strict=True) if h in missing]
             )
     except Exception as e:
         logger.debug(f"peer transport: a block's operations not held: {e}")

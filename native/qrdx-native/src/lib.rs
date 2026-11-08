@@ -32,6 +32,7 @@ mod router;
 mod smt;
 mod oqs;
 mod tx;
+mod wire;
 
 create_exception!(_native, Unsupported, PyException);
 
@@ -255,6 +256,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lane::lane_judge, m)?)?;
     m.add_function(wrap_pyfunction!(lane::lane_run, m)?)?;
     m.add_function(wrap_pyfunction!(order_lane::order_lane_run, m)?)?;
+    m.add_function(wrap_pyfunction!(tx::tx_read, m)?)?;
+    m.add_function(wrap_pyfunction!(wire::wire_parse, m)?)?;
+    m.add_function(wrap_pyfunction!(wire::wire_build, m)?)?;
+    m.add_function(wrap_pyfunction!(wire::wire_text, m)?)?;
     m.add_class::<net::NetService>()?;
     Ok(())
 }

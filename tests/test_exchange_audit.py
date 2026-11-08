@@ -256,7 +256,7 @@ async def test_a_block_without_an_exchange_root_cannot_carry_forged_transactions
                                              "amount": "1000"},
                                      gas_limit=2_000_000, gas_price=10**9)  # never signed
         ok, err = await block_import._apply_exchange_section_on_import(
-            2, float(T + 2), encode_exchange_txs([forged]), None)
+            2, float(T + 2), encode_exchange_txs([forged], 2), None)  # (block 2's form)
         assert not ok and "failed verification" in err
         assert await db.get_token_balance(token, thief) == 0
         assert await db.get_token_balance(token, victim) == 1000

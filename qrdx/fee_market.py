@@ -66,7 +66,12 @@ def floors() -> Tuple[int, int]:
 def _is_vote(item: Any) -> bool:
     from .exchange.transactions import ExchangeOpType
 
-    op = item.get("op_type") if isinstance(item, dict) else getattr(item, "op_type", None)
+    if isinstance(item, str):  # (the binary form's text)
+        from .exchange.wire import peek
+
+        op: Any = peek(item)[0]
+    else:
+        op = item.get("op_type") if isinstance(item, dict) else getattr(item, "op_type", None)
     if op is None:
         return False
     try:
@@ -81,6 +86,10 @@ def _in_free_lane(item: Any) -> bool:
 
     if _price(item) != 0:
         return False
+    if isinstance(item, str):  # (a free one in the binary form: decoded for its params)
+        from .exchange.transactions import ExchangeTransaction
+
+        item = ExchangeTransaction.from_any(item)
     op = item.get("op_type") if isinstance(item, dict) else getattr(item, "op_type", None)
     params = item.get("params") if isinstance(item, dict) else getattr(item, "params", None)
     if op is None:
@@ -93,6 +102,10 @@ def _in_free_lane(item: Any) -> bool:
 
 
 def _price(item: Any) -> int:
+    if isinstance(item, str):  # (the binary form's text: its head read alone)
+        from .exchange.wire import peek
+
+        return int(peek(item)[2])
     raw = item.get("gas_price", 0) if isinstance(item, dict) else getattr(item, "gas_price", 0)
     return int(raw)
 

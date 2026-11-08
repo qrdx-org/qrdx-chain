@@ -22,7 +22,6 @@ The node's state (the exchange mempool) lives in qrdx.node.main and is read from
 time, as ``_node.<name>``.
 """
 
-import json
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -134,7 +133,7 @@ async def rebuild(
             return None, f"{len(missing)} of the block's exchange operations are unavailable"
         for i, item in zip(missing, fetched, strict=True):
             try:
-                tx = ExchangeTransaction.from_dict(item)
+                tx = ExchangeTransaction.from_any(item)
             except Exception as e:
                 return None, f"the sender sent an unreadable operation: {e}"
             if tx.tx_hash() != hashes[i]:
@@ -142,7 +141,12 @@ async def rebuild(
             txs[i] = tx
     full = {k: v for k, v in block_data.items() if k != "exchange_tx_hashes"}
     objects = [t for t in txs if t is not None]
-    full["exchange_transactions"] = [t.to_dict() for t in objects]
+    from qrdx.exchange.block_processor import encode_exchange_txs
+
+    height = block_data.get("id")
+    full["exchange_transactions"] = encode_exchange_txs(
+        objects, int(height) if isinstance(height, int) else None
+    )
     full["_exchange_objects"] = objects
     full["_exchange_tx_hashes"] = list(hashes)
     if missing:
@@ -163,7 +167,7 @@ def _read(raws: List[Optional[bytes]], hashes: List[str]) -> List[Any]:
         tx = None
         if raw is not None:
             try:
-                tx = parse_exchange_tx(json.loads(raw))
+                tx = parse_exchange_tx(raw)
                 if tx.tx_hash() != h:
                     tx = None
             except Exception:

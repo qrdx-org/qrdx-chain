@@ -115,7 +115,7 @@ def assemble_pos_block_data(
         # is not in use.
         from ..exchange.block_processor import BLOCK_EXCHANGE_TXS_KEY, encode_exchange_txs
 
-        data[BLOCK_EXCHANGE_TXS_KEY] = encode_exchange_txs(exchange_txs)
+        data[BLOCK_EXCHANGE_TXS_KEY] = encode_exchange_txs(exchange_txs, height)
         # Kept beside the block, never sent: the decoded operations, which name the section by
         # hash when it is relayed compact (qrdx/node/block_relay.py).
         data["_exchange_objects"] = list(exchange_txs)
@@ -872,7 +872,9 @@ class ValidatorNode:
                                     state_root=unified_root,
                                     timestamp=block_timestamp,
                                     exchange_section=(
-                                        encode_exchange_txs(exchange_txs) if exchange_txs else []
+                                        encode_exchange_txs(exchange_txs, next_height)
+                                        if exchange_txs
+                                        else []
                                     ),
                                     evm_section=encode_evm_txs(evm_txs) if evm_txs else [],
                                     base_fees=base_fees,
@@ -1592,7 +1594,9 @@ class ValidatorNode:
                 transactions=pending_txs[:100],  # Limit to 100 txs per block
                 state_root=state_root,
                 timestamp=block_timestamp,
-                exchange_section=encode_exchange_txs(exchange_txs) if exchange_txs else [],
+                exchange_section=(
+                    encode_exchange_txs(exchange_txs, next_height) if exchange_txs else []
+                ),
                 evm_section=encode_evm_txs(evm_raws) if evm_raws else [],
                 base_fees=base_fees,
             )

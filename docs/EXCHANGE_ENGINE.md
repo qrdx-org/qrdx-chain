@@ -29,7 +29,7 @@ the plan for moving the exchange into Rust, and what is done.
 | E2 | Order book | Price levels, orders, matching (limit, market, iceberg, hidden, stop, expiry, self-trade), fees, trades, the book's digest and level tree, undo and snapshots | done: held to Python on 16,800 random operations; found a consensus bug (one price in two spellings) |
 | E3a | Spot books held natively | Every spot pair's book is a native one behind the Python book's interface: the router, handlers, triggers, views, undo, snapshots and proofs run unchanged | done (2026-11-08): the exchange with native books is the exchange with Python's, block for block; found a snapshot bug (proof trees) |
 | E3b | Spot settlement | Escrow, token and QRDX moves, fees, the journal's fills: a run of plain limit orders and cancels executed natively end to end | done (2026-11-08): 210 → 72 µs an order on a block's path |
-| E4 | Ledger | Token balances and nonces held natively, the database written behind the block | |
+| E4 | Ledger | Token balances and nonces held natively, the database written behind the block | measured (2026-11-08): the block's maps held natively were slower, taken back out; the database's cost is its triggers and preloads (below), and writing it behind belongs to deferring execution further |
 | E5 | Router and pools | Unified liquidity (`plan_fill`): the AMM's tick math and the book together | done (2026-11-08): orders that reach a pool and swaps (hub routing too) run natively; 240 → 113 µs an order, 331 → 155 with swaps |
 | E6 | Perps | The clearinghouse: margin, funding, liquidation | |
 
@@ -219,10 +219,41 @@ operation):
 | orders, `--liquidity` (crossing orders reach the pool) | 240 | 113 |
 | orders and swaps, `--liquidity --swaps 0.3` | 331 | 155 |
 
+## E4: the ledger (2026-11-08) — measured, left as Python's
+
+The block's balance ledger (each address's QRDX delta and loaded balance, each holder's token
+delta and loaded balance) was moved into Rust behind dict views, with savepoints for undo, and
+the lanes read and wrote it directly. It was slower: orders 75 → 92 µs, transfers' execution and
+flush slower too. Every Python caller (the fee reservation, the preloads, the inclusion judgment,
+the flush's copy) paid a native call and a decimal conversion where a dict costs a fraction, and
+the lanes had already read each entry once a stretch. It was taken back out (not committed).
+
+What the ledger costs a block is the database: the flush (about 19 µs a row: SQLite's triggers
+for the state commitment, the proof tree and the undo journal, mostly the first change of a row
+in a block) and the preloads (6 µs a transfer). A cache of balances across blocks would skip the
+preloads, but `account_state` and `token_balances` are written from fourteen places (the EVM's
+state, genesis, the undo journal's rollbacks), only two of which tell a listener: keeping a cache
+coherent is a consensus risk larger than what it saves. Writing the database behind the block is
+a pipeline question: it is part of deferring execution a second block, below.
+
+## Binary transactions (2026-11-08)
+
+Exchange transactions travel and are stored in binary (chain-spec feature `binary_exchange_txs`,
+a genesis default; `qrdx/exchange/wire.py`, `native/qrdx-native/src/wire.rs`; docs/PERFORMANCE.md
+30): half the bytes of their JSON, a third less in a block body (base64). The signed bytes and the
+hash are unchanged, so is every check. A block's section is in the form its height carries
+(a compact block is rebuilt by height, so a proposer may not choose); peers relay the bytes,
+the transport's native reader reads both forms. Tests (`tests/test_exchange_wire.py`): random
+transactions of every shape round-trip to the same fields, signed bytes and hash, whatever their
+params' order; the native codec is Python's (bytes, transactions, refusals); the transport's
+reader gives the same hash and signed bytes from either form; malformed input is refused; a
+binary section goes through the block's limits, its children's base fees, storage, the
+transport's held operations and an import.
+
 ## What remains outside the engine
 
-* **A binary transaction format** (a fork): a transfer is about 10.5 KB of hex JSON. Binary
-  halves it, and a key named by its address (the registry the chain already has) saves 1.95 KB
-  more. Every block hashes, stores and relays less.
+* **A key named by its account**: 1.95 KB more out of every transaction once the chain has seen
+  its key. Only validators' keys are registered; an accounts' key registry is new consensus
+  state (reorgs, snapshots, checkpoint sync).
 * **Execution deferred a second block** (a fork): the next proposer would not wait for its
   parent's run either; the inclusion rule then needs a fee reserve.

@@ -403,6 +403,50 @@ class ExchangeTransaction:
             "tx_hash": self.tx_hash(),
         }
 
+    def to_wire(self) -> bytes:
+        """The binary form (qrdx/exchange/wire.py), remembered while every field it is made of is
+        as it was."""
+        from . import wire
+
+        key = self._fingerprint()
+        key = None if key is None else (key, self.timestamp, self.signature, self.public_key)
+        memo = self.__dict__.get("_wire_memo")
+        if key is not None and memo is not None and memo[0] == key:
+            return memo[1]  # type: ignore[no-any-return]
+        raw = wire.encode(self)
+        if key is not None:
+            self.__dict__["_wire_memo"] = (key, raw)
+        return raw
+
+    def to_text(self) -> str:
+        """The binary form as a block body carries it (base64), remembered with it."""
+        from . import wire
+
+        raw = self.to_wire()
+        memo = self.__dict__.get("_text_memo")
+        if memo is not None and memo[0] is raw:
+            return memo[1]  # type: ignore[no-any-return]
+        text = wire.to_text(raw)
+        self.__dict__["_text_memo"] = (raw, text)
+        return text
+
+    @classmethod
+    def from_wire(cls, raw: bytes) -> "ExchangeTransaction":
+        from . import wire
+
+        return wire.decode(raw)  # type: ignore[no-any-return]
+
+    @classmethod
+    def from_any(cls, item: Any) -> "ExchangeTransaction":
+        """A section's or a peer's item: the binary form's text or bytes, or the JSON object."""
+        from . import wire
+
+        if isinstance(item, cls):
+            return item
+        if isinstance(item, (str, bytes, bytearray)):
+            return wire.decode(item)  # type: ignore[no-any-return]
+        return cls.from_dict(item)
+
     def _hex(self) -> Tuple[str, str]:
         """The signature's and public key's hex, remembered while both are the same objects (5
         KB, hexed for the block body, its store and gossip alike)."""

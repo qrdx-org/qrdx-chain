@@ -42,7 +42,7 @@ def txs():
 
 
 def _block(txs):
-    section = encode_exchange_txs(txs)
+    section = encode_exchange_txs(txs, 9)  # (block 9: the form its height carries)
     data = {"id": 9, "block_hash": "ab" * 32, "block_content": "{}", "exchange_transactions": section,
             "exchange_state_root": "cd" * 32, "_exchange_objects": list(txs)}
     data["body_root"] = body_root(data)

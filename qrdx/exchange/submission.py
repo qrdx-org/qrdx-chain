@@ -61,8 +61,12 @@ def parse_exchange_tx(tx: Any) -> ExchangeTransaction:
     if isinstance(tx, ExchangeTransaction):
         return tx
     if isinstance(tx, (bytes, bytearray)):
+        if tx[:1] == b"\x01":  # (the binary form: qrdx/exchange/wire.py)
+            return ExchangeTransaction.from_wire(bytes(tx))
         tx = tx.decode()
     if isinstance(tx, str):
+        if not tx.lstrip().startswith("{"):  # (the binary form's text)
+            return ExchangeTransaction.from_any(tx)
         tx = json.loads(tx)
     if not isinstance(tx, dict):
         raise ValueError("an exchange transaction is a JSON object")
@@ -183,7 +187,7 @@ class ExchangeSubmitter:
         # The same batch to every peer, encoded and signed once (each peer's own encoding of a
         # megabyte batch was a share of a loaded node's event loop).
         self._forward_batch_to_all = forward_batch_to_all
-        self._outbox: List[Dict[str, Any]] = []
+        self._outbox: List[Any] = []  # (each its binary form's text)
         self._announcements: List[str] = []
         self._seen: "OrderedDict[str, None]" = OrderedDict()
         self._flusher: Optional[asyncio.Future] = None
@@ -225,9 +229,7 @@ class ExchangeSubmitter:
             return False, err, None
         if self._transport is not None:
             if not propagated and raw is None:
-                from .. import fastjson
-
-                raw = fastjson.dumps(tx.to_dict()).encode()
+                raw = tx.to_wire()  # (the binary form: half the bytes of its JSON)
             self._to_relay.append((tx_hash, raw, not propagated, origin))
             if len(self._to_relay) == 1:  # (what is admitted together goes in one call)
                 asyncio.get_running_loop().call_soon(self._relay_now)
@@ -236,12 +238,12 @@ class ExchangeSubmitter:
             if propagated and self._announce is not None:
                 self._announcements.append(tx_hash)
             else:
-                self._outbox.append(tx.to_dict())
+                self._outbox.append(tx.to_text())
             if self._flusher is None or self._flusher.done():
                 self._flusher = asyncio.ensure_future(self._flush_outbox())
         else:
             asyncio.ensure_future(
-                self._gossip(tx.to_dict(), origin="peer" if propagated else "local")
+                self._gossip(tx.to_text(), origin="peer" if propagated else "local")
             )
         return True, "", tx_hash
 
@@ -348,7 +350,7 @@ class ExchangeSubmitter:
                 if isinstance(r, Exception):
                     logger.debug("exchange gossip to %s failed: %s", url, r)
 
-    async def _gossip_to(self, url: str, push: List[Dict[str, Any]], announce: List[str]) -> None:
+    async def _gossip_to(self, url: str, push: List[Any], announce: List[str]) -> None:
         assert self._forward_batch is not None
         for at in range(0, len(push), GOSSIP_BATCH):
             await self._forward_batch(url, push[at : at + GOSSIP_BATCH])
@@ -359,11 +361,11 @@ class ExchangeSubmitter:
             chunk = announce[at : at + ANNOUNCE_BATCH]
             asked = set(await self._announce(url, chunk) or ())
             txs = [mempool.get(h) for h in chunk if h in asked]
-            wanted = [t.to_dict() for t in txs if t is not None]
+            wanted = [t.to_text() for t in txs if t is not None]
             for start in range(0, len(wanted), GOSSIP_BATCH):
                 await self._forward_batch(url, wanted[start : start + GOSSIP_BATCH])
 
-    async def _gossip(self, tx_dict: Dict[str, Any], origin: str) -> None:
+    async def _gossip(self, tx_dict: Any, origin: str) -> None:
         try:
             urls = [u for u in self._get_peer_urls() if u]
         except Exception as e:

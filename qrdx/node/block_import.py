@@ -126,6 +126,7 @@ async def _apply_exchange_section_on_import(
         flush_validator_lifecycle_deltas,
         preload_sender_balances,
         preload_token_balances,
+        section_form_error,
         verify_exchange_txs,
     )
     from ..exchange.state_manager import ExchangeStateManager
@@ -136,6 +137,11 @@ async def _apply_exchange_section_on_import(
     # (docs/EXCHANGE_AUDIT.md).
     # Decoded once, here; the steps below share these transactions (a compact block's are the
     # mempool's own, checked when admitted: docs/PERFORMANCE.md).
+    # The section in the form its height carries (chain-spec ``binary_exchange_txs``): a
+    # compact block is rebuilt by height, so a proposer may not choose another.
+    _form = section_form_error(ex_section, int(block_height))
+    if _form:
+        return False, f"exchange section of block {block_height}: {_form}"
     try:
         _decoded = decode_exchange_txs(ex_section)
     except Exception as e:

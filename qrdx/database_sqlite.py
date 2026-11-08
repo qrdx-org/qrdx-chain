@@ -1846,13 +1846,19 @@ class DatabaseSQLite:
         # (its children's base fee reads the gas it declared: noted now, not parsed back)
         note_exchange_section(self, block_hash, items)
 
+        def tx_hash(idx: int, item: Any) -> str:
+            if objects is not None and len(objects) == len(items):
+                return str(objects[idx].tx_hash())
+            if isinstance(item, dict):
+                return str(item.get("tx_hash", ""))
+            from .exchange.transactions import ExchangeTransaction
+
+            return str(ExchangeTransaction.from_any(item).tx_hash())  # (the binary form's text)
+
         await self.connection.executemany(
             "INSERT OR IGNORE INTO block_exchange_transactions "
             "(block_hash, tx_index, tx_hash, tx_data) VALUES (?, ?, ?, ?)",
-            [
-                (block_hash, idx, item.get("tx_hash", ""), dumps(item))
-                for idx, item in enumerate(items)
-            ],
+            [(block_hash, idx, tx_hash(idx, item), dumps(item)) for idx, item in enumerate(items)],
         )
         await self.connection.commit()
 

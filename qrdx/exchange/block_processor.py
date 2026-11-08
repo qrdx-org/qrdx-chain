@@ -1348,15 +1348,45 @@ def extract_exchange_transactions(block: Any) -> List[ExchangeTransaction]:
 BLOCK_EXCHANGE_TXS_KEY = "exchange_transactions"
 
 
-def encode_exchange_txs(txs: List[ExchangeTransaction]) -> List[Dict[str, Any]]:
+def binary_section(height: Optional[int]) -> bool:
+    """Does a block at ``height`` carry its exchange transactions in their binary form
+    (chain-spec feature ``binary_exchange_txs``)?"""
+    if height is None:
+        return False
+    from .. import chain_spec
+
+    return chain_spec.is_active("binary_exchange_txs", int(height))
+
+
+def encode_exchange_txs(txs: List[ExchangeTransaction], height: Optional[int] = None) -> List[Any]:
     """
-    Encode an ordered list of exchange transactions for the block body.
+    Encode an ordered list of exchange transactions for the body of the block at ``height``.
 
     Order is preserved exactly (it is consensus-relevant — the proposer's
-    canonical selection order). Per-tx ``to_dict`` already serializes the PQ
-    signature + public key, so authentication survives the round trip.
+    canonical selection order). Each is its binary form's text where the block carries that
+    (``binary_section``), else its ``to_dict``; either keeps the PQ signature and public key,
+    so authentication survives the round trip. A function of the transactions and the height,
+    so a block rebuilt from a node's own copies of them (a compact block) is the proposer's.
     """
+    if binary_section(height):
+        return [tx.to_text() for tx in txs]
     return [tx.to_dict() for tx in txs]
+
+
+def section_form_error(items: Optional[List[Any]], height: int) -> str:
+    """Why a section is not in the form a block at ``height`` carries ("" if it is): every
+    item its binary form's text where ``binary_section``, every one an object elsewhere."""
+    if not items:
+        return ""
+    binary = binary_section(height)
+    for i, item in enumerate(items):
+        if isinstance(item, ExchangeTransaction):
+            continue  # (decoded already: the body it came in was checked)
+        if binary and not isinstance(item, str):
+            return f"exchange transaction {i} is not in its binary form"
+        if not binary and not isinstance(item, dict):
+            return f"exchange transaction {i} is not an object"
+    return ""
 
 
 def decode_exchange_txs(items: Optional[List[Any]]) -> List[ExchangeTransaction]:
@@ -1369,9 +1399,7 @@ def decode_exchange_txs(items: Optional[List[Any]]) -> List[ExchangeTransaction]
     """
     if not items:
         return []
-    return [
-        d if isinstance(d, ExchangeTransaction) else ExchangeTransaction.from_dict(d) for d in items
-    ]
+    return [ExchangeTransaction.from_any(d) for d in items]
 
 
 def exchange_txs_canonical_bytes(txs: List[ExchangeTransaction]) -> bytes:

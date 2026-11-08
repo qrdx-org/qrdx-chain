@@ -74,7 +74,7 @@ async def test_a_wallets_transaction_is_pushed_whole_to_every_peer():
     t = _signed(PQPrivateKey.generate(), 0)
     assert (await sub.submit(t.to_dict()))[0]
     await _flushed(sub)
-    assert [d["nonce"] for d in net.pushed["http://a"]] == [0] == [d["nonce"] for d in net.pushed["http://b"]]
+    assert [ExchangeTransaction.from_any(d).nonce for d in net.pushed["http://a"]] == [0] == [ExchangeTransaction.from_any(d).nonce for d in net.pushed["http://b"]]
     assert net.announced == {}
 
 
@@ -86,7 +86,7 @@ async def test_a_relayed_transaction_is_announced_and_sent_only_where_it_is_lack
     await _flushed(sub)
     assert net.announced == {"http://a": [t.tx_hash()], "http://b": [t.tx_hash()]}
     assert "http://a" not in net.pushed                       # it had it
-    assert [d["nonce"] for d in net.pushed["http://b"]] == [0]
+    assert [ExchangeTransaction.from_any(d).nonce for d in net.pushed["http://b"]] == [0]
 
 
 async def test_a_node_asks_for_nothing_it_holds_or_handled_lately():

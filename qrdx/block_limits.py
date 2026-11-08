@@ -60,7 +60,14 @@ def exchange_section_gas(section: Optional[Iterable[Any]]) -> int:
     """The declared gas limits of an exchange section's operations, summed."""
     total = 0
     for item in section or ():
-        gas = item.get("gas_limit", 100_000) if isinstance(item, dict) else item.gas_limit
+        if isinstance(item, dict):
+            gas = item.get("gas_limit", 100_000)
+        elif isinstance(item, str):  # (the binary form's text: its head read alone)
+            from .exchange.wire import peek
+
+            gas = peek(item)[1]
+        else:
+            gas = item.gas_limit
         total += int(gas)
     return total
 

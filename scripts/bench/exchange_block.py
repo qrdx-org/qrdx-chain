@@ -129,11 +129,13 @@ async def run(args) -> None:
                 await BP.flush_validator_lifecycle_deltas(db, mgr, block_epoch=0, block_height=b)
             with clock.phase("unified state root"):
                 await ValidatorNode._compute_unified_state_root(SimpleNamespace(db=db), b, b)
+            with clock.phase("encode its section (proposer)"):
+                section = BP.encode_exchange_txs(kept, b)
             with clock.phase("store the block"):
                 bh = f"{b:064x}"
                 await db.add_block(block_hash=bh, block_height=b, block_content="{}",
                                    validator_address="0xPQ" + "ab" * 32, timestamp=int(ts))
-                await db.add_block_exchange_txs(bh, BP.encode_exchange_txs(kept))
+                await db.add_block_exchange_txs(bh, section, kept)
                 await db.connection.commit()
             total += len(kept)
     finally:

@@ -399,6 +399,13 @@ The fourth round, consensus changes for the regenesis (2026-11-05):
     block's missing operations are asked of its sender there before HTTP. The transaction index
     reads a block it just stored from memory (it re-read and parsed the section, a megabyte a
     block at load, holding the block lock).
+30. **Exchange transactions in binary** (chain-spec feature `binary_exchange_txs`, a genesis
+    default; qrdx/exchange/wire.py, native/qrdx-native/src/wire.rs). A transaction's signature
+    and key travel as bytes, its other fields as varints: a transfer is 5.5 KB rather than
+    10.9 KB of JSON, 7.3 KB as the base64 a block body carries. Every block hashes for its body
+    root, stores and relays a third less; peers relay each other the bytes (the transport's
+    native reader checks either form). What a transaction signs and its hash are unchanged.
+    Decoding one costs about what its JSON did (11 µs, the base64 and fields native).
 
 Each block's phase line ends with its database round trips (`db N`).
 
@@ -537,9 +544,11 @@ In the order they would pay, toward four blocks a second at 2,000–4,000 transf
    run off the path too, but the inclusion rule then needs a balance no block has computed
    yet: a reserve each account keeps for fees, as some chains do, or fees judged against a
    bound of what the pending block can spend.
-3. **The size of what a block stores and hashes.** A transfer is about 10.5 KB of hex JSON, so
-   a block of 900 is about 10 MB to hash for its body root, write to the database and keep.
-   A binary wire format (below) shrinks all three; it changes what is signed, so it is a fork.
+3. **The size of what a block stores and hashes.** Binary transactions (30, above) took a third
+   off; the rest is the signature itself (3.3 KB) and a key (1.9 KB) in every transaction. A
+   key named by its account once the chain has seen it would take the key out, but no registry
+   of accounts' keys exists (only validators'): one is new consensus state (kept through
+   reorgs, snapshots and checkpoint sync).
 4. **The protocol cap and transaction size,** above.
 5. **Real machines.** The emulation shares one machine's memory and disk; the geo-distributed
    soak (§3.4) is the real measure.

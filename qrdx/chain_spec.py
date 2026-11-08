@@ -437,6 +437,12 @@ FEATURES: Dict[str, str] = {
         "refused before it runs — which used to sit in the block without paying, consuming its "
         "nonce or executing — is invalid."
     ),
+    "binary_exchange_txs": (
+        "A block's exchange transactions travel and are stored in their binary form (base64 "
+        "in the block body; qrdx/exchange/wire.py) rather than as JSON objects with hex "
+        "signatures and keys: half the bytes to hash, store and relay. The signed bytes and "
+        "the hash of a transaction are unchanged."
+    ),
     "deferred_execution": (
         "A block commits to the state its parent left (its signed state root is the unified "
         "root after the parent), not to its own: a proposer judges and signs a block before "
@@ -459,6 +465,7 @@ GENESIS_DEFAULT_FEATURES: Tuple[str, ...] = (
     "exchange_inclusion",
     "evm_conformance",
     "deferred_execution",
+    "binary_exchange_txs",
 )
 
 

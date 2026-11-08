@@ -22,6 +22,10 @@ from ._native import (
     order_lane_run,
     smt_update,
     threads,
+    tx_read,
+    wire_build,
+    wire_parse,
+    wire_text,
 )
 
 __all__ = [
@@ -46,4 +50,8 @@ __all__ = [
     "order_lane_run",
     "smt_update",
     "threads",
+    "tx_read",
+    "wire_build",
+    "wire_parse",
+    "wire_text",
 ]
