@@ -467,11 +467,15 @@ The fourth round, consensus changes for the regenesis (2026-11-05):
       block lost the fork, the node rolled back and stopped to sync, and missed several slots
       more. It now waits to catch up instead.
     * With `QRDX_LOOP_LAG_LOG=1` a node logs each time its event loop was held 100 ms or more,
-      and what it was running: under load, a block's synchronous exchange run (inside the
-      block's undo scope it costs about a third more: 62 → 82 µs a transfer).
+      and what it was running: under load, a block's synchronous exchange run. Inside the
+      block's undo scope it cost about a third more (62 → 82 µs a transfer), most of it
+      recording a block's own scratch — its balance deltas and the balances loaded for it, which
+      every block starts afresh. A block's scope no longer records them (``keep_entry(...,
+      transient=True)``; an operation that fails still puts them back): 82 → 70 µs.
 
-    One host, 2,000 a second for 30 s: 1,973 executed at 3.4 blocks a second (sustained 40 s
-    steps after 1,000 and 1,500: 1,700–1,875 at 2.6–3.2).
+    One host: 1,000 a second at 4.0 blocks a second (p95 0.6 s); 2,000 a second for 30 s on a
+    fresh network executed 1,973 at 3.4 blocks a second; 40 s steps after 1,000 and 1,500
+    executed 1,700–1,875 at 2.6–3.2 — still behind at 1,500 and 2,000.
 34. **Less work a transfer on the import path** (bench: 234 → 218 µs a transfer, 500 to a block):
     * A block's balance changes are folded into the account accumulator once
       (`state_commitment.batched`), and journaled for undo in one statement written ahead of

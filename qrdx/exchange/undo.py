@@ -38,8 +38,12 @@ _ACTIVE: "contextvars.ContextVar[Optional[Scope]]" = contextvars.ContextVar(
 class Scope:
     """What one atomic operation changed, as restore actions in the order they were recorded."""
 
-    def __init__(self, parent: Optional["Scope"]) -> None:
+    def __init__(self, parent: Optional["Scope"], block: bool = False) -> None:
         self.parent = parent
+        # A block's own scope (qrdx/exchange/block_undo.py): what it records is how to take the
+        # block back out of the exchange's state — not the block's scratch (``transient``).
+        self.block = block
+        self.transient: Set[Tuple[int, Any]] = set()
         self.entries: List[Tuple[Optional[Tuple[int, Any]], Callable[[], None]]] = []
         # Restores that must run after every other one: a container's key order (a key deleted
         # and put back would otherwise land at the end — and some of the exchange iterates in
@@ -88,12 +92,15 @@ class Scope:
         parent = self.parent
         if parent is None:
             return
+        scratch = self.transient if parent.block else ()
         for token, restore in self.entries:
             if token is not None:
-                if token in parent.seen:
+                if token in parent.seen or token in scratch:
                     continue
                 parent.seen.add(token)
             parent.entries.append((token, restore))
+        if not parent.block:
+            parent.transient |= self.transient
         for final_token, restore in self.finals:
             if final_token in parent.seen:
                 continue
@@ -147,12 +154,21 @@ def keep(obj: Any, attrs: Tuple[str, ...], tag: str = "attrs", *, shallow: bool 
     scope.record(obj, (tag, attrs), restore)
 
 
-def keep_entry(container: Dict[Any, Any], key: Any, *, mutable: bool = True) -> None:
+def keep_entry(
+    container: Dict[Any, Any], key: Any, *, mutable: bool = True, transient: bool = False
+) -> None:
     """Record a plain dict's entry ``key`` (deep-copied when ``mutable``) the first time the open
-    scope sees it; a rollback puts it back (or removes it if it was absent)."""
+    scope sees it; a rollback puts it back (or removes it if it was absent). ``transient``: an
+    entry of a block's scratch (its balance deltas, the balances loaded for it — every block
+    starts them afresh): an operation that fails puts it back, but taking a block back out of
+    the exchange does not (a block's scope does not record it)."""
     scope = _ACTIVE.get()
-    if scope is None or not scope.first(container, ("entry", key)):
+    if scope is None or (transient and scope.block):
         return
+    if not scope.first(container, ("entry", key)):
+        return
+    if transient:
+        scope.transient.add((id(container), ("entry", key)))
     if key in container:
         old = container[key]
         if mutable:

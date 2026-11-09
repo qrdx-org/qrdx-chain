@@ -269,14 +269,14 @@ def run(
             mgr._nonces[lane] = n
     values = dict(new_deltas)
     for a in values:
-        undo.keep_entry(deltas, a, mutable=False)
+        undo.keep_entry(deltas, a, mutable=False, transient=True)
     for a, v in values.items():
         if a in deltas:
             deltas[a] = Decimal(v)
     for a in added:
         deltas[a] = Decimal(values[a])
     for a, v in new_avail:
-        undo.keep_entry(avail, a, mutable=False)
+        undo.keep_entry(avail, a, mutable=False, transient=True)
         avail[a] = Decimal(v)
     mgr._block_fees = Decimal(fees)
 

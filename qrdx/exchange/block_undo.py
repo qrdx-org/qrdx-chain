@@ -138,7 +138,7 @@ class BlockUndo:
 
     def __init__(self, mgr: Any, height: int) -> None:
         self.height = int(height)
-        self.scope = undo.Scope(None)
+        self.scope = undo.Scope(None, block=True)
         self.root = mgr.compute_state_root()
         self.fields = {f: copy.deepcopy(getattr(mgr, f)) for f in MANAGER_FIELDS if hasattr(mgr, f)}
         self.engines: Dict[str, Tuple[Any, frozenset, Dict[str, Any]]] = {

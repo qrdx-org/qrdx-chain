@@ -296,15 +296,23 @@ def test_random_blocks_run_as_python_runs_them(seed, monkeypatch):
         txs = _block(rng, pairs, nonces, known)
         a, _ = _run_block(py, height, txs, False, monkeypatch)
         copies = _copies(txs)
+        before_avail = dict(nat._available_balances)
+        before_tokens = dict(nat._available_token_balances)
         b, root_before = _run_block(nat, height, copies, True, monkeypatch)
         assert a == b, f"seed {seed} block {height}: {[k for k in a if a[k] != b[k]]}"
         assert a["out"][0], a["out"]
         for t in txs:
             if t.op_type == Op.PLACE_ORDER and t.success and (t.result or {}).get("order_id"):
                 known.append((t.sender, t.result["order_id"], t.params["pair"]))
-        # every block still undoes: take it back out, compare, run it again
+        # every block still undoes: take it back out, compare, run it again (with the balances
+        # loaded as they were — a node loads them afresh for every block, from the database the
+        # journal took back; taking a block out of the exchange leaves its scratch alone)
         assert block_undo.take_back(nat, height - 1) == 1
         assert nat.compute_state_root() == root_before
+        nat._available_balances.clear()
+        nat._available_balances.update(before_avail)
+        nat._available_token_balances.clear()
+        nat._available_token_balances.update(before_tokens)
         block_undo.invalidate()
         again, _ = _run_block(nat, height, _copies(txs), True, monkeypatch)
         assert again["root"] == a["root"] and again["deltas"] == a["deltas"]

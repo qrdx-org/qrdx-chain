@@ -1530,7 +1530,7 @@ class ExchangeStateManager:
     def set_available_balance(self, address: str, qrdx: Decimal) -> None:
         """Pre-load a sender's available QRDX balance (from account_state) for the
         collateral check. Called by the async block paths before processing."""
-        undo.keep_entry(self._available_balances, address, mutable=False)
+        undo.keep_entry(self._available_balances, address, mutable=False, transient=True)
         self._available_balances[address] = self._start_balances[address] = Decimal(qrdx)
 
     def available_balance(self, address: str) -> Optional[Decimal]:
@@ -1549,10 +1549,10 @@ class ExchangeStateManager:
         (``fee_floor``): the operation fails."""
         if delta_qrdx < 0 and self._fee_reserve is not None and address != self._reserve_spender:
             self._keep_fee_floor(address, delta_qrdx)
-        undo.keep_entry(self._balance_deltas, address, mutable=False)
+        undo.keep_entry(self._balance_deltas, address, mutable=False, transient=True)
         self._balance_deltas[address] = self._balance_deltas.get(address, ZERO) + delta_qrdx
         if address in self._available_balances:
-            undo.keep_entry(self._available_balances, address, mutable=False)
+            undo.keep_entry(self._available_balances, address, mutable=False, transient=True)
             self._available_balances[address] = self._available_balances[address] + delta_qrdx
 
     def _reserve_fee(self, payer: str, amount: Decimal) -> None:
@@ -1560,10 +1560,10 @@ class ExchangeStateManager:
         fee floor keeps, so it does not hold them back; it is lowered by them instead."""
         if self._fee_reserve is not None:
             self._fees_reserved[payer] = self._fees_reserved.get(payer, ZERO) + amount
-        undo.keep_entry(self._balance_deltas, payer, mutable=False)
+        undo.keep_entry(self._balance_deltas, payer, mutable=False, transient=True)
         self._balance_deltas[payer] = self._balance_deltas.get(payer, ZERO) - amount
         if payer in self._available_balances:
-            undo.keep_entry(self._available_balances, payer, mutable=False)
+            undo.keep_entry(self._available_balances, payer, mutable=False, transient=True)
             self._available_balances[payer] = self._available_balances[payer] - amount
 
     def fee_floor(self, address: str) -> Optional[Decimal]:
@@ -1612,7 +1612,9 @@ class ExchangeStateManager:
         if is_native_asset(token):
             self.set_available_balance(holder, amount)
         else:
-            undo.keep_entry(self._available_token_balances, (holder, token), mutable=False)
+            undo.keep_entry(
+                self._available_token_balances, (holder, token), mutable=False, transient=True
+            )
             self._available_token_balances[(holder, token)] = Decimal(amount)
 
     def available_token_balance(self, holder: str, token: str) -> Optional[Decimal]:
@@ -1631,10 +1633,10 @@ class ExchangeStateManager:
         keep the in-memory available token balance in step so later ops in the same
         block see the moved amount."""
         key = (holder, token)
-        undo.keep_entry(self._token_balance_deltas, key, mutable=False)
+        undo.keep_entry(self._token_balance_deltas, key, mutable=False, transient=True)
         self._token_balance_deltas[key] = self._token_balance_deltas.get(key, ZERO) + delta
         if key in self._available_token_balances:
-            undo.keep_entry(self._available_token_balances, key, mutable=False)
+            undo.keep_entry(self._available_token_balances, key, mutable=False, transient=True)
             self._available_token_balances[key] = self._available_token_balances[key] + delta
 
     def token_balance_deltas(self) -> Dict[Tuple[str, str], Decimal]:

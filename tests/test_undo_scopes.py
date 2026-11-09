@@ -266,3 +266,36 @@ def test_a_perp_order_that_cannot_rest_changes_nothing():
     assert ch.markets[mid].book.get_order("ask1").filled == 0
     assert m.get_nonce("taker") == 1                       # it still consumed its nonce
     ExchangeStateManager.reset_instance()
+
+
+def test_a_blocks_scratch_is_put_back_by_a_failed_operation_not_by_the_block():
+    """``keep_entry(..., transient=True)`` — a block's balance deltas and the balances loaded for
+    it: an operation that fails puts them back, as everything else; a block's own scope (what
+    takes the block back out of the exchange) does not record them — every block starts them
+    afresh — whether written in it directly or handed up by an operation that succeeded."""
+    import pytest
+
+    from qrdx.exchange import undo
+
+    scratch, state = {"a": 1}, {"n": 1}
+    block = undo.Scope(None, block=True)
+    token = undo._ACTIVE.set(block)
+    try:
+        with pytest.raises(RuntimeError):
+            with undo.atomic():
+                undo.keep_entry(scratch, "a", mutable=False, transient=True)
+                scratch["a"] = 2
+                raise RuntimeError("the operation fails")
+        assert scratch == {"a": 1}                         # (put back by the operation)
+        with undo.atomic():
+            with undo.atomic():                            # (nested: kept until a block's)
+                undo.keep_entry(scratch, "a", mutable=False, transient=True)
+                undo.keep_entry(state, "n", mutable=False)
+                scratch["a"], state["n"] = 3, 5
+        undo.keep_entry(scratch, "b", mutable=False, transient=True)   # (in the block directly)
+        scratch["b"] = 9
+    finally:
+        undo._ACTIVE.reset(token)
+    block.rollback()
+    assert state == {"n": 1}                               # (state: taken back out)
+    assert scratch == {"a": 3, "b": 9}                     # (scratch: left as the block left it)

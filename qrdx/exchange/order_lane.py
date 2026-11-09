@@ -756,18 +756,18 @@ def _write_back(mgr, qrdx, tokens, lanes, book_nonces, fee_tokens, totals, place
     """What the native run changed, through Python's own dicts and undo records."""
     deltas, avail = mgr._balance_deltas, mgr._available_balances
     for address, delta, held in qrdx:
-        undo.keep_entry(deltas, address, mutable=False)
+        undo.keep_entry(deltas, address, mutable=False, transient=True)
         deltas[address] = Decimal(delta)
         if held is not None:
-            undo.keep_entry(avail, address, mutable=False)
+            undo.keep_entry(avail, address, mutable=False, transient=True)
             avail[address] = Decimal(held)
     deltas, avail = mgr._token_balance_deltas, mgr._available_token_balances
     for key, delta, held in tokens:
         key = tuple(key)
-        undo.keep_entry(deltas, key, mutable=False)
+        undo.keep_entry(deltas, key, mutable=False, transient=True)
         deltas[key] = Decimal(delta)
         if held is not None:
-            undo.keep_entry(avail, key, mutable=False)
+            undo.keep_entry(avail, key, mutable=False, transient=True)
             avail[key] = Decimal(held)
     for lane, n in lanes:
         mgr._nonces[lane] = n
