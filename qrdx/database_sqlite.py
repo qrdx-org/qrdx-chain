@@ -643,6 +643,14 @@ class DatabaseSQLite:
             value TEXT NOT NULL
         );
 
+        -- Node-local: the unified root after each block, by hash, for the block that signs it
+        -- (qrdx/post_state.py). Not journaled: an orphan's row is never read for another block.
+        CREATE TABLE IF NOT EXISTS post_roots (
+            block_hash TEXT PRIMARY KEY,
+            height INTEGER NOT NULL,
+            root TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(block_height);
         CREATE INDEX IF NOT EXISTS idx_block_exchange_txs ON block_exchange_transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_block_evm_txs ON block_evm_transactions(block_hash);

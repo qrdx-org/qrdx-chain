@@ -71,7 +71,7 @@ async def rebuild_derived_state_interleaved(db, evm_state_manager=None, execute_
     from .exchange.state_manager import ExchangeStateManager
 
     await undo_journal.reset(db)
-    post_state.forget()  # (the roots after each block are recomputed from the rebuilt state)
+    post_state.forget()  # (from memory: the database keeps them, and the rebuilt state matches)
     block_undo.invalidate()  # (the exchange is rebuilt: the replay records each block again)
     CHECKPOINTS.clear()
     _LAST_EPOCH.clear()

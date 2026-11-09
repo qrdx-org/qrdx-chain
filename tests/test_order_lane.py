@@ -316,6 +316,61 @@ def test_random_blocks_run_as_python_runs_them(seed, monkeypatch):
     assert trades > 40, trades
 
 
+def _floor_run(seed, monkeypatch, floors=True):
+    """Random blocks with the traders holding a few QRDX each (``two_block_deferral``'s fee
+    floor binds: qrdx/post_state.py), run by Python and by the lane. Returns (blocks that
+    differ, operations Python refused for a floor, operations run natively)."""
+    from qrdx import constants
+
+    monkeypatch.setattr(native_book, "available", lambda: True)
+    monkeypatch.setattr(constants, "PERP_COLLATERAL_TOKEN", "0x" + "55" * 20)
+    if not floors:
+        monkeypatch.setattr(order_lane, "_floors", lambda mgr, senders: {})
+    ran = [0]
+    stretch = order_lane._stretch
+
+    def counted(mgr, fn, txs, prepared, prepaid, payers, start, results):
+        done = stretch(mgr, fn, txs, prepared, prepaid, payers, start, results)
+        ran[0] += done
+        return done
+
+    monkeypatch.setattr(order_lane, "_stretch", counted)
+    rng = random.Random(1000 + seed)
+    block_undo.invalidate()
+    py, pairs, nonces = _setup()
+    nat, _, _ = _setup()
+    known = []
+    refused = 0
+    for height in range(2, 20):
+        txs = _block(rng, pairs, nonces, known)
+        held = [rng.choice(["0.3", "1", "1.5", "4", "12"]) for _ in TRADERS]
+        for m in (py, nat):
+            for who, amount in zip(TRADERS, held, strict=True):
+                m.set_available_balance(who, D(amount))
+        a, _ = _run_block(py, height, txs, False, monkeypatch)
+        b, _ = _run_block(nat, height, _copies(txs), True, monkeypatch)
+        if a != b:
+            return 1, refused, ran[0]
+        refused += sum("fee reserve" in (r.error or "") for r in py._block_results)
+        for t in txs:
+            if t.op_type == Op.PLACE_ORDER and t.success and (t.result or {}).get("order_id"):
+                known.append((t.sender, t.result["order_id"], t.params["pair"]))
+    return 0, refused, ran[0]
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_fee_floors_hold_natively_as_in_python(seed, monkeypatch):
+    """An order or swap that would take a trader below its fee floor is left to Python, which
+    refuses it: the same blocks as Python's own run."""
+    differ, refused, native = _floor_run(seed, monkeypatch)
+    assert differ == 0 and refused >= 3 and native > 150, (differ, refused, native)
+
+
+def test_without_its_floors_the_lane_would_differ(monkeypatch):
+    """(The test above has teeth: a lane not told the floors runs what Python refuses.)"""
+    assert any(_floor_run(seed, monkeypatch, floors=False)[0] for seed in range(4))
+
+
 def test_what_is_not_a_plain_order_or_cancel_is_left_to_python():
     s = TRADERS[0]
     plain = dict(pair=f"{A}:{USD}", side="buy", order_type="limit", price="2", amount="1")

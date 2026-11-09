@@ -126,8 +126,11 @@ unless every step holds:
      exchange tree, and the validator root, with stored log roots discarded.
    * The unified root must equal the one block C signs — under deferred execution (chain-spec
      feature `deferred_execution`) the one block C + 1 signs, since a block signs the state its
-     parent left. Block C + 1 is read before the blocks above C are removed, and the trusted
-     checkpoint must reach it.
+     parent left, and under `two_block_deferral` the one block C + 2 signs. That block is read
+     before the blocks above C are removed, and the trusted checkpoint must reach it. Under two
+     blocks, block C + 1 is checked against the state after C − 1, which the node cannot
+     recompute: that root is taken from block C + 1 itself, on the trusted history, and kept
+     with C's (`post_roots`; a snapshot's own rows are discarded).
 
    Every cache a root could be read from is discarded first, so rows and commitments cannot
    disagree. Of the validator states the snapshot stored, only the verified `S_E` is kept.

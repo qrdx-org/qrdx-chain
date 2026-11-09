@@ -149,6 +149,19 @@ def test_random_blocks_are_judged_and_run_as_python_does(seed, monkeypatch):
     assert ran_natively > 100
 
 
+def test_without_its_floor_check_the_lane_would_differ(monkeypatch):
+    """(The test above holds the fee floor too — ``two_block_deferral``, qrdx/post_state.py: a
+    lane that skipped its check would run transfers Python refuses.)"""
+    monkeypatch.setattr(transfer_lane, "_above_floors", lambda mgr, txs, prepared: True)
+    differed = 0
+    for seed in range(4):
+        try:
+            test_random_blocks_are_judged_and_run_as_python_does(seed, monkeypatch)
+        except AssertionError:
+            differed += 1
+    assert differed
+
+
 def test_what_is_not_a_plain_transfer_is_left_to_python():
     good = _tx(ExchangeOpType.TOKEN_TRANSFER, ADDRS[0], 0,
                {"token_address": "QRDX", "to": ADDRS[1], "amount": "1"})

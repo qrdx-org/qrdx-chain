@@ -44,13 +44,13 @@ class StateModule(RPCModule):
                 RPCErrorCode.RESOURCE_UNAVAILABLE, "state proofs are off on this network"
             )
         if height is None:
-            # Under deferred execution the tip's state is signed by the next block, not yet
-            # made: the newest provable state is its parent's.
+            # Under deferred execution the tip's state is signed by a later block, not yet
+            # made: the newest provable state is the one the tip signs.
             from ... import post_state
 
             tip = int(await db.get_next_block_id()) - 1
             if tip >= 1 and post_state.active(tip + 1):
-                height = tip - 1
+                height = max(0, post_state.newest_signed(tip))
         try:
             if kind in ("exchange", "exchange_part"):
                 from ...exchange.state_manager import ExchangeStateManager

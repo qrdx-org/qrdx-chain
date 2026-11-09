@@ -331,6 +331,10 @@ PARAMS: Dict[str, Param] = {
     "FREE_ACTIONS_PER_BLOCK": Param("int", 64, "QRDX_FREE_ACTIONS_PER_BLOCK", minimum=1),
     "FREE_ACTION_MIN_QRDX": Param("decimal", "0.025", "QRDX_FREE_ACTION_MIN_QRDX", minimum=0),
     "FREE_ACTION_MIN_EQUITY": Param("int", 10, "QRDX_FREE_ACTION_MIN_EQUITY", minimum=0),
+    # Under ``two_block_deferral``: an account's fee reserve, the QRDX (or all it holds, if less)
+    # that nothing but fees takes from it within a block unless its own transaction says so
+    # (``params.spend_reserve``) — what keeps the next block's fees payable (qrdx/post_state.py).
+    "FEE_RESERVE_QRDX": Param("decimal", "1", "QRDX_FEE_RESERVE_QRDX", minimum=0),
     "FREE_TRADING_MAX_BASE_FEE_BPS": Param(
         "int", 20_000, "QRDX_FREE_TRADING_MAX_BASE_FEE_BPS", minimum=10_000
     ),
@@ -451,6 +455,17 @@ FEATURES: Dict[str, str] = {
         "a balance it no longer has) is skipped and changes nothing. The state a block leaves is "
         "bound by the next block's root."
     ),
+    "two_block_deferral": (
+        "A block commits to the state its grandparent left (the unified root after block N−2), "
+        "so a proposer can judge, sign and send its block while its parent still runs. What "
+        "makes that safe is each account's fee reserve: within a block, nothing but fees takes "
+        "an account below min(FEE_RESERVE_QRDX, its balance as the block began) less the fees "
+        "the block reserved from it, unless the account's own transaction sets "
+        "params.spend_reserve; EVM transactions, always the account's own, are not held to it. "
+        "So the fees a payer's next block may carry are known from the state before its parent "
+        "and the parent's contents alone (qrdx/post_state.py). In force only with "
+        "deferred_execution and exchange_inclusion."
+    ),
 }
 
 # The rules a network created by this release has from genesis unless its spec says otherwise
@@ -466,6 +481,7 @@ GENESIS_DEFAULT_FEATURES: Tuple[str, ...] = (
     "evm_conformance",
     "deferred_execution",
     "binary_exchange_txs",
+    "two_block_deferral",
 )
 
 

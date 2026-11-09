@@ -134,6 +134,16 @@ def holds_pooled_funds(value: object) -> bool:
     return is_synthetic_holder(value) and str(value)[:6].upper() != "0XSUBA"
 
 
+def pays_exchange_fees(value: object) -> bool:
+    """An account that signs exchange transactions and pays their gas: a key's or a multisig's
+    (0xPQ…), or a sub-account (0xSUBA…, signed for by its master). Not a protocol holder or a
+    system wallet: no fee is ever taken from one."""
+    if not isinstance(value, str):
+        return False
+    head = value[:6].upper()
+    return head[:4] == "0XPQ" or head == "0XSUBA"
+
+
 def is_synthetic_holder(value: object) -> bool:
     """True iff ``value`` is a well-formed protocol holder address (``SYNTHETIC_HOLDER_PREFIXES``)."""
     if not isinstance(value, str):

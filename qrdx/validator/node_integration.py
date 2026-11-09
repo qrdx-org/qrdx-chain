@@ -1583,10 +1583,18 @@ class ValidatorNode:
                 self._evm_tx_source.remove(gone)
         phases.mark("select")
 
-        # 2. Signed with the root of the state its parent left, and sent.
+        # 2. Signed with the root of the state its parent left (its grandparent, under two
+        #    blocks), and sent.
         if self.manager is None:
             return None, None, None
-        state_root = await post_state.root_after(self.db, next_height - 1, parent_hash)
+        before = next_height - post_state.lag(next_height)
+        try:
+            state_root = await post_state.root_after(
+                self.db, before, parent_hash if before == next_height - 1 else None
+            )
+        except LookupError as e:
+            logger.warning(f"Block #{next_height} not proposed: {e}")
+            return None, None, None
         try:
             block = await self.manager.propose_block(
                 slot=current_slot,

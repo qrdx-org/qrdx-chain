@@ -45,10 +45,12 @@ from qrdx.exchange.transactions import ExchangeOpType
 from pq_addrs import pq
 
 
-def _deposit_tx(sender, stake, pubkey="ab" * 100, nonce=0):
+def _deposit_tx(sender, stake, pubkey="ab" * 100, nonce=0, spend_reserve=False):
+    params = {"validator_public_key": pubkey, "stake_amount": str(stake)}
+    if spend_reserve:
+        params["spend_reserve"] = True
     return SimpleNamespace(
-        sender=sender, nonce=nonce, op_type=ExchangeOpType.STAKE_DEPOSIT,
-        params={"validator_public_key": pubkey, "stake_amount": str(stake)},
+        sender=sender, nonce=nonce, op_type=ExchangeOpType.STAKE_DEPOSIT, params=params
     )
 
 
@@ -72,7 +74,12 @@ async def _node(funded=None, holder=None):
 async def _run_deposit(db, mgr, tx, block_epoch=0):
     mgr.begin_block(1, 0.0)
     await preload_sender_balances(db, [tx], mgr)
-    res = mgr._op_stake_deposit(tx)
+    # (as process_transaction runs it: signed to spend the fee reserve, it may)
+    mgr._reserve_spender = tx.sender if tx.params.get("spend_reserve") is True else None
+    try:
+        res = mgr._op_stake_deposit(tx)
+    finally:
+        mgr._reserve_spender = None
     mgr.commit_block()
     await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)
     await flush_validator_lifecycle_deltas(db, mgr, block_epoch=block_epoch, block_height=1)
@@ -212,11 +219,13 @@ async def test_the_debit_lands_on_the_canonical_account_row():
 
 
 async def test_a_staker_cannot_double_spend_the_locked_stake():
-    """Deposit the whole balance, then try to deposit again — nothing is left."""
+    """Deposit the whole balance (its fee reserve too, by its own say), then try to deposit
+    again — nothing is left."""
     staker = pq("double-spender")
     db, mgr = await _node(funded=str(MIN_VALIDATOR_STAKE), holder=staker)
     try:
-        assert (await _run_deposit(db, mgr, _deposit_tx(staker, MIN_VALIDATOR_STAKE))).success
+        whole = _deposit_tx(staker, MIN_VALIDATOR_STAKE, spend_reserve=True)
+        assert (await _run_deposit(db, mgr, whole)).success
         assert await db.get_address_balance(staker) == 0
         second = await _run_deposit(
             db, mgr, _deposit_tx(staker, MIN_VALIDATOR_STAKE, nonce=1))

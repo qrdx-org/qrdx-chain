@@ -45,8 +45,9 @@ fell 144 blocks behind and caught up by sync.
 **Closing it requires** (docs/PERFORMANCE.md, "What limits it next"):
 * the exchange's state held and executed natively beyond plain transfers, with the database
   written behind it (docs/NATIVE.md);
-* execution deferred a second block (a consensus change: the inclusion rule then needs a fee
-  reserve or a bound on what the pending block spends);
+* a proposer that judges and signs its block before running its parent: the rules for it are in
+  force (`two_block_deferral`: blocks sign the state two back, and the fee reserve bounds what
+  each payer holds after the parent), the proposer's scheduling is not;
 * a binary wire format, shrinking what each block hashes and stores (a fork);
 * the geo-distributed soak (docs/MAINNET_READINESS.md §3.4) to measure it on real hosts.
 

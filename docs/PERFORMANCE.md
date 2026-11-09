@@ -355,7 +355,8 @@ The fourth round, consensus changes for the regenesis (2026-11-05):
 
     The next proposer still runs the parent before it can sign, so a slot holds one run of a
     block, not a build and an import: the proposer sizes its block by its whole work against
-    half the slot (`QRDX_DEFERRED_BUILD_SHARE`).
+    half the slot (`QRDX_DEFERRED_BUILD_SHARE`). Signing two blocks back (31, below) is the rule
+    that lets it stop waiting.
 23. **A reorg takes its blocks back out** (qrdx/exchange/block_undo.py). Each block runs in an
     exchange undo scope, with what no scope records (the manager's own fields, the plain
     attributes of each engine, book and market) kept beside it, and the indexes derived from
@@ -406,6 +407,27 @@ The fourth round, consensus changes for the regenesis (2026-11-05):
     root, stores and relays a third less; peers relay each other the bytes (the transport's
     native reader checks either form). What a transaction signs and its hash are unchanged.
     Decoding one costs about what its JSON did (11 µs, the base64 and fields native).
+31. **Execution deferred a second block** (chain-spec feature `two_block_deferral`, a genesis
+    default with `deferred_execution` and `exchange_inclusion`; qrdx/post_state.py). Block N
+    signs the root after block N−2, so a proposer needs only its grandparent's state to sign.
+    To judge its block's fees without having run its parent it needs a lower bound on what each
+    payer holds after the parent, from the state before it and the parent's contents. The **fee
+    reserve** gives one: within a block, nothing but fees takes an account below
+    min(`FEE_RESERVE_QRDX`, 1 QRDX by default, and its balance as the block began) less the fees
+    the block reserved from it (`ExchangeStateManager.fee_floor`). An operation that would is
+    refused, unless the account's own transaction sets `params.spend_reserve` (a wallet sending
+    its last QRDX); EVM transactions are the account's own and take at most their signed cost.
+    Protocol holders (pools, escrows, the perps holder) and system wallets have no floor. So
+    after its parent a payer holds at least min(R, its balance before the parent) less its fees
+    and EVM costs in the parent — unless the parent spent its reserve, when it waits a block.
+    Importers still judge a block on the state its parent left; a block judged on the bound is
+    one they accept (tests/test_two_block_deferral.py builds chains that way: every block is
+    accepted with the reserve, and without it most chains reach a block that is refused).
+    The roots a block is checked against are kept by block hash in the database too
+    (`post_roots`): the state a node holds is past them, so they cannot be recomputed after a
+    restart, and a snapshot restore keeps its checkpoint's parent's from the trusted history.
+    The native lanes hold the floor: the order lane leaves an operation that would cross it to
+    Python, and the transfer lane a run whose senders could.
 
 Each block's phase line ends with its database round trips (`db N`).
 
@@ -539,11 +561,10 @@ In the order they would pay, toward four blocks a second at 2,000–4,000 transf
    storing it 15–35 (about 11 KB of JSON an operation), its body root and rules 10–22. Holding
    the exchange's state natively, with the database written behind it, is still the change
    that moves the ceiling by a multiple.
-2. **Execution deferred further.** A block still signs its parent's state, so the next proposer
-   must run the parent before it can sign. Signing the state two blocks back would take that
-   run off the path too, but the inclusion rule then needs a balance no block has computed
-   yet: a reserve each account keeps for fees, as some chains do, or fees judged against a
-   bound of what the pending block can spend.
+2. **A proposer that builds before its parent has run.** Blocks sign the state two blocks back
+   and the fee reserve bounds each payer's balance (31, above), so a block may be judged and
+   signed while its parent still runs. The proposer does not do that yet: it runs the parent
+   first, as it did under one block.
 3. **The size of what a block stores and hashes.** Binary transactions (30, above) took a third
    off; the rest is the signature itself (3.3 KB) and a key (1.9 KB) in every transaction. A
    key named by its account once the chain has seen it would take the key out, but no registry

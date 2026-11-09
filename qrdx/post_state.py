@@ -23,6 +23,20 @@ block N's signed root is the unified root after block N−1:
 
 The root of the state after block h is computed with block h's own height and slot: exactly what
 block h would have signed without the feature, one block later.
+
+**Two blocks** (chain-spec feature ``two_block_deferral``): block N signs the root after block
+N−2. A proposer needs the state after N−2 to sign — not N−1's — so it can judge, sign and send
+its block while its parent still runs. Judging needs a lower bound on what each payer holds after
+the parent, from the state before it and its contents alone; the fee reserve gives one
+(``ExchangeStateManager.fee_floor``): within a block, nothing but fees takes an account below
+min(FEE_RESERVE_QRDX, its balance as the block began) less the fees the block reserved from it,
+unless its own transaction sets ``params.spend_reserve``, and EVM transactions take at most their
+signed maximum cost. Importers judge a block on the state its parent left, as before: a block
+judged on that bound is one they accept.
+
+Roots are kept by block hash, in memory and in the database (``post_roots``): under two blocks
+the root a block is checked against is not of the state a node holds (its parent ran since), so
+it cannot be recomputed after a restart.
 """
 
 from __future__ import annotations
@@ -34,6 +48,7 @@ from typing import Any, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 FEATURE = "deferred_execution"
+TWO_BLOCKS = "two_block_deferral"
 
 # block hash → the unified root after that block. A reorg leaves the orphans' entries behind;
 # they are keyed by hash, so they are never read for another block.
@@ -50,6 +65,40 @@ def active(height: Optional[int]) -> bool:
     return chain_spec.is_active(FEATURE, int(height))
 
 
+def two_blocks(height: Optional[int]) -> bool:
+    """Is block ``height`` under ``two_block_deferral``? Only with ``deferred_execution`` and
+    ``exchange_inclusion`` (fees reserved up front, which the fee floor builds on) — without them
+    it does nothing."""
+    if height is None or not active(height):
+        return False
+    from . import chain_spec
+
+    h = int(height)
+    return chain_spec.is_active(TWO_BLOCKS, h) and chain_spec.is_active("exchange_inclusion", h)
+
+
+def lag(height: Optional[int]) -> int:
+    """How many blocks back the state is that block ``height`` signs: 1 under the feature, 2 under
+    two blocks (from block 2), 0 where a block signs the state it leaves."""
+    if height is None or not active(height):
+        return 0
+    return 2 if height >= 2 and two_blocks(height) else 1
+
+
+def signer_of(height: int) -> int:
+    """The block whose signed root is the root of the state after block ``height``: the first
+    after it that signs it, or the block itself where blocks sign their own."""
+    for s in (height + 1, height + 2):
+        if lag(s) and s - lag(s) == height:
+            return s
+    return height
+
+
+def newest_signed(tip: int) -> int:
+    """The newest state a chain whose tip is ``tip`` has signed: the one the tip signs."""
+    return tip - lag(tip)
+
+
 def forget() -> None:
     """Drop every kept root (derived state was rebuilt; they are recomputed on demand)."""
     _ROOTS.clear()
@@ -64,6 +113,42 @@ def remember(block_hash: str, root: str) -> None:
 
 def kept(block_hash: Optional[str]) -> Optional[str]:
     return _ROOTS.get(block_hash) if block_hash else None
+
+
+# The roots, by block hash, in the node's database too (``post_roots``, in its schema: not
+# consensus state — a reorg leaves the orphans' rows behind, never read for another block; rows
+# far below the tip are pruned).
+KEEP_STORED = 8192
+
+
+async def store(db: Any, height: int, block_hash: str, root: str) -> None:
+    """Keep the root after block ``height`` (hash ``block_hash``), in memory and in the database
+    (written with the block: not committed here)."""
+    remember(block_hash, root)
+    if getattr(db, "connection", None) is None:
+        return
+    conn = db.connection
+    await conn.execute(
+        "INSERT OR REPLACE INTO post_roots (block_hash, height, root) VALUES (?, ?, ?)",
+        (block_hash, int(height), root),
+    )
+    if height % 1024 == 0 and height > KEEP_STORED:
+        await conn.execute("DELETE FROM post_roots WHERE height < ?", (height - KEEP_STORED,))
+
+
+async def stored(db: Any, block_hash: Optional[str]) -> Optional[str]:
+    """The root after block ``block_hash``, kept in memory or in the database."""
+    root = kept(block_hash)
+    if root is not None or not block_hash or getattr(db, "connection", None) is None:
+        return root
+    cur = await db.connection.execute(
+        "SELECT root FROM post_roots WHERE block_hash = ?", (block_hash,)
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    remember(block_hash, str(row[0]))
+    return str(row[0])
 
 
 async def unified_root(db: Any, height: int, slot: Optional[int]) -> str:
@@ -134,28 +219,36 @@ async def settle(db: Any, height: int, block_hash: str, slot: Optional[int] = No
     if slot is None:
         slot = await _slot_of(db, height)
     root = await unified_root(db, height, slot)
-    remember(block_hash, root)
+    await store(db, height, block_hash, root)
     return root
 
 
 async def root_after(db: Any, height: int, block_hash: Optional[str] = None) -> str:
-    """The root of the state block ``height`` (hash ``block_hash``, default the chain's) left —
-    which must be the state now. Kept when the block was applied; computed now when it was not
-    (a restart, a rebuild)."""
+    """The root of the state block ``height`` (hash ``block_hash``, default the chain's) left.
+    Kept when the block was applied; when it was not (a restart, a rebuild), computed now if the
+    state now is that state — the chain's tip is block ``height`` — and otherwise unknown here
+    (``LookupError``)."""
     if block_hash is None:
         block_hash = (await db.get_block_hashes(height, height)).get(height)
-    root = kept(block_hash)
+    root = await stored(db, block_hash)
     if root is not None:
         return root
+    tip = int(await db.get_next_block_id()) - 1
+    if tip != height:
+        raise LookupError(
+            f"the root of the state after block {height} is not kept here, and the state now is "
+            f"after block {tip}"
+        )
     root = await unified_root(db, height, await _slot_of(db, height))
     if block_hash:
-        remember(block_hash, root)
+        await store(db, height, block_hash, root)
     return root
 
 
 async def check(db: Any, block_content: Any, height: int) -> Tuple[bool, str]:
     """Before block ``height`` runs: its signed root must be the root of the state its parent
-    left, which is the state this node holds (the block's parent is its tip)."""
+    left, which is the state this node holds (the block's parent is its tip) — under two
+    blocks, the state its grandparent left, whose root was kept when it ran."""
     from .validator.block_verification import _parse_block_content
 
     try:
@@ -164,22 +257,25 @@ async def check(db: Any, block_content: Any, height: int) -> Tuple[bool, str]:
         return False, "unreadable block content"
     if not declared:
         return False, "the block signs no state root"
-    expected = await root_after(db, height - 1)
+    before = height - lag(height)
+    try:
+        expected = await root_after(db, before)
+    except LookupError as e:
+        return False, str(e)
     if declared != expected:
         return False, (
             f"state root mismatch: the block signs {str(declared)[:16]}…, the state block "
-            f"{height - 1} left is {expected[:16]}…"
+            f"{before} left is {expected[:16]}…"
         )
     return True, ""
 
 
 async def signed_root_of_state(db: Any, height: int) -> Tuple[Optional[str], Optional[int]]:
     """The signed root of the state after block ``height``, and the height of the block that
-    signs it: the next block under the feature (None until it exists), the block itself
-    otherwise."""
+    signs it (``signer_of``; None until it exists)."""
     from .validator.block_verification import _parse_block_content
 
-    signer = height + 1 if active(height + 1) else height
+    signer = signer_of(height)
     block = await db.get_block_by_id(signer)
     if not block:
         return None, signer

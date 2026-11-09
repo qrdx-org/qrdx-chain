@@ -246,6 +246,9 @@ struct Run<'a, 'py> {
     changed: Vec<(usize, Order)>,
     // the router's order-book sequence (its ids): a failed operation does not take it back
     clob_sequence: i64,
+    // each fee payer's QRDX floor (``two_block_deferral``: ``fee_floor``): an operation that
+    // would take an account below its floor is Python's (which refuses it)
+    floors: HashMap<Id, Dec>,
 }
 
 /// Python's own values for the pools (``router::Transcendental``): ``amm(op, value)``.
@@ -298,6 +301,13 @@ impl Run<'_, '_> {
         e.delta = Some(add(e.delta.as_ref().unwrap_or(&Dec::zero()), d)?);
         if let Some(a) = &e.avail {
             e.avail = Some(add(a, d)?);
+        }
+        if let (Key::Qrdx(holder), Some(a)) = (&key, &e.avail) {
+            if let Some(floor) = self.floors.get(holder) {
+                if lt(d, &Dec::zero()) && lt(a, floor) {
+                    return Err(Stop::Python); // (below its fee reserve: Python refuses it)
+                }
+            }
         }
         self.changes.entries.insert(key.clone(), e);
         if !self.changes.written.contains_key(&key) {
@@ -1539,6 +1549,7 @@ pub fn order_lane_run<'py>(
     consts: (String, String, String, String, String, String, i64, f64, i64, i64, i64),
     tiers: (Vec<(String, String, String)>, i64, i64, String, String, String, i64),
     totals: (String, String),
+    floors: HashMap<String, String>,
 ) -> PyResult<RunOut<'py>> {
     let bad = |what: &str| pyo3::exceptions::PyValueError::new_err(format!("order lane: {what}"));
     let dec = |s: &str| Dec::parse(s).ok_or_else(|| bad(s));
@@ -1662,6 +1673,10 @@ pub fn order_lane_run<'py>(
         },
         changed: Vec::new(),
         clob_sequence: amm.2,
+        floors: floors
+            .iter()
+            .map(|(a, f)| Ok((Id::from(a.as_str()), dec(f)?)))
+            .collect::<PyResult<HashMap<_, _>>>()?,
     };
     let mut lane_nonces: HashMap<String, i64> = HashMap::new();
     let mut lane_order: Vec<String> = Vec::new();

@@ -62,6 +62,14 @@ and the trading history are in [TRADING_FEATURES.md](TRADING_FEATURES.md).
 - contracts trading through the `0x…0401` precompile;
 - where markets come from (genesis, governance) and token perps.
 
+**The fee reserve.** Within a block, nothing but fees takes an account below the smaller of
+1 QRDX (`FEE_RESERVE_QRDX`) and what it held as the block began, less the fees of its
+transactions in that block: that keeps the next block's fees payable while a proposer judges it
+before the block has run (docs/PERFORMANCE.md 31). To spend it — send the last of an account's
+QRDX, deposit all of it — sign the transaction with `"spend_reserve": true` in its params. A
+proposer judging the next block before that one has run may then leave the account's next
+transactions for the block after.
+
 **Nonce.** `GET /get_exchange_nonce?address=` or `exchange_getNonce`. A transaction that
 executes consumes its nonce whether it succeeds or fails (e.g. an order refused for margin); one
 rejected before execution (bad signature, wrong nonce, under-priced, unaffordable gas) does not.
@@ -130,6 +138,7 @@ from the chain on restart).
 | `the oracle for … is stale; only reduce-only orders are accepted` | no fresh oracle: the validators' votes lapsed, or a token perp's spot market is under its depth floor |
 | `… sizes are multiples of …` / `… prices have at most 5 significant figures and … decimals` / `an order is worth at least …` | off the market's order grid (docs/HYPERLIQUID_PARITY.md 5) |
 | `expired at block time …` | the block is later than the transaction's `expires_at` |
+| `… would keep less than its fee reserve (…)` | it would take the account below its fee reserve (below); send it with `"spend_reserve": true` to spend that too |
 
 **Initial margin is tiered.** Each slice of a position's notional above a floor carries a lower
 maximum leverage — full to 1,000,000, half to 10,000,000, a quarter beyond — so a large position

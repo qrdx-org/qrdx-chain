@@ -306,8 +306,10 @@ def create(source_db: str, out_dir: str, public: bool = False) -> Dict[str, Any]
 
 # ── restoring ────────────────────────────────────────────────────────────────────────────
 
-# Recomputed from the rows here, never read from a snapshot.
+# Recomputed from the rows here (the roots after blocks: the verified checkpoint's, and its
+# parent's from the trusted history), never read from a snapshot.
 _RECOMPUTED = (
+    "post_roots",
     "state_commitment",
     "smt_meta",
     "smt_nodes",
@@ -539,11 +541,11 @@ async def restore(
         progress("genesis: building this network's own")
         genesis_hash = await _genesis(db, genesis_file, scratch)
 
-        # The block whose signed root binds the state after block ``height``: the next one under
+        # The block whose signed root binds the state after block ``height``: a later one under
         # deferred execution (qrdx/post_state.py), which the trusted history must then reach.
         from . import post_state
 
-        signer = height + 1 if post_state.active(height + 1) else height
+        signer = post_state.signer_of(height)
         anchor = None
         for h in sorted(h for h in trusted if h >= signer):
             if (await db.get_block_hashes(h, h)).get(h, "").lower() == trusted[h].lower():
@@ -568,6 +570,17 @@ async def restore(
         if not signing:
             raise SnapshotError(f"the snapshot lacks block {signer}, which signs its state")
         signed_root = _parse_block_content(signing["content"]).get("state_root")
+        # Under two blocks the first block above the checkpoint signs the state before it, which
+        # the node cannot recompute: that root is taken from the trusted history (the block that
+        # signs it is on it), and kept with the checkpoint's own (qrdx/post_state.py).
+        earlier: Optional[Tuple[str, str]] = None
+        if height >= 1 and post_state.signer_of(height - 1) > height:
+            before = await db.get_block_by_id(post_state.signer_of(height - 1))
+            parent_hash = (await db.get_block_hashes(height - 1, height - 1)).get(height - 1)
+            root = _parse_block_content(before["content"]).get("state_root") if before else None
+            if not root or not parent_hash:
+                raise SnapshotError(f"the snapshot lacks the signed root of block {height - 1}")
+            earlier = (parent_hash, str(root))
 
         progress(f"state: stepping back to block {height}")
         if await undo_journal.rollback_to(db, height) is None:
@@ -631,6 +644,9 @@ async def restore(
         epoch_state._memo.pop(db, None)
         await undo_journal.reset(db)
         await undo_journal.set_floor(db, height)
+        await post_state.store(db, height, checkpoint_hash, computed)
+        if earlier is not None:
+            await post_state.store(db, height - 1, *earlier)
         CHECKPOINTS.clear()
         CHECKPOINTS[height] = (checkpoint_hash, mgr.capture())
         mgr.journal = ExchangeJournal()

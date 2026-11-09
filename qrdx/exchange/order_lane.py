@@ -577,6 +577,7 @@ def _stretch(mgr, fn, txs, prepared, prepaid, payers, start, results) -> int:  #
             _consts(mgr),
             _tiers(mgr),
             (str(mgr._block_fees), str(mgr._block_staker_fees)),
+            _floors(mgr, senders),
         )
     except Exception:
         # Nothing of Python's was written yet: the books as they were, and Python runs it.
@@ -625,6 +626,20 @@ def _stretch(mgr, fn, txs, prepared, prepaid, payers, start, results) -> int:  #
         mgr._block_results.append(result)
         results.append(result)
     return int(done)
+
+
+def _floors(mgr: Any, senders: Dict[Tuple[str, str], None]) -> Dict[str, str]:
+    """Each sender's fee floor (``ExchangeStateManager.fee_floor``), where it has one: the
+    native run leaves an operation that would cross it to Python, which refuses it."""
+    if mgr._fee_reserve is None:
+        return {}
+    out: Dict[str, str] = {}
+    for sender, _token in senders:
+        if sender not in out:
+            floor = mgr.fee_floor(sender)
+            if floor is not None:
+                out[sender] = str(floor)
+    return out
 
 
 def _frozen(mgr: Any, senders: Dict[Tuple[str, str], None]) -> List[Tuple[str, str]]:

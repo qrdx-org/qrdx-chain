@@ -340,12 +340,14 @@ async def test_forward_and_rebuild_liquidate_identically(monkeypatch, oracle_com
             if txs:
                 await db.add_block_exchange_txs(bh, encode_exchange_txs(txs))
 
-        # every sender pays gas: Alice keeps a little beyond her deposit, the genesis validator
-        # (which votes BTC's price) is funded
+        # every sender pays gas: Alice keeps a little beyond her deposit (below her fee reserve,
+        # which her deposit says it spends), the genesis validator (which votes BTC's price) is
+        # funded
         await add(0, alloc=[(alice, "3500.01"), (bob, "1000000"),
                             (oracle_committee.address, "5000")])
         await add(1, [oracle_committee.vote({"BTC": "30000"}),
-                      tx(1, ExchangeOpType.PERP_DEPOSIT, {"amount": "3500"}),
+                      tx(1, ExchangeOpType.PERP_DEPOSIT, {"amount": "3500",
+                                                          "spend_reserve": True}),
                       tx(2, ExchangeOpType.PERP_DEPOSIT, {"amount": "100000"})])
         await add(2, [tx(2, ExchangeOpType.PERP_ORDER, {"market_id": BTC, "side": "sell",
                                                         "size": "1", "price": "30000"}),

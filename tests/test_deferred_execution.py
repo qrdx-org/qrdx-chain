@@ -11,6 +11,9 @@ runs its block and the next proposer does not wait for the block's own root. Wha
   what each block leaves is kept by the block's hash;
 * the state after block h is vouched for by block h + 1 (proofs, snapshots);
 * every path runs a block the same way: the proposer, the live import, sync and the rebuild.
+
+These pin the one-block rule (``two_block_deferral`` off where it matters); the two-block rule
+is tests/test_two_block_deferral.py.
 """
 
 import inspect
@@ -119,7 +122,12 @@ class _Blocks:
         return {"content": str({"state_root": self.roots[h], "slot": h})}
 
 
-async def test_the_state_after_a_block_is_vouched_for_by_the_next():
+def _one_block(monkeypatch):
+    monkeypatch.setattr(post_state, "two_blocks", lambda height: False)
+
+
+async def test_the_state_after_a_block_is_vouched_for_by_the_next(monkeypatch):
+    _one_block(monkeypatch)
     db = _Blocks({4: "aa" * 64, 5: "bb" * 64})
     assert await post_state.signed_root_of_state(db, 4) == ("bb" * 64, 5)
     assert await post_state.signed_root_of_state(db, 5) == (None, 6)   # (not signed yet)
@@ -136,6 +144,10 @@ async def test_a_root_is_checked_against_the_state_the_parent_left(monkeypatch):
         async def get_block_hashes(self, lo, hi):
             return {lo: "parent-hash"}
 
+        async def get_next_block_id(self):
+            return 8
+
+    _one_block(monkeypatch)
     monkeypatch.setattr(post_state, "unified_root", unified_root)
     monkeypatch.setattr(post_state, "_slot_of", lambda db, h: _none())
     post_state.forget()

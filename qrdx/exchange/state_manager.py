@@ -28,6 +28,7 @@ import logging
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ..crypto.account_id import pays_exchange_fees
 from . import undo
 from .amm import (
     ConcentratedLiquidityPool,
@@ -98,6 +99,16 @@ logger = logging.getLogger(__name__)
 ZERO = Decimal("0")
 
 
+def fee_reserve_at(height: int) -> Optional[Decimal]:
+    """The fee reserve the block at ``height`` holds accounts to (``two_block_deferral``:
+    ``ExchangeStateManager.fee_floor``), or None."""
+    from .. import constants, post_state
+
+    if not post_state.two_blocks(height):
+        return None
+    return Decimal(constants.FEE_RESERVE_QRDX)
+
+
 class ExchangeStateManager:
     """
     Singleton bridge between the blockchain consensus layer and the
@@ -119,6 +130,11 @@ class ExchangeStateManager:
     fee_tokens = committed("fees.tokens", _encode_fee_token, mutable=False)
 
     instance: Optional[ExchangeStateManager] = None
+
+    # Under ``two_block_deferral`` (qrdx/post_state.py): the block's fee reserve (None: no fee
+    # floors), and the sender of the operation running with ``params.spend_reserve``.
+    _fee_reserve: Optional[Decimal] = None
+    _reserve_spender: Optional[str] = None
 
     def __init__(self) -> None:
         # --- Engine instances (consensus-critical state) ---
@@ -188,6 +204,10 @@ class ExchangeStateManager:
         # atomically with the block by the async wrapper when collateral is
         # enforced. Block-scoped, so not part of the exchange state root.
         self._balance_deltas: Dict[str, Decimal] = {}
+        # Per block, for the fee floors (``fee_floor``): each loaded account's balance as the
+        # block began, and the fees the block reserved from each payer.
+        self._start_balances: Dict[str, Decimal] = {}
+        self._fees_reserved: Dict[str, Decimal] = {}
         # Collateral enforcement gate (set by the node when enforcing): when True,
         # open_position rejects if margin exceeds available balance.
         self.enforce_collateral: bool = False
@@ -324,6 +344,8 @@ class ExchangeStateManager:
         self._block_tick_events = []  # journal: this block's liquidations + funding
         self._block_journaled = False
         self._block_free_actions = {}  # free trading actions taken in this block, by account
+        self._fee_reserve = fee_reserve_at(block_height)
+        self._fees_reserved = {}
 
         # Each order book starts the block when the block first uses it (its per-block rate
         # limits reset, its time set: ``OrderBook.enter_block``). Only a book holding orders that
@@ -547,13 +569,15 @@ class ExchangeStateManager:
                         gas_used=0,
                         error=f"insufficient QRDX for gas: need {reserved}, available {avail}",
                     )
-                self._record_balance_delta(payer, -reserved)
+                self._reserve_fee(payer, reserved)
 
         # 4. Execute the operation — all or nothing (qrdx/exchange/undo.py): an operation that
         #    raises or fails changes nothing; it only pays for its gas and consumes its nonce
         #    (below). It used to keep whatever it had done before failing: a perp order that
         #    matched and then could not rest (the book's limits) kept the makers' fills in the
         #    book without the trades — a maker lost its order and got no position.
+        #    Signed to spend the sender's fee reserve, it may (``fee_floor``).
+        self._reserve_spender = tx.sender if tx.spends_reserve() else None
         try:
             with self.atomic():
                 if denied:
@@ -569,6 +593,8 @@ class ExchangeStateManager:
         except Exception as e:
             logger.error("Exchange op %s failed: %s", tx.op_type.name, e)
             result = ExchangeExecResult(success=False, gas_used=base_gas, error=str(e))
+        finally:
+            self._reserve_spender = None
 
         # 5. Consume the nonce once the operation has EXECUTED — success or failure. It used
         #    to advance only on success, so a failing operation could be re-submitted and
@@ -766,7 +792,7 @@ class ExchangeStateManager:
                 out.append(None)
                 continue
             payer, fee = self.fee_payer(tx), tx.max_fee()
-            self._record_balance_delta(payer, -fee)
+            self._reserve_fee(payer, fee)
             out.append((payer, fee))
         return out
 
@@ -1503,7 +1529,7 @@ class ExchangeStateManager:
         """Pre-load a sender's available QRDX balance (from account_state) for the
         collateral check. Called by the async block paths before processing."""
         undo.keep_entry(self._available_balances, address, mutable=False)
-        self._available_balances[address] = Decimal(qrdx)
+        self._available_balances[address] = self._start_balances[address] = Decimal(qrdx)
 
     def available_balance(self, address: str) -> Optional[Decimal]:
         """Pre-loaded available balance, or None if not loaded (check is skipped)."""
@@ -1512,16 +1538,64 @@ class ExchangeStateManager:
     def clear_available_balances(self) -> None:
         """Reset the pre-loaded balances (call per block)."""
         self._available_balances.clear()
+        self._start_balances.clear()
 
     def _record_balance_delta(self, address: str, delta_qrdx: Decimal) -> None:
         """Accumulate a real-balance delta for this block (negative = debit) and
         keep the in-memory available balance in step so later ops in the same
-        block see the locked amount."""
+        block see the locked amount. A debit may not take an account below its fee floor
+        (``fee_floor``): the operation fails."""
+        if delta_qrdx < 0 and self._fee_reserve is not None and address != self._reserve_spender:
+            self._keep_fee_floor(address, delta_qrdx)
         undo.keep_entry(self._balance_deltas, address, mutable=False)
         self._balance_deltas[address] = self._balance_deltas.get(address, ZERO) + delta_qrdx
         if address in self._available_balances:
             undo.keep_entry(self._available_balances, address, mutable=False)
             self._available_balances[address] = self._available_balances[address] + delta_qrdx
+
+    def _reserve_fee(self, payer: str, amount: Decimal) -> None:
+        """A transaction's maximum fee, taken from its payer before it runs. Fees are what the
+        fee floor keeps, so it does not hold them back; it is lowered by them instead."""
+        if self._fee_reserve is not None:
+            self._fees_reserved[payer] = self._fees_reserved.get(payer, ZERO) + amount
+        undo.keep_entry(self._balance_deltas, payer, mutable=False)
+        self._balance_deltas[payer] = self._balance_deltas.get(payer, ZERO) - amount
+        if payer in self._available_balances:
+            undo.keep_entry(self._available_balances, payer, mutable=False)
+            self._available_balances[payer] = self._available_balances[payer] - amount
+
+    def fee_floor(self, address: str) -> Optional[Decimal]:
+        """Under ``two_block_deferral`` (qrdx/post_state.py), the least QRDX ``address`` keeps
+        through anything in this block but fees: the smaller of FEE_RESERVE_QRDX and its balance
+        as the block began, less the fees the block reserved from it. So whatever the block
+        does, the account still holds that much after it — which is all a proposer judging the
+        next block's fees, before this one has run, needs to know. None where there is no
+        floor: the feature is off, the account cannot pay exchange fees (a protocol holder, a
+        system wallet), or its balance was not loaded (it is not debited then either)."""
+        reserve = self._fee_reserve
+        if reserve is None or not pays_exchange_fees(address):
+            return None
+        start = self._start_balances.get(address)
+        if start is None:
+            return None
+        return min(reserve, start) - self._fees_reserved.get(address, ZERO)
+
+    def _keep_fee_floor(self, address: str, delta: Decimal) -> None:
+        """Refuse (the operation fails, changing nothing) a debit that would take ``address``
+        below its fee floor — unless the account's own transaction spends its reserve."""
+        floor = self.fee_floor(address)
+        held = self._available_balances.get(address)
+        if floor is None or held is None or held + delta >= floor:
+            return
+        raise _OperationFailed(
+            ExchangeExecResult(
+                success=False,
+                error=(
+                    f"{address[:16]}… would keep less than its fee reserve ({floor} QRDX): its "
+                    "own transaction may spend it with params.spend_reserve"
+                ),
+            )
+        )
 
     def balance_deltas(self) -> Dict[str, Decimal]:
         """This block's accumulated per-address balance deltas (QRDX)."""

@@ -196,6 +196,22 @@ def judge(
     return True
 
 
+def _above_floors(mgr: Any, txs: Sequence[Any], prepared: Sequence[Prepared]) -> bool:
+    """Every sender keeps its fee floor (``ExchangeStateManager.fee_floor``) even if all its
+    transfers in the run ran and nothing came in: otherwise Python runs the run, and refuses
+    the transfer that would cross it."""
+    sent: Dict[str, Decimal] = {}
+    with localcontext(_CTX):
+        for tx, pr in zip(txs, prepared, strict=True):
+            sent[tx.sender] = sent.get(tx.sender, Decimal(0)) + pr.amount
+        for sender, total in sent.items():
+            floor = mgr.fee_floor(sender)
+            held = mgr._available_balances.get(sender)
+            if floor is not None and (held is None or held - total < floor):
+                return False
+    return True
+
+
 def run(
     mgr: Any,
     txs: Sequence[Any],
@@ -215,6 +231,8 @@ def run(
     for tx, paid in zip(txs, prepaid, strict=True):
         if paid[0] != payers[tx.sender]:
             return None
+    if mgr._fee_reserve is not None and not _above_floors(mgr, txs, prepared):
+        return None
     lanes: Dict[str, int] = {}
     addresses: Dict[str, None] = {}
     for tx, pr, paid in zip(txs, prepared, prepaid, strict=True):

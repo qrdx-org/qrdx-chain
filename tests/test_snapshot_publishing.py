@@ -37,6 +37,7 @@ def _node_db(path, checkpoint=100):
         CREATE TABLE tx_participants (account TEXT, block_height INTEGER);
         CREATE TABLE hist_trades (id INTEGER, data TEXT);
         CREATE TABLE state_commitment (domain TEXT, acc BLOB);
+        CREATE TABLE post_roots (block_hash TEXT, height INTEGER, root TEXT);
     """)
     for h in range(0, 150):
         conn.execute("INSERT INTO blocks VALUES (?, ?, ?)", (f"{h:064x}", h, "x" * 200))
@@ -50,6 +51,7 @@ def _node_db(path, checkpoint=100):
     conn.execute("INSERT INTO tx_participants VALUES ('0xPQa', 3)")
     conn.execute("INSERT INTO hist_trades VALUES (1, 'fill')")
     conn.execute("INSERT INTO state_commitment VALUES ('accounts', x'00')")
+    conn.execute("INSERT INTO post_roots VALUES ('h', 99, 'planted')")  # (never trusted)
     conn.commit()
     return conn
 
@@ -77,7 +79,7 @@ def test_a_published_snapshot_leaves_out_what_a_restore_discards(tmp_path):
         conn.close()
     copy = str(tmp_path / "pub" / "qrdx.db")
     for table in ("peers", "pending_transactions", "tx_index", "tx_participants", "hist_trades",
-                  "state_commitment"):
+                  "state_commitment", "post_roots"):
         assert _count(copy, table) == 0, table
     for table in ("blocks", "undo_log", "account_state", "exchange_checkpoint"):
         assert _count(copy, table) > 0, table

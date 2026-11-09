@@ -538,6 +538,11 @@ class ExchangeTransaction:
         runs one (EXCHANGE_FREE_TRADING; the account's budget is judged when it executes)."""
         return self.gas_price == 0 and free_trading_op(self.op_type, self.params or {})
 
+    def spends_reserve(self) -> bool:
+        """Signed to spend its sender's fee reserve (``params.spend_reserve``: true), which
+        nothing but fees otherwise takes under ``two_block_deferral`` (qrdx/post_state.py)."""
+        return isinstance(self.params, dict) and self.params.get("spend_reserve") is True
+
     def validate_fee(self, min_gas_price: Optional[int] = None) -> None:
         """Raises ValueError unless gas_price is a whole number of wei at or above the floor."""
         floor = _min_gas_price() if min_gas_price is None else int(min_gas_price)

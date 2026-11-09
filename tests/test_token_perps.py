@@ -245,8 +245,10 @@ def test_open_interest_is_capped_by_the_depth(listed, monkeypatch):
 def test_liquidity_added_for_a_moment_raises_no_cap(listed):
     m = listed.market
     before = m.spot_depth
+    # (nearly all Alice's QRDX: her own say lets it below her fee reserve)
     (r,) = listed.block(listed.tx(ALICE, Op.ADD_LIQUIDITY, pool_id=listed.pool_id,
-                                  tick_lower=-60000, tick_upper=60000, amount="100000000"))
+                                  tick_lower=-60000, tick_upper=60000, amount="100000000",
+                                  spend_reserve=True))
     assert r.success, r.error
     listed.block()
     assert m.spot_depth < before * D("1.1")                        # rises only gradually
