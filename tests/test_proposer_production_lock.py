@@ -54,8 +54,9 @@ def test_everything_from_the_tip_recheck_to_storing_the_block_is_locked():
 
 def test_broadcast_and_slot_sleep_happen_outside_the_lock():
     """The broadcast begins as soon as the block is signed (peers import while this node
-    stores it), but it is awaited only once the lock is released: a slow peer never holds up
-    imports."""
+    stores it) and finishes on its own: never awaited under the lock (a slow peer would hold up
+    imports), nor by the loop (peers answer once they have imported the block, and waiting held
+    the loop past its next slot)."""
     lines = _loop_lines()
     start, end = _locked_region(lines)
     region = "\n".join(lines[start:end])
@@ -64,7 +65,7 @@ def test_broadcast_and_slot_sleep_happen_outside_the_lock():
     begun = region.index("asyncio.ensure_future(\n") if "asyncio.ensure_future(\n" in region else -1
     assert begun > region.index("self.manager.propose_block("), "broadcast only a signed block"
     assert begun < region.index("self.db.add_block("), "the broadcast does not wait for storing"
-    assert "await broadcast" in after
+    assert "await broadcast" not in after and "self._follow_broadcast(broadcast" in after
     assert "asyncio.sleep(" not in region, "never sleep while holding the lock"
 
 
@@ -139,3 +140,28 @@ async def test_the_share_of_a_slot_left():
     node._genesis_timestamp = genesis
     assert abs(await node._slot_left(10) - 0.75) < 0.1
     assert await node._slot_left(9) == 0.0 and await node._slot_left(12) == 1.0
+
+
+async def test_a_broadcast_finishes_on_its_own_and_is_logged():
+    import asyncio
+    import logging
+
+    node = NI.ValidatorNode.__new__(NI.ValidatorNode)
+    gate = asyncio.Event()
+
+    async def send():
+        await gate.wait()
+
+    task = asyncio.ensure_future(send())
+    node._follow_broadcast(task, 7)
+    assert task in node._broadcasts                       # (kept referenced while it runs)
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    NI.logger.addHandler(handler)
+    try:
+        gate.set()
+        await asyncio.sleep(0.01)
+    finally:
+        NI.logger.removeHandler(handler)
+    assert not node._broadcasts and any("#7" in r.getMessage() for r in records)

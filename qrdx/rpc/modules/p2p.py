@@ -465,6 +465,7 @@ class P2PModule(RPCModule):
 
             if next_block_id < block_no:
                 # Peer is ahead—request sync (and check whether it is on another branch).
+                await self._note_network_ahead(block_data, block_no, block_content)
                 self._signal_fork(block_no, block_data, "a block above our tip")
                 return {
                     "ok": False,
@@ -615,6 +616,27 @@ class P2PModule(RPCModule):
                 self._propagate_fn("submit_block", block_data, ignore_node_id=None, db=self._db)
             )
             return {"ok": True, "result": f"Block {block_no} accepted."}
+
+    async def _note_network_ahead(
+        self, block_data: Dict, block_no: Any, block_content: Any
+    ) -> None:
+        """A block above this node's tip: once its proposer's signature checks, the network is
+        known to be ahead (qrdx/validator/pipeline.py ``note_ahead``) — a validator two blocks
+        behind does not propose a block that can only lose."""
+        validator_address = block_data.get("validator_address")
+        if not validator_address:
+            return
+        try:
+            from ...validator import pipeline
+            from ...validator.block_verification import verify_block_proposer
+
+            ok, _why = await verify_block_proposer(
+                self._db, block_content, validator_address, int(block_no)
+            )
+            if ok:
+                pipeline.note_ahead(int(block_no))
+        except Exception as e:  # (a sighting is advice: never fails the reply)
+            logger.debug(f"block {block_no} above the tip not noted: {e}")
 
     async def _slot_timing(self, block_content: Any, received: float) -> str:
         """When a block arrived and was done, in ms into its own slot (", slot +A→+D ms"): what

@@ -412,6 +412,8 @@ class ValidatorNode:
         from . import pipeline
 
         pipeline.PROPOSER = self  # (the live import may ask it to build before a parent runs)
+        if os.environ.get("QRDX_LOOP_LAG_LOG") == "1":
+            self._lag_task = asyncio.create_task(self._loop_lag_monitor())
 
         logger.info("✅ Validator tasks started")
 
@@ -449,6 +451,7 @@ class ValidatorNode:
         last_slot = -1
         current_slot = 0
         retried_slot = -1  # (a slot whose tip moved while preparing is tried once more)
+        iteration_started = time.perf_counter()
         while self._running:
             try:
                 # Get current slot and epoch — each slot is handled once, at its start.
@@ -456,6 +459,14 @@ class ValidatorNode:
                 if current_slot <= last_slot:
                     await self._sleep_until(last_slot + 1)
                     continue
+                if last_slot >= 0 and current_slot > last_slot + 1:
+                    # (slots that passed while the last one was handled: never tried)
+                    logger.info(
+                        f"⏱  Slot loop at slot {current_slot}: slots {last_slot + 1}.."
+                        f"{current_slot - 1} passed while slot {last_slot} was handled "
+                        f"({1000 * (time.perf_counter() - iteration_started):.0f} ms)"
+                    )
+                iteration_started = time.perf_counter()
                 last_slot = current_slot
                 current_epoch = current_slot // SLOTS_PER_EPOCH
 
@@ -597,6 +608,7 @@ class ValidatorNode:
                     # its peers: its tip may be far behind the network's.
                     reason = self._proposal_guard() if self._proposal_guard is not None else None
                     reason = reason or await self._block_signing_refusal(current_slot)
+                    reason = reason or self._behind_the_network(next_height)
                     if reason:
                         if reason != self._last_skip_reason:
                             logger.info("⏭  Skipping slot %s: %s", current_slot, reason)
@@ -1016,20 +1028,14 @@ class ValidatorNode:
                                         f"finality record skipped for block #{next_height}: {e}"
                                     )
 
-                # The broadcast, begun once the block was signed — awaited outside the lock, so
-                # a slow peer never holds up imports.
+                # The broadcast, begun once the block was signed, finishes on its own: peers
+                # answer once they have imported the block, and waiting for them here (100-300
+                # ms under load) held this loop past its next slot — lost without a try when
+                # this validator proposes two slots running.
+                if broadcast is not None:
+                    self._follow_broadcast(broadcast, next_height if block else None)
                 if block:
-                    if broadcast is not None:
-                        try:
-                            await broadcast
-                            logger.info(f"📡 Broadcast block #{next_height} to peers")
-                        except Exception as e:
-                            logger.warning(f"Failed to broadcast block: {e}")
-
                     logger.info(f"✅ Block {block.hash[:16]}... added to chain")
-                elif broadcast is not None:
-                    # (a deferred block that could not run: sent, then refused everywhere)
-                    await asyncio.gather(broadcast, return_exceptions=True)
 
                 # Wait for the next slot to START (not a fixed delay after this one's work).
                 await self._sleep_until(current_slot + 1)
@@ -1731,8 +1737,10 @@ class ValidatorNode:
         await self._refresh_validator_set(slot)
         if await self.manager.proposer_rank(slot) != 0:
             return None
-        if (self._proposal_guard() if self._proposal_guard is not None else None) or (
-            await self._block_signing_refusal(slot)
+        if (
+            (self._proposal_guard() if self._proposal_guard is not None else None)
+            or await self._block_signing_refusal(slot)
+            or self._behind_the_network(height)
         ):
             return None
         section = block_data.get("exchange_transactions") or []
@@ -1774,6 +1782,8 @@ class ValidatorNode:
         if signed is None:
             return None
         block, data, broadcast, sent_at = signed
+        if broadcast is not None:
+            self._follow_broadcast(broadcast, height)
         return _Ahead(
             block, data, height, slot, epoch, block_timestamp, exchange_txs, evm_raws, phases,
             locked_at, sent_at, broadcast,
@@ -2097,6 +2107,72 @@ class ValidatorNode:
             return 0
         elapsed = datetime.now(timezone.utc).timestamp() - genesis
         return max(0, int(elapsed // SLOT_DURATION_SECONDS))
+
+    async def _loop_lag_monitor(self, tick: float = 0.01, report: float = 0.1) -> None:
+        """(``QRDX_LOOP_LAG_LOG=1``, a diagnostic) Log each time the event loop woke this task
+        ``report`` seconds or more late: synchronous work held the loop that long. A watchdog
+        thread logs what the loop was running when its heartbeat went ``report`` seconds stale."""
+        import sys
+        import threading
+        import traceback
+
+        beat = [time.perf_counter()]
+        main = threading.get_ident()
+
+        def watch() -> None:
+            seen = 0.0
+            while self._running:
+                time.sleep(0.02)
+                stale = time.perf_counter() - beat[0]
+                if stale >= report and beat[0] != seen:
+                    seen = beat[0]
+                    frame = sys._current_frames().get(main)
+                    if frame is not None:
+                        where = " < ".join(
+                            f"{f.name} ({f.filename.rsplit('/', 2)[-1]}:{f.lineno})"
+                            for f in reversed(traceback.extract_stack(frame)[-8:])
+                        )
+                        logger.info(f"⏳ Loop held {1000 * stale:.0f} ms so far, in: {where}")
+
+        threading.Thread(target=watch, name="loop-lag-watchdog", daemon=True).start()
+        while self._running:
+            asked = time.perf_counter()
+            beat[0] = asked
+            await asyncio.sleep(tick)
+            late = time.perf_counter() - asked - tick
+            if late >= report:
+                logger.info(f"⏳ Event loop held {1000 * late:.0f} ms")
+
+    def _follow_broadcast(self, broadcast: "asyncio.Future", height: Optional[int]) -> None:
+        """Log a block's broadcast when it finishes (kept referenced until then). ``height`` is
+        None for a block that could not run here: sent, and refused everywhere."""
+        pending = self.__dict__.setdefault("_broadcasts", set())
+        pending.add(broadcast)
+
+        def done(task: "asyncio.Future") -> None:
+            pending.discard(task)
+            if height is None or task.cancelled():
+                return
+            error = task.exception()
+            if error is not None:
+                logger.warning(f"Failed to broadcast block #{height}: {error}")
+            else:
+                logger.info(f"📡 Broadcast block #{height} to peers")
+
+        broadcast.add_done_callback(done)
+
+    @staticmethod
+    def _behind_the_network(next_height: int) -> Optional[str]:
+        """Why not to propose at ``next_height``: a block two or more heights above it is known
+        (a peer sent it, its proposer's signature checked, within the last second) — the block
+        would compete with a longer chain, lose, and cost this node a rollback while it falls
+        further behind. None otherwise."""
+        from . import pipeline
+
+        ahead = pipeline.network_ahead()
+        if ahead is not None and ahead > next_height:
+            return f"behind the network (block {ahead} is known): catching up"
+        return None
 
     @staticmethod
     def _retry_share() -> float:

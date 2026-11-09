@@ -412,3 +412,40 @@ def test_the_import_builds_before_running_and_finishes_after():
     assert ahead.index("_select_sections(") < ahead.index("_sign_and_send(")
     finish = inspect.getsource(NI.ValidatorNode.finish_ahead)
     assert finish.index("before_block(") < finish.index("_run_and_store(")
+
+
+def test_a_validator_behind_the_network_does_not_propose(monkeypatch):
+    """A block two or more heights above where this node would build — a peer sent it and its
+    proposer's signature checked — means its block would only compete with a longer chain and
+    lose. The sighting counts for a second (a network ahead keeps renewing it)."""
+    import time
+
+    from qrdx.validator import node_integration as NI
+    from qrdx.validator import pipeline
+
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(pipeline, "_AHEAD", [])
+    assert NI.ValidatorNode._behind_the_network(50) is None
+    pipeline.note_ahead(50)                              # (the very block it would build on next)
+    assert NI.ValidatorNode._behind_the_network(50) is None
+    pipeline.note_ahead(52)
+    pipeline.note_ahead(51)                              # (a lower sighting does not lower it)
+    assert "block 52" in NI.ValidatorNode._behind_the_network(50)
+    assert NI.ValidatorNode._behind_the_network(52) is None
+    clock[0] += pipeline.AHEAD_FOR + 0.1                 # (stale: no longer counts)
+    assert NI.ValidatorNode._behind_the_network(50) is None
+    pipeline.note_ahead(40)                              # (a fresh sighting replaces a stale one)
+    assert pipeline.network_ahead() == 40
+
+
+def test_only_a_signed_block_above_the_tip_counts():
+    import inspect
+
+    from qrdx.rpc.modules import p2p
+
+    src = inspect.getsource(p2p.P2PModule._note_network_ahead)
+    assert src.index("verify_block_proposer(") < src.index("pipeline.note_ahead(")
+    assert "if ok:" in src
+    submit = inspect.getsource(p2p.P2PModule.submitBlock)
+    assert submit.index("_note_network_ahead(") < submit.index('"sync_required"')

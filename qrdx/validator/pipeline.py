@@ -211,6 +211,30 @@ def judge(
 PROPOSER: Any = None
 
 
+# The highest block a peer sent above this node's tip, with its proposer's signature checked, and
+# when (monotonic): a validator two or more blocks behind the network builds only a fork that loses.
+_AHEAD: List[Tuple[int, float]] = []
+AHEAD_FOR = 1.0  # seconds a sighting counts: the next blocks of a network ahead renew it
+
+
+def note_ahead(height: int) -> None:
+    """A peer sent block ``height``, above this node's tip, signed by its proposer."""
+    import time
+
+    if not _AHEAD or height >= _AHEAD[0][0] or time.monotonic() - _AHEAD[0][1] > AHEAD_FOR:
+        _AHEAD[:] = [(int(height), time.monotonic())]
+
+
+def network_ahead() -> Optional[int]:
+    """The height of a block the network has above this node's tip, seen in the last
+    ``AHEAD_FOR`` seconds (None if none)."""
+    import time
+
+    if _AHEAD and time.monotonic() - _AHEAD[0][1] <= AHEAD_FOR:
+        return _AHEAD[0][0]
+    return None
+
+
 def parent_carries(content: Dict[str, Any]) -> Tuple[Set[Tuple[str, int]], List[Any]]:
     """The (validator, target epoch) of the votes a parent carries, and its slashing evidence."""
     from .attestation_block import decode_attestations

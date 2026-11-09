@@ -456,7 +456,23 @@ The fourth round, consensus changes for the regenesis (2026-11-05):
     Live (4 nodes, one host, 2,048 accounts): 1,000 transfers a second fill 4.0 blocks a second
     (p95 0.7 s); at 1,500 a tenth of blocks are built ahead, none failed to run, and the chain
     still falls behind (2.7 blocks a second), as it did without it (2.4–2.6).
-33. **Less work a transfer on the import path** (bench: 234 → 218 µs a transfer, 500 to a block):
+33. **Slots a proposer lost without trying.** In a 2,000-a-second step a fifth of slots saw no
+    attempt: the proposer's slot loop was still busy when its slot came and went.
+    * After proposing, the loop waited for the broadcast — for peers' replies, which come once
+      they have imported the block (100–300 ms under load), so a validator proposing two slots
+      running (a third of the time with three) lost the second. The broadcast now finishes on
+      its own and is logged when it does.
+    * A validator two or more blocks behind the network (a peer sent a block that high, its
+      proposer's signature checked, within the last second) proposed on its stale tip: the
+      block lost the fork, the node rolled back and stopped to sync, and missed several slots
+      more. It now waits to catch up instead.
+    * With `QRDX_LOOP_LAG_LOG=1` a node logs each time its event loop was held 100 ms or more,
+      and what it was running: under load, a block's synchronous exchange run (inside the
+      block's undo scope it costs about a third more: 62 → 82 µs a transfer).
+
+    One host, 2,000 a second for 30 s: 1,973 executed at 3.4 blocks a second (sustained 40 s
+    steps after 1,000 and 1,500: 1,700–1,875 at 2.6–3.2).
+34. **Less work a transfer on the import path** (bench: 234 → 218 µs a transfer, 500 to a block):
     * A block's balance changes are folded into the account accumulator once
       (`state_commitment.batched`), and journaled for undo in one statement written ahead of
       them (`undo_journal.written_ahead`), instead of a trigger rewriting the accumulator and
