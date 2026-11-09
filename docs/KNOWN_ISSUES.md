@@ -14,6 +14,19 @@ Companions: [UNIFIED_ACCOUNT_IDENTITY.md](UNIFIED_ACCOUNT_IDENTITY.md),
 
 # Open defects
 
+## OPEN — An unexplained cluster of crashes on 2026-11-09
+
+**Severity: unknown (not reproduced).** Within about 20 minutes on the development host: one
+node of a 4-node load run reported `database disk image is malformed` (it had first read an
+account's balance as 0 — a missed index lookup), a Python process segfaulted inside libc, and
+three test processes segfaulted during garbage collection (the full suite once, the order-lane
+tests twice in 18 runs). Nothing has recurred since: 35 runs of the same tests, 20 of them under
+a debugger, a full suite and later load runs whose databases all pass `PRAGMA integrity_check`.
+The native module has no `unsafe` code but its liboqs bindings; the native order lane built
+before that day's changes showed no crash in 12 runs, too few to rule its changes in or out.
+Load runs now check every node's database afterwards; a recurrence is to be caught under a
+debugger for a native backtrace.
+
 ## OPEN — Live throughput is about a quarter of what the protocol allows
 
 **Severity: medium (capacity, not safety).** Measured 2026-11-05 (docs/PERFORMANCE.md).

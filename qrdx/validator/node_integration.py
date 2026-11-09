@@ -554,10 +554,13 @@ class ValidatorNode:
                     if (await self.db.get_next_block_id()) != next_block_id:
                         # The block that landed is most often the previous slot's, imported while
                         # this one waited for the lock: build on it, in this slot, from the top
-                        # (eligibility and every check again, on the new tip). Once a slot.
+                        # (eligibility and every check again, on the new tip). Once a slot. With a
+                        # pipelined proposer next (qrdx/validator/pipeline.py) a block sent late
+                        # in its slot is built on before it runs, so it is worth building while
+                        # any of the slot is left: a skipped slot is a block lost for good.
                         if (
                             retried_slot != current_slot
-                            and await self._slot_left(current_slot) > 0.5
+                            and await self._slot_left(current_slot) > self._retry_share()
                         ):
                             retried_slot, last_slot = current_slot, current_slot - 1
                             continue
@@ -578,7 +581,7 @@ class ValidatorNode:
                     if not tip_hash or tip_hash != parent_hash:
                         if (
                             retried_slot != current_slot
-                            and await self._slot_left(current_slot) > 0.5
+                            and await self._slot_left(current_slot) > self._retry_share()
                         ):
                             retried_slot, last_slot = current_slot, current_slot - 1
                             continue
@@ -1596,6 +1599,7 @@ class ValidatorNode:
         block_timestamp: Any,
         base_fees: Any,
         ahead: Optional[Tuple[Any, Any]] = None,
+        phases: Optional[Phases] = None,
     ) -> Tuple[List[Any], List[str]]:
         """A block's exchange and EVM sections, from the mempools, judged on the state now.
         ``ahead``: (``pipeline.ParentEffects``, the fee reserve) when its parent has not run yet
@@ -1620,6 +1624,8 @@ class ValidatorNode:
                 )
                 if exchange_txs and chain_spec.is_active(FEATURE, next_height):
                     exchange_txs = fair_order(exchange_txs)
+                if phases is not None:
+                    phases.mark("pick")
                 if ahead is not None:
                     if exchange_txs:
                         exchange_txs = await self._judge_ahead(
@@ -1676,13 +1682,14 @@ class ValidatorNode:
         """Build on block ``parent_height`` before it runs (two blocks; qrdx/validator/pipeline.py).
 
         Called by the live import, holding the block-processing lock, once the block is verified
-        and before it runs. When this node proposes the next slot and the block would not have
-        run by that slot's start, the next block is judged on the state now (before the parent)
-        and the parent's contents, signed with the root of the state now and sent at the slot's
-        start; the import then runs the parent, and ``finish_ahead`` runs and stores this one.
-        The slot loop, finding the height filled, passes. Returns the pending block, or None to
-        import as usual (a parent that opens an epoch, carries operations the bounds do not
-        cover, or will have run in time; another proposer's slot; anything a proposal checks)."""
+        and before it runs. When this node proposes the next slot and the block arrived within
+        half a slot of that slot's start (or after it), the next block is judged on the state now
+        (before the parent) and the parent's contents, signed with the root of the state now and
+        sent at once; the import then runs the parent, and ``finish_ahead`` runs and stores this
+        one. The slot loop, finding the height filled, passes. Returns the pending block, or None
+        to import as usual (a parent that opens an epoch, carries operations the bounds do not
+        cover, or arrived in time to run first; another proposer's slot; anything a proposal
+        checks)."""
         from .. import chain_index, chain_spec, post_state
         from ..exchange.block_processor import decode_exchange_txs
         from ..exchange.state_manager import ExchangeStateManager, fee_reserve_at
@@ -1714,8 +1721,13 @@ class ValidatorNode:
         if genesis is None:
             return None
         start = genesis + slot * SLOT_DURATION_SECONDS
-        if time.time() + pipeline.expected_run() < start:
-            return None  # (it runs before the slot starts: build on it as usual)
+        if time.time() < start - SLOT_DURATION_SECONDS / 2:
+            # (it arrived in time to run before the slot: run it now, build on it as usual)
+            return None
+        # Within half a slot of the slot's start, the block is built and sent now: its timestamp
+        # is the slot's start whenever it is built, and importers take a slot up to a second
+        # ahead of their clock (block_verification). Waiting for the slot, holding the lock,
+        # kept the parent and every block behind it waiting.
         await self._refresh_validator_set(slot)
         if await self.manager.proposer_rank(slot) != 0:
             return None
@@ -1732,21 +1744,19 @@ class ValidatorNode:
         if effects.unbounded:
             logger.debug(f"Block #{height} waits for its parent to run: {effects.unbounded}")
             return None
-        wait = start - time.time()
-        if wait > 0:
-            await asyncio.sleep(wait)
         phases = Phases()
         locked_at = time.perf_counter()
         base_fees = await base_fees_at(
             self.db, height, parent=parent_inputs(content, section, evm_section)
         )
+        phases.mark("fees")
         origin = await genesis_time(self.db)
         if chain_spec.is_active("slot_timestamps", height) and origin is not None:
             block_timestamp: Any = slot_timestamp(origin, slot)
         else:
             block_timestamp = int(datetime.now(timezone.utc).timestamp())
         exchange_txs, evm_raws = await self._select_sections(
-            height, block_timestamp, base_fees, ahead=(effects, reserve)
+            height, block_timestamp, base_fees, ahead=(effects, reserve), phases=phases
         )
         phases.mark("select")
         signed = await self._sign_and_send(
@@ -1921,7 +1931,7 @@ class ValidatorNode:
             into = f", sent +{1000 * offset:.0f} ms into its slot"
         logger.info(
             f"📦 Proposed block #{next_height} at slot {current_slot}: {block.hash[:16]}... "
-            f"({1000 * (sent_at - locked_at):.0f} ms to send, "
+            f"({len(exchange_txs)} ops, {1000 * (sent_at - locked_at):.0f} ms to send, "
             f"{1000 * (time.perf_counter() - locked_at):.0f} ms in all: {phases}{into})"
         )
 
@@ -2087,6 +2097,14 @@ class ValidatorNode:
             return 0
         elapsed = datetime.now(timezone.utc).timestamp() - genesis
         return max(0, int(elapsed // SLOT_DURATION_SECONDS))
+
+    @staticmethod
+    def _retry_share() -> float:
+        """How much of its slot must be left for a proposer whose tip moved while it prepared to
+        build again on the new tip: half, or a twentieth with a pipelined proposer next."""
+        from . import pipeline
+
+        return 0.05 if pipeline.enabled() else 0.5
 
     async def _slot_left(self, slot: int) -> float:
         """The share of ``slot`` still to come (0 once it has passed)."""

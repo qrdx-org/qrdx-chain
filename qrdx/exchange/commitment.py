@@ -58,7 +58,30 @@ def verifying() -> bool:
 
 
 def canonical_bytes(obj: Any) -> bytes:
+    """``json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)``, encoded. A plain
+    string, or a flat list of plain strings and whole numbers — what most entries and keys are
+    (nonces, balances, allowances) — is written directly, to the same bytes (``_plain``: printable
+    ASCII with nothing JSON escapes)."""
+    t = type(obj)
+    if t is str and _plain(obj):
+        return b'"' + obj.encode() + b'"'
+    if t is list or t is tuple:
+        parts = []
+        for v in obj:
+            tv = type(v)
+            if tv is str and _plain(v):
+                parts.append('"' + v + '"')
+            elif tv is int:
+                parts.append(str(v))
+            else:
+                break
+        else:
+            return ("[" + ",".join(parts) + "]").encode()
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str).encode()
+
+
+def _plain(s: str) -> bool:
+    return s.isascii() and s.isprintable() and '"' not in s and "\\" not in s
 
 
 def _digest(encoded: Any) -> bytes:

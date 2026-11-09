@@ -107,16 +107,24 @@ def test_the_parent_is_re_checked_under_the_lock_before_any_section_runs():
     assert sum("continue" in l for l in region[recheck + 1:recheck + 14]) == 2
 
 
-def test_a_tip_that_moved_while_preparing_is_built_on_in_the_same_slot():
+def test_a_tip_that_moved_while_preparing_is_built_on_in_the_same_slot(monkeypatch):
     """An import that lands while the proposer waits for the lock (most often the previous
     slot's block) used to cost the proposer its slot. It now goes back to the top once, while
-    at least half the slot is left, and builds on the new tip after every check again."""
+    enough of the slot is left — half, or a twentieth with a pipelined proposer next (whose
+    import builds on a late block before running it) — and builds on the new tip after every
+    check again."""
+    from qrdx.validator import pipeline
+
     src = "\n".join(_loop_lines())
     for skip in ("was filled while preparing", "the tip changed while preparing"):
         before = src[: src.index(skip)]
         guard = before.rindex("retried_slot != current_slot")
-        assert "await self._slot_left(current_slot) > 0.5" in before[guard:]
+        assert "await self._slot_left(current_slot) > self._retry_share()" in before[guard:]
         assert "retried_slot, last_slot = current_slot, current_slot - 1" in before[guard:]
+    monkeypatch.setattr(pipeline, "enabled", lambda: True)
+    assert NI.ValidatorNode._retry_share() == 0.05
+    monkeypatch.setattr(pipeline, "enabled", lambda: False)
+    assert NI.ValidatorNode._retry_share() == 0.5
 
 
 async def test_the_share_of_a_slot_left():

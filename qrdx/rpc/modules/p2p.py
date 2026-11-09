@@ -650,7 +650,6 @@ class P2PModule(RPCModule):
         from ...derived_state_rebuild import before_block
         from ...validator.block_verification import epoch_from_block as _block_epoch
 
-        run_started = time.perf_counter()
         stored = False
         try:
             async with await before_block(self._db, block_no, _block_epoch(block_data)):
@@ -826,7 +825,6 @@ class P2PModule(RPCModule):
             if stored:
                 from ...validator import pipeline
 
-                pipeline.note_run(time.perf_counter() - run_started)
                 if ahead is not None:
                     # (after this block's journal and undo scope closed: the next block's own)
                     ahead.finished = True

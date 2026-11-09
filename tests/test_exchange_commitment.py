@@ -181,3 +181,64 @@ def test_a_revert_restores_a_consistent_commitment(monkeypatch):
         assert m.compute_state_root() == root  # (and verify_commitments ran clean)
     finally:
         ExchangeStateManager.reset_instance()
+
+
+def test_canonical_bytes_are_json_dumps_byte_for_byte():
+    """The direct path for plain strings and flat lists (nonces, balances, allowances) writes
+    exactly what ``json.dumps`` does — escapes, non-ASCII, booleans and floats fall back to it."""
+    import json
+    import random
+
+    from qrdx.exchange.commitment import canonical_bytes
+
+    rng = random.Random(7)
+    alphabet = ['a', 'Z', '0', ' ', '"', '\\', '/', '\n', '\t', '\x00', '\x7f', 'é', '✓', '|', ':']
+
+    def text():
+        return "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 6)))
+
+    def value(depth=0):
+        k = rng.random()
+        if k < 0.4:
+            return text()
+        if k < 0.6:
+            return rng.choice([0, 1, -5, 2**70, -(2**64)])
+        if k < 0.7:
+            return rng.choice([True, False, None, 1.5, -0.0])
+        if depth < 2 and k < 0.85:
+            return [value(depth + 1) for _ in range(rng.randint(0, 3))]
+        if depth < 2 and k < 0.92:
+            return tuple(value(depth + 1) for _ in range(rng.randint(0, 3)))
+        return {text(): value(depth + 1) for _ in range(rng.randint(0, 2))} if depth < 2 else text()
+
+    for _ in range(20_000):
+        obj = value()
+        want = json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str).encode()
+        assert canonical_bytes(obj) == want, obj
+    for obj in ("0xPQ" + "ab" * 32, ["0xPQ" + "ab" * 32, "17"], ("k", 3), ["a|b", -2]):
+        assert canonical_bytes(obj) == json.dumps(obj, separators=(",", ":")).encode()
+
+
+def test_a_transactions_params_json_is_json_dumps_byte_for_byte():
+    """The transaction hash's params (``_params_json``): the direct path writes what
+    ``json.dumps(params, sort_keys=True, default=str)`` does, whatever the params."""
+    import json
+    import random
+
+    from qrdx.exchange.transactions import _params_json
+
+    rng = random.Random(11)
+    alphabet = ['a', 'Z', '0', ' ', '"', '\\', '/', '\n', '\x00', 'é', '✓', ':', ',']
+
+    def text():
+        return "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 5)))
+
+    def value():
+        return rng.choice([text(), text(), rng.randint(-10, 10**20), True, None, 1.25,
+                           [text()], {"x": text()}])
+
+    for _ in range(20_000):
+        params = {text(): value() for _ in range(rng.randint(0, 4))}
+        if rng.random() < 0.05:
+            params = rng.choice([[], None, "s", {1: "a"}])
+        assert _params_json(params) == json.dumps(params, sort_keys=True, default=str).encode()

@@ -210,25 +210,6 @@ def judge(
 # block before running it (``ValidatorNode.propose_ahead``).
 PROPOSER: Any = None
 
-# How long running an imported block takes here, the last few: whether a parent surely runs
-# before the proposer's slot starts, or the proposer builds first. Judged by the slow ones (a
-# block's run varies with what else the node is doing): one that overruns costs the slot.
-_RUNS: List[float] = []
-_KEEP_RUNS = 32
-
-
-def note_run(seconds: float) -> None:
-    _RUNS.append(max(0.0, float(seconds)))
-    del _RUNS[:-_KEEP_RUNS]
-
-
-def expected_run() -> float:
-    """The 90th percentile of the recent runs (0.1 s before any)."""
-    if not _RUNS:
-        return 0.1
-    ordered = sorted(_RUNS)
-    return ordered[min(len(ordered) - 1, int(0.9 * len(ordered)))]
-
 
 def parent_carries(content: Dict[str, Any]) -> Tuple[Set[Tuple[str, int]], List[Any]]:
     """The (validator, target epoch) of the votes a parent carries, and its slashing evidence."""

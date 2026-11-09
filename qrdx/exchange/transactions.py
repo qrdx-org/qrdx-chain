@@ -181,6 +181,32 @@ class ExchangeOpType(IntEnum):
 # ---------------------------------------------------------------------------
 
 
+def _params_json(params: Any) -> bytes:
+    """``json.dumps(params, sort_keys=True, default=str)``, encoded. Flat params of plain strings
+    and whole numbers — most operations' — are written directly, to the same bytes (printable
+    ASCII with nothing JSON escapes; the default separators)."""
+    if type(params) is dict:
+        parts = []
+        for k in sorted(params):
+            v = params[k]
+            if type(k) is not str or not _plain(k):
+                break
+            tv = type(v)
+            if tv is str and _plain(v):
+                parts.append('"' + k + '": "' + v + '"')
+            elif tv is int:
+                parts.append('"' + k + '": ' + str(v))
+            else:
+                break
+        else:
+            return ("{" + ", ".join(parts) + "}").encode()
+    return json.dumps(params, sort_keys=True, default=str).encode("utf-8")
+
+
+def _plain(s: str) -> bool:
+    return s.isascii() and s.isprintable() and '"' not in s and "\\" not in s
+
+
 @dataclass
 class ExchangeTransaction:
     """
@@ -280,7 +306,7 @@ class ExchangeTransaction:
     def _canonical_bytes(self) -> bytes:
         """Canonical byte representation for hashing and signing."""
         # Deterministic JSON serialization of params
-        params_json = json.dumps(self.params, sort_keys=True, default=str).encode("utf-8")
+        params_json = _params_json(self.params)
         parts = [
             _SIGNING_TAG,
             int(self.chain_id).to_bytes(8, "big"),

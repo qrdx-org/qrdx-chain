@@ -5,12 +5,13 @@ This is a simplified SQLite adapter for local testnet development.
 For production, use the full PostgreSQL database.py implementation.
 """
 
+import contextlib
 import json
 import os
 from collections import OrderedDict
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiosqlite
 
@@ -1373,17 +1374,31 @@ class DatabaseSQLite:
         for i in ids:
             for listener in getattr(self, "account_write_listeners", ()):
                 listener(i)
+        from . import state_commitment, undo_journal
+
+        # Each account's rows as they are: its balance, its committed columns (for the
+        # accumulator), and — while the block is journaled — its rowid and every column (for the
+        # undo journal), so the writes below are folded and journaled as a batch.
+        journal_cols = undo_journal.journaling(self.connection, "account_state")
+        names = journal_cols or ["address", "balance", "nonce", "code_hash", "storage_root"]
+        at_of = {n: k for k, n in enumerate(names)}
+        if not all(
+            c in at_of for c in ("address", "balance", "nonce", "code_hash", "storage_root")
+        ):
+            names, journal_cols = ["address", "balance", "nonce", "code_hash", "storage_root"], None
+            at_of = {n: k for k, n in enumerate(names)}
         rows: Dict[str, Any] = {}
+        found: Dict[str, List[Any]] = {}  # id → (rowid, its columns) of each of its rows
         for at in range(0, len(ids), self._BATCH):
             part = ids[at : at + self._BATCH]
             cur = await self.connection.execute(
-                "SELECT LOWER(address), balance FROM account_state WHERE LOWER(address) IN ("
-                + ",".join("?" * len(part))
-                + ")",
+                f"SELECT LOWER(address), rowid, {', '.join(names)} FROM account_state "
+                "WHERE LOWER(address) IN (" + ",".join("?" * len(part)) + ")",
                 part,
             )
-            for addr, bal in await cur.fetchall():
-                rows.setdefault(addr, int(bal or 0))
+            for addr, rid, *row in await cur.fetchall():
+                rows.setdefault(addr, int(row[at_of["balance"]] or 0))
+                found.setdefault(addr, []).append((rid, row))
         balance = dict(rows)  # id → its balance as the deltas leave it
         created: set = set()
         results: Dict[str, bool] = {}
@@ -1404,9 +1419,25 @@ class DatabaseSQLite:
         updates = [(str(balance[i]), i) for i in ids if i in balance and i not in created]
         inserts = [(i, str(balance[i])) for i in ids if i in created]
         if updates:
-            await self.connection.executemany(
-                "UPDATE account_state SET balance = ? WHERE LOWER(address) = LOWER(?)", updates
-            )
+            # Folded into the accumulator once, and journaled in one statement ahead of the
+            # writes, rather than row by row by their triggers.
+            committed = ("address", "balance", "nonce", "code_hash", "storage_root")
+            touched = [(value, rid, row) for value, i in updates for rid, row in found.get(i, ())]
+            ahead = [(rid, row) for _v, rid, row in touched] if journal_cols else None
+            async with contextlib.AsyncExitStack() as stack:
+                if ahead is not None:
+                    await stack.enter_async_context(
+                        undo_journal.written_ahead(self.connection, "account_state", ahead)
+                    )
+                batch = await stack.enter_async_context(
+                    state_commitment.batched(self.connection, "account")
+                )
+                await self.connection.executemany(
+                    "UPDATE account_state SET balance = ? WHERE LOWER(address) = LOWER(?)", updates
+                )
+                for value, _rid, row in touched:
+                    old = tuple(row[at_of[c]] for c in committed)
+                    batch.fold(old, (old[0], value, old[2], old[3], old[4]))
         if inserts:
             await self.connection.executemany(
                 "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, "
@@ -1851,8 +1882,10 @@ class DatabaseSQLite:
         from .fastjson import dumps
         from .fee_market import note_exchange_section
 
-        # (its children's base fee reads the gas it declared: noted now, not parsed back)
-        note_exchange_section(self, block_hash, items)
+        # (its children's base fee reads the gas it declared: noted now, not parsed back — from
+        # the operations themselves when the caller holds them, not each item's bytes again)
+        whole = objects is not None and len(objects) == len(items)
+        note_exchange_section(self, block_hash, objects if whole else items)
 
         def tx_hash(idx: int, item: Any) -> str:
             if objects is not None and len(objects) == len(items):

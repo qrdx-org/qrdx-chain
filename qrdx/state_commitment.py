@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import time
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .crypto import lthash
 
@@ -243,6 +243,63 @@ class suspended:
                 "UPDATE state_commitment SET acc = ? WHERE domain = ?",
                 (lthash.ZERO, self._domain),
             )
+
+
+class batched:
+    """Write rows of a domain with its triggers off, folding each row's change into the
+    accumulator once on leaving — what the triggers would have done row by row (the same
+    function, ``qrdx_lt_apply``), with one accumulator write instead of one a row. Every change
+    made inside must be handed to ``fold`` (its committed columns before and after: None for a
+    row that did not exist, or no longer does). Only under the node's block-processing lock: a
+    statement on the domain from elsewhere inside the window would go unfolded."""
+
+    def __init__(self, conn: Any, kind: str) -> None:
+        self._conn = conn
+        self._kind = kind
+        self._domain = TABLES[kind][0]
+        self._changes: List[Tuple[Optional[Sequence[Any]], Optional[Sequence[Any]]]] = []
+
+    def fold(self, old: Optional[Sequence[Any]], new: Optional[Sequence[Any]]) -> None:
+        self._changes.append((old, new))
+
+    async def __aenter__(self) -> "batched":
+        off = getattr(self._conn, "qrdx_lt_off", None)
+        if off is not None:
+            off.add(self._domain)
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        off = getattr(self._conn, "qrdx_lt_off", None)
+        if off is None:
+            return  # (no triggers on this connection: nothing to fold)
+        off.discard(self._domain)
+        if exc[0] is not None:
+            # (which rows changed is not known: the accumulator, from every row)
+            acc = await full_accumulator(self._conn, self._domain)
+            await self._conn.execute(
+                "UPDATE state_commitment SET acc = ? WHERE domain = ?", (acc, self._domain)
+            )
+            return
+        if not self._changes:
+            return
+        from .native import lt_apply_function
+
+        apply = lt_apply_function() or _udf_apply
+        width = len(TABLES[self._kind][3])
+        pad = (None,) * (_WIDTH - width)
+        acc = await stored_accumulator(self._conn, self._domain)
+        for old, new in self._changes:
+            acc = apply(
+                acc,
+                self._kind,
+                0 if old is None else 1,
+                0 if new is None else 1,
+                *(tuple(old) + pad if old is not None else (None,) * _WIDTH),
+                *(tuple(new) + pad if new is not None else (None,) * _WIDTH),
+            )
+        await self._conn.execute(
+            "UPDATE state_commitment SET acc = ? WHERE domain = ?", (acc, self._domain)
+        )
 
 
 async def root(conn: Any, domain: str) -> str:

@@ -91,3 +91,79 @@ async def test_a_rollback_that_takes_a_table_and_its_triggers_is_noticed(db):
     await conn.commit()
     assert await undo_journal.rollback_to(db, 1) == 1
     assert await _held(db) == []
+
+
+async def test_a_batched_balance_flush_journals_what_the_triggers_would(tmp_path, monkeypatch):
+    """``apply_account_balance_deltas`` journals its updates in one statement ahead of them and
+    folds the accumulator once (undo_journal.written_ahead, state_commitment.batched). Against a
+    twin whose flush leaves both to the triggers, row by row: the same undo entries, rows and
+    accumulator after every block — and a rollback by the journal restores the earlier state."""
+    import marshal
+    import random
+    from decimal import Decimal
+
+    from qrdx import state_commitment as sc
+    from qrdx import undo_journal
+    from qrdx.database_sqlite import DatabaseSQLite
+
+    batched_db = await DatabaseSQLite.create(db_path=str(tmp_path / "batched.db"))
+    rowwise_db = await DatabaseSQLite.create(db_path=str(tmp_path / "rowwise.db"))
+    real_journaling, real_batched = undo_journal.journaling, sc.batched
+
+    class _Triggers:  # (the twin: nothing batched, the triggers do it all)
+        def __init__(self, conn, kind):
+            pass
+
+        def fold(self, old, new):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+    async def snapshot(db):
+        rows = await db.connection.execute_fetchall(
+            "SELECT address, balance, nonce, code_hash, storage_root FROM account_state "
+            "ORDER BY address")
+        undo = await db.connection.execute_fetchall(
+            "SELECT height, tbl, op, rid, old FROM undo_log ORDER BY seq")
+        # (an entry as the rollback reads it: marshal's bytes for equal values may differ, as it
+        # marks objects shared in memory)
+        undo = [(h, t, o, r, None if old is None else marshal.loads(old))
+                for h, t, o, r, old in undo]
+        return [tuple(r) for r in rows], undo, \
+            await sc.stored_accumulator(db.connection, "account")
+
+    try:
+        rng = random.Random(5)
+        addrs = ["0xPQ" + f"{i:064x}" for i in range(30)]
+        states = {}
+        for height in range(1, 16):
+            deltas = [(rng.choice(addrs), Decimal(rng.choice(["1", "-0.5", "2.25", "-3", "7"])))
+                      for _ in range(rng.randint(1, 20))]
+            for db, plain in ((batched_db, False), (rowwise_db, True)):
+                if plain:
+                    monkeypatch.setattr(undo_journal, "journaling", lambda conn, table: None)
+                    monkeypatch.setattr(sc, "batched", _Triggers)
+                async with undo_journal.recording(db, height):
+                    await db.apply_account_balance_deltas(deltas)
+                await db.connection.commit()
+                monkeypatch.setattr(undo_journal, "journaling", real_journaling)
+                monkeypatch.setattr(sc, "batched", real_batched)
+            a, b = await snapshot(batched_db), await snapshot(rowwise_db)
+            assert a == b, height
+            assert a[2] == await sc.full_accumulator(batched_db.connection, "account")
+            states[height] = a[0]
+        assert len(a[1]) > 50                                   # (updates journaled)
+        assert await undo_journal.rollback_to(batched_db, 7) is not None
+        rows = await batched_db.connection.execute_fetchall(
+            "SELECT address, balance, nonce, code_hash, storage_root FROM account_state "
+            "ORDER BY address")
+        assert [tuple(r) for r in rows] == states[7]
+        assert await sc.stored_accumulator(batched_db.connection, "account") == \
+            await sc.full_accumulator(batched_db.connection, "account")
+    finally:
+        await batched_db.connection.close()
+        await rowwise_db.connection.close()

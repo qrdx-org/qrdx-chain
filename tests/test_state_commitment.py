@@ -225,3 +225,31 @@ def test_lthash_add_and_remove_are_inverse():
         acc = lthash.mix(acc, v, None)
     assert acc == lthash.ZERO
     assert lthash.root("x", lthash.ZERO) == "0" * 128
+
+
+async def test_a_batched_balance_flush_folds_what_the_triggers_would(tmp_path):
+    """``apply_account_balance_deltas`` writes its updates with the account trigger off and folds
+    them into the accumulator once (``state_commitment.batched``): after every batch — credits,
+    debits, accounts new and old, one changed twice — the accumulator is the rows'."""
+    import random
+    from decimal import Decimal
+
+    from qrdx import state_commitment as sc
+    from qrdx.database_sqlite import DatabaseSQLite
+
+    db = await DatabaseSQLite.create(db_path=str(tmp_path / "flush.db"))
+    try:
+        rng = random.Random(3)
+        addrs = ["0xPQ" + f"{i:064x}" for i in range(40)]
+        changed = 0
+        for k in range(30):
+            deltas = [(rng.choice(addrs), Decimal(rng.choice(["1", "-0.5", "2.25", "1E-6", "-3"])))
+                      for _ in range(rng.randint(1, 25))]
+            before = await sc.stored_accumulator(db.connection, "account")
+            await db.apply_account_balance_deltas(deltas)
+            after = await sc.stored_accumulator(db.connection, "account")
+            changed += after != before
+            assert after == await sc.full_accumulator(db.connection, "account"), k
+        assert changed > 20
+    finally:
+        await db.connection.close()

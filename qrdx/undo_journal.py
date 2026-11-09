@@ -158,6 +158,34 @@ async def recording(db: Any, height: int) -> AsyncIterator[None]:
         st.height = previous
 
 
+def journaling(conn: Any, table: str) -> Optional[List[str]]:
+    """The columns ``table``'s undo trigger packs, while this connection's writes to it are being
+    journaled (None while they are not: the trigger would write nothing)."""
+    st = getattr(conn, "qrdx_undo", None)
+    if st is None or st.suspended or table not in st.columns:
+        return None
+    return list(st.columns[table])
+
+
+@contextlib.asynccontextmanager
+async def written_ahead(conn: Any, table: str, entries: List[Any]) -> AsyncIterator[None]:
+    """Journal the updates about to run — ``entries``: (rowid, the row's columns as
+    ``journaling`` lists them), what the trigger would write for each — in one statement, then
+    run them inside with the trigger quiet. Written before the updates: a rollback by the
+    journal restores every row whether its update ran or not."""
+    st = _state(conn)
+    height = UNATTRIBUTED if st.height is None else st.height
+    await conn.executemany(
+        "INSERT INTO undo_log (height, tbl, op, rid, old) VALUES (?, ?, 'U', ?, ?)",
+        [(height, table, rid, marshal.dumps(tuple(row))) for rid, row in entries],
+    )
+    st.suspended += 1
+    try:
+        yield
+    finally:
+        st.suspended -= 1
+
+
 @contextlib.asynccontextmanager
 async def suspended(db: Any) -> AsyncIterator[None]:
     """Writes that are not a block's — a clear before a full rebuild, genesis seeding — are not
