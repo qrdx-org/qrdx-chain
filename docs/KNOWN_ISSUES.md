@@ -45,9 +45,10 @@ fell 144 blocks behind and caught up by sync.
 **Closing it requires** (docs/PERFORMANCE.md, "What limits it next"):
 * the exchange's state held and executed natively beyond plain transfers, with the database
   written behind it (docs/NATIVE.md);
-* a proposer that judges and signs its block before running its parent: the rules for it are in
-  force (`two_block_deferral`: blocks sign the state two back, and the fee reserve bounds what
-  each payer holds after the parent), the proposer's scheduling is not;
+* the cost of importing a block, about 218 µs a transfer (docs/PERFORMANCE.md, "What limits it
+  next"): at 1,500 a second it fills each node's second, and late blocks are raced. (A proposer
+  now builds before its parent has run — `two_block_deferral` and qrdx/validator/pipeline.py —
+  which takes the parent's trip off the path on real networks, not each node's own work);
 * a binary wire format, shrinking what each block hashes and stores (a fork);
 * the geo-distributed soak (docs/MAINNET_READINESS.md §3.4) to measure it on real hosts.
 

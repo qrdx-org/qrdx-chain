@@ -650,6 +650,7 @@ class ExchangeStateManager:
         balance_of: Optional[Any] = None,
         base_fee: Any = "block",
         prepared: Optional[List[Any]] = None,
+        nonces_after: Optional[Dict[str, int]] = None,
     ) -> Dict[int, str]:
         """Why each of a block's exchange transactions may not be in it, by index — empty: the
         block may carry them all. Judged together, as of the block's start, before any runs:
@@ -668,7 +669,8 @@ class ExchangeStateManager:
         are how a proposer judges its selection before pre-loading anything — the balances every
         importer will pre-load. ``prepared``: the transactions prepared for the native lanes, when
         the caller has them (plain QRDX transfers, spot orders and cancels are judged natively, run
-        by run: ``order_lane.judged_together``)."""
+        by run: ``order_lane.judged_together``). ``nonces_after``: each lane's next nonce once a
+        parent not run yet has run (qrdx/validator/pipeline.py)."""
         from . import order_lane, transfer_lane
 
         balance = balance_of or self.available_balance
@@ -677,7 +679,7 @@ class ExchangeStateManager:
                 transfer_lane.prepare_all(txs), order_lane.prepare_all(txs)
             )
         lane_runs = dict(transfer_lane.runs(prepared))
-        nonces: Dict[str, int] = {}
+        nonces: Dict[str, int] = dict(nonces_after or {})
         votes: Dict[str, int] = {}
         owed: Dict[str, Decimal] = {}
         free_in_block: Dict[str, int] = {}

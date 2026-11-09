@@ -469,16 +469,17 @@ async def vote_for(db: Any, epoch: int) -> Optional[Tuple[int, str, int, str]]:
 
 
 async def votes_to_include(
-    db: Any, candidates: List[Any], block_epoch: int, limit: int
+    db: Any, candidates: List[Any], block_epoch: int, limit: int, also_carried: Any = ()
 ) -> List[Any]:
     """The pool attestations a proposer may put in its next block: valid for its chain (the
     target is this chain's checkpoint), within the inclusion window, and not already carried by
     the chain — judged against the chain itself, so a vote that rode an orphaned block is
-    included again. One per (validator, target), oldest target first."""
+    included again. One per (validator, target), oldest target first. ``also_carried``: the
+    (validator, target epoch) of votes a parent not stored yet carries."""
     from .. import chain_index
 
     low = max(1, int(block_epoch) - INCLUSION_EPOCHS)
-    carried = await chain_index.voted_targets(db, low)
+    carried = set(await chain_index.voted_targets(db, low)) | set(also_carried)
     height = int(await db.get_next_block_id())
     checkpoints: Dict[int, Optional[Tuple[int, str]]] = {}
     chosen: Dict[Tuple[str, int], Any] = {}

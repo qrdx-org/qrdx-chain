@@ -543,6 +543,7 @@ class ValidatorManager:
         exchange_section: Optional[List[Any]] = None,
         evm_section: Optional[List[Any]] = None,
         base_fees: Optional[Tuple[int, int]] = None,
+        parent_carries: Optional[Tuple[Any, Any]] = None,
     ) -> Optional[PoSBlock]:
         """
         Propose a block if selected for this slot.
@@ -567,6 +568,9 @@ class ValidatorManager:
                 them (``body_root``).
             base_fees: (EVM, exchange) base fees the parent sets (``fee_market.base_fees_at``);
                 the floors when not given.
+            parent_carries: for a parent not stored yet (qrdx/validator/pipeline.py), the
+                (validator, target epoch) of the votes and the slashing evidence it carries:
+                not carried again.
 
         Returns:
             Proposed block or None if not selected
@@ -622,6 +626,7 @@ class ValidatorManager:
                 await self.attestation_pool.votes(max(1, epoch - INCLUSION_EPOCHS)),
                 epoch,
                 max_votes,
+                parent_carries[0] if parent_carries else (),
             )
         else:
             attestations = await self.attestation_pool.select_attestations_for_inclusion(
@@ -635,9 +640,10 @@ class ValidatorManager:
         slashing_evidence = []
         try:
             if self.database is not None:
-                slashing_evidence = (await self.database.get_pending_slashing_evidence())[
-                    :MAX_SLASHING_EVIDENCE_PER_BLOCK
-                ]  # the rest ride the next blocks
+                pending = await self.database.get_pending_slashing_evidence()
+                if parent_carries:
+                    pending = [e for e in pending if e not in parent_carries[1]]
+                slashing_evidence = pending[:MAX_SLASHING_EVIDENCE_PER_BLOCK]  # the rest: later
         except Exception as e:
             logger.debug("slashing-evidence inclusion skipped: %s", e)
 

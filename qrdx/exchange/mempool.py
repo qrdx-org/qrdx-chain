@@ -242,6 +242,8 @@ class ExchangeMempool:
         gas_limit: Optional[int] = None,
         min_price: int = 0,
         height: Optional[int] = None,
+        after: Optional[Dict[str, int]] = None,
+        skip: Optional[Set[str]] = None,
     ) -> List[ExchangeTransaction]:
         """
         Deterministically select an executable set for block inclusion.
@@ -257,6 +259,10 @@ class ExchangeMempool:
 
         The result is the canonical ordering every validator would compute from
         the same mempool contents + committed state — the basis for D2.
+
+        A proposer building on a parent it has not run yet (qrdx/validator/pipeline.py) passes
+        ``after``: each lane's next nonce once the parent has run (a lane absent from it starts
+        at the state's), and ``skip``: lanes and oracle voters to leave out of this block.
         """
         if gas_limit is None:
             from ..block_limits import exchange_gas_limit_at
@@ -266,14 +272,19 @@ class ExchangeMempool:
         # is passed over; it leaves as blocks are applied, ``prune_lanes``)
         selected: List[ExchangeTransaction] = []
         gas = 0
+        skip = skip or set()
         for vote in self.votes():  # prices first
+            if vote.sender.lower() in skip:
+                continue
             if len(selected) >= limit or gas + int(vote.gas_limit) > gas_limit:
                 break
             selected.append(vote)
             gas += int(vote.gas_limit)
         for sender in sorted(self._by_sender.keys()):
+            if sender in skip:
+                continue
             by_nonce = self._lane_nonces.get(sender, {})
-            n = self._nonce_provider(sender)
+            n = after[sender] if after and sender in after else self._nonce_provider(sender)
             while n in by_nonce and len(selected) < limit:
                 tx = self._txs[by_nonce[n]]
                 if gas + int(tx.gas_limit) > gas_limit:

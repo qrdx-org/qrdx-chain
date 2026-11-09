@@ -671,7 +671,11 @@ class EVMMempool:
     # ── Selection (canonical, deterministic) ───────────────────────────
 
     def select_for_block(
-        self, limit: int = 256, gas_limit: Optional[int] = None, min_price: int = 0
+        self,
+        limit: int = 256,
+        gas_limit: Optional[int] = None,
+        min_price: int = 0,
+        skip: Optional[Set[str]] = None,
     ) -> List[str]:
         """
         Deterministically select executable raw txs for block inclusion.
@@ -681,7 +685,8 @@ class EVMMempool:
         ``limit`` transactions and ``gas_limit`` gas (default ``BLOCK_GAS_LIMIT``: a block's
         declared gas, docs/BLOCK_LIMITS.md), offering at least ``min_price`` (the block's base
         fee). A sender's run stops at the first transaction that does not fit or pays too
-        little. Identical mempool + state ⇒ identical selection on every node.
+        little. Identical mempool + state ⇒ identical selection on every node. ``skip``: senders
+        (lowercase) to leave out — those a parent not yet run sends from (their nonces move).
         """
         if gas_limit is None:
             from ..constants import BLOCK_GAS_LIMIT
@@ -690,6 +695,8 @@ class EVMMempool:
         selected: List[str] = []
         gas = 0
         for sender in sorted(self._by_sender.keys()):
+            if skip and sender.lower() in skip:
+                continue
             by_nonce = {int(self._txs[h]["nonce"]): self._txs[h] for h in self._by_sender[sender]}
             n = self._nonce_provider(sender)
             while n in by_nonce and len(selected) < limit:

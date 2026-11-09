@@ -219,6 +219,16 @@ async def _stored_block(db: Any, height: int) -> Optional[Tuple[Tuple[int, int],
     return inputs
 
 
+def parent_inputs(
+    content: Optional[dict], exchange_section: Optional[Iterable[Any]], evm_section: Any
+) -> Tuple[Tuple[int, int], int, int]:
+    """What a block contributes to its children's base fees, from the block itself (its header
+    and sections): ``_stored_block``'s, for a block not stored yet."""
+    evm_gas, _ = fee_gas((), evm_section or ())
+    _, exchange_gas = fee_gas(exchange_section or (), ())
+    return header_fees(content), evm_gas, exchange_gas
+
+
 def _evm_track_parent(height: int) -> int:
     """The block whose EVM gas sets this one's EVM base fee — the previous block of its kind
     (docs/BLOCK_LIMITS.md, big blocks): a big block's is the big block an interval before it;
@@ -233,17 +243,22 @@ def _evm_track_parent(height: int) -> int:
     return parent - 1 if is_big_block(parent) else parent
 
 
-async def base_fees_at(db: Any, height: int) -> Tuple[int, int]:
+async def base_fees_at(
+    db: Any, height: int, parent: Optional[Tuple[Tuple[int, int], int, int]] = None
+) -> Tuple[int, int]:
     """The base fees of a block at ``height`` on the stored chain. The exchange's is set by its
     parent, the block at ``height − 1``; the EVM's by the previous block of its kind
     (``_evm_track_parent``) — the parent, unless big blocks are in play (each stored, with its
-    sections, before anything is built on it)."""
+    sections, before anything is built on it). ``parent``: the parent's (header fees, EVM gas,
+    exchange gas) when it is not stored yet (``parent_inputs``: a proposer building on a parent
+    it has not run, qrdx/validator/pipeline.py)."""
     from .block_limits import evm_gas_limit_at, exchange_gas_limit_at, is_big_block
 
     evm_floor, exchange_floor = floors()
     if height <= 1:  # the parent is genesis: no fees, no sections
         return floors()
-    parent = await _stored_block(db, int(height) - 1)
+    if parent is None:
+        parent = await _stored_block(db, int(height) - 1)
     if parent is None:
         return floors()
     fees, evm_gas, exchange_gas = parent

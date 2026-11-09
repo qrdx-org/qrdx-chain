@@ -191,10 +191,15 @@ def test_every_path_runs_a_block_the_same_way():
     )
     assert "apply_block_evm_section_total(" in inspect.getsource(derived_state_rebuild._replay)
     build = inspect.getsource(NI.ValidatorNode._build_deferred)
-    signed = build.index("propose_block(")
-    assert build.index("root_after(") < signed < build.index("_run_signed_block(")
-    assert build.index("broadcast_callback(") < build.index("_run_signed_block(")
-    assert build.index("post_state.settle(") < build.index("add_block(")
+    assert build.index("_select_sections(") < build.index("_sign_and_send(")
+    assert build.index("_sign_and_send(") < build.index("_run_and_store(")
+    send = inspect.getsource(NI.ValidatorNode._sign_and_send)
+    assert send.index("root_after(") < send.index("propose_block(") < send.index(
+        "broadcast_callback("
+    )
+    run = inspect.getsource(NI.ValidatorNode._run_and_store)
+    assert run.index("_run_signed_block(") < run.index("post_state.settle(")
+    assert run.index("post_state.settle(") < run.index("add_block(")
     verify = inspect.getsource(block_import._verify_unified_state_root)
     assert "post_state.settle(" in verify
 

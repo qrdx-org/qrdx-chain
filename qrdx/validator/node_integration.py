@@ -9,9 +9,10 @@ oracle votes (prices, bridge deposits and chain heads).
 import asyncio
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..constants import SLOT_DURATION, SLOTS_PER_EPOCH
 from ..logger import get_logger
@@ -130,6 +131,25 @@ def assemble_pos_block_data(
     return data
 
 
+@dataclass
+class _Ahead:
+    """A block ``ValidatorNode.propose_ahead`` signed and sent before its parent ran."""
+
+    block: Any
+    data: Any
+    height: int
+    slot: int
+    epoch: int
+    timestamp: Any
+    exchange_txs: List[Any]
+    evm_raws: List[str]
+    phases: Phases
+    locked_at: float
+    sent_at: float
+    broadcast: Optional[asyncio.Future]
+    finished: bool = False  # (its parent was stored: ``finish_ahead`` ran or is running)
+
+
 class ValidatorNode:
     """
     Integrates PoS validator consensus into the node.
@@ -193,6 +213,7 @@ class ValidatorNode:
         # then skips its slot rather than build on a tip that is about to change.
         self._proposal_guard = None
         self._last_skip_reason = None
+        self._sent_wall: Dict[str, float] = {}  # block hash → when it was sent (wall clock)
         self._restore_hook = None  # main._restore_after_rejected_block
         # Slashing protection and the doppelganger check (set in initialize()).
         self.protection: Optional[Any] = None
@@ -388,6 +409,9 @@ class ValidatorNode:
         self._attestation_task = asyncio.create_task(self._attestation_loop())
         self._epoch_processing_task = asyncio.create_task(self._epoch_processing_loop())
         self._oracle_task = asyncio.create_task(self._oracle_vote_loop())
+        from . import pipeline
+
+        pipeline.PROPOSER = self  # (the live import may ask it to build before a parent runs)
 
         logger.info("✅ Validator tasks started")
 
@@ -395,6 +419,10 @@ class ValidatorNode:
         """Stop validator consensus duties."""
         self._running = False
         logger.info("Stopping validator consensus duties...")
+        from . import pipeline
+
+        if pipeline.PROPOSER is self:
+            pipeline.PROPOSER = None
 
         # Cancel tasks
         if self._block_production_task:
@@ -437,12 +465,7 @@ class ValidatorNode:
 
                 # Get latest block from database for parent hash and next height
                 next_block_id = await self.db.get_next_block_id()
-                # The body is needed only for the propagation grace's tip-slot read.
-                latest_block = await (
-                    self.db.get_block_by_id(next_block_id - 1)
-                    if _PROPOSER_PROPAGATION_GRACE
-                    else self._read_block_header(next_block_id - 1)
-                )
+                latest_block = await self._read_block_header(next_block_id - 1)
                 parent_hash = (
                     latest_block.get("hash") or latest_block.get("block_hash")
                     if latest_block
@@ -478,14 +501,20 @@ class ValidatorNode:
                 # of it instead of racing it. A genuinely empty previous slot costs only the
                 # grace period. Behaviour-only: no consensus rule changes, so it cannot make
                 # any block invalid.
-                if _PROPOSER_PROPAGATION_GRACE and rank == 0 and latest_block:
-                    try:
-                        from .block_verification import _parse_block_content
+                # With a pipelined proposer (qrdx/validator/pipeline.py) the wait is what lets a late
+                # parent be built on: arriving during it, the import builds this slot's block on
+                # it before running it — rather than this loop racing it from the grandparent.
+                from . import pipeline
 
-                        tip_slot = int(_parse_block_content(latest_block.get("content"))["slot"])
+                grace = _PROPOSER_PROPAGATION_GRACE or pipeline.enabled()
+                if grace and rank == 0 and latest_block:
+                    from .. import chain_index
+
+                    try:
+                        tip_slot = await chain_index.slot_at(self.db, next_block_id - 1)
                     except Exception:
                         tip_slot = None
-                    if tip_slot is not None and tip_slot < current_slot - 1:
+                    if tip_slot is not None and int(tip_slot) < current_slot - 1:
                         await self._await_tip_change(_PROPOSER_PROPAGATION_GRACE_SECONDS)
 
                 # Everything from the tip re-check to storing the block runs under the node's
@@ -1523,37 +1552,97 @@ class ValidatorNode:
         it leaves, and store it. Returns ``(block, block_data, broadcast)``; block is None when
         nothing was proposed, or when running the signed block failed (every node refuses it the
         same way: its state is restored and it is not stored)."""
-        from .. import chain_spec, post_state
-        from ..contracts.evm_block import encode_evm_txs
-        from ..exchange.block_processor import encode_exchange_txs, includable_exchange_txs
-        from ..exchange.fair_ordering import FEATURE, fair_order
-        from .types import AlreadyProposedError
-
         # 1. What the block carries, judged on the state now: its parent's.
+        exchange_txs, evm_raws = await self._select_sections(
+            next_height, block_timestamp, base_fees
+        )
+        phases.mark("select")
+        # 2. Signed with the root of the state its parent left (its grandparent, under two
+        #    blocks), and sent.
+        signed = await self._sign_and_send(
+            next_height,
+            current_slot,
+            parent_hash,
+            block_timestamp,
+            base_fees,
+            pending_txs[:100],  # Limit to 100 txs per block
+            exchange_txs,
+            evm_raws,
+            phases,
+        )
+        if signed is None:
+            return None, None, None
+        block, block_data, broadcast, sent_at = signed
+        # 3–4. Run, as every importer will, and stored.
+        if not await self._run_and_store(
+            block,
+            block_data,
+            next_height,
+            current_epoch,
+            current_slot,
+            block_timestamp,
+            exchange_txs,
+            evm_raws,
+            phases,
+            locked_at,
+            sent_at,
+        ):
+            return None, None, broadcast
+        return block, block_data, broadcast
+
+    async def _select_sections(
+        self,
+        next_height: int,
+        block_timestamp: Any,
+        base_fees: Any,
+        ahead: Optional[Tuple[Any, Any]] = None,
+    ) -> Tuple[List[Any], List[str]]:
+        """A block's exchange and EVM sections, from the mempools, judged on the state now.
+        ``ahead``: (``pipeline.ParentEffects``, the fee reserve) when its parent has not run yet
+        (qrdx/validator/pipeline.py) — each lane starts after the parent's, fees are judged on
+        the bounds the reserve gives, and what must wait for the parent stays in the mempool."""
+        from .. import chain_spec
+        from ..exchange.block_processor import includable_exchange_txs
+        from ..exchange.fair_ordering import FEATURE, fair_order
+
         exchange_txs: List[Any] = []
         if self._exchange_tx_source is not None:
             try:
+                effects = ahead[0] if ahead else None
                 exchange_txs = (
                     self._exchange_tx_source.select_for_block(
-                        limit=self._exchange_budget(), min_price=base_fees[1], height=next_height
+                        limit=self._exchange_budget(),
+                        min_price=base_fees[1],
+                        height=next_height,
+                        **({"after": effects.lanes, "skip": effects.voters} if effects else {}),
                     )
                     or []
                 )
                 if exchange_txs and chain_spec.is_active(FEATURE, next_height):
                     exchange_txs = fair_order(exchange_txs)
-                exchange_txs, refused = await includable_exchange_txs(
-                    self.db, exchange_txs, next_height, float(block_timestamp), base_fees[1]
-                )
-                if refused:
-                    logger.info(
-                        f"Leaving {len(refused)} exchange tx(s) out of block #{next_height}: "
-                        f"{refused[0][1]}"
+                if ahead is not None:
+                    if exchange_txs:
+                        exchange_txs = await self._judge_ahead(
+                            exchange_txs, next_height, block_timestamp, base_fees, ahead
+                        )
+                else:
+                    exchange_txs, refused = await includable_exchange_txs(
+                        self.db, exchange_txs, next_height, float(block_timestamp), base_fees[1]
                     )
-                    self._exchange_tx_source.remove([t.tx_hash() for t, _why in refused])
+                    if refused:
+                        logger.info(
+                            f"Leaving {len(refused)} exchange tx(s) out of block #{next_height}: "
+                            f"{refused[0][1]}"
+                        )
+                        self._exchange_tx_source.remove([t.tx_hash() for t, _why in refused])
             except Exception as e:
                 logger.warning(f"Exchange tx selection failed: {e}")
                 exchange_txs = []
         evm_raws: List[str] = []
+        # (a parent not run yet that carries EVM transactions could change what a delegated
+        # spend's authority reads: the block's EVM transactions wait for it)
+        if ahead is not None and ahead[0].evm_senders:
+            return exchange_txs, evm_raws
         if self._evm_tx_source is not None and self._evm_section_runner is not None:
             from ..block_limits import evm_gas_limit_at
             from ..contracts.evm_mempool import parse_eth_raw_tx, verify_delegated_spend
@@ -1581,12 +1670,176 @@ class ValidatorNode:
                     pass
             if gone:
                 self._evm_tx_source.remove(gone)
-        phases.mark("select")
+        return exchange_txs, evm_raws
 
-        # 2. Signed with the root of the state its parent left (its grandparent, under two
-        #    blocks), and sent.
+    async def propose_ahead(self, block_data: Dict[str, Any], parent_height: int) -> Optional[Any]:
+        """Build on block ``parent_height`` before it runs (two blocks; qrdx/validator/pipeline.py).
+
+        Called by the live import, holding the block-processing lock, once the block is verified
+        and before it runs. When this node proposes the next slot and the block would not have
+        run by that slot's start, the next block is judged on the state now (before the parent)
+        and the parent's contents, signed with the root of the state now and sent at the slot's
+        start; the import then runs the parent, and ``finish_ahead`` runs and stores this one.
+        The slot loop, finding the height filled, passes. Returns the pending block, or None to
+        import as usual (a parent that opens an epoch, carries operations the bounds do not
+        cover, or will have run in time; another proposer's slot; anything a proposal checks)."""
+        from .. import chain_index, chain_spec, post_state
+        from ..exchange.block_processor import decode_exchange_txs
+        from ..exchange.state_manager import ExchangeStateManager, fee_reserve_at
+        from ..fee_market import base_fees_at, parent_inputs
+        from . import pipeline
+        from .block_verification import _parse_block_content, genesis_time, slot_timestamp
+        from .randao import randao_selection_active
+
+        if not (self._running and self.manager is not None and pipeline.enabled()):
+            return None
+        height = int(parent_height) + 1
+        reserve = fee_reserve_at(height)
+        if reserve is None or post_state.lag(height) != 2 or randao_selection_active(height):
+            return None
+        try:
+            content = _parse_block_content(block_data.get("block_content"))
+            parent_slot = int(content["slot"])
+            parent_hash = str(block_data["block_hash"])
+        except Exception:
+            return None
+        slot = parent_slot + 1
+        epoch = slot // SLOTS_PER_EPOCH
+        if epoch != parent_slot // SLOTS_PER_EPOCH or await self._get_current_slot() > slot:
+            return None
+        grand_slot = await chain_index.slot_at(self.db, height - 2)
+        if grand_slot is None or int(grand_slot) // SLOTS_PER_EPOCH != epoch:
+            return None  # (the parent opens an epoch)
+        genesis = await self._genesis_timestamp()
+        if genesis is None:
+            return None
+        start = genesis + slot * SLOT_DURATION_SECONDS
+        if time.time() + pipeline.expected_run() < start:
+            return None  # (it runs before the slot starts: build on it as usual)
+        await self._refresh_validator_set(slot)
+        if await self.manager.proposer_rank(slot) != 0:
+            return None
+        if (self._proposal_guard() if self._proposal_guard is not None else None) or (
+            await self._block_signing_refusal(slot)
+        ):
+            return None
+        section = block_data.get("exchange_transactions") or []
+        evm_section = block_data.get("evm_transactions") or []
+        parent_txs = block_data.get("_exchange_objects") or decode_exchange_txs(section)
+        effects = pipeline.parent_effects(
+            ExchangeStateManager.get_instance(), parent_txs, evm_section
+        )
+        if effects.unbounded:
+            logger.debug(f"Block #{height} waits for its parent to run: {effects.unbounded}")
+            return None
+        wait = start - time.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        phases = Phases()
+        locked_at = time.perf_counter()
+        base_fees = await base_fees_at(
+            self.db, height, parent=parent_inputs(content, section, evm_section)
+        )
+        origin = await genesis_time(self.db)
+        if chain_spec.is_active("slot_timestamps", height) and origin is not None:
+            block_timestamp: Any = slot_timestamp(origin, slot)
+        else:
+            block_timestamp = int(datetime.now(timezone.utc).timestamp())
+        exchange_txs, evm_raws = await self._select_sections(
+            height, block_timestamp, base_fees, ahead=(effects, reserve)
+        )
+        phases.mark("select")
+        signed = await self._sign_and_send(
+            height,
+            slot,
+            parent_hash,
+            block_timestamp,
+            base_fees,
+            [],
+            exchange_txs,
+            evm_raws,
+            phases,
+            parent_carries=pipeline.parent_carries(content),
+        )
+        if signed is None:
+            return None
+        block, data, broadcast, sent_at = signed
+        return _Ahead(
+            block, data, height, slot, epoch, block_timestamp, exchange_txs, evm_raws, phases,
+            locked_at, sent_at, broadcast,
+        )  # fmt: skip
+
+    async def finish_ahead(self, ahead: Any) -> None:
+        """Run and store a block ``propose_ahead`` built, once its parent has run and is stored
+        (called by the import, still holding the lock). A parent that was not stored takes it
+        with it: every node refuses a block whose parent it refused."""
+        from ..derived_state_rebuild import before_block
+
+        tip = await self._read_block_header(ahead.height - 1)
+        if not tip or (tip.get("hash") or tip.get("block_hash")) != ahead.block.parent_hash:
+            logger.warning(f"Block #{ahead.height} dropped: its parent was not stored here")
+            return
+        ahead.phases.mark("parent")
+        waited = time.perf_counter() - ahead.sent_at  # (the parent's run: not this block's)
+        async with await before_block(self.db, ahead.height, ahead.epoch):
+            await self._run_and_store(
+                ahead.block,
+                ahead.data,
+                ahead.height,
+                ahead.epoch,
+                ahead.slot,
+                ahead.timestamp,
+                ahead.exchange_txs,
+                ahead.evm_raws,
+                ahead.phases,
+                ahead.locked_at + waited,
+                ahead.sent_at + waited,
+            )
+
+    async def _judge_ahead(
+        self,
+        txs: List[Any],
+        next_height: int,
+        block_timestamp: Any,
+        base_fees: Any,
+        ahead: Tuple[Any, Any],
+    ) -> List[Any]:
+        """``pipeline.judge`` of a selection for a block whose parent has not run: fees on the
+        bounds the reserve gives, from the balances now (the state before the parent)."""
+        from ..exchange.block_processor import _balances, apply_enforcement
+        from ..exchange.state_manager import ExchangeStateManager
+        from . import pipeline
+
+        mgr = ExchangeStateManager.get_instance()
+        apply_enforcement(mgr)
+        holders = list(dict.fromkeys(h for t in txs for h in (t.sender, mgr.fee_payer(t))))
+        bound = pipeline.bounds(ahead[0], await _balances(self.db, holders), ahead[1])
+        return pipeline.judge(
+            mgr, txs, next_height, float(block_timestamp), base_fees[1], ahead[0], bound.get
+        )
+
+    async def _sign_and_send(
+        self,
+        next_height: int,
+        current_slot: int,
+        parent_hash: str,
+        block_timestamp: Any,
+        base_fees: Any,
+        pending_txs: List[Any],
+        exchange_txs: List[Any],
+        evm_raws: List[str],
+        phases: Phases,
+        parent_carries: Optional[Tuple[Any, Any]] = None,
+    ) -> Optional[Tuple[Any, Any, Optional[asyncio.Future], float]]:
+        """Sign the block with the root of the state ``post_state.lag`` blocks back and send it.
+        Returns ``(block, block_data, broadcast, sent_at)``, or None when nothing was signed."""
+        from .. import post_state
+        from ..contracts.evm_block import encode_evm_txs
+        from ..exchange.block_processor import encode_exchange_txs
+        from .types import AlreadyProposedError
+
         if self.manager is None:
-            return None, None, None
+            return None
         before = next_height - post_state.lag(next_height)
         try:
             state_root = await post_state.root_after(
@@ -1594,12 +1847,12 @@ class ValidatorNode:
             )
         except LookupError as e:
             logger.warning(f"Block #{next_height} not proposed: {e}")
-            return None, None, None
+            return None
         try:
             block = await self.manager.propose_block(
                 slot=current_slot,
                 parent_hash=parent_hash,
-                transactions=pending_txs[:100],  # Limit to 100 txs per block
+                transactions=pending_txs,
                 state_root=state_root,
                 timestamp=block_timestamp,
                 exchange_section=(
@@ -1607,11 +1860,12 @@ class ValidatorNode:
                 ),
                 evm_section=encode_evm_txs(evm_raws) if evm_raws else [],
                 base_fees=base_fees,
+                parent_carries=parent_carries,
             )
         except AlreadyProposedError:
-            return None, None, None
+            return None
         if not block:
-            return None, None, None
+            return None
         phases.mark("sign")
         block_data = assemble_pos_block_data(block, next_height, exchange_txs, None, evm_raws, None)
         broadcast = None
@@ -1619,9 +1873,30 @@ class ValidatorNode:
             broadcast = asyncio.ensure_future(
                 self.broadcast_callback("submit_block", block_data, ignore_node_id=None, db=self.db)
             )
-        sent_at = time.perf_counter()
+        self._sent_wall[block.hash] = time.time()  # (for the log: how far into its slot)
+        while len(self._sent_wall) > 64:
+            self._sent_wall.pop(next(iter(self._sent_wall)))
+        return block, block_data, broadcast, time.perf_counter()
 
-        # 3. Run it, as every importer will.
+    async def _run_and_store(
+        self,
+        block: Any,
+        block_data: Any,
+        next_height: int,
+        current_epoch: int,
+        current_slot: int,
+        block_timestamp: Any,
+        exchange_txs: List[Any],
+        evm_raws: List[str],
+        phases: Phases,
+        locked_at: float,
+        sent_at: float,
+    ) -> bool:
+        """Run a block this node signed and sent, as every importer will; keep the root of what it
+        leaves; store it and take its operations out of the mempools. False when it could not
+        run (its state is restored and it is not stored)."""
+        from .. import post_state
+
         failed = await self._run_signed_block(
             block, next_height, current_epoch, block_timestamp, exchange_txs, evm_raws
         )
@@ -1630,7 +1905,7 @@ class ValidatorNode:
             await self._restore_state(next_height, failed)
             if self._exchange_tx_source is not None and exchange_txs:
                 self._exchange_tx_source.remove([t.tx_hash() for t in exchange_txs])
-            return None, None, broadcast
+            return False
         phases.mark("run")
         await post_state.settle(self.db, next_height, block.hash, current_slot)
         phases.mark("root")
@@ -1638,13 +1913,19 @@ class ValidatorNode:
             self._measure_exchange(
                 len(exchange_txs), time.perf_counter() - locked_at, DEFERRED_BUILD_SHARE
             )
+        genesis = await self._genesis_timestamp()
+        sent_wall = self._sent_wall.pop(block.hash, None)
+        into = ""
+        if genesis is not None and sent_wall is not None:
+            offset = sent_wall - genesis - current_slot * SLOT_DURATION_SECONDS
+            into = f", sent +{1000 * offset:.0f} ms into its slot"
         logger.info(
             f"📦 Proposed block #{next_height} at slot {current_slot}: {block.hash[:16]}... "
             f"({1000 * (sent_at - locked_at):.0f} ms to send, "
-            f"{1000 * (time.perf_counter() - locked_at):.0f} ms in all: {phases})"
+            f"{1000 * (time.perf_counter() - locked_at):.0f} ms in all: {phases}{into})"
         )
 
-        # 4. Stored, its operations out of the mempools.
+        # Stored, its operations out of the mempools.
         await self.db.add_block(
             block_hash=block.hash,
             block_height=next_height,
@@ -1689,7 +1970,7 @@ class ValidatorNode:
         except Exception as e:
             logger.debug(f"finality record skipped for block #{next_height}: {e}")
         phases.mark("store")
-        return block, block_data, broadcast
+        return True
 
     async def _run_signed_block(
         self,

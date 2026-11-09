@@ -557,188 +557,34 @@ class P2PModule(RPCModule):
                     if not ok_root:
                         return {"ok": False, "error": f"Refused before running: {root_err}"}
 
-                # Everything the block changes from here is recorded in the undo journal under its
-                # height (a checkpoint first if it opens an epoch) — what makes a later reorg cheap.
-                from ...derived_state_rebuild import before_block
-                from ...validator.block_verification import epoch_from_block as _block_epoch
+                # Two blocks (qrdx/validator/pipeline.py): when this node proposes the next slot
+                # and this block would not have run by then, it builds and sends the next block
+                # first — judged on the state now and this block's contents — then runs this one.
+                from ...validator import pipeline
 
                 phases.mark("rules")
-                async with await before_block(self._db, block_no, _block_epoch(block_data)):
-                    phases.mark("journal")
-                    # D3: securely validate + replay the exchange section (verify
-                    # signatures, re-execute, match the declared exchange_state_root)
-                    # BEFORE storing. Reject the block on any mismatch — local
-                    # exchange state is left untouched.
-                    ex_section = block_data.get("exchange_transactions")
-                    if ex_section:
-                        try:
-                            if self._exchange_apply_section is not None:
-                                # Phase E: route through the importer hook so the
-                                # collateral flush (margin debit → account_state) runs
-                                # on this live-broadcast path too — otherwise only the
-                                # proposer/sync paths debit and account_state diverges.
-                                from ...validator.block_verification import epoch_from_block
-
-                                ok_ex, verr = await self._exchange_apply_section(
-                                    block_no,
-                                    float(block_data.get("timestamp", 0) or 0),
-                                    # (a compact block's: the mempool's own, already checked)
-                                    block_data.get("_exchange_objects") or ex_section,
-                                    block_data.get("exchange_state_root"),
-                                    epoch_from_block(block_data),
-                                )
-                            else:
-                                from ...exchange.block_processor import apply_block_exchange_section
-
-                                ok_ex, verr = apply_block_exchange_section(
-                                    block_no,
-                                    float(block_data.get("timestamp", 0) or 0),
-                                    ex_section,
-                                    block_data.get("exchange_state_root"),
-                                )
-                        except Exception as e:
-                            ok_ex, verr = False, f"exchange validation error: {e}"
-                        if not ok_ex:
-                            # Half-applied (there is no per-block revert point): back to the tip.
-                            await self._restore_after_rejection(
-                                block_no, f"exchange section: {verr}"
-                            )
-                            return {"ok": False, "error": f"Invalid exchange section: {verr}"}
-                        phases.mark("exchange")
-                    elif block_no and int(block_no) >= 1:
-                        # No exchange transactions — the exchange still ticks every block (mark
-                        # prices; liquidations and funding next), exactly as the other paths do.
-                        try:
-                            from ...exchange.block_processor import (
-                                ensure_oracle_committee,
-                                tick_and_flush,
-                            )
-                            from ...exchange.state_manager import ExchangeStateManager
-
-                            await ensure_oracle_committee(
-                                self._db, ExchangeStateManager.get_instance(), int(block_no)
-                            )
-                            await tick_and_flush(
-                                self._db, int(block_no), float(block_data.get("timestamp", 0) or 0)
-                            )
-                        except Exception as e:
-                            logger.error(f"exchange tick failed at block {block_no}: {e}")
-                        phases.mark("tick")
-
-                    # E-D3b: validate + replay the EVM section (execute-on-mine) before
-                    # storing; reject on account_state_root mismatch. The apply hook is
-                    # injected from main.py (shares the live executor + state manager).
-                    evm_section = block_data.get("evm_transactions")
-                    if evm_section and self._evm_apply_section is not None:
-                        try:
-                            ok_evm, verr_evm = await self._evm_apply_section(
-                                block_no,
-                                block_hash,
-                                int(block_data.get("timestamp", 0) or 0),
-                                evm_section,
-                                block_data.get("account_state_root"),
-                            )
-                        except Exception as e:
-                            ok_evm, verr_evm = False, f"evm validation error: {e}"
-                        if not ok_evm:
-                            await self._restore_after_rejection(
-                                block_no, f"EVM section: {verr_evm}"
-                            )
-                            return {"ok": False, "error": f"Invalid EVM section: {verr_evm}"}
-                        phases.mark("evm")
-
-                    # Stake withdrawals — same point as the proposer and the other import
-                    # paths: after the EVM section, before the unified-root check.
+                ahead = None
+                if pipeline.PROPOSER is not None:
                     try:
-                        from ...validator.block_verification import epoch_from_block
-                        from ...validator.withdrawals import process_block_withdrawals
-
-                        _wd_epoch = epoch_from_block(block_data)
-                        if _wd_epoch is not None:
-                            await process_block_withdrawals(self._db, int(block_no), int(_wd_epoch))
+                        ahead = await pipeline.PROPOSER.propose_ahead(block_data, int(block_no))
                     except Exception as e:
-                        logger.error(
-                            "withdrawal processing failed on p2p import of block %s: %s",
-                            block_no,
-                            e,
+                        logger.warning(f"Building on block {block_no} before it ran failed: {e}")
+                    if ahead is not None:
+                        phases.mark("ahead")
+                try:
+                    return await self._run_pos_block(
+                        block_data, block_no, block_hash, block_content, validator_address,
+                        phases, _received, ahead,
+                    )  # fmt: skip
+                finally:
+                    if ahead is not None and not ahead.finished:
+                        logger.warning(
+                            f"Block #{ahead.height}, sent before its parent ran, is dropped: "
+                            f"its parent {block_no} was refused"
                         )
-                    phases.mark("withdrawals")
-
-                    # E-D4: verify the recomputed unified state root against the signed
-                    # root (after section replay, before storing).
-                    if self._verify_unified_root is not None:
-                        try:
-                            ok_root, root_err = await self._verify_unified_root(
-                                block_content, height=int(block_no), block_hash=block_hash
-                            )
-                        except Exception as e:
-                            ok_root, root_err = True, f"unified root check error: {e}"
-                        if not ok_root:
-                            await self._restore_after_rejection(block_no, f"E-D4: {root_err}")
-                            return {"ok": False, "error": f"Invalid state root: {root_err}"}
-                    phases.mark("root")
-
-                    try:
-                        await self._db.add_block(
-                            block_hash=block_hash,
-                            block_height=block_no,
-                            block_content=block_content or "",
-                            validator_address=validator_address,
-                            timestamp=block_data.get("timestamp", 0),
-                        )
-                        # Persist the (validated) exchange section for durability.
-                        if ex_section:
-                            try:
-                                await self._db.add_block_exchange_txs(
-                                    block_hash, ex_section, block_data.get("_exchange_objects")
-                                )
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to store exchange section for block {block_no}: {e}"
-                                )
-                        # Persist the (validated) EVM section for durability/rebuild.
-                        if evm_section:
-                            try:
-                                await self._db.add_block_evm_txs(block_hash, evm_section)
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to store EVM section for block {block_no}: {e}"
-                                )
-                        phases.mark("store")
-                        if self._block_relay is not None:
-                            try:
-                                self._block_relay.settle(block_data)
-                            except Exception as e:  # (hygiene: never fails an import)
-                                logger.debug(f"mempool settle after block {block_no}: {e}")
-                        # Finality (observe): record attestation votes + recompute.
-                        try:
-                            from ...validator.finality import record_finality_from_block
-
-                            await record_finality_from_block(self._db, block_content)
-                        except Exception as e:
-                            logger.debug(f"finality record skipped for block {block_no}: {e}")
-                        phases.mark("finality")
-                        logger.info(
-                            f"Accepted PoS block {block_no} via RPC "
-                            f"({1000 * (time.perf_counter() - _received):.0f} ms: {phases}). "
-                            f"Propagating..."
-                        )
-                        asyncio.create_task(
-                            self._propagate_fn(
-                                "submit_block", block_data, ignore_node_id=None, db=self._db
-                            )
-                        )
-                        # Immediate follow-up sync check — with the node that verifiably sent the
-                        # block (its signed request), never one a sender merely names.
-                        sender = rpc_caller.get()
-                        if self._follow_up_sync and sender:
-                            asyncio.create_task(self._follow_up_sync(sender))
-                        return {"ok": True, "result": f"Block {block_no} accepted."}
-                    except Exception as e:
-                        logger.error(f"Failed to store PoS block {block_no}: {e}")
-                        return {"ok": False, "error": "Storage failure"}
 
             # --- Legacy PoW path ---
+
             from ...transactions import Transaction
 
             txs_data = block_data.get("txs", [])
@@ -769,6 +615,225 @@ class P2PModule(RPCModule):
                 self._propagate_fn("submit_block", block_data, ignore_node_id=None, db=self._db)
             )
             return {"ok": True, "result": f"Block {block_no} accepted."}
+
+    async def _slot_timing(self, block_content: Any, received: float) -> str:
+        """When a block arrived and was done, in ms into its own slot (", slot +A→+D ms"): what
+        shows a block running late — its proposer's start, its trip, or its import."""
+        try:
+            from ...constants import SLOT_DURATION_MS
+            from ...validator.block_verification import _parse_block_content, genesis_time
+
+            origin = await genesis_time(self._db)
+            slot = int(_parse_block_content(block_content)["slot"])
+            start = float(origin) + slot * int(SLOT_DURATION_MS) / 1000  # type: ignore[arg-type]
+            now = time.time()
+            arrived = now - (time.perf_counter() - received)
+            return f", slot +{1000 * (arrived - start):.0f}→+{1000 * (now - start):.0f} ms"
+        except Exception:
+            return ""
+
+    async def _run_pos_block(
+        self,
+        block_data: Dict,
+        block_no: Any,
+        block_hash: str,
+        block_content: Any,
+        validator_address: str,
+        phases: Phases,
+        _received: float,
+        ahead: Any,
+    ) -> Dict:
+        """Run a verified PoS block's sections, check its root, store it and relay it — then run
+        and store the block this node built on it before it ran (``ahead``), if any."""
+        # Everything the block changes from here is recorded in the undo journal under its
+        # height (a checkpoint first if it opens an epoch) — what makes a later reorg cheap.
+        from ...derived_state_rebuild import before_block
+        from ...validator.block_verification import epoch_from_block as _block_epoch
+
+        run_started = time.perf_counter()
+        stored = False
+        try:
+            async with await before_block(self._db, block_no, _block_epoch(block_data)):
+                phases.mark("journal")
+                # D3: securely validate + replay the exchange section (verify
+                # signatures, re-execute, match the declared exchange_state_root)
+                # BEFORE storing. Reject the block on any mismatch — local
+                # exchange state is left untouched.
+                ex_section = block_data.get("exchange_transactions")
+                if ex_section:
+                    try:
+                        if self._exchange_apply_section is not None:
+                            # Phase E: route through the importer hook so the
+                            # collateral flush (margin debit → account_state) runs
+                            # on this live-broadcast path too — otherwise only the
+                            # proposer/sync paths debit and account_state diverges.
+                            from ...validator.block_verification import epoch_from_block
+
+                            ok_ex, verr = await self._exchange_apply_section(
+                                block_no,
+                                float(block_data.get("timestamp", 0) or 0),
+                                # (a compact block's: the mempool's own, already checked)
+                                block_data.get("_exchange_objects") or ex_section,
+                                block_data.get("exchange_state_root"),
+                                epoch_from_block(block_data),
+                            )
+                        else:
+                            from ...exchange.block_processor import apply_block_exchange_section
+
+                            ok_ex, verr = apply_block_exchange_section(
+                                block_no,
+                                float(block_data.get("timestamp", 0) or 0),
+                                ex_section,
+                                block_data.get("exchange_state_root"),
+                            )
+                    except Exception as e:
+                        ok_ex, verr = False, f"exchange validation error: {e}"
+                    if not ok_ex:
+                        # Half-applied (there is no per-block revert point): back to the tip.
+                        await self._restore_after_rejection(block_no, f"exchange section: {verr}")
+                        return {"ok": False, "error": f"Invalid exchange section: {verr}"}
+                    phases.mark("exchange")
+                elif block_no and int(block_no) >= 1:
+                    # No exchange transactions — the exchange still ticks every block (mark
+                    # prices; liquidations and funding next), exactly as the other paths do.
+                    try:
+                        from ...exchange.block_processor import (
+                            ensure_oracle_committee,
+                            tick_and_flush,
+                        )
+                        from ...exchange.state_manager import ExchangeStateManager
+
+                        await ensure_oracle_committee(
+                            self._db, ExchangeStateManager.get_instance(), int(block_no)
+                        )
+                        await tick_and_flush(
+                            self._db, int(block_no), float(block_data.get("timestamp", 0) or 0)
+                        )
+                    except Exception as e:
+                        logger.error(f"exchange tick failed at block {block_no}: {e}")
+                    phases.mark("tick")
+
+                # E-D3b: validate + replay the EVM section (execute-on-mine) before
+                # storing; reject on account_state_root mismatch. The apply hook is
+                # injected from main.py (shares the live executor + state manager).
+                evm_section = block_data.get("evm_transactions")
+                if evm_section and self._evm_apply_section is not None:
+                    try:
+                        ok_evm, verr_evm = await self._evm_apply_section(
+                            block_no,
+                            block_hash,
+                            int(block_data.get("timestamp", 0) or 0),
+                            evm_section,
+                            block_data.get("account_state_root"),
+                        )
+                    except Exception as e:
+                        ok_evm, verr_evm = False, f"evm validation error: {e}"
+                    if not ok_evm:
+                        await self._restore_after_rejection(block_no, f"EVM section: {verr_evm}")
+                        return {"ok": False, "error": f"Invalid EVM section: {verr_evm}"}
+                    phases.mark("evm")
+
+                # Stake withdrawals — same point as the proposer and the other import
+                # paths: after the EVM section, before the unified-root check.
+                try:
+                    from ...validator.block_verification import epoch_from_block
+                    from ...validator.withdrawals import process_block_withdrawals
+
+                    _wd_epoch = epoch_from_block(block_data)
+                    if _wd_epoch is not None:
+                        await process_block_withdrawals(self._db, int(block_no), int(_wd_epoch))
+                except Exception as e:
+                    logger.error(
+                        "withdrawal processing failed on p2p import of block %s: %s",
+                        block_no,
+                        e,
+                    )
+                phases.mark("withdrawals")
+
+                # E-D4: verify the recomputed unified state root against the signed
+                # root (after section replay, before storing).
+                if self._verify_unified_root is not None:
+                    try:
+                        ok_root, root_err = await self._verify_unified_root(
+                            block_content, height=int(block_no), block_hash=block_hash
+                        )
+                    except Exception as e:
+                        ok_root, root_err = True, f"unified root check error: {e}"
+                    if not ok_root:
+                        await self._restore_after_rejection(block_no, f"E-D4: {root_err}")
+                        return {"ok": False, "error": f"Invalid state root: {root_err}"}
+                phases.mark("root")
+
+                try:
+                    await self._db.add_block(
+                        block_hash=block_hash,
+                        block_height=block_no,
+                        block_content=block_content or "",
+                        validator_address=validator_address,
+                        timestamp=block_data.get("timestamp", 0),
+                    )
+                    # Persist the (validated) exchange section for durability.
+                    if ex_section:
+                        try:
+                            await self._db.add_block_exchange_txs(
+                                block_hash, ex_section, block_data.get("_exchange_objects")
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to store exchange section for block {block_no}: {e}"
+                            )
+                    # Persist the (validated) EVM section for durability/rebuild.
+                    if evm_section:
+                        try:
+                            await self._db.add_block_evm_txs(block_hash, evm_section)
+                        except Exception as e:
+                            logger.warning(f"Failed to store EVM section for block {block_no}: {e}")
+                    phases.mark("store")
+                    if self._block_relay is not None:
+                        try:
+                            self._block_relay.settle(block_data)
+                        except Exception as e:  # (hygiene: never fails an import)
+                            logger.debug(f"mempool settle after block {block_no}: {e}")
+                    # Finality (observe): record attestation votes + recompute.
+                    try:
+                        from ...validator.finality import record_finality_from_block
+
+                        await record_finality_from_block(self._db, block_content)
+                    except Exception as e:
+                        logger.debug(f"finality record skipped for block {block_no}: {e}")
+                    phases.mark("finality")
+                    logger.info(
+                        f"Accepted PoS block {block_no} via RPC "
+                        f"({1000 * (time.perf_counter() - _received):.0f} ms: {phases}"
+                        f"{await self._slot_timing(block_content, _received)}). Propagating..."
+                    )
+                    asyncio.create_task(
+                        self._propagate_fn(
+                            "submit_block", block_data, ignore_node_id=None, db=self._db
+                        )
+                    )
+                    # Immediate follow-up sync check — with the node that verifiably sent the
+                    # block (its signed request), never one a sender merely names.
+                    sender = rpc_caller.get()
+                    if self._follow_up_sync and sender:
+                        asyncio.create_task(self._follow_up_sync(sender))
+                    stored = True
+                    return {"ok": True, "result": f"Block {block_no} accepted."}
+                except Exception as e:
+                    logger.error(f"Failed to store PoS block {block_no}: {e}")
+                    return {"ok": False, "error": "Storage failure"}
+        finally:
+            if stored:
+                from ...validator import pipeline
+
+                pipeline.note_run(time.perf_counter() - run_started)
+                if ahead is not None:
+                    # (after this block's journal and undo scope closed: the next block's own)
+                    ahead.finished = True
+                    try:
+                        await pipeline.PROPOSER.finish_ahead(ahead)
+                    except Exception as e:
+                        logger.error(f"Block #{ahead.height}, built on {block_no}: {e}")
 
     @rpc_method
     @peer_only

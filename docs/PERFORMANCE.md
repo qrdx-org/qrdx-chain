@@ -428,6 +428,27 @@ The fourth round, consensus changes for the regenesis (2026-11-05):
     restart, and a snapshot restore keeps its checkpoint's parent's from the trusted history.
     The native lanes hold the floor: the order lane leaves an operation that would cross it to
     Python, and the transfer lane a run whose senders could.
+32. **A proposer that builds before its parent has run** (qrdx/validator/pipeline.py; node-local,
+    `QRDX_PIPELINED_PROPOSER=0` turns it off). When the live import verifies a block whose next
+    slot this node proposes, and the block would not surely have run by that slot's start (the
+    90th percentile of recent runs), it builds the next block first — at the slot's start, signed
+    with the root of the state it holds (the grandparent's) — then runs the parent and its own
+    block, each in its own journal and undo scope. The judgment uses only that state and the
+    parent's contents: each lane's nonce after the parent, each payer's fees on
+    min(R, its balance) less its fees in the parent, nothing from a payer that spent its reserve
+    or sent EVM transactions in it, free operations only on a QRDX holding and only from accounts
+    with none in the parent, no oracle vote from a voter in it, the parent's votes not carried
+    again, base fees from its header and sections. A parent carrying anything else (authority,
+    staking, governance, token administration…), or opening an epoch, runs first as before.
+    What waits stays in the mempool. The slot loop waits up to half a slot for an in-flight
+    parent (it used to build on the grandparent at once and race it): a parent arriving during
+    the wait is built on before it runs.
+
+    On one host this changes little — the parent's trip is 40 ms of a 250 ms slot, and what binds
+    there is each node's own work (below). It is for real networks, where the trip is 100–200 ms.
+    Live (4 nodes, one host, 2,048 accounts): 1,000 transfers a second fill 3.95 blocks a second
+    (p95 1.0 s); at 1,500 about a tenth of blocks are built ahead, none failed to run, and the
+    chain still falls behind (2.7 blocks a second), as it did without it (2.4–2.6).
 
 Each block's phase line ends with its database round trips (`db N`).
 
@@ -561,10 +582,12 @@ In the order they would pay, toward four blocks a second at 2,000–4,000 transf
    storing it 15–35 (about 11 KB of JSON an operation), its body root and rules 10–22. Holding
    the exchange's state natively, with the database written behind it, is still the change
    that moves the ceiling by a multiple.
-2. **A proposer that builds before its parent has run.** Blocks sign the state two blocks back
-   and the fee reserve bounds each payer's balance (31, above), so a block may be judged and
-   signed while its parent still runs. The proposer does not do that yet: it runs the parent
-   first, as it did under one block.
+2. **What an import costs a transaction.** At 1,500 transfers a second each node spends most of
+   every second importing blocks: about 218 µs a transfer offline for a 500-transfer block
+   (flush 50, execute 36, state root 34, signatures 34 where not already checked, store 28,
+   judgment 23, preloads 15), 100 ms a block live with tails of 300–500 ms behind the node's
+   other work. A late block is raced, the fork costs a rollback, blocks grow, and the chain falls
+   behind. 2,000 a second with headroom needs that cost about halved.
 3. **The size of what a block stores and hashes.** Binary transactions (30, above) took a third
    off; the rest is the signature itself (3.3 KB) and a key (1.9 KB) in every transaction. A
    key named by its account once the chain has seen it would take the key out, but no registry

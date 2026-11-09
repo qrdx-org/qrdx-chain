@@ -225,10 +225,13 @@ def test_only_accounts_that_pay_fees_have_a_floor(m):
 
 
 def _chain(seed, blocks=25, native=True):
-    """A chain built as a proposer that has not run its parent builds: each block judged on the
-    state before its parent (its balances) and the parent's contents (each payer's fees in it,
-    and whether it spent its reserve) — fees within min(R, balance) less the parent's. Runs it
-    as importers do; returns (blocks an importer refused, floor breaches)."""
+    """A chain built as a pipelined proposer builds it (qrdx/validator/pipeline.py): each block
+    judged by ``pipeline.judge`` BEFORE its parent runs — on the state before the parent and the
+    parent's contents — then the parent run as importers run it, judged on the state its own
+    parent left. Transfers in and out (some spending the reserve, some draining an account),
+    paid and free cancels. Returns (blocks an importer refused, floor breaches, carried)."""
+    from qrdx.validator import pipeline
+
     rng = random.Random(seed)
     who = [ALICE, BOB, CAROL, DAN]
     reserve = D(constants.FEE_RESERVE_QRDX)
@@ -237,68 +240,78 @@ def _chain(seed, blocks=25, native=True):
     BP.apply_enforcement(m)
     m.begin_block(1, float(T0))
     held = {a: D(rng.choice(["0", "0.3", "1", "1.2", "2", "5", "40"])) for a in who}
-    nonces = {a: 0 for a in who}
-    before = dict(held)                                       # (the state before the parent)
-    parent: list = []                                         # (the parent's transactions)
-    refused = breaches = 0
-    for height in range(2, blocks + 2):
-        # Judge the block on the state before its parent and the parent's contents.
-        fees = {a: sum((MAX_FEE for t in parent if t.sender == a), D(0)) for a in who}
-        spent = {t.sender for t in parent if t.spends_reserve()}
-        bound = {a: min(reserve, before[a]) - fees[a] for a in who if a not in spent}
-        txs, owed, drained = [], {a: D(0) for a in who}, set()
-        for _ in range(rng.randint(0, 10)):
-            a = rng.choice(who)
-            if a not in bound or a in drained or owed[a] + MAX_FEE > bound[a]:
-                continue
-            k = rng.random()
-            if k < 0.25:
-                t = _tx(Op.CANCEL_ALL, sender=a, nonce=nonces[a])
-            else:
-                amount = rng.choice(["0.05", "0.3", "0.9", "1", "2.5", "7"])
-                if k > 0.85 and held[a] - owed[a] - MAX_FEE > 0:
-                    # (its last in the block: everything it holds after the block's fees — the
-                    # account knows its balance — which would leave its next block's unpaid)
-                    amount = str(held[a] - owed[a] - MAX_FEE)
-                    drained.add(a)
-                t = _send(rng.choice(who), amount, sender=a, nonce=nonces[a],
-                          spend=rng.random() < 0.15)
-            txs.append(t)
-            owed[a] += MAX_FEE
-            nonces[a] += 1
-        txs = fair_order(txs)
-        # An importer judges it on the state its parent left.
-        m.clear_available_balances()
-        for a in who:
-            m.set_available_balance(a, held[a])
-        monkey = None if native else transfer_lane._native
-        if not native:
-            transfer_lane._native = lambda name: None
-        try:
-            errors = m.section_errors(txs, height, float(T0 + height))
-            ok, _err, _ = BP.process_exchange_transactions(height, float(T0 + height), txs, m)
-        finally:
-            if monkey is not None:
-                transfer_lane._native = monkey
-        if errors or not ok:
-            refused += 1
-            break                                             # (an importer would refuse it)
-        m.commit_block()
-        after = {a: held[a] + m.balance_deltas().get(a, D(0)) for a in who}
-        for a in who:
-            mine = [t for t in txs if t.sender == a]
-            if not any(t.spends_reserve() for t in mine):
-                floor = min(reserve, held[a]) - MAX_FEE * len(mine)
-                breaches += after[a] < floor
-        before, held, parent = held, after, txs
-    ExchangeStateManager.reset_instance()
-    return refused, breaches
+    nonces = {a: 0 for a in who}  # (each account's next, after what blocks carried)
+    parent: list = []  # (judged, not run yet)
+    refused = breaches = carried = 0
+    saved = transfer_lane._native
+    if not native:
+        transfer_lane._native = lambda name: None
+    try:
+        for height in range(2, blocks + 3):
+            # 1. The block at ``height``, judged while its parent has not run: the state now is
+            #    the one before the parent.
+            txs: list = []
+            if height <= blocks + 1:
+                effects = pipeline.parent_effects(m, parent, [])
+                bound = pipeline.bounds(effects, held, reserve)
+                start, owed, drained, candidates = dict(nonces), {a: D(0) for a in who}, set(), []
+                for _ in range(rng.randint(0, 12)):
+                    a = rng.choice(who)
+                    if a in drained:
+                        continue
+                    k = rng.random()
+                    if k < 0.3:
+                        t = _tx(Op.CANCEL_ALL, sender=a, nonce=nonces[a])
+                        if k < 0.1:
+                            t.gas_price = 0  # (the free lane)
+                    else:
+                        amount = rng.choice(["0.05", "0.3", "0.9", "1", "2.5", "7"])
+                        rest = held[a] - effects.fees.get(a, D(0)) - owed[a] - MAX_FEE
+                        if k > 0.85 and rest > 0:
+                            # (its last in the block: all it will hold after the parent's fees
+                            # and this block's — which would leave the next block's unpaid)
+                            amount = str(rest)
+                            drained.add(a)
+                        t = _send(rng.choice(who), amount, sender=a, nonce=nonces[a],
+                                  spend=rng.random() < 0.15)
+                    candidates.append(t)
+                    owed[a] += t.max_fee()
+                    nonces[a] += 1
+                txs = pipeline.judge(m, fair_order(candidates), height, float(T0 + height), None,
+                                     effects, bound.get)
+                for a in who:
+                    kept = [t.nonce for t in txs if t.sender == a]
+                    nonces[a] = max(kept) + 1 if kept else start[a]
+            # 2. The parent runs, as every importer runs it.
+            h = height - 1
+            m.clear_available_balances()
+            for a in who:
+                m.set_available_balance(a, held[a])
+            errors = m.section_errors(parent, h, float(T0 + h))
+            ok, _err, _ = BP.process_exchange_transactions(h, float(T0 + h), parent, m)
+            if errors or not ok:
+                refused += 1
+                break
+            m.commit_block()
+            after = {a: held[a] + m.balance_deltas().get(a, D(0)) for a in who}
+            for a in who:
+                mine = [t for t in parent if t.sender == a]
+                if not any(t.spends_reserve() for t in mine):
+                    floor = min(reserve, held[a]) - sum((t.max_fee() for t in mine), D(0))
+                    breaches += after[a] < floor
+            held, parent = after, txs
+            carried += len(txs)
+    finally:
+        transfer_lane._native = saved
+        ExchangeStateManager.reset_instance()
+    return refused, breaches, carried
 
 
 @pytest.mark.parametrize("seed", range(10))
-def test_a_block_judged_without_its_parents_run_is_one_importers_accept(seed):
+def test_a_block_judged_before_its_parent_runs_is_one_importers_accept(seed):
     for native in (True, False):
-        assert _chain(seed, native=native) == (0, 0)
+        refused, breaches, carried = _chain(seed, native=native)
+        assert (refused, breaches) == (0, 0) and carried > 40, (refused, breaches, carried)
 
 
 def test_without_the_floor_such_blocks_are_refused(monkeypatch):
@@ -308,5 +321,94 @@ def test_without_the_floor_such_blocks_are_refused(monkeypatch):
 
     monkeypatch.setattr(state_manager, "fee_reserve_at", lambda height: None)
     outcomes = [_chain(seed) for seed in range(10)]
-    assert sum(refused for refused, _ in outcomes) >= 3, outcomes
-    assert sum(breaches for _, breaches in outcomes) > 0, outcomes
+    assert sum(refused for refused, _, _ in outcomes) >= 3, outcomes
+    assert sum(breaches for _, breaches, _ in outcomes) > 0, outcomes
+
+
+# ── the pipelined proposer's pieces (qrdx/validator/pipeline.py) ─────────────────────────────
+
+
+def test_a_parents_effects_come_from_its_contents(m):
+    from qrdx.validator import pipeline
+
+    vote = _tx(Op.ORACLE_VOTE, {"prices": {"BTC": "1"}}, sender=DAN, nonce=4)
+    free = _tx(Op.CANCEL_ALL, sender=CAROL, nonce=2)
+    free.gas_price = 0
+    parent = [vote, free, _send(BOB, "1", nonce=0), _send(BOB, "1", nonce=1, spend=True),
+              _tx(Op.CANCEL_ALL, sender=BOB, nonce=5)]
+    e = pipeline.parent_effects(m, parent, [])
+    assert e.unbounded == "" and e.voters == {DAN.lower()} and e.free == {CAROL}
+    assert e.lanes == {ALICE: 2, CAROL: 3, BOB: 6} and e.spent == {ALICE}
+    assert e.fees == {ALICE: 2 * MAX_FEE, BOB: MAX_FEE}
+    b = pipeline.bounds(e, {ALICE: D(9), BOB: D("0.5"), CAROL: D(3)}, D(1))
+    assert b == {ALICE: None, BOB: D("0.5") - MAX_FEE, CAROL: D(1)}
+    # what changes another block's judgment beyond balances and nonces: run the parent first
+    for op, params in ((Op.AGENT_APPROVE, {"agent": BOB}), (Op.STAKE_DEPOSIT, {}),
+                       (Op.BATCH, {"actions": [{"op": "AGENT_REVOKE", "params": {}}]})):
+        assert pipeline.parent_effects(m, [_tx(op, params)], []).unbounded
+
+
+def test_an_evm_sender_in_the_parent_has_no_bound(m):
+    from qrdx.crypto.account_id import to_account_id
+    from qrdx.validator import pipeline
+
+    e = pipeline.ParentEffects(evm_senders={to_account_id(ALICE).lower()})
+    assert pipeline.bounds(e, {ALICE: D(5), BOB: D(5)}, D(1)) == {ALICE: None, BOB: D(1)}
+
+
+def test_the_mempool_selects_after_a_parent_not_run(m):
+    from qrdx.exchange import ExchangeMempool
+    from qrdx.crypto.pq.dilithium import PQPrivateKey
+
+    keys = [PQPrivateKey.generate() for _ in range(2)]
+    pool = ExchangeMempool(nonce_provider=lambda lane: 0)
+    for key in keys:
+        for n in range(3):
+            t = _tx(Op.CANCEL_ALL, sender=key.public_key.to_address(), nonce=n)
+            t.public_key = key.public_key.to_bytes()
+            t.signature = key.sign(t.signing_bytes()).to_bytes()
+            assert pool.admit(t)[0]
+    a, b = (k.public_key.to_address() for k in keys)
+    picked = pool.select_for_block(after={a: 2}, skip={b})
+    assert [(t.sender, t.nonce) for t in picked] == [(a, 2)]
+
+
+def test_base_fees_come_from_a_parent_not_stored():
+    from qrdx import fee_market
+
+    content = {"base_fee": 2 * 10 ** 9, "exchange_base_fee": 3 * 10 ** 8}
+    section = [_send(BOB, "1", nonce=n).to_dict() for n in range(3)]
+    inputs = fee_market.parent_inputs(content, section, [])
+    assert inputs == ((2 * 10 ** 9, 3 * 10 ** 8), 0, 3 * GAS)
+
+    class _NoChain:
+        async def get_block_by_id(self, h):
+            raise AssertionError("the parent is not read from the chain")
+
+    import asyncio
+
+    fees = asyncio.run(fee_market.base_fees_at(_NoChain(), 5, parent=inputs))
+    assert fees[1] == fee_market.next_base_fee(
+        3 * 10 ** 8, 3 * GAS, __import__("qrdx.block_limits").block_limits.exchange_gas_limit_at(4),
+        fee_market.floors()[1])
+
+
+def test_the_import_builds_before_running_and_finishes_after():
+    """The live import asks the proposer before the block runs, and runs the block it built only
+    once its parent's journal and undo scope have closed (never nested in them)."""
+    import inspect
+
+    from qrdx.rpc.modules import p2p
+    from qrdx.validator import node_integration as NI
+
+    submit = inspect.getsource(p2p.P2PModule.submitBlock)
+    assert submit.index("_check_deferred_root(") < submit.index("propose_ahead(")
+    assert submit.index("propose_ahead(") < submit.index("_run_pos_block(")
+    run = inspect.getsource(p2p.P2PModule._run_pos_block)
+    body, tail = run.split("        finally:\n", 1)
+    assert "async with await before_block(" in body and "finish_ahead(" in tail
+    ahead = inspect.getsource(NI.ValidatorNode.propose_ahead)
+    assert ahead.index("parent_effects(") < ahead.index("_select_sections(")
+    assert ahead.index("_select_sections(") < ahead.index("_sign_and_send(")
+    finish = inspect.getsource(NI.ValidatorNode.finish_ahead)
+    assert finish.index("before_block(") < finish.index("_run_and_store(")
