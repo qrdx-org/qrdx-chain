@@ -269,45 +269,37 @@ def _hex32(value) -> str:
 async def _write_receipt(db, r) -> None:
     """Receipt and logs into the tables eth_getTransactionReceipt / eth_getLogs read (a node's
     query index, rebuilt with the chain — not consensus state)."""
-    conn = db.connection
-    await conn.execute("DELETE FROM contract_logs WHERE tx_hash = ?", (r["tx_hash"],))
-    await conn.execute(
-        "INSERT OR REPLACE INTO contract_transactions "
-        "(tx_hash, block_number, tx_index, from_address, to_address, value, gas_limit, "
-        "gas_used, gas_price, nonce, input_data, contract_address, status, error_message, "
-        "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            r["tx_hash"],
-            int(r["block_number"]),
-            r["tx_index"],
-            r["from"],
-            r.get("to"),
-            str(r["value"]),
-            int(r["gas_limit"]),
-            int(r["gas_used"]),
-            str(r["gas_price"]),
-            int(r["nonce"]),
-            r.get("data") or b"",
-            r.get("contract_address"),
-            1 if r["success"] else 0,
-            r.get("error"),
-            int(r.get("timestamp") or 0),
-        ),
+    db.drop_contract_logs_of(r["tx_hash"])
+    db.put_contract_transaction(
+        {
+            "tx_hash": r["tx_hash"],
+            "block_number": int(r["block_number"]),
+            "tx_index": r["tx_index"],
+            "from_address": r["from"],
+            "to_address": r.get("to"),
+            "value": str(r["value"]),
+            "gas_limit": int(r["gas_limit"]),
+            "gas_used": int(r["gas_used"]),
+            "gas_price": str(r["gas_price"]),
+            "nonce": int(r["nonce"]),
+            "input_data": r.get("data") or b"",
+            "contract_address": r.get("contract_address"),
+            "status": 1 if r["success"] else 0,
+            "error_message": r.get("error"),
+            "created_at": int(r.get("timestamp") or 0),
+        },
+        replace=True,
     )
     for i, (address, topics, data) in enumerate(r.get("logs") or []):
         topics = list(topics) + [None] * (4 - len(topics))
-        await conn.execute(
-            "INSERT OR REPLACE INTO contract_logs (tx_hash, block_number, log_index, "
-            "contract_address, topic0, topic1, topic2, topic3, data, removed) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-            (
-                r["tx_hash"],
-                int(r["block_number"]),
-                i,
-                "0x" + bytes(address).hex(),
-                *[None if t is None else _hex32(t) for t in topics[:4]],
-                bytes(data or b""),
-            ),
+        db.put_contract_log(
+            r["tx_hash"],
+            int(r["block_number"]),
+            i,
+            "0x" + bytes(address).hex(),
+            [None if t is None else _hex32(t) for t in topics[:4]],
+            bytes(data or b""),
+            replace=True,
         )
 
 

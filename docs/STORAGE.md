@@ -82,7 +82,8 @@ not turn the store off.
 | S4a validator logs | the validator set's inputs (deposits, exits, staking operations, fee income, withdrawals, payouts), its stored epoch states and log roots | done |
 | S4 validators | `validators` (the display copy), stakes, lifecycle, slashing | to do |
 | S5a the node's indexes | the transaction index (`tx_index`, `tx_participants`, `tx_index_blocks`) and the trading history (`hist_*`) | done |
-| S5 the node's own | pending transactions, peers, slashing protection, EVM receipts and logs | to do |
+| S5b EVM receipts | `contract_transactions`, `contract_logs`, `contract_metadata` (eth_getTransactionReceipt, eth_getLogs) | done |
+| S5 the node's own | pending transactions, peers, the validator display copy and legacy stake tables | to do |
 | S6 | SQLite and aiosqlite removed | to do |
 
 The chain index used to count writes to `blocks` with SQLite triggers. The database's block

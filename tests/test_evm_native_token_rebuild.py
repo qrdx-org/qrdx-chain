@@ -148,12 +148,11 @@ async def test_forward_and_rebuild_agree_on_evm_token_moves_and_storage(monkeypa
         # every executed transaction has its receipt (what eth_getTransactionReceipt serves),
         # and the token transfer its Transfer log
         async def receipts():
-            rows = await (await db.connection.execute(
-                "SELECT block_number, tx_index, status, contract_address FROM "
-                "contract_transactions ORDER BY block_number, tx_index")).fetchall()
-            logs = await (await db.connection.execute(
-                "SELECT contract_address, topic0, topic2 FROM contract_logs")).fetchall()
-            return [tuple(r) for r in rows], [tuple(r) for r in logs]
+            rows = [(r.block_number, r.tx_index, r.status, r.contract_address)
+                    for r in db.store["contract_transactions"].scan_index("by_block")]
+            logs = [(r.contract_address, r.topic0, r.topic2)
+                    for r in db.store["contract_logs"].scan()]
+            return rows, logs
         forward_receipts = await receipts()
         rows, logs = forward_receipts
         assert [(r[0], r[1], r[2]) for r in rows] == [(2, 0, 1), (2, 1, 0), (3, 0, 1), (3, 1, 1)]

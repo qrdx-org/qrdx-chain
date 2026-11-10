@@ -311,12 +311,7 @@ class EthModule(RPCModule):
         try:
             found = db.store["blocks"].scan_index("by_hash", block_hash, limit=1)
             if found:
-                cursor2 = await db.connection.execute(
-                    "SELECT COUNT(*) FROM contract_transactions WHERE block_number = ?",
-                    (found[0].block_height,),
-                )
-                crow = await cursor2.fetchone()
-                count += crow[0] if crow else 0
+                count += len(db.contract_transactions_in_block(found[0].block_height))
         except Exception:
             pass
         return count
@@ -334,15 +329,7 @@ class EthModule(RPCModule):
         """Get EVM/contract transactions in a block as dicts."""
         db = self._db()
         try:
-            cursor = await db.connection.execute(
-                "SELECT tx_hash, block_number, tx_index, from_address, to_address, "
-                "value, gas_limit, gas_used, gas_price, nonce, input_data, "
-                "contract_address, status, error_message, created_at "
-                "FROM contract_transactions WHERE block_number = ? ORDER BY tx_index ASC",
-                (block_number,),
-            )
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+            return db.contract_transactions_in_block(block_number)
         except Exception:
             return []
 
@@ -357,16 +344,9 @@ class EthModule(RPCModule):
         # Check contract_transactions first (richer schema)
         for variant in (h, _ensure_0x(h)):
             try:
-                cursor = await db.connection.execute(
-                    "SELECT tx_hash, block_number, tx_index, from_address, to_address, "
-                    "value, gas_limit, gas_used, gas_price, nonce, input_data, "
-                    "contract_address, status, error_message, created_at "
-                    "FROM contract_transactions WHERE tx_hash = ?",
-                    (variant,),
-                )
-                row = await cursor.fetchone()
+                row = db.contract_transaction(variant)
                 if row:
-                    return dict(row), "contract"
+                    return row, "contract"
             except Exception:
                 pass
 
@@ -385,14 +365,20 @@ class EthModule(RPCModule):
         db = self._db()
         h = _strip_0x(tx_hash)
         try:
-            cursor = await db.connection.execute(
-                "SELECT contract_address, topic0, topic1, topic2, topic3, "
-                "data, block_number, log_index, removed "
-                "FROM contract_logs WHERE tx_hash = ? OR tx_hash = ? "
-                "ORDER BY log_index ASC",
-                (h, _ensure_0x(h)),
-            )
-            rows = await cursor.fetchall()
+            rows = [
+                (
+                    r["contract_address"],
+                    r["topic0"],
+                    r["topic1"],
+                    r["topic2"],
+                    r["topic3"],
+                    r["data"],
+                    r["block_number"],
+                    r["log_index"],
+                    r["removed"],
+                )
+                for r in db.contract_logs_of(h, _ensure_0x(h))
+            ]
             return [
                 {
                     "address": _ensure_0x(row[0]) if row[0] else _ZERO_ADDR_HEX,
@@ -826,12 +812,13 @@ class EthModule(RPCModule):
             fields["stateRoot"] = "0x" + (raw if len(raw) == 32 else keccak(raw)).hex()
             fields["qrdxStateRoot"] = "0x" + raw.hex()
         try:
-            cursor = await self._db().connection.execute(
-                "SELECT contract_address, topic0, topic1, topic2, topic3 FROM contract_logs"
-                " WHERE block_number = ? AND (removed IS NULL OR removed = 0)",
-                (height,),
+            fields["logsBloom"] = _logs_bloom(
+                [
+                    (r["contract_address"], r["topic0"], r["topic1"], r["topic2"], r["topic3"])
+                    for r in self._db().contract_logs_between(height, height)
+                    if not r["removed"]
+                ]
             )
-            fields["logsBloom"] = _logs_bloom(await cursor.fetchall())
         except Exception as e:
             logger.debug("logs bloom for block %s skipped: %s", height, e)
         return fields
@@ -1200,28 +1187,24 @@ class EthModule(RPCModule):
                     if result.created_address:
                         contract_addr = encode_hex(result.created_address)
 
-                    await db.connection.execute(
-                        "INSERT OR IGNORE INTO contract_transactions "
-                        "(tx_hash, block_number, tx_index, from_address, to_address, "
-                        "value, gas_limit, gas_used, gas_price, nonce, input_data, "
-                        "contract_address, status, error_message, created_at) "
-                        "VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            tx_hash_hex,
-                            block_height,
-                            sender_hex,
-                            to_hex,
-                            str(value_wei),
-                            gas,
-                            result.gas_used,
-                            str(gas_price_wei),
-                            nonce,
-                            data,
-                            contract_addr,
-                            1 if result.success else 0,
-                            result.error,
-                            int(time.time()),
-                        ),
+                    db.put_contract_transaction(
+                        {
+                            "tx_hash": tx_hash_hex,
+                            "block_number": block_height,
+                            "tx_index": 0,
+                            "from_address": sender_hex,
+                            "to_address": to_hex,
+                            "value": str(value_wei),
+                            "gas_limit": gas,
+                            "gas_used": result.gas_used,
+                            "gas_price": str(gas_price_wei),
+                            "nonce": nonce,
+                            "input_data": data,
+                            "contract_address": contract_addr,
+                            "status": 1 if result.success else 0,
+                            "error_message": result.error,
+                            "created_at": int(time.time()),
+                        }
                     )
 
                     # Persist logs
@@ -1242,22 +1225,8 @@ class EthModule(RPCModule):
                             topic_strs = [str(t) for t in getattr(log_entry, "topics", [])]
                             data_bytes = getattr(log_entry, "data", b"")
 
-                        await db.connection.execute(
-                            "INSERT OR IGNORE INTO contract_logs "
-                            "(tx_hash, block_number, log_index, contract_address, "
-                            "topic0, topic1, topic2, topic3, data, removed) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                            (
-                                tx_hash_hex,
-                                block_height,
-                                i,
-                                addr_hex,
-                                topic_strs[0] if len(topic_strs) > 0 else None,
-                                topic_strs[1] if len(topic_strs) > 1 else None,
-                                topic_strs[2] if len(topic_strs) > 2 else None,
-                                topic_strs[3] if len(topic_strs) > 3 else None,
-                                data_bytes,
-                            ),
+                        db.put_contract_log(
+                            tx_hash_hex, block_height, i, addr_hex, topic_strs[:4], data_bytes
                         )
 
                     await db.connection.commit()
@@ -1694,57 +1663,39 @@ class EthModule(RPCModule):
         from_int = await self._resolve_block_tag(from_block)
         to_int = await self._resolve_block_tag(to_block)
 
-        query_parts: List[str] = []
-        params: List[Any] = []
-
         # Block range
         if block_hash:
             bh_clean = _strip_0x(block_hash)
             try:
                 found = db.store["blocks"].scan_index("by_hash", bh_clean, limit=1)
-                if found:
-                    query_parts.append("block_number = ?")
-                    params.append(found[0].block_height)
-                else:
+                if not found:
                     return []
+                from_int = to_int = int(found[0].block_height)
             except Exception:
                 return []
-        else:
-            query_parts.append("block_number >= ? AND block_number <= ?")
-            params.extend([from_int, to_int])
-
-        # Address filter
-        if addresses:
-            placeholders = ",".join("?" for _ in addresses)
-            query_parts.append(f"contract_address IN ({placeholders})")
-            params.extend(a.lower() for a in addresses)
-
-        # Topic filters
-        topic_cols = ["topic0", "topic1", "topic2", "topic3"]
-        for i, topic in enumerate(topics):
-            if i >= 4:
-                break
-            if topic is None:
-                continue
-            if isinstance(topic, list):
-                tp = ",".join("?" for _ in topic)
-                query_parts.append(f"{topic_cols[i]} IN ({tp})")
-                params.extend(topic)
-            else:
-                query_parts.append(f"{topic_cols[i]} = ?")
-                params.append(topic)
-
-        where = " AND ".join(query_parts) if query_parts else "1=1"
 
         try:
-            cursor = await db.connection.execute(
-                f"SELECT contract_address, topic0, topic1, topic2, topic3, "
-                f"data, block_number, tx_hash, log_index, removed "
-                f"FROM contract_logs WHERE {where} "
-                f"ORDER BY block_number ASC, log_index ASC LIMIT 10000",
-                params,
-            )
-            rows = await cursor.fetchall()
+            rows = [
+                (
+                    r["contract_address"],
+                    r["topic0"],
+                    r["topic1"],
+                    r["topic2"],
+                    r["topic3"],
+                    r["data"],
+                    r["block_number"],
+                    r["tx_hash"],
+                    r["log_index"],
+                    r["removed"],
+                )
+                for r in db.contract_logs_between(
+                    from_int,
+                    to_int,
+                    [a.lower() for a in addresses] if addresses else None,
+                    topics,
+                    10000,
+                )
+            ]
 
             results: List[Dict] = []
             for row in rows:

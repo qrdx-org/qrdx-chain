@@ -301,12 +301,25 @@ async def _evm(db, blk: _BlockIndex, final: bool) -> bool:
     for raw in raws:
         raw_hex = raw if isinstance(raw, str) else str(raw)
         tx_hash = "0x" + keccak(bytes.fromhex(raw_hex.removeprefix("0x"))).hex()
-        cursor = await db.connection.execute(
-            "SELECT from_address, to_address, value, gas_used, gas_price, contract_address, "
-            "status, error_message, nonce FROM contract_transactions WHERE tx_hash = ?",
-            (tx_hash,),
+        found = db.contract_transaction(tx_hash)
+        rec = (
+            None
+            if found is None
+            else tuple(
+                found[k]
+                for k in (
+                    "from_address",
+                    "to_address",
+                    "value",
+                    "gas_used",
+                    "gas_price",
+                    "contract_address",
+                    "status",
+                    "error_message",
+                    "nonce",
+                )
+            )
         )
-        rec = await cursor.fetchone()
         if rec is None:
             if not final:
                 return False
@@ -320,13 +333,11 @@ async def _evm(db, blk: _BlockIndex, final: bool) -> bool:
             frm, to, value, nonce = parsed["sender"], parsed["to"], parsed["value"], parsed["nonce"]
             rec = (frm, to, str(value), None, None, None, None, None, nonce)
         frm, to, value, gas_used, gas_price, created, status, error, nonce = tuple(rec)
-        logs = await (
-            await db.connection.execute(
-                "SELECT contract_address, topic1, topic2, topic3, data FROM contract_logs "
-                "WHERE tx_hash = ? AND topic0 = ? ORDER BY log_index",
-                (tx_hash, topic),
-            )
-        ).fetchall()
+        logs = [
+            (r["contract_address"], r["topic1"], r["topic2"], r["topic3"], r["data"])
+            for r in db.contract_logs_of(tx_hash)
+            if r["topic0"] == topic
+        ]
         transfers = []
         for token, t1, t2, t3, data in logs:
             if t1 is None or t2 is None:

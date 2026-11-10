@@ -227,7 +227,9 @@ async def test_the_tip_waits_for_its_receipts(chain):
     """A tip block whose EVM receipts are not written yet (still applying) is not indexed
     half-done: the indexer stops there and picks it up on a later pass."""
     db, _, mgr, *_ = chain
-    await db.connection.execute("DELETE FROM contract_transactions WHERE block_number = 3")
+    receipts = db.store["contract_transactions"]
+    for r in receipts.scan_index("by_block", 3):
+        receipts.delete(r.tx_hash)
     await db.connection.commit()
     assert await tx_index.sync_index(db, mgr.journal) == 3
     assert await db.tx_index_head() == 2

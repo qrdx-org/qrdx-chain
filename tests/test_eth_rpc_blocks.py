@@ -26,25 +26,17 @@ async def test_a_block_reports_its_own_gas_limit_base_fee_root_and_bloom(monkeyp
     import json
     from types import SimpleNamespace
 
-    import aiosqlite
-
     from qrdx.block_limits import evm_gas_limit_at
 
-    async with aiosqlite.connect(":memory:") as conn:
-        await conn.execute(
-            "CREATE TABLE contract_logs (contract_address TEXT, topic0 TEXT, topic1 TEXT,"
-            " topic2 TEXT, topic3 TEXT, block_number INTEGER, removed INTEGER)"
-        )
-        await conn.execute(
-            "INSERT INTO contract_logs VALUES (?, ?, NULL, NULL, NULL, 7, 0)",
-            ("0x" + "cd" * 20, "0x" + "dd" * 32),
-        )
-        module = eth.EthModule.__new__(eth.EthModule)
-        monkeypatch.setattr(module, "_db", lambda: SimpleNamespace(connection=conn))
-        content = json.dumps({"base_fee": 3_000_000_000, "state_root": "ab" * 64})
-        block = {"id": 7, "hash": "11" * 32, "content": content}
-        header = await module._header_fields(block, 7, [{"gas_used": 21000}])
-        out = module._fmt_block(block, [], False, header=header)
+    log = {"contract_address": "0x" + "cd" * 20, "topic0": "0x" + "dd" * 32, "topic1": None,
+           "topic2": None, "topic3": None, "block_number": 7, "removed": 0}
+    db = SimpleNamespace(contract_logs_between=lambda lo, hi, *a: [log] if lo <= 7 <= hi else [])
+    module = eth.EthModule.__new__(eth.EthModule)
+    monkeypatch.setattr(module, "_db", lambda: db)
+    content = json.dumps({"base_fee": 3_000_000_000, "state_root": "ab" * 64})
+    block = {"id": 7, "hash": "11" * 32, "content": content}
+    header = await module._header_fields(block, 7, [{"gas_used": 21000}])
+    out = module._fmt_block(block, [], False, header=header)
 
     assert out["baseFeePerGas"] == hex(3_000_000_000)
     assert out["gasLimit"] == hex(evm_gas_limit_at(7)) and out["gasUsed"] == hex(21000)

@@ -248,51 +248,6 @@ class DatabaseSQLite:
             FOREIGN KEY (validator_address) REFERENCES validator_stakes(validator_address)
         );
 
-        CREATE TABLE IF NOT EXISTS contract_metadata (
-            contract_address TEXT PRIMARY KEY,
-            name TEXT,
-            symbol TEXT,
-            compiler_version TEXT,
-            source_code TEXT,
-            abi TEXT,
-            verified BOOLEAN NOT NULL DEFAULT 0,
-            verified_at INTEGER
-        );
-
-        CREATE TABLE IF NOT EXISTS contract_transactions (
-            tx_hash TEXT PRIMARY KEY,
-            block_number INTEGER NOT NULL,
-            tx_index INTEGER NOT NULL,
-            from_address TEXT NOT NULL,
-            to_address TEXT,
-            value TEXT NOT NULL DEFAULT '0',
-            gas_limit INTEGER NOT NULL,
-            gas_used INTEGER NOT NULL,
-            gas_price TEXT NOT NULL,
-            nonce INTEGER NOT NULL,
-            input_data BLOB,
-            contract_address TEXT,
-            status INTEGER NOT NULL DEFAULT 1,
-            error_message TEXT,
-            created_at INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS contract_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tx_hash TEXT NOT NULL,
-            block_number INTEGER NOT NULL,
-            log_index INTEGER NOT NULL,
-            contract_address TEXT NOT NULL,
-            topic0 TEXT,
-            topic1 TEXT,
-            topic2 TEXT,
-            topic3 TEXT,
-            data BLOB,
-            removed BOOLEAN NOT NULL DEFAULT 0,
-            UNIQUE(tx_hash, log_index),
-            FOREIGN KEY (tx_hash) REFERENCES contract_transactions(tx_hash)
-        );
-
         CREATE TABLE IF NOT EXISTS attestations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             slot INTEGER NOT NULL,
@@ -357,18 +312,8 @@ class DatabaseSQLite:
         CREATE INDEX IF NOT EXISTS idx_withdrawals_validator ON stake_withdrawals(validator_address);
         -- Balance writes find their row case-insensitively (genesis may store a checksummed
         -- address): without this every write scanned the table (docs/KNOWN_ISSUES.md).
-        CREATE INDEX IF NOT EXISTS idx_contract_metadata_verified ON contract_metadata(verified);
-        CREATE INDEX IF NOT EXISTS idx_contract_tx_block ON contract_transactions(block_number);
-        CREATE INDEX IF NOT EXISTS idx_contract_tx_from ON contract_transactions(from_address);
-        CREATE INDEX IF NOT EXISTS idx_contract_tx_to ON contract_transactions(to_address);
-        CREATE INDEX IF NOT EXISTS idx_contract_logs_tx ON contract_logs(tx_hash);
-        CREATE INDEX IF NOT EXISTS idx_contract_logs_block ON contract_logs(block_number);
-        CREATE INDEX IF NOT EXISTS idx_contract_logs_address ON contract_logs(contract_address);
         CREATE INDEX IF NOT EXISTS idx_system_wallets_controller ON system_wallets(controller_address);
         CREATE INDEX IF NOT EXISTS idx_system_wallets_category ON system_wallets(category);
-        CREATE INDEX IF NOT EXISTS idx_contract_logs_topic0 ON contract_logs(topic0);
-        CREATE INDEX IF NOT EXISTS idx_contract_logs_topic1 ON contract_logs(topic1);
-        CREATE INDEX IF NOT EXISTS idx_contract_logs_topic2 ON contract_logs(topic2);
         CREATE INDEX IF NOT EXISTS idx_attestations_slot ON attestations(slot);
         CREATE INDEX IF NOT EXISTS idx_attestations_epoch ON attestations(epoch);
         CREATE INDEX IF NOT EXISTS idx_attestations_validator ON attestations(validator_address);
@@ -736,10 +681,7 @@ class DatabaseSQLite:
         # The EVM's receipts and logs index (rewritten as the replay re-executes each section,
         # so an orphaned block's receipts do not survive).
         for tbl in ("contract_logs", "contract_transactions"):
-            try:
-                await self.connection.execute(f"DELETE FROM {tbl}")
-            except Exception:
-                pass
+            self.store[tbl].clear()
         for tbl in ("evm_balance_sync_registry", "evm_balance_changes"):
             self.store[tbl].clear()
         await self.connection.commit()
@@ -1100,25 +1042,109 @@ class DatabaseSQLite:
         data: Optional[bytes] = None,
     ):
         """Add contract event log"""
-        await self.connection.execute(
-            """
-            INSERT INTO contract_logs
-            (tx_hash, block_number, log_index, contract_address, topic0, topic1, topic2, topic3, data, removed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-        """,
-            (
-                tx_hash,
-                block_number,
-                log_index,
-                contract_address,
-                topic0,
-                topic1,
-                topic2,
-                topic3,
-                data,
-            ),
+        self.put_contract_log(
+            tx_hash,
+            block_number,
+            log_index,
+            contract_address,
+            (topic0, topic1, topic2, topic3),
+            data,
         )
         await self.connection.commit()
+
+    # ── the EVM's receipts and logs (eth_getTransactionReceipt, eth_getLogs) ──
+
+    def put_contract_log(
+        self,
+        tx_hash: str,
+        block_number: int,
+        log_index: int,
+        contract_address: str,
+        topics: Any,
+        data: Any,
+        replace: bool = False,
+    ) -> bool:
+        """A log of transaction ``tx_hash`` (once per (tx, log index): the first is kept unless
+        ``replace``). Whether it was written."""
+        logs = self.store["contract_logs"]
+        existing = logs.scan_index("by_tx", tx_hash, int(log_index))
+        if existing and not replace:
+            return False
+        for old in existing:
+            logs.delete(old.block_number, old.id)
+        topics = list(topics or []) + [None] * 4
+        logs.put(
+            int(block_number),
+            self.store.next_id("contract_logs"),
+            tx_hash,
+            int(log_index),
+            contract_address,
+            *topics[:4],
+            data,
+            0,
+        )
+        return True
+
+    def drop_contract_logs_of(self, tx_hash: str) -> None:
+        logs = self.store["contract_logs"]
+        for old in logs.scan_index("by_tx", tx_hash):
+            logs.delete(old.block_number, old.id)
+
+    def put_contract_transaction(self, receipt: Dict[str, Any], replace: bool = False) -> bool:
+        """A transaction's receipt row (``contract_transactions`` columns, by name)."""
+        txs = self.store["contract_transactions"]
+        if not replace and txs.exists(receipt["tx_hash"]):
+            return False
+        txs.put(**receipt)
+        return True
+
+    def contract_transaction(self, tx_hash: str) -> Optional[Dict[str, Any]]:
+        row = self.store["contract_transactions"].get(tx_hash)
+        return row._asdict() if row is not None else None
+
+    def contract_transactions_in_block(self, block_number: int) -> List[Dict[str, Any]]:
+        rows = self.store["contract_transactions"].scan_index("by_block", int(block_number))
+        return [r._asdict() for r in rows]
+
+    def contract_logs_of(self, *tx_hashes: str) -> List[Dict[str, Any]]:
+        """The logs of the transactions spelled ``tx_hashes``, by log index."""
+        rows = [r for h in tx_hashes for r in self.store["contract_logs"].scan_index("by_tx", h)]
+        rows.sort(key=lambda r: int(r.log_index))
+        return [r._asdict() for r in rows]
+
+    def contract_logs_between(
+        self,
+        low: int,
+        high: int,
+        addresses: Optional[Any] = None,
+        topics: Optional[Any] = None,
+        limit: int = 10_000,
+    ) -> List[Dict[str, Any]]:
+        """The logs of blocks ``low``..``high`` matching ``addresses`` (any of) and ``topics``
+        (per position: None for any, a value, or a list of values), by block then log index."""
+        logs = self.store["contract_logs"]
+        span = {"lo": (int(low),), "hi": (int(high) + 1,)}
+        if addresses:
+            rows = [
+                r for a in sorted(set(addresses)) for r in logs.scan_index("by_address", a, **span)
+            ]
+        else:
+            rows = logs.scan(**span)
+        out = []
+        for r in sorted(rows, key=lambda r: (int(r.block_number), int(r.id))):
+            ok = True
+            for i, want in enumerate((topics or [])[:4]):
+                have = (r.topic0, r.topic1, r.topic2, r.topic3)[i]
+                if want is None:
+                    continue
+                if isinstance(want, list) and have not in want:
+                    ok = False
+                elif not isinstance(want, list) and have != want:
+                    ok = False
+            if ok:
+                out.append(r._asdict())
+        out.sort(key=lambda d: (int(d["block_number"]), int(d["log_index"])))
+        return out[: int(limit)]
 
     async def add_contract_metadata(
         self,
@@ -1129,13 +1155,8 @@ class DatabaseSQLite:
         abi: Optional[str] = None,
     ):
         """Add or update contract metadata"""
-        await self.connection.execute(
-            """
-            INSERT OR REPLACE INTO contract_metadata
-            (contract_address, name, symbol, verified, abi)
-            VALUES (?, ?, ?, ?, ?)
-        """,
-            (contract_address, name, symbol, verified, abi),
+        self.store["contract_metadata"].put(
+            contract_address=contract_address, name=name, symbol=symbol, verified=verified, abi=abi
         )
         await self.connection.commit()
 
@@ -1143,67 +1164,38 @@ class DatabaseSQLite:
         """Get tokens owned by address from Transfer events"""
         # Normalize address to 64-char hex (32 bytes)
         address_topic = "0x" + address.lower().replace("0x", "").zfill(64)
-
-        cursor = await self.connection.execute(
-            """
-            SELECT DISTINCT
-                cl.contract_address,
-                cm.name,
-                cm.symbol,
-                COALESCE(cm.verified, 0) as verified,
-                COUNT(DISTINCT cl.id) as transfer_count
-            FROM contract_logs cl
-            LEFT JOIN contract_metadata cm ON cl.contract_address = cm.contract_address
-            WHERE cl.topic0 = ?
-              AND cl.topic2 = ?
-              AND cl.removed = 0
-            GROUP BY cl.contract_address, cm.name, cm.symbol, cm.verified
-        """,
-            (transfer_topic, address_topic),
-        )
-
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        counts: Dict[str, int] = {}
+        for r in self.store["contract_logs"].scan_index("by_topic0", transfer_topic):
+            if r.topic2 == address_topic and not r.removed:
+                counts[r.contract_address] = counts.get(r.contract_address, 0) + 1
+        meta = self.store["contract_metadata"]
+        out = []
+        for contract, n in counts.items():
+            m = meta.get(contract)
+            out.append(
+                {
+                    "contract_address": contract,
+                    "name": m.name if m else None,
+                    "symbol": m.symbol if m else None,
+                    "verified": m.verified if m else 0,
+                    "transfer_count": n,
+                }
+            )
+        return out
 
     async def get_token_info(self, token_address: str, transfer_topic: str):
         """Get token contract information"""
-        # Get metadata
-        cursor = await self.connection.execute(
-            """
-            SELECT * FROM contract_metadata WHERE contract_address = ?
-        """,
-            (token_address,),
-        )
-        metadata = await cursor.fetchone()
-
+        metadata = self.store["contract_metadata"].get(token_address)
         if not metadata:
             return None
-
-        # Get transfer count
-        cursor = await self.connection.execute(
-            """
-            SELECT COUNT(*) as count FROM contract_logs
-            WHERE contract_address = ? AND topic0 = ? AND removed = 0
-        """,
-            (token_address, transfer_topic),
-        )
-        transfer_row = await cursor.fetchone()
-        transfer_count = transfer_row[0] if transfer_row else 0
-
-        # Get unique holders (distinct topic2 recipients)
-        cursor = await self.connection.execute(
-            """
-            SELECT COUNT(DISTINCT topic2) as count FROM contract_logs
-            WHERE contract_address = ? AND topic0 = ? AND removed = 0
-        """,
-            (token_address, transfer_topic),
-        )
-        holder_row = await cursor.fetchone()
-        holder_count = holder_row[0] if holder_row else 0
-
-        result = dict(metadata)
-        result["total_transfers"] = transfer_count
-        result["total_holders"] = holder_count
+        transfers = [
+            r
+            for r in self.store["contract_logs"].scan_index("by_address", token_address)
+            if r.topic0 == transfer_topic and not r.removed
+        ]
+        result = metadata._asdict()
+        result["total_transfers"] = len(transfers)
+        result["total_holders"] = len({r.topic2 for r in transfers if r.topic2 is not None})
         return result
 
     async def get_top_addresses_by_balance(self, limit: int, offset: int):
@@ -1228,23 +1220,18 @@ class DatabaseSQLite:
 
     async def get_top_addresses_by_tokens(self, limit: int, offset: int, transfer_topic: str):
         """Get addresses with most token holdings"""
-        cursor = await self.connection.execute(
-            """
-            SELECT
-                topic2 as address_topic,
-                COUNT(DISTINCT contract_address) as token_count,
-                COUNT(*) as transfer_count
-            FROM contract_logs
-            WHERE topic0 = ? AND removed = 0 AND topic2 IS NOT NULL
-            GROUP BY topic2
-            ORDER BY token_count DESC
-            LIMIT ? OFFSET ?
-        """,
-            (transfer_topic, limit, offset),
-        )
-
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        tokens: Dict[str, set] = {}
+        transfers: Dict[str, int] = {}
+        for r in self.store["contract_logs"].scan_index("by_topic0", transfer_topic):
+            if r.removed or r.topic2 is None:
+                continue
+            tokens.setdefault(r.topic2, set()).add(r.contract_address)
+            transfers[r.topic2] = transfers.get(r.topic2, 0) + 1
+        ranked = sorted(tokens, key=lambda a: -len(tokens[a]))[offset : offset + limit]
+        return [
+            {"address_topic": a, "token_count": len(tokens[a]), "transfer_count": transfers[a]}
+            for a in ranked
+        ]
 
     async def get_recent_transactions_with_blocks(self, limit: int, offset: int):
         """Get recent transactions with block info (newest block first)"""
@@ -1267,19 +1254,24 @@ class DatabaseSQLite:
 
     async def get_recent_contract_transactions(self, limit: int, offset: int):
         """Get recent contract transactions"""
-        cursor = await self.connection.execute(
-            """
-            SELECT tx_hash, block_number, from_address, to_address, value, gas_used, status
-            FROM contract_transactions
-            ORDER BY block_number DESC
-            LIMIT ? OFFSET ?
-        """,
-            (limit, offset),
-        )
+        rows = self.store["contract_transactions"].scan_index(
+            "by_block", reverse=True, limit=offset + limit
+        )[offset:]
         out = []
         blocks = self.store["blocks"]
-        for row in await cursor.fetchall():
-            d = dict(row)
+        for r in rows:
+            d = {
+                k: getattr(r, k)
+                for k in (
+                    "tx_hash",
+                    "block_number",
+                    "from_address",
+                    "to_address",
+                    "value",
+                    "gas_used",
+                    "status",
+                )
+            }
             b = blocks.get(d["block_number"]) if d.get("block_number") is not None else None
             d["timestamp"] = b.timestamp if b is not None else None
             out.append(d)
@@ -1836,12 +1828,10 @@ class DatabaseSQLite:
         chain_index.blocks_changed(self)
         # The removed blocks' EVM receipts and indexed transactions are no longer canonical:
         # a re-applied block writes its own (an orphaned transaction must not keep a receipt).
-        await self.connection.execute(
-            "DELETE FROM contract_logs WHERE block_number >= ?", (start_id,)
-        )
-        await self.connection.execute(
-            "DELETE FROM contract_transactions WHERE block_number >= ?", (start_id,)
-        )
+        self.store["contract_logs"].delete_prefix(lo=(int(start_id),), hi=(2**62,))
+        receipts = self.store["contract_transactions"]
+        for r in receipts.scan_index("by_block", lo=(int(start_id),), hi=(2**62,)):
+            receipts.delete(r.tx_hash)
         self._tx_index_cut(start_id)
         self._hist_cut(start_id)
         await self.connection.commit()
