@@ -23,10 +23,8 @@ from pq_addrs import pq
 async def _node(trader, fund_qrdx):
     db = await DatabaseSQLite.create(db_path=tempfile.mktemp(suffix=".db"))
     if fund_qrdx is not None:
-        await db.connection.execute(
-            "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, is_contract) "
-            "VALUES (?, ?, 0, 0, 0, 0)",
-            (to_account_id(trader), str(int(Decimal(fund_qrdx) * 10**18))))
+        db.store["account_state"].put(
+            address=to_account_id(trader), balance=str(int(Decimal(fund_qrdx) * 10**18)))
         await db.connection.commit()
     mgr = ExchangeStateManager()
     mgr.enforce_collateral = True
@@ -48,11 +46,8 @@ async def _run_block(db, mgr, tx):
 
 
 async def _acct_wei(db, addr):
-    cur = await db.connection.execute(
-        "SELECT balance FROM account_state WHERE LOWER(address)=LOWER(?)",
-        (to_account_id(addr),))
-    r = await cur.fetchone()
-    return int(r[0]) if r and r[0] is not None else None
+    r = db.store["account_state"].get(to_account_id(addr))
+    return int(r.balance) if r and r.balance is not None else None
 
 
 async def test_two_nodes_agree_on_debit_and_root():

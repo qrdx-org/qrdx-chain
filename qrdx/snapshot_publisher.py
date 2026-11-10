@@ -2,7 +2,8 @@
 Publishing snapshots (docs/CHECKPOINT_SYNC.md, "Publishing"). A node started with
 ``QRDX_SNAPSHOT_DIR`` writes a snapshot of its own database each time it persists a newer
 exchange checkpoint (every 1,024 finalized blocks), keeps the newest, serves it at
-``/snapshot/manifest.json`` and ``/snapshot/qrdx.db`` (range requests: a cut download resumes),
+``/snapshot/manifest.json``, ``/snapshot/qrdx.db`` and ``/snapshot/qrdx.db.store`` (range requests:
+a cut download resumes),
 and advertises it in ``p2p_getStatus``. A joining node finds one with
 ``scripts/node/snapshot.py fetch --peer URL``.
 
@@ -13,7 +14,8 @@ snapshot leaves out what a restore discards anyway — the tables this node keep
 rebuilds — so it neither shows them nor costs the bandwidth.
 
 The work runs in a thread, from a poller: off the block path and the event loop. It reads the
-database through SQLite's online backup, a consistent read while the node keeps writing.
+database through SQLite's online backup and the store through MDBX's online copy, each a
+consistent read while the node keeps writing.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 from .logger import get_logger
-from .snapshot import DATABASE, MANIFEST, create
+from .snapshot import DATABASE, MANIFEST, STORE, create
 
 logger = get_logger(__name__)
 
@@ -52,7 +54,7 @@ def latest(root: str) -> Optional[Dict[str, Any]]:
         manifest = json.loads((directory / MANIFEST).read_text())
     except (OSError, ValueError, KeyError, TypeError):
         return None
-    if not (directory / DATABASE).is_file():
+    if not (directory / DATABASE).is_file() or not (directory / STORE).is_file():
         return None
     return {"dir": str(directory), "manifest": manifest}
 
@@ -106,10 +108,10 @@ def publish(db_path: str, root: str) -> Optional[Dict[str, Any]]:
 
 
 def published_file(name: str) -> Optional[str]:
-    """The path of the published snapshot's ``manifest.json`` or ``qrdx.db`` — the only two
-    names served — or None when this node publishes none."""
+    """The path of the published snapshot's ``manifest.json``, ``qrdx.db`` or ``qrdx.db.store``
+    — the only names served — or None when this node publishes none."""
     root = _ROOT.get("root")
-    if root is None or name not in (MANIFEST, DATABASE):
+    if root is None or name not in (MANIFEST, DATABASE, STORE):
         return None
     current = latest(root)
     if current is None:

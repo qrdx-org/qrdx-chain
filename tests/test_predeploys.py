@@ -117,15 +117,12 @@ async def test_genesis_writes_them_and_every_rebuild_seeds_them_again(genesis_db
     await db.connection.commit()
 
     async def state():
-        cur = await db.connection.execute(
-            "SELECT address, code_hash, nonce, is_contract FROM account_state "
-            "WHERE address IN (?, ?) ORDER BY address",
-            (predeploys.IMPLEMENTATION_ADDRESS, predeploys.FACTORY_ADDRESS))
-        accounts = [tuple(r) for r in await cur.fetchall()]
-        cur = await db.connection.execute(
-            "SELECT contract_address, storage_key, storage_value FROM contract_storage "
-            "ORDER BY contract_address, storage_key")
-        return accounts, [tuple(r) for r in await cur.fetchall()]
+        wanted = {predeploys.IMPLEMENTATION_ADDRESS, predeploys.FACTORY_ADDRESS}
+        accounts = [(r.address, r.code_hash, r.nonce, r.is_contract)
+                    for r in db.store["account_state"].scan() if r.address in wanted]
+        storage = [(r.contract_address, r.storage_key, r.storage_value)
+                   for r in db.store["contract_storage"].scan()]
+        return accounts, storage
 
     accounts, storage = await state()
     assert [a[0] for a in accounts] == [predeploys.IMPLEMENTATION_ADDRESS, predeploys.FACTORY_ADDRESS]
@@ -136,8 +133,8 @@ async def test_genesis_writes_them_and_every_rebuild_seeds_them_again(genesis_db
     assert len(await cur.fetchall()) == 2                      # block-0 records
 
     root = await db.get_account_state_root()
-    await db.connection.execute("DELETE FROM account_state")    # as a rebuild clears it
-    await db.connection.execute("DELETE FROM contract_storage")
+    db.store["account_state"].delete_prefix()    # as a rebuild clears it
+    db.store["contract_storage"].delete_prefix()
     await db.seed_genesis_account_state()
     assert await state() == (accounts, storage)
     assert await db.get_account_state_root() == root

@@ -4,7 +4,8 @@ stands in for.
 
 Each function here returns exactly what its Python path returns, so consensus never depends on
 whether the module is installed. A node without it runs the Python path; ``QRDX_NATIVE=0`` turns
-it off. What the module does:
+it off. (The node's store, qrdx/store.py, is the module's too and has no Python path: the node
+needs the module for it.) What the module does:
 
 * ``mldsa65_verify_batch``: ML-DSA-65 signatures, checked by the same liboqs the Python path
   calls, in parallel and without Python's lock (on one core, through Python, a block's
@@ -73,15 +74,6 @@ def mldsa65_verify_batch(items: Sequence[Tuple[bytes, bytes, bytes]]) -> Optiona
     return list(_native.mldsa65_verify_batch(list(items)))
 
 
-def lt_apply_function() -> Optional[Callable[..., Any]]:
-    """The native ``qrdx_lt_apply`` trigger function (qrdx/state_commitment.py), or None
-    without the module. It answers as ``state_commitment._udf_apply`` does, handing it what it
-    does not reproduce exactly."""
-    if _native is None or not hasattr(_native, "lt_apply"):
-        return None
-    return _native.lt_apply  # type: ignore[no-any-return]
-
-
 def tree_module() -> Optional[Any]:
     """The module, if it has the exchange's in-memory proof trees (qrdx/crypto/smt.py ``m_*``)."""
     if _native is None or not hasattr(_native, "mt_update"):
@@ -94,6 +86,15 @@ def lt_mix_entries_function() -> Optional[Callable[..., Any]]:
     if _native is None or not hasattr(_native, "lt_mix_entries"):
         return None
     return _native.lt_mix_entries  # type: ignore[no-any-return]
+
+
+def smt_entries_function() -> Optional[Callable[..., Any]]:
+    """The database tree's entries of marked rows (``state_proofs._changes``), natively: each
+    item (key, payload) or None where only Python computes it exactly. None without the
+    module."""
+    if _native is None:
+        return None
+    return _native.smt_entries  # type: ignore[no-any-return]
 
 
 def smt_update_function() -> Optional[Callable[..., Any]]:

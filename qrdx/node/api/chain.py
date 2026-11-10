@@ -78,16 +78,9 @@ async def get_unified_state_root():
         token_root = await _node.db.get_token_balances_root(tip)
         from qrdx import state_proofs
 
-        cur = (
-            await _node.db.connection.execute(
-                "SELECT proof, validators FROM state_root_parts WHERE height = ?", (tip,)
-            )
-            if state_proofs.scheduled()
-            else None
-        )
-        row = await cur.fetchone() if cur is not None else None
-        proof_root = row[0] if row is not None else None
-        validators = row[1] if row is not None else None
+        row = _node.db.store["state_root_parts"].get(tip) if state_proofs.scheduled() else None
+        proof_root = row.proof if row is not None else None
+        validators = row.validators if row is not None else None
         root = unified_state_root(
             utxo_root, account_root, exchange_root, token_root, proof_root, validators
         )

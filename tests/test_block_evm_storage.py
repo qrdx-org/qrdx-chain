@@ -62,16 +62,20 @@ async def test_idempotent_and_isolated():
         await db.close(); os.remove(path)
 
 
-async def test_remove_blocks_cleans_orphaned_evm_sections():
+async def test_remove_blocks_drops_the_removed_blocks_sections():
+    """A section is stored right after its block (every import path), keyed by the block's hash
+    in the store: removing blocks drops theirs and keeps the rest."""
     db, path = await _db()
     try:
-        # Block present in canonical chain.
-        await db.add_block(block_hash="h5", block_height=5, block_content="",
-                           validator_address="0xPQ" + "00" * 32, timestamp=1)
-        await db.add_block_evm_txs("h5", [_raw(7)])
-        # Orphaned section (no matching block row).
-        await db.add_block_evm_txs("orphan", [_raw(8)])
-        await db.remove_blocks(0)  # rolls back everything
-        assert await db.get_block_evm_txs("orphan") == []
+        for h in (4, 5):
+            await db.add_block(block_hash=f"h{h}", block_height=h, block_content="",
+                               validator_address="0xPQ" + "00" * 32, timestamp=1)
+            await db.add_block_evm_txs(f"h{h}", [_raw(h)])
+            await db.add_block_exchange_txs(f"h{h}", [{"tx_hash": f"x{h}"}])
+        await db.remove_blocks(5)  # (a reorg back to block 4)
+        assert await db.get_block_evm_txs("h5") == []
+        assert await db.get_block_exchange_txs("h5") == []
+        assert await db.get_block_evm_txs("h4") == [_raw(4)]
+        assert await db.get_block_exchange_txs("h4") == [{"tx_hash": "x4"}]
     finally:
         await db.close(); os.remove(path)

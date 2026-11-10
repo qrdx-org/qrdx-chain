@@ -42,15 +42,11 @@ async def _db():
 
 
 async def _row_count(db, address):
-    cur = await db.connection.execute(
-        "SELECT COUNT(*) FROM account_state WHERE LOWER(address) = LOWER(?)",
-        (to_account_id(address),))
-    return (await cur.fetchone())[0]
+    return int(db.store["account_state"].exists(to_account_id(address)))
 
 
 async def _all_rows(db):
-    cur = await db.connection.execute("SELECT address, balance FROM account_state")
-    return {r[0]: int(r[1]) for r in await cur.fetchall()}
+    return {r.address: int(r.balance) for r in db.store["account_state"].scan()}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -129,9 +125,7 @@ async def test_token_ledger_shares_the_same_holder_key():
         assert await db.get_token_balance(token, holder) == Decimal("1000")
         assert await db.get_token_balance(token, to_account_id(holder)) == Decimal("1000")
 
-        cur = await db.connection.execute(
-            "SELECT COUNT(*) FROM token_balances WHERE token_address = ?", (token,))
-        assert (await cur.fetchone())[0] == 1
+        assert db.store["token_balances"].count(token) == 1
     finally:
         path = db.db_path
         await db.close()

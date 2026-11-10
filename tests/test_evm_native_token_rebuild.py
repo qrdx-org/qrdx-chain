@@ -140,10 +140,8 @@ async def test_forward_and_rebuild_agree_on_evm_token_moves_and_storage(monkeypa
         # the chain did what it says
         assert await db.get_token_balance(token, BOB) == Decimal(100)
         assert await db.get_token_balance(token, ALICE.address) == Decimal(200)
-        rows = await (await db.connection.execute(
-            "SELECT storage_value FROM contract_storage WHERE contract_address = ?",
-            (contract,))).fetchall()
-        assert [int(r[0], 16) for r in rows] == [42]
+        rows = db.store["contract_storage"].scan(contract)
+        assert [int(r.storage_value, 16) for r in rows] == [42]
         forward = (await db.get_token_balances_root(), await db.get_account_state_root(),
                    ExchangeStateManager.get_instance().compute_state_root())
 

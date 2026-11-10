@@ -18,12 +18,12 @@ Entries (each a typed, fixed-width payload, so a contract can build one; absent 
 
 An entry's key is ``key_of(type | identity)``; its leaf commits to ``value_hash(payload)``.
 
-**Keeping it.** TEMP triggers (on the node's own connection, like the accumulators') mark every
-changed row in ``smt_dirty``, in the writing statement's transaction. ``proof_root`` folds the
-marked rows into the tree when a block's root is computed — on every path, at the point the
-other roots are — and records the root for that height. Everything it writes is in the block's
-transaction, so a rolled-back block takes its tree changes with it. The tree is a function of the
-rows alone (qrdx/crypto/smt.py), so it does not matter when or how often the marks are folded.
+**Keeping it.** The store (qrdx/store.py) marks every changed row of the three tables, in the
+writes' own transaction. ``proof_root`` folds the marked rows into the tree when a block's root
+is computed — on every path, at the point the other roots are — and records the root for that
+height. Everything it writes is in the block's transaction, so a rolled-back block takes its tree
+changes with it. The tree is a function of the rows alone (qrdx/crypto/smt.py), so it does not
+matter when or how often the marks are folded.
 
 Stored nodes are keyed by an internal version that never repeats in this process (nor across
 restarts: it is in ``smt_meta``), so a cached node is never wrong. Nodes a later version replaced
@@ -51,26 +51,6 @@ RETENTION_BLOCKS = int(os.environ.get("QRDX_STATE_PROOF_RETENTION_BLOCKS", "1000
 PRUNE_EVERY = 1000
 _CACHE_SIZE = 200_000
 
-SCHEMA = (
-    "CREATE TABLE IF NOT EXISTS smt_nodes (nkey TEXT PRIMARY KEY, data BLOB NOT NULL)",
-    # (No unique key: a trigger's conflict clause yields to its outer statement's — an upsert
-    # would abort on a repeated mark. Marks are de-duplicated when read.)
-    "CREATE TABLE IF NOT EXISTS smt_dirty (kind TEXT NOT NULL, ident TEXT NOT NULL)",
-    "CREATE INDEX IF NOT EXISTS idx_smt_dirty ON smt_dirty(kind, ident)",
-    "CREATE TABLE IF NOT EXISTS smt_meta (id INTEGER PRIMARY KEY CHECK (id = 1),"
-    " version INTEGER NOT NULL, root BLOB NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS smt_roots (height INTEGER PRIMARY KEY, version INTEGER NOT NULL,"
-    " root BLOB NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS smt_stale (version INTEGER NOT NULL, nkey TEXT NOT NULL)",
-    "CREATE INDEX IF NOT EXISTS idx_smt_stale_version ON smt_stale(version)",
-    # The domain roots each height's unified root was computed from (node-local: what a proof
-    # needs to reach the signed root; written where the root is computed or checked).
-    # (dtree / xtree: the database tree's and the exchange tree's roots; proof combines them)
-    "CREATE TABLE IF NOT EXISTS state_root_parts (height INTEGER PRIMARY KEY, utxo TEXT,"
-    " account TEXT, exchange TEXT, token TEXT, proof TEXT, dtree TEXT, xtree TEXT,"
-    " validators TEXT)",
-)
-
 # kind → (table, the identity columns, the payload columns)
 TABLES = {
     "account": (
@@ -90,9 +70,12 @@ TABLES = {
     ),
 }
 
+# (by store)
 _locks: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = weakref.WeakKeyDictionary()
 _versions: "weakref.WeakKeyDictionary[Any, int]" = weakref.WeakKeyDictionary()
 _caches: "weakref.WeakKeyDictionary[Any, OrderedDict]" = weakref.WeakKeyDictionary()
+
+_KIND_OF = {table: kind for kind, (table, _i, _c) in TABLES.items()}
 
 
 # ── entries ──────────────────────────────────────────────────────────────────────────────
@@ -197,28 +180,6 @@ def identity(kind: str, *ident: Any) -> bytes:
 # ── keeping the tree ─────────────────────────────────────────────────────────────────────
 
 
-def _trigger_sql(kind: str) -> List[str]:
-    table, ident_cols, payload_cols = TABLES[kind]
-
-    def ident(prefix: str) -> str:
-        return " || '|' || ".join(f"{prefix}.{c}" for c in ident_cols)
-
-    mark = (
-        "INSERT INTO smt_dirty (kind, ident) SELECT '{k}', {i} WHERE NOT EXISTS "
-        "(SELECT 1 FROM smt_dirty WHERE kind = '{k}' AND ident = {i});"
-    )
-    changed = " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in payload_cols)
-    return [
-        f"CREATE TEMP TRIGGER IF NOT EXISTS qrdx_smt_{kind}_ins AFTER INSERT ON main.{table} "
-        f"BEGIN {mark.format(k=kind, i=ident('NEW'))} END",
-        f"CREATE TEMP TRIGGER IF NOT EXISTS qrdx_smt_{kind}_upd AFTER UPDATE ON main.{table} "
-        f"WHEN {changed} BEGIN {mark.format(k=kind, i=ident('OLD'))} "
-        f"{mark.format(k=kind, i=ident('NEW'))} END",
-        f"CREATE TEMP TRIGGER IF NOT EXISTS qrdx_smt_{kind}_del AFTER DELETE ON main.{table} "
-        f"BEGIN {mark.format(k=kind, i=ident('OLD'))} END",
-    ]
-
-
 def scheduled() -> bool:
     """Does this network's chain spec switch the feature on at all (genesis or a fork)?"""
     from . import chain_spec
@@ -229,75 +190,49 @@ def scheduled() -> bool:
         return False
 
 
-async def install(conn: Any) -> None:
-    """Create the tables and the triggers on this connection — on a network that schedules
-    the feature. A database that has never kept the tree has all its rows marked, so the first
-    root covers them."""
+def install(db: Any) -> None:
+    """On a network that schedules the feature: a store that has never kept the tree has every
+    row marked, so the first root covers them. Elsewhere the store marks nothing."""
+    store = db.store
     if not scheduled():
+        store.set_tracking(False)
         return
-    for sql in SCHEMA:
-        await conn.execute(sql)
-    cur = await conn.execute("PRAGMA table_info(state_root_parts)")
-    if "validators" not in {r[1] for r in await cur.fetchall()}:  # (a database from before)
-        await conn.execute("ALTER TABLE state_root_parts ADD COLUMN validators TEXT")
-    for kind in TABLES:
-        for sql in _trigger_sql(kind):
-            await conn.execute(sql)
-    cur = await conn.execute("SELECT 1 FROM smt_meta WHERE id = 1")
-    fresh = await cur.fetchone() is None
-    repaired = getattr(conn, "qrdx_lt_repaired", None) or {}
-    if fresh or repaired.get("account") or repaired.get("token"):
-        # Every row marked: a database that never kept the tree, or one whose rows were written
-        # where the triggers do not run (the accumulators caught it at startup: they cover
-        # every column the tree does). The next root re-derives the tree from the rows.
-        if not fresh:
-            # Rebuilt from empty: a row deleted without the triggers leaves nothing to mark.
-            # (This node's proofs of earlier heights go with the old tree.)
-            logger.warning("state proof tree: rows were written without its triggers; rebuilt")
-            for table in ("smt_nodes", "smt_stale", "smt_roots"):
-                await conn.execute(f"DELETE FROM {table}")
-            await conn.execute("UPDATE smt_meta SET root = ? WHERE id = 1", (smt.encode_ref(None),))
-            _caches.pop(conn, None)
-        await conn.execute("DELETE FROM smt_dirty")
-        for kind, (table, ident_cols, _cols) in TABLES.items():
-            ident = " || '|' || ".join(ident_cols)
-            try:
-                await conn.execute(
-                    f"INSERT INTO smt_dirty (kind, ident) SELECT DISTINCT '{kind}', {ident} "
-                    f"FROM {table}"
-                )
-            except Exception:
-                pass  # (a table not created yet: nothing to mark)
-        if fresh:
-            await conn.execute(
-                "INSERT INTO smt_meta (id, version, root) VALUES (1, 0, ?)",
-                (smt.encode_ref(None),),
-            )
-        await conn.commit()
+    if store["smt_meta"].get(1) is None:
+        mark_all(db)
+        store["smt_meta"].put(1, 0, smt.encode_ref(None))
+        store.commit()
 
 
-def _lock(conn: Any) -> asyncio.Lock:
-    lock = _locks.get(conn)
+def mark_all(db: Any) -> None:
+    """Mark every row of the tree's tables (the next root re-derives the tree from them)."""
+    for table in _KIND_OF:
+        t = db.store[table]
+        for row in t.scan():
+            db.store.native.mark(t.id, t.key(*row[: len(t.spec.key)]))
+
+
+def _lock(store: Any) -> asyncio.Lock:
+    lock = _locks.get(store)
     if lock is None:
-        lock = _locks[conn] = asyncio.Lock()
+        lock = _locks[store] = asyncio.Lock()
     return lock
 
 
-def _loader(conn: Any):
-    cache = _caches.get(conn)
+def _loader(store: Any):
+    cache = _caches.get(store)
     if cache is None:
-        cache = _caches[conn] = OrderedDict()
+        cache = _caches[store] = OrderedDict()
+    nodes = store["smt_nodes"]
 
     async def load(nkey: str) -> Optional[bytes]:
         data = cache.get(nkey)
         if data is not None:
             cache.move_to_end(nkey)
             return data
-        cur = await conn.execute("SELECT data FROM smt_nodes WHERE nkey = ?", (nkey,))
-        row = await cur.fetchone()
+        row = nodes.get(nkey)
         if row is None:
             return None
-        data = bytes(row[0])
+        data = bytes(row.data)
         cache[nkey] = data
         if len(cache) > _CACHE_SIZE:
             cache.popitem(last=False)
@@ -308,7 +243,7 @@ def _loader(conn: Any):
 
 async def _native_update(
     update: Any,
-    conn: Any,
+    store: Any,
     cache: Any,
     root_ref: Optional[smt.Ref],
     changes: List[smt.Change],
@@ -316,58 +251,64 @@ async def _native_update(
 ) -> Tuple[Optional[smt.Ref], List[Tuple[str, bytes]], List[str]]:
     """``smt.Tree(load, version).update(root_ref, changes)``, natively (qrdx/native.py): the same
     writes, stale nodes and root. The nodes it needs that are not cached are named in one pass,
-    loaded in one query, and the update runs again; at most a pass a level of the tree."""
+    loaded together, and the update runs again; at most a pass a level of the tree."""
     encoded = smt.encode_ref(root_ref)
+    nodes = store["smt_nodes"]
     for _ in range(300):
         out = update(encoded, changes, version, cache)
         if out[0] == "ok":
             return smt.Ref.decode(out[1])[0], list(out[2]), list(out[3])
         missing = list(out[1])
         found = 0
-        for i in range(0, len(missing), 500):
-            chunk = missing[i : i + 500]
-            rows = await conn.execute_fetchall(
-                f"SELECT nkey, data FROM smt_nodes WHERE nkey IN ({','.join('?' * len(chunk))})",
-                chunk,
-            )
-            for nkey, data in rows:
-                cache[str(nkey)] = bytes(data)
+        for nkey, row in zip(missing, nodes.get_many((k,) for k in missing), strict=True):
+            if row is not None:
+                cache[str(nkey)] = bytes(row.data)
                 found += 1
         if found < len(missing):
             raise KeyError(f"state tree nodes missing (pruned?): {sorted(set(missing))[:3]}")
     raise RuntimeError("the state tree update did not settle")
 
 
-async def _changes(conn: Any, dirty: Sequence[Tuple[str, str]]) -> List[smt.Change]:
-    """The marked rows' entries as they are now: (key, payload or None)."""
+def _changes(store: Any, marks: Sequence[Tuple[str, bytes]]) -> List[smt.Change]:
+    """The marked rows' entries as they are now: (key, payload or None). Natively where the
+    module computes them exactly (``smt_entries``: account ids, plain numerals, 32-byte words),
+    else by the functions above."""
+    from .native import smt_entries_function
+    from .store import unpack
+
+    native_entries = smt_entries_function()
     out: Dict[bytes, Optional[bytes]] = {}
-    by_kind: Dict[str, List[str]] = {}
-    for kind, ident in dirty:
-        by_kind.setdefault(kind, []).append(ident)
-    for kind in sorted(by_kind):
-        table, ident_cols, cols = TABLES[kind]
-        idents = sorted(set(by_kind[kind]))
-        found: Dict[str, Tuple[Any, ...]] = {}
-        expr = " || '|' || ".join(ident_cols)
-        for i in range(0, len(idents), 500):
-            chunk = idents[i : i + 500]
-            marks = ",".join("?" * len(chunk))
-            cur = await conn.execute(
-                f"SELECT {expr}, {', '.join(cols)} FROM {table} WHERE {expr} IN ({marks})",
-                chunk,
-            )
-            for row in await cur.fetchall():
-                found[str(row[0])] = tuple(row[1:])
-        for ident in idents:
-            parts = ident.split("|")
-            try:
-                key = smt.key_of(identity(kind, *parts))
-            except Exception:
-                continue  # an identity no entry can have (malformed row): not committed
-            row = found.get(ident)
-            payload = _ENTRY[kind](*row) if row is not None else None
-            if key not in out or payload is not None:  # (two spellings of one id: the row wins)
-                out[key] = payload
+    by_table: Dict[str, List[bytes]] = {}
+    for table, key in marks:
+        if table in _KIND_OF:
+            by_table.setdefault(table, []).append(key)
+    for table in sorted(by_table, key=lambda t: _KIND_OF[t]):
+        kind = _KIND_OF[table]
+        _t, _ident_cols, cols = TABLES[kind]
+        t = store[table]
+        keys = sorted(set(by_table[table]))  # (packed: in the order of their tuples)
+        values = store.native.get_many(t.id, keys)
+        at = [t.spec.columns.index(c) for c in cols]
+        fast = (
+            native_entries(kind, list(zip(keys, values, strict=True)), at)
+            if native_entries is not None
+            else [None] * len(keys)
+        )
+        for key, value, got in zip(keys, values, fast, strict=True):
+            if got is None:
+                ident = unpack(key)
+                try:
+                    ekey = smt.key_of(identity(kind, *ident))
+                except Exception:
+                    continue  # an identity no entry can have (malformed row): not committed
+                row = t.row(key, value) if value is not None else None
+                payload = (
+                    _ENTRY[kind](*(getattr(row, c) for c in cols)) if row is not None else None
+                )
+            else:
+                ekey, payload = got
+            if ekey not in out or payload is not None:  # (two spellings of one id: the row wins)
+                out[ekey] = payload
     return sorted(out.items())
 
 
@@ -378,57 +319,39 @@ async def proof_root(db: Any, height: int, exchange_root: Optional[bytes] = None
     is not in force at that height (the tree is still kept on a network that schedules it, so it
     is ready when it is)."""
     from . import chain_spec
+    from .store import pack
 
     if not scheduled():
         return None
-    conn = db.connection
-    async with _lock(conn):
-        rows = await conn.execute_fetchall("SELECT version, root FROM smt_meta WHERE id = 1")
-        meta = rows[0] if rows else None
+    store = db.store
+    async with _lock(store):
+        meta = store["smt_meta"].get(1)
         if meta is None:
-            await install(conn)
-            rows = await conn.execute_fetchall("SELECT version, root FROM smt_meta WHERE id = 1")
-            meta = rows[0]
-        version, root_ref = int(meta[0]), smt.Ref.decode(bytes(meta[1]))[0]
-        dirty = [
-            (str(k), str(i))
-            for k, i in await conn.execute_fetchall(
-                "SELECT DISTINCT kind, ident FROM smt_dirty ORDER BY kind, ident"
-            )
-        ]
-        if dirty:
-            version = max(version, _versions.get(conn, 0)) + 1
-            _versions[conn] = version
-            load, cache = _loader(conn)
-            changes = await _changes(conn, dirty)
+            install(db)
+            meta = store["smt_meta"].get(1)
+        version, root_ref = int(meta.version), smt.Ref.decode(bytes(meta.root))[0]
+        marks = store.native.take_marks()
+        if marks:
+            version = max(version, _versions.get(store, 0)) + 1
+            _versions[store] = version
+            load, cache = _loader(store)
+            changes = _changes(store, marks)
             native_update = smt_update_function()
             if native_update is not None:
                 root_ref, writes, stale = await _native_update(
-                    native_update, conn, cache, root_ref, changes, version
+                    native_update, store, cache, root_ref, changes, version
                 )
             else:
                 tree = smt.Tree(load, version)
                 root_ref = await tree.update(root_ref, changes)
                 writes, stale = list(tree.writes.items()), tree.stale
-            await conn.executemany(
-                "INSERT OR REPLACE INTO smt_nodes (nkey, data) VALUES (?, ?)", writes
-            )
-            await conn.executemany(
-                "INSERT INTO smt_stale (version, nkey) VALUES (?, ?)",
-                [(version, k) for k in stale],
-            )
+            store["smt_nodes"].put_raw([(pack((k,)), pack((d,))) for k, d in writes])
+            store["smt_stale"].put_raw([(pack((version, k)), pack(())) for k in stale])
             cache.update(writes)
-            await conn.execute(
-                "UPDATE smt_meta SET version = ?, root = ? WHERE id = 1",
-                (version, smt.encode_ref(root_ref)),
-            )
-            await conn.execute("DELETE FROM smt_dirty")
-        await conn.execute(
-            "INSERT OR REPLACE INTO smt_roots (height, version, root) VALUES (?, ?, ?)",
-            (int(height), version, smt.encode_ref(root_ref)),
-        )
+            store["smt_meta"].put(1, version, smt.encode_ref(root_ref))
+        store["smt_roots"].put(int(height), version, smt.encode_ref(root_ref))
         if int(height) % PRUNE_EVERY == 0:
-            await _prune(conn, int(height) - RETENTION_BLOCKS)
+            _prune(store, int(height) - RETENTION_BLOCKS)
     if not chain_spec.is_active(FEATURE, int(height)):
         return None
     return smt.combine(smt.root_hash(root_ref), exchange_root or smt.EMPTY).hex()
@@ -436,85 +359,68 @@ async def proof_root(db: Any, height: int, exchange_root: Optional[bytes] = None
 
 async def database_root(db: Any, height: int) -> Optional[str]:
     """The database tree's root recorded for ``height`` (hex)."""
-    rows = await db.connection.execute_fetchall(
-        "SELECT root FROM smt_roots WHERE height = ?", (int(height),)
-    )
-    row = rows[0] if rows else None
-    return smt.root_hash(smt.Ref.decode(bytes(row[0]))[0]).hex() if row else None
+    row = db.store["smt_roots"].get(int(height))
+    return smt.root_hash(smt.Ref.decode(bytes(row.root))[0]).hex() if row else None
 
 
-async def _prune(conn: Any, below_height: int) -> None:
+def _prune(store: Any, below_height: int) -> None:
     """Forget heights below ``below_height`` and the nodes only they reached."""
     if below_height <= 0:
         return
-    await conn.execute("DELETE FROM smt_roots WHERE height < ?", (below_height,))
-    await conn.execute("DELETE FROM state_root_parts WHERE height < ?", (below_height,))
-    cur = await conn.execute("SELECT MIN(version) FROM smt_roots")
-    row = await cur.fetchone()
-    if row is None or row[0] is None:
+    store["smt_roots"].delete_prefix(lo=(-(2**62),), hi=(below_height,))
+    store["state_root_parts"].delete_prefix(lo=(-(2**62),), hi=(below_height,))
+    # (versions grow with height — a rolled-back height is redone at a newer version — so the
+    # lowest retained height's is the oldest)
+    lowest = store["smt_roots"].scan(limit=1)
+    if not lowest:
         return
-    oldest = int(row[0])  # a node replaced at or before it is reached by no retained root
-    await conn.execute(
-        "DELETE FROM smt_nodes WHERE nkey IN (SELECT nkey FROM smt_stale WHERE version <= ?)",
-        (oldest,),
-    )
-    await conn.execute("DELETE FROM smt_stale WHERE version <= ?", (oldest,))
+    oldest = int(lowest[0].version)  # a node replaced at or before it is reached by no root
+    stale = store["smt_stale"].scan(lo=(-(2**62),), hi=(oldest + 1,))
+    store.native.delete_many(store["smt_nodes"].id, [store["smt_nodes"].key(r.nkey) for r in stale])
+    store["smt_stale"].delete_prefix(lo=(-(2**62),), hi=(oldest + 1,))
 
 
 async def record_parts(db: Any, height: int, parts: Dict[str, Optional[str]]) -> None:
     """Remember the domain roots block ``height``'s unified root was made of (for proofs)."""
     if not scheduled():
         return
-    await db.connection.execute(
-        "INSERT OR REPLACE INTO state_root_parts "
-        "(height, utxo, account, exchange, token, proof, dtree, xtree, validators) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            int(height),
-            parts.get("utxo"),
-            parts.get("account"),
-            parts.get("exchange"),
-            parts.get("token"),
-            parts.get("proof"),
-            await database_root(db, height),
-            parts.get("xtree"),
-            parts.get("validators"),
-        ),
+    db.store["state_root_parts"].put(
+        int(height),
+        parts.get("utxo"),
+        parts.get("account"),
+        parts.get("exchange"),
+        parts.get("token"),
+        parts.get("proof"),
+        await database_root(db, height),
+        parts.get("xtree"),
+        parts.get("validators"),
     )
 
 
 async def recorded(db: Any, height: Optional[int] = None) -> Dict[str, Any]:
     """The roots recorded for ``height`` (default: the newest provable one): the four domain
     roots (and the validator root, once committed), the two trees' and the proof root."""
-    conn = db.connection
+    roots_t, parts_t = db.store["smt_roots"], db.store["state_root_parts"]
     if height is None:
-        cur = await conn.execute(
-            "SELECT MAX(r.height) FROM smt_roots r JOIN state_root_parts p USING (height)"
-        )
-        row = await cur.fetchone()
-        if row is None or row[0] is None:
+        newest = parts_t.scan(reverse=True, limit=64)
+        height = next((int(p.height) for p in newest if roots_t.exists(p.height)), None)
+        if height is None:
             raise ValueError("no provable height recorded yet")
-        height = int(row[0])
-    cur = await conn.execute(
-        "SELECT r.root, p.utxo, p.account, p.exchange, p.token, p.proof, p.dtree, p.xtree, "
-        "p.validators FROM smt_roots r JOIN state_root_parts p USING (height) WHERE height = ?",
-        (int(height),),
-    )
-    row = await cur.fetchone()
-    if row is None:
+    r, p = roots_t.get(int(height)), parts_t.get(int(height))
+    if r is None or p is None:
         raise ValueError(
             f"no proof root recorded for height {height} (pruned, or not computed here)"
         )
-    roots = {"utxo": row[1], "account": row[2], "exchange": row[3], "token": row[4]}
-    if row[8]:
-        roots["validators"] = row[8]
+    roots = {"utxo": p.utxo, "account": p.account, "exchange": p.exchange, "token": p.token}
+    if p.validators:
+        roots["validators"] = p.validators
     return {
         "height": int(height),
-        "ref": smt.Ref.decode(bytes(row[0]))[0],
+        "ref": smt.Ref.decode(bytes(r.root))[0],
         "roots": roots,
-        "proof_root": row[5],
-        "database_tree_root": row[6],
-        "exchange_tree_root": row[7] or smt.EMPTY.hex(),
+        "proof_root": p.proof,
+        "database_tree_root": p.dtree,
+        "exchange_tree_root": p.xtree or smt.EMPTY.hex(),
     }
 
 
@@ -523,9 +429,8 @@ async def undo_above(db: Any, tip_height: int) -> None:
     itself needs nothing: the rows the rollback rewrote are marked, and fold in next.)"""
     if not scheduled():
         return
-    conn = db.connection
-    await conn.execute("DELETE FROM smt_roots WHERE height > ?", (int(tip_height),))
-    await conn.execute("DELETE FROM state_root_parts WHERE height > ?", (int(tip_height),))
+    db.store["smt_roots"].delete_prefix(lo=(int(tip_height) + 1,), hi=(2**62,))
+    db.store["state_root_parts"].delete_prefix(lo=(int(tip_height) + 1,), hi=(2**62,))
 
 
 # ── proofs ───────────────────────────────────────────────────────────────────────────────
@@ -535,11 +440,10 @@ async def prove(db: Any, kind: str, *ident: Any, height: Optional[int] = None) -
     """A proof of one entry at ``height`` (default: the newest height with a recorded root):
     the entry (or its absence), the tree path, the proof root and the other domain roots — all
     a verifier needs to reach the block's signed state root (``verify_against``)."""
-    conn = db.connection
     rec = await recorded(db, height)
     ident_bytes = identity(kind, *ident)
     key = smt.key_of(ident_bytes)
-    load, _cache = _loader(conn)
+    load, _cache = _loader(db.store)
     siblings, terminal, payload = await smt.Tree(load, 0).prove(rec["ref"], key)
     member = terminal is not None and terminal[0] == key
     return {

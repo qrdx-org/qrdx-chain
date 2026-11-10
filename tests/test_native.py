@@ -208,7 +208,7 @@ def test_the_transport_json_writes_what_json_writes():
         "x": 123456789012345678901234567890}
 
 
-# ── the database domains' LtHash trigger function (qrdx/state_commitment.py) ──
+# ── the database domains' LtHash accumulators, kept by the store (qrdx/state_commitment.py) ──
 
 
 def _column(rng):
@@ -227,93 +227,41 @@ def _column(rng):
                        "1e", "1e1234567", "sNaN", "Infinity", "+.0", "5.", "١"])
 
 
-@pytest.mark.parametrize("seed", range(4))
-def test_the_trigger_function_answers_as_python(seed):
-    from qrdx.crypto import lthash
-    from qrdx.state_commitment import _udf_apply
-
-    rng = random.Random(seed)
-    accs = [lthash.ZERO, lthash.mix(lthash.ZERO, None, lthash.entry(b"x", b"y"))]
-    for _ in range(600):
-        acc = rng.choice(accs)
-        if rng.random() < 0.03:
-            acc = acc[:-4] if rng.random() < 0.5 else b"\xff" * len(acc)   # (malformed)
-        kind = rng.choice(["account", "storage", "token", "utxo", "token", "nope"])
-        args = (acc, kind, rng.choice([0, 1]), rng.choice([0, 1]),
-                *(_column(rng) for _ in range(10)))
-        try:
-            want = ("ok", _udf_apply(*args))
-        except Exception as e:
-            want = ("raised", type(e))
-        try:
-            got = ("ok", N.lt_apply(*args))
-        except Exception as e:
-            got = ("raised", type(e))
-        assert got == want, args
-        if want[0] == "ok" and len(want[1]) == lthash.SIZE and want[1] not in accs:
-            accs.append(want[1])
-
-
-async def test_the_accumulators_with_the_native_function_are_the_rows(tmp_path):
-    """Through SQLite's triggers: random writes to every domain's tables, then the accumulators
-    the native function kept against the ones recomputed from the rows."""
-    import aiosqlite
-
+async def test_the_store_keeps_the_accumulators_python_computes(tmp_path):
+    """Through the store (qrdx/store.py), which folds rows natively: random writes to every
+    domain's tables, with the column values the trigger function is checked on (odd numerals,
+    bytes, Unicode digits), then the accumulators it kept against Python's from the rows."""
     from qrdx import state_commitment as sc
+    from qrdx.database_sqlite import DatabaseSQLite
 
-    assert native.lt_apply_function() is N.lt_apply
     rng = random.Random(5)
-    async with aiosqlite.connect(tmp_path / "s.db") as conn:
-        await conn.execute("CREATE TABLE account_state (address TEXT PRIMARY KEY, balance TEXT, "
-                           "nonce INTEGER, code_hash TEXT, storage_root TEXT)")
-        await conn.execute("CREATE TABLE contract_storage (contract_address TEXT, storage_key "
-                           "TEXT, storage_value TEXT, PRIMARY KEY (contract_address, storage_key))")
-        await conn.execute("CREATE TABLE token_balances (token_address TEXT, holder_address TEXT,"
-                           " balance TEXT, PRIMARY KEY (token_address, holder_address))")
-        await conn.execute("CREATE TABLE unspent_outputs (tx_hash TEXT, output_index INTEGER, "
-                           "address TEXT, amount TEXT, PRIMARY KEY (tx_hash, output_index))")
-        await sc.install(conn)
+    db = await DatabaseSQLite.create(str(tmp_path / "s.db"))
+    try:
+        accounts, tokens = db.store["account_state"], db.store["token_balances"]
         for _ in range(400):
             a = f"0xPQ{rng.randrange(30):064x}"
-            amount = rng.choice(["0", "1.5", str(rng.randrange(10 ** 6)), "0E-18", "12.000"])
+            amount = rng.choice(["0", "1.5", str(rng.randrange(10 ** 6)), "0E-18", "12.000",
+                                 _column(rng)])
             k = rng.random()
             if k < 0.3:
-                await conn.execute("INSERT OR REPLACE INTO account_state VALUES (?, ?, ?, ?, ?)",
-                                   (a, amount, rng.randrange(9), None, ""))
+                accounts.put(address=a, balance=amount, nonce=rng.randrange(9), storage_root="")
             elif k < 0.5:
-                await conn.execute("INSERT OR REPLACE INTO token_balances VALUES (?, ?, ?)",
-                                   ("0xTOKEN", a, amount))
+                tokens.put("0xTOKEN", a, amount, 0)
             elif k < 0.6:
-                await conn.execute("INSERT OR REPLACE INTO contract_storage VALUES (?, ?, ?)",
-                                   (a, str(rng.randrange(5)), amount))
+                db.store["contract_storage"].put(a, str(rng.randrange(5)), amount, 0)
             elif k < 0.7:
-                await conn.execute("INSERT OR REPLACE INTO unspent_outputs VALUES (?, ?, ?, ?)",
-                                   (a, rng.randrange(3), a, amount))
+                db.store["unspent_outputs"].put(a, rng.randrange(3), a, rng.randrange(99))
             elif k < 0.85:
-                await conn.execute("UPDATE token_balances SET balance = ? WHERE holder_address = ?",
-                                   (amount, a))
+                tokens.update(("0xTOKEN", a), balance=amount)
             else:
-                await conn.execute("DELETE FROM account_state WHERE address = ?", (a,))
-        await conn.commit()
+                accounts.delete(a)
+            if rng.random() < 0.05:
+                await db.connection.commit()
+        await db.connection.commit()
         for domain in sc.DOMAINS:
-            assert await sc.stored_accumulator(conn, domain) == await sc.full_accumulator(conn, domain)
-
-
-def test_the_trigger_function_is_faster():
-    import timeit
-
-    from qrdx.crypto import lthash
-    from qrdx.state_commitment import _udf_apply
-
-    args = (lthash.ZERO, "account", 1, 1, "0xPQ" + "a" * 64, "1000.000001", 3, "", "",
-            "0xPQ" + "a" * 64, "999.000001", 4, "", "")
-    assert N.lt_apply(*args) == _udf_apply(*args)
-    python = min(timeit.repeat(lambda: _udf_apply(*args), number=300, repeat=3))
-    rust = min(timeit.repeat(lambda: N.lt_apply(*args), number=300, repeat=3))
-    assert rust < python / 2, (rust, python)
-
-
-# ── the state-proof tree's update (qrdx/crypto/smt.py) ──
+            assert await sc.stored_accumulator(db, domain) == await sc.full_accumulator(db, domain)
+    finally:
+        await db.close()
 
 
 @pytest.mark.parametrize("seed", range(6))

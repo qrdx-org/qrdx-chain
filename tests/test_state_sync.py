@@ -155,10 +155,15 @@ class MockDatabase:
     """
 
     def __init__(self):
+        import tempfile
+
+        from qrdx.store import Store
+
         self.balances = {}
         self.pool = MockPool(self)
         self.last_insert = None
         self.connection = MockConnection(self)
+        self.store = Store(tempfile.mktemp(suffix=".db") + ".store")
 
     async def get_address_balance(self, address: str) -> Decimal:
         """Mock balance lookup."""

@@ -42,13 +42,11 @@ async def db():
                 "INSERT INTO blocks (block_hash, block_height, content, timestamp, "
                 "validator_signature) VALUES (?, ?, ?, 0, ?)",
                 (f"{h:064x}", h, block_codec.encode(repr(content)), "ef" * 1650))
-            await d.connection.execute(
-                "INSERT INTO block_exchange_transactions (block_hash, tx_index, tx_hash, tx_data) "
-                "VALUES (?, 0, ?, ?)", (f"{h:064x}", f"{h:064x}", "x" * 5000))
+            d.store["exchange_sections"].put(f"{h:064x}", b'["' + b"x" * 5000 + b'"]')
         await d.connection.commit()
         yield d
     finally:
-        await d.connection.close()
+        await d.close()
         for p in (path, path + "-wal", path + "-shm"):
             if os.path.exists(p):
                 os.remove(p)
@@ -83,8 +81,7 @@ async def test_pruning_runs_behind_finality_in_batches(db):
         bc = _parse_block_content(block_codec.decode(content))
         assert bool(bc.get("pruned")) == (height < 15), height
         assert (signature is None) == (height < 15)
-    cur = await db.connection.execute("SELECT COUNT(*) FROM block_exchange_transactions")
-    assert (await cur.fetchone())[0] == 16                              # 15..30 keep sections
+    assert db.store["exchange_sections"].count() == 16                  # 15..30 keep sections
     assert await prune(db, finalized_height=25, window=0) == 0          # an archive node
 
 

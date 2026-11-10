@@ -14,7 +14,8 @@ byte.
 | `mldsa65_verify_batch(items)` | liboqs through `oqs-python`, one signature at a time | `block_processor.verify_exchange_txs`: a block's section on import; a gossip batch on admission (`ExchangeSubmitter`) |
 | `canonical_json(obj, compact, default_str)` | `json.dumps(obj, sort_keys=True, ensure_ascii=True)` | `qrdx/native.py` |
 | `body_root_sha256(prefix, body)` | `sha256(prefix + json.dumps(body, ...))` | `block_verification.body_root`, on every block |
-| `lt_apply(acc, kind, has_old, has_new, *old_row, *new_row)` | `state_commitment._udf_apply` | the `qrdx_lt_apply` SQLite trigger function: every row a block changes in `account_state`, `contract_storage`, `token_balances` and `unspent_outputs` |
+| `Store`, `store_pack`, `store_unpack` | (no Python path) | the node's store: the ledger, its commitments, the undo journal and the proof tree (docs/STORAGE.md) |
+| `smt_entries(kind, items, columns)` | `state_proofs.identity` and the entry functions | the database proof tree's entries of the rows a block changed (`state_proofs._changes`) |
 | `smt_update(root, changes, version, cache)` | `smt.Tree.update` | the database's proof tree, once a block (`state_proofs.proof_root`) |
 | `mt_build`, `mt_update`, `mt_prove`, `MNode` | `smt._py_build`, `_py_update`, `_py_prove`, `smt.MNode` | the exchange's in-memory proof trees, every collection and order book a block touches (`smt.m_*`) |
 | `lt_mix_entries(acc, tag, removed, added)` | `commitment._apply` of each entry's `lthash.entry` | the exchange's accumulators, every collection a block touches (`commitment._apply_digests`) |
@@ -49,19 +50,21 @@ lock for its own work around each call. The first native version was no faster e
 reason was in the module itself: PyO3 converted each `bytes` to a vector element by element.
 It now reads the bytes in place.
 
-### The state commitment's trigger function
+### The store
 
-Every row a block writes in the database's state domains fires a trigger that folds the row's
-change into its domain's LtHash accumulator (qrdx/state_commitment.py): the hash of the old row
-out, the new row in. SQLite calls the function on the database's thread, holding the GIL, two or
-three times a transfer. In Python it took 17.5 µs a call (two 4 KB BLAKE3 outputs, then
-big-integer lane arithmetic); natively 7.8 µs, most of it PyO3 reading the fourteen arguments.
-A block of 500 transfers flushes in 15.9 ms instead of 21.2.
+The node's store (`Store`, src/store; docs/STORAGE.md) replaced SQLite's state tables and the
+triggers that kept their commitments. It folds each changed row into its domain's LtHash
+accumulator natively, from the row's packed columns. It computes what Python's encoders compute,
+and hands Python each row it would not compute exactly: a value that is not text or an integer
+(Python's `str` of it is what is hashed), or a token balance that is not a plain decimal numeral
+(whose zeroness Python's `Decimal` judges).
 
-It computes what Python computes, and what it would not compute exactly it hands to Python, all
-of it: an accumulator that is not 4,096 well-formed bytes, a value that is not text or an
-integer (Python's `str` of it is what is hashed), a token balance that is not a plain decimal
-numeral (whose zeroness Python's `Decimal` judges), an unknown kind.
+`smt_entries` computes the database proof tree's entries for the rows a block changed: each
+row's key and payload, from account ids, plain numerals and 32-byte words. Any other form (a
+PQ address, text hashed into a word, a numeral `Decimal` reads differently) it hands to Python's
+entry functions. In Python this took about 21 µs a row.
+
+The store has no Python path, unlike every other function here: the node needs the module.
 
 ### The proof trees
 
@@ -152,10 +155,12 @@ past 900. An object `json` cannot serialize raises `TypeError`, as in Python.
   signature), against liboqs through Python;
 * a section of transactions, some tampered and some bound to the wrong sender, with the
   module and without it;
-* the trigger function on 2,400 random calls (text, integers, None, floats and bytes; plain,
-  odd and invalid decimals; malformed accumulators; unknown kinds), result or exception, and
-  through SQLite's triggers on random writes to every domain, against the accumulators
-  recomputed from the rows;
+* the store's accumulators after random writes to every domain (text, integers, None, floats
+  and bytes; plain, odd and invalid decimals), against Python's encoders over the rows
+  (tests/test_native.py, tests/test_state_commitment.py); the store itself against a dict
+  (tests/test_store.py);
+* the proof tree's entries over random rows of every kind with odd values, each computed one
+  against Python's (tests/test_state_proofs.py);
 * the database tree's update over 39 versions of random changes from an empty cache (the same
   root, writes in the same order and stale nodes), and a malformed root or key refused;
 * the in-memory tree over 60 rounds of random changes (deep shared prefixes too): the same root

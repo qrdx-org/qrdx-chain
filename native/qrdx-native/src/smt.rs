@@ -400,3 +400,198 @@ mod tests {
         assert_eq!(path_hex(&zero, 9), "0");
     }
 }
+
+// ── the database tree's entries (qrdx/state_proofs.py ``_changes``) ──────────────────────────
+
+use crate::store::codec::{self, Field};
+use num_bigint::{BigInt, Sign};
+
+/// ``_id20``: a 20-byte account id — here only from an account id itself (``0x`` and 40 hex
+/// digits), which ``to_account_id`` lowercases; any other form is Python's.
+fn id20(f: &Field) -> Option<[u8; 20]> {
+    let Field::Str(s) = f else { return None };
+    let b = s.as_bytes();
+    if b.len() != 42 || b[0] != b'0' || (b[1] != b'x' && b[1] != b'X') {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    for (i, pair) in b[2..].chunks(2).enumerate() {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out[i] = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
+/// ``_addr20``: a token's address as is (``0x`` and 40 hex digits); a symbol is Python's.
+fn addr20(f: &Field) -> Option<[u8; 20]> {
+    id20(f)
+}
+
+fn hex32(h: &str) -> Option<[u8; 32]> {
+    let b = h.as_bytes();
+    if b.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in b.chunks(2).enumerate() {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out[i] = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
+fn int32(negative: bool, magnitude: &[u8]) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    if negative {
+        return Some(out); // (max(0, n))
+    }
+    let start = magnitude.iter().position(|&b| b != 0).unwrap_or(magnitude.len());
+    let m = &magnitude[start..];
+    if m.len() > 32 {
+        return None; // (Python's to_bytes overflows)
+    }
+    out[32 - m.len()..].copy_from_slice(m);
+    Some(out)
+}
+
+/// ``_word``: None or "" as zero, an int as is, 64 hex digits (after an optional ``0x``) as
+/// their bytes; anything else (text hashed, a negative int, odd hex) is Python's.
+fn word(f: &Field) -> Option<[u8; 32]> {
+    match f {
+        Field::Null => Some([0u8; 32]),
+        Field::Int(negative, magnitude) => int32(*negative, magnitude),
+        Field::Str(s) if s.is_empty() => Some([0u8; 32]),
+        Field::Str(s) => {
+            let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+            hex32(h)
+        }
+        _ => None,
+    }
+}
+
+/// ``_int(value, scale)``: max(0, int(Decimal(value) × 10^scale)) — here from an int, or a
+/// plain ASCII numeral (a sign, digits, one point); anything else is Python's.
+fn int_scaled(f: &Field, scale: u32) -> Option<[u8; 32]> {
+    let (negative, digits, frac): (bool, String, String) = match f {
+        Field::Null => return Some([0u8; 32]),
+        Field::Int(negative, magnitude) => {
+            if scale == 0 {
+                return int32(*negative, magnitude);
+            }
+            let n = BigInt::from_bytes_be(if *negative { Sign::Minus } else { Sign::Plus }, magnitude);
+            let s = n.to_string();
+            let (neg, d) = match s.strip_prefix('-') {
+                Some(d) => (true, d.to_string()),
+                None => (false, s),
+            };
+            (neg, d, String::new())
+        }
+        Field::Str(s) if s.is_empty() => return Some([0u8; 32]),
+        Field::Str(s) => {
+            let (neg, body) = match s.as_bytes().first() {
+                Some(b'-') => (true, &s[1..]),
+                Some(b'+') => (false, &s[1..]),
+                _ => (false, &s[..]),
+            };
+            let (whole, frac) = match body.split_once('.') {
+                Some((w, f)) => (w, f),
+                None => (body, ""),
+            };
+            if whole.is_empty() && frac.is_empty() {
+                return None;
+            }
+            if !whole.bytes().all(|c| c.is_ascii_digit()) || !frac.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            (neg, whole.to_string(), frac.to_string())
+        }
+        _ => return None,
+    };
+    // value × 10^scale, truncated toward zero: the whole digits, then `scale` digits of the fraction
+    let mut text = digits;
+    let take: String = frac.chars().chain(std::iter::repeat('0')).take(scale as usize).collect();
+    text.push_str(&take);
+    let n = num_bigint::BigUint::parse_bytes(if text.is_empty() { b"0" } else { text.as_bytes() }, 10)?;
+    if negative {
+        return Some([0u8; 32]); // (a negative truncates to ≤ 0: max(0, ·))
+    }
+    int32(false, &n.to_bytes_be())
+}
+
+/// One marked row's (key, payload or None), or None where Python must compute it.
+fn entry(kind: &str, key: &[Field], row: Option<&[Field]>) -> Option<([u8; 32], Option<Vec<u8>>)> {
+    let identity: Vec<u8> = match kind {
+        "account" => [&[1u8][..], &id20(key.first()?)?].concat(),
+        "storage" => [&[2u8][..], &id20(key.first()?)?, &word(key.get(1)?)?].concat(),
+        "token" => [&[3u8][..], &id20(key.get(1)?)?, &addr20(key.first()?)?].concat(),
+        _ => return None,
+    };
+    let ekey = key_of(&identity);
+    let Some(r) = row else { return Some((ekey, None)) };
+    let payload = match kind {
+        "account" => {
+            let body = [int_scaled(r.get(1)?, 0)?, int_scaled(r.get(2)?, 0)?, word(r.get(3)?)?, word(r.get(4)?)?].concat();
+            if body.iter().all(|&b| b == 0) {
+                None
+            } else {
+                Some([&[1u8][..], &id20(r.first()?)?, &body].concat())
+            }
+        }
+        "storage" => {
+            let v = word(r.get(2)?)?;
+            if v == [0u8; 32] {
+                None
+            } else {
+                Some([&[2u8][..], &id20(r.first()?)?, &word(r.get(1)?)?, &v].concat())
+            }
+        }
+        _ => {
+            let amount = int_scaled(r.get(2)?, 18)?;
+            if amount == [0u8; 32] {
+                None
+            } else {
+                Some([&[3u8][..], &id20(r.get(1)?)?, &addr20(r.first()?)?, &amount].concat())
+            }
+        }
+    };
+    Some((ekey, payload))
+}
+
+/// ``state_proofs._changes`` for one table's marked rows: each (packed key, packed value or
+/// None) to (entry key, payload or None) — ``columns`` pick the payload's columns from the key's
+/// fields followed by the value's — or None where only Python can compute it exactly.
+#[pyfunction]
+pub fn smt_entries<'py>(
+    py: Python<'py>,
+    kind: &str,
+    items: &Bound<'py, PyList>,
+    columns: Vec<usize>,
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty_bound(py);
+    for item in items.iter() {
+        let (k, v): (Bound<'py, PyBytes>, Option<Bound<'py, PyBytes>>) = item.extract()?;
+        let key = codec::fields(k.as_bytes()).ok();
+        let row = match (&key, &v) {
+            (Some(key), Some(v)) => codec::fields(v.as_bytes()).ok().map(|vals| {
+                let all: Vec<Field> = key.iter().cloned().chain(vals).collect();
+                columns.iter().filter_map(|&i| all.get(i).cloned()).collect::<Vec<Field>>()
+            }),
+            _ => None,
+        };
+        let got = match (&key, &v, &row) {
+            (Some(key), None, _) => entry(kind, key, None),
+            (Some(key), Some(_), Some(row)) if row.len() == columns.len() => entry(kind, key, Some(row)),
+            _ => None,
+        };
+        match got {
+            Some((ekey, payload)) => out.append((
+                PyBytes::new_bound(py, &ekey),
+                payload.map(|p| PyBytes::new_bound(py, &p)),
+            ))?,
+            None => out.append(py.None())?,
+        }
+    }
+    Ok(out)
+}

@@ -144,7 +144,8 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     RUSTFLAGS="--remap-path-prefix=/build/native=. --remap-path-prefix=/opt/cargo=cargo -C debuginfo=0"
-RUN apt-get-reproducible curl
+# (clang: bindgen generates the store's MDBX bindings from its C header — docs/STORAGE.md)
+RUN apt-get-reproducible curl clang libclang-dev
 RUN set -eux; \
     curl -sSf -o /tmp/rustup-init \
         "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"; \

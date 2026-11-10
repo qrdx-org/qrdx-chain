@@ -101,10 +101,11 @@ async def _rehydrate_evm_pending_nonces() -> int:
     guarantees safety, so a failure here degrades spam filtering, not correctness.
     """
     try:
-        cursor = await _node.db.connection.execute(
-            "SELECT LOWER(address), nonce FROM account_state WHERE nonce > 0"
-        )
-        rows = list(await cursor.fetchall())
+        rows = [
+            (r.address.lower(), r.nonce)
+            for r in _node.db.store["account_state"].scan()
+            if r.nonce and int(r.nonce) > 0
+        ]
     except Exception as e:
         logger.warning("EVM pending-nonce rehydrate skipped: %s", e)
         return 0

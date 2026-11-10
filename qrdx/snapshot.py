@@ -57,7 +57,8 @@ logger = get_logger(__name__)
 
 MANIFEST = "manifest.json"
 DATABASE = "qrdx.db"
-FORMAT = 1
+STORE = DATABASE + ".store"  # the node's store beside it (qrdx/store.py)
+FORMAT = 2
 
 
 class SnapshotError(Exception):
@@ -186,6 +187,44 @@ def _backup(source: str, dest: str) -> None:
         src.close()
 
 
+def _copy_store(source: str, dest: str) -> None:
+    """A consistent copy of a (possibly running) node's store: MDBX's online copy — through the
+    running node's own handle when it is this process."""
+    from . import store as store_mod
+
+    live = store_mod.opened(source)
+    if live is not None:
+        live.copy_to(dest)
+        return
+    if not os.path.exists(source):
+        raise SnapshotError(f"no store at {source}")
+    other = store_mod.Store(source)
+    try:
+        other.copy_to(dest)
+    finally:
+        other.close()
+
+
+def _clear_store(path: str, tables: Sequence[str], compact: bool = False) -> None:
+    """Empty ``tables`` of the store file at ``path`` (and compact it)."""
+    from . import store as store_mod
+
+    s = store_mod.Store(path)
+    try:
+        for table in tables:
+            s[table].clear()
+        s.commit()
+        if compact:
+            s.copy_to(path + ".compact")
+    finally:
+        s.close()
+    if compact:
+        store_mod.remove_files(path)
+        os.rename(path + ".compact", path)
+    elif os.path.exists(path + "-lck"):
+        os.remove(path + "-lck")
+
+
 def _exchange_checkpoint(conn: sqlite3.Connection) -> Tuple[int, str, bytes]:
     try:
         row = conn.execute(
@@ -212,9 +251,10 @@ def _sha256(path: str) -> str:
 
 
 def fetch(url: str, out_dir: str, progress: Callable[[str], None] = print) -> Dict[str, Any]:
-    """Download a snapshot directory that any HTTP server publishes (``manifest.json`` and
-    ``qrdx.db`` under ``url``), resuming a partial download. The manifest's checksum catches a
-    broken transfer early; it vouches for nothing — ``restore`` verifies the snapshot itself."""
+    """Download a snapshot directory that any HTTP server publishes (``manifest.json``,
+    ``qrdx.db`` and ``qrdx.db.store`` under ``url``), resuming a partial download. The manifest's
+    checksums catch a broken transfer early; they vouch for nothing — ``restore`` verifies the
+    snapshot itself."""
     import urllib.request
 
     base = url.rstrip("/") + "/"
@@ -222,11 +262,24 @@ def fetch(url: str, out_dir: str, progress: Callable[[str], None] = print) -> Di
     out.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(base + MANIFEST, timeout=60) as r:
         manifest = json.loads(r.read(1 << 20))
-    total = int(manifest["bytes"])
-    part = out / (DATABASE + ".part")
+    if int(manifest.get("format", 1)) != FORMAT:
+        raise SnapshotError(f"a snapshot of format {manifest.get('format')}, not {FORMAT}")
+    _download(base, DATABASE, int(manifest["bytes"]), manifest.get("sha256"), out, progress)
+    store = manifest.get("store") or {}
+    _download(base, STORE, int(store.get("bytes", 0)), store.get("sha256"), out, progress)
+    (out / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
+
+
+def _download(
+    base: str, name: str, total: int, sha256: Any, out: Path, progress: Callable[[str], None]
+) -> None:
+    import urllib.request
+
+    part = out / (name + ".part")
     have = part.stat().st_size if part.exists() else 0
     while have < total:
-        request = urllib.request.Request(base + DATABASE, headers={"Range": f"bytes={have}-"})
+        request = urllib.request.Request(base + name, headers={"Range": f"bytes={have}-"})
         with urllib.request.urlopen(request, timeout=60) as r, open(part, "ab") as f:
             if have and r.status != 206:  # (the server ignored the range: start over)
                 f.truncate(0)
@@ -236,12 +289,10 @@ def fetch(url: str, out_dir: str, progress: Callable[[str], None] = print) -> Di
                 have += len(chunk)
                 if have % (64 << 20) < len(chunk):
                     progress(f"{have >> 20} / {total >> 20} MB")
-    if have != total or _sha256(str(part)) != manifest.get("sha256"):
+    if have != total or _sha256(str(part)) != sha256:
         part.unlink()
-        raise SnapshotError("the download does not match the manifest: fetch it again")
-    part.rename(out / DATABASE)
-    (out / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
-    return manifest
+        raise SnapshotError(f"the download of {name} does not match the manifest: fetch it again")
+    part.rename(out / name)
 
 
 def discover(peers: Sequence[str], timeout: float = 10.0) -> Tuple[str, Dict[str, Any]]:
@@ -277,7 +328,11 @@ def create(source_db: str, out_dir: str, public: bool = False) -> Dict[str, Any]
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=False)
     db_path = str(out / DATABASE)
+    store_path = str(out / STORE)
+    _copy_store(source_db + ".store", store_path)  # (before the database: see restore)
     _backup(source_db, db_path)
+    if public:
+        _clear_store(store_path, _STORE_RECOMPUTED, compact=True)
     conn = sqlite3.connect(db_path)
     try:
         if public:
@@ -299,6 +354,7 @@ def create(source_db: str, out_dir: str, public: bool = False) -> Dict[str, Any]
         "genesis_hash": genesis[0] if genesis else None,
         "bytes": os.path.getsize(db_path),
         "sha256": _sha256(db_path),
+        "store": {"bytes": os.path.getsize(store_path), "sha256": _sha256(store_path)},
     }
     (out / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
@@ -307,17 +363,16 @@ def create(source_db: str, out_dir: str, public: bool = False) -> Dict[str, Any]
 # ── restoring ────────────────────────────────────────────────────────────────────────────
 
 # Recomputed from the rows here (the roots after blocks: the verified checkpoint's, and its
-# parent's from the trusted history), never read from a snapshot.
-_RECOMPUTED = (
+# parent's from the trusted history), never read from a snapshot. (The commitments'
+# accumulators too: recomputed from the rows when the restore opens the store.)
+_RECOMPUTED = ("validator_log_roots",)
+_STORE_RECOMPUTED = (
     "post_roots",
-    "state_commitment",
     "smt_meta",
     "smt_nodes",
     "smt_stale",
     "smt_roots",
-    "smt_dirty",
     "state_root_parts",
-    "validator_log_roots",
 )
 # Rebuilt from the verified blocks.
 _REBUILT = (
@@ -396,7 +451,7 @@ async def _genesis(db: Any, genesis_file: Optional[str], scratch: str) -> str:
         records = [tuple(r) for r in await cur.fetchall()]
         record_cols = [d[0] for d in cur.description] if cur.description else []
     finally:
-        await ref.connection.close()
+        await ref.close()
     have = await db.get_block_by_id(0)
     if not have or not want or have["hash"] != want["hash"]:
         raise SnapshotError(
@@ -434,8 +489,7 @@ async def _verify_code(db: Any) -> None:
     code under a contract's hash, which this node would then run and answer calls with."""
     from eth_utils import keccak
 
-    cur = await db.connection.execute("SELECT code_hash, bytecode FROM contract_code")
-    for code_hash, bytecode in await cur.fetchall():
+    for code_hash, bytecode, *_rest in db.store["contract_code"].scan():
         code = (
             bytes(bytecode)
             if isinstance(bytecode, (bytes, memoryview))
@@ -506,12 +560,13 @@ async def restore(
     starts from at ``target_db`` (which must not exist). ``trusted``: {height: block hash} of
     trusted checkpoints; one at or above the snapshot's exchange checkpoint must be on its chain.
     Returns what was restored."""
-    from . import chain_index, state_proofs, undo_journal
+    from . import chain_index, state_commitment, state_proofs, undo_journal
     from .crypto.hashing import unified_state_root
     from .database_sqlite import DatabaseSQLite
     from .derived_state_rebuild import CHECKPOINTS, persist_checkpoint
     from .exchange.journal import ExchangeJournal
     from .exchange.state_manager import ExchangeStateManager
+    from .store import remove_files
     from .validator import validator_root
     from .validator.block_verification import _parse_block_content
     from .validator.withdrawals import undo_withdrawal_logs_above
@@ -519,6 +574,8 @@ async def restore(
     source = str(Path(snapshot_dir) / DATABASE)
     if not os.path.exists(source):
         raise SnapshotError(f"no {DATABASE} in {snapshot_dir}")
+    if not os.path.exists(str(Path(snapshot_dir) / STORE)):
+        raise SnapshotError(f"no {STORE} in {snapshot_dir}")
     if os.path.exists(target_db):
         raise SnapshotError(f"{target_db} exists: restore into a new path")
     work = target_db + ".partial"
@@ -527,15 +584,20 @@ async def restore(
         for suffix in ("", "-wal", "-shm"):
             if os.path.exists(leftover + suffix):
                 os.remove(leftover + suffix)
+        remove_files(leftover + ".store")
     _backup(source, work)
+    shutil.copyfile(str(Path(snapshot_dir) / STORE), work + ".store")
     raw = sqlite3.connect(work)
     try:
         height, checkpoint_hash, state_blob = _exchange_checkpoint(raw)
     finally:
         raw.close()
     _wipe(work)
+    _clear_store(work + ".store", _STORE_RECOMPUTED)
 
     db = await DatabaseSQLite.create(work)
+    # (the accumulators the snapshot carried, recomputed from its rows: never believed)
+    await state_commitment.reconcile(db)
     ok = False
     try:
         progress("genesis: building this network's own")
@@ -667,18 +729,22 @@ async def restore(
             "trusted_checkpoint": anchor,
         }
     finally:
-        await db.connection.close()
+        await db.close()
         CHECKPOINTS.clear()
         ExchangeStateManager.reset_instance()
         for suffix in ("", "-wal", "-shm"):
             if os.path.exists(scratch + suffix):
                 os.remove(scratch + suffix)
+        remove_files(scratch + ".store")
         if ok:
             shutil.move(work, target_db)
+            shutil.move(work + ".store", target_db + ".store")
             for suffix in ("-wal", "-shm"):
                 if os.path.exists(work + suffix):
                     os.remove(work + suffix)
+            remove_files(work + ".store")
         else:
             for suffix in ("", "-wal", "-shm"):
                 if os.path.exists(work + suffix):
                     os.remove(work + suffix)
+            remove_files(work + ".store")

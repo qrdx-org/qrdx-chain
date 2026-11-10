@@ -75,9 +75,9 @@ the unified root and compares it to the block's signed `state_root`. Nothing els
 
 ## 2. How the tree is kept
 
-**The database tree.** TEMP triggers on the node's own connection mark every changed `account_state`,
-`contract_storage` and `token_balances` row, in the writing statement's transaction (the same
-rows the accumulators fold). When a block's root is computed — by the proposer and by every
+**The database tree.** The node's store (docs/STORAGE.md) marks every changed `account_state`,
+`contract_storage` and `token_balances` row, in the writes' own transaction (the same rows the
+accumulators fold). When a block's root is computed — by the proposer and by every
 importer, at the point the other roots are — the marked rows are folded into the tree and the
 root recorded for that height. All of it is in the block's transaction: a rolled-back block
 takes its tree changes with it. A rollback forgets the orphaned heights' roots; the rows it
@@ -89,9 +89,9 @@ once no retained height reaches them: heights older than `QRDX_STATE_PROOF_RETEN
 (node-local, default 100,000) can no longer be proven by that node. Cost, measured: folding 200
 changed accounts into a 20,000-account tree ~26 ms; the first fold of 20,000 entries 0.67 s.
 
-Rows written where the triggers do not run (another connection, a tool) are caught at startup:
-the LtHash accumulators are recomputed from the rows then, and a domain they had to repair makes
-the tree rebuild itself from the rows (a deleted row included).
+Every write goes through the store, which marks the row as it writes it, so no write path can
+skip the tree. A store that has never kept the tree (a new one, or a restored snapshot, whose
+tree is discarded) has every row marked, and its first root re-derives the tree from the rows.
 
 **The exchange tree** is computed by every path at the point the exchange root is, and kept in
 memory for the last 256 heights, for proofs.

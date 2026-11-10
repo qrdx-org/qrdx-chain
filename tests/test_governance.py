@@ -481,9 +481,10 @@ async def test_a_system_spend_debits_the_wallet_in_the_ledger_and_conserves_valu
         fund = C.SYSTEM_WALLET_ADDRESSES["DEVELOPER_FUND"]
         start = await db.get_address_balance(fund)
         assert start == C.SYSTEM_WALLET_GENESIS_BALANCES["DEVELOPER_FUND"]  # (2,500: TOKENOMICS)
-        cur = await db.connection.execute(
-            "SELECT balance FROM account_state WHERE LOWER(address) = LOWER(?)", (fund,))
-        assert await cur.fetchone(), "a system wallet's genesis balance lives in account_state"
+        from qrdx.crypto.account_id import to_account_id
+
+        assert db.store["account_state"].get(to_account_id(fund)), (
+            "a system wallet's genesis balance lives in account_state")
         assert await db.seed_genesis_account_state() >= 2       # restored after a reorg too
 
         c = Chain()

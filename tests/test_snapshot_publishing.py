@@ -16,6 +16,7 @@ import pytest
 
 from qrdx import snapshot, snapshot_publisher
 from qrdx.snapshot import SnapshotError, create, discover, fetch
+from qrdx.store import Store
 
 PEER_IP = "10.9.8.7"
 
@@ -29,31 +30,43 @@ def _node_db(path, checkpoint=100):
         CREATE TABLE blocks (block_hash TEXT, block_height INTEGER, content TEXT);
         CREATE TABLE exchange_checkpoint (id INTEGER PRIMARY KEY, height INTEGER,
                                           block_hash TEXT, state BLOB, journal BLOB);
-        CREATE TABLE undo_log (id INTEGER PRIMARY KEY, height INTEGER, op TEXT);
-        CREATE TABLE account_state (address TEXT, balance TEXT);
         CREATE TABLE peers (id TEXT, address TEXT);
         CREATE TABLE pending_transactions (tx_hash TEXT, tx_hex TEXT);
         CREATE TABLE tx_index (tx_hash TEXT, block_height INTEGER);
         CREATE TABLE tx_participants (account TEXT, block_height INTEGER);
         CREATE TABLE hist_trades (id INTEGER, data TEXT);
-        CREATE TABLE state_commitment (domain TEXT, acc BLOB);
-        CREATE TABLE post_roots (block_hash TEXT, height INTEGER, root TEXT);
+        CREATE TABLE validator_log_roots (height INTEGER, root TEXT);
     """)
     for h in range(0, 150):
         conn.execute("INSERT INTO blocks VALUES (?, ?, ?)", (f"{h:064x}", h, "x" * 200))
     conn.execute("INSERT INTO exchange_checkpoint VALUES (1, ?, ?, ?, ?)",
                  (checkpoint, f"{checkpoint:064x}", b"state", b"journal"))
-    conn.execute("INSERT INTO undo_log (height, op) VALUES (120, 'put')")
-    conn.execute("INSERT INTO account_state VALUES ('0xPQa', '5')")
     conn.execute("INSERT INTO peers VALUES ('p1', ?)", (f"http://{PEER_IP}:3007",))
     conn.execute("INSERT INTO pending_transactions VALUES ('t', 'secret-pending')")
     conn.execute("INSERT INTO tx_index VALUES ('t', 3)")
     conn.execute("INSERT INTO tx_participants VALUES ('0xPQa', 3)")
     conn.execute("INSERT INTO hist_trades VALUES (1, 'fill')")
-    conn.execute("INSERT INTO state_commitment VALUES ('accounts', x'00')")
-    conn.execute("INSERT INTO post_roots VALUES ('h', 99, 'planted')")  # (never trusted)
+    conn.execute("INSERT INTO validator_log_roots VALUES (99, 'planted')")  # (never trusted)
     conn.commit()
+    # The store beside it (qrdx/store.py): the state and its journal a restore needs, and the
+    # roots and the tree it recomputes.
+    store = Store(path + ".store")
+    with store.recording(120):
+        store["account_state"].put(address="0xPQa", balance="5")
+    store["post_roots"].put("h", 99, "planted")  # (never trusted)
+    store["smt_nodes"].put("0:0:", b"planted")
+    store.commit()
+    store.close()
     return conn
+
+
+def _store_count(path, table):
+    store = Store(path)
+    try:
+        return store[table].count()
+    finally:
+        store.close()
+        os.remove(path + "-lck")
 
 
 def _count(path, table):
@@ -79,15 +92,22 @@ def test_a_published_snapshot_leaves_out_what_a_restore_discards(tmp_path):
         conn.close()
     copy = str(tmp_path / "pub" / "qrdx.db")
     for table in ("peers", "pending_transactions", "tx_index", "tx_participants", "hist_trades",
-                  "state_commitment", "post_roots"):
+                  "validator_log_roots"):
         assert _count(copy, table) == 0, table
-    for table in ("blocks", "undo_log", "account_state", "exchange_checkpoint"):
+    for table in ("blocks", "exchange_checkpoint"):
         assert _count(copy, table) > 0, table
+    store_copy = copy + ".store"
+    store_raw = open(store_copy, "rb").read()
+    assert manifest["store"]["sha256"] == hashlib.sha256(store_raw).hexdigest()
+    for table in ("post_roots", "smt_nodes"):
+        assert _store_count(store_copy, table) == 0, table
+    assert _store_count(store_copy, "account_state") == 1
+    assert b"planted" not in store_raw   # (compacted: not only unlinked)
     raw = open(copy, "rb").read()
     assert PEER_IP.encode() not in raw and b"secret-pending" not in raw   # overwritten
     assert manifest["checkpoint"]["height"] == 100 and manifest["tip"] == 149
     assert manifest["sha256"] == hashlib.sha256(raw).hexdigest()
-    assert sorted(os.listdir(tmp_path / "pub")) == ["manifest.json", "qrdx.db"]  # no -wal
+    assert sorted(os.listdir(tmp_path / "pub")) == ["manifest.json", "qrdx.db", "qrdx.db.store"]
 
 
 def test_a_restore_also_discards_the_transaction_participants(tmp_path):
@@ -120,6 +140,7 @@ def test_only_the_published_snapshot_is_served_and_advertised(tmp_path, monkeypa
     _node_db(db).close()
     snapshot_publisher.publish(db, root)
     assert snapshot_publisher.published_file("qrdx.db").endswith("/100/qrdx.db")
+    assert snapshot_publisher.published_file("qrdx.db.store").endswith("/100/qrdx.db.store")
     for name in ("latest.json", "../latest.json", "100/qrdx.db", "qrdx.db-wal"):
         assert snapshot_publisher.published_file(name) is None, name
     ad = snapshot_publisher.advertised()
@@ -193,12 +214,10 @@ async def test_a_restore_refuses_code_stored_under_another_codes_hash(tmp_path):
     db = await DatabaseSQLite.create(str(tmp_path / "restoring.db"))
     try:
         code = bytes.fromhex("6000600055")
-        await db.connection.execute(
-            "INSERT INTO contract_code (code_hash, bytecode, deployed_at, deployer, size) "
-            "VALUES (?, ?, 0, 'genesis', 5)", (keccak(code).hex(), code))
+        db.store["contract_code"].put(keccak(code).hex(), code, 0, "genesis", 5)
         await snapshot._verify_code(db)                                    # the honest copy
-        await db.connection.execute("UPDATE contract_code SET bytecode = ?", (b"\x60\x01\x00",))
+        db.store["contract_code"].update((keccak(code).hex(),), bytecode=b"\x60\x01\x00")
         with pytest.raises(SnapshotError, match="is not that code"):
             await snapshot._verify_code(db)
     finally:
-        await db.connection.close()
+        await db.close()

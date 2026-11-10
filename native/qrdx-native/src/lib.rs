@@ -30,6 +30,7 @@ mod mtree;
 mod order_lane;
 mod router;
 mod smt;
+mod store;
 mod oqs;
 mod tx;
 mod wire;
@@ -242,8 +243,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mldsa65_keypair, m)?)?;
     m.add_function(wrap_pyfunction!(canonical_json, m)?)?;
     m.add_function(wrap_pyfunction!(body_root_sha256, m)?)?;
-    m.add_function(wrap_pyfunction!(lthash::lt_apply, m)?)?;
     m.add_function(wrap_pyfunction!(smt::smt_update, m)?)?;
+    m.add_function(wrap_pyfunction!(smt::smt_entries, m)?)?;
     m.add_function(wrap_pyfunction!(mtree::mt_build, m)?)?;
     m.add_function(wrap_pyfunction!(mtree::mt_update, m)?)?;
     m.add_function(wrap_pyfunction!(mtree::mt_prove, m)?)?;
@@ -261,5 +262,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(wire::wire_build, m)?)?;
     m.add_function(wrap_pyfunction!(wire::wire_text, m)?)?;
     m.add_class::<net::NetService>()?;
+    m.add_class::<store::Store>()?;
+    m.add_function(wrap_pyfunction!(store::codec::store_pack, m)?)?;
+    m.add_function(wrap_pyfunction!(store::codec::store_unpack, m)?)?;
     Ok(())
 }

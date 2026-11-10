@@ -370,14 +370,12 @@ async def test_rebuild_equivalence_native_token_ops(monkeypatch):
         assert await db.get_token_balance(tok, t2) == Decimal("691")   # 1000 − 200 − 100 − 10 + 1 minted
         assert await db.get_token_balance(tok, t1) == Decimal("710")   # 500 + 200 + 10
         fwd = (await db.get_token_balances_root(), mgr.tokens.state_hash(),
-               await (await db.connection.execute(
-                   "SELECT * FROM token_registry ORDER BY token_address")).fetchall())
+               [tuple(r) for r in db.store["token_registry"].scan()])
 
         _rb_acct, rb_tok = await _run_rebuild(db)
         rb_mgr = ExchangeStateManager.get_instance()
         rb = (rb_tok, rb_mgr.tokens.state_hash(),
-              await (await db.connection.execute(
-                  "SELECT * FROM token_registry ORDER BY token_address")).fetchall())
+              [tuple(r) for r in db.store["token_registry"].scan()])
         assert fwd[0] == rb[0], "token root diverges"
         assert fwd[1] == rb[1], "token registry (exchange state) diverges"
         assert fwd[2] == rb[2], f"registry mirror diverges: {fwd[2]} vs {rb[2]}"

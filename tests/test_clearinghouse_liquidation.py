@@ -381,15 +381,13 @@ async def test_forward_and_rebuild_liquidate_identically(monkeypatch, oracle_com
         assert BTC not in ch.accounts[alice].positions, "alice should have been liquidated"
         assert ch.accounts[VAULT].positions[BTC].size == 1
         forward_root, forward_state = mgr.compute_state_root(), ch.canonical()
-        cur = await db.connection.execute("SELECT balance FROM account_state")
-        forward_total = sum(int(r[0]) for r in await cur.fetchall())
+        forward_total = sum(int(r.balance) for r in db.store["account_state"].scan())
 
         await rebuild_derived_state_interleaved(db)
         mgr = ExchangeStateManager.get_instance()
         assert mgr.clearinghouse.canonical() == forward_state
         assert mgr.compute_state_root() == forward_root
-        cur = await db.connection.execute("SELECT balance FROM account_state")
-        assert sum(int(r[0]) for r in await cur.fetchall()) == forward_total
+        assert sum(int(r.balance) for r in db.store["account_state"].scan()) == forward_total
     finally:
         ExchangeStateManager.reset_instance()
         path = db.db_path

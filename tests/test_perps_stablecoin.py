@@ -97,14 +97,11 @@ async def chain(monkeypatch, genesis_btc, oracle_committee):
 
 
 async def _token_total(db, usd):
-    cur = await db.connection.execute(
-        "SELECT balance FROM token_balances WHERE token_address = ?", (usd,))
-    return sum(D(str(r[0])) for r in await cur.fetchall())
+    return sum(D(str(r.balance)) for r in db.store["token_balances"].scan(usd))
 
 
 async def _qrdx_total(db):
-    cur = await db.connection.execute("SELECT balance FROM account_state")
-    return sum(int(r[0]) for r in await cur.fetchall())
+    return sum(int(r.balance) for r in db.store["account_state"].scan())
 
 
 async def _fund(apply, issuer, rep, alice, bob):

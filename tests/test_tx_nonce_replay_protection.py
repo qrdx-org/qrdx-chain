@@ -228,9 +228,7 @@ async def test_pending_nonces_are_rehydrated_from_durable_account_state():
 
         a, b, fresh = "0x" + "11" * 20, "0x" + "22" * 20, "0x" + "33" * 20
         for addr, nonce in ((a, 5), (b, 2), (fresh, 0)):
-            await db.connection.execute(
-                "INSERT INTO account_state (address, balance, nonce, created_at, "
-                "updated_at, is_contract) VALUES (?, '0', ?, 0, 0, 0)", (addr, nonce))
+            db.store["account_state"].put(address=addr, balance="0", nonce=nonce)
         await db.connection.commit()
 
         loaded = await evm_runtime._rehydrate_evm_pending_nonces()
@@ -257,9 +255,7 @@ async def test_rehydration_never_lowers_a_live_expectation():
         addr = "0x" + "44" * 20
         node_main.EVM_PENDING_NONCE.clear()
         node_main.EVM_PENDING_NONCE[addr] = 9      # pending txs already queued
-        await db.connection.execute(
-            "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, "
-            "is_contract) VALUES (?, '0', 4, 0, 0, 0)", (addr,))
+        db.store["account_state"].put(address=addr, balance="0", nonce=4)
         await db.connection.commit()
 
         await evm_runtime._rehydrate_evm_pending_nonces()

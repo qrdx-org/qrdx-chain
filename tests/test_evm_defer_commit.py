@@ -36,10 +36,8 @@ async def _setup():
 
 
 async def _db_balance(db):
-    cur = await db.connection.execute(
-        "SELECT balance FROM account_state WHERE address = ?", (ADDR,))
-    row = await cur.fetchone()
-    return int(row[0]) if row and row[0] is not None else None
+    row = db.store["account_state"].get(ADDR)
+    return int(row.balance) if row and row.balance is not None else None
 
 
 async def test_defer_commit_keeps_change_out_of_db_until_committed():

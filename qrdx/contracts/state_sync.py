@@ -61,34 +61,7 @@ class StateSyncManager:
         """
         conn = self.db.connection
 
-        # Create sync registry table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS evm_balance_sync_registry (
-                address TEXT PRIMARY KEY,
-                last_sync_block_height INTEGER NOT NULL,
-                last_sync_block_hash TEXT NOT NULL,
-                last_sync_timestamp TEXT NOT NULL,
-                native_balance_at_sync TEXT NOT NULL,
-                evm_balance_at_sync TEXT NOT NULL,
-                sync_tx_hash TEXT
-            )
-        """)
-
-        # Create balance changes table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS evm_balance_changes (
-                change_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                address TEXT NOT NULL,
-                block_height INTEGER NOT NULL,
-                block_hash TEXT NOT NULL,
-                tx_hash TEXT NOT NULL,
-                balance_before TEXT NOT NULL,
-                balance_after TEXT NOT NULL,
-                delta TEXT NOT NULL,
-                change_reason TEXT NOT NULL,
-                changed_at TEXT NOT NULL
-            )
-        """)
+        # (The sync registry and the balance-change log are the store's: qrdx/store.py.)
 
         # Create state checkpoints table
         await conn.execute("""
@@ -107,22 +80,6 @@ class StateSyncManager:
         """)
 
         # Create indexes for performance
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_sync_block_height
-            ON evm_balance_sync_registry(last_sync_block_height)
-        """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_balance_changes_address
-            ON evm_balance_changes(address)
-        """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_balance_changes_block
-            ON evm_balance_changes(block_height)
-        """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_balance_changes_tx
-            ON evm_balance_changes(tx_hash)
-        """)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_checkpoints_block
             ON state_checkpoints(block_height)
@@ -206,17 +163,8 @@ class StateSyncManager:
         """
         Check if address was already synced at or after given block.
         """
-        conn = self.db.connection
-        cursor = await conn.execute(
-            """
-            SELECT last_sync_block_height
-            FROM evm_balance_sync_registry
-            WHERE address = ? AND last_sync_block_height >= ?
-            """,
-            (address, block_height),
-        )
-        row = await cursor.fetchone()
-        return row is not None
+        row = self.db.store["evm_balance_sync_registry"].get(address)
+        return row is not None and int(row.last_sync_block_height) >= int(block_height)
 
     async def _record_sync(
         self,
@@ -228,35 +176,17 @@ class StateSyncManager:
         tx_hash: Optional[str] = None,
     ) -> None:
         """Record sync in registry."""
-        conn = self.db.connection
         now = datetime.now(timezone.utc).isoformat()
-
-        await conn.execute(
-            """
-            INSERT INTO evm_balance_sync_registry (
-                address, last_sync_block_height, last_sync_block_hash,
-                last_sync_timestamp, native_balance_at_sync,
-                evm_balance_at_sync, sync_tx_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (address) DO UPDATE SET
-                last_sync_block_height = excluded.last_sync_block_height,
-                last_sync_block_hash = excluded.last_sync_block_hash,
-                last_sync_timestamp = excluded.last_sync_timestamp,
-                native_balance_at_sync = excluded.native_balance_at_sync,
-                evm_balance_at_sync = excluded.evm_balance_at_sync,
-                sync_tx_hash = excluded.sync_tx_hash
-            """,
-            (
-                address,
-                block_height,
-                block_hash,
-                now,
-                str(native_balance),
-                str(evm_balance),
-                tx_hash,
-            ),
+        self.db.store["evm_balance_sync_registry"].put(
+            address,
+            block_height,
+            block_hash,
+            now,
+            str(native_balance),
+            str(evm_balance),
+            tx_hash,
         )
-        await conn.commit()
+        await self.db.connection.commit()
 
     async def record_balance_change(
         self,
@@ -273,30 +203,23 @@ class StateSyncManager:
         Provides an audit trail of all balance changes.
         """
         delta = balance_after - balance_before
-        conn = self.db.connection
         now = datetime.now(timezone.utc).isoformat()
-
-        await conn.execute(
-            """
-            INSERT INTO evm_balance_changes (
-                address, block_height, block_hash, tx_hash,
-                balance_before, balance_after, delta,
-                change_reason, changed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                address,
-                block_height,
-                block_hash,
-                tx_hash,
-                str(balance_before),
-                str(balance_after),
-                str(delta),
-                reason,
-                now,
-            ),
+        changes = self.db.store["evm_balance_changes"]
+        newest = changes.scan(reverse=True, limit=1)
+        change_id = int(newest[0].change_id) + 1 if newest else 1
+        changes.put(
+            change_id,
+            address,
+            block_height,
+            block_hash,
+            tx_hash,
+            str(balance_before),
+            str(balance_after),
+            str(delta),
+            reason,
+            now,
         )
-        await conn.commit()
+        await self.db.connection.commit()
 
         logger.debug(
             f"Recorded balance change for {address}: "
@@ -382,33 +305,27 @@ class StateSyncManager:
         This is deterministic — all nodes compute same result.
         """
         conn = self.db.connection
-        cursor = await conn.execute(
-            """
-            SELECT uo.tx_hash, uo."index", t.outputs_amounts, uo.address
-            FROM unspent_outputs uo
-            INNER JOIN transactions t ON uo.tx_hash = t.tx_hash
-            INNER JOIN blocks b ON t.block_hash = b.block_hash
-            WHERE b.id <= ?
-            ORDER BY uo.tx_hash, uo."index"
-            """,
-            (block_height,),
-        )
-        utxos = await cursor.fetchall()
+        utxos = []
+        for uo in self.db.store["unspent_outputs"].scan():  # (by tx_hash, output_index)
+            cursor = await conn.execute(
+                "SELECT b.block_height FROM transactions t JOIN blocks b "
+                "ON t.block_hash = b.block_hash WHERE t.tx_hash = ?",
+                (uo.tx_hash,),
+            )
+            row = await cursor.fetchone()
+            if row is not None and int(row[0]) <= block_height:
+                utxos.append(uo)
 
         if not utxos:
             return "0" * 64
 
         # Build Merkle tree from UTXOs
         leaves = []
-        for utxo in utxos:
-            tx_hash_val = utxo["tx_hash"] if isinstance(utxo["tx_hash"], str) else utxo[0]
-            index_val = utxo["index"] if isinstance(utxo, dict) else utxo[1]
-            address_val = utxo["address"] if isinstance(utxo, dict) else utxo[3]
-
+        for uo in utxos:
             leaf_data = (
-                bytes.fromhex(tx_hash_val)
-                + int(index_val).to_bytes(4, "big")
-                + address_val.encode("utf-8")
+                bytes.fromhex(uo.tx_hash)
+                + int(uo.output_index).to_bytes(4, "big")
+                + (uo.address or "").encode("utf-8")
             )
             leaves.append(keccak(leaf_data))
 
@@ -428,23 +345,16 @@ class StateSyncManager:
 
     async def _get_sync_statistics(self) -> Dict[str, Any]:
         """Get synchronization statistics."""
-        conn = self.db.connection
-        cursor = await conn.execute("""
-            SELECT
-                COUNT(*) as synced_count,
-                COALESCE(SUM(CAST(native_balance_at_sync AS REAL)), 0) as native_total,
-                COALESCE(SUM(CAST(evm_balance_at_sync AS INTEGER)), 0) as evm_total
-            FROM evm_balance_sync_registry
-            """)
-        row = await cursor.fetchone()
-        if row is None:  # an aggregate always yields a row; defensive
-            return {"synced_count": 0, "native_total": Decimal("0"), "evm_total": 0}
-
-        return {
-            "synced_count": row[0] or 0,
-            "native_total": Decimal(str(row[1])) if row[1] else Decimal("0"),
-            "evm_total": int(row[2]) if row[2] else 0,
-        }
+        rows = self.db.store["evm_balance_sync_registry"].scan()
+        native_total = Decimal("0")
+        evm_total = 0
+        for r in rows:
+            try:
+                native_total += Decimal(str(r.native_balance_at_sync or 0))
+                evm_total += int(r.evm_balance_at_sync or 0)
+            except Exception:
+                continue
+        return {"synced_count": len(rows), "native_total": native_total, "evm_total": evm_total}
 
 
 class ExecutionContext:

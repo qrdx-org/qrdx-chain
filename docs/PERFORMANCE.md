@@ -489,6 +489,17 @@ The fourth round, consensus changes for the regenesis (2026-11-05):
     * A stored section's gas is summed from its operations when the caller holds them, not by
       reading every binary item's head twice.
 
+35. **The node's store** (docs/STORAGE.md). The ledger, its commitments, the undo journal, the
+    proof tree and each block's sections moved from SQLite to a native store on MDBX. What
+    SQLite's triggers did, the store does natively as each row changes. The database's part of
+    an import fell from 76 to 45 µs a transfer on the bench.
+    * Live at 1,500 a second the median import fell from 119 to 78 ms and its database round
+      trips from 61 to 36.
+    * The block rate stayed at 2.7 blocks a second, and 2,000 a second executed 1,734 at 2.72.
+      Slot accounting shows why: proposers sent their blocks a median 157 ms into their slot
+      (p90 358 ms, past its end), their event loop still busy with the block before. The next
+      step is the event loop, not the database.
+
 Each block's phase line ends with its database round trips (`db N`).
 
 ## The block pipeline, measured offline

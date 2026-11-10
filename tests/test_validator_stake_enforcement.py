@@ -212,8 +212,7 @@ async def test_the_debit_lands_on_the_canonical_account_row():
         expected = Decimal("500000") - MIN_VALIDATOR_STAKE
         assert await db.get_address_balance(staker) == expected
         assert await db.get_address_balance(to_account_id(staker)) == expected
-        cur = await db.connection.execute("SELECT COUNT(*) FROM account_state")
-        assert (await cur.fetchone())[0] == 1, "stake debit split the account into two rows"
+        assert db.store["account_state"].count() == 1, "stake debit split the account into two rows"
     finally:
         await _close(db)
 

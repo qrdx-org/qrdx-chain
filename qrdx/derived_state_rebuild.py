@@ -481,12 +481,10 @@ async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, An
         (start, end),
     )
     blocks = await cur.fetchall()
-    cur = await db.connection.execute("SELECT DISTINCT block_hash FROM block_exchange_transactions")
-    with_exchange = {r[0] for r in await cur.fetchall()}
+    with_exchange = {k[0] for k in db.store["exchange_sections"].keys()}
     with_evm: set = set()
     if sm is not None:
-        cur = await db.connection.execute("SELECT DISTINCT block_hash FROM block_evm_transactions")
-        with_evm = {r[0] for r in await cur.fetchall()}
+        with_evm = {k[0] for k in db.store["evm_sections"].keys()}
     epochs = await _epochs_of(db, start, end)
 
     for height, block_hash, timestamp in blocks:

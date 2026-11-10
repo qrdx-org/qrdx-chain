@@ -117,9 +117,7 @@ async def test_the_rebuild_resets_mempool_nonce_expectations():
     try:
         node_main.db, node_main.EVM_STATE_MANAGER = db, None
         sender = "0x" + "12" * 20
-        await db.connection.execute(
-            "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, "
-            "is_contract) VALUES (?, '0', 3, 0, 0, 0)", (sender,))
+        db.store["account_state"].put(address=sender, balance="0", nonce=3)
         await db.connection.commit()
         node_main.EVM_PENDING_NONCE.clear()
         node_main.EVM_PENDING_NONCE[sender] = 5       # bumped by an orphaned block's txs

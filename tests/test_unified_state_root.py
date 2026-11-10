@@ -62,10 +62,8 @@ async def test_account_state_root_changes_with_state_and_is_deterministic():
     db, path = await _db()
     try:
         now = 1_700_000_000
-        await db.connection.execute(
-            "INSERT INTO account_state (address, balance, nonce, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            ("0xPQ" + "11" * 32, "1000", 0, now, now),
+        db.store["account_state"].put(
+            address="0xPQ" + "11" * 32, balance="1000", nonce=0, created_at=now, updated_at=now
         )
         await db.connection.commit()
         r1 = await db.get_account_state_root()
@@ -74,10 +72,7 @@ async def test_account_state_root_changes_with_state_and_is_deterministic():
         assert r1 == await db.get_account_state_root()
 
         # Mutating a balance changes the root.
-        await db.connection.execute(
-            "UPDATE account_state SET balance = ? WHERE address = ?",
-            ("2000", "0xPQ" + "11" * 32),
-        )
+        db.store["account_state"].update(("0xPQ" + "11" * 32,), balance="2000")
         await db.connection.commit()
         assert await db.get_account_state_root() != r1
     finally:
@@ -93,9 +88,8 @@ async def test_account_state_root_canonical_ordering():
         db, path = await _db()
         try:
             for addr, bal in order:
-                await db.connection.execute(
-                    "INSERT INTO account_state (address, balance, nonce, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)", (addr, bal, 0, now, now),
+                db.store["account_state"].put(
+                    address=addr, balance=bal, nonce=0, created_at=now, updated_at=now
                 )
             await db.connection.commit()
             roots.append(await db.get_account_state_root())

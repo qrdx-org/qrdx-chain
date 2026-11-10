@@ -190,20 +190,16 @@ class Node:
         return await rebuild_to_tip(self.db)
 
     async def state(self):
-        c = self.db.connection
         out = {}
-        for table, order in (("account_state", "address"),
-                             ("contract_storage", "contract_address, storage_key"),
-                             ("token_balances", "token_address, holder_address"),
-                             ("token_registry", "token_address")):
-            cur = await c.execute(f"SELECT * FROM {table} ORDER BY {order}")
-            rows = [tuple(r) for r in await cur.fetchall()]
-            if table in ("account_state", "token_balances", "token_registry"):
-                rows = [r[:-2] if table == "account_state" else r for r in rows]  # (timestamps)
+        for table in ("account_state", "contract_storage", "token_balances", "token_registry"):
+            rows = [tuple(r) for r in self.db.store[table].scan()]
+            if table == "account_state":
+                rows = [r[:5] + r[7:] for r in rows]  # (timestamps)
             out[table] = rows
         for d in SC.DOMAINS:
-            assert await SC.stored_accumulator(c, d) == await SC.full_accumulator(c, d), d
-            out["acc:" + d] = await SC.stored_accumulator(c, d)
+            stored = await SC.stored_accumulator(self.db, d)
+            assert stored == await SC.full_accumulator(self.db, d), d
+            out["acc:" + d] = stored
         mgr = ExchangeStateManager.get_instance()
         out["exchange"] = (mgr._sequential_state_root(), mgr._incremental_state_root(),
                            mgr._current_block_height)
@@ -266,10 +262,8 @@ async def test_a_write_outside_any_block_forces_the_full_rebuild():
             await node.apply(txs)
         for _ in range(8):
             await node.apply([])
-        cur = await node.db.connection.execute(  # a write outside any block: unattributed
-            "UPDATE account_state SET balance = '1' WHERE rowid = "
-            "(SELECT MIN(rowid) FROM account_state)")
-        assert cur.rowcount == 1
+        accounts = node.db.store["account_state"]  # a write outside any block: unattributed
+        assert accounts.update((accounts.scan(limit=1)[0].address,), balance="1")
         await node.db.connection.commit()
         tip = await node.db.get_next_block_id() - 1
         res = await node.rollback(tip - 2)

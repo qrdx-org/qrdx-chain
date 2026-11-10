@@ -212,10 +212,7 @@ async def test_selfdestruct_removes_the_account_and_all_its_storage(chain):
     assert (await chain.tx(ALICE, c, word(1))).success           # slot 0 := 7
     assert await chain.db.get_account_state_root()
     assert (await chain.tx(ALICE, c)).success                    # SELFDESTRUCT
-    rows = await (await chain.db.connection.execute(
-        "SELECT COUNT(*) FROM contract_storage WHERE contract_address = ?",
-        (to_account_id(c),))).fetchone()
-    assert rows[0] == 0
+    assert chain.db.store["contract_storage"].count(to_account_id(c)) == 0
     assert (await Chain(chain.db).sm.get_code(_hex(c))) == b""
 
 

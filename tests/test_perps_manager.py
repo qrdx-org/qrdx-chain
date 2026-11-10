@@ -78,8 +78,7 @@ async def _block(db, mgr, height, txs):
 
 
 async def _total_qrdx(db):
-    cur = await db.connection.execute("SELECT balance FROM account_state")
-    return sum(int(r[0]) for r in await cur.fetchall())
+    return sum(int(r.balance) for r in db.store["account_state"].scan())
 
 
 async def test_perps_conserve_real_qrdx_end_to_end(env):

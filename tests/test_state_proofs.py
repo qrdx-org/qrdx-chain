@@ -14,6 +14,7 @@ from test_evm_world import ALICE, BOB, Chain, _hex, chain  # noqa: F401  (fixtur
 from qrdx import state_proofs
 from qrdx.contracts.evm_world import STATE_PROOF_ADDRESS
 from qrdx.contracts.state_proof_evm import encode
+from qrdx.crypto.account_id import to_account_id
 from qrdx.crypto.hashing import unified_state_root
 from qrdx.database_sqlite import DatabaseSQLite
 
@@ -29,7 +30,7 @@ async def db():
     os.close(fd)
     d = await DatabaseSQLite.create(path)
     yield d
-    await d.connection.close()
+    await d.close()
     for p in (path, path + "-wal", path + "-shm"):
         if os.path.exists(p):
             os.remove(p)
@@ -47,9 +48,7 @@ async def _rows(db):
     await db.apply_account_balance_delta(_hex(ALICE), D(5))
     await db.apply_account_balance_delta(_hex(BOB), D("0.25"))
     await db.apply_token_balance_delta(TOKEN, _hex(ALICE), D("12.5"))
-    await db.connection.execute(
-        "INSERT INTO contract_storage (contract_address, storage_key, storage_value, block_number)"
-        " VALUES (?, ?, ?, 1)", (_hex(BOB), "0x" + "00" * 31 + "07", "0x" + "00" * 31 + "2a"))
+    db.store["contract_storage"].put(_hex(BOB), "0x" + "00" * 31 + "07", "0x" + "00" * 31 + "2a", 1)
 
 
 async def test_an_entry_and_an_absence_are_proven_against_the_signed_root(db):
@@ -108,16 +107,14 @@ async def test_the_root_is_a_function_of_the_rows(db):
     os.close(fd)
     other = await DatabaseSQLite.create(path)
     try:
-        await other.connection.execute(
-            "INSERT INTO contract_storage (contract_address, storage_key, storage_value, "
-            "block_number) VALUES (?, ?, ?, 1)",
-            (_hex(BOB), "0x" + "00" * 31 + "07", "0x" + "00" * 31 + "2a"))
+        other.store["contract_storage"].put(
+            _hex(BOB), "0x" + "00" * 31 + "07", "0x" + "00" * 31 + "2a", 1)
         await other.apply_token_balance_delta(TOKEN, _hex(ALICE), D("12.5"))
         await other.apply_account_balance_delta(_hex(BOB), D("0.25"))
         await other.apply_account_balance_delta(_hex(ALICE), D(5))
         assert await state_proofs.proof_root(other, 7) == a
     finally:
-        await other.connection.close()
+        await other.close()
         os.remove(path)
 
 
@@ -172,44 +169,94 @@ async def test_only_an_ancestor_can_be_proven_against(chain):
     assert int.from_bytes(r.output, "big") == 0
 
 
-async def test_rows_written_without_the_triggers_are_caught_at_startup(tmp_path):
-    """A tool's connection has no triggers: at the next start the accumulators see the change,
-    and the tree is rebuilt from the rows — a deleted row's leaf included."""
-    import sqlite3
-
+async def test_a_reopened_store_keeps_its_tree(tmp_path):
+    """The tree, its marks and its version live in the store's file: a node restarted between
+    two blocks folds the second into the tree it kept, to the root a node that never stopped (or
+    one built from the final rows alone) has — a deleted row's leaf included."""
     path = str(tmp_path / "n.db")
     db = await DatabaseSQLite.create(path)
     await _rows(db)
     await state_proofs.proof_root(db, 1)
     await db.connection.commit()
-    await db.connection.close()
-    raw = sqlite3.connect(path)
-    raw.execute("DELETE FROM account_state WHERE address = ?", (_hex(BOB),))
-    raw.execute("UPDATE token_balances SET balance = '3' WHERE holder_address = ?", (_hex(ALICE),))
-    raw.commit()
-    raw.close()
+    await db.close()
     db = await DatabaseSQLite.create(path)
     try:
+        db.store["account_state"].delete(to_account_id(_hex(BOB)))
+        await db.apply_token_balance_delta(TOKEN, _hex(ALICE), D("-9.5"))
         got = await state_proofs.proof_root(db, 2)
         fresh_path = str(tmp_path / "fresh.db")
         fresh = await DatabaseSQLite.create(fresh_path)
         try:
             await fresh.apply_account_balance_delta(_hex(ALICE), D(5))
             await fresh.apply_token_balance_delta(TOKEN, _hex(ALICE), D(3))
-            await fresh.connection.execute(
-                "INSERT INTO contract_storage (contract_address, storage_key, storage_value, "
-                "block_number) VALUES (?, ?, ?, 1)",
-                (_hex(BOB), "0x" + "00" * 31 + "07", "0x" + "00" * 31 + "2a"))
+            fresh.store["contract_storage"].put(
+                _hex(BOB), "0x" + "00" * 31 + "07", "0x" + "00" * 31 + "2a", 1)
             assert got == await state_proofs.proof_root(fresh, 2)
         finally:
-            await fresh.connection.close()
+            await fresh.close()
     finally:
-        await db.connection.close()
+        await db.close()
 
 
-async def test_a_balance_write_finds_its_row_by_index(db):
-    cur = await db.connection.execute(
-        "EXPLAIN QUERY PLAN SELECT address, balance FROM account_state "
-        "WHERE LOWER(address) = LOWER(?)", ("0xAB",))
-    plan = " ".join(str(tuple(r)) for r in await cur.fetchall())
-    assert "idx_account_state_lower" in plan
+def _odd(rng):
+    """A column value as the store may hold one: plain and odd numerals, ids in either case, a
+    PQ address, words with and without 0x, text, ints of any size."""
+    return rng.choice([
+        None, "", "0", "1", "-1", "1.9", "-1.9", "12.5", ".5", "5.", "+3", " 3", "1e3", "NaN",
+        "0E-18", "1_000", "١", "99999999999999999999999999999999999999999999999999999999999999999999999999999999",
+        0, 7, -7, 2**255, 2**256, 2**300,
+        "0x" + "ab" * 20, "0X" + "AB" * 20, "0x" + "Ab" * 20, " 0x" + "ab" * 20, "0x" + "zz" * 20,
+        "0xPQ" + "11" * 32, "QRDX", "0x" + "cd" * 32, "cd" * 32, "0x" + "cd" * 31, "ab " * 21,
+    ])
+
+
+_PLAIN = {
+    "id": lambda rng: "0x" + f"{rng.randrange(50):040x}",
+    "word": lambda rng: rng.choice([None, "", "0x" + f"{rng.randrange(10**9):064x}",
+                                    f"{rng.randrange(10**9):064x}"]),
+    "amount": lambda rng: rng.choice(["0", str(rng.randrange(10**30)),
+                                      str(rng.randrange(10**6)) + ".25", "7.000000000000000001"]),
+    "nonce": lambda rng: rng.randrange(1000),
+}
+# each kind's key columns and value columns, by what they hold
+_SHAPE = {
+    "account": (("id",), ("amount", "nonce", "word", "word")),
+    "storage": (("id", "word"), ("word",)),
+    "token": (("id", "id"), ("amount",)),
+}
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_the_native_entries_are_pythons(seed):
+    """``smt_entries`` (the module) against ``identity`` and the entry functions, on rows of
+    every kind with odd values: each entry it computes is Python's, and what it hands back
+    (None) Python computes."""
+    import random
+
+    import qrdx_native as N
+
+    from qrdx.crypto import smt
+    from qrdx.store import pack
+
+    rng = random.Random(seed)
+    handed, native = 0, 0
+    for kind, (table, ident_cols, cols) in state_proofs.TABLES.items():
+        nkey = len(ident_cols)
+        items, rows = [], []
+        key_shape, value_shape = _SHAPE[kind]
+        for _ in range(300):
+            key = tuple(_odd(rng) if rng.random() < 0.1 else _PLAIN[k](rng) for k in key_shape)
+            vals = None if rng.random() < 0.1 else tuple(
+                _odd(rng) if rng.random() < 0.1 else _PLAIN[k](rng) for k in value_shape)
+            items.append((pack(key), None if vals is None else pack(vals)))
+            rows.append((key, vals))
+        at = list(range(len(cols)))
+        for (key, vals), got in zip(rows, N.smt_entries(kind, items, at)):
+            if got is None:
+                handed += 1
+                continue
+            native += 1
+            want_key = smt.key_of(state_proofs.identity(kind, *key))
+            want = None if vals is None else state_proofs._ENTRY[kind](*key, *vals)
+            assert got == (want_key, want), (kind, key, vals)
+    assert native > 600 and handed > 100

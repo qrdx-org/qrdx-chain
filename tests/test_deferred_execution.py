@@ -75,8 +75,7 @@ async def test_an_evm_transaction_that_cannot_run_is_skipped_whole(evm):
     )
     assert ok, err
     assert ran == [a, c]
-    cur = await db.connection.execute("SELECT address FROM account_state ORDER BY address")
-    held = {r[0].lower() for r in await cur.fetchall()}
+    held = {r.address.lower() for r in db.store["account_state"].scan()}
     assert a_addr.lower() in held and c_addr.lower() in held
     assert b_addr.lower() not in held                      # (nothing of it survives)
 
@@ -88,8 +87,7 @@ async def test_what_needs_no_state_is_still_a_rule(evm):
         1, "h", 0, [a, "0xdeadbeef"], db, sm, _executor(sm)
     )
     assert not ok and "failed verification" in err and ran == []
-    cur = await db.connection.execute("SELECT COUNT(*) FROM account_state")
-    assert (await cur.fetchone())[0] == 0                  # (refused before anything ran)
+    assert db.store["account_state"].count() == 0          # (refused before anything ran)
 
 
 async def test_running_a_section_twice_leaves_the_same_state(evm):

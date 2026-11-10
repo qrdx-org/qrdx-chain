@@ -77,9 +77,7 @@ async def _db_root(db):
 
 
 async def _db_account_count(db):
-    cur = await db.connection.execute("SELECT COUNT(*) FROM account_state")
-    row = await cur.fetchone()
-    return int(row[0])
+    return db.store["account_state"].count()
 
 
 # ── helper to compute what the root WILL be after a replay, deterministically ──

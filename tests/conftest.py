@@ -27,9 +27,26 @@ os.environ.setdefault("QRDX_PERP_GENESIS_MARKETS", "")
 os.environ.setdefault("QRDX_VERIFY_STATE_COMMITMENTS", "1")
 # Every answer the chain index gives from memory, checked against its table (qrdx/chain_index.py).
 os.environ.setdefault("QRDX_VERIFY_CHAIN_INDEX", "1")
+# Each open store reserves address space for its file (qrdx/store.py): tests open hundreds.
+os.environ.setdefault("QRDX_STORE_MAX_GB", "2")
 
 
 import pytest  # noqa: E402
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """The stores beside the temporary databases tests made and deleted (a test removes its
+    ``.db`` file; the store's file and lock file sit beside it: qrdx/store.py)."""
+    import glob
+    import tempfile
+
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), "*.db.store")):
+        if not os.path.exists(path[: -len(".store")]):
+            for name in (path, path + "-lck"):
+                try:
+                    os.remove(name)
+                except OSError:
+                    pass
 
 
 @pytest.fixture

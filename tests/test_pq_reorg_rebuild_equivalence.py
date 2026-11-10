@@ -194,6 +194,4 @@ async def test_genesis_reseed_is_idempotent_for_pq_allocations():
 
 
 async def _rows(db):
-    cur = await db.connection.execute(
-        "SELECT address, balance, nonce FROM account_state ORDER BY address")
-    return {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
+    return {r.address: (r.balance, r.nonce) for r in db.store["account_state"].scan()}

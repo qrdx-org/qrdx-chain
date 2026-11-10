@@ -91,8 +91,9 @@ python scripts/node/snapshot.py restore --snapshot snapshot-2026-10-28/ --db /ne
 
 **`create`**:
 
-* takes SQLite's online backup of a node's database, running or not, plus a manifest with a
-  checksum;
+* takes SQLite's online backup of a node's database and MDBX's online copy of its store
+  (docs/STORAGE.md), running or not, plus a manifest with a checksum of each (`qrdx.db` and
+  `qrdx.db.store`, format 2);
 * needs a persisted exchange checkpoint, which a node writes every 1,024 finalized blocks.
 
 **`fetch`** downloads a published snapshot directory from any HTTP server, resuming a cut
@@ -177,9 +178,9 @@ A node started with `QRDX_SNAPSHOT_DIR` publishes snapshots of its own database:
 
 * **When:** each time it persists a newer exchange checkpoint (every 1,024 finalized blocks). It
   keeps only the newest. A background poller does the work in a thread, off the block path,
-  through SQLite's online backup.
-* **Where:** `/snapshot/manifest.json` and `/snapshot/qrdx.db` on its API port, with range
-  requests, so `fetch` resumes a cut download.
+  through SQLite's online backup and MDBX's online copy of the store.
+* **Where:** `/snapshot/manifest.json`, `/snapshot/qrdx.db` and `/snapshot/qrdx.db.store` on its
+  API port, with range requests, so `fetch` resumes a cut download.
 * **Advertised:** `p2p_getStatus` carries the manifest under `snapshot`.
 * **Left out:** what a restore discards anyway. That is the node's own tables (peers, pending
   transactions, the transaction index, trading history, display copies) and the tables a

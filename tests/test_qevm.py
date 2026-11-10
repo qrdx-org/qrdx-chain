@@ -128,7 +128,12 @@ class MockDatabaseSQLite:
     """In-memory mock of DatabaseSQLite for testing."""
 
     def __init__(self):
+        import tempfile
+
+        from qrdx.store import Store
+
         self.connection = None  # will be set to real aiosqlite connection
+        self.store = Store(tempfile.mktemp(suffix=".db") + ".store")
         self._balances = {}     # account id → Decimal
 
     async def get_address_balance(self, address: str) -> Decimal:
@@ -964,11 +969,7 @@ class TestStateSyncManager:
             reason='gas_payment',
         )
         # Verify it was recorded
-        cursor = await db.connection.execute(
-            "SELECT COUNT(*) FROM evm_balance_changes"
-        )
-        row = await cursor.fetchone()
-        assert row[0] == 1
+        assert db.store["evm_balance_changes"].count() == 1
 
 
 # ── Execution Context ────────────────────────────────────────────────

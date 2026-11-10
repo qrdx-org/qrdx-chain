@@ -43,12 +43,10 @@ def _deltas(rng, n):
 
 
 async def _state(db):
-    cur = await db.connection.execute("SELECT LOWER(address), balance FROM account_state "
-                                      "ORDER BY LOWER(address)")
-    accounts = await cur.fetchall()
-    cur = await db.connection.execute("SELECT token_address, holder_address, balance FROM "
-                                      "token_balances ORDER BY 1, 2")
-    return accounts, await cur.fetchall()
+    accounts = sorted((r.address.lower(), r.balance) for r in db.store["account_state"].scan())
+    tokens = [(r.token_address, r.holder_address, r.balance)
+              for r in db.store["token_balances"].scan()]
+    return accounts, tokens
 
 
 @pytest.mark.parametrize("seed", range(8))

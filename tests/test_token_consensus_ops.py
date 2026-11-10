@@ -163,9 +163,7 @@ async def test_flush_applies_registry_and_balances(db):
 
     # Balance landed in the ledger and the registry row exists.
     assert await db.get_token_balance(token, deployer) == Decimal("1000000")
-    cur = await db.connection.execute(
-        "SELECT symbol, owner_address FROM token_registry WHERE token_address = ?", (token,))
-    row = await cur.fetchone()
-    assert row[0] == "qUSD" and row[1] == deployer
+    row = db.store["token_registry"].get(token)
+    assert row.symbol == "qUSD" and row.owner_address == deployer
     # Token root is now non-zero (state exists).
     assert await db.get_token_balances_root() != ZERO_ROOT

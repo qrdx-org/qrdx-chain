@@ -120,11 +120,11 @@ async def test_evm_account_rebuild_equals_forward_apply():
             f"rebuild={rebuild_root[:16]}")
 
         # And the genesis-only account C survived the clear+rebuild with its exact balance.
-        cur = await db.connection.execute(
-            "SELECT balance FROM account_state WHERE LOWER(address) = LOWER(?)", (addr_c,))
-        row = await cur.fetchone()
+        from qrdx.crypto.account_id import to_account_id
+
+        row = db.store["account_state"].get(to_account_id(addr_c))
         assert row is not None, "genesis-only account was dropped by the rebuild"
-        assert int(row[0]) == 777 * 10 ** 18, "genesis-only balance wrong after rebuild"
+        assert int(row.balance) == 777 * 10 ** 18, "genesis-only balance wrong after rebuild"
     finally:
         await db.close()
         os.remove(path)

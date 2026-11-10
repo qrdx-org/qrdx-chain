@@ -84,5 +84,4 @@ async def test_the_check_runs_at_the_blocks_height_not_its_slot(node_db):
     filed (qrdx/state_proofs.py) — at the height the importer applies it at."""
     content = str({"state_root": "ab" * 64, "number": 999, "slot": 999})
     await block_import._verify_unified_state_root(content, enforce=False, height=5)
-    cur = await node_db.connection.execute("SELECT height FROM state_root_parts")
-    assert [r[0] for r in await cur.fetchall()] == [5]
+    assert [r.height for r in node_db.store["state_root_parts"].scan()] == [5]

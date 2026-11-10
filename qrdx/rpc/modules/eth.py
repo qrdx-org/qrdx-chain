@@ -1365,15 +1365,11 @@ class EthModule(RPCModule):
             except Exception:
                 pass
 
-        # 2. account_state table (direct SQL fallback)
+        # 2. account_state table (direct fallback)
         try:
-            cursor = await db.connection.execute(
-                "SELECT balance FROM account_state WHERE address = ?",
-                (address,),
-            )
-            row = await cursor.fetchone()
-            if row and row[0]:
-                bal = _safe_int(row[0], 0)
+            row = db.store["account_state"].get(address)
+            if row and row.balance:
+                bal = _safe_int(row.balance, 0)
                 if bal > 0:
                     return _to_hex(bal)
         except Exception:
@@ -1381,12 +1377,11 @@ class EthModule(RPCModule):
 
         # 3. UTXO balance (native layer)
         try:
-            cursor = await db.connection.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM unspent_outputs WHERE address = ?",
-                (address,),
+            utxo_micro = sum(
+                int(r.amount or 0)
+                for r in db.store["unspent_outputs"].scan()
+                if r.address == address
             )
-            row = await cursor.fetchone()
-            utxo_micro = row[0] if row and row[0] else 0
             if utxo_micro > 0:
                 # Convert micro-QRDX (10^6 base) to wei (10^18 base)
                 return _to_hex(utxo_micro * (10**12))

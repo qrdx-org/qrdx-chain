@@ -125,30 +125,26 @@ async def store(db: Any, height: int, block_hash: str, root: str) -> None:
     """Keep the root after block ``height`` (hash ``block_hash``), in memory and in the database
     (written with the block: not committed here)."""
     remember(block_hash, root)
-    if getattr(db, "connection", None) is None:
+    if getattr(db, "store", None) is None:
         return
-    conn = db.connection
-    await conn.execute(
-        "INSERT OR REPLACE INTO post_roots (block_hash, height, root) VALUES (?, ?, ?)",
-        (block_hash, int(height), root),
-    )
+    table = db.store["post_roots"]
+    table.put(block_hash, int(height), root)
     if height % 1024 == 0 and height > KEEP_STORED:
-        await conn.execute("DELETE FROM post_roots WHERE height < ?", (height - KEEP_STORED,))
+        old = [r.block_hash for r in table.scan() if r.height < height - KEEP_STORED]
+        for h in old:
+            table.delete(h)
 
 
 async def stored(db: Any, block_hash: Optional[str]) -> Optional[str]:
     """The root after block ``block_hash``, kept in memory or in the database."""
     root = kept(block_hash)
-    if root is not None or not block_hash or getattr(db, "connection", None) is None:
+    if root is not None or not block_hash or getattr(db, "store", None) is None:
         return root
-    cur = await db.connection.execute(
-        "SELECT root FROM post_roots WHERE block_hash = ?", (block_hash,)
-    )
-    row = await cur.fetchone()
+    row = db.store["post_roots"].get(block_hash)
     if row is None:
         return None
-    remember(block_hash, str(row[0]))
-    return str(row[0])
+    remember(block_hash, str(row.root))
+    return str(row.root)
 
 
 async def unified_root(db: Any, height: int, slot: Optional[int]) -> str:

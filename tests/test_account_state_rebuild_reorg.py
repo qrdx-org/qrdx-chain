@@ -52,15 +52,12 @@ async def test_clear_account_state_resets_sync_registry(db):
 
     # Post-clear: the replay will RE-SYNC (no stale dedup), so genesis funding survives.
     assert await ssm._is_already_synced(ADDR, 5) is False
-    cur = await db.connection.execute("SELECT COUNT(*) FROM evm_balance_sync_registry")
-    assert (await cur.fetchone())[0] == 0
+    assert db.store["evm_balance_sync_registry"].count() == 0
 
 
 async def test_clear_account_state_ok_without_evm_tables(db):
     # EVM never initialized → the sync tables don't exist; clear must not raise.
-    await db.connection.execute("INSERT INTO account_state (address, balance, created_at, updated_at) "
-                                "VALUES (?, '1', 0, 0)", (ADDR,))
+    db.store["account_state"].put(address=ADDR, balance="1")
     await db.connection.commit()
     await db.clear_account_state()  # should not raise
-    cur = await db.connection.execute("SELECT COUNT(*) FROM account_state")
-    assert (await cur.fetchone())[0] == 0
+    assert db.store["account_state"].count() == 0

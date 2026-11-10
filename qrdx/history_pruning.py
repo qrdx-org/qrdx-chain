@@ -120,8 +120,8 @@ async def prune(db: Any, finalized_height: int, window: int = -1) -> int:
                 "UPDATE blocks SET content = ?, validator_signature = NULL WHERE block_height = ?",
                 (block_codec.encode(repr(strip(bc))), int(height)),
             )
-        for table in ("block_exchange_transactions", "block_evm_transactions"):
-            await conn.execute(f"DELETE FROM {table} WHERE block_hash = ?", (block_hash,))
+        for table in ("exchange_sections", "evm_sections"):
+            db.store[table].delete(block_hash)
         count += 1
     await conn.execute(
         "INSERT OR REPLACE INTO chain_metadata (key, value) VALUES (?, ?)", (KEY, str(upto))

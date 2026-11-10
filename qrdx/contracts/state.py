@@ -117,23 +117,15 @@ class ContractStateManager:
             return self._accounts_cache[address]
 
         # Load from database
-        cursor = await self.db.connection.execute(
-            """
-            SELECT balance, nonce, code_hash, storage_root
-            FROM account_state
-            WHERE address = ?
-            """,
-            (address,),
-        )
-        row = await cursor.fetchone()
+        row = self.db.store["account_state"].get(address)
 
         if row:
             account = Account(
                 address=address,
-                balance=int(row[0]),
-                nonce=int(row[1]),
-                code_hash=bytes.fromhex(row[2]) if row[2] else None,
-                storage_root=bytes.fromhex(row[3]) if row[3] else None,
+                balance=int(row.balance),
+                nonce=int(row.nonce),
+                code_hash=bytes.fromhex(row.code_hash) if row.code_hash else None,
+                storage_root=bytes.fromhex(row.storage_root) if row.storage_root else None,
             )
         else:
             # New account
@@ -218,15 +210,11 @@ class ContractStateManager:
             return self._code_cache[account.code_hash]
 
         # Load from database
-        cursor = await self.db.connection.execute(
-            "SELECT bytecode FROM contract_code WHERE code_hash = ?", (account.code_hash.hex(),)
-        )
-        row = await cursor.fetchone()
+        row = self.db.store["contract_code"].get(account.code_hash.hex())
 
         if row:
-            bytecode = (
-                bytes(row[0]) if isinstance(row[0], (bytes, memoryview)) else bytes.fromhex(row[0])
-            )
+            raw = row.bytecode
+            bytecode = bytes(raw) if isinstance(raw, (bytes, memoryview)) else bytes.fromhex(raw)
             self._code_cache[account.code_hash] = bytecode
             return bytecode
 
@@ -253,12 +241,12 @@ class ContractStateManager:
         self._code_cache[code_hash] = code
 
         # Store in database
-        await self.db.connection.execute(
-            """
-            INSERT OR IGNORE INTO contract_code (code_hash, bytecode, deployed_at, deployer, size)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (code_hash.hex(), code, block_number, deployer, len(code)),
+        self.db.store["contract_code"].insert(
+            code_hash=code_hash.hex(),
+            bytecode=code,
+            deployed_at=block_number,
+            deployer=deployer,
+            size=len(code),
         )
         await self.db.connection.commit()
 
@@ -288,18 +276,10 @@ class ContractStateManager:
             return b"\x00" * 32
 
         # Load from database
-        cursor = await self.db.connection.execute(
-            """
-            SELECT storage_value
-            FROM contract_storage
-            WHERE contract_address = ? AND storage_key = ?
-            """,
-            (address, key.hex()),
-        )
-        row = await cursor.fetchone()
+        row = self.db.store["contract_storage"].get(address, key.hex())
 
         if row:
-            value = bytes.fromhex(row[0])
+            value = bytes.fromhex(row.storage_value)
         else:
             value = b"\x00" * 32  # Default empty value
 
@@ -330,12 +310,12 @@ class ContractStateManager:
         address = to_account_id(address)
         rows = []
         if address not in self._destroyed:
-            cursor = await self.db.connection.execute(
-                "SELECT storage_key, storage_value FROM contract_storage WHERE contract_address = ?"
-                + (" LIMIT ?" if limit is not None else ""),
-                (address, limit + 1) if limit is not None else (address,),
-            )
-            rows = await cursor.fetchall()
+            rows = [
+                (r.storage_key, r.storage_value)
+                for r in self.db.store["contract_storage"].scan(
+                    address, limit=limit + 1 if limit is not None else None
+                )
+            ]
             if limit is not None and len(rows) > limit:
                 return None
         out: Dict[bytes, bytes] = {}
@@ -394,9 +374,7 @@ class ContractStateManager:
             self._dirty_storage.discard(key)
 
         # Mark for database deletion
-        await self.db.connection.execute(
-            "DELETE FROM contract_storage WHERE contract_address = ?", (address,)
-        )
+        self.db.store["contract_storage"].delete_prefix(address)
         await self.db.connection.commit()
 
     async def account_exists(self, address: str) -> bool:
@@ -464,10 +442,10 @@ class ContractStateManager:
         conn = self.db.connection
 
         # Destroyed accounts lose every stored slot, before this block's writes land.
+        storage = self.db.store["contract_storage"]
+        accounts = self.db.store["account_state"]
         for address in sorted(self._destroyed):
-            await conn.execute(
-                "DELETE FROM contract_storage WHERE contract_address = ?", (address,)
-            )
+            storage.delete_prefix(address)
 
         # Commit account changes
         for address in sorted(self._dirty_accounts):
@@ -475,31 +453,28 @@ class ContractStateManager:
                 account = self._accounts_cache[address]
 
                 if account.is_empty:
-                    await conn.execute("DELETE FROM account_state WHERE address = ?", (address,))
+                    accounts.delete(address)
                 else:
-                    await conn.execute(
-                        """
-                        INSERT INTO account_state
-                        (address, balance, nonce, code_hash, storage_root,
-                         created_at, updated_at, is_contract)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT (address) DO UPDATE SET
-                            balance = excluded.balance,
-                            nonce = excluded.nonce,
-                            code_hash = excluded.code_hash,
-                            storage_root = excluded.storage_root,
-                            updated_at = excluded.updated_at,
-                            is_contract = excluded.is_contract
-                        """,
+                    accounts.upsert(
+                        (address,),
+                        {
+                            "balance": str(account.balance),
+                            "nonce": account.nonce,
+                            "code_hash": account.code_hash.hex() if account.code_hash else None,
+                            "storage_root": (
+                                account.storage_root.hex() if account.storage_root else None
+                            ),
+                            "created_at": block_number,
+                            "updated_at": block_number,
+                            "is_contract": account.is_contract,
+                        },
                         (
-                            address,
-                            str(account.balance),
-                            account.nonce,
-                            account.code_hash.hex() if account.code_hash else None,
-                            account.storage_root.hex() if account.storage_root else None,
-                            block_number,
-                            block_number,
-                            account.is_contract,
+                            "balance",
+                            "nonce",
+                            "code_hash",
+                            "storage_root",
+                            "updated_at",
+                            "is_contract",
                         ),
                     )
 
@@ -508,10 +483,12 @@ class ContractStateManager:
             cached = self._accounts_cache.get(address)
             if cached is not None and cached.code_hash and cached.code_hash in self._code_cache:
                 code = self._code_cache[cached.code_hash]
-                await conn.execute(
-                    """INSERT OR IGNORE INTO contract_code
-                       (code_hash, bytecode, deployed_at, deployer, size) VALUES (?, ?, ?, ?, ?)""",
-                    (cached.code_hash.hex(), code, block_number, "", len(code)),
+                self.db.store["contract_code"].insert(
+                    code_hash=cached.code_hash.hex(),
+                    bytecode=code,
+                    deployed_at=block_number,
+                    deployer="",
+                    size=len(code),
                 )
 
         # Commit storage changes
@@ -520,25 +497,9 @@ class ContractStateManager:
                 value = self._storage_cache[(address, key)]
 
                 if value == b"\x00" * 32:
-                    await conn.execute(
-                        """
-                        DELETE FROM contract_storage
-                        WHERE contract_address = ? AND storage_key = ?
-                        """,
-                        (address, key.hex()),
-                    )
+                    storage.delete(address, key.hex())
                 else:
-                    await conn.execute(
-                        """
-                        INSERT INTO contract_storage
-                        (contract_address, storage_key, storage_value, block_number)
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT (contract_address, storage_key) DO UPDATE SET
-                            storage_value = excluded.storage_value,
-                            block_number = excluded.block_number
-                        """,
-                        (address, key.hex(), value.hex(), block_number),
-                    )
+                    storage.put(address, key.hex(), value.hex(), block_number)
 
         if flush_only:
             # Rows are written but NOT committed and dirty/snapshots are kept,

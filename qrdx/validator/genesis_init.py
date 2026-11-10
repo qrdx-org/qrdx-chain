@@ -293,11 +293,8 @@ class GenesisInitializer:
             # The genesis tx above keeps the display address for auditability.
             account_id = to_account_id(address)
             wei = int(_D(str(balance)) * _D(10**18))
-            await self.db.connection.execute(
-                "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, is_contract) "
-                "VALUES (?, ?, 0, 0, 0, 0) "
-                "ON CONFLICT(address) DO UPDATE SET balance = excluded.balance",
-                (account_id, str(wei)),
+            self.db.store["account_state"].upsert(
+                (account_id,), {"balance": str(wei)}, ("balance",)
             )
 
             logger.debug(
@@ -390,11 +387,10 @@ class GenesisInitializer:
             # system_spend) found nothing to debit and was dropped, while its credit landed.
             from ..crypto.account_id import to_account_id
 
-            await self.db.connection.execute(
-                "INSERT INTO account_state (address, balance, nonce, created_at, updated_at, is_contract) "
-                "VALUES (?, ?, 0, 0, 0, 0) "
-                "ON CONFLICT(address) DO UPDATE SET balance = excluded.balance",
-                (to_account_id(address), str(int(balance * Decimal(10**18)))),
+            self.db.store["account_state"].upsert(
+                (to_account_id(address),),
+                {"balance": str(int(balance * Decimal(10**18)))},
+                ("balance",),
             )
 
             # Store system wallet metadata
