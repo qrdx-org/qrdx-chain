@@ -304,16 +304,12 @@ class StateSyncManager:
 
         This is deterministic — all nodes compute same result.
         """
-        conn = self.db.connection
+        store = self.db.store
         utxos = []
-        for uo in self.db.store["unspent_outputs"].scan():  # (by tx_hash, output_index)
-            cursor = await conn.execute(
-                "SELECT b.block_height FROM transactions t JOIN blocks b "
-                "ON t.block_hash = b.block_hash WHERE t.tx_hash = ?",
-                (uo.tx_hash,),
-            )
-            row = await cursor.fetchone()
-            if row is not None and int(row[0]) <= block_height:
+        for uo in store["unspent_outputs"].scan():  # (by tx_hash, output_index)
+            tx = store["transactions"].get(uo.tx_hash)
+            found = store["blocks"].scan_index("by_hash", tx.block_hash, limit=1) if tx else []
+            if found and int(found[0].block_height) <= block_height:
                 utxos.append(uo)
 
         if not utxos:

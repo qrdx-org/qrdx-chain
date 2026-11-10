@@ -163,6 +163,33 @@ fn unescape(data: &[u8], mut i: usize) -> Result<(Vec<u8>, usize), &'static str>
     }
 }
 
+/// The byte range of each element of a packed tuple (its packing, as it appears in ``data``).
+pub(crate) fn spans(data: &[u8]) -> Result<Vec<(usize, usize)>, &'static str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let start = i;
+        let tag = data[i];
+        i += 1;
+        match tag {
+            NULL => {}
+            BYTES | STRING => i = unescape(data, i)?.1,
+            0x0C..=0x1C => i += (tag as i32 - INT_ZERO as i32).unsigned_abs() as usize,
+            POS_BIG | NEG_BIG => {
+                let len_byte = *data.get(i).ok_or("a short int")?;
+                i += 1 + if tag == NEG_BIG { !len_byte } else { len_byte } as usize;
+            }
+            DOUBLE => i += 8,
+            _ => return Err("an unknown type code"),
+        }
+        if i > data.len() {
+            return Err("a short element");
+        }
+        out.push((start, i));
+    }
+    Ok(out)
+}
+
 /// The fields of a packed tuple.
 pub(crate) fn fields(data: &[u8]) -> Result<Vec<Field>, &'static str> {
     let mut out = Vec::new();

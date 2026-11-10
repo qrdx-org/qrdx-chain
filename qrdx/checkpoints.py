@@ -106,12 +106,9 @@ async def reorg_floor(db: Any) -> int:
         finalized = -1
     restored = -1
     try:
-        cur = await db.connection.execute(
-            "SELECT value FROM chain_metadata WHERE key = 'restored_from_snapshot'"
-        )
-        row = await cur.fetchone()
-        if row is not None:
-            restored = int(json.loads(row[0])["height"])
+        value = db.get_metadata("restored_from_snapshot")
+        if value is not None:
+            restored = int(json.loads(value)["height"])
     except Exception:
         pass
     return max(finalized, highest_at_or_below(tip), restored)

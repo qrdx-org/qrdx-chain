@@ -472,15 +472,13 @@ async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, An
         return counts
 
     # What the replay needs of each block is its hash and timestamp, and whether it carries
-    # a section. Read them in three queries rather than fetching every block (a ~60 KB body)
-    # and probing both section tables per height: that was ~90% of the rebuild's cost, and
-    # the rebuild runs on every reorg and every restart.
-    cur = await db.connection.execute(
-        "SELECT block_height, block_hash, timestamp FROM blocks "
-        "WHERE block_height BETWEEN ? AND ? ORDER BY block_height",
-        (start, end),
-    )
-    blocks = await cur.fetchall()
+    # a section: its header and the sections' keys, not its body (a ~60 KB of signatures) nor
+    # the sections themselves. Fetching every block and probing both section tables per
+    # height was ~90% of the rebuild's cost, and the rebuild runs on every reorg and restart.
+    blocks = [
+        (r.block_height, r.block_hash, r.timestamp)
+        for r in db.store["blocks"].scan(lo=(int(start),), hi=(int(end) + 1,))
+    ]
     with_exchange = {k[0] for k in db.store["exchange_sections"].keys()}
     with_evm: set = set()
     if sm is not None:
@@ -572,9 +570,7 @@ async def _epochs_of(db, start: int, end: int) -> Dict[int, Optional[int]]:
 
     try:
         await chain_index.sync(db, end)
-        cur = await db.connection.execute(
-            "SELECT height, epoch FROM chain_index WHERE height BETWEEN ? AND ?", (start, end)
-        )
-        return {int(h): (None if e is None else int(e)) for h, e in await cur.fetchall()}
+        rows = db.store["chain_index"].scan(lo=(int(start),), hi=(int(end) + 1,))
+        return {int(r.height): (None if r.epoch is None else int(r.epoch)) for r in rows}
     except Exception:
         return {}

@@ -15,6 +15,7 @@ import pytest
 
 from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.validator.block_verification import _future_tolerance_slots, verify_slot_progression
+from chain_rows import put_block
 
 
 @pytest.fixture
@@ -23,9 +24,7 @@ async def db():
     os.close(fd)
     database = await DatabaseSQLite.create(path)
     for h, slot in enumerate([0, 3, 7]):
-        await database.connection.execute(
-            "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, ?, ?, 0)",
-            (f"{h:064x}", h, repr({"slot": slot})),
+        put_block(database, h, f"{h:064x}", repr({"slot": slot}),
         )
     await database.connection.commit()
     yield database

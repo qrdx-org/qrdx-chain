@@ -23,6 +23,7 @@ from qrdx.history_pruning import (
 )
 from qrdx.validator.attestation_block import extract_attestations_from_dict
 from qrdx.validator.block_verification import _parse_block_content
+from chain_rows import block_content, put_block
 
 VOTE = {"slot": 9, "epoch": 0, "block_hash": "bh", "validator_address": "0xPQ" + "a" * 64,
         "validator_index": 0, "signature": "ab" * 1600, "source_epoch": 0, "target_epoch": 1,
@@ -38,10 +39,7 @@ async def db():
         for h in range(1, 31):
             content = {"number": h, "parent_hash": "00" * 32, "proposer_signature": "ef" * 1650,
                        "attestations": [VOTE], "slashing_evidence": [], "graffiti": "", "slot": h}
-            await d.connection.execute(
-                "INSERT INTO blocks (block_hash, block_height, content, timestamp, "
-                "validator_signature) VALUES (?, ?, ?, 0, ?)",
-                (f"{h:064x}", h, block_codec.encode(repr(content)), "ef" * 1650))
+            put_block(d, h, f"{h:064x}", repr(content), validator_signature="ef" * 1650)
             d.store["exchange_sections"].put(f"{h:064x}", b'["' + b"x" * 5000 + b'"]')
         await d.connection.commit()
         yield d
@@ -75,10 +73,9 @@ async def test_pruning_runs_behind_finality_in_batches(db):
     assert await prune(db, finalized_height=25, window=10) == 14        # blocks 1..14
     assert await pruned_below(db) == 15
     assert await prune(db, finalized_height=25, window=10) == 0         # nothing new
-    cur = await db.connection.execute(
-        "SELECT block_height, content, validator_signature FROM blocks ORDER BY block_height")
-    for height, content, signature in await cur.fetchall():
-        bc = _parse_block_content(block_codec.decode(content))
+    for row in db.store["blocks"].scan():
+        height, signature = row.block_height, row.validator_signature
+        bc = _parse_block_content(block_content(db, height))
         assert bool(bc.get("pruned")) == (height < 15), height
         assert (signature is None) == (height < 15)
     assert db.store["exchange_sections"].count() == 16                  # 15..30 keep sections
@@ -98,5 +95,4 @@ async def test_what_needs_the_pruned_bodies_refuses(db):
     assert len(await blocks_for_transfer(db, 15, 10)) == 10
     with pytest.raises(HistoryPruned, match="replay from genesis"):
         await rebuild_derived_state_interleaved(db)
-    cur = await db.connection.execute("SELECT COUNT(*) FROM blocks")
-    assert (await cur.fetchone())[0] == 30                              # nothing was reset
+    assert db.store["blocks"].count() == 30                             # nothing was reset

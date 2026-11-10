@@ -23,6 +23,7 @@ from qrdx.node import discovery as node_discovery
 from qrdx.node import sync as node_sync
 from qrdx.node.nodes_manager import NodeInterface, NodesManager
 from qrdx.rpc.modules.p2p import P2PModule
+from chain_rows import put_block
 
 PEER = {"node_id": "qxpushsyncpeer", "url": "http://peer.invalid"}
 
@@ -33,11 +34,8 @@ async def chain():
     os.close(fd)
     db = await DatabaseSQLite.create(path)
     for h in range(6):
-        await db.connection.execute(
-            "INSERT INTO blocks (block_hash, block_height, validator_address, timestamp, content) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (f"{h:064x}", h, f"0xPQproposer{h}", 1_700_000_000 + 2 * h, repr({"slot": h})),
-        )
+        put_block(db, h, f"{h:064x}", repr({"slot": h}), timestamp=1_700_000_000 + 2 * h,
+                  validator_address=f"0xPQproposer{h}")
     await db.connection.commit()
     yield db
     await db.connection.close()

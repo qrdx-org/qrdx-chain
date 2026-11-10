@@ -15,9 +15,10 @@ to its whole ancestry, so the index is valid exactly up to the highest height wh
 hash still matches the ``blocks`` table; ``sync`` finds that height (one comparison in the
 common case, a binary search after a reorg), drops everything above it, and re-derives.
 
-Index writes join the connection's current transaction (no commit of their own): a block that
-is rolled back takes its index rows with it, and a block deleted by a rollback is caught by the
-hash check on the next ``sync``.
+The index lives in the node's store (qrdx/store.py: ``chain_index`` and its vote, offender and
+FFG tables, each with the secondary indexes its questions need). Its writes join the store's
+current transaction (no commit of their own): a block that is rolled back takes its index rows
+with it, and a block deleted by a rollback is caught by the hash check on the next ``sync``.
 
 Every derived value is what the original per-call walk computed (tests/test_chain_index.py
 checks each against it, across reorgs).
@@ -27,16 +28,16 @@ epoch, finality, the validators' root — and each ask cost two round trips to t
 thread: the check that the chain had not changed, then the read. Two things make most of them
 free:
 
-* the connection counts every write to ``blocks`` (a TEMP trigger calls ``qrdx_chain_changed``)
-  and every rollback (``rollback`` is wrapped), so ``sync`` knows without a query when the chain
-  is as it last checked it;
+* the database counts every write to ``blocks`` (its block writers call ``blocks_changed``) and
+  every rollback (``rolled_back``), so ``sync`` knows without a read when the chain is as it last
+  checked it;
 * the hash and slot of the newest ``RECENT`` heights are kept in memory, exactly as the index
   rows hold them: written beside each row, cut where rows are dropped, forgotten whole on a
   rollback (and re-read in one query).
 
 So the index is still never trusted across a change: any write to ``blocks`` and any rollback
-sends ``sync`` back to the database. That holds while the node's database is written only
-through its connection (a snapshot is restored before the node starts). With
+sends ``sync`` back to the store. That holds while the node's blocks are written only through
+its database's methods (a snapshot is restored before the node starts). With
 ``QRDX_VERIFY_CHAIN_INDEX=1`` (the test suite) every answer from memory is checked against the
 database.
 """
@@ -53,51 +54,17 @@ from .logger import get_logger
 
 logger = get_logger(__name__)
 
-_SCHEMA = [
-    "CREATE TABLE IF NOT EXISTS chain_index ("
-    " height INTEGER PRIMARY KEY,"
-    " block_hash TEXT NOT NULL,"
-    " slot INTEGER,"
-    " epoch INTEGER,"
-    " randao_mix TEXT NOT NULL)",  # hex: the mix after folding this block's reveal
-    "CREATE INDEX IF NOT EXISTS idx_chain_index_slot ON chain_index(slot)",
-    "CREATE TABLE IF NOT EXISTS chain_index_votes ("
-    " height INTEGER NOT NULL,"
-    " carry_epoch INTEGER NOT NULL,"  # the epoch of the block carrying the vote
-    " target_epoch INTEGER NOT NULL,"
-    " validator TEXT NOT NULL)",
-    "CREATE INDEX IF NOT EXISTS idx_chain_index_votes_target"
-    " ON chain_index_votes(target_epoch, validator, carry_epoch)",
-    "CREATE INDEX IF NOT EXISTS idx_chain_index_votes_carry ON chain_index_votes(carry_epoch)",
-    "CREATE INDEX IF NOT EXISTS idx_chain_index_votes_height ON chain_index_votes(height)",
-    "CREATE TABLE IF NOT EXISTS chain_index_offenders ("
-    " height INTEGER NOT NULL,"
-    " offender TEXT NOT NULL)",  # lower-cased address a verified proof convicts
-    "CREATE INDEX IF NOT EXISTS idx_chain_index_offenders ON chain_index_offenders(offender, height)",
-    # The Casper FFG votes canonical blocks carry (qrdx/validator/ffg.py) — every field the
-    # finality computation and the proposer's inclusion check need, so neither re-parses a body.
-    "CREATE TABLE IF NOT EXISTS chain_index_ffg ("
-    " height INTEGER NOT NULL,"
-    " validator TEXT NOT NULL,"
-    " source_epoch INTEGER NOT NULL,"
-    " source_root TEXT NOT NULL,"
-    " target_epoch INTEGER NOT NULL,"
-    " target_root TEXT NOT NULL)",
-    "CREATE INDEX IF NOT EXISTS idx_chain_index_ffg_target"
-    " ON chain_index_ffg(target_epoch, validator, height)",
-    "CREATE INDEX IF NOT EXISTS idx_chain_index_ffg_height ON chain_index_ffg(height)",
-    "CREATE TABLE IF NOT EXISTS chain_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-]
-
 _TABLES = (
     "chain_index",
     "chain_index_votes",
     "chain_index_offenders",
     "chain_index_ffg",
 )
+_TOP = 2**62  # (above every height)
 # Bumped whenever what is derived per block changes: an index written by an older version is
 # dropped and re-derived (it is derived data; the chain is the source).
-_VERSION = "3"  # 3: no stake-op index (it could not tell an executed deposit from a refused one)
+_VERSION = "4"  # 3: no stake-op index (it could not tell an executed deposit from a refused one)
+# 4: in the store
 _BATCH = 256  # blocks read per query while catching up
 
 _locks: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = weakref.WeakKeyDictionary()
@@ -196,17 +163,15 @@ _recent: "weakref.WeakKeyDictionary[Any, _Recent]" = weakref.WeakKeyDictionary()
 
 
 class _Watch:
-    """The connection's count of writes to ``blocks`` and rollbacks (see the module doc), and
-    the count and tip at the last check that found the index in step with the chain; and the
-    count and tip when the tip was last read."""
+    """The database's count of writes to ``blocks`` and rollbacks (see the module doc), and
+    the count and tip at the last check that found the index in step with the chain."""
 
-    __slots__ = ("count", "clean_at", "tip", "tip_read")
+    __slots__ = ("count", "clean_at", "tip")
 
     def __init__(self) -> None:
         self.count = 0
         self.clean_at = -1
         self.tip = -1
-        self.tip_read: Tuple[int, int] = (-1, -1)
 
     def bump(self) -> None:
         self.count += 1
@@ -215,48 +180,30 @@ class _Watch:
         return self.clean_at == self.count
 
 
+# (by the database's store: every database object on one store shares its count)
 _watches: "weakref.WeakKeyDictionary[Any, _Watch]" = weakref.WeakKeyDictionary()
+
+
+def _watch_key(db: Any) -> Any:
+    return getattr(db, "store", None) or db
+
+
 # What else forgets on a rollback (a table created once per database: created again, since the
 # rollback may have taken it). Each is called with the database.
 _rollback_hooks: List[Any] = []
 
 
 def on_rollback(hook: Any) -> None:
-    """Call ``hook(db)`` after every rollback of ``db``'s connection (once per hook)."""
+    """Call ``hook(db)`` after every rollback of ``db`` (once per hook)."""
     if hook not in _rollback_hooks:
         _rollback_hooks.append(hook)
 
 
 def change_count(db: Any) -> Optional[int]:
-    """A number that changes whenever ``blocks`` is written or a rollback happens on ``db``'s
-    connection (None while they are not counted)."""
-    watch = _watches.get(db)
+    """A number that changes whenever ``blocks`` is written or ``db`` rolls back (None before
+    the index has looked at ``db``)."""
+    watch = _watches.get(_watch_key(db))
     return None if watch is None else watch.count
-
-
-def known_tip(db: Any) -> Optional[int]:
-    """The chain's tip (its highest height), if nothing was written to ``blocks`` and nothing
-    rolled back since it was last read; None to read it."""
-    watch = _watches.get(db)
-    if watch is None:
-        return None
-    if watch.clean():
-        return watch.tip
-    count, tip = watch.tip_read
-    return tip if count == watch.count else None
-
-
-def saw_tip(db: Any, read: Optional[Tuple[int, int]]) -> Optional[int]:
-    """``read`` None: the count to give back with the tip read next (None when writes are not
-    counted). ``read`` (that count, the tip read): remembered for ``known_tip``."""
-    watch = _watches.get(db)
-    if watch is None:
-        return None
-    if read is None:
-        return watch.count
-    if read[0] is not None:
-        watch.tip_read = (int(read[0]), int(read[1]))
-    return None
 
 
 def _verifying() -> bool:
@@ -264,52 +211,35 @@ def _verifying() -> bool:
 
 
 def _forget(db: Any) -> None:
-    """The index may differ from what memory holds of it (a rollback): ask the database."""
+    """The index may differ from what memory holds of it (a rollback): ask the store."""
     _synced.pop(db, None)
     _recent.pop(db, None)
-    _ready.pop(db, None)  # (a rollback can take tables or triggers created in its transaction)
-    watch = _watches.get(db)
+    _ready.pop(db, None)
+    watch = _watches.get(_watch_key(db))
     if watch is not None:
         watch.bump()
 
 
-async def _watch(db: Any) -> None:
-    """Count the connection's writes to ``blocks`` and its rollbacks: one count a connection,
-    shared by every database object on it. Registered for ``db`` only once its triggers are in
-    place (without them nothing would count, and the count would be trusted)."""
-    conn = db.connection
-    watch = getattr(conn, "qrdx_chain_watch", None)
+def _watch_of(db: Any) -> "_Watch":
+    watch = _watches.get(_watch_key(db))
     if watch is None:
-        create = getattr(conn, "create_function", None)
-        if create is None:
-            return  # (not counted: every sync asks the database)
-        watch = _Watch()
-        await create("qrdx_chain_changed", 0, watch.bump)
-        rollback = conn.rollback
-        if not getattr(rollback, "_qrdx_watched", False):
+        watch = _watches[_watch_key(db)] = _Watch()
+    return watch
 
-            async def watched_rollback(*args: Any, **kwargs: Any) -> Any:
-                try:
-                    return await rollback(*args, **kwargs)
-                finally:
-                    for other in list(_watches.keys()):  # (every db on this connection)
-                        if getattr(other, "connection", None) is conn:
-                            _forget(other)
-                            for hook in list(_rollback_hooks):
-                                try:
-                                    hook(other)
-                                except Exception:
-                                    pass
 
-            watched_rollback._qrdx_watched = True  # type: ignore[attr-defined]
-            conn.rollback = watched_rollback
-    for i, event in enumerate(("INSERT", "DELETE", "UPDATE OF block_hash, block_height")):
-        await conn.execute(
-            f"CREATE TEMP TRIGGER IF NOT EXISTS qrdx_chain_changed_{i} AFTER {event} ON main.blocks "
-            "BEGIN SELECT qrdx_chain_changed(); END"
-        )
-    conn.qrdx_chain_watch = watch
-    _watches[db] = watch
+def blocks_changed(db: Any) -> None:
+    """``db``'s block writers call this after writing to ``blocks`` (a block added, removed)."""
+    _watch_of(db).bump()
+
+
+def rolled_back(db: Any) -> None:
+    """``db``'s rollback calls this: what memory holds may be gone from the store."""
+    _forget(db)
+    for hook in list(_rollback_hooks):
+        try:
+            hook(db)
+        except Exception:
+            pass
 
 
 def _lock_for(db: Any) -> asyncio.Lock:
@@ -322,31 +252,20 @@ def _lock_for(db: Any) -> asyncio.Lock:
 async def _ensure(db: Any) -> None:
     if _ready.get(db):
         return
-    # One statement at a time: executescript() would COMMIT whatever the shared connection
-    # has pending — another task's half-applied block, say.
-    for sql in _SCHEMA:
-        await db.connection.execute(sql)
-    try:
-        await _watch(db)
-    except Exception as e:  # (no triggers: every sync asks the database)
-        _watches.pop(db, None)
-        logger.debug("chain index: writes to blocks not counted (%s)", e)
-    rows = await db.connection.execute_fetchall(
-        "SELECT value FROM chain_index_meta WHERE key = 'version'"
-    )
-    row = rows[0] if rows else None
-    if row is None or row[0] != _VERSION:
+    _watch_of(db)
+    meta = db.store["chain_index_meta"]
+    row = meta.get("version")
+    if row is None or row.value != _VERSION:
         for table in _TABLES:
-            await db.connection.execute(f"DELETE FROM {table}")
+            db.store[table].clear()
+        meta.delete("unordered")
         _recent.pop(db, None)
         _synced.pop(db, None)
-        await db.connection.execute("DROP TABLE IF EXISTS chain_index_ops")  # retired in v3
-        await db.connection.execute(
-            "INSERT OR REPLACE INTO chain_index_meta (key, value) VALUES ('version', ?)",
-            (_VERSION,),
-        )
+        meta.put("version", _VERSION)
         if row is not None:
-            logger.info("chain index: format changed (v%s → v%s) — re-deriving", row[0], _VERSION)
+            logger.info(
+                "chain index: format changed (v%s → v%s) — re-deriving", row.value, _VERSION
+            )
     _ready[db] = True
 
 
@@ -450,33 +369,22 @@ async def _index_block(db: Any, height: int, block_hash: str, content: Any, mix:
     reveal = _reveal(bc)
     if reveal is not None:
         mix = _mix_in(mix, reveal)
-    conn = db.connection
-    await conn.execute(
-        "INSERT OR REPLACE INTO chain_index (height, block_hash, slot, epoch, randao_mix) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (height, block_hash, slot, epoch, mix.hex()),
-    )
+    store = db.store
+    index = store["chain_index"]
+    if slot is not None:
+        below = index.scan(hi=(height,), reverse=True, limit=1)
+        if below and below[0].slot is not None and int(below[0].slot) >= slot:
+            store["chain_index_meta"].put("unordered", "1")  # (only a contrived chain)
+    index.put(height, block_hash, slot, epoch, mix.hex())
     recent = _recent.get(db)
     if recent is not None:
         recent.put(height, block_hash, slot)
-    votes = _votes(bc, epoch)
-    if votes:
-        await conn.executemany(
-            "INSERT INTO chain_index_votes (height, carry_epoch, target_epoch, validator) "
-            "VALUES (?, ?, ?, ?)",
-            [(height, epoch, te, v) for te, v in votes],
-        )
-    for offender in _offenders(bc):
-        await conn.execute(
-            "INSERT INTO chain_index_offenders (height, offender) VALUES (?, ?)", (height, offender)
-        )
-    ffg = _ffg(bc)
-    if ffg:
-        await conn.executemany(
-            "INSERT INTO chain_index_ffg (height, validator, source_epoch, source_root, "
-            "target_epoch, target_root) VALUES (?, ?, ?, ?, ?, ?)",
-            [(height, *v) for v in ffg],
-        )
+    for seq, (te, v) in enumerate(_votes(bc, epoch)):
+        store["chain_index_votes"].put(height, seq, epoch, te, v)
+    for seq, offender in enumerate(_offenders(bc)):
+        store["chain_index_offenders"].put(height, seq, offender)
+    for seq, vote in enumerate(_ffg(bc)):
+        store["chain_index_ffg"].put(height, seq, *vote)
     return mix
 
 
@@ -484,21 +392,18 @@ async def _index_block(db: Any, height: int, block_hash: str, content: Any, mix:
 
 
 async def _chain_hash(db: Any, height: int) -> Optional[str]:
-    rows = await db.connection.execute_fetchall(
-        "SELECT block_hash FROM blocks WHERE block_height = ?", (int(height),)
-    )
-    row = rows[0] if rows else None
-    return row[0] if row else None
+    row = db.store["blocks"].get(int(height))
+    return row.block_hash if row is not None else None
 
 
 async def _indexed_at_or_below(db: Any, height: int) -> Optional[Tuple[int, str, str]]:
-    rows = await db.connection.execute_fetchall(
-        "SELECT height, block_hash, randao_mix FROM chain_index WHERE height <= ? "
-        "ORDER BY height DESC LIMIT 1",
-        (int(height),),
-    )
-    row = rows[0] if rows else None
-    return (int(row[0]), row[1], row[2]) if row else None
+    rows = db.store["chain_index"].scan(hi=(int(height) + 1,), reverse=True, limit=1)
+    return (int(rows[0].height), rows[0].block_hash, rows[0].randao_mix) if rows else None
+
+
+def _drop_above(db: Any, height: int) -> None:
+    for table in _TABLES:
+        db.store[table].delete_prefix(lo=(int(height) + 1,), hi=(_TOP,))
 
 
 async def _valid_top(db: Any) -> int:
@@ -506,11 +411,10 @@ async def _valid_top(db: Any) -> int:
     it. Matching hashes form a prefix — a block's hash commits to its ancestry — so one
     comparison settles the usual case and a binary search finds the fork point after a
     reorg."""
-    rows = await db.connection.execute_fetchall("SELECT MAX(height) FROM chain_index")
-    row = rows[0] if rows else None
-    top = row[0] if row else None
-    if top is None:
+    rows = db.store["chain_index"].scan(reverse=True, limit=1)
+    if not rows:
         return -1
+    top = int(rows[0].height)
     entry = await _indexed_at_or_below(db, top)
     if entry and await _chain_hash(db, entry[0]) == entry[1]:
         return entry[0]
@@ -525,8 +429,7 @@ async def _valid_top(db: Any) -> int:
             lo = mid + 1
         else:
             hi = entry[0] - 1
-    for table in _TABLES:
-        await db.connection.execute(f"DELETE FROM {table} WHERE height > ?", (good,))
+    _drop_above(db, good)
     recent = _recent.get(db)
     if recent is not None:
         recent.cut(good)
@@ -544,7 +447,7 @@ async def sync(db: Any, up_to: Optional[int] = None) -> int:
     async with _lock_for(db):
         await _ensure(db)
         known = _synced.get(db)
-        watch = _watches.get(db)
+        watch = _watches.get(_watch_key(db))
         if known is not None and watch is not None and watch.clean():
             # (nothing written to blocks, nothing rolled back, since the check below last
             # found the index in step: no query)
@@ -553,18 +456,16 @@ async def sync(db: Any, up_to: Optional[int] = None) -> int:
                 return known[0]
         if known is not None:
             count = watch.count if watch is not None else None
-            # (the index's own row too: a rollback of the connection's transaction can take
-            # rows it wrote while the block they index stays)
-            rows = await db.connection.execute_fetchall(  # (statement and fetch: one trip)
-                "SELECT (SELECT MAX(block_height) FROM blocks), "
-                "(SELECT block_hash FROM blocks WHERE block_height = ?), "
-                "(SELECT block_hash FROM chain_index WHERE height = ?)",
-                (known[0], known[0]),
-            )
-            row = rows[0] if rows else None
-            tip = -1 if row is None or row[0] is None else int(row[0])
+            # (the index's own row too: a rollback of the store's transaction can take rows it
+            # wrote while the block they index stays)
+            tip = int(await db.get_block_height())
             target = tip if up_to is None else min(int(up_to), tip)
-            if row is not None and row[1] == known[1] == row[2]:
+            indexed = db.store["chain_index"].get(known[0])
+            if (
+                await _chain_hash(db, known[0])
+                == known[1]
+                == (indexed.block_hash if indexed is not None else None)
+            ):
                 if watch is not None and count is not None:
                     # (counted before the query: a write since makes it unclean again)
                     watch.clean_at, watch.tip = count, tip
@@ -592,15 +493,16 @@ async def _sync(db: Any, up_to: Optional[int]) -> int:
     below = await _indexed_at_or_below(db, top) if top >= 0 else None
     mix = bytes.fromhex(below[2]) if below else RANDAO_SEED
     start = top + 1
+    from . import block_codec
+
+    blocks, bodies = db.store["blocks"], db.store["block_bodies"]
     while start <= target:
         end = min(target, start + _BATCH - 1)
-        rows = await db.connection.execute_fetchall(
-            "SELECT block_height, block_hash, content FROM blocks "
-            "WHERE block_height BETWEEN ? AND ? ORDER BY block_height",
-            (start, end),
-        )
-        for height, block_hash, content in rows:
-            mix = await _index_block(db, int(height), block_hash, content, mix)
+        rows = blocks.scan(lo=(start,), hi=(end + 1,))
+        contents = bodies.get_many((int(r.block_height),) for r in rows)
+        for row, body in zip(rows, contents, strict=True):
+            content = block_codec.decode(body.content) if body is not None else None
+            mix = await _index_block(db, int(row.block_height), row.block_hash, content, mix)
         start = end + 1
         await asyncio.sleep(0)  # let the node run between batches while catching up
     return target
@@ -629,14 +531,10 @@ async def _kept(db: Any) -> Optional[_Recent]:
     recent = _recent.get(db)
     if recent is not None and recent.hashes and (recent.top, recent.hashes[-1]) == known:
         return recent
-    rows = await db.connection.execute_fetchall(
-        "SELECT height, block_hash, slot FROM chain_index WHERE height > ? AND height <= ? "
-        "ORDER BY height",
-        (known[0] - RECENT, known[0]),
-    )
+    rows = db.store["chain_index"].scan(lo=(known[0] - RECENT + 1,), hi=(known[0] + 1,))
     recent = _Recent()
-    for height, block_hash, slot in rows:
-        recent.put(int(height), block_hash, None if slot is None else int(slot))
+    for r in rows:
+        recent.put(int(r.height), r.block_hash, None if r.slot is None else int(r.slot))
     if (
         not recent.hashes
         or (recent.top, recent.hashes[-1]) != known
@@ -648,51 +546,63 @@ async def _kept(db: Any) -> Optional[_Recent]:
     return recent
 
 
-async def _checked(db: Any, kept: Any, sql: str, args: Tuple[Any, ...]) -> Any:
-    """``kept`` (an answer from memory), checked against the database when verifying."""
+async def _checked(db: Any, kept: Any, what: str, stored: Any) -> Any:
+    """``kept`` (an answer from memory), checked against the store's (``stored``, a function
+    reading it) when verifying."""
     if _verifying():
-        rows = await db.connection.execute_fetchall(sql, args)
-        row = rows[0] if rows else None
-        value = row[0] if row else None
-        want = value if not isinstance(kept, int) or value is not None else -1
+        want = stored()
         if want != kept:
-            raise AssertionError(f"chain index memory: {sql} {args} → {kept!r}, not {want!r}")
+            raise AssertionError(f"chain index memory: {what} → {kept!r}, not {want!r}")
     return kept
+
+
+def _stored_before_slot(db: Any, slot: int, max_height: Optional[int] = None) -> int:
+    """The highest height (≤ ``max_height``) whose slot is known and below ``slot``, from the
+    store (-1 if none): by the slot index — on a chain whose slots rise with its heights (every
+    canonical one: a block's slot is after its parent's) the first such row down from ``slot``
+    — else by every row."""
+    index = db.store["chain_index"]
+    floor = -(2**62)  # (an unknown slot sorts below every number)
+    if db.store["chain_index_meta"].get("unordered") is None:
+        for r in index.scan_index("by_slot", lo=(floor,), hi=(int(slot),), reverse=True):
+            if max_height is None or int(r.height) <= int(max_height):
+                return int(r.height)
+        return -1
+    best = -1
+    for r in index.scan_index("by_slot", lo=(floor,), hi=(int(slot),)):
+        if max_height is None or int(r.height) <= int(max_height):
+            best = max(best, int(r.height))
+    return best
 
 
 async def highest_height_before_slot(db: Any, slot: int) -> int:
     """The highest block height whose slot is < ``slot`` (-1 if none)."""
     await sync(db)
-    sql = "SELECT MAX(height) FROM chain_index WHERE slot IS NOT NULL AND slot < ?"
     recent = await _kept(db)
     if recent is not None:
         answered, height = recent.before_slot(int(slot))
         if answered:
-            return int(await _checked(db, height, sql, (int(slot),)))
-    rows = await db.connection.execute_fetchall(sql, (int(slot),))
-    row = rows[0] if rows else None
-    return int(row[0]) if row and row[0] is not None else -1
+            return int(
+                await _checked(
+                    db, height, f"before slot {slot}", lambda: _stored_before_slot(db, slot)
+                )
+            )
+    return _stored_before_slot(db, slot)
 
 
 async def slashed_before(db: Any, address: str, before_height: int) -> bool:
     """True if a canonical block below ``before_height`` carries a verified slashing proof
     against ``address``."""
     await sync(db, int(before_height) - 1)
-    rows = await db.connection.execute_fetchall(
-        "SELECT 1 FROM chain_index_offenders WHERE offender = ? AND height < ? LIMIT 1",
-        (address.lower(), int(before_height)),
-    )
-    return (rows[0] if rows else None) is not None
+    rows = db.store["chain_index_offenders"].scan_index("by_offender", address.lower(), limit=1)
+    return bool(rows) and int(rows[0].height) < int(before_height)
 
 
 async def offenders_before(db: Any, before_height: int) -> List[str]:
     """Every address a canonical block below ``before_height`` convicts (lower-cased, sorted)."""
     await sync(db, int(before_height) - 1)
-    rows = await db.connection.execute_fetchall(
-        "SELECT DISTINCT offender FROM chain_index_offenders WHERE height < ? ORDER BY offender",
-        (int(before_height),),
-    )
-    return [r[0] for r in rows]
+    rows = db.store["chain_index_offenders"].scan(lo=(-(2**62),), hi=(int(before_height),))
+    return sorted({r.offender for r in rows})
 
 
 # ── Casper FFG (validator/ffg.py) ────────────────────────────────────────────────────────
@@ -700,15 +610,17 @@ async def offenders_before(db: Any, before_height: int) -> List[str]:
 
 async def block_hash_at(db: Any, height: int) -> Optional[str]:
     await sync(db, height)
-    sql = "SELECT block_hash FROM chain_index WHERE height = ?"
+
+    def stored() -> Optional[str]:
+        row = db.store["chain_index"].get(int(height))
+        return row.block_hash if row is not None else None
+
     recent = await _kept(db)
     if recent is not None:
         answered, found = recent.hash_at(int(height))
         if answered:
-            return await _checked(db, found, sql, (int(height),))  # type: ignore[no-any-return]
-    rows = await db.connection.execute_fetchall(sql, (int(height),))
-    row = rows[0] if rows else None
-    return row[0] if row else None
+            return await _checked(db, found, f"hash at {height}", stored)  # type: ignore[no-any-return]
+    return stored()
 
 
 async def checkpoint(db: Any, epoch: int, slots_per_epoch: int) -> Optional[Tuple[int, str]]:
@@ -729,31 +641,39 @@ async def ffg_votes(
     ``up_to_height``, default the tip), in chain order: (height, validator, source epoch,
     source root, target epoch, target root)."""
     await sync(db, up_to_height)
-    sql = (
-        "SELECT height, validator, source_epoch, source_root, target_epoch, target_root "
-        "FROM chain_index_ffg WHERE target_epoch >= ?"
+    return [
+        (int(r.height), r.validator, r.source_epoch, r.source_root, r.target_epoch, r.target_root)
+        for r in _ffg_rows(db, from_target_epoch, up_to_height)
+    ]
+
+
+def _ffg_rows(db: Any, from_target_epoch: int, up_to_height: Optional[int]) -> List[Any]:
+    """The FFG rows with target epoch ≥ ``from_target_epoch`` carried at or below
+    ``up_to_height``, in chain order (height, then the order the block carries them)."""
+    rows = db.store["chain_index_ffg"].scan_index(
+        "by_target", lo=(int(from_target_epoch),), hi=(_TOP,)
     )
-    args: List[Any] = [int(from_target_epoch)]
     if up_to_height is not None:
-        sql += " AND height <= ?"
-        args.append(int(up_to_height))
-    rows = await db.connection.execute_fetchall(sql + " ORDER BY height, rowid", args)
-    return [tuple(r) for r in rows]  # type: ignore[misc]
+        rows = [r for r in rows if int(r.height) <= int(up_to_height)]
+    return sorted(rows, key=lambda r: (int(r.height), int(r.seq)))
 
 
 async def height_before_slot_at_or_below(db: Any, slot: int, max_height: int) -> int:
     """The highest canonical height ≤ ``max_height`` whose slot is < ``slot`` (-1 if none)."""
     await sync(db, max_height)
-    sql = "SELECT MAX(height) FROM chain_index WHERE slot IS NOT NULL AND slot < ? AND height <= ?"
-    args = (int(slot), int(max_height))
     recent = await _kept(db)
     if recent is not None:
         answered, height = recent.before_slot(int(slot), int(max_height))
         if answered:
-            return int(await _checked(db, height, sql, args))
-    rows = await db.connection.execute_fetchall(sql, args)
-    row = rows[0] if rows else None
-    return int(row[0]) if row and row[0] is not None else -1
+            return int(
+                await _checked(
+                    db,
+                    height,
+                    f"before slot {slot} at or below {max_height}",
+                    lambda: _stored_before_slot(db, slot, max_height),
+                )
+            )
+    return _stored_before_slot(db, slot, max_height)
 
 
 async def voted_targets(
@@ -762,18 +682,12 @@ async def voted_targets(
     """{(validator, target epoch): its first canonical FFG vote} for targets ≥
     ``from_target_epoch`` carried at or below ``up_to_height`` (default: the tip)."""
     await sync(db, up_to_height)
-    sql = (
-        "SELECT validator, target_epoch, source_epoch, source_root, target_root FROM "
-        "chain_index_ffg WHERE target_epoch >= ?"
-    )
-    args: List[Any] = [int(from_target_epoch)]
-    if up_to_height is not None:
-        sql += " AND height <= ?"
-        args.append(int(up_to_height))
-    rows = await db.connection.execute_fetchall(sql + " ORDER BY height, rowid", args)
     out: Dict[Tuple[str, int], Tuple[int, str, int, str]] = {}
-    for validator, te, se, sr, tr in rows:
-        out.setdefault((validator, int(te)), (int(se), sr, int(te), tr))
+    for r in _ffg_rows(db, from_target_epoch, up_to_height):
+        out.setdefault(
+            (r.validator, int(r.target_epoch)),
+            (int(r.source_epoch), r.source_root, int(r.target_epoch), r.target_root),
+        )
     return out
 
 
@@ -819,12 +733,14 @@ async def validator_public_key(db: Any, address: str, before_height: int) -> Opt
 async def slot_at(db: Any, height: int) -> Optional[int]:
     """The slot of the canonical block at ``height`` (None if unknown)."""
     await sync(db, height)
-    sql = "SELECT slot FROM chain_index WHERE height = ?"
+
+    def stored() -> Optional[int]:
+        row = db.store["chain_index"].get(int(height))
+        return int(row.slot) if row is not None and row.slot is not None else None
+
     recent = await _kept(db)
     if recent is not None:
         answered, found = recent.slot_at(int(height))
         if answered:
-            return await _checked(db, found, sql, (int(height),))  # type: ignore[no-any-return]
-    rows = await db.connection.execute_fetchall(sql, (int(height),))
-    row = rows[0] if rows else None
-    return int(row[0]) if row and row[0] is not None else None
+            return await _checked(db, found, f"slot at {height}", stored)  # type: ignore[no-any-return]
+    return stored()

@@ -43,8 +43,7 @@ async def test_the_database_stores_compressed_and_hands_out_text():
         body = _body()
         await db.add_block(block_hash="aa" * 32, block_height=0, block_content=body,
                            validator_address="0xPQ" + "00" * 32, timestamp=1)
-        cur = await db.connection.execute("SELECT content FROM blocks WHERE block_height = 0")
-        raw = (await cur.fetchone())[0]
+        raw = db.store["block_bodies"].get(0).content
         assert isinstance(raw, bytes) and len(raw) < len(body)
         for got in (await db.get_block_by_id(0), await db.get_block("aa" * 32),
                     await db.get_latest_block(), (await db.get_blocks(0, 5))[0]):

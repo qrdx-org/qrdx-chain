@@ -8,6 +8,8 @@ created under, and forks that have passed can never be changed, removed or inser
 chain.
 """
 import json
+
+from qrdx import block_codec
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -77,8 +79,7 @@ async def test_a_different_spec_refuses_to_start(monkeypatch, db):
 async def test_a_database_from_before_chain_specs_refuses_to_start(monkeypatch, db):
     await _chain(monkeypatch, db, _spec())
     content = {"type": "genesis", "chain_id": 88888}                 # no chain_spec_hash
-    await db.connection.execute("UPDATE blocks SET content = ? WHERE block_height = 0",
-                                (json.dumps(content),))
+    db.store["block_bodies"].put(0, block_codec.encode(json.dumps(content)))
     await db.connection.commit()
     with pytest.raises(chain_identity.ChainIdentityError, match="before chain specs"):
         await _start(monkeypatch, _spec())

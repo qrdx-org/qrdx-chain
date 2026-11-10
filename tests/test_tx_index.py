@@ -24,6 +24,7 @@ from qrdx.node import evm_runtime
 from eth_account import Account as EthAccount
 from eth_utils import to_checksum_address
 from test_evm_native_token_rebuild import ALICE, BOB, TS0, _add_block, _legacy, _transfer, _use
+from chain_rows import set_block
 
 D = Decimal
 
@@ -216,8 +217,7 @@ async def test_a_reorg_cuts_the_index_and_reindexes(chain):
     assert _ops(await tx_index.history(db, BOB)) == [("evm", "TRANSFER", 3)]
 
     # a block replaced without remove_blocks (a hash change at an indexed height) is noticed
-    await db.connection.execute("UPDATE blocks SET block_hash = ? WHERE block_height = 2",
-                                ("ff" * 32,))
+    set_block(db, 2, block_hash="ff" * 32)
     await db.connection.commit()
     assert await tx_index.sync_index(db, mgr.journal) == 2           # heights 2 and 3 again
     assert (await db.tx_index_blocks_from(2))[0] == (2, "ff" * 32)

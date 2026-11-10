@@ -19,6 +19,7 @@ from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.exchange import ExchangeOpType as Op
 from qrdx.exchange import ExchangeStateManager, ExchangeTransaction
 from qrdx.exchange.orderbook import Order, OrderSide, OrderType
+from chain_rows import put_block
 
 T0 = 1_700_000_000
 OWNER = "0xPQ" + "a" * 64
@@ -167,9 +168,7 @@ async def test_a_contract_verifies_an_exchange_entry(chain):
     mgr.set_available_balance(OWNER, D(1_000))
     _tx(mgr, OWNER, Op.QNS_REGISTER, name="carol")
     signed = await _seal(chain.db, mgr, 1)
-    await chain.db.connection.execute(
-        "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, ?, ?, 0)",
-        ("1" * 64, 1, repr({"number": 1, "state_root": signed})))
+    put_block(chain.db, 1, "1" * 64, repr({"number": 1, "state_root": signed}))
     await chain.db.connection.commit()
     p = await state_proofs.prove_exchange(chain.db, mgr, "qns.names", "carol.qrdx")
     r = await chain.tx(ALICE, STATE_PROOF_ADDRESS, encode(p))

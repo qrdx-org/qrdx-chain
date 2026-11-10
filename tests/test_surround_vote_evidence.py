@@ -15,6 +15,8 @@ from qrdx.validator.slashing_block import (
     attestation_equivocation, make_attestation_evidence, verify_attestation_evidence,
 )
 
+from chain_rows import put_block
+
 
 def _root(epoch):
     """A checkpoint root per epoch (one honest chain)."""
@@ -147,9 +149,7 @@ async def test_surround_vote_records_and_enforces_50pct():
             [{"address": x, "public_key": "", "stake": "100000"} for x in [addr, *others]])
         for h, slot, extra in ((0, 0, {}), (1, SLOTS_PER_EPOCH + 1, {BLOCK_SLASHING_KEY: [ev]})):
             content = {"number": h, "slot": slot, "epoch": slot // SLOTS_PER_EPOCH, **extra}
-            await db.connection.execute(
-                "INSERT INTO blocks (block_hash, block_height, content, timestamp) "
-                "VALUES (?, ?, ?, 0)", (f"{h:064x}", h, repr(content)))
+            put_block(db, h, f"{h:064x}", repr(content))
         assert await record_block_slashing_evidence(db, {BLOCK_SLASHING_KEY: [ev]}) == 1
         await db.connection.commit()
         state = await ES.state_at(db, 2)

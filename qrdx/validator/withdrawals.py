@@ -149,11 +149,8 @@ async def slashed_on_chain_by_scan(db, address: str, before_height: int) -> bool
     from .block_verification import _parse_block_content
     from .slashing_block import extract_slashing_evidence_from_dict, verified_offender
 
-    cur = await db.connection.execute(
-        "SELECT content FROM blocks WHERE block_height < ? ORDER BY block_height",
-        (int(before_height),),
-    )
-    for (stored,) in await cur.fetchall():
+    bodies = db.store["block_bodies"].scan(lo=(-(2**62),), hi=(int(before_height),))
+    for stored in (b.content for b in bodies):
         content = decode(stored) or ""  # bodies are stored compressed: filter after decoding
         if (
             "slashing_evidence" not in content

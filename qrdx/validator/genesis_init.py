@@ -534,10 +534,7 @@ class GenesisInitializer:
         metadata["chain_spec_hash"] = state.chain_spec_hash
         # In the node's own database (chain_metadata), never beside the package: a file there
         # is shared by every node started from this checkout, and was dirtied by each one.
-        await self.db.connection.execute(
-            "INSERT OR REPLACE INTO chain_metadata (key, value) VALUES ('genesis', ?)",
-            (json.dumps(metadata, sort_keys=True),),
-        )
+        self.db.set_metadata("genesis", json.dumps(metadata, sort_keys=True))
         await self.db.connection.commit()
 
 

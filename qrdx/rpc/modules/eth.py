@@ -304,25 +304,16 @@ class EthModule(RPCModule):
         count = 0
         # Native transactions
         try:
-            cursor = await db.connection.execute(
-                "SELECT COUNT(*) FROM transactions WHERE block_hash = ?",
-                (block_hash,),
-            )
-            row = await cursor.fetchone()
-            count += row[0] if row else 0
+            count += len(db.store["transactions"].scan_index("by_block", block_hash))
         except Exception:
             pass
         # EVM (contract) transactions
         try:
-            cursor = await db.connection.execute(
-                "SELECT block_height FROM blocks WHERE block_hash = ?",
-                (block_hash,),
-            )
-            brow = await cursor.fetchone()
-            if brow:
+            found = db.store["blocks"].scan_index("by_hash", block_hash, limit=1)
+            if found:
                 cursor2 = await db.connection.execute(
                     "SELECT COUNT(*) FROM contract_transactions WHERE block_number = ?",
-                    (brow[0],),
+                    (found[0].block_height,),
                 )
                 crow = await cursor2.fetchone()
                 count += crow[0] if crow else 0
@@ -334,14 +325,8 @@ class EthModule(RPCModule):
         """Get native transactions in a block as dicts."""
         db = self._db()
         try:
-            cursor = await db.connection.execute(
-                "SELECT tx_hash, tx_hex, block_hash, inputs_addresses, "
-                "outputs_addresses, outputs_amounts, fees, created_at "
-                "FROM transactions WHERE block_hash = ? ORDER BY rowid ASC",
-                (block_hash,),
-            )
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+            rows = db.store["transactions"].scan_index("by_block", block_hash)
+            return [{k: v for k, v in r._asdict().items() if k != "seq"} for r in rows]
         except Exception:
             return []
 
@@ -613,10 +598,7 @@ class EthModule(RPCModule):
             highest = current
             if hasattr(db, "connection"):
                 try:
-                    cursor = await db.connection.execute("SELECT MAX(block_height) FROM blocks")
-                    row = await cursor.fetchone()
-                    if row and row[0] is not None:
-                        highest = max(highest, row[0])
+                    highest = max(highest, int(await db.get_block_height()))
                 except Exception:
                     pass
             if current >= highest:
@@ -1064,12 +1046,13 @@ class EthModule(RPCModule):
         # Count native transactions from this address
         db = self._db()
         try:
-            cursor = await db.connection.execute(
-                "SELECT COUNT(*) FROM transactions WHERE inputs_addresses LIKE ?",
-                (f"%{address}%",),
+            return _to_hex(
+                sum(
+                    1
+                    for r in db.store["transactions"].scan()
+                    if address in (r.inputs_addresses or "")
+                )
             )
-            row = await cursor.fetchone()
-            return _to_hex(row[0] if row else 0)
         except Exception as e:
             logger.debug("native tx count(%s) failed: %s", address, e)
 
@@ -1718,14 +1701,10 @@ class EthModule(RPCModule):
         if block_hash:
             bh_clean = _strip_0x(block_hash)
             try:
-                cursor = await db.connection.execute(
-                    "SELECT block_height FROM blocks WHERE block_hash = ?",
-                    (bh_clean,),
-                )
-                brow = await cursor.fetchone()
-                if brow:
+                found = db.store["blocks"].scan_index("by_hash", bh_clean, limit=1)
+                if found:
                     query_parts.append("block_number = ?")
-                    params.append(brow[0])
+                    params.append(found[0].block_height)
                 else:
                     return []
             except Exception:
@@ -1787,13 +1766,9 @@ class EthModule(RPCModule):
                 # Get block hash for this block number
                 block_hash_val = _ZERO_HASH
                 try:
-                    bcur = await db.connection.execute(
-                        "SELECT block_hash FROM blocks WHERE block_height = ?",
-                        (bn,),
-                    )
-                    brow = await bcur.fetchone()
-                    if brow:
-                        block_hash_val = _ensure_0x(brow[0])
+                    brow = db.store["blocks"].get(int(bn))
+                    if brow is not None:
+                        block_hash_val = _ensure_0x(brow.block_hash)
                 except Exception:
                     pass
 

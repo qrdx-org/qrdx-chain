@@ -27,7 +27,6 @@ def _node_db(path, checkpoint=100):
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript("""
-        CREATE TABLE blocks (block_hash TEXT, block_height INTEGER, content TEXT);
         CREATE TABLE exchange_checkpoint (id INTEGER PRIMARY KEY, height INTEGER,
                                           block_hash TEXT, state BLOB, journal BLOB);
         CREATE TABLE peers (id TEXT, address TEXT);
@@ -37,8 +36,6 @@ def _node_db(path, checkpoint=100):
         CREATE TABLE hist_trades (id INTEGER, data TEXT);
         CREATE TABLE validator_log_roots (height INTEGER, root TEXT);
     """)
-    for h in range(0, 150):
-        conn.execute("INSERT INTO blocks VALUES (?, ?, ?)", (f"{h:064x}", h, "x" * 200))
     conn.execute("INSERT INTO exchange_checkpoint VALUES (1, ?, ?, ?, ?)",
                  (checkpoint, f"{checkpoint:064x}", b"state", b"journal"))
     conn.execute("INSERT INTO peers VALUES ('p1', ?)", (f"http://{PEER_IP}:3007",))
@@ -55,6 +52,10 @@ def _node_db(path, checkpoint=100):
         store["account_state"].put(address="0xPQa", balance="5")
     store["post_roots"].put("h", 99, "planted")  # (never trusted)
     store["smt_nodes"].put("0:0:", b"planted")
+    for h in range(0, 150):
+        store["blocks"].put(block_height=h, block_hash=f"{h:064x}")
+        store["block_bodies"].put(h, b"x" * 200)
+    store["chain_index"].put(99, "h", 99, 12, "planted")  # (rebuilt from the blocks)
     store.commit()
     store.close()
     return conn
@@ -94,14 +95,14 @@ def test_a_published_snapshot_leaves_out_what_a_restore_discards(tmp_path):
     for table in ("peers", "pending_transactions", "tx_index", "tx_participants", "hist_trades",
                   "validator_log_roots"):
         assert _count(copy, table) == 0, table
-    for table in ("blocks", "exchange_checkpoint"):
-        assert _count(copy, table) > 0, table
+    assert _count(copy, "exchange_checkpoint") > 0
     store_copy = copy + ".store"
     store_raw = open(store_copy, "rb").read()
     assert manifest["store"]["sha256"] == hashlib.sha256(store_raw).hexdigest()
-    for table in ("post_roots", "smt_nodes"):
+    for table in ("post_roots", "smt_nodes", "chain_index"):
         assert _store_count(store_copy, table) == 0, table
     assert _store_count(store_copy, "account_state") == 1
+    assert _store_count(store_copy, "blocks") == 150
     assert b"planted" not in store_raw   # (compacted: not only unlinked)
     raw = open(copy, "rb").read()
     assert PEER_IP.encode() not in raw and b"secret-pending" not in raw   # overwritten
@@ -115,7 +116,7 @@ def test_a_restore_also_discards_the_transaction_participants(tmp_path):
     _node_db(db).close()
     snapshot._wipe(db)
     assert _count(db, "tx_participants") == 0 and _count(db, "tx_index") == 0
-    assert _count(db, "blocks") == 150
+    assert _store_count(db + ".store", "blocks") == 150
 
 
 def test_a_node_publishes_each_newer_checkpoint_and_keeps_the_newest(tmp_path):

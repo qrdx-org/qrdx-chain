@@ -499,6 +499,9 @@ The fourth round, consensus changes for the regenesis (2026-11-05):
       Slot accounting shows why: proposers sent their blocks a median 157 ms into their slot
       (p90 358 ms, past its end), their event loop still busy with the block before. The next
       step is the event loop, not the database.
+    * With the chain's tables in the store too (blocks, transactions, the chain index), an
+      import's database round trips fell to a median 11. Live, 1,000 a second at 3.97 blocks a
+      second; 1,500 at 2.74; 2,000 executed 1,877 at 2.84.
 
 Each block's phase line ends with its database round trips (`db N`).
 

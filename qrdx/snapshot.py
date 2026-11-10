@@ -205,6 +205,23 @@ def _copy_store(source: str, dest: str) -> None:
         other.close()
 
 
+def _chain_ends(path: str) -> Tuple[int, Optional[str]]:
+    """(the tip's height, the genesis block's hash) of the store file at ``path``."""
+    from . import store as store_mod
+
+    s = store_mod.Store(path)
+    try:
+        top = s["blocks"].scan(reverse=True, limit=1)
+        genesis = s["blocks"].get(0)
+        return (int(top[0].block_height) if top else -1), (
+            genesis.block_hash if genesis is not None else None
+        )
+    finally:
+        s.close()
+        if os.path.exists(path + "-lck"):
+            os.remove(path + "-lck")
+
+
 def _clear_store(path: str, tables: Sequence[str], compact: bool = False) -> None:
     """Empty ``tables`` of the store file at ``path`` (and compact it)."""
     from . import store as store_mod
@@ -343,15 +360,14 @@ def create(source_db: str, out_dir: str, public: bool = False) -> Dict[str, Any]
             conn.commit()
             conn.execute("VACUUM")
         height, block_hash, _state = _exchange_checkpoint(conn)
-        tip = conn.execute("SELECT MAX(block_height) FROM blocks").fetchone()[0]
-        genesis = conn.execute("SELECT block_hash FROM blocks WHERE block_height = 0").fetchone()
     finally:
         conn.close()
+    tip, genesis = _chain_ends(store_path)
     manifest = {
         "format": FORMAT,
         "tip": int(tip),
         "checkpoint": {"height": height, "block_hash": block_hash},
-        "genesis_hash": genesis[0] if genesis else None,
+        "genesis_hash": genesis,
         "bytes": os.path.getsize(db_path),
         "sha256": _sha256(db_path),
         "store": {"bytes": os.path.getsize(store_path), "sha256": _sha256(store_path)},
@@ -373,15 +389,15 @@ _STORE_RECOMPUTED = (
     "smt_stale",
     "smt_roots",
     "state_root_parts",
-)
-# Rebuilt from the verified blocks.
-_REBUILT = (
+    # (rebuilt from the verified blocks)
     "chain_index",
     "chain_index_votes",
     "chain_index_offenders",
     "chain_index_ffg",
     "chain_index_meta",
 )
+# Rebuilt from the verified blocks (in the store now: above).
+_REBUILT: Tuple[str, ...] = ()
 # This node's own, not the server's.
 _LOCAL = (
     "peers",
@@ -438,18 +454,13 @@ async def _genesis(db: Any, genesis_file: Optional[str], scratch: str) -> str:
     try:
         await initialize_genesis_if_needed(ref, genesis_file=genesis_file, chain_spec=spec)
         want = await ref.get_block_by_id(0)
-        cur = await ref.connection.execute("SELECT key, value FROM chain_metadata")
-        metadata = [tuple(r) for r in await cur.fetchall()]
+        metadata = [(r.key, r.value) for r in ref.store["chain_metadata"].scan()]
         cur = await ref.connection.execute("SELECT * FROM system_wallets ORDER BY address")
         wallets = [tuple(r) for r in await cur.fetchall()]
         cols = [d[0] for d in cur.description] if cur.description else []
         # Block 0's records (the allocations, system wallets and predeployed contracts) are what
         # every rebuild seeds the state from: this network's, never the server's.
-        cur = await ref.connection.execute(
-            "SELECT * FROM transactions WHERE block_hash = ? ORDER BY tx_hash", (want["hash"],)
-        )
-        records = [tuple(r) for r in await cur.fetchall()]
-        record_cols = [d[0] for d in cur.description] if cur.description else []
+        records = ref.store["transactions"].scan_index("by_block", want["hash"])
     finally:
         await ref.close()
     have = await db.get_block_by_id(0)
@@ -463,23 +474,20 @@ async def _genesis(db: Any, genesis_file: Optional[str], scratch: str) -> str:
     # the step back to the checkpoint (were it false, the step back would be inexact, and the
     # roots would not match); the restore then sets its own.
     conn = db.connection
-    await conn.execute("DELETE FROM chain_metadata WHERE key != 'undo_floor'")
-    await conn.executemany(
-        "INSERT OR REPLACE INTO chain_metadata (key, value) VALUES (?, ?)",
-        [(k, v) for k, v in metadata if k != "undo_floor"],
-    )
+    db.store["chain_metadata"].delete_prefix()
+    for k, v in metadata:
+        db.set_metadata(k, v)
     await conn.execute("DELETE FROM system_wallets")
     if wallets:
         marks = ", ".join("?" * len(cols))
         await conn.executemany(
             f"INSERT INTO system_wallets ({', '.join(cols)}) VALUES ({marks})", wallets
         )
-    await conn.execute("DELETE FROM transactions WHERE block_hash = ?", (want["hash"],))
-    if records:
-        marks = ", ".join("?" * len(record_cols))
-        await conn.executemany(
-            f"INSERT INTO transactions ({', '.join(record_cols)}) VALUES ({marks})", records
-        )
+    txs = db.store["transactions"]
+    for old in txs.scan_index("by_block", want["hash"]):
+        txs.delete(old.tx_hash)
+    for record in records:
+        txs.put(*record)
     return str(want["hash"])
 
 
@@ -713,12 +721,9 @@ async def restore(
         CHECKPOINTS[height] = (checkpoint_hash, mgr.capture())
         mgr.journal = ExchangeJournal()
         await persist_checkpoint(db, height)
-        await db.connection.execute(
-            "INSERT OR REPLACE INTO chain_metadata (key, value) VALUES (?, ?)",
-            (
-                "restored_from_snapshot",
-                json.dumps({"height": height, "block_hash": checkpoint_hash, "anchor": anchor}),
-            ),
+        db.set_metadata(
+            "restored_from_snapshot",
+            json.dumps({"height": height, "block_hash": checkpoint_hash, "anchor": anchor}),
         )
         await db.connection.commit()
         ok = True

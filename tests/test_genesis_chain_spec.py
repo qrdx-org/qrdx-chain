@@ -133,8 +133,7 @@ async def test_a_node_reproduces_the_genesis_its_file_describes(tmp_path, db):
     assert await db.get_address_balance(BOB) == Decimal("250.5")
     assert await db.get_address_balance(ALICE) == Decimal("1000")
     # Recorded in the node's own database, not beside the package.
-    cur = await db.connection.execute("SELECT value FROM chain_metadata WHERE key = 'genesis'")
-    meta = json.loads((await cur.fetchone())[0])
+    meta = json.loads(db.get_metadata("genesis"))
     assert meta["genesis_block_hash"] == block.block_hash
     # Already initialised: a second call changes nothing.
     assert await initialize_genesis_if_needed(db, genesis_file=path, chain_spec=SPEC) is False

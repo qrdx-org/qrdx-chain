@@ -176,15 +176,12 @@ async def _target_stakes(db: Any, view: "ChainView", target: int) -> Dict[str, D
 
 async def _stored_finalized(db: Any) -> Optional[Tuple[int, str, int]]:
     try:
-        rows = await db.connection.execute_fetchall(  # (statement and fetch: one trip)
-            "SELECT value FROM chain_metadata WHERE key = 'ffg_finalized'"
-        )
-        row = rows[0] if rows else None
+        value = db.get_metadata("ffg_finalized")
     except Exception:
         return None
-    if not row:
+    if value is None:
         return None
-    v = json.loads(row[0])
+    v = json.loads(value)
     return int(v["epoch"]), str(v["root"]), int(v["height"])
 
 
@@ -383,9 +380,9 @@ async def update(db: Any) -> Dict[str, int]:
         return {"justified_epoch": -1, "finalized_epoch": -1}
     fin_epoch, fin_root = state.finalized
     if prev is None or fin_epoch > prev[0]:
-        await db.connection.execute(
-            "INSERT OR REPLACE INTO chain_metadata (key, value) VALUES ('ffg_finalized', ?)",
-            (json.dumps({"epoch": fin_epoch, "root": fin_root, "height": state.finalized_height}),),
+        db.set_metadata(
+            "ffg_finalized",
+            json.dumps({"epoch": fin_epoch, "root": fin_root, "height": state.finalized_height}),
         )
         try:
             from ..derived_state_rebuild import prune_reorg_state

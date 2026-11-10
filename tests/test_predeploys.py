@@ -128,9 +128,8 @@ async def test_genesis_writes_them_and_every_rebuild_seeds_them_again(genesis_db
     assert [a[0] for a in accounts] == [predeploys.IMPLEMENTATION_ADDRESS, predeploys.FACTORY_ADDRESS]
     assert accounts[1][1] == keccak(predeploys.factory_code()).hex() and accounts[1][2:] == (1, 1)
     assert storage == [(predeploys.IMPLEMENTATION_ADDRESS, "00" * 32, predeploys.IMPLEMENTATION_LOCK)]
-    cur = await db.connection.execute(
-        "SELECT tx_hex FROM transactions WHERE tx_hex LIKE '%genesis_contract%'")
-    assert len(await cur.fetchall()) == 2                      # block-0 records
+    records = [t for t in db.store["transactions"].scan() if "genesis_contract" in t.tx_hex]
+    assert len(records) == 2                                   # block-0 records
 
     root = await db.get_account_state_root()
     db.store["account_state"].delete_prefix()    # as a rebuild clears it

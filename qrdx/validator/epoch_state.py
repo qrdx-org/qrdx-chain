@@ -562,11 +562,13 @@ async def epoch_inputs(db: Any, epoch: int, up_to_height: int) -> EpochInputs:
     from .ffg import INCLUSION_EPOCHS
 
     conn = db.connection
-    cur = await conn.execute(
-        "SELECT MIN(height), MAX(height) FROM chain_index WHERE epoch = ? AND height <= ?",
-        (int(epoch), int(up_to_height)),
-    )
-    lo, hi = await cur.fetchone()
+    heights = [
+        int(r.height)
+        for r in db.store["chain_index"].scan_index("by_epoch", int(epoch))
+        if int(r.height) <= int(up_to_height)
+    ]
+    lo: Optional[int] = min(heights) if heights else None
+    hi: int = max(heights) if heights else -1
     ops: List[Tuple[str, str, Optional[str], Any]] = []
     offenders: List[str] = []
     fees = ZERO
@@ -601,12 +603,10 @@ async def epoch_inputs(db: Any, epoch: int, up_to_height: int) -> EpochInputs:
             for h, i, kind, sender, validator, value in staking
         ]
         ops = [op for *_k, op in sorted(merged, key=lambda r: r[:3])]
-        cur = await conn.execute(
-            "SELECT offender FROM chain_index_offenders WHERE height BETWEEN ? AND ? "
-            "ORDER BY height, rowid",
-            (lo, hi),
-        )
-        offenders = [r[0] for r in await cur.fetchall()]
+        offenders = [
+            r.offender
+            for r in db.store["chain_index_offenders"].scan(lo=(int(lo),), hi=(int(hi) + 1,))
+        ]
         cur = await conn.execute(
             "SELECT amount FROM staker_fee_income WHERE block_height BETWEEN ? AND ?",
             (lo, hi),
@@ -615,12 +615,15 @@ async def epoch_inputs(db: Any, epoch: int, up_to_height: int) -> EpochInputs:
     target = int(epoch) - INCLUSION_EPOCHS
     attesters: List[str] = []
     if target >= 1:
-        cur = await conn.execute(
-            "SELECT DISTINCT validator FROM chain_index_votes "
-            "WHERE target_epoch = ? AND carry_epoch <= ? AND height <= ?",
-            (target, int(epoch), int(up_to_height)),
+        attesters = list(
+            dict.fromkeys(
+                r.validator
+                for r in db.store["chain_index_votes"].scan_index("by_target", target)
+                if r.carry_epoch is not None
+                and int(r.carry_epoch) <= int(epoch)
+                and int(r.height) <= int(up_to_height)
+            )
         )
-        attesters = [r[0] for r in await cur.fetchall()]
     return EpochInputs(
         ops=ops, attesters=attesters, offenders=offenders, has_blocks=lo is not None, fees=fees
     )
@@ -760,15 +763,13 @@ async def _advance(db: Any, state: State, start: int, epoch: int, top: int) -> S
     conn = db.connection
     first = max(0, start - INCLUSION_EPOCHS)  # votes for start's reward target ride from here
     base = await _checkpoint(db, first, top)
-    cur = await conn.execute(
-        "SELECT height, block_hash, slot, epoch FROM chain_index "
-        "WHERE height <= ? AND slot IS NOT NULL AND slot >= ? ORDER BY height",
-        (top, first * SLOTS_PER_EPOCH),
+    rows = sorted(
+        (int(r.height), r.block_hash, int(r.slot), None if r.epoch is None else int(r.epoch))
+        for r in db.store["chain_index"].scan_index(
+            "by_slot", lo=(first * SLOTS_PER_EPOCH,), hi=(2**62,)
+        )
+        if int(r.height) <= int(top)
     )
-    rows = [
-        (int(h), bh, int(sl), None if ep is None else int(ep))
-        for h, bh, sl, ep in await cur.fetchall()
-    ]
 
     slots = [sl for _h, _bh, sl, _ep in rows]
 
@@ -822,12 +823,8 @@ async def _advance(db: Any, state: State, start: int, epoch: int, top: int) -> S
                 ops_by_epoch.setdefault(ep, []).append(
                     (int(h), 2, int(i), (kind, sender, validator, v))
                 )
-        cur = await conn.execute(
-            "SELECT height, offender FROM chain_index_offenders WHERE height BETWEEN ? AND ? "
-            "ORDER BY height, rowid",
-            (lo, hi),
-        )
-        for h, offender in await cur.fetchall():
+        offender_rows = db.store["chain_index_offenders"].scan(lo=(int(lo),), hi=(int(hi) + 1,))
+        for h, offender in ((r.height, r.offender) for r in offender_rows):
             ep = epoch_of.get(int(h))
             if ep is not None and start <= ep < epoch:
                 offenders_by_epoch.setdefault(ep, []).append(offender)
@@ -842,14 +839,15 @@ async def _advance(db: Any, state: State, start: int, epoch: int, top: int) -> S
     # Votes for the reward targets of these transitions, carried at or below the last one's
     # boundary: (target, validator, carry epoch, height).
     last_boundary = checkpoint(epoch)[0]
-    cur = await conn.execute(
-        "SELECT target_epoch, validator, carry_epoch, height FROM chain_index_votes "
-        "WHERE target_epoch BETWEEN ? AND ? AND height <= ?",
-        (start - INCLUSION_EPOCHS, epoch - 1 - INCLUSION_EPOCHS, last_boundary),
+    vote_rows = db.store["chain_index_votes"].scan_index(
+        "by_target", lo=(start - INCLUSION_EPOCHS,), hi=(epoch - INCLUSION_EPOCHS,)
     )
     votes: Dict[int, List[Tuple[str, int, int]]] = {}
-    for target, validator, carry, h in await cur.fetchall():
-        votes.setdefault(int(target), []).append((validator, int(carry), int(h)))
+    for r in vote_rows:
+        if int(r.height) <= int(last_boundary):
+            votes.setdefault(int(r.target_epoch), []).append(
+                (r.validator, int(r.carry_epoch), int(r.height))
+            )
 
     for e in range(start, epoch):
         boundary = checkpoint(e + 1)

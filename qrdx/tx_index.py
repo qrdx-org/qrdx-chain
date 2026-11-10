@@ -131,11 +131,10 @@ class _BlockIndex:
 
 
 async def _legacy(db, blk: _BlockIndex) -> None:
-    cursor = await db.connection.execute(
-        "SELECT tx_hash, tx_hex FROM transactions WHERE block_hash = ? ORDER BY rowid",
-        (blk.block_hash,),
-    )
-    for tx_hash, tx_hex in await cursor.fetchall():
+    for tx_hash, tx_hex in (
+        (r.tx_hash, r.tx_hex)
+        for r in db.store["transactions"].scan_index("by_block", blk.block_hash)
+    ):
         try:
             doc = json.loads(tx_hex)
         except (TypeError, ValueError):

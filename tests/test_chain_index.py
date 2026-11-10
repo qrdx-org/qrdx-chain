@@ -21,6 +21,7 @@ from qrdx.exchange.transactions import ExchangeOpType, ExchangeTransaction
 from qrdx.validator import randao, withdrawals as W
 from qrdx.validator.slashing_block import make_double_sign_evidence
 
+from chain_rows import block_content, delete_blocks, put_block, set_block
 from test_slashing_evidence import _signed_header
 
 VALIDATORS = [f"0xPQv{i}" + "0" * 59 for i in range(4)]
@@ -101,10 +102,8 @@ async def _indexed_votes(db, carried_through_epoch):
     """(target epoch, validator) of every vote the index says blocks of an epoch ≤ the given
     one carry — what the validator set's rewards read (validator/epoch_state.py)."""
     await chain_index.sync(db)
-    cur = await db.connection.execute(
-        "SELECT DISTINCT target_epoch, validator FROM chain_index_votes WHERE carry_epoch <= ?",
-        (carried_through_epoch,))
-    return sorted(tuple(r) for r in await cur.fetchall())
+    return sorted({(r.target_epoch, r.validator) for r in db.store["chain_index_votes"].scan()
+                   if r.carry_epoch is not None and r.carry_epoch <= carried_through_epoch})
 
 
 async def _walked_votes(db, carried_through_epoch):
@@ -151,10 +150,9 @@ async def test_every_answer_equals_the_walk_across_reorgs(db, offender_key, seed
     for round_ in range(3):
         tip = await db.get_next_block_id() - 1
         cut = tip - rng.randint(6, 24)
-        await db.connection.execute("DELETE FROM blocks WHERE block_height > ?", (cut,))
+        delete_blocks(db, cut + 1)
         await db.connection.commit()
-        cur = await db.connection.execute("SELECT content FROM blocks WHERE block_height = ?", (cut,))
-        slot = int(eval(block_codec.decode((await cur.fetchone())[0]))["slot"])
+        slot = int(eval(block_content(db, cut))["slot"])
         slot = await _build(db, rng, rng.randint(10, 40), offender_key, tag="bcdef"[round_],
                             start=cut + 1, slot0=slot)
         await _assert_matches_the_walk(db, rng, offender_key)
@@ -166,9 +164,7 @@ async def test_a_rolled_back_block_takes_its_index_rows_with_it(db, offender_key
     await chain_index.sync(db)
     body = {"number": 30, "slot": slot + 2, "epoch": (slot + 2) // SLOTS_PER_EPOCH,
             "randao_reveal": "ab" * 48, "attestations": [_att(VALIDATORS[0], 0)]}
-    await db.connection.execute(                                # uncommitted
-        "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, 30, ?, 0)",
-        ("z" * 64, str(body)))
+    put_block(db, 30, "z" * 64, str(body))                      # uncommitted
     assert await chain_index.sync(db) == 30                     # indexed in the same transaction
     await db.connection.rollback()
     assert await db.get_next_block_id() == 30
@@ -214,7 +210,7 @@ async def test_an_unchanged_chain_is_checked_without_a_round_trip(db, offender_k
         assert DB_CALLS[0] - before == 0
     slot = await _build(db, rng, 1, offender_key, start=20, slot0=slot)          # (a new block)
     assert await chain_index.sync(db) == 20
-    await db.connection.execute("DELETE FROM blocks WHERE block_height = 20")      # (replaced)
+    delete_blocks(db, 20, 20)                                                     # (replaced)
     await db.connection.commit()
     await _build(db, rng, 1, offender_key, tag="b", start=20, slot0=slot)
     assert await chain_index.sync(db) == 20
@@ -222,15 +218,12 @@ async def test_an_unchanged_chain_is_checked_without_a_round_trip(db, offender_k
     await db.connection.commit()
     body = {"number": 21, "slot": slot + 3, "epoch": (slot + 3) // SLOTS_PER_EPOCH,
             "randao_reveal": "cd" * 48, "attestations": []}
-    await db.connection.execute(
-        "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, 21, ?, 0)",
-        ("y" * 64, str(body)))
+    put_block(db, 21, "y" * 64, str(body))
     await db.connection.commit()                                   # (the block stays…)
     assert await chain_index.sync(db) == 21
     await db.connection.rollback()                                 # (…its index row does not)
     assert await chain_index.sync(db) == 21
-    cur = await db.connection.execute("SELECT block_hash FROM chain_index WHERE height = 21")
-    assert (await cur.fetchone())[0] == "y" * 64
+    assert db.store["chain_index"].get(21).block_hash == "y" * 64
 
 
 async def test_what_memory_holds_follows_every_change_to_the_chain(db, offender_key, monkeypatch):
@@ -255,18 +248,17 @@ async def test_what_memory_holds_follows_every_change_to_the_chain(db, offender_
 
     await every_read(29)
     kept = await chain_index.block_hash_at(db, 27)
-    await db.connection.execute("DELETE FROM blocks WHERE block_height >= 25")    # (by hand)
+    delete_blocks(db, 25)                                             # (by hand)
     await every_read(24)
     assert await chain_index.block_hash_at(db, 27) is None
     await db.connection.rollback()                                    # (…and back again)
     await every_read(29)
     assert await chain_index.block_hash_at(db, 27) == kept
-    await db.connection.execute("UPDATE blocks SET block_hash = ? WHERE block_height = 29",
-                                ("e" * 64,))
+    set_block(db, 29, block_hash="e" * 64)
     await every_read(29)
     assert await chain_index.block_hash_at(db, 29) == "e" * 64
     await db.connection.commit()
-    await db.connection.execute("DELETE FROM blocks WHERE block_height >= 12")
+    delete_blocks(db, 12)
     await db.connection.commit()
     slot = await _build(db, rng, 10, offender_key, tag="r", start=12, slot0=slot)
     await every_read(21)
@@ -279,7 +271,7 @@ async def test_two_databases_on_one_connection_share_its_count(db, offender_key)
     rng = random.Random(4)
     slot = await _build(db, rng, 6, offender_key)
     other = DatabaseSQLite.__new__(DatabaseSQLite)
-    other.connection = db.connection
+    other.connection, other.store = db.connection, db.store
     assert await chain_index.sync(db) == 5 and await chain_index.sync(other) == 5
     await _build(other, rng, 2, offender_key, start=6, slot0=slot)
     assert await chain_index.sync(db) == 7 and await chain_index.sync(other) == 7

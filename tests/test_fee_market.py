@@ -18,6 +18,7 @@ from qrdx import fee_market as F
 from qrdx.constants import CHAIN_ID
 from qrdx.contracts.evm_mempool import EVMMempool
 from qrdx.exchange import ExchangeOpType, ExchangeTransaction
+from chain_rows import put_block
 
 GWEI = 10 ** 9
 
@@ -110,9 +111,7 @@ async def _store(db, height, fees, evm=()):
     content = {"number": height, "slot": height, "base_fee": fees[0],
                "exchange_base_fee": fees[1]}
     bh = f"{height:064x}"
-    await db.connection.execute(
-        "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, ?, ?, 0)",
-        (bh, height, repr(content)))
+    put_block(db, height, bh, repr(content))
     await db.connection.commit()
     if evm:
         await db.add_block_evm_txs(bh, list(evm))

@@ -15,6 +15,7 @@ import pytest
 
 from qrdx import manager
 from qrdx.database_sqlite import DatabaseSQLite
+from chain_rows import put_block
 
 # P-256's generator in the legacy compressed format (parity byte 42/43, x little-endian).
 MINER = bytes([43]) + (
@@ -34,10 +35,8 @@ async def pos_chain():
         prev = "00" * 32
         for h in range(513):
             bh = hashlib.sha256(f"pos-{h}".encode()).hexdigest()
-            await db.connection.execute(
-                "INSERT INTO blocks (block_hash, block_height, prev_block_hash, timestamp, "
-                "validator_address, content) VALUES (?, ?, ?, ?, ?, ?)",
-                (bh, h, prev, now - 600 + h, "0xPQ" + "ab" * 32, "{}"))
+            put_block(db, h, bh, "{}", timestamp=now - 600 + h, prev_block_hash=prev,
+                      validator_address="0xPQ" + "ab" * 32)
             prev = bh
         await db.connection.commit()
         yield db, prev

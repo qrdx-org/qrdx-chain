@@ -41,6 +41,7 @@ from qrdx.validator import ffg
 from qrdx.validator.finality import update_finality
 
 from test_finality_compute import Chain, keys  # noqa: F401  (keys: the module fixture)
+from chain_rows import put_block
 
 PEER = "qxpeer"
 
@@ -76,9 +77,7 @@ async def setup(monkeypatch, keys):  # noqa: F811
             return False
         if b["block_height"] != await ours.db.get_next_block_id():
             return False
-        await ours.db.connection.execute(
-            "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, ?, ?, 0)",
-            (b["block_hash"], b["block_height"], b["content"]))
+        put_block(ours.db, b["block_height"], b["block_hash"], b["content"])
         await ours.db.connection.commit()
         applied.append(b["block_hash"])
         return True
@@ -116,13 +115,11 @@ async def _common(ours, theirs, epochs):
 
 
 async def copy_blocks(src, dst):
-    cur = await src.db.connection.execute(
-        "SELECT block_hash, block_height, content FROM blocks WHERE block_height > ? "
-        "ORDER BY block_height", (dst.height,))
-    for bh, height, content in await cur.fetchall():
-        await dst.db.connection.execute(
-            "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, ?, ?, 0)",
-            (bh, height, content))
+    rows = src.db.store["blocks"].scan(lo=(dst.height + 1,), hi=(2**62,))
+    bodies = src.db.store["block_bodies"]
+    for bh, height, content in ((r.block_hash, r.block_height, bodies.get(r.block_height).content)
+                                for r in rows):
+        put_block(dst.db, height, bh, content)
         dst.height = height
         dst.hashes.append(bh)
         dst.slots.append(src.slots[height])

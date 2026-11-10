@@ -57,6 +57,12 @@ flushes the file every second. A crash of the process loses nothing committed. A
 machine loses at most the last second, and the file stays consistent. A node that loses blocks
 that way syncs them again from its peers.
 
+**Secondary indexes.** A table can declare indexes on any of its columns (`Spec(indexes=...)`):
+the store keeps an index table for each, keyed by those columns then the row's key, natively
+with every write — a journal rollback and a clear included. `Table.scan_index` reads the rows in
+an index's order. The chain index finds its slots, epochs, vote targets and offenders this way;
+a block is found by its hash.
+
 **One handle per file per process.** MDBX allows only one. A snapshot of the running node shares
 its handle (`store.opened`) and copies the file with MDBX's online copy, a consistent read while
 the node keeps writing (`Store.copy_to`).
@@ -71,10 +77,15 @@ not turn the store off.
 | S1 engine | — | done: layers, commit and rollback, the hooks, the online copy |
 | S2 ledger | `account_state`, `contract_storage`, `contract_code`, `token_balances`, `token_registry`, `unspent_outputs`, `evm_balance_sync_registry`, `evm_balance_changes`; the proof tree (`smt_*`, `state_root_parts`); `post_roots`; the accumulators and the undo journal | done |
 | S3a sections | each block's exchange and EVM sections, whole: one value a block (they were a row an item) | done |
-| S3 chain | blocks, transactions, the chain index, votes, checkpoints, chain metadata | to do |
+| S3 chain | blocks (header by height, by hash through an index; body apart), transactions, chain metadata, the chain index (its votes, offenders and FFG votes) | done |
+| S3b | votes and finality (`attestation_votes`, `epochs`, `slashing_events`), the exchange checkpoint | to do |
 | S4 validators | validators, stakes, lifecycle, epoch states, withdrawals, slashing, staking | to do |
 | S5 the node's own | pending transactions, peers, slashing protection, transaction and trading history | to do |
 | S6 | SQLite and aiosqlite removed | to do |
+
+The chain index used to count writes to `blocks` with SQLite triggers. The database's block
+writers now tell it (`chain_index.blocks_changed`, `rolled_back`), so a write the index must
+notice goes through them.
 
 Until S6, a crash between the store's commit and SQLite's can leave the store a block ahead.
 The startup rebuild handles this case as it handles every other partial write. It replays the

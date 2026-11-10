@@ -74,11 +74,10 @@ def retention(environ: Optional[Mapping[str, str]] = None) -> int:
 async def pruned_below(db: Any) -> int:
     """Blocks below this height are pruned (0: none)."""
     try:
-        cur = await db.connection.execute("SELECT value FROM chain_metadata WHERE key = ?", (KEY,))
-        row = await cur.fetchone()
+        value = db.get_metadata(KEY)
     except Exception:
         return 0
-    return int(row[0]) if row else 0
+    return int(value) if value is not None else 0
 
 
 def strip(bc: Dict[str, Any]) -> Dict[str, Any]:
@@ -106,27 +105,20 @@ async def prune(db: Any, finalized_height: int, window: int = -1) -> int:
     if target <= done:
         return 0
     upto = min(target, done + BATCH)
-    conn = db.connection
-    cur = await conn.execute(
-        "SELECT block_height, block_hash, content FROM blocks "
-        "WHERE block_height >= ? AND block_height < ? ORDER BY block_height",
-        (done, upto),
-    )
+    blocks, bodies = db.store["blocks"], db.store["block_bodies"]
     count = 0
-    for height, block_hash, content in await cur.fetchall():
-        bc = _parse_block_content(block_codec.decode(content))
+    for row in blocks.scan(lo=(done,), hi=(upto,)):
+        height = int(row.block_height)
+        body = bodies.get(height)
+        bc = _parse_block_content(block_codec.decode(body.content if body is not None else None))
         if not bc.get("pruned"):
-            await conn.execute(
-                "UPDATE blocks SET content = ?, validator_signature = NULL WHERE block_height = ?",
-                (block_codec.encode(repr(strip(bc))), int(height)),
-            )
+            bodies.put(height, block_codec.encode(repr(strip(bc))))
+            blocks.update((height,), validator_signature=None)
         for table in ("exchange_sections", "evm_sections"):
-            db.store[table].delete(block_hash)
+            db.store[table].delete(row.block_hash)
         count += 1
-    await conn.execute(
-        "INSERT OR REPLACE INTO chain_metadata (key, value) VALUES (?, ?)", (KEY, str(upto))
-    )
-    await conn.commit()
+    db.set_metadata(KEY, str(upto))
+    await db.connection.commit()
     if count:
         logger.info("history pruned below block %d (%d blocks this step)", upto, count)
     return count

@@ -27,6 +27,7 @@ Python implementation (``QRDX_NATIVE=0`` does not turn it off).
 from __future__ import annotations
 
 import contextlib
+import datetime
 import os
 from collections import namedtuple
 from decimal import Decimal
@@ -37,8 +38,10 @@ import qrdx_native
 pack = qrdx_native.store_pack
 unpack = qrdx_native.store_unpack
 
-# Address space reserved for the file (it grows as it fills, up to this).
+# Address space reserved for the file (it grows as it fills, up to this), and the steps it grows
+# by (a step is written out in full on some file systems: tmpfs).
 MAX_GB = float(os.environ.get("QRDX_STORE_MAX_GB", "256"))
+GROWTH_MB = float(os.environ.get("QRDX_STORE_GROWTH_MB", "16"))
 
 # The stores this process has open, by their file's real path: MDBX allows one handle a file a
 # process, so a second user here (a snapshot of the running node) shares it (``opened``).
@@ -70,6 +73,7 @@ class Spec:
         tracked: bool = False,
         commitment: Optional[Tuple[str, str, Sequence[str]]] = None,
         raw: bool = False,
+        indexes: Optional[Dict[str, Sequence[str]]] = None,
     ) -> None:
         self.name = name
         self.key = tuple(c for c, _a in key)
@@ -85,6 +89,19 @@ class Spec:
         self.raw = raw
         if raw and len(self.value) != 1:
             raise ValueError(f"{name}: a raw table has one value column")
+        # Secondary indexes, kept natively with every write: name → the columns it is keyed by
+        # (its rows, in their order, by ``Table.scan_index``).
+        self.indexes: Dict[str, Tuple[str, ...]] = {k: tuple(v) for k, v in (indexes or {}).items()}
+        if raw and self.indexes:
+            raise ValueError(f"{name}: a raw table has no index")
+
+    def index_table(self, index: str) -> str:
+        return f"{self.name}__{index}"
+
+    def affinity(self, column: str) -> str:
+        i = self.columns.index(column)
+        n = len(self.key)
+        return self.key_affinity[i] if i < n else self.value_affinity[i - n]
 
 
 _T, _I, _B = "TEXT", "INTEGER", "BLOB"
@@ -201,6 +218,79 @@ SPECS: Tuple[Spec, ...] = (
             ("validators", _T, None),
         ],
     ),
+    # ── the chain: each block's header by height (and by hash), its body apart (zlib text,
+    # qrdx/block_codec.py: what most reads skip), the transactions blocks carry (legacy and
+    # genesis records, in the order stored), the chain's settings ──
+    Spec(
+        "blocks",
+        [("block_height", _I)],
+        [
+            ("block_hash", _T, None),
+            ("prev_block_hash", _T, None),
+            ("merkle_root", _T, None),
+            ("timestamp", _I, None),
+            ("difficulty", _I, None),
+            ("nonce", _I, None),
+            ("validator_address", _T, None),
+            ("validator_signature", _T, None),
+            ("created_at", _T, None),
+        ],
+        indexes={"by_hash": ("block_hash",)},
+    ),
+    Spec("block_bodies", [("block_height", _I)], [("content", _B, b"")], raw=True),
+    Spec(
+        "transactions",
+        [("tx_hash", _T)],
+        [
+            ("tx_hex", _T, None),
+            ("block_hash", _T, None),
+            ("inputs_addresses", _T, None),
+            ("outputs_addresses", _T, None),
+            ("outputs_amounts", _T, None),
+            ("fees", _I, None),
+            ("created_at", _T, None),
+            ("seq", _I, 0),
+        ],
+        indexes={"by_block": ("block_hash", "seq")},
+    ),
+    Spec("chain_metadata", [("key", _T)], [("value", _T, None)]),
+    # ── the chain index (qrdx/chain_index.py): derived from the blocks, re-derived at will ──
+    Spec(
+        "chain_index",
+        [("height", _I)],
+        [
+            ("block_hash", _T, None),
+            ("slot", _I, None),
+            ("epoch", _I, None),
+            ("randao_mix", _T, None),
+        ],
+        indexes={"by_slot": ("slot",), "by_epoch": ("epoch",)},
+    ),
+    Spec(
+        "chain_index_votes",
+        [("height", _I), ("seq", _I)],
+        [("carry_epoch", _I, None), ("target_epoch", _I, None), ("validator", _T, None)],
+        indexes={"by_target": ("target_epoch", "validator")},
+    ),
+    Spec(
+        "chain_index_offenders",
+        [("height", _I), ("seq", _I)],
+        [("offender", _T, None)],
+        indexes={"by_offender": ("offender",)},
+    ),
+    Spec(
+        "chain_index_ffg",
+        [("height", _I), ("seq", _I)],
+        [
+            ("validator", _T, None),
+            ("source_epoch", _I, None),
+            ("source_root", _T, None),
+            ("target_epoch", _I, None),
+            ("target_root", _T, None),
+        ],
+        indexes={"by_target": ("target_epoch",)},
+    ),
+    Spec("chain_index_meta", [("key", _T)], [("value", _T, None)]),
     # ── each block's sections, whole, by its hash: the exchange's as a JSON list of its items,
     # the EVM's as a JSON list of raw transactions (they were a row an item) ──
     Spec("exchange_sections", [("block_hash", _T)], [("data", _B, b"")], raw=True),
@@ -230,6 +320,10 @@ def _coerce(value: Any, affinity: str) -> Any:
         return None
     if isinstance(value, bool):
         value = int(value)
+    if isinstance(value, datetime.datetime):
+        value = value.isoformat(" ")  # (sqlite3's adapters)
+    elif isinstance(value, datetime.date):
+        value = value.isoformat()
     if affinity == _T:
         if isinstance(value, (int, float, Decimal)):
             return str(value)
@@ -263,6 +357,7 @@ class Table:
         self.name = spec.name
         self.id = store.native.table_id(spec.name)
         self.Row: Any = namedtuple(spec.name, spec.columns)  # type: ignore[misc]
+        self._index_ids = {i: store.native.table_id(spec.index_table(i)) for i in spec.indexes}
         self._n = store.native
         self._nk = len(spec.key)
 
@@ -338,6 +433,34 @@ class Table:
         """The keys (as tuples) of the rows ``scan`` would return, without reading a value."""
         lo_b, hi_b = self._range(prefix, lo, hi)
         return [unpack(k) for k in self._n.keys(self.id, lo_b, hi_b)]
+
+    def scan_index(
+        self,
+        index: str,
+        *prefix: Any,
+        lo: Optional[Sequence[Any]] = None,
+        hi: Optional[Sequence[Any]] = None,
+        reverse: bool = False,
+        limit: Optional[int] = None,
+    ) -> List[Any]:
+        """The rows whose ``index`` columns start with ``prefix`` (and, after it, lie in
+        [lo, hi)), in the index's order (ties by key)."""
+        columns = self.spec.indexes[index]
+        aff = [self.spec.affinity(c) for c in columns]
+
+        def packed(values: Sequence[Any]) -> bytes:
+            return pack(tuple(_coerce(v, aff[i]) for i, v in enumerate(values)))
+
+        p = packed(prefix) if prefix else b""
+        lo_b = packed((*prefix, *lo)) if lo is not None else (p or None)
+        hi_b = packed((*prefix, *hi)) if hi is not None else (p + b"\xff" if p else None)
+        n = len(self.spec.value)
+        out = []
+        for k, v in self._n.index_rows(self.id, self._index_ids[index], lo_b, hi_b, reverse, limit):
+            if len(v) < n:
+                v = v + self.spec.defaults[len(v) :]
+            out.append(self.Row(*k, *v[:n]))
+        return out
 
     def count(self, *prefix: Any) -> int:
         if not prefix:
@@ -418,7 +541,9 @@ class Store:
 
     def __init__(self, path: str, specs: Sequence[Spec] = SPECS) -> None:
         self.path = path
-        self.native = qrdx_native.Store(path, [s.name for s in specs], MAX_GB)
+        names = [s.name for s in specs]
+        names += [s.index_table(i) for s in specs for i in s.indexes]
+        self.native = qrdx_native.Store(path, names, MAX_GB, 1.0, GROWTH_MB)
         _OPEN[os.path.realpath(path)] = self
         self.tables: Dict[str, Table] = {}
         from . import state_commitment
@@ -434,6 +559,9 @@ class Store:
                 self.native.set_journaled(table.id, True)
             if spec.tracked:
                 self.native.set_tracked(table.id, True)
+            for index, cols in spec.indexes.items():
+                at = [spec.columns.index(c) for c in cols]
+                self.native.set_index(table.id, table._index_ids[index], at)
 
     def __getitem__(self, name: str) -> Table:
         return self.tables[name]

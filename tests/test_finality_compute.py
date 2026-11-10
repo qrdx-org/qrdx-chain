@@ -31,6 +31,7 @@ from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.validator import ffg
 from qrdx.validator.attestation import Attestation
 from qrdx.validator.finality import finalized_block_height, update_finality
+from chain_rows import delete_blocks, put_block
 
 
 @pytest.fixture(scope="module")
@@ -91,9 +92,7 @@ class Chain:
                    "attestations": [v.to_dict() for v in votes]}
         content["body_root"] = body_root(content)
         h = reconstruct_signing_root(content).hex()
-        await self.db.connection.execute(
-            "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, ?, ?, 0)",
-            (h, self.height, repr(content)),
+        put_block(self.db, self.height, h, repr(content),
         )
         await self.db.connection.commit()
         self.hashes.append(h)
@@ -102,7 +101,7 @@ class Chain:
 
     async def truncate(self, height):
         """Drop blocks above ``height`` (a reorg's rollback)."""
-        await self.db.connection.execute("DELETE FROM blocks WHERE block_height > ?", (height,))
+        delete_blocks(self.db, height + 1)
         await self.db.connection.commit()
         self.height = height
         del self.hashes[height + 1:]

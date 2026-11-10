@@ -106,12 +106,12 @@ class DoppelgangerGuard:
         if self.start_slot is None:
             return None
         start, conn = self._scan_from_slot, self.db.connection
-        cur = await conn.execute(
-            "SELECT ci.slot, b.block_hash FROM blocks b JOIN chain_index ci"
-            " ON ci.height = b.block_height WHERE b.validator_address = ? AND ci.slot >= ?",
-            (self.address, start),
-        )
-        blocks = await cur.fetchall()
+        stored = self.db.store["blocks"]
+        blocks = []
+        for ci in self.db.store["chain_index"].scan_index("by_slot", lo=(int(start),), hi=(2**62,)):
+            b = stored.get(int(ci.height))
+            if b is not None and b.validator_address == self.address:
+                blocks.append((ci.slot, b.block_hash))
         if blocks:
             mine = await self.protection.signed_block_roots(self.address, start)
             for slot, block_hash in blocks:

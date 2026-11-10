@@ -210,11 +210,12 @@ def test_the_manager_records_a_block_before_signing_it():
 
 
 async def _chain_db(tmp_path):
+    """A chain in miniature: its blocks and chain index in a store (qrdx/store.py), the votes
+    it carries in SQLite."""
+    from qrdx.store import Store
+
     conn = await aiosqlite.connect(str(tmp_path / "chain.db"))
-    await conn.execute(
-        "CREATE TABLE blocks (block_hash TEXT, block_height INTEGER, validator_address TEXT)"
-    )
-    await conn.execute("CREATE TABLE chain_index (height INTEGER, slot INTEGER)")
+    conn.store = Store(str(tmp_path / "chain.db.store"))
     await conn.execute(
         "CREATE TABLE attestation_votes (validator_address TEXT, target_epoch INTEGER,"
         " source_epoch INTEGER, slot INTEGER, block_hash TEXT, epoch INTEGER,"
@@ -224,14 +225,18 @@ async def _chain_db(tmp_path):
 
 
 async def _add_block(conn, height, slot, block_hash, proposer=V):
-    await conn.execute("INSERT INTO blocks VALUES (?, ?, ?)", (block_hash, height, proposer))
-    await conn.execute("INSERT INTO chain_index VALUES (?, ?)", (height, slot))
+    conn.store["blocks"].put(block_height=height, block_hash=block_hash, validator_address=proposer)
+    conn.store["chain_index"].put(height, block_hash, slot, None, "")
+
+
+def _db(conn):
+    return SimpleNamespace(connection=conn, store=conn.store)
 
 
 async def test_a_validator_listens_before_signing_and_stops_on_a_doppelganger(tmp_path, record):
     conn = await _chain_db(tmp_path)
     try:
-        guard = D.DoppelgangerGuard(SimpleNamespace(connection=conn), record, V, 2, 8)
+        guard = D.DoppelgangerGuard(_db(conn), record, V, 2, 8)
         assert "listening until slot 116" in await guard.hold(100)
         assert await guard.hold(115)
         assert await guard.hold(116) is None
@@ -245,13 +250,14 @@ async def test_a_validator_listens_before_signing_and_stops_on_a_doppelganger(tm
         assert reason and "doppelganger" in reason and "did not sign" in reason
         assert await guard.hold(200) == reason
     finally:
+        conn.store.close()
         await conn.close()
 
 
 async def test_a_vote_the_validator_never_signed_is_a_doppelganger(tmp_path, record):
     conn = await _chain_db(tmp_path)
     try:
-        guard = D.DoppelgangerGuard(SimpleNamespace(connection=conn), record, V, 0, 8)
+        guard = D.DoppelgangerGuard(_db(conn), record, V, 0, 8)
         assert await guard.hold(80) is None
         await conn.execute(
             "INSERT INTO attestation_votes VALUES (?, 10, 9, 81, ?, 10, ?, ?)",
@@ -259,6 +265,7 @@ async def test_a_vote_the_validator_never_signed_is_a_doppelganger(tmp_path, rec
         )
         assert "target epoch 10" in await guard.hold(88)
     finally:
+        conn.store.close()
         await conn.close()
 
 

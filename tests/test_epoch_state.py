@@ -23,6 +23,7 @@ from qrdx.database_sqlite import DatabaseSQLite
 from qrdx.validator import epoch_state as ES
 from qrdx.validator.epoch_state import EpochInputs, genesis_state, transition
 from qrdx.validator.ffg import INCLUSION_EPOCHS
+from chain_rows import delete_blocks, put_block
 
 D = Decimal
 G = [f"0xPQ{c * 64}" for c in "abc"]          # genesis validators
@@ -51,9 +52,7 @@ class Chain:
     async def _put(self, height, slot, extra):
         bh = f"{self.tag}{height:063d}"
         content = {"number": height, "slot": slot, "epoch": slot // SLOTS_PER_EPOCH, **extra}
-        await self.db.connection.execute(
-            "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, ?, ?, 0)",
-            (bh, height, repr(content)))
+        put_block(self.db, height, bh, repr(content))
         self.height = height
         return bh
 
@@ -80,7 +79,7 @@ class Chain:
     async def rollback(self, to_height):
         from qrdx.validator.withdrawals import undo_withdrawal_logs_above
 
-        await self.db.connection.execute("DELETE FROM blocks WHERE block_height > ?", (to_height,))
+        delete_blocks(self.db, to_height + 1)
         await self.db.undo_validator_deposits_above(to_height)
         await undo_withdrawal_logs_above(self.db, to_height)
         await self.db.connection.commit()

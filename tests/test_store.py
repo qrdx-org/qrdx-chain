@@ -262,3 +262,61 @@ class _Rows:
 
     def __init__(self, store):
         self.store = store
+
+
+_INDEXED = (
+    Spec(
+        "votes",
+        [("height", "INTEGER"), ("seq", "INTEGER")],
+        [("target", "INTEGER", 0), ("validator", "TEXT", None)],
+        journaled=True,
+        indexes={"by_target": ("target", "validator"), "by_validator": ("validator",)},
+    ),
+    Spec("store_meta", [("key", "TEXT")], [("value", "TEXT", None)]),
+)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_an_index_follows_every_write(tmp_path, seed):
+    """Puts, overwrites that move a row in the index, deletes, rollbacks, a clear and the
+    journal's own rollback: the index always lists exactly the rows, in its columns' order."""
+    rng = random.Random(seed)
+    path = str(tmp_path / "i.store")
+    store = Store(path, _INDEXED)
+    votes = store["votes"]
+    states = {}
+    height = 0
+    for _ in range(300):
+        op = rng.random()
+        if op < 0.5:
+            with store.recording(height):
+                votes.put(rng.randrange(8), rng.randrange(4), rng.randrange(5), f"v{rng.randrange(6)}")
+        elif op < 0.6:
+            with store.recording(height):
+                votes.delete(rng.randrange(8), rng.randrange(4))
+        elif op < 0.7:
+            store.commit()
+            states[height] = sorted(tuple(r) for r in votes.scan())
+            height += 1
+        elif op < 0.75:
+            store.rollback()
+        elif op < 0.78 and states:
+            back = rng.choice(sorted(states))
+            store.native.undo_rollback(back)
+            store.commit()
+            assert sorted(tuple(r) for r in votes.scan()) == states[back]
+            states = {h: s for h, s in states.items() if h <= back}
+            height = back + 1
+        rows = [tuple(r) for r in votes.scan()]
+        want = sorted(rows, key=lambda r: (r[2], r[3], r[0], r[1]))
+        assert [tuple(r) for r in votes.scan_index("by_target")] == want
+        t = rng.randrange(5)
+        assert [tuple(r) for r in votes.scan_index("by_target", t)] == [r for r in want if r[2] == t]
+        assert [tuple(r) for r in votes.scan_index("by_target", lo=(1,), hi=(3,))] == [
+            r for r in want if 1 <= r[2] < 3]
+        v = f"v{rng.randrange(6)}"
+        assert [tuple(r) for r in votes.scan_index("by_validator", v, reverse=True)] == sorted(
+            (r for r in rows if r[3] == v), key=lambda r: (r[0], r[1]), reverse=True)
+    votes.clear()
+    assert votes.scan_index("by_target") == [] and votes.scan_index("by_validator") == []
+    store.close()

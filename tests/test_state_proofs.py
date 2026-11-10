@@ -17,6 +17,7 @@ from qrdx.contracts.state_proof_evm import encode
 from qrdx.crypto.account_id import to_account_id
 from qrdx.crypto.hashing import unified_state_root
 from qrdx.database_sqlite import DatabaseSQLite
+from chain_rows import put_block
 
 D = Decimal
 TOKEN = "0x" + "70" * 20
@@ -138,9 +139,7 @@ async def test_the_feature_binds_the_proof_root_into_the_unified_root():
 # ── on chain: the precompile ────────────────────────────────────────────────
 
 async def _block(db, height, state_root):
-    await db.connection.execute(
-        "INSERT INTO blocks (block_hash, block_height, content, timestamp) VALUES (?, ?, ?, 0)",
-        (f"{height:064x}", height, repr({"number": height, "state_root": state_root})))
+    put_block(db, height, f"{height:064x}", repr({"number": height, "state_root": state_root}))
     await db.connection.commit()
 
 

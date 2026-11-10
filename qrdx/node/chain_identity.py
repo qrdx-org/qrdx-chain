@@ -54,11 +54,8 @@ class ChainIdentityError(RuntimeError):
 
 
 async def _read_chain_metadata(key: str):
-    cur = await _node.db.connection.execute(
-        "SELECT value FROM chain_metadata WHERE key = ?", (key,)
-    )
-    row = await cur.fetchone()
-    return json.loads(row[0]) if row else None
+    value = _node.db.get_metadata(key)
+    return json.loads(value) if value is not None else None
 
 
 async def _verify_chain_identity() -> str:
@@ -137,9 +134,8 @@ async def _verify_chain_identity() -> str:
                 )
         tip = max(tip, reached)
     passed = [f for f in CHAIN_SPEC.forks if f["height"] <= tip]
-    await _node.db.connection.execute(
-        "INSERT OR REPLACE INTO chain_metadata (key, value) VALUES (?, ?)",
-        (_PASSED_FORKS_KEY, json.dumps({"tip": tip, "forks": passed}, sort_keys=True)),
+    _node.db.set_metadata(
+        _PASSED_FORKS_KEY, json.dumps({"tip": tip, "forks": passed}, sort_keys=True)
     )
     await _node.db.connection.commit()
     return str(genesis_hash)

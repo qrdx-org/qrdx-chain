@@ -90,6 +90,30 @@ struct TableInfo {
     commitment: Option<Commitment>,
     journaled: bool,
     tracked: bool,
+    /// Secondary indexes: (the index's table, the columns it is keyed by — indices into the
+    /// row's key fields followed by its value fields). An index row's key is those columns'
+    /// packing followed by the row's key; its value, the row's key.
+    indexes: Vec<(usize, Vec<usize>)>,
+}
+
+/// The key of ``row``'s entry in an index on ``columns``: those fields' packing, then the key.
+fn index_key(key: &[u8], value: &[u8], columns: &[usize]) -> PyResult<Bytes> {
+    let ks = codec::spans(key).map_err(PyValueError::new_err)?;
+    let vs = codec::spans(value).map_err(PyValueError::new_err)?;
+    let mut out = Vec::with_capacity(key.len() + 32);
+    for &c in columns {
+        let piece = if c < ks.len() {
+            &key[ks[c].0..ks[c].1]
+        } else {
+            match vs.get(c - ks.len()) {
+                Some(&(a, b)) => &value[a..b],
+                None => &[0u8][..], // (a column the row predates: None)
+            }
+        };
+        out.extend_from_slice(piece);
+    }
+    out.extend_from_slice(key);
+    Ok(out)
 }
 
 #[derive(Default)]
@@ -332,7 +356,10 @@ impl Inner {
     /// Put (Some) or delete (None) one row, with every hook the table has.
     fn write(&mut self, t: usize, key: Bytes, value: Option<Bytes>) -> PyResult<bool> {
         let info = &self.tables[t];
-        let hooked = info.commitment.is_some() || info.tracked || self.recording(t).is_some();
+        let hooked = info.commitment.is_some()
+            || info.tracked
+            || !info.indexes.is_empty()
+            || self.recording(t).is_some();
         if !hooked {
             let existed = match self.layers[t].writes.get(&key) {
                 Some(v) => v.is_some(),
@@ -372,6 +399,17 @@ impl Inner {
             let mark = named(&self.tables[t].name, &key);
             let marks = self.marks;
             self.layers[marks].writes.insert(mark, Some(Vec::new()));
+        }
+        let indexes = self.tables[t].indexes.clone();
+        for (it, columns) in &indexes {
+            if let Some(o) = &old {
+                let k = index_key(&key, o, columns)?;
+                self.layers[*it].writes.insert(k, None);
+            }
+            if let Some(v) = &value {
+                let k = index_key(&key, v, columns)?;
+                self.layers[*it].writes.insert(k, Some(key.clone()));
+            }
         }
         self.layers[t].writes.insert(key, value);
         Ok(existed)
@@ -556,10 +594,11 @@ macro_rules! with {
 #[pymethods]
 impl Store {
     /// Open (or create) the store at ``path`` (a file) with ``tables``. ``max_gb``: the most
-    /// the file may grow to (address space is reserved for it).
+    /// the file may grow to (address space is reserved for it); ``growth_mb``: the steps it
+    /// grows (and shrinks) by.
     #[new]
-    #[pyo3(signature = (path, tables, max_gb = 256.0, sync_seconds = 1.0))]
-    fn new(path: &str, tables: Vec<String>, max_gb: f64, sync_seconds: f64) -> PyResult<Self> {
+    #[pyo3(signature = (path, tables, max_gb = 256.0, sync_seconds = 1.0, growth_mb = 16.0))]
+    fn new(path: &str, tables: Vec<String>, max_gb: f64, sync_seconds: f64, growth_mb: f64) -> PyResult<Self> {
         let mut names = tables.clone();
         for internal in [UNDO, MARKS, META] {
             if names.iter().any(|n| n == internal) {
@@ -570,6 +609,7 @@ impl Store {
         if names.iter().any(|n| n.len() > 255 || n.is_empty()) {
             return Err(PyValueError::new_err("a table name of 1 to 255 bytes"));
         }
+        let growth = ((growth_mb.max(0.0625) * 1024.0 * 1024.0) as isize + 4095) / 4096 * 4096;
         let options = DatabaseOptions {
             no_sub_dir: true,
             max_tables: Some((names.len() + 16) as u64),
@@ -577,10 +617,10 @@ impl Store {
             liforeclaim: true,
             mode: Mode::ReadWrite(ReadWriteOptions {
                 sync_mode: SyncMode::SafeNoSync,
-                min_size: None,
+                min_size: Some(growth),
                 max_size: Some((max_gb * 1024.0 * 1024.0 * 1024.0) as isize),
-                growth_step: Some(64 * 1024 * 1024),
-                shrink_threshold: None,
+                growth_step: Some(growth),
+                shrink_threshold: Some(2 * growth),
             }),
             ..Default::default()
         };
@@ -597,7 +637,13 @@ impl Store {
             env: env.clone(),
             tables: names
                 .iter()
-                .map(|name| TableInfo { name: name.clone(), commitment: None, journaled: false, tracked: false })
+                .map(|name| TableInfo {
+                    name: name.clone(),
+                    commitment: None,
+                    journaled: false,
+                    tracked: false,
+                    indexes: Vec::new(),
+                })
                 .collect(),
             by_name: names.iter().enumerate().map(|(i, n)| (n.clone(), i)).collect(),
             layers: (0..n).map(|_| Layer::default()).collect(),
@@ -686,6 +732,44 @@ impl Store {
             inner.table(t)?;
             inner.tables[t].journaled = on;
             Ok(())
+        })
+    }
+
+    /// Keep table ``index`` as an index of table ``t`` on ``columns`` (see ``TableInfo``).
+    fn set_index(&self, t: usize, index: usize, columns: Vec<usize>) -> PyResult<()> {
+        with!(self, inner, {
+            inner.table(t)?;
+            inner.table(index)?;
+            inner.tables[t].indexes.push((index, columns));
+            Ok(())
+        })
+    }
+
+    /// The rows of ``t`` whose entries in its index ``index`` lie in [lo, hi), in the index's
+    /// order, as (key tuple, value tuple).
+    #[pyo3(signature = (t, index, lo = None, hi = None, reverse = false, limit = None))]
+    fn index_rows<'py>(
+        &self,
+        py: Python<'py>,
+        t: usize,
+        index: usize,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        reverse: bool,
+        limit: Option<usize>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        with!(self, inner, {
+            inner.table(t)?;
+            inner.table(index)?;
+            let entries = inner.scan(index, lo, hi, reverse, limit)?;
+            let txn = inner.ro()?;
+            let out = PyList::empty_bound(py);
+            for (_ik, key) in entries {
+                if let Some(v) = inner.read_in(&txn, t, &key)? {
+                    out.append((codec::unpack(py, &key)?, codec::unpack(py, &v)?))?;
+                }
+            }
+            Ok(out)
         })
     }
 
@@ -871,6 +955,9 @@ impl Store {
                 result?;
             }
             inner.layers[t] = Layer { writes: BTreeMap::new(), cleared: true };
+            for (it, _) in inner.tables[t].indexes.clone() {
+                inner.layers[it] = Layer { writes: BTreeMap::new(), cleared: true };
+            }
             inner.pending.retain(|(table, _), _| *table != t);
             Ok(())
         })

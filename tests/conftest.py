@@ -29,6 +29,7 @@ os.environ.setdefault("QRDX_VERIFY_STATE_COMMITMENTS", "1")
 os.environ.setdefault("QRDX_VERIFY_CHAIN_INDEX", "1")
 # Each open store reserves address space for its file (qrdx/store.py): tests open hundreds.
 os.environ.setdefault("QRDX_STORE_MAX_GB", "2")
+os.environ.setdefault("QRDX_STORE_GROWTH_MB", "1")
 
 
 import pytest  # noqa: E402
