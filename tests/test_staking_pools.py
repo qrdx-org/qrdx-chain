@@ -242,11 +242,9 @@ async def test_the_first_block_of_an_epoch_pays_what_is_due_once(chain):
     s = await ES.state_at(chain.db, 3)
     assert not [p for p in s.payouts if p.address == A]
     # Rolled back, the payout's ledger row goes; rebuilt, it is re-credited.
-    cur = await chain.db.connection.execute("SELECT COUNT(*) FROM staking_payouts WHERE address = ?", (A,))
-    assert (await cur.fetchone())[0] == 1
+    assert len([r for r in chain.db.store["staking_payouts"].scan() if r.address == A]) == 1
     await W.undo_withdrawal_logs_above(chain.db, first - 1)
-    cur = await chain.db.connection.execute("SELECT COUNT(*) FROM staking_payouts")
-    assert (await cur.fetchone())[0] == 0
+    assert chain.db.store["staking_payouts"].count() == 0
 
 
 async def test_rewards_are_minted_to_attesting_validators_on_the_chain(chain):

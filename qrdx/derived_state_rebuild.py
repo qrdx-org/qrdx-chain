@@ -445,19 +445,16 @@ async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, An
     from .validator.withdrawals import _payout_moves
 
     # Withdrawals already paid, grouped by the block that paid them.
-    cur = await db.connection.execute(
-        "SELECT block_height, address, amount FROM validator_withdrawals "
-        "WHERE block_height BETWEEN ? AND ? ORDER BY block_height, address",
-        (start, end),
-    )
-    paid = [(h, a, v, "withdrawal") for h, a, v in await cur.fetchall()]
+    span = {"lo": (int(start),), "hi": (int(end) + 1,)}
+    paid = [
+        (r.block_height, r.address, r.amount, "withdrawal")
+        for r in db.store["validator_withdrawals"].scan_index("by_height", **span)
+    ]
     # …and staking payouts (rewards, undelegations, refunds, fee income), the same way.
-    cur = await db.connection.execute(
-        "SELECT block_height, address, amount, kind FROM staking_payouts "
-        "WHERE block_height BETWEEN ? AND ? ORDER BY block_height, payout_id",
-        (start, end),
-    )
-    paid += list(await cur.fetchall())
+    paid += [
+        (r.block_height, r.address, r.amount, r.kind)
+        for r in db.store["staking_payouts"].scan_index("by_height", **span)
+    ]
     paid_by_block: dict = {}
     for height, address, amount, kind in paid:
         if Decimal(str(amount)) != 0:  # a forfeited exit is settled with a zero row

@@ -79,9 +79,9 @@ async def test_the_root_is_a_function_of_the_chain_not_of_row_ids_or_history():
             await c.epoch(4, exits=[G[2]])
             for e in range(5, 9):
                 await c.epoch(e)
-        b_ids = await (await db_.connection.execute("SELECT MAX(id) FROM validator_deposits")).fetchone()
-        a_ids = await (await da.connection.execute("SELECT MAX(id) FROM validator_deposits")).fetchone()
-        assert b_ids[0] > a_ids[0]                                         # the ids differ
+        b_ids = max(r.id for r in db_.store["validator_deposits"].scan())
+        a_ids = max(r.id for r in da.store["validator_deposits"].scan())
+        assert b_ids > a_ids                                               # the ids differ
         for h in range(a.height + 1):
             assert await VR.log_root(a.db, h) == await VR.log_root(b.db, h), h
         slot = 9 * SLOTS_PER_EPOCH + 1
@@ -101,7 +101,10 @@ async def test_the_root_moves_with_the_blocks_own_logs_and_with_the_set(chain):
     await chain.db.log_validator_deposit(J, "", "500000", chain.height + 1, "pending")
     with_deposit = await VR.compute(chain.db, chain.height + 1, slot)
     assert with_deposit != before                                          # its own rows count
-    await chain.db.connection.execute("DELETE FROM validator_deposits WHERE address = ?", (J,))
+    deposits = chain.db.store["validator_deposits"]
+    for r in deposits.scan():
+        if r.address == J:
+            deposits.delete(r.block_height, r.id)
     assert await VR.compute(chain.db, chain.height + 1, slot) == before
     await chain.epoch(2, deposits=[(J, "500000")])
     s3 = await ES.state_at(chain.db, 3)
@@ -115,8 +118,7 @@ async def test_the_root_moves_with_the_blocks_own_logs_and_with_the_set(chain):
 async def _from_rows(db, height):
     """The log root recomputed from the rows alone (no memo, no stored entry)."""
     VR.clear_memo()
-    await db.connection.execute(VR._SCHEMA)
-    await db.connection.execute("DELETE FROM validator_log_roots")
+    db.store["validator_log_roots"].delete_prefix()
     return await VR.log_root(db, height)
 
 
@@ -124,13 +126,10 @@ async def test_withdrawals_payouts_and_fee_income_are_committed(chain):
     await chain.epoch(1)
     h = chain.height
     before = await _from_rows(chain.db, h)
-    conn = chain.db.connection
-    await conn.execute("INSERT INTO validator_withdrawals (address, exit_epoch, amount, block_height) "
-                       "VALUES (?, 3, '100', ?)", (G[0], h))
+    chain.db.store["validator_withdrawals"].put(G[0], 3, "100", h, G[0].lower())
     after_withdrawal = await _from_rows(chain.db, h)
     assert after_withdrawal != before
-    await conn.execute("INSERT INTO staking_payouts (payout_id, address, amount, kind, block_height) "
-                       "VALUES (1, ?, '2.5', 'reward', ?)", (G[1], h))
+    chain.db.store["staking_payouts"].put(1, G[1], "2.5", "reward", h)
     with_payout = await _from_rows(chain.db, h)
     await chain.db.log_staker_fee_income(h, 7)
     assert len({before, after_withdrawal, with_payout, await _from_rows(chain.db, h)}) == 4
@@ -143,9 +142,7 @@ async def test_a_reorg_never_reuses_a_stale_root(chain, monkeypatch):
     await chain.epoch(2, deposits=[(J, "500000")])
     await chain.epoch(3)
     stale = await VR.log_root(chain.db, chain.height)                      # memoized and stored
-    stored = await (await chain.db.connection.execute(
-        "SELECT COUNT(*) FROM validator_log_roots")).fetchone()
-    assert stored[0] >= 1
+    assert chain.db.store["validator_log_roots"].count() >= 1
     await chain.rollback(1)
     chain.tag = "a"
     await chain.epoch(2)
@@ -153,7 +150,7 @@ async def test_a_reorg_never_reuses_a_stale_root(chain, monkeypatch):
     fresh = await VR.log_root(chain.db, chain.height)
     assert fresh != stale
     VR.clear_memo()
-    await chain.db.connection.execute("DELETE FROM validator_log_roots")
+    chain.db.store["validator_log_roots"].delete_prefix()
     assert await VR.log_root(chain.db, chain.height) == fresh               # computed from rows
 
 

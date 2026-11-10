@@ -356,9 +356,8 @@ async def test_the_real_rollback_hook_replays_in_forward_order():
         finally:
             node_main.db, node_main.EVM_STATE_MANAGER = saved
 
-        cur = await db.connection.execute(
-            "SELECT block_height FROM validator_withdrawals ORDER BY block_height")
-        assert [r[0] for r in await cur.fetchall()] == [1], "orphaned withdrawal survived"
+        heights = [r.block_height for r in db.store["validator_withdrawals"].scan_index("by_height")]
+        assert heights == [1], "orphaned withdrawal survived"
         # 10k genesis + 100k withdrawal − 100k stake − its gas: the deposit was accepted again.
         assert await db.get_address_balance(addr) == S / 10 - STAKE_GAS
     finally:

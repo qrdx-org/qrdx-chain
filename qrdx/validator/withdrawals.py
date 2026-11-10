@@ -73,7 +73,7 @@ from __future__ import annotations
 import logging
 import os
 from decimal import Decimal
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 from ..constants import WITHDRAWAL_DELAY_EPOCHS
 
@@ -113,9 +113,8 @@ async def ensure_tables(db) -> None:
 async def record_validator_exit(db, address: str, exit_epoch: int, block_height: int) -> None:
     """Log a consensus STAKE_EXIT against the block that carried it. Does not commit."""
     await ensure_tables(db)
-    await db.connection.execute(
-        "INSERT INTO validator_exits (block_height, address, exit_epoch) VALUES (?, ?, ?)",
-        (int(block_height), address, int(exit_epoch)),
+    db.store["validator_exits"].put(
+        int(block_height), db.store.next_id("validator_exits"), address, int(exit_epoch)
     )
 
 
@@ -190,40 +189,32 @@ async def compute_block_withdrawals(
     effect of staking is zero.
     """
     await ensure_tables(db)
-    cur = await db.connection.execute(
-        "SELECT address, exit_epoch FROM validator_exits "
-        "WHERE block_height < ? AND exit_epoch + ? <= ? "
-        "ORDER BY LOWER(address), exit_epoch",
-        (int(block_height), int(WITHDRAWAL_DELAY_EPOCHS), int(block_epoch)),
-    )
-    candidates = [tuple(r) for r in await cur.fetchall()]
+    store = db.store
+    candidates = [
+        (r.address, r.exit_epoch)
+        for r in store["validator_exits"].scan(lo=(-(2**62),), hi=(int(block_height),))
+        if int(r.exit_epoch) + int(WITHDRAWAL_DELAY_EPOCHS) <= int(block_epoch)
+    ]
     candidates += await _ejected(db, block_height, block_epoch)
     candidates.sort(key=lambda c: (str(c[0]).lower(), int(c[1])))
 
     payable: List[Withdrawal] = []
     forfeited: List[Forfeit] = []
     for address, exit_epoch in candidates:
-        cur = await db.connection.execute(
-            "SELECT 1 FROM validator_withdrawals "
-            "WHERE LOWER(address) = LOWER(?) AND exit_epoch = ?",
-            (address, exit_epoch),
-        )
-        if await cur.fetchone():
+        if store["validator_withdrawals"].scan_index(
+            "by_address", str(address).lower(), int(exit_epoch), limit=1
+        ):
             continue  # already settled
         if any(f[0].lower() == address.lower() and f[1] == int(exit_epoch) for f in forfeited):
             continue
 
-        cur = await db.connection.execute(
-            "SELECT stake FROM validator_deposits "
-            "WHERE LOWER(address) = LOWER(?) AND block_height < ?",
-            (address, int(block_height)),
+        deposits = store["validator_deposits"].scan_index(
+            "by_address", str(address).lower(), lo=(-(2**62),), hi=(int(block_height),)
         )
-        deposited = sum((Decimal(str(r[0])) for r in await cur.fetchall()), Decimal(0))
+        deposited = sum((Decimal(str(r.stake)) for r in deposits), Decimal(0))
 
-        cur = await db.connection.execute(
-            "SELECT amount FROM validator_withdrawals WHERE LOWER(address) = LOWER(?)", (address,)
-        )
-        withdrawn = sum((Decimal(str(r[0])) for r in await cur.fetchall()), Decimal(0))
+        settled = store["validator_withdrawals"].scan_index("by_address", str(address).lower())
+        withdrawn = sum((Decimal(str(r.amount)) for r in settled), Decimal(0))
         # Withdrawals already queued earlier in THIS list (an address with two exits).
         withdrawn += sum((w[2] for w in payable if w[0].lower() == address.lower()), Decimal(0))
 
@@ -247,11 +238,10 @@ async def _ejected(db, block_height: int, block_epoch: int) -> List[Tuple[str, i
     from .epoch_state import state_at
 
     state = await state_at(db, int(block_epoch), int(block_height) - 1)
-    rows = await db.connection.execute_fetchall(
-        "SELECT DISTINCT LOWER(address) FROM validator_exits WHERE block_height < ?",
-        (int(block_height),),
-    )
-    exited_by_operation = {r[0] for r in rows}
+    exited_by_operation = {
+        str(r.address).lower()
+        for r in db.store["validator_exits"].scan(lo=(-(2**62),), hi=(int(block_height),))
+    }
     return [
         (v.address, int(v.exit_epoch))
         for v in state.values()
@@ -277,11 +267,7 @@ async def apply_withdrawals(db, withdrawals: List[Withdrawal], block_height: int
     await ensure_tables(db)
     for address, exit_epoch, amount in withdrawals:
         await db.apply_account_balance_delta(address, amount)
-        await db.connection.execute(
-            "INSERT INTO validator_withdrawals (address, exit_epoch, amount, block_height) "
-            "VALUES (?, ?, ?, ?)",
-            (address, int(exit_epoch), str(amount), int(block_height)),
-        )
+        _settle(db, address, exit_epoch, amount, block_height)
         logger.info(
             "[withdrawal] block %d returned %s QRDX of stake to %s (exit epoch %d)",
             block_height,
@@ -291,6 +277,13 @@ async def apply_withdrawals(db, withdrawals: List[Withdrawal], block_height: int
         )
 
 
+def _settle(db, address: str, exit_epoch: int, amount: Any, block_height: int) -> None:
+    """A ``validator_withdrawals`` row: an exit settled (paid, or forfeited at zero)."""
+    db.store["validator_withdrawals"].put(
+        address, int(exit_epoch), str(amount), int(block_height), str(address).lower()
+    )
+
+
 async def record_forfeits(db, forfeited: List[Forfeit], block_height: int) -> None:
     """
     Settle forfeited exits with a zero-amount ledger row, so the chain scan behind a
@@ -298,11 +291,7 @@ async def record_forfeits(db, forfeited: List[Forfeit], block_height: int) -> No
     ledger re-credit paths skip zero rows so they never touch an account. Does not commit.
     """
     for address, exit_epoch in forfeited:
-        await db.connection.execute(
-            "INSERT INTO validator_withdrawals (address, exit_epoch, amount, block_height) "
-            "VALUES (?, ?, ?, ?)",
-            (address, int(exit_epoch), "0", int(block_height)),
-        )
+        _settle(db, address, exit_epoch, "0", block_height)
         logger.warning(
             "[withdrawal] block %d: stake of %s forfeited (slashed; exit epoch %d)",
             block_height,
@@ -370,25 +359,20 @@ async def apply_payouts(db, payouts: list, block_height: int) -> None:
     for p in payouts:
         for address, delta in _payout_moves(p.address, p.amount, p.kind):
             await db.apply_account_balance_delta(address, delta)
-        await db.connection.execute(
-            "INSERT INTO staking_payouts (payout_id, address, amount, kind, block_height) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (int(p.id), p.address, str(p.amount), p.kind, int(block_height)),
+        db.store["staking_payouts"].put(
+            int(p.id), p.address, str(p.amount), p.kind, int(block_height)
         )
 
 
 async def undo_withdrawal_logs_above(db, tip_height: int) -> None:
     """Discard exit and withdrawal records carried by orphaned blocks. Does not commit."""
     await ensure_tables(db)
-    await db.connection.execute(
-        "DELETE FROM validator_exits WHERE block_height > ?", (int(tip_height),)
-    )
-    await db.connection.execute(
-        "DELETE FROM validator_withdrawals WHERE block_height > ?", (int(tip_height),)
-    )
-    await db.connection.execute(
-        "DELETE FROM staking_payouts WHERE block_height > ?", (int(tip_height),)
-    )
+    store = db.store
+    store["validator_exits"].delete_prefix(lo=(int(tip_height) + 1,), hi=(2**62,))
+    for table in ("validator_withdrawals", "staking_payouts"):
+        t = store[table]
+        for r in t.scan_index("by_height", lo=(int(tip_height) + 1,), hi=(2**62,)):
+            t.delete(*r[: len(t.spec.key)])
 
 
 async def reapply_withdrawal_ledger(db) -> int:
@@ -401,15 +385,13 @@ async def reapply_withdrawal_ledger(db) -> int:
     so re-crediting them restores exactly the forward-path balances. Does not commit.
     """
     await ensure_tables(db)
-    cur = await db.connection.execute(
-        "SELECT address, amount FROM validator_withdrawals ORDER BY block_height, address"
-    )
-    rows = [(a, Decimal(str(v))) for a, v in await cur.fetchall()]
-    cur = await db.connection.execute(
-        "SELECT address, amount, kind FROM staking_payouts ORDER BY block_height, payout_id"
-    )
-    for a, v, kind in await cur.fetchall():
-        rows += _payout_moves(a, Decimal(str(v)), str(kind))
+    store = db.store
+    rows = [
+        (r.address, Decimal(str(r.amount)))
+        for r in store["validator_withdrawals"].scan_index("by_height")
+    ]
+    for r in store["staking_payouts"].scan_index("by_height"):
+        rows += _payout_moves(r.address, Decimal(str(r.amount)), str(r.kind))
     rows = [(a, v) for a, v in rows if v != 0]  # forfeits credit nothing
     for address, amount in rows:
         await db.apply_account_balance_delta(address, amount)

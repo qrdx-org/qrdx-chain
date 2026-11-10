@@ -79,7 +79,8 @@ not turn the store off.
 | S3a sections | each block's exchange and EVM sections, whole: one value a block (they were a row an item) | done |
 | S3 chain | blocks (header by height, by hash through an index; body apart), transactions, chain metadata, the chain index (its votes, offenders and FFG votes) | done |
 | S3b | votes and finality (`attestation_votes`, `epochs`, `slashing_events`), the exchange checkpoint | to do |
-| S4 validators | validators, stakes, lifecycle, epoch states, withdrawals, slashing, staking | to do |
+| S4a validator logs | the validator set's inputs (deposits, exits, staking operations, fee income, withdrawals, payouts), its stored epoch states and log roots | done |
+| S4 validators | `validators` (the display copy), stakes, lifecycle, slashing | to do |
 | S5 the node's own | pending transactions, peers, slashing protection, transaction and trading history | to do |
 | S6 | SQLite and aiosqlite removed | to do |
 

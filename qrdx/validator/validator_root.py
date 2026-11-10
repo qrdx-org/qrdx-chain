@@ -64,13 +64,6 @@ LOGS: Tuple[Tuple[str, Tuple[str, ...], str, Tuple[str, ...]], ...] = (
     ("staking_payouts", ("payout_id", "address", "amount", "kind"), "payout_id", ("amount",)),
 )
 
-_SCHEMA = (
-    "CREATE TABLE IF NOT EXISTS validator_log_roots ("
-    " height INTEGER NOT NULL,"
-    " block_hash TEXT NOT NULL,"
-    " root TEXT NOT NULL,"
-    " PRIMARY KEY (height, block_hash))"
-)
 
 _memo: "OrderedDict[int, Tuple[str, str]]" = OrderedDict()  # height → (block hash, log root)
 _NEAR = 16  # heights below the asked one checked in the memo before the stored entries
@@ -110,41 +103,28 @@ def _row(values: Sequence[Any], columns: Sequence[str], numeric: Sequence[str]) 
     return out
 
 
-def _logs_sql() -> str:
-    """Every table's rows of a range of blocks in one query: (the table's place in ``LOGS``, the
-    height, its columns padded to the widest, then up to two sort keys), each table's rows in
-    the order its own query took them (by height, then the table's order)."""
-    width = max(len(columns) for _t, columns, _o, _n in LOGS)
-    parts = []
-    for i, (table, columns, order, _numeric) in enumerate(LOGS):
-        keys = [k.strip() for k in order.split(",")]
-        if len(keys) > 2:
-            raise ValueError(f"{table}: at most two sort keys")
-        cols = list(columns) + ["NULL"] * (width - len(columns))
-        keys += ["NULL"] * (2 - len(keys))
-        parts.append(
-            f"SELECT {i}, block_height, {', '.join(cols)}, {keys[0]}, {keys[1]} FROM {table} "
-            "WHERE block_height BETWEEN ? AND ?"
-        )
-    return " UNION ALL ".join(parts) + f" ORDER BY 2, 1, {width + 3}, {width + 4}"
-
-
-_LOGS_SQL = _logs_sql()
+def _rows_of(db: Any, table: str, low: int, high: int) -> List[Any]:
+    """``table``'s rows of the blocks ``low`` .. ``high``, by height, then in the order block
+    application wrote them (``LOGS``)."""
+    t = db.store[table]
+    span = {"lo": (int(low),), "hi": (int(high) + 1,)}
+    if "by_height" in t.spec.indexes:  # (keyed otherwise: read in height order by its index)
+        return t.scan_index("by_height", **span)
+    return t.scan(**span)
 
 
 async def logs_between(db: Any, low: int, high: int) -> Dict[int, List[Any]]:
     """Every logged row of the blocks ``low`` .. ``high``, per height: ``[[table, [row, ...]],
-    ...]`` for the tables with rows, in ``LOGS`` order (one query for every table)."""
+    ...]`` for the tables with rows, in ``LOGS`` order."""
     out: Dict[int, List[Any]] = {}
     if high < low:
         return out
-    rows = await db.connection.execute_fetchall(_LOGS_SQL, (int(low), int(high)) * len(LOGS))
     per: Dict[int, Dict[str, List[Any]]] = {}
-    for place, height, *values in rows:
-        table, columns, _order, numeric = LOGS[int(place)]
-        per.setdefault(int(height), {}).setdefault(table, []).append(
-            _row(values[: len(columns)], columns, numeric)
-        )
+    for table, columns, _order, numeric in LOGS:
+        for r in _rows_of(db, table, low, high):
+            per.setdefault(int(r.block_height), {}).setdefault(table, []).append(
+                _row([getattr(r, c) for c in columns], columns, numeric)
+            )
     for height, tables in per.items():
         out[height] = [[t, tables[t]] for t, *_rest in LOGS if t in tables]
     return out
@@ -177,13 +157,6 @@ _ready: "weakref.WeakKeyDictionary[Any, bool]" = weakref.WeakKeyDictionary()
 
 
 async def _ensure(db: Any) -> None:
-    """The table, once per database — again after a rollback, which can take it."""
-    if _ready.get(db):
-        return
-    from .. import chain_index
-
-    await db.connection.execute(_SCHEMA)
-    chain_index.on_rollback(_ready.pop)
     _ready[db] = True
 
 
@@ -197,13 +170,12 @@ async def _newest_known(db: Any, height: int) -> Tuple[int, str]:
         if hit is not None and await chain_index.block_hash_at(db, k) == hit[0]:
             return k, hit[1]
     below = height + 1
+    stored = db.store["validator_log_roots"]
     while True:
-        cur = await db.connection.execute(
-            "SELECT height, block_hash, root FROM validator_log_roots WHERE height < ? "
-            "ORDER BY height DESC LIMIT ?",
-            (below, _CANDIDATES),
-        )
-        rows = await cur.fetchall()
+        rows = [
+            (r.height, r.block_hash, r.root)
+            for r in stored.scan(lo=(-(2**62),), hi=(below,), reverse=True, limit=_CANDIDATES)
+        ]
         for k, block_hash, root in rows:
             if await chain_index.block_hash_at(db, int(k)) == block_hash:
                 return int(k), str(root)
@@ -228,11 +200,7 @@ async def log_root(db: Any, height: int) -> str:
         if block_hash is not None:
             _remember(height, block_hash, root)
             if height // STORE_EVERY > k // STORE_EVERY:
-                await db.connection.execute(
-                    "INSERT OR REPLACE INTO validator_log_roots (height, block_hash, root) "
-                    "VALUES (?, ?, ?)",
-                    (int(height), block_hash, root),
-                )
+                db.store["validator_log_roots"].put(int(height), block_hash, root)
     return root
 
 

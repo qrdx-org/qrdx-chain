@@ -381,7 +381,7 @@ def create(source_db: str, out_dir: str, public: bool = False) -> Dict[str, Any]
 # Recomputed from the rows here (the roots after blocks: the verified checkpoint's, and its
 # parent's from the trusted history), never read from a snapshot. (The commitments'
 # accumulators too: recomputed from the rows when the restore opens the store.)
-_RECOMPUTED = ("validator_log_roots",)
+_RECOMPUTED: Tuple[str, ...] = ()
 _STORE_RECOMPUTED = (
     "post_roots",
     "smt_meta",
@@ -395,6 +395,7 @@ _STORE_RECOMPUTED = (
     "chain_index_offenders",
     "chain_index_ffg",
     "chain_index_meta",
+    "validator_log_roots",
 )
 # Rebuilt from the verified blocks (in the store now: above).
 _REBUILT: Tuple[str, ...] = ()
@@ -707,10 +708,10 @@ async def restore(
 
         set_epoch = int(bc["slot"]) // SLOTS_PER_EPOCH
         cp = await epoch_state._checkpoint(db, set_epoch, height - 1)
-        await db.connection.execute(
-            "DELETE FROM validator_epoch_states WHERE NOT (epoch = ? AND checkpoint = ?)",
-            (set_epoch, cp[1] if cp else ""),
-        )
+        states = db.store["validator_epoch_states"]
+        for key in states.keys():
+            if key != (set_epoch, cp[1] if cp else ""):
+                states.delete(*key)
         epoch_state._memo.pop(db, None)
         await undo_journal.reset(db)
         await undo_journal.set_floor(db, height)

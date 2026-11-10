@@ -365,9 +365,8 @@ async def test_the_flush_actually_records_an_exit():
         mgr.commit_block()
         await flush_validator_lifecycle_deltas(db, mgr, block_epoch=5, block_height=40)
         await db.connection.commit()
-        cur = await db.connection.execute(
-            "SELECT block_height, address, exit_epoch FROM validator_exits")
-        rows = await cur.fetchall()
+        rows = [(r.block_height, r.address, r.exit_epoch)
+                for r in db.store["validator_exits"].scan()]
         from qrdx.constants import UNBONDING_PERIOD_EPOCHS
         assert [tuple(r) for r in rows] == [(40, who, 5 + UNBONDING_PERIOD_EPOCHS)]
     finally:

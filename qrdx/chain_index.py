@@ -715,12 +715,10 @@ async def validator_public_key(db: Any, address: str, before_height: int) -> Opt
     except Exception:
         pass
     try:
-        rows = await db.connection.execute_fetchall(
-            "SELECT public_key FROM validator_deposits WHERE address = ? AND block_height < ? "
-            "ORDER BY block_height, id",
-            (address, int(before_height)),
+        deposits = db.store["validator_deposits"].scan_index(
+            "by_address", str(address).lower(), lo=(-(2**62),), hi=(int(before_height),)
         )
-        rows = rows
+        rows = [(r.public_key,) for r in deposits if r.address == address]
     except Exception:
         return None  # no deposit log (a database without validators)
     for (key_hex,) in rows:

@@ -341,73 +341,6 @@ class DatabaseSQLite:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
-        -- Every EXECUTED STAKE_DEPOSIT, keyed to the block that carried it (a refused one
-        -- is not here), written by block application and dropped when the block is rolled
-        -- back. The validator set's stake input (qrdx/validator/epoch_state.py) and the
-        -- withdrawals' (qrdx/validator/withdrawals.py). Genesis validators have no rows.
-        -- (created_new: unused, kept for existing databases.)
-        CREATE TABLE IF NOT EXISTS validator_deposits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            block_height INTEGER NOT NULL,
-            block_hash TEXT,
-            address TEXT NOT NULL,
-            public_key TEXT,
-            stake TEXT NOT NULL,
-            created_new BOOLEAN NOT NULL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        -- Consensus STAKE_EXITs, keyed to the carrying block (reversed on rollback), and
-        -- the ledger of stake withdrawals paid inside block application. Both feed
-        -- qrdx/validator/withdrawals.py, which must read ONLY chain-derived records so the
-        -- proposer and every importer compute the same withdrawals — hence these rather
-        -- than the asynchronously rebuilt validators table.
-        CREATE TABLE IF NOT EXISTS validator_exits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            block_height INTEGER NOT NULL,
-            address TEXT NOT NULL,
-            exit_epoch INTEGER NOT NULL
-        );
-        -- Executed delegation operations (STAKE_DELEGATE / STAKE_UNDELEGATE /
-        -- STAKE_SET_COMMISSION), keyed to the carrying block like validator_deposits: the
-        -- pools' input (qrdx/validator/epoch_state.py). value: QRDX, shares (NULL = all) or
-        -- basis points.
-        CREATE TABLE IF NOT EXISTS staking_ops (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            block_height INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            sender TEXT NOT NULL,
-            validator TEXT,
-            value TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_staking_ops_height ON staking_ops(block_height);
-        -- The stakers' share of the protocol's QRDX fee income each block took in, held at
-        -- the fee holder until its epoch is shared out (qrdx/validator/epoch_state.py). One
-        -- row per block, written by every path alike; dropped above a rollback.
-        CREATE TABLE IF NOT EXISTS staker_fee_income (
-            block_height INTEGER PRIMARY KEY,
-            amount TEXT NOT NULL
-        );
-        -- The ledger of staking payouts (rewards, finished undelegations, refunds) blocks have
-        -- credited, like validator_withdrawals: undone above a rollback, re-credited after an
-        -- account rebuild.
-        CREATE TABLE IF NOT EXISTS staking_payouts (
-            payout_id INTEGER NOT NULL,
-            address TEXT NOT NULL,
-            amount TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            block_height INTEGER NOT NULL,
-            PRIMARY KEY (payout_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_staking_payouts_height ON staking_payouts(block_height);
-        CREATE TABLE IF NOT EXISTS validator_withdrawals (
-            address TEXT NOT NULL,
-            exit_epoch INTEGER NOT NULL,
-            amount TEXT NOT NULL,
-            block_height INTEGER NOT NULL,
-            PRIMARY KEY (address, exit_epoch)
-        );
-
         CREATE TABLE IF NOT EXISTS stakes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             validator_address TEXT NOT NULL,
@@ -598,10 +531,6 @@ class DatabaseSQLite:
         CREATE INDEX IF NOT EXISTS idx_stakes_activation ON validator_stakes(activation_epoch);
         CREATE INDEX IF NOT EXISTS idx_deposits_validator ON stake_deposits(validator_address);
         CREATE INDEX IF NOT EXISTS idx_withdrawals_validator ON stake_withdrawals(validator_address);
-        CREATE INDEX IF NOT EXISTS idx_validator_deposits_height ON validator_deposits(block_height);
-        CREATE INDEX IF NOT EXISTS idx_validator_exits_height ON validator_exits(block_height);
-        CREATE INDEX IF NOT EXISTS idx_validator_withdrawals_height ON validator_withdrawals(block_height);
-        CREATE INDEX IF NOT EXISTS idx_validator_deposits_address ON validator_deposits(address);
         -- Balance writes find their row case-insensitively (genesis may store a checksummed
         -- address): without this every write scanned the table (docs/KNOWN_ISSUES.md).
         CREATE INDEX IF NOT EXISTS idx_contract_metadata_verified ON contract_metadata(verified);
@@ -1885,11 +1814,16 @@ class DatabaseSQLite:
         commit."""
         from decimal import Decimal
 
-        await self.connection.execute(
-            "INSERT INTO validator_deposits "
-            "(block_height, block_hash, address, public_key, stake, created_new) "
-            "VALUES (?, ?, ?, ?, ?, 0)",
-            (int(block_height), block_hash, address, public_key, str(Decimal(str(stake)))),
+        self.store["validator_deposits"].put(
+            block_height=int(block_height),
+            id=self.store.next_id("validator_deposits"),
+            block_hash=block_hash,
+            address=address,
+            public_key=public_key,
+            stake=str(Decimal(str(stake))),
+            created_new=0,
+            created_at=_now(),
+            address_lc=str(address).lower(),
         )
 
     async def log_staking_op(
@@ -1898,10 +1832,13 @@ class DatabaseSQLite:
         """Log an executed delegation operation against its carrying block (the pools' input:
         qrdx/validator/epoch_state.py). Dropped by ``undo_validator_deposits_above``. No
         commit."""
-        await self.connection.execute(
-            "INSERT INTO staking_ops (block_height, kind, sender, validator, value) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (int(block_height), kind, sender, validator, None if value is None else str(value)),
+        self.store["staking_ops"].put(
+            int(block_height),
+            self.store.next_id("staking_ops"),
+            kind,
+            sender,
+            validator,
+            None if value is None else str(value),
         )
 
     async def log_staker_fee_income(self, block_height: int, amount) -> None:
@@ -1909,30 +1846,18 @@ class DatabaseSQLite:
         own: written (or, for nothing, removed) by every path that applies the block, so a rebuild
         writes the same and an orphaned block's row never outlives it. No commit."""
         if amount and amount > 0:
-            await self.connection.execute(
-                "INSERT OR REPLACE INTO staker_fee_income (block_height, amount) VALUES (?, ?)",
-                (int(block_height), str(amount)),
-            )
+            self.store["staker_fee_income"].put(int(block_height), str(amount))
         else:
-            await self.connection.execute(
-                "DELETE FROM staker_fee_income WHERE block_height = ?", (int(block_height),)
-            )
+            self.store["staker_fee_income"].delete(int(block_height))
 
     async def undo_validator_deposits_above(self, tip_height: int) -> dict:
         """Drop the deposit log of every block above ``tip_height`` (after a rollback). The
         validator set is computed from the chain and these logs (validator/epoch_state.py),
         so nothing else needs reversing. Does NOT commit. Returns ``{"reversed": n}``."""
-        cur = await self.connection.execute(
-            "DELETE FROM validator_deposits WHERE block_height > ?", (int(tip_height),)
-        )
-        n = cur.rowcount if cur.rowcount is not None else 0
-        cur = await self.connection.execute(
-            "DELETE FROM staking_ops WHERE block_height > ?", (int(tip_height),)
-        )
-        n += cur.rowcount if cur.rowcount is not None else 0
-        await self.connection.execute(
-            "DELETE FROM staker_fee_income WHERE block_height > ?", (int(tip_height),)
-        )
+        above = {"lo": (int(tip_height) + 1,), "hi": (2**62,)}
+        n = self.store["validator_deposits"].delete_prefix(**above)
+        n += self.store["staking_ops"].delete_prefix(**above)
+        self.store["staker_fee_income"].delete_prefix(**above)
         from . import state_proofs
 
         await state_proofs.undo_above(self, tip_height)  # orphaned heights' proof roots

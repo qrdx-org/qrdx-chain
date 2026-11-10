@@ -291,6 +291,57 @@ SPECS: Tuple[Spec, ...] = (
         indexes={"by_target": ("target_epoch",)},
     ),
     Spec("chain_index_meta", [("key", _T)], [("value", _T, None)]),
+    # ── the validator set's inputs, logged against the blocks that carried them, in the order
+    # block application wrote them (qrdx/validator/epoch_state.py, validator_root.py), and its
+    # stored states. ``id``: a counter of the table's own (``Store.next_id``), as AUTOINCREMENT
+    # was; ``address_lc``: the address lower-cased, which the payouts compare by ──
+    Spec(
+        "validator_deposits",
+        [("block_height", _I), ("id", _I)],
+        [
+            ("block_hash", _T, None),
+            ("address", _T, None),
+            ("public_key", _T, None),
+            ("stake", _T, None),
+            ("created_new", _I, 0),
+            ("created_at", _T, None),
+            ("address_lc", _T, None),
+        ],
+        indexes={"by_address": ("address_lc", "block_height")},
+    ),
+    Spec(
+        "validator_exits",
+        [("block_height", _I), ("id", _I)],
+        [("address", _T, None), ("exit_epoch", _I, None)],
+    ),
+    Spec(
+        "staking_ops",
+        [("block_height", _I), ("id", _I)],
+        [("kind", _T, None), ("sender", _T, None), ("validator", _T, None), ("value", _T, None)],
+    ),
+    Spec("staker_fee_income", [("block_height", _I)], [("amount", _T, None)]),
+    Spec(
+        "validator_withdrawals",
+        [("address", _T), ("exit_epoch", _I)],
+        [("amount", _T, None), ("block_height", _I, None), ("address_lc", _T, None)],
+        indexes={
+            "by_address": ("address_lc", "exit_epoch"),
+            "by_height": ("block_height", "address"),
+        },
+    ),
+    Spec(
+        "staking_payouts",
+        [("payout_id", _I)],
+        [
+            ("address", _T, None),
+            ("amount", _T, None),
+            ("kind", _T, None),
+            ("block_height", _I, None),
+        ],
+        indexes={"by_height": ("block_height",)},
+    ),
+    Spec("validator_epoch_states", [("epoch", _I), ("checkpoint", _T)], [("state", _T, None)]),
+    Spec("validator_log_roots", [("height", _I), ("block_hash", _T)], [("root", _T, None)]),
     # ── each block's sections, whole, by its hash: the exchange's as a JSON list of its items,
     # the EVM's as a JSON list of raw transactions (they were a row an item) ──
     Spec("exchange_sections", [("block_hash", _T)], [("data", _B, b"")], raw=True),
@@ -577,6 +628,15 @@ class Store:
             if t.id == table_id:
                 return t
         raise KeyError(table_id)
+
+    def next_id(self, table: str) -> int:
+        """The next ``id`` of ``table``: one above every id it has given (as AUTOINCREMENT, never
+        reused), kept in ``store_meta`` with the rows it numbers."""
+        meta = self["store_meta"]
+        row = meta.get(f"id:{table}")
+        n = (int(row.value) if row is not None else 0) + 1
+        meta.put(f"id:{table}", str(n))
+        return n
 
     def commit(self) -> None:
         self.native.commit()

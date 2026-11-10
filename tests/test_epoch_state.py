@@ -570,7 +570,7 @@ async def test_the_batched_computation_equals_the_per_epoch_one(chain, monkeypat
     async def check(epochs, top, fresh=True):
         await ES._ensure(chain.db)
         if fresh:
-            await chain.db.connection.execute("DELETE FROM validator_epoch_states")
+            chain.db.store["validator_epoch_states"].delete_prefix()
             ES._memo.pop(chain.db, None)
         for e in epochs:
             want = await _per_epoch(chain.db, e, top)

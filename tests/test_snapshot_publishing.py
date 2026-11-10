@@ -34,7 +34,6 @@ def _node_db(path, checkpoint=100):
         CREATE TABLE tx_index (tx_hash TEXT, block_height INTEGER);
         CREATE TABLE tx_participants (account TEXT, block_height INTEGER);
         CREATE TABLE hist_trades (id INTEGER, data TEXT);
-        CREATE TABLE validator_log_roots (height INTEGER, root TEXT);
     """)
     conn.execute("INSERT INTO exchange_checkpoint VALUES (1, ?, ?, ?, ?)",
                  (checkpoint, f"{checkpoint:064x}", b"state", b"journal"))
@@ -43,7 +42,6 @@ def _node_db(path, checkpoint=100):
     conn.execute("INSERT INTO tx_index VALUES ('t', 3)")
     conn.execute("INSERT INTO tx_participants VALUES ('0xPQa', 3)")
     conn.execute("INSERT INTO hist_trades VALUES (1, 'fill')")
-    conn.execute("INSERT INTO validator_log_roots VALUES (99, 'planted')")  # (never trusted)
     conn.commit()
     # The store beside it (qrdx/store.py): the state and its journal a restore needs, and the
     # roots and the tree it recomputes.
@@ -56,6 +54,7 @@ def _node_db(path, checkpoint=100):
         store["blocks"].put(block_height=h, block_hash=f"{h:064x}")
         store["block_bodies"].put(h, b"x" * 200)
     store["chain_index"].put(99, "h", 99, 12, "planted")  # (rebuilt from the blocks)
+    store["validator_log_roots"].put(99, "h", "planted")  # (never trusted)
     store.commit()
     store.close()
     return conn
@@ -92,14 +91,13 @@ def test_a_published_snapshot_leaves_out_what_a_restore_discards(tmp_path):
     finally:
         conn.close()
     copy = str(tmp_path / "pub" / "qrdx.db")
-    for table in ("peers", "pending_transactions", "tx_index", "tx_participants", "hist_trades",
-                  "validator_log_roots"):
+    for table in ("peers", "pending_transactions", "tx_index", "tx_participants", "hist_trades"):
         assert _count(copy, table) == 0, table
     assert _count(copy, "exchange_checkpoint") > 0
     store_copy = copy + ".store"
     store_raw = open(store_copy, "rb").read()
     assert manifest["store"]["sha256"] == hashlib.sha256(store_raw).hexdigest()
-    for table in ("post_roots", "smt_nodes", "chain_index"):
+    for table in ("post_roots", "smt_nodes", "chain_index", "validator_log_roots"):
         assert _store_count(store_copy, table) == 0, table
     assert _store_count(store_copy, "account_state") == 1
     assert _store_count(store_copy, "blocks") == 150

@@ -114,8 +114,7 @@ async def test_the_logged_income_is_shared_and_a_rollback_drops_it(chain, no_min
     assert _fees(s, "fee") == {a: D(30) for a in G}
     assert (await ES.epoch_inputs(chain.db, E, h)).fees == D(90)      # one-epoch ≡ batched
     await chain.rollback(h - 1)
-    cur = await chain.db.connection.execute("SELECT COUNT(*) FROM staker_fee_income")
-    assert (await cur.fetchone())[0] == 0
+    assert chain.db.store["staker_fee_income"].count() == 0
 
 
 # ── the exchange: what goes to the holder ───────────────────────────────────
@@ -166,5 +165,4 @@ async def test_a_block_without_fees_clears_an_orphans_row_at_its_height(chain):
     orphan's income (every path writes each block's row, removing it for nothing)."""
     await chain.db.log_staker_fee_income(7, D(90))                    # the orphan's
     await chain.db.log_staker_fee_income(7, D(0))                     # the new block's
-    cur = await chain.db.connection.execute("SELECT COUNT(*) FROM staker_fee_income")
-    assert (await cur.fetchone())[0] == 0
+    assert chain.db.store["staker_fee_income"].count() == 0

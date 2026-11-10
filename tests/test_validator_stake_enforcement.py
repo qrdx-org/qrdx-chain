@@ -88,9 +88,8 @@ async def _run_deposit(db, mgr, tx, block_epoch=0):
 
 
 async def _deposit_log(db):
-    cur = await db.connection.execute(
-        "SELECT block_height, address, stake FROM validator_deposits ORDER BY id")
-    return [tuple(r) for r in await cur.fetchall()]
+    rows = sorted(db.store["validator_deposits"].scan(), key=lambda r: r.id)
+    return [(r.block_height, r.address, r.stake) for r in rows]
 
 
 async def _close(db):

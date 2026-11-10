@@ -36,15 +36,13 @@ async def db():
 
 
 async def _deposits(db):
-    cur = await db.connection.execute(
-        "SELECT block_height, address, public_key, stake FROM validator_deposits ORDER BY id")
-    return [tuple(r) for r in await cur.fetchall()]
+    rows = sorted(db.store["validator_deposits"].scan(), key=lambda r: r.id)
+    return [(r.block_height, r.address, r.public_key, r.stake) for r in rows]
 
 
 async def _exits(db):
-    cur = await db.connection.execute(
-        "SELECT block_height, address, exit_epoch FROM validator_exits ORDER BY id")
-    return [tuple(r) for r in await cur.fetchall()]
+    rows = sorted(db.store["validator_exits"].scan(), key=lambda r: r.id)
+    return [(r.block_height, r.address, r.exit_epoch) for r in rows]
 
 
 def _mgr():

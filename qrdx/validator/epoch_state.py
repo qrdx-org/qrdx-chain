@@ -77,14 +77,6 @@ MIN_ACTIVE_AFTER_EJECTION = 3  # never eject below this many active validators
 # synthetic holder: no key signs for it).
 STAKER_FEE_HOLDER = "0xFEES" + hashlib.blake2b(b"staking:fee-holder", digest_size=18).hexdigest()
 
-_SCHEMA = (
-    "CREATE TABLE IF NOT EXISTS validator_epoch_states ("
-    " epoch INTEGER NOT NULL,"
-    " checkpoint TEXT NOT NULL,"  # hash of the last block before the epoch's first slot
-    " state TEXT NOT NULL,"
-    " PRIMARY KEY (epoch, checkpoint))"
-)
-
 
 @dataclass
 class ValidatorState:
@@ -561,7 +553,6 @@ async def epoch_inputs(db: Any, epoch: int, up_to_height: int) -> EpochInputs:
     of epochs (tests/test_epoch_state.py holds the two equal)."""
     from .ffg import INCLUSION_EPOCHS
 
-    conn = db.connection
     heights = [
         int(r.height)
         for r in db.store["chain_index"].scan_index("by_epoch", int(epoch))
@@ -573,24 +564,18 @@ async def epoch_inputs(db: Any, epoch: int, up_to_height: int) -> EpochInputs:
     offenders: List[str] = []
     fees = ZERO
     if lo is not None:
-        cur = await conn.execute(
-            "SELECT block_height, id, address, public_key, stake FROM validator_deposits "
-            "WHERE block_height BETWEEN ? AND ? ORDER BY block_height, id",
-            (lo, hi),
-        )
-        deposits = await cur.fetchall()
-        cur = await conn.execute(
-            "SELECT block_height, id, address FROM validator_exits "
-            "WHERE block_height BETWEEN ? AND ? ORDER BY block_height, id",
-            (lo, hi),
-        )
-        exits = await cur.fetchall()
-        cur = await conn.execute(
-            "SELECT block_height, id, kind, sender, validator, value FROM staking_ops "
-            "WHERE block_height BETWEEN ? AND ? ORDER BY block_height, id",
-            (lo, hi),
-        )
-        staking = await cur.fetchall()
+        span = {"lo": (int(lo),), "hi": (int(hi) + 1,)}
+        deposits = [
+            (r.block_height, r.id, r.address, r.public_key, r.stake)
+            for r in db.store["validator_deposits"].scan(**span)
+        ]
+        exits = [
+            (r.block_height, r.id, r.address) for r in db.store["validator_exits"].scan(**span)
+        ]
+        staking = [
+            (r.block_height, r.id, r.kind, r.sender, r.validator, r.value)
+            for r in db.store["staking_ops"].scan(**span)
+        ]
         # Per block: deposits, exits, then delegation operations (each log in its own order;
         # how they interleaved within one block is not recoverable across the logs, and any
         # fixed order is deterministic).
@@ -607,11 +592,9 @@ async def epoch_inputs(db: Any, epoch: int, up_to_height: int) -> EpochInputs:
             r.offender
             for r in db.store["chain_index_offenders"].scan(lo=(int(lo),), hi=(int(hi) + 1,))
         ]
-        cur = await conn.execute(
-            "SELECT amount FROM staker_fee_income WHERE block_height BETWEEN ? AND ?",
-            (lo, hi),
+        fees = sum(
+            (Decimal(str(r.amount)) for r in db.store["staker_fee_income"].scan(**span)), ZERO
         )
-        fees = sum((Decimal(str(a)) for (a,) in await cur.fetchall()), ZERO)
     target = int(epoch) - INCLUSION_EPOCHS
     attesters: List[str] = []
     if target >= 1:
@@ -646,9 +629,7 @@ def _remember(db: Any, key: Tuple[int, str], state: State) -> None:
 
 
 async def _ensure(db: Any) -> None:
-    if not _ready.get(db):
-        await db.connection.execute(_SCHEMA)
-        _ready[db] = True
+    _ready[db] = True
 
 
 async def _checkpoint(
@@ -678,14 +659,10 @@ async def _cached(db: Any, epoch: int, checkpoint: str) -> Optional[State]:
     hit = memo.get((epoch, checkpoint))
     if hit is not None:
         return hit
-    cur = await db.connection.execute(
-        "SELECT state FROM validator_epoch_states WHERE epoch = ? AND checkpoint = ?",
-        (int(epoch), checkpoint),
-    )
-    row = await cur.fetchone()
+    row = db.store["validator_epoch_states"].get(int(epoch), checkpoint)
     if row is None:
         return None
-    state = _load(row[0])
+    state = _load(row.state)
     _remember(db, (epoch, checkpoint), state)
     return state
 
@@ -732,12 +709,8 @@ async def _newest_stored(db: Any, epoch: int, top: int) -> Optional[Tuple[int, S
         return epoch, hit
     below = epoch
     while below > 0:
-        cur = await db.connection.execute(
-            "SELECT DISTINCT epoch FROM validator_epoch_states WHERE epoch < ? "
-            "ORDER BY epoch DESC LIMIT ?",
-            (below, _CANDIDATE_PAGE),
-        )
-        candidates = [int(e) for (e,) in await cur.fetchall()]
+        stored = db.store["validator_epoch_states"].keys(lo=(-(2**62),), hi=(below,))
+        candidates = sorted({int(k[0]) for k in stored}, reverse=True)[:_CANDIDATE_PAGE]
         for e in candidates:
             cp = await _checkpoint(db, e, top)
             hit = await _cached(db, e, cp[1]) if cp else None
@@ -760,7 +733,6 @@ async def _advance(db: Any, state: State, start: int, epoch: int, top: int) -> S
     from ..constants import SLOTS_PER_EPOCH
     from .ffg import INCLUSION_EPOCHS
 
-    conn = db.connection
     first = max(0, start - INCLUSION_EPOCHS)  # votes for start's reward target ride from here
     base = await _checkpoint(db, first, top)
     rows = sorted(
@@ -791,32 +763,26 @@ async def _advance(db: Any, state: State, start: int, epoch: int, top: int) -> S
     heights = [h for hs in spans.values() for h in hs]
     if heights:
         lo, hi = min(heights), max(heights)
-        cur = await conn.execute(
-            "SELECT block_height, id, address, public_key, stake FROM validator_deposits "
-            "WHERE block_height BETWEEN ? AND ?",
-            (lo, hi),
-        )
-        for h, i, a, pk, st in await cur.fetchall():
+        span = {"lo": (int(lo),), "hi": (int(hi) + 1,)}
+        for h, i, a, pk, st in (
+            (r.block_height, r.id, r.address, r.public_key, r.stake)
+            for r in db.store["validator_deposits"].scan(**span)
+        ):
             ep = epoch_of.get(int(h))
             if ep is not None and start <= ep < epoch:
                 ops_by_epoch.setdefault(ep, []).append(
                     (int(h), 0, int(i), ("deposit", a, pk, Decimal(str(st))))
                 )
-        cur = await conn.execute(
-            "SELECT block_height, id, address FROM validator_exits "
-            "WHERE block_height BETWEEN ? AND ?",
-            (lo, hi),
-        )
-        for h, i, a in await cur.fetchall():
+        for h, i, a in (
+            (r.block_height, r.id, r.address) for r in db.store["validator_exits"].scan(**span)
+        ):
             ep = epoch_of.get(int(h))
             if ep is not None and start <= ep < epoch:
                 ops_by_epoch.setdefault(ep, []).append((int(h), 1, int(i), ("exit", a, None, None)))
-        cur = await conn.execute(
-            "SELECT block_height, id, kind, sender, validator, value FROM staking_ops "
-            "WHERE block_height BETWEEN ? AND ?",
-            (lo, hi),
-        )
-        for h, i, kind, sender, validator, value in await cur.fetchall():
+        for h, i, kind, sender, validator, value in (
+            (r.block_height, r.id, r.kind, r.sender, r.validator, r.value)
+            for r in db.store["staking_ops"].scan(**span)
+        ):
             ep = epoch_of.get(int(h))
             if ep is not None and start <= ep < epoch:
                 v = None if value is None else Decimal(str(value))
@@ -828,11 +794,9 @@ async def _advance(db: Any, state: State, start: int, epoch: int, top: int) -> S
             ep = epoch_of.get(int(h))
             if ep is not None and start <= ep < epoch:
                 offenders_by_epoch.setdefault(ep, []).append(offender)
-        cur = await conn.execute(
-            "SELECT block_height, amount FROM staker_fee_income WHERE block_height BETWEEN ? AND ?",
-            (lo, hi),
-        )
-        for h, amount in await cur.fetchall():
+        for h, amount in (
+            (r.block_height, r.amount) for r in db.store["staker_fee_income"].scan(**span)
+        ):
             ep = epoch_of.get(int(h))
             if ep is not None and start <= ep < epoch:
                 fees_by_epoch[ep] = fees_by_epoch.get(ep, ZERO) + Decimal(str(amount))
@@ -948,10 +912,7 @@ async def committee_for_block(db: Any, height: int) -> Dict[str, Decimal]:
 
 
 async def _store(db: Any, epoch: int, checkpoint: str, state: State) -> None:
-    await db.connection.execute(
-        "INSERT OR REPLACE INTO validator_epoch_states (epoch, checkpoint, state) VALUES (?, ?, ?)",
-        (int(epoch), checkpoint, _dump(state)),
-    )
+    db.store["validator_epoch_states"].put(int(epoch), checkpoint, _dump(state))
     _remember(db, (int(epoch), checkpoint), state)
 
 
@@ -982,11 +943,10 @@ async def prune(db: Any, below_epoch: int) -> None:
     """Drop cached states of epochs below ``below_epoch`` (below finality, a state is only
     needed to compute the next one), keeping the newest stored one below it to compute from."""
     await _ensure(db)
-    await db.connection.execute(
-        "DELETE FROM validator_epoch_states WHERE epoch < ? AND epoch < "
-        "(SELECT COALESCE(MAX(epoch), 0) FROM validator_epoch_states WHERE epoch <= ?)",
-        (int(below_epoch), int(below_epoch)),
-    )
+    stored = db.store["validator_epoch_states"]
+    newest = stored.keys(lo=(-(2**62),), hi=(int(below_epoch) + 1,))
+    keep_from = min(int(below_epoch), int(newest[-1][0]) if newest else 0)
+    stored.delete_prefix(lo=(-(2**62),), hi=(keep_from,))
 
 
 async def state_at_tip(db: Any) -> State:

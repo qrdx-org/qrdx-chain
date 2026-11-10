@@ -103,9 +103,9 @@ async def test_evidence_in_an_earlier_block_forfeits_once(db):
     assert await db.get_address_balance(who) == Decimal("500000") - STAKE
 
     # Settled with a zero row, so later blocks neither pay nor rescan the chain.
-    cur = await db.connection.execute(
-        "SELECT amount, block_height FROM validator_withdrawals WHERE address = ?", (who,))
-    assert [(Decimal(a), h) for a, h in await cur.fetchall()] == [(Decimal(0), 100)]
+    rows = [(r.amount, r.block_height)
+            for r in db.store["validator_withdrawals"].scan() if r.address == who]
+    assert [(Decimal(a), h) for a, h in rows] == [(Decimal(0), 100)]
     assert await W.compute_block_withdrawals(db, 101, EXIT_EPOCH + DELAY + 1) == ([], [])
 
 
@@ -134,9 +134,7 @@ async def test_a_zero_row_never_touches_account_state(db):
     crediting 0 to an address with no account would create one and move the root."""
     root = await db.get_account_state_root()
     stranger = PQPrivateKey.generate().public_key.to_address()
-    await db.connection.execute(
-        "INSERT INTO validator_withdrawals (address, exit_epoch, amount, block_height) "
-        "VALUES (?, ?, '0', ?)", (stranger, 1, 5))
+    W._settle(db, stranger, 1, "0", 5)
     assert await W.reapply_withdrawal_ledger(db) == 0
     await db.connection.commit()
     assert await db.get_account_state_root() == root

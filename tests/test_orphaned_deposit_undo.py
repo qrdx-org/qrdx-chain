@@ -30,9 +30,8 @@ async def _close(db):
 
 
 async def _logged(db):
-    cur = await db.connection.execute(
-        "SELECT block_height, address, stake FROM validator_deposits ORDER BY id")
-    return [tuple(r) for r in await cur.fetchall()]
+    rows = sorted(db.store["validator_deposits"].scan(), key=lambda r: r.id)
+    return [(r.block_height, r.address, r.stake) for r in rows]
 
 
 def test_the_gate_is_on():
