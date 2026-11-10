@@ -143,8 +143,7 @@ async def test_votes_justify_and_a_link_finalizes(keys):
         await c.epochs(2, 3, voters=[0, 1, 2])
         res = await update_finality(c.db)
         assert res == {"justified_epoch": 3, "finalized_epoch": 2}
-        cur = await c.db.connection.execute("SELECT finalized FROM epochs WHERE epoch = 2")
-        assert bool((await cur.fetchone())[0])
+        assert bool(c.db.store["epochs"].get(2).finalized)
     finally:
         await c.close()
 
@@ -233,8 +232,7 @@ async def test_justification_above_finality_follows_a_reorg(keys):
         await c.block(2 * S + 1, tag="B")                    # epoch 2 on another branch, no votes
         res = await update_finality(c.db)
         assert res == {"justified_epoch": 1, "finalized_epoch": 1}
-        cur = await c.db.connection.execute("SELECT justified FROM epochs WHERE epoch = 2")
-        assert not bool((await cur.fetchone())[0])
+        assert not bool(c.db.store["epochs"].get(2).justified)
     finally:
         await c.close()
 

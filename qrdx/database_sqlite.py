@@ -309,23 +309,6 @@ class DatabaseSQLite:
             UNIQUE(slot, validator_address)
         );
 
-        CREATE TABLE IF NOT EXISTS epochs (
-            epoch INTEGER PRIMARY KEY,
-            start_slot INTEGER NOT NULL,
-            end_slot INTEGER NOT NULL,
-            active_validators INTEGER NOT NULL DEFAULT 0,
-            total_stake TEXT NOT NULL DEFAULT '0',
-            finalized BOOLEAN NOT NULL DEFAULT 0,
-            justified BOOLEAN NOT NULL DEFAULT 0,
-            finality_root TEXT,
-            randao_mix TEXT,
-            total_rewards TEXT NOT NULL DEFAULT '0',
-            total_penalties TEXT NOT NULL DEFAULT '0',
-            started_at TIMESTAMP,
-            finalized_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
         CREATE TABLE IF NOT EXISTS validators (
             address TEXT PRIMARY KEY,
             public_key TEXT NOT NULL,
@@ -366,45 +349,6 @@ class DatabaseSQLite:
             balance TEXT NOT NULL DEFAULT '0',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        -- Finality: accumulated attestation VOTES (one per validator per target
-        -- epoch — Casper-style). Populated by every node from the attestations
-        -- carried in imported block bodies, so finality is computable by full
-        -- nodes too (not just validators with an in-memory pool).
-        CREATE TABLE IF NOT EXISTS attestation_votes (
-            validator_address TEXT NOT NULL,
-            target_epoch INTEGER NOT NULL,
-            source_epoch INTEGER NOT NULL DEFAULT 0,
-            slot INTEGER NOT NULL,
-            block_hash TEXT NOT NULL,
-            -- Retained so a stored vote can be reconstructed into a fully-signed
-            -- Attestation for SELF-VALIDATING surround/double-vote slashing evidence
-            -- (finality only needs target/source; slashing detection needs the rest).
-            epoch INTEGER NOT NULL DEFAULT 0,
-            validator_index INTEGER NOT NULL DEFAULT 0,
-            signature TEXT NOT NULL DEFAULT '',
-            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (validator_address, target_epoch)
-        );
-
-        -- Slashing evidence (consensus security). A row is recorded when a node
-        -- detects a slashable offence on the import path — primarily DOUBLE_SIGN: the
-        -- slot-eligible proposer signed TWO different blocks for the SAME slot (seen as
-        -- an equal-height fork with identical proposer+slot but different hash). Keyed
-        -- by (validator, slot, condition) so the same offence is recorded once.
-        -- OBSERVE foundation: detection + durable evidence only; the deterministic
-        -- stake penalty (via the finalized-epoch validator-update path, total_slashed)
-        -- is a follow-up that consumes these rows.
-        CREATE TABLE IF NOT EXISTS slashing_events (
-            validator_address TEXT NOT NULL,
-            condition TEXT NOT NULL,
-            slot INTEGER NOT NULL,
-            epoch INTEGER NOT NULL,
-            evidence TEXT NOT NULL,
-            processed INTEGER NOT NULL DEFAULT 0,
-            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (validator_address, slot, condition)
         );
 
         -- Transaction index (qrdx/tx_index.py): every transaction of every canonical block —
@@ -524,8 +468,6 @@ class DatabaseSQLite:
             PRIMARY KEY (block_height, position)
         );
         CREATE INDEX IF NOT EXISTS idx_hist_samples_market ON hist_samples(market, block_time);
-        CREATE INDEX IF NOT EXISTS idx_attestation_votes_target ON attestation_votes(target_epoch);
-        CREATE INDEX IF NOT EXISTS idx_attestation_votes_block ON attestation_votes(block_hash);
         CREATE INDEX IF NOT EXISTS idx_validator_epoch ON validator_states(epoch);
         CREATE INDEX IF NOT EXISTS idx_stakes_status ON validator_stakes(status);
         CREATE INDEX IF NOT EXISTS idx_stakes_activation ON validator_stakes(activation_epoch);
@@ -562,15 +504,6 @@ class DatabaseSQLite:
         _migrations = [
             "ALTER TABLE validators ADD COLUMN total_slashed TEXT NOT NULL DEFAULT '0'",
             "ALTER TABLE validators ADD COLUMN total_rewards TEXT NOT NULL DEFAULT '0'",
-            # Signed-attestation retention for surround/double-vote slashing detection.
-            "ALTER TABLE attestation_votes ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE attestation_votes ADD COLUMN validator_index INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE attestation_votes ADD COLUMN signature TEXT NOT NULL DEFAULT ''",
-            # The FFG vote's checkpoint roots (qrdx/validator/ffg.py): signed, so a retained
-            # vote rebuilds into the exact attestation — and two copies of one vote compare
-            # equal (without them, seeing an honest vote twice looked like a double vote).
-            "ALTER TABLE attestation_votes ADD COLUMN source_root TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE attestation_votes ADD COLUMN target_root TEXT NOT NULL DEFAULT ''",
         ]
         for stmt in _migrations:
             try:
@@ -1606,23 +1539,18 @@ class DatabaseSQLite:
         attestation so a stored vote can be reconstructed for self-validating
         surround/double-vote slashing evidence (see ``get_validator_votes``).
         """
-        await self.connection.execute(
-            "INSERT OR IGNORE INTO attestation_votes "
-            "(validator_address, target_epoch, source_epoch, slot, block_hash, "
-            "epoch, validator_index, signature, source_root, target_root) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                validator_address,
-                int(target_epoch),
-                int(source_epoch),
-                int(slot),
-                block_hash,
-                int(epoch),
-                int(validator_index),
-                str(signature),
-                str(source_root or ""),
-                str(target_root or ""),
-            ),
+        self.store["attestation_votes"].insert(
+            validator_address=validator_address,
+            target_epoch=int(target_epoch),
+            source_epoch=int(source_epoch),
+            slot=int(slot),
+            block_hash=block_hash,
+            epoch=int(epoch),
+            validator_index=int(validator_index),
+            signature=str(signature),
+            source_root=str(source_root or ""),
+            target_root=str(target_root or ""),
+            recorded_at=_now(),
         )
         await self.connection.commit()
 
@@ -1631,24 +1559,32 @@ class DatabaseSQLite:
         finality advances). Returns the rows removed."""
         if below_target_epoch <= 0:
             return 0
-        cur = await self.connection.execute(
-            "DELETE FROM attestation_votes WHERE target_epoch < ?", (int(below_target_epoch),)
-        )
-        return cur.rowcount or 0
+        votes = self.store["attestation_votes"]
+        old = votes.scan_index("by_target", lo=(-(2**62),), hi=(int(below_target_epoch),))
+        for r in old:
+            votes.delete(r.validator_address, r.target_epoch)
+        return len(old)
 
     async def get_validator_votes(self, validator_address: str, limit: int = 128) -> list:
         """The validator's retained attestation votes as fully-signed Attestation dicts
         (most recent target first), for surround/double-vote slashing detection. Only rows
         with a retained ``signature`` are returned (pre-retention rows can't form a proof).
         Bounded by ``limit`` — surround votes span a small epoch window in practice."""
-        cur = await self.connection.execute(
-            "SELECT slot, epoch, block_hash, validator_index, signature, source_epoch, target_epoch, "
-            "source_root, target_root "
-            "FROM attestation_votes WHERE validator_address = ? AND signature != '' "
-            "ORDER BY target_epoch DESC LIMIT ?",
-            (validator_address, int(limit)),
-        )
-        rows = await cur.fetchall()
+        rows = [
+            (
+                r.slot,
+                r.epoch,
+                r.block_hash,
+                r.validator_index,
+                r.signature,
+                r.source_epoch,
+                r.target_epoch,
+                r.source_root,
+                r.target_root,
+            )
+            for r in self.store["attestation_votes"].scan(validator_address, reverse=True)
+            if r.signature != ""
+        ][: int(limit)]
         return [
             {
                 "slot": s,
@@ -1672,28 +1608,27 @@ class DatabaseSQLite:
     ) -> bool:
         """Persist a detected slashable offence (idempotent on
         (validator, slot, condition)). Returns True if it was NEW. Commits."""
-        cur = await self.connection.execute(
-            "INSERT OR IGNORE INTO slashing_events "
-            "(validator_address, condition, slot, epoch, evidence) VALUES (?, ?, ?, ?, ?)",
-            (validator_address, str(condition), int(slot), int(epoch), str(evidence)),
+        new = self.store["slashing_events"].insert(
+            validator_address=validator_address,
+            slot=int(slot),
+            condition=str(condition),
+            epoch=int(epoch),
+            evidence=str(evidence),
+            processed=0,
+            recorded_at=_now(),
         )
         await self.connection.commit()
-        return bool(cur.rowcount)
+        return new
 
     async def get_slashing_events(self, validator_address: Optional[str] = None) -> list:
         """Return recorded slashing evidence rows (optionally for one validator)."""
-        if validator_address:
-            cur = await self.connection.execute(
-                "SELECT validator_address, condition, slot, epoch, evidence, processed "
-                "FROM slashing_events WHERE validator_address = ? ORDER BY slot",
-                (validator_address,),
-            )
-        else:
-            cur = await self.connection.execute(
-                "SELECT validator_address, condition, slot, epoch, evidence, processed "
-                "FROM slashing_events ORDER BY slot"
-            )
-        rows = await cur.fetchall()
+        events = self.store["slashing_events"]
+        found = events.scan(validator_address) if validator_address else events.scan()
+        found.sort(key=lambda r: r.slot)
+        rows = [
+            (r.validator_address, r.condition, r.slot, r.epoch, r.evidence, r.processed)
+            for r in found
+        ]
         return [
             {
                 "validator_address": r[0],
@@ -1714,13 +1649,9 @@ class DatabaseSQLite:
         every importer via INSERT OR IGNORE)."""
         import json as _json
 
-        cur = await self.connection.execute(
-            "SELECT evidence FROM slashing_events WHERE processed = 0 "
-            "ORDER BY validator_address, slot LIMIT ?",
-            (int(limit),),
-        )
+        pending = [r.evidence for r in self.store["slashing_events"].scan() if not r.processed]
         out = []
-        for (ev_json,) in await cur.fetchall():
+        for ev_json in pending[: int(limit)]:
             try:
                 d = _json.loads(ev_json)
                 if not isinstance(d, dict):
@@ -1736,12 +1667,8 @@ class DatabaseSQLite:
 
     async def get_epoch_attesters(self, target_epoch: int) -> list:
         """Return the validator addresses that have voted for ``target_epoch``."""
-        cursor = await self.connection.execute(
-            "SELECT validator_address FROM attestation_votes WHERE target_epoch = ?",
-            (int(target_epoch),),
-        )
-        rows = await cursor.fetchall()
-        return [r[0] for r in rows]
+        votes = self.store["attestation_votes"].scan_index("by_target", int(target_epoch))
+        return [r.validator_address for r in votes]
 
     async def set_epoch_finality(
         self, epoch: int, start_slot: int, end_slot: int, justified: bool, finalized: bool
@@ -1751,23 +1678,34 @@ class DatabaseSQLite:
         epoch-processing writer is PostgreSQL-only, so this is the SQLite path the
         finality computation uses; ``get_pos_chain_head`` reads it back.
         """
-        await self.connection.execute(
-            "INSERT INTO epochs (epoch, start_slot, end_slot, justified, finalized) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(epoch) DO UPDATE SET "
-            "  justified = excluded.justified, "
-            "  finalized = excluded.finalized, "
-            "  finalized_at = CASE WHEN excluded.finalized THEN CURRENT_TIMESTAMP "
-            "                      ELSE epochs.finalized_at END",
-            (
-                int(epoch),
-                int(start_slot),
-                int(end_slot),
-                1 if justified else 0,
-                1 if finalized else 0,
-            ),
-        )
+        epochs = self.store["epochs"]
+        row = epochs.get(int(epoch))
+        if row is None:
+            epochs.put(
+                epoch=int(epoch),
+                start_slot=int(start_slot),
+                end_slot=int(end_slot),
+                justified=1 if justified else 0,
+                finalized=1 if finalized else 0,
+                created_at=_now(),
+            )
+        else:
+            epochs.update(
+                (int(epoch),),
+                justified=1 if justified else 0,
+                finalized=1 if finalized else 0,
+                finalized_at=_now() if finalized else row.finalized_at,
+            )
         await self.connection.commit()
+
+    def finality_marks(self) -> Dict[str, int]:
+        """The newest finalized and justified epochs and the newest epoch recorded (-1: none)."""
+        rows = self.store["epochs"].scan()
+        return {
+            "finalized_epoch": max((int(r.epoch) for r in rows if r.finalized), default=-1),
+            "justified_epoch": max((int(r.epoch) for r in rows if r.justified), default=-1),
+            "max_epoch": max((int(r.epoch) for r in rows), default=-1),
+        }
 
     async def get_validators(self, status: Optional[str] = None):
         """

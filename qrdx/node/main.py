@@ -786,17 +786,7 @@ async def startup():
 
         async def _poll_finality():
             try:
-                cur = await db.connection.execute(
-                    "SELECT COALESCE(MAX(CASE WHEN finalized=1 THEN epoch END), -1), "
-                    "COALESCE(MAX(CASE WHEN justified=1 THEN epoch END), -1), "
-                    "COALESCE(MAX(epoch), -1) FROM epochs"
-                )
-                row = await cur.fetchone()
-                return {
-                    "finalized_epoch": int(row[0]),
-                    "justified_epoch": int(row[1]),
-                    "max_epoch": int(row[2]),
-                }
+                return db.finality_marks()
             except Exception:
                 return {}
 
@@ -825,8 +815,7 @@ async def startup():
 
         async def _poll_slashing():
             try:
-                cur = await db.connection.execute("SELECT COUNT(*) FROM slashing_events")
-                return int((await cur.fetchone())[0])
+                return int(db.store["slashing_events"].count())
             except Exception:
                 return 0
 

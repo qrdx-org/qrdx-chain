@@ -295,14 +295,6 @@ async def prune_reorg_state(db, finalized_height: int) -> None:
 
 PERSIST_INTERVAL_BLOCKS = 1024
 _PERSISTED: Dict[str, int] = {}
-_CHECKPOINT_TABLE = (
-    "CREATE TABLE IF NOT EXISTS exchange_checkpoint ("
-    " id INTEGER PRIMARY KEY CHECK (id = 1),"
-    " height INTEGER NOT NULL,"
-    " block_hash TEXT NOT NULL,"
-    " state BLOB NOT NULL,"  # the exchange state after that block (pickled, compressed)
-    " journal BLOB NOT NULL)"  # the exchange journal, rolled back to that block on load
-)
 
 
 async def persist_checkpoint(db, height: int) -> None:
@@ -321,12 +313,7 @@ async def persist_checkpoint(db, height: int) -> None:
         return zlib.compress(pickle.dumps(snapshot, protocol=5), 6), zlib.compress(journal, 6)
 
     state_blob, journal_blob = await asyncio.to_thread(encode)
-    await db.connection.execute(_CHECKPOINT_TABLE)
-    await db.connection.execute(
-        "INSERT OR REPLACE INTO exchange_checkpoint (id, height, block_hash, state, journal) "
-        "VALUES (1, ?, ?, ?, ?)",
-        (int(height), root, state_blob, journal_blob),
-    )
+    db.store["exchange_checkpoint"].put(1, int(height), root, state_blob, journal_blob)
     _PERSISTED["height"] = int(height)
     logger.info(
         "exchange checkpoint persisted at %d (%d KB state, %d KB journal)",
@@ -338,10 +325,7 @@ async def persist_checkpoint(db, height: int) -> None:
 
 async def drop_persisted_checkpoint(db) -> None:
     _PERSISTED.clear()
-    try:
-        await db.connection.execute("DELETE FROM exchange_checkpoint")
-    except Exception:
-        pass  # no table yet
+    db.store["exchange_checkpoint"].delete(1)
 
 
 async def load_persisted_checkpoint(db) -> Optional[int]:
@@ -354,16 +338,10 @@ async def load_persisted_checkpoint(db) -> Optional[int]:
     from . import undo_journal
     from .exchange.state_manager import ExchangeStateManager
 
-    try:
-        cur = await db.connection.execute(
-            "SELECT height, block_hash, state, journal FROM exchange_checkpoint WHERE id = 1"
-        )
-        row = await cur.fetchone()
-    except Exception:
-        return None
+    row = db.store["exchange_checkpoint"].get(1)
     if row is None:
         return None
-    height, root, state_blob, journal_blob = int(row[0]), row[1], row[2], row[3]
+    height, root, state_blob, journal_blob = int(row.height), row.block_hash, row.state, row.journal
     if await _block_hash(db, height) != root or not await undo_journal.can_roll_back_to(db, height):
         logger.info("persisted exchange checkpoint at %d is unusable: full rebuild", height)
         return None

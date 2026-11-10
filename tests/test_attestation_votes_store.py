@@ -46,16 +46,31 @@ async def test_set_and_read_back_epoch_finality():
     db, path = await _db()
     try:
         await db.set_epoch_finality(2, start_slot=16, end_slot=23, justified=True, finalized=False)
-        cur = await db.connection.execute(
-            "SELECT justified, finalized FROM epochs WHERE epoch = 2")
-        row = await cur.fetchone()
-        assert (bool(row[0]), bool(row[1])) == (True, False)
+        row = db.store["epochs"].get(2)
+        assert (bool(row.justified), bool(row.finalized)) == (True, False)
 
         # Upgrade to finalized — finalized_at gets set.
         await db.set_epoch_finality(2, 16, 23, justified=True, finalized=True)
-        cur = await db.connection.execute(
-            "SELECT finalized, finalized_at FROM epochs WHERE epoch = 2")
-        row = await cur.fetchone()
-        assert bool(row[0]) is True and row[1] is not None
+        row = db.store["epochs"].get(2)
+        assert bool(row.finalized) is True and row.finalized_at is not None
+    finally:
+        await db.close(); os.remove(path)
+
+
+async def test_the_chain_head_reports_the_stored_finality(monkeypatch):
+    """``get_pos_chain_head`` reads the newest finalized and justified epochs back."""
+    from qrdx import manager
+    from qrdx.database import Database
+
+    db, path = await _db()
+    try:
+        await db.add_block(block_hash="aa" * 32, block_height=0, block_content="{}",
+                           validator_address="0xPQ" + "00" * 32, timestamp=1)
+        await db.set_epoch_finality(2, 16, 23, justified=True, finalized=True)
+        await db.set_epoch_finality(3, 24, 31, justified=True, finalized=False)
+        monkeypatch.setattr(Database, "instance", db)
+        head = await manager.get_pos_chain_head()
+        assert (head["finalized_epoch"], head["finalized_slot"]) == (2, 16)
+        assert (head["justified_epoch"], head["justified_slot"]) == (3, 24)
     finally:
         await db.close(); os.remove(path)

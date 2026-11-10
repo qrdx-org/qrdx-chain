@@ -57,9 +57,7 @@ def _block(atts):
 
 
 async def _events(db):
-    cur = await db.connection.execute(
-        "SELECT condition, evidence FROM slashing_events")
-    return await cur.fetchall()
+    return [(r.condition, r.evidence) for r in db.store["slashing_events"].scan()]
 
 
 @pytest.mark.asyncio
@@ -183,8 +181,9 @@ async def test_an_honest_vote_seen_in_two_blocks_is_never_a_slash():
     try:
         a = _signed_att(key, slot=10, epoch=1, block_hash="a1" * 32, source=0, target=1)
         await F.record_block_attestations(db, _block([a]))
-        await db.connection.execute("UPDATE attestation_votes SET source_root = '', "
-                                    "target_root = ''")  # a store that dropped the roots
+        votes = db.store["attestation_votes"]                  # a store that dropped the roots
+        for r in votes.scan():
+            votes.update((r.validator_address, r.target_epoch), source_root="", target_root="")
         await F.record_block_attestations(db, _block([a]))   # the same vote, another block
         assert await _events(db) == []
     finally:

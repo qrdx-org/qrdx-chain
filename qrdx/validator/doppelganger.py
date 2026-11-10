@@ -105,7 +105,7 @@ class DoppelgangerGuard:
         hold; None if nothing."""
         if self.start_slot is None:
             return None
-        start, conn = self._scan_from_slot, self.db.connection
+        start = self._scan_from_slot
         stored = self.db.store["blocks"]
         blocks = []
         for ci in self.db.store["chain_index"].scan_index("by_slot", lo=(int(start),), hi=(2**62,)):
@@ -121,12 +121,20 @@ class DoppelgangerGuard:
         from .attestation import Attestation
 
         start_epoch = self.start_slot // self.slots_per_epoch
-        cur = await conn.execute(
-            "SELECT slot, epoch, block_hash, source_epoch, target_epoch, source_root, target_root"
-            " FROM attestation_votes WHERE validator_address = ? AND target_epoch >= ?",
-            (self.address, start_epoch),
-        )
-        votes = await cur.fetchall()
+        votes = [
+            (
+                r.slot,
+                r.epoch,
+                r.block_hash,
+                r.source_epoch,
+                r.target_epoch,
+                r.source_root,
+                r.target_root,
+            )
+            for r in self.db.store["attestation_votes"].scan(
+                self.address, lo=(int(start_epoch),), hi=(2**62,)
+            )
+        ]
         if votes:
             mine = await self.protection.signed_vote_roots(self.address, start_epoch)
             for slot, epoch, block_hash, source, target, source_root, target_root in votes:

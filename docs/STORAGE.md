@@ -78,7 +78,7 @@ not turn the store off.
 | S2 ledger | `account_state`, `contract_storage`, `contract_code`, `token_balances`, `token_registry`, `unspent_outputs`, `evm_balance_sync_registry`, `evm_balance_changes`; the proof tree (`smt_*`, `state_root_parts`); `post_roots`; the accumulators and the undo journal | done |
 | S3a sections | each block's exchange and EVM sections, whole: one value a block (they were a row an item) | done |
 | S3 chain | blocks (header by height, by hash through an index; body apart), transactions, chain metadata, the chain index (its votes, offenders and FFG votes) | done |
-| S3b | votes and finality (`attestation_votes`, `epochs`, `slashing_events`), the exchange checkpoint | to do |
+| S3b finality | votes (`attestation_votes`), each epoch's flags (`epochs`), offences (`slashing_events`), the exchange's persisted checkpoint, the EVM state checkpoints | done |
 | S4a validator logs | the validator set's inputs (deposits, exits, staking operations, fee income, withdrawals, payouts), its stored epoch states and log roots | done |
 | S4 validators | `validators` (the display copy), stakes, lifecycle, slashing | to do |
 | S5 the node's own | pending transactions, peers, slashing protection, transaction and trading history | to do |

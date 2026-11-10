@@ -59,33 +59,9 @@ class StateSyncManager:
         Ensure sync registry tables exist in database.
         Creates tables if they don't exist (idempotent).
         """
-        conn = self.db.connection
-
-        # (The sync registry and the balance-change log are the store's: qrdx/store.py.)
-
-        # Create state checkpoints table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS state_checkpoints (
-                checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_height INTEGER NOT NULL UNIQUE,
-                block_hash TEXT NOT NULL,
-                native_state_root TEXT NOT NULL,
-                evm_state_root TEXT NOT NULL,
-                combined_state_root TEXT NOT NULL,
-                total_synced_addresses INTEGER NOT NULL,
-                total_native_balance TEXT NOT NULL,
-                total_evm_balance TEXT NOT NULL,
-                checkpointed_at TEXT NOT NULL
-            )
-        """)
-
-        # Create indexes for performance
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_checkpoints_block
-            ON state_checkpoints(block_height)
-        """)
-
-        await conn.commit()
+        # (The sync registry, the balance-change log and the state checkpoints are the
+        # store's: qrdx/store.py.)
+        await self.db.connection.commit()
         logger.info("State sync registry tables verified/created")
 
     async def sync_address_to_evm(
@@ -254,40 +230,20 @@ class StateSyncManager:
         # Get statistics
         stats = await self._get_sync_statistics()
 
-        conn = self.db.connection
         now = datetime.now(timezone.utc).isoformat()
 
-        await conn.execute(
-            """
-            INSERT INTO state_checkpoints (
-                block_height, block_hash, native_state_root,
-                evm_state_root, combined_state_root,
-                total_synced_addresses, total_native_balance,
-                total_evm_balance, checkpointed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (block_height) DO UPDATE SET
-                block_hash = excluded.block_hash,
-                native_state_root = excluded.native_state_root,
-                evm_state_root = excluded.evm_state_root,
-                combined_state_root = excluded.combined_state_root,
-                total_synced_addresses = excluded.total_synced_addresses,
-                total_native_balance = excluded.total_native_balance,
-                total_evm_balance = excluded.total_evm_balance,
-                checkpointed_at = excluded.checkpointed_at
-            """,
-            (
-                block_height,
-                block_hash,
-                native_root,
-                evm_root,
-                combined_root,
-                stats["synced_count"],
-                str(stats["native_total"]),
-                str(stats["evm_total"]),
-                now,
-            ),
+        self.db.store["state_checkpoints"].put(
+            block_height,
+            block_hash,
+            native_root,
+            evm_root,
+            combined_root,
+            stats["synced_count"],
+            str(stats["native_total"]),
+            str(stats["evm_total"]),
+            now,
         )
-        await conn.commit()
+        await self.db.connection.commit()
 
         logger.info(
             f"State checkpoint at block {block_height}: "

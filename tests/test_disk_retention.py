@@ -19,15 +19,14 @@ async def test_old_votes_are_pruned_recent_ones_kept():
     db = await DatabaseSQLite.create(path)
     try:
         for target in range(1, 41):
-            await db.connection.execute(
-                "INSERT INTO attestation_votes (validator_address, target_epoch, source_epoch, slot,"
-                " block_hash, epoch, validator_index, signature, source_root, target_root)"
-                " VALUES (?, ?, ?, ?, ?, ?, 0, ?, '', '')",
-                ("0xPQv", target, target - 1, target * 32, f"{target:064x}", target, "ab" * 3309))
+            db.store["attestation_votes"].put(
+                validator_address="0xPQv", target_epoch=target, source_epoch=target - 1,
+                slot=target * 32, block_hash=f"{target:064x}", epoch=target,
+                signature="ab" * 3309)
         await db.connection.commit()
         assert await db.prune_attestation_votes(30) == 29
-        cur = await db.connection.execute("SELECT MIN(target_epoch), COUNT(*) FROM attestation_votes")
-        assert tuple(await cur.fetchone()) == (30, 11)
+        kept = db.store["attestation_votes"].scan()
+        assert (min(r.target_epoch for r in kept), len(kept)) == (30, 11)
         assert len(await db.get_validator_votes("0xPQv")) == 11
         assert await db.prune_attestation_votes(-5) == 0   # nothing finalized far enough yet
     finally:

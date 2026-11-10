@@ -342,6 +342,68 @@ SPECS: Tuple[Spec, ...] = (
     ),
     Spec("validator_epoch_states", [("epoch", _I), ("checkpoint", _T)], [("state", _T, None)]),
     Spec("validator_log_roots", [("height", _I), ("block_hash", _T)], [("root", _T, None)]),
+    # ── finality: the votes blocks carried (one a validator a target; the fully signed vote
+    # kept for slashing evidence), each epoch's justified and finalized flags, the offences
+    # detected (the proofs blocks carry), the exchange's persisted checkpoint ──
+    Spec(
+        "attestation_votes",
+        [("validator_address", _T), ("target_epoch", _I)],
+        [
+            ("source_epoch", _I, 0),
+            ("slot", _I, 0),
+            ("block_hash", _T, None),
+            ("epoch", _I, 0),
+            ("validator_index", _I, 0),
+            ("signature", _T, ""),
+            ("source_root", _T, ""),
+            ("target_root", _T, ""),
+            ("recorded_at", _T, None),
+        ],
+        indexes={"by_target": ("target_epoch",)},
+    ),
+    Spec(
+        "epochs",
+        [("epoch", _I)],
+        [
+            ("start_slot", _I, 0),
+            ("end_slot", _I, 0),
+            ("active_validators", _I, 0),
+            ("total_stake", _T, "0"),
+            ("finalized", _I, 0),
+            ("justified", _I, 0),
+            ("finality_root", _T, None),
+            ("randao_mix", _T, None),
+            ("total_rewards", _T, "0"),
+            ("total_penalties", _T, "0"),
+            ("started_at", _T, None),
+            ("finalized_at", _T, None),
+            ("created_at", _T, None),
+        ],
+    ),
+    Spec(
+        "slashing_events",
+        [("validator_address", _T), ("slot", _I), ("condition", _T)],
+        [("epoch", _I, 0), ("evidence", _T, None), ("processed", _I, 0), ("recorded_at", _T, None)],
+    ),
+    Spec(
+        "exchange_checkpoint",
+        [("id", _I)],
+        [("height", _I, 0), ("block_hash", _T, None), ("state", _B, b""), ("journal", _B, b"")],
+    ),
+    Spec(
+        "state_checkpoints",
+        [("block_height", _I)],
+        [
+            ("block_hash", _T, None),
+            ("native_state_root", _T, None),
+            ("evm_state_root", _T, None),
+            ("combined_state_root", _T, None),
+            ("total_synced_addresses", _I, 0),
+            ("total_native_balance", _T, None),
+            ("total_evm_balance", _T, None),
+            ("checkpointed_at", _T, None),
+        ],
+    ),
     # ── each block's sections, whole, by its hash: the exchange's as a JSON list of its items,
     # the EVM's as a JSON list of raw transactions (they were a row an item) ──
     Spec("exchange_sections", [("block_hash", _T)], [("data", _B, b"")], raw=True),

@@ -27,16 +27,12 @@ def _node_db(path, checkpoint=100):
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript("""
-        CREATE TABLE exchange_checkpoint (id INTEGER PRIMARY KEY, height INTEGER,
-                                          block_hash TEXT, state BLOB, journal BLOB);
         CREATE TABLE peers (id TEXT, address TEXT);
         CREATE TABLE pending_transactions (tx_hash TEXT, tx_hex TEXT);
         CREATE TABLE tx_index (tx_hash TEXT, block_height INTEGER);
         CREATE TABLE tx_participants (account TEXT, block_height INTEGER);
         CREATE TABLE hist_trades (id INTEGER, data TEXT);
     """)
-    conn.execute("INSERT INTO exchange_checkpoint VALUES (1, ?, ?, ?, ?)",
-                 (checkpoint, f"{checkpoint:064x}", b"state", b"journal"))
     conn.execute("INSERT INTO peers VALUES ('p1', ?)", (f"http://{PEER_IP}:3007",))
     conn.execute("INSERT INTO pending_transactions VALUES ('t', 'secret-pending')")
     conn.execute("INSERT INTO tx_index VALUES ('t', 3)")
@@ -55,6 +51,7 @@ def _node_db(path, checkpoint=100):
         store["block_bodies"].put(h, b"x" * 200)
     store["chain_index"].put(99, "h", 99, 12, "planted")  # (rebuilt from the blocks)
     store["validator_log_roots"].put(99, "h", "planted")  # (never trusted)
+    store["exchange_checkpoint"].put(1, checkpoint, f"{checkpoint:064x}", b"state", b"journal")
     store.commit()
     store.close()
     return conn
@@ -77,10 +74,13 @@ def _count(path, table):
         conn.close()
 
 
-def _move_checkpoint(conn, height):
-    conn.execute("UPDATE exchange_checkpoint SET height = ?, block_hash = ? WHERE id = 1",
-                 (height, f"{height:064x}"))
-    conn.commit()
+def _move_checkpoint(db, height):
+    store = Store(db + ".store")
+    try:
+        store["exchange_checkpoint"].update((1,), height=height, block_hash=f"{height:064x}")
+        store.commit()
+    finally:
+        store.close()
 
 
 def test_a_published_snapshot_leaves_out_what_a_restore_discards(tmp_path):
@@ -93,8 +93,8 @@ def test_a_published_snapshot_leaves_out_what_a_restore_discards(tmp_path):
     copy = str(tmp_path / "pub" / "qrdx.db")
     for table in ("peers", "pending_transactions", "tx_index", "tx_participants", "hist_trades"):
         assert _count(copy, table) == 0, table
-    assert _count(copy, "exchange_checkpoint") > 0
     store_copy = copy + ".store"
+    assert _store_count(store_copy, "exchange_checkpoint") == 1
     store_raw = open(store_copy, "rb").read()
     assert manifest["store"]["sha256"] == hashlib.sha256(store_raw).hexdigest()
     for table in ("post_roots", "smt_nodes", "chain_index", "validator_log_roots"):
@@ -124,7 +124,7 @@ def test_a_node_publishes_each_newer_checkpoint_and_keeps_the_newest(tmp_path):
     try:
         assert snapshot_publisher.publish(db, root)["checkpoint"]["height"] == 100
         assert snapshot_publisher.publish(db, root) is None             # nothing newer
-        _move_checkpoint(conn, 140)
+        _move_checkpoint(db, 140)
         assert snapshot_publisher.publish(db, root)["checkpoint"]["height"] == 140
     finally:
         conn.close()

@@ -242,13 +242,19 @@ def _clear_store(path: str, tables: Sequence[str], compact: bool = False) -> Non
         os.remove(path + "-lck")
 
 
-def _exchange_checkpoint(conn: sqlite3.Connection) -> Tuple[int, str, bytes]:
+def _exchange_checkpoint(store_path: str) -> Tuple[int, str, bytes]:
+    """(height, block hash, state) of the exchange checkpoint the store file at ``store_path``
+    holds."""
+    from . import store as store_mod
+
+    s = store_mod.Store(store_path)
     try:
-        row = conn.execute(
-            "SELECT height, block_hash, state FROM exchange_checkpoint WHERE id = 1"
-        ).fetchone()
-    except sqlite3.Error:
-        row = None
+        cp = s["exchange_checkpoint"].get(1)
+        row = None if cp is None else (cp.height, cp.block_hash, cp.state)
+    finally:
+        s.close()
+        if os.path.exists(store_path + "-lck"):
+            os.remove(store_path + "-lck")
     if row is None:
         raise SnapshotError(
             "the database holds no exchange checkpoint yet (one is persisted every 1,024 "
@@ -359,9 +365,9 @@ def create(source_db: str, out_dir: str, public: bool = False) -> Dict[str, Any]
                 conn.execute(f"DELETE FROM {table}")
             conn.commit()
             conn.execute("VACUUM")
-        height, block_hash, _state = _exchange_checkpoint(conn)
     finally:
         conn.close()
+    height, block_hash, _state = _exchange_checkpoint(store_path)
     tip, genesis = _chain_ends(store_path)
     manifest = {
         "format": FORMAT,
@@ -596,11 +602,7 @@ async def restore(
         remove_files(leftover + ".store")
     _backup(source, work)
     shutil.copyfile(str(Path(snapshot_dir) / STORE), work + ".store")
-    raw = sqlite3.connect(work)
-    try:
-        height, checkpoint_hash, state_blob = _exchange_checkpoint(raw)
-    finally:
-        raw.close()
+    height, checkpoint_hash, state_blob = _exchange_checkpoint(work + ".store")
     _wipe(work)
     _clear_store(work + ".store", _STORE_RECOMPUTED)
 

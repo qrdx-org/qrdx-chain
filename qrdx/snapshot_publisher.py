@@ -24,7 +24,6 @@ import asyncio
 import json
 import os
 import shutil
-import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
@@ -60,17 +59,23 @@ def latest(root: str) -> Optional[Dict[str, Any]]:
 
 
 def _checkpoint_height(db_path: str) -> Optional[int]:
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error:
+    """The height of the exchange checkpoint the node's store holds: through the running node's
+    own handle when it is this process (MDBX allows one a file), else the file's."""
+    from . import store as store_mod
+
+    path = db_path + ".store"
+    live = store_mod.opened(path)
+    if live is not None:
+        row = live["exchange_checkpoint"].get(1)
+        return None if row is None else int(row.height)
+    if not os.path.exists(path):
         return None
+    s = store_mod.Store(path)
     try:
-        row = conn.execute("SELECT height FROM exchange_checkpoint WHERE id = 1").fetchone()
-    except sqlite3.Error:
-        row = None
+        row = s["exchange_checkpoint"].get(1)
+        return None if row is None else int(row.height)
     finally:
-        conn.close()
-    return None if row is None else int(row[0])
+        s.close()
 
 
 def publish(db_path: str, root: str) -> Optional[Dict[str, Any]]:

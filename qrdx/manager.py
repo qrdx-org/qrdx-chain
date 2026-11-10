@@ -642,21 +642,13 @@ async def get_pos_chain_head() -> dict:
     slot = last_block.get("slot", last_block["id"])
     epoch = slot // SLOTS_PER_EPOCH
 
-    # Get finality info from the epochs table (SQLite). Best-effort: if the
-    # table is empty or absent, finality defaults to 0 (handled below).
+    # Get finality info from the epochs table (the store). Best-effort: if the
+    # table is empty, finality defaults to 0 (handled below).
     finalized = justified = None
     try:
-        cur = await database.connection.execute(
-            "SELECT epoch, start_slot FROM epochs WHERE finalized = 1 "
-            "ORDER BY epoch DESC LIMIT 1"
-        )
-        finalized = await cur.fetchone()
-
-        cur = await database.connection.execute(
-            "SELECT epoch, start_slot FROM epochs WHERE justified = 1 "
-            "ORDER BY epoch DESC LIMIT 1"
-        )
-        justified = await cur.fetchone()
+        rows = database.store["epochs"].scan(reverse=True)
+        finalized = next((r for r in rows if r.finalized), None)
+        justified = next((r for r in rows if r.justified), None)
     except Exception as e:
         logger.debug(f"get_pos_chain_head: finality query unavailable: {e}")
 
@@ -664,8 +656,8 @@ async def get_pos_chain_head() -> dict:
         "slot": slot,
         "epoch": epoch,
         "block_hash": last_block["hash"],
-        "finalized_slot": finalized["start_slot"] if finalized else 0,
-        "finalized_epoch": finalized["epoch"] if finalized else 0,
-        "justified_slot": justified["start_slot"] if justified else 0,
-        "justified_epoch": justified["epoch"] if justified else 0,
+        "finalized_slot": finalized.start_slot if finalized else 0,
+        "finalized_epoch": finalized.epoch if finalized else 0,
+        "justified_slot": justified.start_slot if justified else 0,
+        "justified_epoch": justified.epoch if justified else 0,
     }

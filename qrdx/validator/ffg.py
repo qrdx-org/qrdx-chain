@@ -413,10 +413,8 @@ async def update(db: Any) -> Dict[str, int]:
     # including any skipped since the last update); justification above it is recomputed, since
     # a reorg can change it.
     low = prev[0] if prev is not None else 0
-    rows = await db.connection.execute_fetchall(
-        "SELECT epoch, justified, finalized FROM epochs WHERE epoch >= ?", (low,)
-    )
-    stored = {int(r[0]): (bool(r[1]), bool(r[2])) for r in rows}
+    rows = db.store["epochs"].scan(lo=(int(low),), hi=(2**62,))
+    stored = {int(r.epoch): (bool(r.justified), bool(r.finalized)) for r in rows}
     top = max([fin_epoch, *state.justified, *stored])
     for ep in range(low, top + 1):
         was = stored.get(ep, (False, False))

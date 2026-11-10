@@ -210,17 +210,12 @@ def test_the_manager_records_a_block_before_signing_it():
 
 
 async def _chain_db(tmp_path):
-    """A chain in miniature: its blocks and chain index in a store (qrdx/store.py), the votes
-    it carries in SQLite."""
+    """A chain in miniature: its blocks, chain index and the votes it carries in a store
+    (qrdx/store.py)."""
     from qrdx.store import Store
 
     conn = await aiosqlite.connect(str(tmp_path / "chain.db"))
     conn.store = Store(str(tmp_path / "chain.db.store"))
-    await conn.execute(
-        "CREATE TABLE attestation_votes (validator_address TEXT, target_epoch INTEGER,"
-        " source_epoch INTEGER, slot INTEGER, block_hash TEXT, epoch INTEGER,"
-        " source_root TEXT, target_root TEXT)"
-    )
     return conn
 
 
@@ -259,10 +254,9 @@ async def test_a_vote_the_validator_never_signed_is_a_doppelganger(tmp_path, rec
     try:
         guard = D.DoppelgangerGuard(_db(conn), record, V, 0, 8)
         assert await guard.hold(80) is None
-        await conn.execute(
-            "INSERT INTO attestation_votes VALUES (?, 10, 9, 81, ?, 10, ?, ?)",
-            (V, "cd" * 32, "ab" * 32, "ef" * 32),
-        )
+        conn.store["attestation_votes"].put(
+            validator_address=V, target_epoch=10, source_epoch=9, slot=81, block_hash="cd" * 32,
+            epoch=10, source_root="ab" * 32, target_root="ef" * 32)
         assert "target epoch 10" in await guard.hold(88)
     finally:
         conn.store.close()
