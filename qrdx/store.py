@@ -104,7 +104,7 @@ class Spec:
         return self.key_affinity[i] if i < n else self.value_affinity[i - n]
 
 
-_T, _I, _B = "TEXT", "INTEGER", "BLOB"
+_T, _I, _B, _R = "TEXT", "INTEGER", "BLOB", "REAL"
 
 SPECS: Tuple[Spec, ...] = (
     # ── the ledger (qrdx/database_sqlite.py's schema, the same columns) ──
@@ -404,6 +404,115 @@ SPECS: Tuple[Spec, ...] = (
             ("checkpointed_at", _T, None),
         ],
     ),
+    # ── the node's own indexes of the chain, for its RPC: every transaction with the accounts
+    # it touched (qrdx/tx_index.py), and the trading history (qrdx/trading_history.py). Derived
+    # and never hashed: cut back with the chain ──
+    Spec("tx_index_blocks", [("block_height", _I)], [("block_hash", _T, None)]),
+    Spec(
+        "tx_index",
+        [("block_height", _I), ("position", _I)],
+        [
+            ("tx_hash", _T, None),
+            ("block_hash", _T, None),
+            ("timestamp", _I, None),
+            ("kind", _T, None),
+            ("op", _T, None),
+            ("sender", _T, None),
+            ("target", _T, None),
+            ("asset", _T, None),
+            ("amount", _T, None),
+            ("status", _I, None),
+            ("fee", _T, None),
+            ("error", _T, None),
+            ("detail", _T, None),
+        ],
+        indexes={"by_hash": ("tx_hash",)},
+    ),
+    Spec(
+        "tx_participants",
+        [("account", _T), ("block_height", _I), ("position", _I)],
+        [("roles", _T, None)],
+        indexes={"by_block": ("block_height", "position")},
+    ),
+    Spec(
+        "hist_trades",
+        [("block_height", _I), ("position", _I)],
+        [
+            ("block_time", _R, None),
+            ("market", _T, None),
+            ("venue", _T, None),
+            ("kind", _T, None),
+            ("price", _T, None),
+            ("amount", _T, None),
+            ("side", _T, None),
+            ("buyer", _T, None),
+            ("seller", _T, None),
+            ("maker", _T, None),
+            ("taker", _T, None),
+            ("maker_order_id", _T, None),
+            ("taker_order_id", _T, None),
+            ("tx_hash", _T, None),
+            ("pool_id", _T, None),
+            ("fees", _T, None),
+            ("realized", _T, None),
+        ],
+        indexes={"by_market": ("market", "block_height")},
+    ),
+    Spec(
+        "hist_trade_accounts",
+        [("account", _T), ("block_height", _I), ("position", _I)],
+        [
+            ("block_time", _R, None),
+            ("venue", _T, None),
+            ("role", _T, None),
+            ("side", _T, None),
+            ("notional", _T, None),
+            ("fee", _T, None),
+            ("realized", _T, None),
+        ],
+        indexes={"by_block": ("block_height", "position"), "by_venue": ("venue", "block_time")},
+    ),
+    Spec(
+        "hist_orders",
+        [("block_height", _I), ("position", _I)],
+        [
+            ("block_time", _R, None),
+            ("account", _T, None),
+            ("market", _T, None),
+            ("order_id", _T, None),
+            ("event", _T, None),
+            ("tx_hash", _T, None),
+            ("detail", _T, None),
+        ],
+        indexes={"by_account": ("account", "block_height"), "by_id": ("order_id",)},
+    ),
+    Spec(
+        "hist_funding",
+        [("block_height", _I), ("position", _I)],
+        [
+            ("block_time", _R, None),
+            ("market", _T, None),
+            ("rate", _T, None),
+            ("premium", _T, None),
+            ("oracle_price", _T, None),
+            ("open_interest", _T, None),
+            ("funding_time", _T, None),
+        ],
+        indexes={"by_market": ("market", "block_height")},
+    ),
+    Spec(
+        "hist_samples",
+        [("block_height", _I), ("position", _I)],
+        [
+            ("block_time", _R, None),
+            ("market", _T, None),
+            ("mark", _T, None),
+            ("oracle", _T, None),
+            ("open_interest", _T, None),
+            ("funding_rate", _T, None),
+        ],
+        indexes={"by_market": ("market", "block_time")},
+    ),
     # ── each block's sections, whole, by its hash: the exchange's as a JSON list of its items,
     # the EVM's as a JSON list of raw transactions (they were a row an item) ──
     Spec("exchange_sections", [("block_hash", _T)], [("data", _B, b"")], raw=True),
@@ -453,6 +562,15 @@ def _coerce(value: Any, affinity: str) -> Any:
         if isinstance(value, str):
             n = _looks_integral(value.strip())
             return n if n is not None else value
+        return value
+    if affinity == _R:
+        if isinstance(value, (int, Decimal)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                return value
         return value
     if isinstance(value, (bytearray, memoryview)):
         return bytes(value)

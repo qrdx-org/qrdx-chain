@@ -29,15 +29,9 @@ def _node_db(path, checkpoint=100):
     conn.executescript("""
         CREATE TABLE peers (id TEXT, address TEXT);
         CREATE TABLE pending_transactions (tx_hash TEXT, tx_hex TEXT);
-        CREATE TABLE tx_index (tx_hash TEXT, block_height INTEGER);
-        CREATE TABLE tx_participants (account TEXT, block_height INTEGER);
-        CREATE TABLE hist_trades (id INTEGER, data TEXT);
     """)
     conn.execute("INSERT INTO peers VALUES ('p1', ?)", (f"http://{PEER_IP}:3007",))
     conn.execute("INSERT INTO pending_transactions VALUES ('t', 'secret-pending')")
-    conn.execute("INSERT INTO tx_index VALUES ('t', 3)")
-    conn.execute("INSERT INTO tx_participants VALUES ('0xPQa', 3)")
-    conn.execute("INSERT INTO hist_trades VALUES (1, 'fill')")
     conn.commit()
     # The store beside it (qrdx/store.py): the state and its journal a restore needs, and the
     # roots and the tree it recomputes.
@@ -52,6 +46,10 @@ def _node_db(path, checkpoint=100):
     store["chain_index"].put(99, "h", 99, 12, "planted")  # (rebuilt from the blocks)
     store["validator_log_roots"].put(99, "h", "planted")  # (never trusted)
     store["exchange_checkpoint"].put(1, checkpoint, f"{checkpoint:064x}", b"state", b"journal")
+    store["tx_index"].put(3, 0, "t", "h")  # (the node's own: never published nor restored)
+    store["tx_participants"].put("0xPQa", 3, 0, "sender")
+    store["hist_trades"].put(3, 0, 1.0, "fill")
+    store["epochs"].put(epoch=1, finalized=1)
     store.commit()
     store.close()
     return conn
@@ -91,13 +89,14 @@ def test_a_published_snapshot_leaves_out_what_a_restore_discards(tmp_path):
     finally:
         conn.close()
     copy = str(tmp_path / "pub" / "qrdx.db")
-    for table in ("peers", "pending_transactions", "tx_index", "tx_participants", "hist_trades"):
+    for table in ("peers", "pending_transactions"):
         assert _count(copy, table) == 0, table
     store_copy = copy + ".store"
     assert _store_count(store_copy, "exchange_checkpoint") == 1
     store_raw = open(store_copy, "rb").read()
     assert manifest["store"]["sha256"] == hashlib.sha256(store_raw).hexdigest()
-    for table in ("post_roots", "smt_nodes", "chain_index", "validator_log_roots"):
+    for table in ("post_roots", "smt_nodes", "chain_index", "validator_log_roots", "tx_index",
+                  "tx_participants", "hist_trades", "epochs"):
         assert _store_count(store_copy, table) == 0, table
     assert _store_count(store_copy, "account_state") == 1
     assert _store_count(store_copy, "blocks") == 150
@@ -113,7 +112,10 @@ def test_a_restore_also_discards_the_transaction_participants(tmp_path):
     db = str(tmp_path / "node.db")
     _node_db(db).close()
     snapshot._wipe(db)
-    assert _count(db, "tx_participants") == 0 and _count(db, "tx_index") == 0
+    snapshot._clear_store(db + ".store", snapshot._STORE_RECOMPUTED + snapshot._STORE_LOCAL)
+    assert _count(db, "peers") == 0
+    assert _store_count(db + ".store", "tx_participants") == 0
+    assert _store_count(db + ".store", "tx_index") == 0
     assert _store_count(db + ".store", "blocks") == 150
 
 

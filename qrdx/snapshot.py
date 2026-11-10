@@ -355,7 +355,7 @@ def create(source_db: str, out_dir: str, public: bool = False) -> Dict[str, Any]
     _copy_store(source_db + ".store", store_path)  # (before the database: see restore)
     _backup(source_db, db_path)
     if public:
-        _clear_store(store_path, _STORE_RECOMPUTED, compact=True)
+        _clear_store(store_path, _STORE_RECOMPUTED + _STORE_LOCAL, compact=True)
     conn = sqlite3.connect(db_path)
     try:
         if public:
@@ -414,12 +414,24 @@ _LOCAL = (
     "signed_blocks",
     "signed_votes",
     "watermarks",
-    "attestation_votes",
-    "slashing_events",
-    "epochs",
     "validators",
     "contract_logs",
     "contract_transactions",
+)
+# The node's own, in its store: the votes, epochs and offences it recorded, its transaction index
+# and trading history.
+_STORE_LOCAL = (
+    "attestation_votes",
+    "slashing_events",
+    "epochs",
+    "tx_index",
+    "tx_index_blocks",
+    "tx_participants",
+    "hist_trades",
+    "hist_trade_accounts",
+    "hist_orders",
+    "hist_funding",
+    "hist_samples",
 )
 
 
@@ -604,7 +616,7 @@ async def restore(
     shutil.copyfile(str(Path(snapshot_dir) / STORE), work + ".store")
     height, checkpoint_hash, state_blob = _exchange_checkpoint(work + ".store")
     _wipe(work)
-    _clear_store(work + ".store", _STORE_RECOMPUTED)
+    _clear_store(work + ".store", _STORE_RECOMPUTED + _STORE_LOCAL)
 
     db = await DatabaseSQLite.create(work)
     # (the accumulators the snapshot carried, recomputed from its rows: never believed)
