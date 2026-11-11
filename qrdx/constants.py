@@ -24,7 +24,7 @@ from fastecdsa import curve
 _config = dotenv_values(".env")
 
 NODE_DEFAULTS = {
-    "QRDX_DATABASE_PATH": "data/qrdx.db",  # SQLite database path
+    "QRDX_DATABASE_PATH": "data/qrdx.db",  # the node's database (its store's file)
     "QRDX_NODE_HOST": "127.0.0.1",
     "QRDX_NODE_PORT": "3007",
     "QRDX_SELF_URL": "",
@@ -358,7 +358,7 @@ for key, default_raw in DEFAULTS.items():
 # New code should use the QRDX_* prefixed versions.
 DENARO_SELF_URL = namespace.get("QRDX_SELF_URL", "")
 DENARO_BOOTSTRAP_NODE = namespace.get("QRDX_BOOTSTRAP_NODE", "http://node.qrdx.org")
-DENARO_DATABASE_PATH = namespace.get("QRDX_DATABASE_PATH", "data/qrdx.db")  # SQLite path
+DENARO_DATABASE_PATH = namespace.get("QRDX_DATABASE_PATH", "data/qrdx.db")  # the store's file
 DENARO_NODE_HOST = namespace.get("QRDX_NODE_HOST", "127.0.0.1")
 DENARO_NODE_PORT = namespace.get("QRDX_NODE_PORT", "3007")
 

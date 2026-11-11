@@ -188,26 +188,36 @@ async def test_a_synced_index_does_no_work(db, offender_key, monkeypatch):
     assert calls == []
 
 
-async def test_an_unchanged_chain_is_checked_without_a_round_trip(db, offender_key):
+async def test_an_unchanged_chain_is_checked_without_a_read(db, offender_key, monkeypatch):
     """Every chain-index read syncs first, many times a block. After one query has found the
     index in step (the chain's block at the indexed top, the index's row there, the tip), no
-    query at all while nothing is written to ``blocks`` and nothing is rolled back — and the
-    reads come from memory. A new block, a replaced one and an index row rolled back with its
-    transaction are each still seen."""
-    from qrdx.node.observability import DB_CALLS, count_db_calls
+    read of the store at all while nothing is written to ``blocks`` and nothing is rolled
+    back — the reads come from memory. A new block, a replaced one and an index row rolled back
+    with its transaction are each still seen."""
+    from qrdx import store as store_mod
 
+    reads = [0]
+    def counting(original):
+        def counted(self, *a, **k):
+            reads[0] += 1
+            return original(self, *a, **k)
+
+        return counted
+
+    for name in ("get", "get_many", "exists", "scan", "scan_index", "keys", "count"):
+        monkeypatch.setattr(store_mod.Table, name, counting(getattr(store_mod.Table, name)))
     rng = random.Random(3)
     slot = await _build(db, rng, 20, offender_key)
-    count_db_calls(db.connection)
     assert await chain_index.sync(db) == 19
     assert await chain_index.block_hash_at(db, 0) is not None      # (memory filled: one read)
-    before = DB_CALLS[0]
+    assert reads[0] > 0                                            # (the count counts)
+    before = reads[0]
     for _ in range(5):
         assert await chain_index.sync(db) == 19
         assert await chain_index.block_hash_at(db, 7) is not None
         assert await chain_index.highest_height_before_slot(db, slot + 1) == 19
     if os.environ.get("QRDX_VERIFY_CHAIN_INDEX") != "1":
-        assert DB_CALLS[0] - before == 0
+        assert reads[0] - before == 0
     slot = await _build(db, rng, 1, offender_key, start=20, slot0=slot)          # (a new block)
     assert await chain_index.sync(db) == 20
     delete_blocks(db, 20, 20)                                                     # (replaced)

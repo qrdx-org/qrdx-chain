@@ -91,9 +91,8 @@ python scripts/node/snapshot.py restore --snapshot snapshot-2026-10-28/ --db /ne
 
 **`create`**:
 
-* takes SQLite's online backup of a node's database and MDBX's online copy of its store
-  (docs/STORAGE.md), running or not, plus a manifest with a checksum of each (`qrdx.db` and
-  `qrdx.db.store`, format 2);
+* takes MDBX's online copy of a node's database, the store's one file (docs/STORAGE.md),
+  running or not, plus a manifest with its checksum (`qrdx.db`, format 3);
 * needs a persisted exchange checkpoint, which a node writes every 1,024 finalized blocks.
 
 **`fetch`** downloads a published snapshot directory from any HTTP server, resuming a cut
@@ -142,8 +141,8 @@ unless every step holds:
    `eth_call` with the substitute meanwhile.
 4. **The node's database.**
    * The chain index is rebuilt from the verified blocks.
-   * Node-local tables start empty: peers, pending transactions, transaction and trading
-     history, receipts.
+   * Node-local tables start empty: the transaction index and trading history, receipts, the
+     displayed validator set and the validator's stake records.
    * The undo journal starts at C, and the exchange checkpoint is re-persisted by this node.
    * C becomes a reorg floor (`checkpoints.reorg_floor`).
 
@@ -178,14 +177,14 @@ A node started with `QRDX_SNAPSHOT_DIR` publishes snapshots of its own database:
 
 * **When:** each time it persists a newer exchange checkpoint (every 1,024 finalized blocks). It
   keeps only the newest. A background poller does the work in a thread, off the block path,
-  through SQLite's online backup and MDBX's online copy of the store.
-* **Where:** `/snapshot/manifest.json`, `/snapshot/qrdx.db` and `/snapshot/qrdx.db.store` on its
-  API port, with range requests, so `fetch` resumes a cut download.
+  through MDBX's online copy.
+* **Where:** `/snapshot/manifest.json` and `/snapshot/qrdx.db` on its API port, with range
+  requests, so `fetch` resumes a cut download.
 * **Advertised:** `p2p_getStatus` carries the manifest under `snapshot`.
-* **Left out:** what a restore discards anyway. That is the node's own tables (peers, pending
-  transactions, the transaction index, trading history, display copies) and the tables a
-  restore recomputes or rebuilds. Their pages are overwritten (`secure_delete`), not only
-  unlinked, and the file is compacted.
+* **Left out:** what a restore discards anyway. That is the node's own tables (the transaction
+  index, trading history, EVM receipts, its validator's stake records, display copies) and the
+  tables a restore recomputes or rebuilds. The file is compacted after they are cleared, so
+  their rows are gone, not only unlinked.
 
 A joining node takes the newest snapshot from the nodes it names:
 
@@ -231,7 +230,8 @@ needs.
 * Serve blocks below its pruning point. A syncing peer is told to ask an archive node.
 * Answer for transactions in pruned sections.
 
-SQLite reuses the freed pages. The file shrinks only after a `VACUUM` with the node stopped.
+The store reuses the freed pages. The file does not shrink; a published snapshot is a compacted
+copy.
 
 Code: `qrdx/history_pruning.py`. Tests: `tests/test_history_pruning.py`.
 

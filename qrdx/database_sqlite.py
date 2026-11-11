@@ -1,18 +1,19 @@
 """
-SQLite Database Adapter for QRDX Testnet
+The node's database: its methods over the node's store (qrdx/store.py, docs/STORAGE.md), one
+MDBX file at the database path.
 
-This is a simplified SQLite adapter for local testnet development.
-For production, use the full PostgreSQL database.py implementation.
+It was a SQLite database (hence the class's name), moved into the store table by table; no
+SQLite is left. ``db.connection`` remains what callers end a transaction through:
+``commit`` writes every table's pending rows in one MDBX transaction, ``rollback`` drops them.
 """
 
 import json
 import os
+import sqlite3
 from collections import OrderedDict
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
-
-import aiosqlite
 
 from . import block_codec
 from .logger import get_logger
@@ -59,8 +60,35 @@ def _block_dict(row: Any, content: Any = None, with_body: bool = True) -> Option
     return block
 
 
+class _Connection:
+    """``db.connection``: the store's transaction, ended as SQLite's connection's was.
+
+    ``commit`` writes every table's pending rows in one MDBX transaction (counted for a task's
+    phase log line: observability.Phases). ``rollback`` drops them, and the chain index forgets
+    what it read of them."""
+
+    def __init__(self, db: "DatabaseSQLite") -> None:
+        from .node.observability import DB_CALLS
+
+        self._db = db
+        self._calls = DB_CALLS
+
+    async def commit(self) -> None:
+        self._calls[0] += 1
+        self._db.store.commit()
+
+    async def rollback(self) -> None:
+        self._db.store.rollback()
+        from . import chain_index
+
+        chain_index.rolled_back(self._db)
+
+    async def close(self) -> None:
+        await self._db.close()
+
+
 class DatabaseSQLite:
-    """Simplified SQLite database for testnet"""
+    """The node's database, over its store (the module's docstring)."""
 
     instance: Optional["DatabaseSQLite"] = None
     credentials: Dict[str, Any] = {}
@@ -68,40 +96,21 @@ class DatabaseSQLite:
     def __init__(self, db_path: str):
         self.db_path = db_path
         # Opened by create() — the only way an instance is made — before any use.
-        self.connection: aiosqlite.Connection = None  # type: ignore[assignment]
+        self.connection: _Connection = None  # type: ignore[assignment]
         self.store: Any = None  # (qrdx/store.py)
         self.is_indexed = False
+        self._closed = False
 
     @staticmethod
     async def create(db_path: str, **kwargs):
-        """Create and initialize SQLite database"""
+        """Open the database at ``db_path`` (the store's file, made if it is new)."""
         self = DatabaseSQLite(db_path)
-
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-
-        # Open connection
-        self.connection = await aiosqlite.connect(db_path)
-        self.connection.row_factory = aiosqlite.Row
-        # Every statement, fetch and commit is a round trip to aiosqlite's thread, and a
-        # block's fixed cost is mostly those round trips: counted for its phase log line
-        # (observability.Phases).
-        from .node.observability import count_db_calls
-
-        count_db_calls(self.connection)
-
-        await self._refuse_before_the_store()
-        # Enable WAL mode for better concurrency
-        await self.connection.execute("PRAGMA journal_mode=WAL")
-        await self.connection.execute("PRAGMA synchronous=NORMAL")
-
-        # The store beside it (qrdx/store.py): the ledger, its commitments, the undo journal and
-        # the state proof tree. Committing (or rolling back) the connection does the same to the
-        # store, first, so every caller that ends a block's transaction ends both.
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        self._refuse_before_the_store()
         from .store import Store
 
-        self.store = Store(db_path + ".store")
-        self._couple_store()
+        self.store = Store(db_path)
+        self.connection = _Connection(self)
         from . import state_proofs, undo_journal
 
         state_proofs.install(self)
@@ -112,40 +121,32 @@ class DatabaseSQLite:
         # Set singleton instance (matching Database pattern for manager.py etc.)
         DatabaseSQLite.instance = self
 
-        logger.info(f"SQLite database initialized: {db_path}")
+        logger.info(f"Database opened: {db_path}")
         return self
 
-    # Tables the store holds now (qrdx/store.py): a database that still has them was written before
-    # it, and its ledger, journal and sections would be silently left behind.
-    _MOVED_TO_THE_STORE = (
-        "account_state",
-        "contract_storage",
-        "token_balances",
-        "undo_log",
-        "state_commitment",
-        "block_exchange_transactions",
-        "block_evm_transactions",
-        "blocks",
-        "chain_index",
-        # (the system wallets' registry authorises delegated spends at import)
-        "system_wallets",
-        "validators",
-        "validator_stakes",
-    )
-
-    async def _refuse_before_the_store(self) -> None:
-        marks = ",".join("?" * len(self._MOVED_TO_THE_STORE))
-        rows = await self.connection.execute_fetchall(
-            f"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ({marks})",
-            self._MOVED_TO_THE_STORE,
-        )
-        if rows:
-            await self.connection.close()
-            raise RuntimeError(
-                f"{self.db_path} was written before the node's store (docs/STORAGE.md): it holds "
-                f"{', '.join(sorted(r[0] for r in rows))} in SQLite. Start this node from a new "
-                "database (sync, or restore a snapshot of format 2)."
+    def _refuse_before_the_store(self) -> None:
+        """A SQLite database at the path was written before the store: refused, naming what it
+        holds (its ledger and journal would otherwise be silently left behind). An empty file is
+        not one: the store starts there."""
+        try:
+            with open(self.db_path, "rb") as f:
+                header = f.read(16)
+        except OSError:
+            return
+        if header != b"SQLite format 3\x00":
+            return
+        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        try:
+            tables = sorted(
+                r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             )
+        finally:
+            conn.close()
+        raise RuntimeError(
+            f"{self.db_path} is a SQLite database, written before the node's store "
+            f"(docs/STORAGE.md){': it holds ' + ', '.join(tables) if tables else ''}. Start this "
+            "node from a new database (sync, or restore a snapshot of format 3)."
+        )
 
     # ── the chain's settings (``chain_metadata``) ──
 
@@ -164,24 +165,6 @@ class DatabaseSQLite:
         self._tx_seq = seq + 1
         return self._tx_seq
 
-    def _couple_store(self) -> None:
-        conn, store = self.connection, self.store
-        commit, rollback = conn.commit, conn.rollback
-
-        async def commit_both() -> None:
-            store.commit()
-            await commit()
-
-        async def rollback_both() -> None:
-            store.rollback()
-            await rollback()
-            from . import chain_index
-
-            chain_index.rolled_back(self)
-
-        conn.commit = commit_both  # type: ignore[method-assign]
-        conn.rollback = rollback_both  # type: ignore[method-assign]
-
     @staticmethod
     async def get():
         """Get the singleton instance, matching Database.get() interface."""
@@ -199,13 +182,13 @@ class DatabaseSQLite:
         """Clear the legacy mempool (it holds nothing)."""
 
     async def close(self):
-        """Close database connection (and the store: what neither committed is dropped)"""
-        if self.connection:
-            await self.connection.close()
-            logger.info(f"SQLite database closed: {self.db_path}")
-        store = getattr(self, "store", None)
-        if store is not None:
-            store.close()
+        """Close the store (what was not committed is dropped). Once; a second call does
+        nothing."""
+        if self._closed or self.store is None:
+            return
+        self._closed = True
+        self.store.close()
+        logger.info(f"Database closed: {self.db_path}")
 
     # Compatibility methods for existing code
 

@@ -70,7 +70,7 @@ async def readyz():
 @app.get("/snapshot/{name}")
 async def snapshot_file(name: str):
     """The snapshot this node publishes (``QRDX_SNAPSHOT_DIR``; qrdx/snapshot_publisher.py):
-    ``manifest.json``, ``qrdx.db`` and ``qrdx.db.store``, with range requests so a cut download
+    ``manifest.json`` and ``qrdx.db``, with range requests so a cut download
     resumes. 404 when it publishes none. A restore verifies it whoever served it
     (docs/CHECKPOINT_SYNC.md)."""
     from qrdx.snapshot_publisher import published_file

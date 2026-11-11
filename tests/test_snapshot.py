@@ -113,12 +113,9 @@ def test_a_snapshot_downloads_from_any_server_and_a_broken_one_is_caught(tmp_pat
 
     published = tmp_path / "pub"
     published.mkdir()
-    data = os.urandom(300_000)
-    store = os.urandom(70_000)  # (the store's file beside the database: docs/STORAGE.md)
+    data = os.urandom(300_000)  # (the store's file: docs/STORAGE.md)
     (published / "qrdx.db").write_bytes(data)
-    (published / "qrdx.db.store").write_bytes(store)
-    manifest = {"format": 2, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
-                "store": {"bytes": len(store), "sha256": hashlib.sha256(store).hexdigest()}}
+    manifest = {"format": 3, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
     (published / "manifest.json").write_text(json.dumps(manifest))
     server, url = _serve(published)
     try:
@@ -127,7 +124,6 @@ def test_a_snapshot_downloads_from_any_server_and_a_broken_one_is_caught(tmp_pat
         (out / "qrdx.db.part").write_bytes(data[:1000])          # a download cut short
         assert fetch(url, str(out), progress=lambda m: None)["bytes"] == len(data)
         assert (out / "qrdx.db").read_bytes() == data and not (out / "qrdx.db.part").exists()
-        assert (out / "qrdx.db.store").read_bytes() == store
         (published / "qrdx.db").write_bytes(data[:-1] + b"\x00")  # corrupted in transit
         with pytest.raises(SnapshotError, match="does not match the manifest"):
             fetch(url, str(tmp_path / "bad"), progress=lambda m: None)

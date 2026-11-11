@@ -583,9 +583,9 @@ async def startup():
     self_node_id = get_node_id()
     NodesManager.init(self_node_id)
 
-    # Initialize SQLite database
+    # The node's database: its store's file (docs/STORAGE.md)
     db_path = str(DENARO_DATABASE_PATH) if DENARO_DATABASE_PATH else "data/qrdx.db"
-    logger.info(f"Using SQLite database: {db_path}")
+    logger.info(f"Using database: {db_path}")
 
     # Ensure the database directory exists
     os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)

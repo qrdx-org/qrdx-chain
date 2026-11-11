@@ -502,12 +502,14 @@ The fourth round, consensus changes for the regenesis (2026-11-05):
     * With the chain's tables in the store too (blocks, transactions, the chain index), an
       import's database round trips fell to a median 11. Live, 1,000 a second at 3.97 blocks a
       second; 1,500 at 2.74; 2,000 executed 1,877 at 2.84.
+    * Every table then moved (S6): no SQLite is left in the node's database, so a commit is no
+      longer a round trip to aiosqlite's thread.
 
-Each block's phase line ends with its database round trips (`db N`).
+Each block's phase line ends with its store commits (`db N`; they were SQLite round trips).
 
 ## The block pipeline, measured offline
 
-`scripts/bench/exchange_block.py` times one block's exchange section on a real SQLite database.
+`scripts/bench/exchange_block.py` times one block's exchange section on a real database.
 It covers what the proposer does (the inclusion judgment, the balance preloads, execution, the
 flush, the unified state root, storing the block) and what an importer adds (verifying the
 signatures). It runs on one core with no network, so it measures the node's own cost per

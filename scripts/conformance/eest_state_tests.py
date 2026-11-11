@@ -152,8 +152,7 @@ class Runner:
 
     async def __aexit__(self, *exc):
         await self.db.close()
-        for p in (self.path, self.path + "-wal", self.path + "-shm", self.path + ".store",
-                  self.path + ".store-lck"):
+        for p in (self.path, self.path + "-lck"):
             if os.path.exists(p):
                 os.remove(p)
 

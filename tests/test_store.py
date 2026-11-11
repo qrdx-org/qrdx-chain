@@ -12,6 +12,7 @@ What must hold:
   * the marks name every changed row of a tracked table, once;
   * a copy is the committed state, whatever is pending.
 """
+import os
 import random
 
 import pytest
@@ -320,3 +321,43 @@ def test_an_index_follows_every_write(tmp_path, seed):
     votes.clear()
     assert votes.scan_index("by_target") == [] and votes.scan_index("by_validator") == []
     store.close()
+
+
+async def test_the_database_is_the_stores_one_file(tmp_path):
+    """No SQLite is left: the database path is the store's file. An empty file there (a
+    deployment's placeholder) is where the store starts; a commit and a rollback through
+    ``db.connection`` end the store's transaction."""
+    path = str(tmp_path / "node.db")
+    open(path, "wb").close()
+    db = await DatabaseSQLite.create(path)
+    try:
+        db.set_metadata("k", "kept")
+        await db.connection.commit()
+        db.set_metadata("k", "dropped")
+        await db.connection.rollback()
+        assert db.get_metadata("k") == "kept"
+    finally:
+        await db.connection.close()
+        await db.close()  # (a second close does nothing)
+    assert sorted(os.listdir(tmp_path)) == ["node.db", "node.db-lck"]
+    with open(path, "rb") as f:
+        assert not f.read(16).startswith(b"SQLite")
+    again = await DatabaseSQLite.create(path)
+    try:
+        assert again.get_metadata("k") == "kept"
+    finally:
+        await again.close()
+
+
+async def test_a_sqlite_database_from_before_the_store_is_refused(tmp_path):
+    import sqlite3
+
+    path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE system_wallets (address TEXT PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(RuntimeError, match=r"written before the node's store .*: it holds "
+                                           "system_wallets"):
+        await DatabaseSQLite.create(path)
+    assert sorted(os.listdir(tmp_path)) == ["old.db"]   # (nothing opened, nothing written)

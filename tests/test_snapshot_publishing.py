@@ -5,12 +5,11 @@ A node with QRDX_SNAPSHOT_DIR writes a snapshot of its database at each newer ex
 checkpoint, keeps the newest, serves it at /snapshot/ (resumable) and advertises it in its
 status; ``snapshot.py fetch --peer`` finds the newest one among the nodes it is given. A
 published snapshot leaves out what a restore discards — the node's own tables among them — and
-overwrites them rather than only unlinking them.
+compacts the file, so their rows are gone rather than only unlinked.
 """
 import hashlib
 import json
 import os
-import sqlite3
 
 import pytest
 
@@ -21,21 +20,15 @@ from qrdx.store import Store
 PEER_IP = "10.9.8.7"
 
 
+class _Closed:
+    def close(self):
+        pass
+
+
 def _node_db(path, checkpoint=100):
-    """A node database in miniature: chain, state and journal rows a restore needs, and the
-    node's own rows it does not."""
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.executescript("""
-        CREATE TABLE peers (id TEXT, address TEXT);
-        CREATE TABLE pending_transactions (tx_hash TEXT, tx_hex TEXT);
-    """)
-    conn.execute("INSERT INTO peers VALUES ('p1', ?)", (f"http://{PEER_IP}:3007",))
-    conn.execute("INSERT INTO pending_transactions VALUES ('t', 'secret-pending')")
-    conn.commit()
-    # The store beside it (qrdx/store.py): the state and its journal a restore needs, and the
-    # roots and the tree it recomputes.
-    store = Store(path + ".store")
+    """A node database (the store's file) in miniature: chain, state and journal rows a restore
+    needs, and the node's own rows it does not."""
+    store = Store(path)
     with store.recording(120):
         store["account_state"].put(address="0xPQa", balance="5")
     store["post_roots"].put("h", 99, "planted")  # (never trusted)
@@ -50,9 +43,11 @@ def _node_db(path, checkpoint=100):
     store["tx_participants"].put("0xPQa", 3, 0, "sender")
     store["hist_trades"].put(3, 0, 1.0, "fill")
     store["epochs"].put(epoch=1, finalized=1)
+    store["validator_stakes"].put(validator_address=f"http://{PEER_IP}:3007", stake=5)
+    store["contract_logs"].put(block_number=1, id=1, tx_hash="t", data=b"secret-receipt")
     store.commit()
     store.close()
-    return conn
+    return _Closed()
 
 
 def _store_count(path, table):
@@ -64,16 +59,8 @@ def _store_count(path, table):
         os.remove(path + "-lck")
 
 
-def _count(path, table):
-    conn = sqlite3.connect(path)
-    try:
-        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    finally:
-        conn.close()
-
-
 def _move_checkpoint(db, height):
-    store = Store(db + ".store")
+    store = Store(db)
     try:
         store["exchange_checkpoint"].update((1,), height=height, block_hash=f"{height:064x}")
         store.commit()
@@ -89,34 +76,29 @@ def test_a_published_snapshot_leaves_out_what_a_restore_discards(tmp_path):
     finally:
         conn.close()
     copy = str(tmp_path / "pub" / "qrdx.db")
-    for table in ("peers", "pending_transactions"):
-        assert _count(copy, table) == 0, table
-    store_copy = copy + ".store"
-    assert _store_count(store_copy, "exchange_checkpoint") == 1
-    store_raw = open(store_copy, "rb").read()
-    assert manifest["store"]["sha256"] == hashlib.sha256(store_raw).hexdigest()
-    for table in ("post_roots", "smt_nodes", "chain_index", "validator_log_roots", "tx_index",
-                  "tx_participants", "hist_trades", "epochs"):
-        assert _store_count(store_copy, table) == 0, table
-    assert _store_count(store_copy, "account_state") == 1
-    assert _store_count(store_copy, "blocks") == 150
-    assert b"planted" not in store_raw   # (compacted: not only unlinked)
+    assert _store_count(copy, "exchange_checkpoint") == 1
     raw = open(copy, "rb").read()
-    assert PEER_IP.encode() not in raw and b"secret-pending" not in raw   # overwritten
+    for table in ("post_roots", "smt_nodes", "chain_index", "validator_log_roots", "tx_index",
+                  "tx_participants", "hist_trades", "epochs", "validator_stakes", "contract_logs"):
+        assert _store_count(copy, table) == 0, table
+    assert _store_count(copy, "account_state") == 1
+    assert _store_count(copy, "blocks") == 150
+    assert b"planted" not in raw   # (compacted: not only unlinked)
+    assert PEER_IP.encode() not in raw and b"secret-receipt" not in raw
     assert manifest["checkpoint"]["height"] == 100 and manifest["tip"] == 149
+    assert manifest["format"] == 3
     assert manifest["sha256"] == hashlib.sha256(raw).hexdigest()
-    assert sorted(os.listdir(tmp_path / "pub")) == ["manifest.json", "qrdx.db", "qrdx.db.store"]
+    assert manifest["bytes"] == len(raw)
+    assert sorted(os.listdir(tmp_path / "pub")) == ["manifest.json", "qrdx.db"]
 
 
 def test_a_restore_also_discards_the_transaction_participants(tmp_path):
     db = str(tmp_path / "node.db")
     _node_db(db).close()
-    snapshot._wipe(db)
-    snapshot._clear_store(db + ".store", snapshot._STORE_RECOMPUTED + snapshot._STORE_LOCAL)
-    assert _count(db, "peers") == 0
-    assert _store_count(db + ".store", "tx_participants") == 0
-    assert _store_count(db + ".store", "tx_index") == 0
-    assert _store_count(db + ".store", "blocks") == 150
+    snapshot._clear_store(db, snapshot._STORE_RECOMPUTED + snapshot._STORE_LOCAL)
+    assert _store_count(db, "tx_participants") == 0
+    assert _store_count(db, "tx_index") == 0
+    assert _store_count(db, "blocks") == 150
 
 
 def test_a_node_publishes_each_newer_checkpoint_and_keeps_the_newest(tmp_path):
@@ -141,8 +123,7 @@ def test_only_the_published_snapshot_is_served_and_advertised(tmp_path, monkeypa
     _node_db(db).close()
     snapshot_publisher.publish(db, root)
     assert snapshot_publisher.published_file("qrdx.db").endswith("/100/qrdx.db")
-    assert snapshot_publisher.published_file("qrdx.db.store").endswith("/100/qrdx.db.store")
-    for name in ("latest.json", "../latest.json", "100/qrdx.db", "qrdx.db-wal"):
+    for name in ("latest.json", "../latest.json", "100/qrdx.db", "qrdx.db-lck", "qrdx.db.store"):
         assert snapshot_publisher.published_file(name) is None, name
     ad = snapshot_publisher.advertised()
     assert ad["path"] == "/snapshot/" and ad["checkpoint"]["height"] == 100

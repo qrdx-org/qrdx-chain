@@ -27,8 +27,9 @@ the restoring node already trusts — its chain spec and genesis file, and a tru
    kept.
 4. **The rest.** Blocks above C are removed (the node syncs them from peers, verifying them as
    any import). The tables that are a function of history (the chain index: slots, RANDAO
-   mixes, votes, offenders) are rebuilt from the verified blocks; node-local ones (peers,
-   pending transactions, the undo journal, transaction and trading history) start empty.
+   mixes, votes, offenders) are rebuilt from the verified blocks; node-local ones (the undo
+   journal, the transaction index and trading history, EVM receipts, the displayed validator
+   set) start empty.
 
 **The exchange checkpoint is not unpickled.** The node persists it with pickle, which runs code
 named in the data. A snapshot's copy is read by an unpickler that resolves only the classes and
@@ -46,19 +47,19 @@ import json
 import os
 import pickle
 import shutil
-import sqlite3
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
 from .logger import get_logger
 
 logger = get_logger(__name__)
 
 MANIFEST = "manifest.json"
-DATABASE = "qrdx.db"
-STORE = DATABASE + ".store"  # the node's store beside it (qrdx/store.py)
-FORMAT = 2
+DATABASE = "qrdx.db"  # the node's database: its store's file (qrdx/store.py)
+# 3: the store's file alone. (2 was a SQLite database and the store beside it, 1 the SQLite
+# database alone.)
+FORMAT = 3
 
 
 class SnapshotError(Exception):
@@ -174,19 +175,6 @@ def pickled_globals(blob: bytes) -> Set[Tuple[str, str]]:
 # ── creating ─────────────────────────────────────────────────────────────────────────────
 
 
-def _backup(source: str, dest: str) -> None:
-    """A consistent copy of a (possibly running) node's database: SQLite's online backup."""
-    src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
-    try:
-        out = sqlite3.connect(dest)
-        try:
-            src.backup(out)
-        finally:
-            out.close()
-    finally:
-        src.close()
-
-
 def _copy_store(source: str, dest: str) -> None:
     """A consistent copy of a (possibly running) node's store: MDBX's online copy — through the
     running node's own handle when it is this process."""
@@ -274,10 +262,9 @@ def _sha256(path: str) -> str:
 
 
 def fetch(url: str, out_dir: str, progress: Callable[[str], None] = print) -> Dict[str, Any]:
-    """Download a snapshot directory that any HTTP server publishes (``manifest.json``,
-    ``qrdx.db`` and ``qrdx.db.store`` under ``url``), resuming a partial download. The manifest's
-    checksums catch a broken transfer early; they vouch for nothing — ``restore`` verifies the
-    snapshot itself."""
+    """Download a snapshot directory that any HTTP server publishes (``manifest.json`` and
+    ``qrdx.db`` under ``url``), resuming a partial download. The manifest's checksum catches a
+    broken transfer early; it vouches for nothing — ``restore`` verifies the snapshot itself."""
     import urllib.request
 
     base = url.rstrip("/") + "/"
@@ -288,8 +275,6 @@ def fetch(url: str, out_dir: str, progress: Callable[[str], None] = print) -> Di
     if int(manifest.get("format", 1)) != FORMAT:
         raise SnapshotError(f"a snapshot of format {manifest.get('format')}, not {FORMAT}")
     _download(base, DATABASE, int(manifest["bytes"]), manifest.get("sha256"), out, progress)
-    store = manifest.get("store") or {}
-    _download(base, STORE, int(store.get("bytes", 0)), store.get("sha256"), out, progress)
     (out / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
@@ -345,30 +330,17 @@ def create(source_db: str, out_dir: str, public: bool = False) -> Dict[str, Any]
     the database and a manifest. Nothing in the manifest is trusted by a restore; it says what
     the snapshot claims, for the operator choosing one.
 
-    ``public``: for publishing. Leave out every table a restore discards (``_discarded``) — the
-    node's own (its peers, pending transactions, indexes and display copies) and what a restore
-    recomputes or rebuilds — overwritten, not only unlinked, and compact the file."""
+    ``public``: for publishing. Leave out every table a restore discards — the node's own (its
+    indexes, display copies and records) and what a restore recomputes or rebuilds — and compact
+    the file, so their rows are not only unlinked but gone."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=False)
     db_path = str(out / DATABASE)
-    store_path = str(out / STORE)
-    _copy_store(source_db + ".store", store_path)  # (before the database: see restore)
-    _backup(source_db, db_path)
+    _copy_store(source_db, db_path)
     if public:
-        _clear_store(store_path, _STORE_RECOMPUTED + _STORE_LOCAL, compact=True)
-    conn = sqlite3.connect(db_path)
-    try:
-        if public:
-            conn.execute("PRAGMA journal_mode = DELETE")
-            conn.execute("PRAGMA secure_delete = ON")
-            for table in _discarded(_tables(conn)):
-                conn.execute(f"DELETE FROM {table}")
-            conn.commit()
-            conn.execute("VACUUM")
-    finally:
-        conn.close()
-    height, block_hash, _state = _exchange_checkpoint(store_path)
-    tip, genesis = _chain_ends(store_path)
+        _clear_store(db_path, _STORE_RECOMPUTED + _STORE_LOCAL, compact=True)
+    height, block_hash, _state = _exchange_checkpoint(db_path)
+    tip, genesis = _chain_ends(db_path)
     manifest = {
         "format": FORMAT,
         "tip": int(tip),
@@ -376,7 +348,6 @@ def create(source_db: str, out_dir: str, public: bool = False) -> Dict[str, Any]
         "genesis_hash": genesis,
         "bytes": os.path.getsize(db_path),
         "sha256": _sha256(db_path),
-        "store": {"bytes": os.path.getsize(store_path), "sha256": _sha256(store_path)},
     }
     (out / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
@@ -385,9 +356,9 @@ def create(source_db: str, out_dir: str, public: bool = False) -> Dict[str, Any]
 # ── restoring ────────────────────────────────────────────────────────────────────────────
 
 # Recomputed from the rows here (the roots after blocks: the verified checkpoint's, and its
-# parent's from the trusted history), never read from a snapshot. (The commitments'
-# accumulators too: recomputed from the rows when the restore opens the store.)
-_RECOMPUTED: Tuple[str, ...] = ()
+# parent's from the trusted history), or rebuilt from the verified blocks, never read from a
+# snapshot. (The commitments' accumulators too: recomputed from the rows when the restore opens
+# the store.)
 _STORE_RECOMPUTED = (
     "post_roots",
     "smt_meta",
@@ -402,21 +373,6 @@ _STORE_RECOMPUTED = (
     "chain_index_ffg",
     "chain_index_meta",
     "validator_log_roots",
-)
-# Rebuilt from the verified blocks (in the store now: above).
-_REBUILT: Tuple[str, ...] = ()
-# This node's own, not the server's.
-_LOCAL = (
-    "peers",
-    "pending_transactions",
-    "pending_spent_outputs",
-    "pending_exchange_transactions",
-    "signed_blocks",
-    "signed_votes",
-    "watermarks",
-    "validators",
-    "contract_logs",
-    "contract_transactions",
 )
 # The node's own, in its store: the validator set it displays, its validator's stake records,
 # its EVM receipts, the votes, epochs and offences it recorded, its transaction index and trading
@@ -440,29 +396,6 @@ _STORE_LOCAL = (
     "hist_funding",
     "hist_samples",
 )
-
-
-def _tables(conn: sqlite3.Connection) -> Set[str]:
-    return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-
-
-def _discarded(present: Set[str]) -> List[str]:
-    """The tables of ``present`` a restore empties: recomputed, rebuilt, or the node's own
-    (its transaction index and trading history included)."""
-    named = [t for t in _RECOMPUTED + _REBUILT + _LOCAL if t in present]
-    return named + sorted(
-        t for t in present if t.startswith(("tx_index", "tx_participants", "hist_"))
-    )
-
-
-def _wipe(path: str) -> None:
-    conn = sqlite3.connect(path)
-    try:
-        for table in _discarded(_tables(conn)):
-            conn.execute(f"DELETE FROM {table}")
-        conn.commit()
-    finally:
-        conn.close()
 
 
 async def _genesis(db: Any, genesis_file: Optional[str], scratch: str) -> str:
@@ -603,22 +536,15 @@ async def restore(
     source = str(Path(snapshot_dir) / DATABASE)
     if not os.path.exists(source):
         raise SnapshotError(f"no {DATABASE} in {snapshot_dir}")
-    if not os.path.exists(str(Path(snapshot_dir) / STORE)):
-        raise SnapshotError(f"no {STORE} in {snapshot_dir}")
-    if os.path.exists(target_db):
+    if os.path.exists(target_db) and os.path.getsize(target_db) > 0:
         raise SnapshotError(f"{target_db} exists: restore into a new path")
     work = target_db + ".partial"
     scratch = target_db + ".genesis"
     for leftover in (work, scratch):
-        for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(leftover + suffix):
-                os.remove(leftover + suffix)
-        remove_files(leftover + ".store")
-    _backup(source, work)
-    shutil.copyfile(str(Path(snapshot_dir) / STORE), work + ".store")
-    height, checkpoint_hash, state_blob = _exchange_checkpoint(work + ".store")
-    _wipe(work)
-    _clear_store(work + ".store", _STORE_RECOMPUTED + _STORE_LOCAL)
+        remove_files(leftover)
+    shutil.copyfile(source, work)
+    height, checkpoint_hash, state_blob = _exchange_checkpoint(work)
+    _clear_store(work, _STORE_RECOMPUTED + _STORE_LOCAL)
 
     db = await DatabaseSQLite.create(work)
     # (the accumulators the snapshot carried, recomputed from its rows: never believed)
@@ -754,19 +680,8 @@ async def restore(
         await db.close()
         CHECKPOINTS.clear()
         ExchangeStateManager.reset_instance()
-        for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(scratch + suffix):
-                os.remove(scratch + suffix)
-        remove_files(scratch + ".store")
+        remove_files(scratch)
         if ok:
+            remove_files(target_db)  # (an empty file a deployment made: nothing in it)
             shutil.move(work, target_db)
-            shutil.move(work + ".store", target_db + ".store")
-            for suffix in ("-wal", "-shm"):
-                if os.path.exists(work + suffix):
-                    os.remove(work + suffix)
-            remove_files(work + ".store")
-        else:
-            for suffix in ("", "-wal", "-shm"):
-                if os.path.exists(work + suffix):
-                    os.remove(work + suffix)
-            remove_files(work + ".store")
+        remove_files(work)

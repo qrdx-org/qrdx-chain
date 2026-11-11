@@ -327,7 +327,7 @@ EOF
 setup_databases() {
     local num_nodes=$1
     
-    log_step "Setting up SQLite databases"
+    log_step "Setting up databases"
     
     # A new genesis: remove every node's old database and peer state (node<i>.p2p holds its
     # peer list and routing table, which would point at nodes from an earlier run).
@@ -335,10 +335,10 @@ setup_databases() {
     rm -rf "${db_dir}"
     mkdir -p "${db_dir}"
 
-    # Create SQLite database for each node
+    # Each node's database: the store's file, started from empty (docs/STORAGE.md)
     for i in $(seq 0 $((num_nodes - 1))); do
         local db_file="${db_dir}/node${i}.db"
-        log_info "Creating SQLite database: ${db_file}"
+        log_info "Creating database: ${db_file}"
         
         # Create new empty database file
         touch "${db_file}"
@@ -346,7 +346,7 @@ setup_databases() {
         log_success "Database created: ${db_file}"
     done
     
-    log_success "All SQLite databases created"
+    log_success "All databases created"
 }
 
 # =============================================================================
@@ -401,7 +401,7 @@ QRDX_SELF_URL=http://127.0.0.1:${node_port}
 QRDX_BOOTSTRAP_NODE=${bootstrap_nodes%%,*}
 QRDX_BOOTSTRAP_NODES=${bootstrap_nodes}
 
-# Database (SQLite)
+# Database (the node's store: docs/STORAGE.md)
 QRDX_DATABASE_PATH=${TESTNET_DIR}/databases/node${node_id}.db
 
 # Per-node identity key directory (avoids key collision in multi-node testnet)

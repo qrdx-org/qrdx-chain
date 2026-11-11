@@ -13,9 +13,10 @@ The cost had four sources:
 * **Section rows.** Each block's section was stored as hundreds of rows.
 * **SQL itself.** Each statement was parsed and planned.
 
-The store replaces that database, table by table, with ordered tables in one
+The store replaced that database, table by table, with ordered tables in one
 [MDBX](https://libmdbx.dqdkfa.ru/) file, kept by the native module (`native/qrdx-native/src/store`,
-`qrdx/store.py`). MDBX is the B-tree file Reth and Erigon keep Ethereum's state in. It is an
+`qrdx/store.py`). No SQLite is left in the node's database: its path (`QRDX_DATABASE_PATH`) is
+the store's file. MDBX is the B-tree file Reth and Erigon keep Ethereum's state in. It is an
 embedded library, so reads come from memory-mapped pages in the node's own process.
 
 ## How it works
@@ -33,8 +34,9 @@ as it did and commits to the same entry.
 
 **Writes wait in memory.** A put or delete lands in the table's layer, a sorted map, and reads
 look there first. `commit` writes every layer in one MDBX transaction and `rollback` drops them.
-Committing or rolling back the SQLite connection does the same to the store, store first
-(`DatabaseSQLite._couple_store`), so every caller that ends a block's transaction ends both.
+Callers end a transaction through `db.connection` as they did through SQLite's connection: its
+`commit` and `rollback` are the store's (qrdx/database_sqlite.py, `_Connection`). Neither is a
+round trip to another thread any more.
 
 **What the triggers did, the store does natively**, as each row changes, so no write path can
 forget it:
@@ -84,7 +86,7 @@ not turn the store off.
 | S5a the node's indexes | the transaction index (`tx_index`, `tx_participants`, `tx_index_blocks`) and the trading history (`hist_*`) | done |
 | S5b EVM receipts | `contract_transactions`, `contract_logs`, `contract_metadata` (eth_getTransactionReceipt, eth_getLogs) | done |
 | S5 the node's own | the legacy mempool, peers, attestations: none of them held anything (below) | done |
-| S6 | SQLite and aiosqlite removed | to do |
+| S6 | SQLite and aiosqlite removed from the node's database; a snapshot is the store's file | done |
 
 Three SQLite tables held nothing, so nothing of theirs moved:
 
@@ -104,17 +106,18 @@ The chain index used to count writes to `blocks` with SQLite triggers. The datab
 writers now tell it (`chain_index.blocks_changed`, `rolled_back`), so a write the index must
 notice goes through them.
 
-Until S6, a crash between the store's commit and SQLite's can leave the store a block ahead.
-The startup rebuild handles this case as it handles every other partial write. It replays the
-derived state from the newest exchange checkpoint, which steps the store back through its own
-journal first (docs/KNOWN_ISSUES.md, "a restart replayed exchange state").
+While both existed, a crash between the store's commit and SQLite's could leave the store a block
+ahead; with one file, a commit is whole or absent.
 
-A checkpoint-sync snapshot is now two files: `qrdx.db` and `qrdx.db.store` (format 2,
-docs/CHECKPOINT_SYNC.md).
+A checkpoint-sync snapshot is the store's file, `qrdx.db` (format 3, docs/CHECKPOINT_SYNC.md).
 
-A database from before the store is refused at startup with a message naming the tables it
-still holds. Its ledger, journal and sections would otherwise be silently left behind. Start
-such a node from a new database (sync, or restore a format-2 snapshot).
+A SQLite database at the database path was written before the store. It is refused at startup
+with a message naming the tables it holds, which would otherwise be silently left behind. Start
+such a node from a new database (sync, or restore a format-3 snapshot). An empty file there
+(`scripts/testnet.sh` makes one) is where the store starts.
+
+Some code paths still speak PostgreSQL (`database.pool`: parts of `qrdx/rpc/modules/validator.py`,
+`contracts.py` and `qrdx/node/api`). They predate the SQLite database and never ran against it.
 
 ## Measured
 

@@ -606,29 +606,14 @@ EVENT_HUB = EventHub()
 CHAIN_CHANGED = ChangeSignal()
 
 
-# Round trips to the database's thread (aiosqlite), for Phases: every statement, fetch and commit.
+# The store's commits (each one MDBX write transaction: qrdx/database_sqlite.py), for Phases.
 DB_CALLS = [0]
-
-
-def count_db_calls(connection: Any) -> None:
-    """Count ``connection``'s round trips in DB_CALLS (its every operation goes through
-    ``_execute``)."""
-    inner = getattr(connection, "_execute", None)
-    if inner is None or getattr(inner, "_counted", False):
-        return
-
-    async def counted(fn: Any, *args: Any, **kwargs: Any) -> Any:
-        DB_CALLS[0] += 1
-        return await inner(fn, *args, **kwargs)
-
-    counted._counted = True  # type: ignore[attr-defined]
-    connection._execute = counted
 
 
 class Phases:
     """Wall time of a task's steps, for its log line: ``mark(name)`` ends the step called
-    ``name``. ``str()`` reads "lock 3, exchange 41, store 9, db 37" (milliseconds; steps under
-    half a millisecond left out; ``db``: the database round trips since it began)."""
+    ``name``. ``str()`` reads "lock 3, exchange 41, store 9, db 2" (milliseconds; steps under
+    half a millisecond left out; ``db``: the store's commits since it began)."""
 
     __slots__ = ("_last", "_steps", "_db")
 

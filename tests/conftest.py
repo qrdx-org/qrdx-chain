@@ -36,18 +36,17 @@ import pytest  # noqa: E402
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """The stores beside the temporary databases tests made and deleted (a test removes its
-    ``.db`` file; the store's file and lock file sit beside it: qrdx/store.py)."""
+    """The lock files of the temporary databases tests made and deleted (a test removes its
+    ``.db`` file, the store's; MDBX leaves ``-lck`` beside it: qrdx/store.py)."""
     import glob
     import tempfile
 
-    for path in glob.glob(os.path.join(tempfile.gettempdir(), "*.db.store")):
-        if not os.path.exists(path[: -len(".store")]):
-            for name in (path, path + "-lck"):
-                try:
-                    os.remove(name)
-                except OSError:
-                    pass
+    for lock in glob.glob(os.path.join(tempfile.gettempdir(), "*-lck")):
+        if not os.path.exists(lock[: -len("-lck")]):
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
 
 
 @pytest.fixture
