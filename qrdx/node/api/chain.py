@@ -489,6 +489,13 @@ async def get_pending_transactions(pretty: bool = False):
     )
 
 
+@app.get("/get_slashing_events")
+async def get_slashing_events(validator: Optional[str] = None):
+    """The offences this node recorded (the double-sign and surround proofs blocks carried), by
+    slot, optionally for one validator. The proofs are on chain: nothing here is private."""
+    return {"ok": True, "result": await _node.db.get_slashing_events(validator)}
+
+
 @app.get("/get_validators")
 async def get_validators(status: Optional[str] = None, pretty: bool = False):
     """

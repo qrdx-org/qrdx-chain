@@ -152,13 +152,14 @@ class Runner:
 
     async def __aexit__(self, *exc):
         await self.db.close()
-        for p in (self.path, self.path + "-wal", self.path + "-shm"):
+        for p in (self.path, self.path + "-wal", self.path + "-shm", self.path + ".store",
+                  self.path + ".store-lck"):
             if os.path.exists(p):
                 os.remove(p)
 
     async def _wipe(self) -> None:
         for table in ("account_state", "contract_storage", "contract_code"):
-            await self.db.connection.execute(f"DELETE FROM {table}")
+            self.db.store[table].delete_prefix()
         await self.db.connection.commit()
 
     async def run(self, case: Case) -> Outcome:

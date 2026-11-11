@@ -61,11 +61,9 @@ class Chain:
         c = cls(db, keys, stakes)
         c.path = path
         for k, stake in zip(keys, c.stakes, strict=True):
-            await db.connection.execute(
-                "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
-                "activation_epoch) VALUES (?, ?, ?, ?, 'active', 0)",
-                (_addr(k), k.public_key.to_bytes().hex(), stake, stake),
-            )
+            db.store["validators"].put(
+                address=_addr(k), public_key=k.public_key.to_bytes().hex(), stake=stake,
+                effective_stake=stake, status="active", activation_epoch=0)
         await db.record_genesis_validators(
             [{"address": _addr(k), "public_key": k.public_key.to_bytes().hex(), "stake": st}
              for k, st in zip(keys, c.stakes, strict=True)])

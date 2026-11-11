@@ -19,6 +19,7 @@ from ..chain_spec import ChainSpec, ChainSpecError
 from ..constants import (
     GENESIS_PREFUNDED_ACCOUNTS,
 )
+from ..database_sqlite import _now
 from ..logger import get_logger
 from .genesis import GenesisBlock, GenesisConfig, GenesisCreator, GenesisState
 
@@ -393,54 +394,19 @@ class GenesisInitializer:
                 ("balance",),
             )
 
-            # Store system wallet metadata
-            try:
-                # Try PostgreSQL syntax first
-                try:
-                    await self.db.execute(
-                        """
-                        INSERT INTO system_wallets (
-                            address, name, description, wallet_type,
-                            controller_address, is_burner, category, balance
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                        ON CONFLICT (address) DO NOTHING
-                    """,
-                        address,
-                        name,
-                        wallet_info["description"],
-                        wallet_info["type"],
-                        controller_address,
-                        is_burner,
-                        wallet_info["category"],
-                        str(balance),
-                    )
-                    logger.debug(f"Stored system wallet metadata (PostgreSQL): {name}")
-                except Exception as pg_err:
-                    # Try SQLite syntax
-                    logger.debug(f"PostgreSQL insert failed: {pg_err}, trying SQLite syntax")
-                    await self.db.execute(
-                        """
-                        INSERT OR IGNORE INTO system_wallets (
-                            address, name, description, wallet_type,
-                            controller_address, is_burner, category, balance
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                        address,
-                        name,
-                        wallet_info["description"],
-                        wallet_info["type"],
-                        controller_address,
-                        is_burner,
-                        wallet_info["category"],
-                        str(balance),
-                    )
-                    logger.debug(f"Stored system wallet metadata (SQLite): {name}")
-            except Exception as e:
-                # Log the error but continue - system wallets work via UTXOs even without this table
-                logger.error(f"Failed to store system wallet metadata for {name}: {e}")
-                import traceback
-
-                traceback.print_exc()
+            # Store system wallet metadata (whose controller authorises its spends)
+            self.db.store["system_wallets"].insert(
+                address=address,
+                name=name,
+                description=wallet_info["description"],
+                wallet_type=wallet_info["type"],
+                controller_address=controller_address,
+                is_burner=is_burner,
+                category=wallet_info["category"],
+                balance=str(balance),
+                created_at=_now(),
+                updated_at=_now(),
+            )
 
             logger.debug(f"Initialized system wallet: {name} at {address} = {balance} QRDX")
 
@@ -450,45 +416,19 @@ class GenesisInitializer:
         """Initialize validators from genesis state."""
         logger.info(f"Initializing {len(validators)} genesis validators")
 
+        shown = self.db.store["validators"]
         for v in validators:
-            try:
-                # Try PostgreSQL syntax first
-                try:
-                    await self.db.execute(
-                        """
-                        INSERT INTO validators (
-                            address, public_key, stake, effective_stake,
-                            status, activation_epoch, created_at
-                        ) VALUES ($1, $2, $3, $3, 'active', 0, NOW())
-                        ON CONFLICT (address) DO NOTHING
-                    """,
-                        v["address"],
-                        v["public_key"],
-                        Decimal(v["stake"]),
-                    )
-                    logger.debug(f"Initialized validator (PostgreSQL): {v['address'][:20]}...")
-                except Exception as pg_err:
-                    # Fall back to SQLite syntax.
-                    # SQLite cannot bind Decimal objects, and stake/effective_stake
-                    # are TEXT columns, so the stake must be passed as a string.
-                    logger.debug(f"PostgreSQL insert failed: {pg_err}, trying SQLite syntax")
-                    stake_str = str(Decimal(v["stake"]))
-                    await self.db.execute(
-                        """
-                        INSERT OR IGNORE INTO validators (
-                            address, public_key, stake, effective_stake,
-                            status, activation_epoch, created_at
-                        ) VALUES (?, ?, ?, ?, 'active', 0, datetime('now'))
-                    """,
-                        v["address"],
-                        v["public_key"],
-                        stake_str,
-                        stake_str,
-                    )
-                    logger.debug(f"Initialized validator (SQLite): {v['address'][:20]}...")
-
-            except Exception as e:
-                logger.error(f"Failed to initialize validator {v['address']}: {e}")
+            stake = str(Decimal(v["stake"]))
+            shown.insert(
+                address=v["address"],
+                public_key=v["public_key"],
+                stake=stake,
+                effective_stake=stake,
+                status="active",
+                activation_epoch=0,
+                created_at=_now(),
+                updated_at=_now(),
+            )
 
         # The immutable genesis base the validator reconstruction resets to
         # (DatabaseSQLite.get_genesis_validators) — never the live rows, which deposits top up.

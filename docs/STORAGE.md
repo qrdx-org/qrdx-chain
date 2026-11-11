@@ -80,11 +80,25 @@ not turn the store off.
 | S3 chain | blocks (header by height, by hash through an index; body apart), transactions, chain metadata, the chain index (its votes, offenders and FFG votes) | done |
 | S3b finality | votes (`attestation_votes`), each epoch's flags (`epochs`), offences (`slashing_events`), the exchange's persisted checkpoint, the EVM state checkpoints | done |
 | S4a validator logs | the validator set's inputs (deposits, exits, staking operations, fee income, withdrawals, payouts), its stored epoch states and log roots | done |
-| S4 validators | `validators` (the display copy), stakes, lifecycle, slashing | to do |
+| S4 validators | `validators` (the set at the tip, for display), the system wallets' registry, the validator's own stake records (`validator_stakes`, `stake_deposits`, `stake_withdrawals`) | done |
 | S5a the node's indexes | the transaction index (`tx_index`, `tx_participants`, `tx_index_blocks`) and the trading history (`hist_*`) | done |
 | S5b EVM receipts | `contract_transactions`, `contract_logs`, `contract_metadata` (eth_getTransactionReceipt, eth_getLogs) | done |
-| S5 the node's own | pending transactions, peers, the validator display copy and legacy stake tables | to do |
+| S5 the node's own | the legacy mempool, peers, attestations: none of them held anything (below) | done |
 | S6 | SQLite and aiosqlite removed | to do |
+
+Three SQLite tables held nothing, so nothing of theirs moved:
+
+* **The legacy (UTXO) mempool** (`pending_transactions`, `pending_spent_outputs`). Its insert
+  named columns the table did not have, and the error was swallowed, so no transaction was ever
+  stored. The proposer reads it, so storing transactions now would put legacy transactions into
+  blocks. Its methods answer as the empty table did. Account transactions have their own pools.
+* **`peers`.** Nothing wrote it; the node keeps its peers in memory.
+* **`attestations`.** Nothing wrote it. The explorer's attestation list now reads the votes
+  blocks carried (`attestation_votes`).
+
+The slashing-protection record (qrdx/validator/slashing_protection.py) stays a SQLite file of
+its own, written with a full sync on every signature. It must survive a machine crash, which
+the store's one-second flush does not promise.
 
 The chain index used to count writes to `blocks` with SQLite triggers. The database's block
 writers now tell it (`chain_index.blocks_changed`, `rolled_back`), so a write the index must

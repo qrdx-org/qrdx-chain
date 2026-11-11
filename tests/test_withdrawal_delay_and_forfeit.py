@@ -152,8 +152,8 @@ async def test_an_ejected_validator_claims_its_principal_with_stake_exit(db):
     who = PQPrivateKey.generate().public_key.to_address()
     await db.apply_account_balance_delta(who, Decimal("500000") - STAKE)
     await db.log_validator_deposit(who, "ab" * 100, STAKE, 10)
-    await db.connection.execute(          # what the sweep does: exit it, below the floor
-        "UPDATE validators SET status = 'exiting', exit_epoch = 12 WHERE address = ?", (who,))
+    # what the sweep does: exit it, below the floor
+    db.store["validators"].update((who,), status="exiting", exit_epoch=12)
     await db.connection.commit()
 
     ExchangeStateManager.reset_instance()

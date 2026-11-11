@@ -342,6 +342,85 @@ SPECS: Tuple[Spec, ...] = (
     ),
     Spec("validator_epoch_states", [("epoch", _I), ("checkpoint", _T)], [("state", _T, None)]),
     Spec("validator_log_roots", [("height", _I), ("block_hash", _T)], [("root", _T, None)]),
+    # ── the validator set in force at the tip, for display (written whole by
+    # epoch_state.materialize; consensus reads epoch_state.state_at, never this) ──
+    Spec(
+        "validators",
+        [("address", _T)],
+        [
+            ("public_key", _T, None),
+            ("stake", _T, None),
+            ("effective_stake", _T, None),
+            ("status", _T, "pending"),
+            ("activation_epoch", _I, None),
+            ("exit_epoch", _I, None),
+            ("slashed", _I, 0),
+            ("total_slashed", _T, "0"),
+            ("total_rewards", _T, "0"),
+            ("created_at", _T, None),
+            ("updated_at", _T, None),
+        ],
+    ),
+    # ── the system wallets genesis registered (their controller authorises their spends:
+    # contracts/evm_mempool.py) ──
+    Spec(
+        "system_wallets",
+        [("address", _T)],
+        [
+            ("name", _T, None),
+            ("description", _T, None),
+            ("wallet_type", _T, None),
+            ("controller_address", _T, None),
+            ("is_burner", _I, 0),
+            ("category", _T, None),
+            ("balance", _T, "0"),
+            ("created_at", _T, None),
+            ("updated_at", _T, None),
+        ],
+    ),
+    # ── this node's validator's stake records (validator/stake.py's StakeManager; amounts in
+    # 10⁻⁸ QRDX) ──
+    Spec(
+        "validator_stakes",
+        [("validator_address", _T)],
+        [
+            ("stake", _I, 0),
+            ("effective_stake", _I, 0),
+            ("status", _T, "PENDING"),
+            ("activation_epoch", _I, None),
+            ("exit_epoch", _I, None),
+            ("slashed", _I, 0),
+            ("uptime_score", _R, 1.0),
+            ("validator_index", _I, None),
+            ("created_at", _T, None),
+            ("updated_at", _T, None),
+        ],
+    ),
+    Spec(
+        "stake_deposits",
+        [("id", _I)],
+        [
+            ("validator_address", _T, None),
+            ("amount", _I, 0),
+            ("tx_hash", _T, None),
+            ("block_number", _I, None),
+            ("epoch", _I, None),
+            ("created_at", _T, None),
+        ],
+    ),
+    Spec(
+        "stake_withdrawals",
+        [("id", _I)],
+        [
+            ("validator_address", _T, None),
+            ("amount", _I, 0),
+            ("request_epoch", _I, 0),
+            ("completion_epoch", _I, None),
+            ("status", _T, "PENDING"),
+            ("created_at", _T, None),
+            ("completed_at", _T, None),
+        ],
+    ),
     # ── finality: the votes blocks carried (one a validator a target; the fully signed vote
     # kept for slashing evidence), each epoch's justified and finalized flags, the offences
     # detected (the proofs blocks carry), the exchange's persisted checkpoint ──

@@ -82,6 +82,5 @@ async def test_record_slashing_event_distinct_offences(db):
 
 
 async def _status(db, addr):
-    c = await db.connection.execute(
-        "SELECT status, effective_stake FROM validators WHERE address = ?", (addr,))
-    return await c.fetchone()
+    row = db.store["validators"].get(addr)
+    return None if row is None else (row.status, row.effective_stake)

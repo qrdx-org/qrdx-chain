@@ -979,25 +979,20 @@ async def materialize(db: Any) -> str:
     digest = state_hash(state)
     if _materialized.get(db) == digest:
         return digest
-    conn = db.connection
-    await conn.execute("DELETE FROM validators")
+    shown = db.store["validators"]
+    shown.clear()
     for v in state.values():
-        await conn.execute(
-            "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
-            "activation_epoch, exit_epoch, slashed, total_slashed, total_rewards) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                v.address,
-                v.public_key,
-                str(v.stake),
-                str(v.effective_stake),
-                v.status,
-                v.activation_epoch,
-                v.exit_epoch,
-                1 if v.slashed else 0,
-                str(v.total_slashed),
-                str(v.total_rewards),
-            ),
+        shown.put(
+            address=v.address,
+            public_key=v.public_key,
+            stake=str(v.stake),
+            effective_stake=str(v.effective_stake),
+            status=v.status,
+            activation_epoch=v.activation_epoch,
+            exit_epoch=v.exit_epoch,
+            slashed=1 if v.slashed else 0,
+            total_slashed=str(v.total_slashed),
+            total_rewards=str(v.total_rewards),
         )
     _materialized[db] = digest
     return digest

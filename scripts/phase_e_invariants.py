@@ -33,19 +33,20 @@ LOG_GLOB = "testnet/logs/node*/node.log"
 async def _node_snapshot(path: str) -> dict:
     db = await DatabaseSQLite.create(path)
     try:
-        reg = await db.connection.execute(
-            "SELECT token_address, symbol, total_supply FROM token_registry")
-        registry = {r[0]: {"symbol": r[1], "supply": Decimal(str(r[2]))} for r in await reg.fetchall()}
-        bal = await db.connection.execute(
-            "SELECT token_address, holder_address, balance FROM token_balances")
-        token_bals = [(r[0], r[1], Decimal(str(r[2]))) for r in await bal.fetchall()]
-        acct = await db.connection.execute("SELECT address, balance FROM account_state")
-        account = {r[0]: Decimal(str(r[1])) for r in await acct.fetchall()}
+        registry = {
+            r.token_address: {"symbol": r.symbol, "supply": Decimal(str(r.total_supply))}
+            for r in db.store["token_registry"].scan()
+        }
+        token_bals = [
+            (r.token_address, r.holder_address, Decimal(str(r.balance)))
+            for r in db.store["token_balances"].scan()
+        ]
+        account = {r.address: Decimal(str(r.balance)) for r in db.store["account_state"].scan()}
         token_root = await db.get_token_balances_root()
         return {"registry": registry, "token_bals": token_bals,
                 "account": account, "token_root": token_root}
     finally:
-        await db.connection.close()
+        await db.close()
 
 
 def _check(label: str, ok: bool, detail: str = "") -> bool:

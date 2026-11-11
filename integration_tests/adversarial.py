@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sqlite3
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -149,20 +148,18 @@ class Adversary:
         await asyncio.sleep(seconds)
         return (await self.height(self.urls[0]) - start) / seconds
 
-    def slashing_rows(self, validator: str) -> List[List[tuple]]:
-        """Each node's DOUBLE_SIGN evidence rows for ``validator`` (read-only, WAL-safe)."""
+    async def slashing_rows(self, validator: str) -> List[List[tuple]]:
+        """Each node's DOUBLE_SIGN evidence rows for ``validator``, as (slot, epoch, evidence)."""
         out = []
-        for path in self.db_paths:
-            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
-            try:
-                rows = con.execute(
-                    "SELECT slot, epoch, evidence FROM slashing_events "
-                    "WHERE validator_address = ? AND condition = 'double_sign' ORDER BY slot",
-                    (validator,),
-                ).fetchall()
-            finally:
-                con.close()
-            out.append(rows)
+        for url in self.urls:
+            r = await self.http.get(f"{url}/get_slashing_events", params={"validator": validator})
+            out.append(
+                [
+                    (e["slot"], e["epoch"], e["evidence"])
+                    for e in r.json().get("result") or []
+                    if e["condition"] == "double_sign"
+                ]
+            )
         return out
 
 
@@ -231,20 +228,20 @@ async def equivocation(adv: Adversary) -> AttackResult:
             ],
         )
         await asyncio.sleep(1.0)
-        if any(int(r[0]) in slots for node in adv.slashing_rows(v0) for r in node):
+        if any(int(r[0]) in slots for node in await adv.slashing_rows(v0) for r in node):
             break
     if not sent:
         return AttackResult("equivocation", False, "validator 0 proposed no block to twin")
 
     # Every node holds the evidence: the nodes that saw both blocks record it, and a proposer
     # carries it in a block (a self-validating proof), which every importer records.
-    def evidence() -> List[List[tuple]]:
-        return [[r for r in node if int(r[0]) in slots] for node in adv.slashing_rows(v0)]
+    async def evidence() -> List[List[tuple]]:
+        return [[r for r in node if int(r[0]) in slots] for node in await adv.slashing_rows(v0)]
 
     deadline = time.monotonic() + 180
-    while time.monotonic() < deadline and not all(evidence()):
+    while time.monotonic() < deadline and not all(await evidence()):
         await asyncio.sleep(3)
-    held = evidence()
+    held = await evidence()
     if not any(held):
         return AttackResult(
             "equivocation", False, f"{len(sent)} twin(s) sent, no node recorded a double-sign"
@@ -441,7 +438,7 @@ async def run_adversarial_phase(
             logger.info("%s %s: %s", "✓" if result.passed else "✗", name, result.detail)
             report.results.append(result)
         report.slashings = max(
-            (len(rows) for rows in adv.slashing_rows(validator_wallet["address"])), default=0
+            (len(rows) for rows in await adv.slashing_rows(validator_wallet["address"])), default=0
         )
     return report
 

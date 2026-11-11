@@ -44,11 +44,9 @@ def _tx(priv, on_behalf_of=None, nonce=0, value=10 ** 18):
 
 async def _db_with_system_wallet(wallet_addr, controller_addr):
     db = await DatabaseSQLite.create(db_path=tempfile.mktemp(suffix=".db"))
-    await db.connection.execute(
-        "INSERT INTO system_wallets (address, name, description, wallet_type, "
-        "controller_address, is_burner, category) VALUES (?, 'Treasury', 'test', "
-        "'treasury', ?, 0, 'core')",
-        (wallet_addr, controller_addr))
+    db.store["system_wallets"].put(
+        address=wallet_addr, name="Treasury", description="test", wallet_type="treasury",
+        controller_address=controller_addr, is_burner=0, category="core")
     await db.connection.commit()
     return db
 
@@ -168,10 +166,9 @@ async def test_authorisation_fails_closed_when_the_registry_is_unreadable():
     check that did not run.
     """
     class Broken:
-        class connection:
-            @staticmethod
-            async def execute(*_a, **_k):
-                raise RuntimeError("no such table: system_wallets")
+        @property
+        def store(self):
+            raise RuntimeError("the store is closed")
 
     priv, _pub = generate_keypair()
     raw = "0x" + _tx(priv, on_behalf_of=bytes.fromhex("ab" * 20)).encode().hex()

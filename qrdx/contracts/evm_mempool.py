@@ -146,35 +146,24 @@ async def verify_delegated_spend(
     source = tx.spend_from()
     if authority.may_control(source, signer):
         return True, ""
+    # The registry is a handful of rows: matched by address case-insensitively, or by the
+    # account id of the address genesis created the wallet with (which may be a 0xPQ form whose
+    # account id is what the transaction names).
     try:
-        cur = await db.connection.execute(
-            "SELECT controller_address FROM system_wallets WHERE LOWER(address) = LOWER(?)",
-            (source,),
-        )
-        row = await cur.fetchone()
+        wallets = [(w.address, w.controller_address) for w in db.store["system_wallets"].scan()]
     except Exception as e:
         return False, f"system-wallet registry unreadable ({e})"
+    from ..crypto.account_id import to_account_id
 
+    row = next(((c,) for a, c in wallets if str(a).lower() == str(source).lower()), None)
     if not row:
-        # Also accept the registry's display-address form: system wallets are recorded
-        # under the address genesis created them with, which may be a 0xPQ form whose
-        # account id is what the transaction names.
-        try:
-            from ..crypto.account_id import to_account_id
-
-            cur = await db.connection.execute(
-                "SELECT address, controller_address FROM system_wallets"
-            )
-            row = None
-            for addr, controller in await cur.fetchall():
-                try:
-                    if to_account_id(addr) == source:
-                        row = (controller,)
-                        break
-                except ValueError:
-                    continue
-        except Exception as e:
-            return False, f"system-wallet registry unreadable ({e})"
+        for addr, controller in wallets:
+            try:
+                if to_account_id(addr) == source:
+                    row = (controller,)
+                    break
+            except ValueError:
+                continue
 
     if not row:
         return False, f"{source[:20]} is not a system wallet"

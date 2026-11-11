@@ -418,9 +418,16 @@ _LOCAL = (
     "contract_logs",
     "contract_transactions",
 )
-# The node's own, in its store: the votes, epochs and offences it recorded, its transaction index
-# and trading history.
+# The node's own, in its store: the validator set it displays, its validator's stake records,
+# its EVM receipts, the votes, epochs and offences it recorded, its transaction index and trading
+# history.
 _STORE_LOCAL = (
+    "validators",
+    "validator_stakes",
+    "stake_deposits",
+    "stake_withdrawals",
+    "contract_transactions",
+    "contract_logs",
     "attestation_votes",
     "slashing_events",
     "epochs",
@@ -474,9 +481,7 @@ async def _genesis(db: Any, genesis_file: Optional[str], scratch: str) -> str:
         await initialize_genesis_if_needed(ref, genesis_file=genesis_file, chain_spec=spec)
         want = await ref.get_block_by_id(0)
         metadata = [(r.key, r.value) for r in ref.store["chain_metadata"].scan()]
-        cur = await ref.connection.execute("SELECT * FROM system_wallets ORDER BY address")
-        wallets = [tuple(r) for r in await cur.fetchall()]
-        cols = [d[0] for d in cur.description] if cur.description else []
+        wallets = ref.store["system_wallets"].scan()
         # Block 0's records (the allocations, system wallets and predeployed contracts) are what
         # every rebuild seeds the state from: this network's, never the server's.
         records = ref.store["transactions"].scan_index("by_block", want["hash"])
@@ -492,16 +497,13 @@ async def _genesis(db: Any, genesis_file: Optional[str], scratch: str) -> str:
     # nothing the server recorded (its finality, its passed forks). Its journal floor stays for
     # the step back to the checkpoint (were it false, the step back would be inexact, and the
     # roots would not match); the restore then sets its own.
-    conn = db.connection
     db.store["chain_metadata"].delete_prefix()
     for k, v in metadata:
         db.set_metadata(k, v)
-    await conn.execute("DELETE FROM system_wallets")
-    if wallets:
-        marks = ", ".join("?" * len(cols))
-        await conn.executemany(
-            f"INSERT INTO system_wallets ({', '.join(cols)}) VALUES ({marks})", wallets
-        )
+    registry = db.store["system_wallets"]
+    registry.clear()
+    for wallet in wallets:
+        registry.put(*wallet)
     txs = db.store["transactions"]
     for old in txs.scan_index("by_block", want["hash"]):
         txs.delete(old.tx_hash)

@@ -324,10 +324,9 @@ async def test_a_frozen_master_cannot_spend_from_a_system_wallet():
     path = tempfile.mktemp(suffix=".db")
     db = await DatabaseSQLite.create(db_path=path)
     try:
-        await db.connection.execute(
-            "INSERT INTO system_wallets (address, name, description, wallet_type, "
-            "controller_address, is_burner, category) VALUES (?, 'Dev', 't', 't', ?, 0, 'c')",
-            (C.SYSTEM_WALLET_ADDRESSES["DEVELOPER_FUND"], pub.to_address()))
+        db.store["system_wallets"].put(
+            address=C.SYSTEM_WALLET_ADDRESSES["DEVELOPER_FUND"], name="Dev", description="t",
+            wallet_type="t", controller_address=pub.to_address(), is_burner=0, category="c")
         await db.connection.commit()
         raw = "0x" + PQTransaction(chain_id=C.CHAIN_ID, nonce=0, gas_price=10 ** 9,
                                    gas_limit=500_000, to=bytes.fromhex("cd" * 20), value=1,

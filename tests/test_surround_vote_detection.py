@@ -44,10 +44,9 @@ async def _fresh_db_with_validator(key):
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     db = await DatabaseSQLite.create(path)
-    await db.connection.execute(
-        "INSERT INTO validators (address, public_key, stake, effective_stake, status, "
-        "activation_epoch) VALUES (?, ?, '100000', '100000', 'active', 0)",
-        (key.public_key.to_address(), key.public_key.to_bytes().hex()))
+    db.store["validators"].put(
+        address=key.public_key.to_address(), public_key=key.public_key.to_bytes().hex(),
+        stake="100000", effective_stake="100000", status="active", activation_epoch=0)
     await db.connection.commit()
     return db, path
 
