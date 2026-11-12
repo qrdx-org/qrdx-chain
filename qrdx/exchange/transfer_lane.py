@@ -31,7 +31,7 @@ from __future__ import annotations
 from decimal import Decimal, localcontext
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import undo
+from . import balance_plane, undo
 from .handlers.common import ExchangeExecResult
 from .orderbook import _CTX
 from .tokens import (
@@ -175,6 +175,30 @@ def judge(
         lane = tx.nonce_key()
         if lane not in lanes:
             lanes[lane] = nonces.get(lane, mgr._nonces.get(lane, 0))
+    plane = mgr._plane
+    if (
+        plane is not None
+        and owed is mgr._owed
+        and balance == mgr.available_balance
+        and balance_plane.exchange_context()
+    ):
+        # In place, on the plane's balances and what the block owes (qrdx/exchange/balance_plane.py)
+        judged = plane.judge(
+            [
+                (
+                    tx.nonce_key(),
+                    tx.nonce,
+                    payers[tx.sender],
+                    pr.max_fee_s if type(pr) is Prepared else str(pr.max_fee),
+                )
+                for tx, pr in zip(txs, prepared, strict=True)
+            ],
+            lanes,
+        )
+        if judged is None:
+            return False
+        nonces.update(judged)
+        return True
     held: Dict[str, Optional[str]] = {}
     owing: Dict[str, str] = {}
     for payer in set(payers.values()):
@@ -240,6 +264,8 @@ def run(
     for tx, paid in zip(txs, prepaid, strict=True):
         if paid[0] != payers[tx.sender]:
             return None
+    if mgr._plane is not None and balance_plane.in_place():
+        return _run_on_plane(mgr, txs, prepared, prepaid)
     if mgr._fee_reserve is not None and not _above_floors(mgr, txs, prepared):
         return None
     lanes: Dict[str, int] = {}
@@ -289,7 +315,52 @@ def run(
         avail[a] = Decimal(v)
     mgr._block_fees = Decimal(fees)
 
-    # Each result, as process_transaction records it.
+    return _results(mgr, txs, prepared, outcomes)
+
+
+def _run_on_plane(
+    mgr: Any, txs: Sequence[Any], prepared: Sequence[Prepared], prepaid: Sequence[Any]
+) -> Optional[List[ExchangeExecResult]]:
+    """``run`` in place on the manager's balance plane (qrdx/exchange/balance_plane.py): the fee
+    floors checked there too; None, nothing changed, to have Python run them."""
+    lanes: Dict[str, int] = {}
+    for tx in txs:
+        lane = tx.nonce_key()
+        if lane not in lanes:
+            lanes[lane] = mgr._nonces.get(lane, 0)
+    reserve = mgr._fee_reserve
+    out = mgr._plane.run(
+        [
+            (
+                tx.nonce_key(),
+                tx.nonce,
+                tx.sender,
+                pr.to,
+                pr.amount_s,
+                paid[0],
+                str(paid[1]),
+                pr.fee_s,
+            )
+            for tx, pr, paid in zip(txs, prepared, prepaid, strict=True)
+        ],
+        lanes,
+        str(mgr._block_fees),
+        None if reserve is None else str(reserve),
+    )
+    if out is None:
+        return None
+    outcomes, new_nonces, fees = out
+    for lane, n in new_nonces:
+        if n != lanes[lane]:
+            mgr._nonces[lane] = n
+    mgr._block_fees = Decimal(fees)
+    return _results(mgr, txs, prepared, outcomes)
+
+
+def _results(
+    mgr: Any, txs: Sequence[Any], prepared: Sequence[Prepared], outcomes: Sequence[Any]
+) -> List[ExchangeExecResult]:
+    """Each result, as process_transaction records it."""
     results: List[ExchangeExecResult] = []
     for tx, pr, (ran, found) in zip(txs, prepared, outcomes, strict=True):
         if ran:

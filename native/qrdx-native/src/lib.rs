@@ -22,12 +22,14 @@ use sha2::{Digest, Sha256};
 
 mod book;
 mod canon;
+mod commit;
 pub mod dec;
 mod lane;
 mod lthash;
 pub mod net;
 mod mtree;
 mod order_lane;
+pub mod plane;
 mod router;
 mod smt;
 mod store;
@@ -253,6 +255,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mtree::mt_prove, m)?)?;
     m.add_class::<mtree::MNode>()?;
     m.add_function(wrap_pyfunction!(lthash::lt_mix_entries, m)?)?;
+    m.add_function(wrap_pyfunction!(commit::commit_plain, m)?)?;
     m.add_function(wrap_pyfunction!(dec::dec_eval, m)?)?;
     m.add_class::<book::NativeBook>()?;
     m.add_function(wrap_pyfunction!(book::float_repr, m)?)?;
@@ -260,6 +263,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lane::lane_judge, m)?)?;
     m.add_function(wrap_pyfunction!(lane::lane_run, m)?)?;
     m.add_function(wrap_pyfunction!(order_lane::order_lane_run, m)?)?;
+    m.add_class::<plane::Plane>()?;
+    m.add_class::<plane::PlaneView>()?;
     m.add_function(wrap_pyfunction!(tx::tx_read, m)?)?;
     m.add_function(wrap_pyfunction!(wire::wire_parse, m)?)?;
     m.add_function(wrap_pyfunction!(wire::wire_build, m)?)?;

@@ -714,6 +714,41 @@ Each block's phase line ends with its store commits (`db N`; they were SQLite ro
     the store 24, the roots 20), and ends a median 285 ms into the slot: what remains is each
     node's own work, on an event loop that also admits 2,000 transactions a second.
 
+42. **The block's QRDX balances held natively, plain collections committed natively.**
+    * **The balance plane** (docs/NATIVE.md, "The balance plane"): the exchange's per-block QRDX
+      dicts — available balances, balances as the block began, deltas, fees reserved, what the
+      block owes — are the maps of one native object, which Python reads and writes through
+      views that are the dicts they stand for. The transfer lane judges and runs on them in
+      place (it had converted every value it touched to text and back, each run, about 7 µs a
+      transfer inside the native call alone); the fee floors, the reservations, the pre-loads
+      and the flush's wei amounts are native too, and the order lane reads them directly.
+    * **Plain collections committed together** (`commit_plain`): nonces, shares and allowances
+      — entries of two plain strings — have every changed entry's canonical bytes, digest and
+      tree key made, the accumulator mixed and the proof tree updated in one call. A block of
+      500 transfers changes 500 nonces: about 6 µs an entry in Python.
+    * **Smaller:** the token pre-load read the routing hubs (and the perps' collateral token)
+      for every operation, and set again every QRDX balance the sender pre-load had just set;
+      a balance read packed its key through the generic coercion (3 µs); a receipt read an
+      enum's name three times and called the fill and order recorders for operations that have
+      neither.
+
+    | µs a transfer (500 a block, 2,048 accounts) | Before | After |
+    |---|---:|---:|
+    | Import: pre-loads | 11.0 | 8.0 |
+    | Import: execution (with the exchange root) | 28.5 | 18.5 |
+    | Import: flush | 9.0 | 7.5 |
+    | In all, with admission | 137 | 122 |
+
+    Across emulated machines (2 CPUs a node, 25 ms each way; image with this module):
+
+    | | 1,000 a second | 1,500 | 2,000 |
+    |---|---|---|---|
+    | After 41 | p95 0.51 s | p95 0.72 s; import 105 ms for ~330 operations | 3.54 blocks/s, p50 11.9 s |
+    | After 42 | p95 0.49 s | **p95 0.52 s; import 66 ms for ~373** (execution 26) | 3.39 blocks/s, p50 0.90 s, p95 6.6 s |
+
+    At 2,000 an import of ~494 operations takes 118 ms there: execution 45, the store 22, the
+    roots 21 — the store and the roots now cost what execution does.
+
 ## The block pipeline, measured offline
 
 `scripts/bench/exchange_block.py` times one block's exchange section on a real database.
@@ -837,29 +872,22 @@ batching is the lever that moves it.
 
 In the order they would pay, toward four blocks a second at 2,000–4,000 transfers:
 
-1. **The exchange's state held natively.** After 36–40 an importing validator spends about
-   125 µs of its one thread on each transfer (`scripts/bench/import_block.py`; about 1.8 times
-   that live, beside three other nodes): admission 43, the import 82 (execution 29, the store
-   17, the roots 14, pre-loads 11, the flush 8). What is left is no longer one cost but dozens
-   of 2–6 µs ones, and most are one thing: the exchange's balances, deltas and nonces live in
-   Python dicts of `Decimal`, so the native lane converts each value to text and back, writes
-   an undo record a key, and the pre-load, the flush and the commitments each read or write
-   them again. The step that removes them together, in this order:
-   * **A native balance plane:** a block's available balances and deltas held by the native
-     module, read from the store natively (no row objects, no `Decimal` a holder), changed by
-     the lane in place, flushed to `account_state` natively, with the undo journal's records
-     natively too. The state manager reads and writes it through a mapping, so the Python
-     operations (everything but plain transfers and spot orders) see the same values.
-   * **The nonces and their commitment** the same way: the lane's nonce updates and the
-     commitment entries they feed, without a Python value each.
-   * **Receipts** recorded natively and turned into dicts when read.
-   The Python state stays the reference the native one is held to, as the lanes are now
-   (random blocks run both ways). A second core per node (docs/SECOND_CORE.md) is the
-   alternative for admission and the index.
-2. **What an import costs beside execution.** The rules a block is judged by (since 40 about
-   5 ms a block, most of it the body root: SHA-256 over the section's ~4 MB of text), storing
-   its section (about 11 KB of text an operation) and the roots (the proof tree native since
-   37–38, split across threads since 40) are paid by every validator for every block.
+1. **What is left of the exchange's state in Python.** After 42 an importing validator spends
+   about 68 µs of its one thread on each transfer outside admission (bench): execution 18.5,
+   the store 17, the roots 15, the pre-loads 8, the flush 7.5. In execution and the flush, what
+   remains a transfer is Python objects: the result and receipt each transaction gets (about
+   6 µs: the receipts are what the journal and the transaction index read), the lane's own
+   preparation and payer checks, the nonces written back to their committed dict. Native
+   receipts (made into dicts when read), and the nonces held natively as the balances are, are
+   the next steps there. The token balances are still Python's dicts (the balance plane holds
+   QRDX only). A second core per node (docs/SECOND_CORE.md) is the alternative for admission
+   and the index.
+2. **What an import costs beside execution** — since 42 as much as execution itself. The rules
+   a block is judged by (since 40 about 5 ms a block, most of it the body root: SHA-256 over the
+   section's ~4 MB of text), storing its section (about 11 KB of text an operation; the store's
+   three commits a block, the section's JSON, the transaction index's rows) and the roots (the
+   database's accumulators and proof tree, native since 37–38, split across threads since 40)
+   are paid by every validator for every block.
 3. **The size of what a block stores and hashes.** Binary transactions (30, above) took a third
    off; the rest is the signature itself (3.3 KB) and a key (1.9 KB) in every transaction. A
    key named by its account once the chain has seen it would take the key out, but no registry

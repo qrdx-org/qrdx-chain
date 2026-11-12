@@ -27,6 +27,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..constants import UNBONDING_PERIOD_EPOCHS
+from . import balance_plane
 from .state_manager import ExchangeStateManager
 from .transactions import EXCHANGE_GAS_COSTS, ExchangeOpType, ExchangeTransaction
 
@@ -285,8 +286,7 @@ async def preload_sender_balances(
         for holder in (sender, payer):
             seen.setdefault(holder)
     loaded = await _balances(db, list(seen))
-    for holder, balance in loaded.items():
-        mgr.set_available_balance(holder, balance)
+    mgr.set_available_balances(loaded.items())
     # A governance system_spend debits a system wallet, not its sender: pre-load that wallet's
     # balance too, under the key the execution debits (the wallet's lowercase address).
     for tx in txs or []:
@@ -367,12 +367,17 @@ async def preload_token_balances(
     from .transactions import ExchangeOpType
 
     wanted = set()
+    asset = mgr.canonical_asset  # "QRDX" for native, canonical token addresses
+    hubs = None  # (the routing hubs, read once: nothing here changes them)
     # The exchange actions EVM contracts sent run first (process_exchange_transactions).
     for sender, op, p in _operations(mgr.evm_action_txs() + list(txs or [])):
         if not sender:
             continue
-        asset = mgr.canonical_asset  # "QRDX" for native, canonical token addresses
-        paths = _swap_paths(op, p, asset, mgr.routing_hubs())
+        paths = []
+        if op == ExchangeOpType.SWAP:
+            if hubs is None:
+                hubs = mgr.routing_hubs()
+            paths = _swap_paths(op, p, asset, hubs)
         if paths:
             # A multi-hop swap spends what each hop bought: every token but the last.
             for path in paths:
@@ -479,12 +484,14 @@ async def preload_token_balances(
     native_balances = {h: known[h] for h in native if h in known}
     native_balances.update(await _balances(db, [h for h in native if h not in known]))
     tokens = await _token_balances(db, [(t, h) for h, t in ordered if not is_native_asset(t)])
+    qrdx_loaded = []
     for holder, token in ordered:
         if is_native_asset(token):  # native QRDX: the account balance
-            if holder in native_balances:
-                mgr.set_available_balance(holder, native_balances[holder])
+            if holder in native_balances and holder not in known:  # (known: loaded already)
+                qrdx_loaded.append((holder, native_balances[holder]))
         elif (token, holder) in tokens:
             mgr.set_available_token_balance(holder, token, tokens[(token, holder)])
+    mgr.set_available_balances(qrdx_loaded)
 
 
 async def flush_exchange_balance_deltas(
@@ -507,6 +514,33 @@ async def flush_exchange_balance_deltas(
         # every path that applies them. Written for every block, nothing included (which
         # removes the row): a block replacing an orphan at its height must not inherit its row.
         await db.log_staker_fee_income(mgr._current_block_height, mgr.block_staker_fees())
+    flushed = None
+    if (
+        enforce
+        and mgr._plane is not None
+        and hasattr(db, "apply_account_balance_wei")
+        and balance_plane.exchange_context()
+    ):
+        # (each delta's wei computed natively, in the deltas' order: balance_plane)
+        flushed = mgr._plane.wei(balance_plane.DELTA)
+    if flushed is not None:
+        if not flushed:
+            return
+        applied_all = None
+        try:
+            applied_all = await db.apply_account_balance_wei([(a, w) for a, w, _n in flushed])
+        except ValueError as e:  # an address no account id is made from: one at a time
+            logger.debug("batched balance flush refused, applying one at a time: %s", e)
+        if applied_all is not None:
+            for addr, _wei, negative in flushed:
+                if not applied_all.get(addr) and negative:
+                    logger.error(
+                        "[VALUE-LOST] flush_exchange_balance_deltas: debit of %s on %s "
+                        "found no account_state row",
+                        mgr._balance_deltas.get(addr),
+                        str(addr)[:24],
+                    )
+            return
     deltas = mgr.balance_deltas()
     if not deltas:
         return

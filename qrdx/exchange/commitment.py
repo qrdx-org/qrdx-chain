@@ -43,7 +43,7 @@ import os
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..crypto import lthash, smt
-from ..native import lt_mix_entries_function
+from ..native import commit_plain_function, lt_mix_entries_function
 from .undo import (
     active as _undo_active,
     restore_into as _undo_restore_into,
@@ -129,6 +129,14 @@ def _apply(acc: bytes, removed: "lthash.Accumulator", added: "lthash.Accumulator
         int.from_bytes(removed.digest(), "little") if removed.count else None,
         int.from_bytes(added.digest(), "little") if added.count else None,
     )
+
+
+def _native_tree(tree: Any) -> bool:
+    """Whether a proof tree is the module's (``smt.m_update`` keeps a Python one Python's)."""
+    from .. import native
+
+    module = native.tree_module()
+    return module is not None and isinstance(tree, module.MNode)
 
 
 def _apply_digests(acc: bytes, tag: str, removed: List[bytes], added: List[bytes]) -> bytes:
@@ -379,6 +387,12 @@ class CommittedDict(dict):
             self._tree_on = rebuilt = True
         elif not trees:
             self._tree, self._tree_on = None, False
+        if (
+            self._dirty
+            and self._encode is encode_value
+            and self._commit_plain(trees and not rebuilt)
+        ):
+            return self._acc
         if self._dirty:
             removed: List[bytes] = []
             added: List[bytes] = []
@@ -402,6 +416,48 @@ class CommittedDict(dict):
             if tree_changes and not rebuilt:
                 self._tree = smt.m_update(self._tree, sorted(tree_changes))
         return self._acc
+
+    def _commit_plain(self, update_tree: bool) -> bool:
+        """``commitment``'s changed entries natively (native/qrdx-native/src/commit.rs), for a
+        collection of plain values (``encode_value``): True if done; False — nothing changed —
+        where the module is not here or an entry is not a plain string, and Python commits."""
+        commit = commit_plain_function()
+        tree = self.__dict__.get("_tree")
+        if commit is None or (update_tree and tree is not None and not _native_tree(tree)):
+            return False
+        keys = list(self._dirty)
+        items: List[Tuple[str, Optional[str], Optional[bytes]]] = []
+        digests = self._digests
+        for key in keys:
+            if type(key) is not str:
+                return False
+            if dict.__contains__(self, key):
+                text = encode_value(key, dict.__getitem__(self, key))
+                if type(text) is not str:
+                    return False
+                items.append((key, text, digests.get(key)))
+            else:
+                items.append((key, None, digests.get(key)))
+        out = commit(
+            b"qrdx/exchange/" + self._tag.encode(),
+            self._acc,
+            tree if update_tree else None,
+            update_tree,
+            items,
+        )
+        if out is None:
+            return False
+        acc, new_tree, new = out
+        for key, digest in zip(keys, new, strict=True):
+            if digest is None:
+                digests.pop(key, None)
+            else:
+                digests[key] = digest
+        self._acc = bytes(acc)
+        if update_tree:
+            self._tree = new_tree
+        self._dirty.clear()
+        return True
 
     @property
     def tree(self) -> Optional[smt.MNode]:

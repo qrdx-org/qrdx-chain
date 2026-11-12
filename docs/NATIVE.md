@@ -20,7 +20,9 @@ byte.
 | `smt_update_into(root, changes, version, nodes)`, `SmtNodes` | `smt.Tree.update` | the same over a native node cache, its writes packed for the store (the node's path) |
 | `mt_build`, `mt_update`, `mt_prove`, `MNode` | `smt._py_build`, `_py_update`, `_py_prove`, `smt.MNode` | the exchange's in-memory proof trees, every collection and order book a block touches (`smt.m_*`) |
 | `lt_mix_entries(acc, tag, removed, added)` | `commitment._apply` of each entry's `lthash.entry` | the exchange's accumulators, every collection a block touches (`commitment._apply_digests`) |
-| `lane_judge`, `lane_run` | `section_errors` and `process_transaction` for plain QRDX transfers | a block's runs of plain transfers, judged and run (`qrdx/exchange/transfer_lane.py`); `lane_judge` judges plain spot orders and cancels too |
+| `lane_judge`, `lane_run` | `section_errors` and `process_transaction` for plain QRDX transfers | a block's runs of plain transfers, judged and run (`qrdx/exchange/transfer_lane.py`) where the balances are dicts; `lane_judge` judges plain spot orders and cancels too |
+| `Plane`, `PlaneView` | the exchange's per-block QRDX dicts | the block's balances (`qrdx/exchange/balance_plane.py`): the transfer lane judged and run on them in place, the fee reservations, the pre-loads, the flush's amounts; the order lane reads them |
+| `commit_plain(tag, acc, tree, update_tree, items)` | `CommittedDict.commitment`'s loop over a collection of plain entries | nonces, shares, allowances: every changed entry of such a collection, committed together |
 | `NativeBook` | `orderbook.OrderBook` | every spot pair's book, behind the Python book's interface (`qrdx/exchange/native_book.py`; docs/EXCHANGE_ENGINE.md) |
 | `order_lane_run` | `process_transaction` for plain spot orders (limit and market), cancels and swaps: matching, the pools and the router (`router.rs`), settlement, fees, escrow | a block's runs of them over the native books (`qrdx/exchange/order_lane.py`) |
 | `wire_parse`, `wire_build`, `wire_text` | `wire.py_decode`, `py_encode`, `base64` | exchange transactions' binary form: every block section decoded on import, encoded by its proposer (`qrdx/exchange/wire.py`) |
@@ -122,7 +124,47 @@ a time, about 3.3 µs an entry on one thread; 1,000 entries take 0.5–0.9 ms on
 beyond about eight threads they do not get faster.
 
 Together, a commitment of 1,000 changed entries in a collection of 100,000 went from 33.6 ms
-to 15 ms; the rest is Python encoding each entry, which stays Python's.
+to 15 ms; the rest is Python encoding each entry.
+
+For the collections of plain values (`encode_value`: nonces, shares, allowances — an entry is
+`[key, str(value)]`, two strings JSON writes as they are), that encoding is native too:
+`commit_plain` takes every changed entry (its key, its value's text, the digest held for it)
+and makes each one's canonical bytes, digest and tree key, mixes the accumulator and updates the
+proof tree, in one call and without Python's lock. A key or value that is not such a string
+(printable ASCII with no quote or backslash), a tree that is Python's, and the collection is
+committed by Python's loop. A block of 500 transfers changes 500 nonces: about 6 µs an entry in
+Python, the whole commitment now about 1 ms.
+
+### The balance plane
+
+The exchange keeps per-block dicts of QRDX amounts by address: the available balances loaded
+for the block, each account's balance as the block began, the block's net change to each
+account (flushed to `account_state` after the block, in the order addresses entered it), the
+fees it reserved from each payer, and, while a block is judged, what each payer's transactions
+may cost. Held in Python, the transfer lane converted each value it touched to text and back,
+each run, and the pre-loads, the reservations and the flush went through them a value at a time.
+
+They are the five maps of one native `Plane` (native/qrdx-native/src/plane.rs): a table of
+addresses and a map of values for each. The state manager holds a `PlaneView` of each, which is
+the dict it stands for — the same keys in the same order (insertion order; a key removed and set
+again goes last), a `Decimal` back for what was set, every method Python's code and the undo
+scopes use — so Python's own operations read and write them as before. A value is kept natively
+when it is a `Decimal` whose text the module reads back to the same text (src/dec.rs, the port
+of Python's `Decimal`); anything else is kept as it is, and a native path that meets one hands
+its work to Python. Natively, in place:
+
+* the transfer lane's judgment (against the plane's balances and what the block owes) and its
+  run, the fee floors checked there too; each computes its whole run first and writes nothing
+  when it bails;
+* the fee reservations of a section (`reserve_section_fees`) and the pre-loaded balances
+  (`set_available_balances`);
+* each delta's amount in wei for the flush (`Plane.wei`: `int(Decimal(str(d)) * 10**18)`);
+* the order lane reads the QRDX balances from it, and writes back through the views.
+
+Native paths run only where Python's decimal context is the exchange's (precision 78,
+half-even, as `amm` sets it for the process: the arithmetic they reproduce) and no operation's
+undo scope is open (a block's scope does not record these per-block values). `QRDX_NATIVE_PLANE=0`
+keeps plain dicts.
 
 ### Plain transfers
 
@@ -135,7 +177,8 @@ execution: nonces, available balances, balance deltas, fees). The arithmetic is 
 negative zero or a nonce out of sequence makes the call bail, and Python runs the run. What it
 writes back goes through the same dicts and undo records, new keys in the order Python's would
 have inserted them. Anything else in a block (another token, another operation, an agent's or a
-multisig's signature) is Python's.
+multisig's signature) is Python's. Where the balances are the balance plane's (below), the lane
+judges and runs on them in place (`Plane.judge`, `Plane.run`), with nothing converted.
 
 ### Transactions read whole
 
@@ -222,9 +265,16 @@ past 900. An object `json` cannot serialize raises `TypeError`, as in Python.
   an old root unchanged by later updates, a pickle round trip;
 * the accumulator mix against Python's over random digests, and a malformed accumulator handed
   back;
-* the transfer lane over random blocks (tests/test_transfer_lane.py), run with and without it:
-  the same judgment and refusals, results, fees, nonces, deltas (and the order they entered),
-  available balances and root, and every block taken back out by its undo record;
+* the transfer lane over random blocks (tests/test_transfer_lane.py), run with and without it,
+  on dicts and on the balance plane: the same judgment and refusals, results, fees, nonces,
+  deltas (and the order they entered), available balances and root, and every block taken back
+  out by its undo record;
+* a view of the balance plane against a dict over thousands of random operations (values it
+  keeps natively and others, every method), its reservations and pre-loads against Python's
+  loops, its flush amounts against Python's arithmetic, and inside an operation's undo scope
+  (tests/test_balance_plane.py);
+* the commitment of plain collections against Python's loop over random blocks of changes: the
+  accumulator, every digest and the proof tree (tests/test_exchange_commitment.py);
 * the native book against Python's (tests/test_native_book.py) and the exchange with each
   (tests/test_native_spot_equivalence.py) — docs/EXCHANGE_ENGINE.md;
 * the order lane over random blocks of orders and cancels among what only Python runs
@@ -271,9 +321,8 @@ pip install --no-deps dist/qrdx_native-0.1.0-cp310-abi3-linux_x86_64.whl
 ## What is not native yet
 
 Execution beyond plain transfers, plain spot orders and swaps (liquidity, trigger orders, perps,
-tokens), each entry's encoding for the exchange's commitments, and the database writes still run
-in Python. So do sync between
-peers, fork choice and the validator client. The exchange's state held natively, with the
-database written behind it, is the next candidate and the largest (docs/PERFORMANCE.md, "What
-limits it next"). The Python versions stay as the reference the native ones are tested
-against.
+tokens), each entry's encoding for the exchange's commitments beyond the plain collections, the
+token balances (the QRDX ones are the balance plane's), the receipts and the database writes
+still run in Python. So do sync between peers, fork choice and the validator client
+(docs/PERFORMANCE.md, "What limits it next"). The Python versions stay as the reference the
+native ones are tested against.

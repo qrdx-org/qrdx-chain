@@ -54,12 +54,14 @@ def _tx(op, sender, nonce, params, gas_limit=600_000, gas_price=10 ** 9):
     return t
 
 
-def _setup():
+def _setup(plane=True):
     """An exchange with three pairs — A:USD with two pools (fee tiers 0.3% and 0.05%) holding
     liquidity around the price in several ranges, B:USD with liquidity only above the price,
     C:QRDX with none — funded traders (one with no B balance loaded), referrals, fee tiers and a
-    staking discount."""
+    staking discount. ``plane``: its QRDX balances on the native balance plane (the lane's),
+    else in dicts (Python's reference)."""
     m = ExchangeStateManager()
+    m.use_plane(plane)
     BP.apply_enforcement(m)
     m.begin_block(1, float(T0 + 1))
     for who in TRADERS + [ISSUER]:
@@ -274,7 +276,7 @@ def test_random_blocks_run_as_python_runs_them(seed, monkeypatch):
         monkeypatch.setattr(constants, "PERP_COLLATERAL_TOKEN", "0x" + "55" * 20)
     rng = random.Random(seed)
     block_undo.invalidate()
-    py, pairs, nonces = _setup()
+    py, pairs, nonces = _setup(plane=False)
     nat, _, _ = _setup()
     known = []
     ran = {"native": 0, "fills": 0, "B": 0, "C": 0}
@@ -345,7 +347,7 @@ def _floor_run(seed, monkeypatch, floors=True):
     monkeypatch.setattr(order_lane, "_stretch", counted)
     rng = random.Random(1000 + seed)
     block_undo.invalidate()
-    py, pairs, nonces = _setup()
+    py, pairs, nonces = _setup(plane=False)
     nat, _, _ = _setup()
     known = []
     refused = 0

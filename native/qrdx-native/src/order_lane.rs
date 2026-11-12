@@ -121,13 +121,25 @@ struct Entry {
     avail: Option<Dec>,
 }
 
-/// Python's dicts: ``_balance_deltas`` / ``_available_balances`` (QRDX) and
-/// ``_token_balance_deltas`` / ``_available_token_balances`` (tokens).
+/// Python's dicts: ``_balance_deltas`` / ``_available_balances`` (QRDX: dicts, or views of the
+/// balance plane, src/plane.rs) and ``_token_balance_deltas`` / ``_available_token_balances``
+/// (tokens).
 struct Dicts<'py> {
-    deltas: Bound<'py, PyDict>,
-    avail: Bound<'py, PyDict>,
+    deltas: Bound<'py, PyAny>,
+    avail: Bound<'py, PyAny>,
     token_deltas: Bound<'py, PyDict>,
     token_avail: Bound<'py, PyDict>,
+}
+
+/// A QRDX balance from a dict or a view of the balance plane (None: no entry).
+fn read_qrdx(d: &Bound<'_, PyAny>, holder: &str) -> R<Option<Dec>> {
+    if let Ok(view) = d.downcast::<crate::plane::PlaneView>() {
+        return crate::plane::view_value(view, holder).ok_or(Stop::Python);
+    }
+    match d.downcast::<PyDict>() {
+        Ok(dict) => read(dict, holder),
+        Err(_) => Err(Stop::Python),
+    }
 }
 
 #[derive(Clone)]
@@ -282,8 +294,8 @@ impl Run<'_, '_> {
         }
         let e = match key {
             Key::Qrdx(a) => Entry {
-                delta: read(&self.dicts.deltas, &**a)?,
-                avail: read(&self.dicts.avail, &**a)?,
+                delta: read_qrdx(&self.dicts.deltas, a)?,
+                avail: read_qrdx(&self.dicts.avail, a)?,
             },
             Key::Token(a, t) => Entry {
                 delta: read(&self.dicts.token_deltas, (&**a, &**t))?,
@@ -1541,7 +1553,7 @@ pub fn order_lane_run<'py>(
     pairs: Vec<PairTuple<'py>>,
     frozen: Vec<(String, String)>,
     parents: HashSet<String>,
-    dicts: (Bound<'py, PyDict>, Bound<'py, PyDict>, Bound<'py, PyDict>, Bound<'py, PyDict>),
+    dicts: (Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyDict>, Bound<'py, PyDict>),
     lanes: Bound<'py, PyDict>,
     fee_tokens: Bound<'py, PyDict>,
     owner_info: Bound<'py, PyAny>,

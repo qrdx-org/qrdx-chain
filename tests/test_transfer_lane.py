@@ -22,7 +22,7 @@ pytest.importorskip("qrdx_native")
 from qrdx.crypto.pq.dilithium import PQPrivateKey  # noqa: E402
 from qrdx.exchange import ExchangeOpType, ExchangeTransaction  # noqa: E402
 from qrdx.exchange import block_processor as BP  # noqa: E402
-from qrdx.exchange import block_undo, transfer_lane  # noqa: E402
+from qrdx.exchange import balance_plane, block_undo, transfer_lane  # noqa: E402
 from qrdx.exchange.state_manager import ExchangeStateManager  # noqa: E402
 
 KEYS = [PQPrivateKey.generate() for _ in range(6)]
@@ -93,8 +93,10 @@ def _snapshot(mgr, txs, out, errors):
     }
 
 
-def _fresh():
+def _fresh(plane=False):
     mgr = ExchangeStateManager()
+    mgr.use_plane(plane)
+    assert (mgr._plane is not None) == (plane and balance_plane.enabled())
     BP.apply_enforcement(mgr)
     return mgr
 
@@ -120,7 +122,9 @@ def _run_block(mgr, height, txs, balances, lane, monkeypatch):
 @pytest.mark.parametrize("seed", range(12))
 def test_random_blocks_are_judged_and_run_as_python_does(seed, monkeypatch):
     rng = random.Random(seed)
-    py, native = _fresh(), _fresh()
+    # Python's path on dicts; the native lane on dicts, and on the balance plane
+    # (qrdx/exchange/balance_plane.py) — the lane's own path there, in place.
+    py, native, planar = _fresh(), _fresh(), _fresh(plane=True)
     nonces = {a: 0 for a in ADDRS}
     block_undo.invalidate()
     ran_natively = 0
@@ -128,10 +132,17 @@ def test_random_blocks_are_judged_and_run_as_python_does(seed, monkeypatch):
         txs = _block(rng, nonces, mode=("plain", "mixed", "any")[seed % 3])
         balances = {a: rng.choice(["0", "5", "1000", "1000000.000000000000000001", "3.333"])
                     for a in ADDRS if rng.random() < 0.85}
-        copies = [ExchangeTransaction.from_dict(t.to_dict()) for t in txs]
-        for c, t in zip(copies, txs):
-            c.public_key, c.signature = t.public_key, t.signature
+
+        def copy():
+            out = [ExchangeTransaction.from_dict(t.to_dict()) for t in txs]
+            for c, t in zip(out, txs):
+                c.public_key, c.signature = t.public_key, t.signature
+            return out
+
+        copies, planar_copies = copy(), copy()
         a, _ = _run_block(py, height, txs, balances, False, monkeypatch)
+        c, _ = _run_block(planar, height, planar_copies, balances, True, monkeypatch)
+        assert a == c, f"seed {seed} block {height} (plane): {[k for k in a if a[k] != c[k]]}"
         b, root_before = _run_block(native, height, copies, balances, True, monkeypatch)
         assert a == b, f"seed {seed} block {height}: {[k for k in a if a[k] != b[k]]}"
         ran_natively += sum(1 for p in transfer_lane.prepare_all(copies) if p is not None)

@@ -26,10 +26,10 @@ import contextlib
 import copy
 import logging
 from decimal import ROUND_DOWN, Decimal
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..crypto.account_id import pays_exchange_fees
-from . import undo
+from . import balance_plane, undo
 from .amm import (
     ConcentratedLiquidityPool,
     PoolManager,
@@ -208,6 +208,13 @@ class ExchangeStateManager:
         # block began, and the fees the block reserved from each payer.
         self._start_balances: Dict[str, Decimal] = {}
         self._fees_reserved: Dict[str, Decimal] = {}
+        # While a block is judged, what each payer's transactions in it may cost
+        # (``section_errors``).
+        self._owed: Dict[str, Decimal] = {}
+        # These five held natively where the module is (qrdx/exchange/balance_plane.py): the same
+        # dicts, as views of one native plane the lanes change in place.
+        self._plane: Any = None
+        self.use_plane(balance_plane.enabled())
         # Collateral enforcement gate (set by the node when enforcing): when True,
         # open_position rejects if margin exceeds available balance.
         self.enforce_collateral: bool = False
@@ -336,7 +343,10 @@ class ExchangeStateManager:
         self._block_exchange_txs = []
         self._block_results = []
         self._block_fees = ZERO
-        self._balance_deltas = {}  # Phase E: reset per-block balance deltas
+        if self._plane is None:
+            self._balance_deltas = {}  # Phase E: reset per-block balance deltas
+        else:
+            self._balance_deltas.clear()
         self._token_balance_deltas = {}  # Phase E (spot): reset per-block token deltas
         self.tokens.changed.clear()  # the DB registry mirror is written per block
         self._validator_lifecycle_ops = []  # Phase 3: reset per-block staking deposit/exit ops
@@ -345,7 +355,10 @@ class ExchangeStateManager:
         self._block_journaled = False
         self._block_free_actions = {}  # free trading actions taken in this block, by account
         self._fee_reserve = fee_reserve_at(block_height)
-        self._fees_reserved = {}
+        if self._plane is None:
+            self._fees_reserved = {}
+        else:
+            self._fees_reserved.clear()
 
         # Each order book starts the block when the block first uses it (its per-block rate
         # limits reset, its time set: ``OrderBook.enter_block``). Only a book holding orders that
@@ -682,6 +695,9 @@ class ExchangeStateManager:
         nonces: Dict[str, int] = dict(nonces_after or {})
         votes: Dict[str, int] = {}
         owed: Dict[str, Decimal] = {}
+        if self._plane is not None:
+            owed = self._owed  # (the plane's: the lane judges in place)
+            owed.clear()
         free_in_block: Dict[str, int] = {}
         free_spent: Dict[str, Tuple[int, Decimal]] = {}
         errors: Dict[int, str] = {}
@@ -793,9 +809,19 @@ class ExchangeStateManager:
             if not self.enforce_fees or tx.free_eligible():
                 out.append(None)
                 continue
-            payer, fee = self.fee_payer(tx), tx.max_fee()
+            out.append((self.fee_payer(tx), tx.max_fee()))
+        reserved = [p for p in out if p is not None]
+        if (
+            self._plane is not None
+            and reserved
+            and balance_plane.in_place()
+            and self._plane.reserve(
+                [(payer, str(fee)) for payer, fee in reserved], self._fee_reserve is not None
+            )
+        ):
+            return out  # (all of them, natively: as ``_reserve_fee`` each)
+        for payer, fee in reserved:
             self._reserve_fee(payer, fee)
-            out.append((payer, fee))
         return out
 
     # ── the free trading lane (docs/TOKENOMICS.md) ──
@@ -1533,6 +1559,35 @@ class ExchangeStateManager:
         undo.keep_entry(self._available_balances, address, mutable=False, transient=True)
         self._available_balances[address] = self._start_balances[address] = Decimal(qrdx)
 
+    def set_available_balances(self, items: Iterable[Tuple[str, Decimal]]) -> None:
+        """``set_available_balance`` of each (address, balance), in order."""
+        items = list(items)
+        if self._plane is not None and balance_plane.in_place():
+            self._plane.load(items)
+            return
+        for address, qrdx in items:
+            self.set_available_balance(address, qrdx)
+
+    def use_plane(self, on: bool = True) -> None:
+        """Hold the block's QRDX balances in the native plane (qrdx/exchange/balance_plane.py),
+        or in dicts, keeping what they hold — tests run one exchange each way."""
+        names = (
+            "_available_balances",
+            "_start_balances",
+            "_balance_deltas",
+            "_fees_reserved",
+            "_owed",
+        )
+        held = [list(getattr(self, n).items()) for n in names]
+        plane = balance_plane.make() if on else None
+        maps: Tuple[Any, ...] = (
+            balance_plane.views(plane) if plane is not None else tuple({} for _ in names)
+        )
+        for name, m, items in zip(names, maps, held, strict=True):
+            m.update(items)
+            setattr(self, name, m)
+        self._plane = plane
+
     def available_balance(self, address: str) -> Optional[Decimal]:
         """Pre-loaded available balance, or None if not loaded (check is skipped)."""
         return self._available_balances.get(address)
@@ -1601,7 +1656,7 @@ class ExchangeStateManager:
 
     def balance_deltas(self) -> Dict[str, Decimal]:
         """This block's accumulated per-address balance deltas (QRDX)."""
-        return dict(self._balance_deltas)
+        return self._balance_deltas.copy()  # (a dict, from a dict or the plane's view)
 
     # --- Phase E (spot): token-balance bridge -----------------------------
 

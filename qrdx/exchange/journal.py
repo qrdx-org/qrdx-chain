@@ -48,6 +48,19 @@ _ORDER_OPS = {
 }
 
 
+# The operations whose receipts carry trades (``_record_fills``): no other records any.
+_FILL_OPS = frozenset({"PERP_ORDER", "PERP_MODIFY", "PLACE_ORDER", "MODIFY_ORDER", "SWAP", "BATCH"})
+_OP_NAMES: Dict[Any, str] = {}
+
+
+def _op_name(op: Any) -> str:
+    """``op.name``, remembered (an enum member's ``name`` is a descriptor call each time)."""
+    name = _OP_NAMES.get(op)
+    if name is None:
+        name = _OP_NAMES[op] = op.name
+    return name
+
+
 def _history_enabled() -> bool:
     """The trading history indexer runs (QRDX_TRADING_HISTORY, on by default): otherwise the
     journal keeps no rows for it."""
@@ -100,13 +113,19 @@ class ExchangeJournal:
         when: Dict[str, Any] = {"block_height": int(height), "block_time": float(timestamp)}
         self._history = {"trades": [], "orders": [], "funding": [], "samples": list(samples)}
         history_time = float(timestamp)
+        receipts = self.receipts
+        block_height, block_time = when["block_height"], when["block_time"]
         for tx, result in zip(txs, results, strict=False):
             tx_hash = tx.tx_hash()
             data = jsonable(getattr(result, "data", {}) or {})
-            self.receipts[tx_hash] = {
+            op = _op_name(tx.op_type)
+            if tx_hash in receipts:
+                receipts.move_to_end(tx_hash)  # (a new one goes last as it is set)
+            receipts[tx_hash] = {
                 "tx_hash": tx_hash,
-                **when,
-                "op": tx.op_type.name,
+                "block_height": block_height,
+                "block_time": block_time,
+                "op": op,
                 "sender": tx.sender,
                 "nonce": tx.nonce,
                 "success": bool(result.success),
@@ -116,12 +135,12 @@ class ExchangeJournal:
                 "fee": str(getattr(result, "fee", 0) or 0),  # QRDX, burned
                 "data": data,
             }
-            self.receipts.move_to_end(tx_hash)
-            while len(self.receipts) > self.max_receipts:
-                self.receipts.popitem(last=False)
-            if result.success:
-                self._record_fills(tx.op_type.name, data, when, tx_hash, tx.sender)
-            self._history_orders(tx, result, data, tx_hash)
+            while len(receipts) > self.max_receipts:
+                receipts.popitem(last=False)
+            if result.success and op in _FILL_OPS:
+                self._record_fills(op, data, when, tx_hash, tx.sender)
+            if op in _ORDER_OPS or op == "BATCH":
+                self._history_orders(tx, result, data, tx_hash)
         for ev in tick_events or ():
             ev = jsonable(ev)
             self._history_tick(ev)

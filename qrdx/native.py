@@ -102,6 +102,14 @@ def lt_mix_entries_function() -> Optional[Callable[..., Any]]:
     return _native.lt_mix_entries  # type: ignore[no-any-return]
 
 
+def commit_plain_function() -> Optional[Callable[..., Any]]:
+    """The native commitment of a collection of plain entries' changes
+    (``CommittedDict.commitment``: native/qrdx-native/src/commit.rs), or None."""
+    if _native is None or not hasattr(_native, "commit_plain"):
+        return None
+    return _native.commit_plain  # type: ignore[no-any-return]
+
+
 def smt_entries_function() -> Optional[Callable[..., Any]]:
     """The database tree's entries of marked rows (``state_proofs._changes``), natively: each
     item (key, payload) or None where only Python computes it exactly. None without the

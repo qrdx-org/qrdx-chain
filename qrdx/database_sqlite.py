@@ -595,11 +595,12 @@ class DatabaseSQLite:
             except ValueError:
                 ids[a] = None  # unkeyable: no account can exist for it
         wanted = sorted({i for i in ids.values() if i})
-        # (the balance column alone: read without making each row's tuple)
-        from .store import unpack
+        # (the balance column alone: read without making each row's tuple; the keys packed as
+        # ``Table.key`` packs an address, without coercing each)
+        from .store import pack, unpack
 
         accounts = self.store["account_state"]
-        values = self.store.native.get_many(accounts.id, [accounts.key(i) for i in wanted])
+        values = self.store.native.get_many(accounts.id, [pack((i,)) for i in wanted])
         found = {i: unpack(v)[0] for i, v in zip(wanted, values, strict=True) if v is not None}
         out: Dict[str, Decimal] = {}
         for a, i in ids.items():
@@ -642,13 +643,18 @@ class DatabaseSQLite:
         the commitment, journals and marks them as it writes)."""
         from decimal import Decimal
 
+        return await self.apply_account_balance_wei(
+            [(addr, int(Decimal(str(delta)) * Decimal(10**18))) for addr, delta in deltas]
+        )
+
+    async def apply_account_balance_wei(self, deltas) -> Dict[str, bool]:
+        """``apply_account_balance_deltas`` of each (address, delta in wei — the delta's
+        ``int(Decimal(str(delta)) * 10**18)``), in order: what a caller that holds the wei
+        already (the balance plane: qrdx/exchange/balance_plane.py) hands it."""
         from .crypto.account_id import to_account_id
         from .store import pack, unpack
 
-        steps = []
-        for addr, delta in deltas:
-            wei = int(Decimal(str(delta)) * Decimal(10**18))
-            steps.append((addr, wei, to_account_id(addr) if wei else None))
+        steps = [(addr, wei, to_account_id(addr) if wei else None) for addr, wei in deltas]
         ids = sorted({i for _a, _w, i in steps if i})
         for i in ids:
             for listener in getattr(self, "account_write_listeners", ()):

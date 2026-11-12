@@ -242,3 +242,51 @@ def test_a_transactions_params_json_is_json_dumps_byte_for_byte():
         if rng.random() < 0.05:
             params = rng.choice([[], None, "s", {1: "a"}])
         assert _params_json(params) == json.dumps(params, sort_keys=True, default=str).encode()
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_plain_collections_are_committed_natively_as_python_commits_them(seed, monkeypatch):
+    """A collection of plain values (``encode_value``: nonces, shares, allowances) commits its
+    changed entries in one native call (native/qrdx-native/src/commit.rs): the same accumulator,
+    digests and proof tree as Python's loop, block after block — and Python's loop wherever a
+    key or value is not a plain string."""
+    import random
+
+    from qrdx import native
+    from qrdx.crypto import smt
+
+    if native.commit_plain_function() is None:
+        pytest.skip("no native module")
+    monkeypatch.setattr(C, "trees_on", lambda: True)
+    rng = random.Random(seed)
+    py = C.CommittedDict("t.nonces", C.encode_value, mutable=False)
+    nat = C.CommittedDict("t.nonces", C.encode_value, mutable=False)
+    calls = {"native": 0}
+    real = C.CommittedDict._commit_plain
+
+    def counted(self, update_tree):
+        done = real(self, update_tree)
+        calls["native"] += done
+        return done
+
+    keys = ["0xPQ" + f"{i:064x}" for i in range(40)] + ["k" + str(i) for i in range(5)]
+    for block in range(30):
+        for _ in range(rng.randint(0, 25)):
+            k = rng.random()
+            key = rng.choice(keys)
+            value = rng.choice([rng.randint(0, 10**6), Decimal(rng.randint(0, 999)) / 7, 0])
+            if k < 0.05:
+                value = 'with "quote"'  # (not plain: Python's)
+            if k < 0.15 and key in py:
+                del py[key], nat[key]
+            else:
+                py[key] = nat[key] = value
+        monkeypatch.setattr(C.CommittedDict, "_commit_plain", lambda self, u: False)
+        want = py.commitment()
+        monkeypatch.setattr(C.CommittedDict, "_commit_plain", counted)
+        got = nat.commitment()
+        assert got == want, f"seed {seed} block {block}"
+        assert nat._digests == py._digests
+        assert smt.m_root(nat.tree) == smt.m_root(py.tree)
+        nat.verify()
+    assert calls["native"] > 15, calls

@@ -443,7 +443,7 @@ fn blake2b(data: &[u8], size: usize) -> Vec<u8> {
 }
 
 /// ``hashlib.blake2b(data, digest_size=32, person=persona)`` (unkeyed).
-fn blake2b_personal(data: &[u8], persona: &[u8]) -> Vec<u8> {
+pub(crate) fn blake2b_personal(data: &[u8], persona: &[u8]) -> Vec<u8> {
     let mut core = Blake2bVarCore::new_with_params(&[], persona, 0, 32);
     let mut buffer: Buffer<Blake2bVarCore> = Default::default();
     buffer.digest_blocks(data, |blocks| core.update_blocks(blocks));
