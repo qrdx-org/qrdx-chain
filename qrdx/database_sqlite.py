@@ -1830,13 +1830,22 @@ class DatabaseSQLite:
     ) -> None:
         """Replace a height's indexed transactions. ``rows``: dicts with the tx_index columns;
         ``participants``: ``(account, position, roles)``."""
+        import operator
+
         self._tx_index_cut(height, only=True)
         index = self.store["tx_index"]
         cols = index.spec.value[2:]  # (after tx_hash and block_hash)
         h = int(height)
-        index.put_rows(
-            (h, r["position"], r["tx_hash"], block_hash, *(r.get(c) for c in cols)) for r in rows
-        )
+        every = operator.itemgetter(*cols)  # (a row with every column: most are)
+
+        def row(r: dict) -> tuple:
+            try:
+                values = every(r)
+            except KeyError:
+                values = tuple(r.get(c) for c in cols)
+            return (h, r["position"], r["tx_hash"], block_hash, *values)
+
+        index.put_rows([row(r) for r in rows])
         self.store["tx_participants"].put_rows((a, h, pos, roles) for a, pos, roles in participants)
         self.store["tx_index_blocks"].put(h, block_hash)
         await self.connection.commit()

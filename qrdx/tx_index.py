@@ -32,6 +32,10 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from .crypto.account_id import to_account_id
+from .exchange.journal import _op_name
+from .native import canonical_json
+
 logger = logging.getLogger(__name__)
 
 INDEX_BATCH = 200  # blocks per pass (with no lock to share)
@@ -59,16 +63,35 @@ ACCOUNT_PARAMS = (
 )
 
 
+# (frozen sets of the names above, and of the receipt data a row's detail keeps)
+_ACCOUNT_PARAM_SET = frozenset(ACCOUNT_PARAMS)
+_DETAIL_DATA = frozenset(
+    (
+        "order_id",
+        "token_address",
+        "pool_id",
+        "amount_out",
+        "filled",
+        "position_id",
+        "collection",
+        "token_id",
+        "fee",
+        "memo",
+    )
+)
+
+
 def account_key(address: Any) -> Optional[str]:
     """The key an address's history is filed under: its canonical account id."""
-    if not isinstance(address, str) or not address.strip():
+    if not isinstance(address, str):
         return None
-    from .crypto.account_id import to_account_id
-
+    address = address.strip()
+    if not address:
+        return None
     try:
-        return to_account_id(address.strip())
+        return to_account_id(address)
     except (ValueError, TypeError):
-        return address.strip().lower()
+        return address.lower()
 
 
 def _timestamp(value: Any) -> Optional[int]:
@@ -89,7 +112,8 @@ def _timestamp(value: Any) -> Optional[int]:
 def _detail(value: Dict[str, Any]) -> Optional[str]:
     if not value:
         return None
-    text = json.dumps(value, sort_keys=True, default=str)
+    # (``json.dumps(value, sort_keys=True, default=str)``, natively where the module is)
+    text = canonical_json(value, compact=False, default_str=True).decode("ascii")
     if len(text) > DETAIL_LIMIT:
         text = json.dumps(
             {"truncated": True, **{k: value[k] for k in list(value)[:4]}},
@@ -241,25 +265,14 @@ async def _exchange(db, blk: _BlockIndex, journal) -> None:
         return
     for tx in objects if objects is not None else decode_exchange_txs(section):
         tx_hash = tx.tx_hash()
-        op = tx.op_type.name
+        op = _op_name(tx.op_type)
         p = dict(tx.params or {})
         receipt = journal.receipt(tx_hash) if journal is not None else None
         data = (receipt or {}).get("data") or {}
         summary = _exchange_summary(op, p, data)
         detail = {"nonce": tx.nonce, "params": p}
-        for k in (
-            "order_id",
-            "token_address",
-            "pool_id",
-            "amount_out",
-            "filled",
-            "position_id",
-            "collection",
-            "token_id",
-            "fee",
-            "memo",
-        ):
-            if k in data:
+        for k in data:
+            if k in _DETAIL_DATA:
                 detail[k] = data[k]
         fills = data.get("fills") or []
         if fills:
@@ -278,9 +291,13 @@ async def _exchange(db, blk: _BlockIndex, journal) -> None:
             detail=_detail(detail),
         )
         blk.touch(tx.sender, pos, "sender")
-        for key in ACCOUNT_PARAMS:
-            if isinstance(p.get(key), str) and p[key].startswith(("0x", "0X")):
-                blk.touch(p[key], pos, key)
+        for key, value in p.items():
+            if (
+                key in _ACCOUNT_PARAM_SET
+                and isinstance(value, str)
+                and value.startswith(("0x", "0X"))
+            ):
+                blk.touch(value, pos, key)
         for fill in fills:
             maker = fill.get("maker")
             if maker and account_key(maker) != account_key(tx.sender):
