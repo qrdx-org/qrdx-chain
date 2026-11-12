@@ -307,6 +307,67 @@ async def test_the_tree_update_is_pythons(seed):
     assert py_root is not None
 
 
+@pytest.mark.parametrize("seed", range(6))
+async def test_the_tree_update_into_native_nodes_is_pythons(seed):
+    """``smt_update_into`` over a native node cache (``SmtNodes``, small enough to evict): the
+    same root as Python's tree, version after version, and the new and stale nodes packed
+    exactly as the store keeps them (``pack((nkey,))`` → ``pack((data,))``, ``pack((version,
+    nkey))`` → ``pack(())``)."""
+    from qrdx.crypto import smt
+    from qrdx.store import pack
+
+    rng = random.Random(seed)
+    store: dict = {}
+    py_root = nat_root = None
+    keys = [smt.key_of(bytes([seed, i])) for i in range(60)]
+    if seed % 2:
+        keys = [bytes([0xAB] * 3) + k[3:] for k in keys]
+    nodes = N.SmtNodes(40)  # (fewer than the tree's nodes: some are evicted and loaded again)
+
+    async def load(nkey):
+        return store.get(nkey)
+
+    for version in range(1, 40):
+        changes = {}
+        for _ in range(rng.randint(1, 25)):
+            changes[rng.choice(keys)] = (None if rng.random() < 0.3
+                                         else bytes(rng.randrange(256) for _ in range(rng.randint(0, 40))))
+        changes = sorted(changes.items())
+        tree = smt.Tree(load, version)
+        py_root = await tree.update(py_root, changes)
+        encoded = smt.encode_ref(nat_root)
+        for _ in range(300):
+            out = N.smt_update_into(encoded, changes, version, nodes)
+            if out[0] == "ok":
+                break
+            assert out[1], "missing names no node"
+            nodes.insert_many([(nkey, store[nkey]) for nkey in out[1]])
+        assert out[0] == "ok"
+        nat_root = smt.Ref.decode(out[1])[0]
+        assert nat_root == py_root
+        assert sorted(out[2]) == sorted((pack((k,)), pack((d,))) for k, d in tree.writes.items())
+        assert sorted(out[3]) == sorted((pack((version, k)), pack(())) for k in tree.stale)
+        for k, d in tree.writes.items():
+            assert nodes.get(k) in (d, None)  # (held as written, unless evicted)
+        store.update(tree.writes)
+    assert py_root is not None and len(nodes) <= 40  # (down to capacity after each update)
+
+
+def test_the_native_node_cache_keeps_the_most_recently_used():
+    from qrdx.crypto import smt
+
+    nodes = N.SmtNodes(10)
+    nodes.insert_many([(f"k{i}", bytes([i])) for i in range(25)])
+    assert len(nodes) == 25  # (loads before any update settled: none evicted)
+    out = N.smt_update_into(smt.encode_ref(None), [], 1, nodes)  # (an update settles…)
+    assert out[0] == "ok" and len(nodes) == 9  # (…down to nine tenths of capacity)
+    assert "k24" in nodes and "k0" not in nodes  # (the most recently used kept)
+    assert nodes.get("k16") == b"\x10"  # (k16 used since: kept until the next update)
+    nodes.insert_many([(f"n{i}", b"x") for i in range(30)])  # (past twice capacity: what was
+    assert "k17" not in nodes and "k16" in nodes  # last used before the update goes)
+    assert all(f"n{i}" in nodes for i in range(30))
+
+
 def test_a_bad_root_or_key_is_refused():
     with pytest.raises(ValueError):
         N.smt_update(b"\x09", [], 1, {})

@@ -418,7 +418,10 @@ class P2PModule(RPCModule):
         if self._security.sync_state_manager.is_syncing:
             return {"ok": False, "error": "Node is synchronizing"}
 
-        async with self._block_processing_lock:
+        from ...validator import pipeline as _pipeline
+
+        # (noted while it waits for the lock: a proposer whose parent this is waits for it)
+        async with _pipeline.incoming_block(block_no), self._block_processing_lock:
             phases.mark("lock")
             next_block_id = await self._db.get_next_block_id()
 
@@ -1085,23 +1088,30 @@ class P2PModule(RPCModule):
             if known in self._rebuilding:
                 return {"ok": False, "error": "Block recently seen"}
             self._rebuilding.add(known)
+        from ...validator import pipeline as _pipeline
+
         try:
-            sender_url = self._sender_url()
-            full, why = await self._block_relay.rebuild(
-                block_data, sender_url, sender_node=rpc_caller.get()
-            )
-            if full is None:
-                return {"ok": False, "error": why}
-            reply = await self.submitBlock(full)
-            if not reply.get("ok") and "body_root" in str(reply.get("error", "")):
-                full, why = await self._block_relay.rebuild(block_data, sender_url, whole=True)
-                if full is None:
-                    return {"ok": False, "error": why}
-                reply = await self.submitBlock(full)
-            return reply
+            async with _pipeline.incoming_block(block_data.get("id") or block_data.get("block_no")):
+                return await self._submit_compact(block_data)
         finally:
             if isinstance(known, str):
                 self._rebuilding.discard(known)
+
+    async def _submit_compact(self, block_data: Dict) -> Dict:
+        """``submitCompactBlock`` once the block is known to be new: rebuilt, then submitted."""
+        sender_url = self._sender_url()
+        full, why = await self._block_relay.rebuild(
+            block_data, sender_url, sender_node=rpc_caller.get()
+        )
+        if full is None:
+            return {"ok": False, "error": why}
+        reply = await self.submitBlock(full)
+        if not reply.get("ok") and "body_root" in str(reply.get("error", "")):
+            full, why = await self._block_relay.rebuild(block_data, sender_url, whole=True)
+            if full is None:
+                return {"ok": False, "error": why}
+            reply = await self.submitBlock(full)
+        return reply
 
     @rpc_method
     @peer_only

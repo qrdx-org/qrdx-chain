@@ -726,6 +726,7 @@ class Table:
         self._index_ids = {i: store.native.table_id(spec.index_table(i)) for i in spec.indexes}
         self._n = store.native
         self._nk = len(spec.key)
+        self._affinities = list(spec.key_affinity + spec.value_affinity)
 
     # ── keys and rows ──
 
@@ -848,6 +849,16 @@ class Table:
             if len(values) < len(self.spec.value):
                 values += list(self.spec.defaults[len(values) :])
         self._n.put(self.id, self.key(*key), self._value(values))
+
+    def put_rows(self, rows: Iterable[Sequence[Any]]) -> int:
+        """``put`` each of ``rows`` (every column, in order): packed natively, with ``_coerce``
+        only for a value not already of its column's type. How many."""
+        if self.spec.raw:
+            rows = list(rows)
+            for r in rows:
+                self.put(*r)
+            return len(rows)
+        return int(self._n.put_rows(self.id, self._nk, self._affinities, rows, _coerce))
 
     def insert(self, **columns: Any) -> bool:
         """``put`` unless the key is taken (INSERT OR IGNORE); whether it was written."""

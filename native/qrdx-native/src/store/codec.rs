@@ -65,6 +65,19 @@ fn escaped(out: &mut Vec<u8>, tag: u8, data: &[u8]) {
     out.push(0);
 }
 
+pub(crate) const BYTES_TAG: u8 = BYTES;
+pub(crate) const STRING_TAG: u8 = STRING;
+
+/// One str (``STRING_TAG``) or bytes (``BYTES_TAG``) element, packed onto ``out``.
+pub(crate) fn escaped_into(out: &mut Vec<u8>, tag: u8, data: &[u8]) {
+    escaped(out, tag, data)
+}
+
+/// One non-negative int element, packed onto ``out``.
+pub(crate) fn uint_into(out: &mut Vec<u8>, n: u64) {
+    int_bytes(out, false, &n.to_be_bytes()).expect("eight bytes")
+}
+
 fn int_bytes(out: &mut Vec<u8>, negative: bool, magnitude: &[u8]) -> PyResult<()> {
     let start = magnitude.iter().position(|&b| b != 0).unwrap_or(magnitude.len());
     let m = &magnitude[start..];

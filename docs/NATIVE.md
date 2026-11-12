@@ -17,6 +17,7 @@ byte.
 | `Store`, `store_pack`, `store_unpack` | (no Python path) | the node's store: the ledger, its commitments, the undo journal and the proof tree (docs/STORAGE.md) |
 | `smt_entries(kind, items, columns)` | `state_proofs.identity` and the entry functions | the database proof tree's entries of the rows a block changed (`state_proofs._changes`) |
 | `smt_update(root, changes, version, cache)` | `smt.Tree.update` | the database's proof tree, once a block (`state_proofs.proof_root`) |
+| `smt_update_into(root, changes, version, nodes)`, `SmtNodes` | `smt.Tree.update` | the same over a native node cache, its writes packed for the store (the node's path) |
 | `mt_build`, `mt_update`, `mt_prove`, `MNode` | `smt._py_build`, `_py_update`, `_py_prove`, `smt.MNode` | the exchange's in-memory proof trees, every collection and order book a block touches (`smt.m_*`) |
 | `lt_mix_entries(acc, tag, removed, added)` | `commitment._apply` of each entry's `lthash.entry` | the exchange's accumulators, every collection a block touches (`commitment._apply_digests`) |
 | `lane_judge`, `lane_run` | `section_errors` and `process_transaction` for plain QRDX transfers | a block's runs of plain transfers, judged and run (`qrdx/exchange/transfer_lane.py`); `lane_judge` judges plain spot orders and cancels too |
@@ -48,7 +49,10 @@ that passed is marked with the exact bytes it passed for, so it is not checked a
 Python reached a block's signatures one at a time even on eight threads: `oqs-python` holds the
 lock for its own work around each call. The first native version was no faster either, and the
 reason was in the module itself: PyO3 converted each `bytes` to a vector element by element.
-It now reads the bytes in place.
+It now reads the bytes in place. The peer transport fell into the same trap twice over: every
+transaction it relayed (5 KB) and every block it sent (megabytes) went through a `Vec<u8>`
+argument, until it too read them in place (`bytes_of`, src/net). A Python-facing function takes
+`&[u8]`, `PyBytes` or `PyAny`, never `Vec<u8>`.
 
 ### The store
 
@@ -75,6 +79,12 @@ with the same node encoding, hashes, writes (in Python's dict order, deleted key
 the end) and stale list. A node that is neither among its writes nor in the caller's cache is
 not loaded by it: it names every missing node, the caller reads them in one query, and the
 update runs again.
+
+On the node's path the cache is native too (`SmtNodes`, the most recently used 200,000
+nodes), and `smt_update_into` hands back the new and stale nodes packed as the store keeps them.
+The update had read each node through a Python dict, and Python had packed its ~3,000 writes a
+block one at a time (the bench's state root: 11.9 → 9.0 ms a block). Nodes an update loaded are
+never evicted before it settles.
 
 The exchange keeps a tree per collection and order book in memory, deep-copied with the state
 every block. Each Python update allocated and hashed a node object per level of each changed

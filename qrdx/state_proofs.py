@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .crypto import smt
 from .logger import get_logger
-from .native import smt_update_function
+from .native import smt_nodes_cache, smt_update_function, smt_update_into_function
 
 logger = get_logger(__name__)
 
@@ -73,7 +73,8 @@ TABLES = {
 # (by store)
 _locks: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = weakref.WeakKeyDictionary()
 _versions: "weakref.WeakKeyDictionary[Any, int]" = weakref.WeakKeyDictionary()
-_caches: "weakref.WeakKeyDictionary[Any, OrderedDict]" = weakref.WeakKeyDictionary()
+# (an OrderedDict, or the native module's SmtNodes: qrdx/native.py ``smt_nodes_cache``)
+_caches: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
 
 _KIND_OF = {table: kind for kind, (table, _i, _c) in TABLES.items()}
 
@@ -221,8 +222,23 @@ def _lock(store: Any) -> asyncio.Lock:
 def _loader(store: Any):
     cache = _caches.get(store)
     if cache is None:
-        cache = _caches[store] = OrderedDict()
+        native = smt_nodes_cache(_CACHE_SIZE) if smt_update_into_function() else None
+        cache = _caches[store] = native if native is not None else OrderedDict()
     nodes = store["smt_nodes"]
+    if not isinstance(cache, OrderedDict):  # (held natively)
+
+        async def load_native(nkey: str) -> Optional[bytes]:
+            data = cache.get(nkey)
+            if data is not None:
+                return data  # type: ignore[no-any-return]
+            row = nodes.get(nkey)
+            if row is None:
+                return None
+            data = bytes(row.data)
+            cache.insert_many([(nkey, data)])
+            return data
+
+        return load_native, cache
 
     async def load(nkey: str) -> Optional[bytes]:
         data = cache.get(nkey)
@@ -241,6 +257,41 @@ def _loader(store: Any):
     return load, cache
 
 
+def _load_missing(store: Any, cache: Any, missing: List[str]) -> None:
+    """Read the nodes an update named into ``cache`` (KeyError for any the store lacks)."""
+    nodes = store["smt_nodes"]
+    found = [
+        (str(nkey), bytes(row.data))
+        for nkey, row in zip(missing, nodes.get_many((k,) for k in missing), strict=True)
+        if row is not None
+    ]
+    if len(found) < len(missing):
+        raise KeyError(f"state tree nodes missing (pruned?): {sorted(set(missing))[:3]}")
+    if isinstance(cache, OrderedDict):
+        cache.update(found)
+    else:
+        cache.insert_many(found)
+
+
+def _native_update_into(
+    update: Any,
+    store: Any,
+    cache: Any,
+    root_ref: Optional[smt.Ref],
+    changes: List[smt.Change],
+    version: int,
+) -> Tuple[Optional[smt.Ref], List[Tuple[bytes, bytes]], List[Tuple[bytes, bytes]]]:
+    """``_native_update`` over the native node cache: the new root, and the new and stale nodes
+    as the store keeps them (the cache holds the new nodes already)."""
+    encoded = smt.encode_ref(root_ref)
+    for _ in range(300):
+        out = update(encoded, changes, version, cache)
+        if out[0] == "ok":
+            return smt.Ref.decode(out[1])[0], out[2], out[3]
+        _load_missing(store, cache, list(out[1]))
+    raise RuntimeError("the state tree update did not settle")
+
+
 async def _native_update(
     update: Any,
     store: Any,
@@ -253,19 +304,11 @@ async def _native_update(
     writes, stale nodes and root. The nodes it needs that are not cached are named in one pass,
     loaded together, and the update runs again; at most a pass a level of the tree."""
     encoded = smt.encode_ref(root_ref)
-    nodes = store["smt_nodes"]
     for _ in range(300):
         out = update(encoded, changes, version, cache)
         if out[0] == "ok":
             return smt.Ref.decode(out[1])[0], list(out[2]), list(out[3])
-        missing = list(out[1])
-        found = 0
-        for nkey, row in zip(missing, nodes.get_many((k,) for k in missing), strict=True):
-            if row is not None:
-                cache[str(nkey)] = bytes(row.data)
-                found += 1
-        if found < len(missing):
-            raise KeyError(f"state tree nodes missing (pruned?): {sorted(set(missing))[:3]}")
+        _load_missing(store, cache, list(out[1]))
     raise RuntimeError("the state tree update did not settle")
 
 
@@ -336,18 +379,26 @@ async def proof_root(db: Any, height: int, exchange_root: Optional[bytes] = None
             _versions[store] = version
             load, cache = _loader(store)
             changes = _changes(store, marks)
-            native_update = smt_update_function()
-            if native_update is not None:
-                root_ref, writes, stale = await _native_update(
-                    native_update, store, cache, root_ref, changes, version
+            update_into = smt_update_into_function()
+            if update_into is not None and not isinstance(cache, OrderedDict):
+                root_ref, packed, gone = _native_update_into(
+                    update_into, store, cache, root_ref, changes, version
                 )
+                store["smt_nodes"].put_raw(packed)
+                store["smt_stale"].put_raw(gone)
             else:
-                tree = smt.Tree(load, version)
-                root_ref = await tree.update(root_ref, changes)
-                writes, stale = list(tree.writes.items()), tree.stale
-            store["smt_nodes"].put_raw([(pack((k,)), pack((d,))) for k, d in writes])
-            store["smt_stale"].put_raw([(pack((version, k)), pack(())) for k in stale])
-            cache.update(writes)
+                native_update = smt_update_function()
+                if native_update is not None:
+                    root_ref, writes, stale = await _native_update(
+                        native_update, store, cache, root_ref, changes, version
+                    )
+                else:
+                    tree = smt.Tree(load, version)
+                    root_ref = await tree.update(root_ref, changes)
+                    writes, stale = list(tree.writes.items()), tree.stale
+                store["smt_nodes"].put_raw([(pack((k,)), pack((d,))) for k, d in writes])
+                store["smt_stale"].put_raw([(pack((version, k)), pack(())) for k in stale])
+                cache.update(writes)
             store["smt_meta"].put(1, version, smt.encode_ref(root_ref))
         store["smt_roots"].put(int(height), version, smt.encode_ref(root_ref))
         if int(height) % PRUNE_EVERY == 0:

@@ -244,6 +244,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(canonical_json, m)?)?;
     m.add_function(wrap_pyfunction!(body_root_sha256, m)?)?;
     m.add_function(wrap_pyfunction!(smt::smt_update, m)?)?;
+    m.add_function(wrap_pyfunction!(smt::smt_update_into, m)?)?;
+    m.add_class::<smt::SmtNodes>()?;
     m.add_function(wrap_pyfunction!(smt::smt_entries, m)?)?;
     m.add_function(wrap_pyfunction!(mtree::mt_build, m)?)?;
     m.add_function(wrap_pyfunction!(mtree::mt_update, m)?)?;

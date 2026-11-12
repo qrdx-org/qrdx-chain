@@ -97,6 +97,23 @@ def smt_entries_function() -> Optional[Callable[..., Any]]:
     return _native.smt_entries  # type: ignore[no-any-return]
 
 
+def smt_update_into_function() -> Optional[Callable[..., Any]]:
+    """The native state-proof tree update over a native node cache (``smt_nodes_cache``),
+    returning its writes packed for the store: ``(encoded root, changes, version, nodes) →
+    ("ok", root, [(key, value)] of smt_nodes, [(key, b"")] of smt_stale)`` or
+    ``("missing", [nkey, ...])``; None without the module."""
+    if _native is None or not hasattr(_native, "smt_update_into"):
+        return None
+    return _native.smt_update_into  # type: ignore[no-any-return]
+
+
+def smt_nodes_cache(capacity: int) -> Optional[Any]:
+    """A native cache of state-tree nodes (``SmtNodes``), or None without the module."""
+    if _native is None or not hasattr(_native, "SmtNodes"):
+        return None
+    return _native.SmtNodes(capacity)
+
+
 def smt_update_function() -> Optional[Callable[..., Any]]:
     """The native state-proof tree update (qrdx/crypto/smt.py ``Tree.update``), or None without
     the module: ``(encoded root, changes, version, cache) → ("ok", root, writes, stale)`` or

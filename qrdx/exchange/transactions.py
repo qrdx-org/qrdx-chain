@@ -274,7 +274,7 @@ class ExchangeTransaction:
         memo = self.__dict__.get("_hash_memo")
         if key is not None and memo is not None and memo[0] == key:
             return memo[1]  # type: ignore[no-any-return]
-        raw = self._canonical_bytes()
+        raw = self._canonical_bytes(key)
         h = hashlib.blake2b(raw, digest_size=32).hexdigest()
         if key is not None:
             self.__dict__["_hash_memo"] = (key, h)
@@ -303,8 +303,24 @@ class ExchangeTransaction:
             self.signer,
         )
 
-    def _canonical_bytes(self) -> bytes:
-        """Canonical byte representation for hashing and signing."""
+    _NO_KEY: Any = object()
+
+    def _canonical_bytes(self, key: Any = _NO_KEY) -> bytes:
+        """Canonical byte representation for hashing and signing. Remembered as the hash is,
+        while every field they are made of is as it was (``_fingerprint``, or ``key``, the
+        caller's): they are asked for the signature's check, every "already checked?" and the
+        hash alike."""
+        if key is ExchangeTransaction._NO_KEY:
+            key = self._fingerprint()
+        memo = self.__dict__.get("_bytes_memo")
+        if key is not None and memo is not None and memo[0] == key:
+            return memo[1]  # type: ignore[no-any-return]
+        raw = self._encode_canonical()
+        if key is not None:
+            self.__dict__["_bytes_memo"] = (key, raw)
+        return raw
+
+    def _encode_canonical(self) -> bytes:
         # Deterministic JSON serialization of params
         params_json = _params_json(self.params)
         parts = [

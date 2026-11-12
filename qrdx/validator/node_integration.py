@@ -57,6 +57,9 @@ EXCHANGE_BUILD_SHARE = float(os.environ.get("QRDX_EXCHANGE_BUILD_SHARE", "0.3"))
 # and what must fit the slot is one run of it — the next proposer's import — not a build and an
 # import: the share is of the proposer's whole work, start to the root of what the block leaves.
 DEFERRED_BUILD_SHARE = float(os.environ.get("QRDX_DEFERRED_BUILD_SHARE", "0.5"))
+# The share of its slot a proposer keeps to build in: it waits for a parent being imported until
+# only this much is left (``_await_tip_change``).
+PARENT_WAIT_LEFT = float(os.environ.get("QRDX_PARENT_WAIT_LEFT", "0.3"))
 EXCHANGE_BUILD_MIN = 64
 EXCHANGE_BUILD_MAX = 10_000
 EXCHANGE_BUILD_START = 500
@@ -532,7 +535,11 @@ class ValidatorNode:
                     except Exception:
                         tip_slot = None
                     if tip_slot is not None and int(tip_slot) < current_slot - 1:
-                        await self._await_tip_change(_PROPOSER_PROPAGATION_GRACE_SECONDS)
+                        await self._await_tip_change(
+                            _PROPOSER_PROPAGATION_GRACE_SECONDS,
+                            parent_height=next_block_id,
+                            slot=current_slot,
+                        )
                 phases.mark("grace")
 
                 # Everything from the tip re-check to storing the block runs under the node's
@@ -1399,12 +1406,28 @@ class ValidatorNode:
             return None
         return build_vote(self.wallet, await self._get_current_slot(), prices, deposits, heads)
 
-    async def _await_tip_change(self, at_most: float) -> None:
-        """Return once the chain's tip moves (a block landed), or after ``at_most`` seconds."""
+    async def _await_tip_change(
+        self, at_most: float, parent_height: Optional[int] = None, slot: Optional[int] = None
+    ) -> None:
+        """Return once the chain's tip moves (a block landed), or after ``at_most`` seconds —
+        or, while a block at ``parent_height`` is being imported (it arrived, and waits for the
+        lock or runs: pipeline.incoming), once only ``PARENT_WAIT_LEFT`` of ``slot`` is left.
+        Built on, that block's import builds this slot's block first (pipeline); raced from the
+        grandparent, the two compete and one side rolls back."""
+        from . import pipeline
+
         start = await self.db.get_next_block_id()
         deadline = time.monotonic() + at_most
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.02)
+        while True:
+            if time.monotonic() >= deadline:
+                if (
+                    parent_height is None
+                    or slot is None
+                    or not pipeline.incoming(parent_height)
+                    or await self._slot_left(slot) <= PARENT_WAIT_LEFT
+                ):
+                    return
+            await asyncio.sleep(0.01)
             if await self.db.get_next_block_id() != start:
                 return
 

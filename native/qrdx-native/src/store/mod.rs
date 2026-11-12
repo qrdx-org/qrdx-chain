@@ -893,6 +893,78 @@ impl Store {
         })
     }
 
+    /// Whole rows (every column in order, the first ``nk`` the key), each value as SQLite's
+    /// affinity for its column stores it (``affinities``: "TEXT", "INTEGER", "BLOB" or "REAL").
+    /// A value already of its column's type (or None) is packed here; any other goes through
+    /// ``coerce(value, affinity)``, qrdx/store.py's ``_coerce``, first. ``Table.put`` for each
+    /// row, without its Python per value.
+    fn put_rows(
+        &self,
+        t: usize,
+        nk: usize,
+        affinities: Vec<String>,
+        rows: &Bound<'_, PyAny>,
+        coerce: &Bound<'_, PyAny>,
+    ) -> PyResult<usize> {
+        #[derive(Clone, Copy)]
+        enum Aff {
+            Text,
+            Integer,
+            Blob,
+            Real,
+        }
+        let affs: Vec<Aff> = affinities
+            .iter()
+            .map(|a| match a.as_str() {
+                "TEXT" => Ok(Aff::Text),
+                "INTEGER" => Ok(Aff::Integer),
+                "BLOB" => Ok(Aff::Blob),
+                "REAL" => Ok(Aff::Real),
+                other => Err(PyValueError::new_err(format!("unknown affinity {other}"))),
+            })
+            .collect::<PyResult<_>>()?;
+        if nk == 0 || nk > affs.len() {
+            return Err(PyValueError::new_err("a key of 1 to every column"));
+        }
+        let names: Vec<Bound<'_, pyo3::types::PyString>> = affinities
+            .iter()
+            .map(|a| pyo3::types::PyString::new_bound(rows.py(), a))
+            .collect();
+        let mut packed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for row in rows.iter()? {
+            let row = row?;
+            let n = row.len()?;
+            if n != affs.len() {
+                return Err(PyValueError::new_err(format!(
+                    "a row of {n} values for {} columns",
+                    affs.len()
+                )));
+            }
+            let (mut key, mut value) = (Vec::with_capacity(32), Vec::with_capacity(64));
+            for i in 0..n {
+                let v = row.get_item(i)?;
+                let fits = v.is_none()
+                    || match affs[i] {
+                        Aff::Text => v.is_instance_of::<pyo3::types::PyString>(),
+                        Aff::Integer => v.is_exact_instance_of::<pyo3::types::PyLong>(),
+                        Aff::Blob => v.is_instance_of::<PyBytes>(),
+                        Aff::Real => v.is_exact_instance_of::<pyo3::types::PyFloat>(),
+                    };
+                let v = if fits { v } else { coerce.call1((v, &names[i]))? };
+                codec::pack_one(&v, if i < nk { &mut key } else { &mut value })?;
+            }
+            packed.push((key, value));
+        }
+        let n = packed.len();
+        with!(self, inner, {
+            inner.table(t)?;
+            for (k, v) in packed {
+                inner.write(t, k, Some(v))?;
+            }
+            Ok(n)
+        })
+    }
+
     fn put_many(&self, t: usize, items: &Bound<'_, PyAny>) -> PyResult<()> {
         with!(self, inner, {
             inner.table(t)?;

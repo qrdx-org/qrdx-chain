@@ -1821,14 +1821,12 @@ class DatabaseSQLite:
         self._tx_index_cut(height, only=True)
         index = self.store["tx_index"]
         cols = index.spec.value[2:]  # (after tx_hash and block_hash)
-        for r in rows:
-            index.put(
-                int(height), r["position"], r["tx_hash"], block_hash, *(r.get(c) for c in cols)
-            )
-        parts = self.store["tx_participants"]
-        for a, pos, roles in participants:
-            parts.put(a, int(height), pos, roles)
-        self.store["tx_index_blocks"].put(int(height), block_hash)
+        h = int(height)
+        index.put_rows(
+            (h, r["position"], r["tx_hash"], block_hash, *(r.get(c) for c in cols)) for r in rows
+        )
+        self.store["tx_participants"].put_rows((a, h, pos, roles) for a, pos, roles in participants)
+        self.store["tx_index_blocks"].put(h, block_hash)
         await self.connection.commit()
 
     @staticmethod

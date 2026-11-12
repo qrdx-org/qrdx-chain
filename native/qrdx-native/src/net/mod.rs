@@ -722,6 +722,18 @@ pub struct NetService {
     listen: String,
 }
 
+/// A ``bytes`` (or ``bytearray``) argument's contents, copied once: PyO3 reads a ``Vec<u8>``
+/// argument an element at a time (a transaction's 5 KB, a block's megabytes; docs/NATIVE.md).
+fn bytes_of(v: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(b) = v.downcast::<PyBytes>() {
+        return Ok(b.as_bytes().to_vec());
+    }
+    if let Ok(b) = v.downcast::<pyo3::types::PyByteArray>() {
+        return Ok(b.to_vec());
+    }
+    v.extract::<Vec<u8>>()
+}
+
 #[pymethods]
 impl NetService {
     #[new]
@@ -994,16 +1006,15 @@ impl NetService {
     /// Relay what Python admitted: (hash, raw | None, local, from | None). What a wallet sent
     /// this node (`local`) goes whole to every peer; what a peer sent is announced to the
     /// others. A raw not in the pool must be given.
-    fn relay(
-        &self,
-        py: Python<'_>,
-        items: Vec<(String, Option<Vec<u8>>, bool, Option<String>)>,
-    ) -> PyResult<()> {
+    fn relay(&self, py: Python<'_>, items: &Bound<'_, PyList>) -> PyResult<()> {
         let mut keyed = Vec::with_capacity(items.len());
-        for (hash, raw, local, from) in items {
+        for item in items.iter() {
+            let (hash, raw, local, from): (String, Option<Bound<'_, PyAny>>, bool, Option<String>) =
+                item.extract()?;
             let Some(key) = unhex32(&hash) else {
                 return Err(PyValueError::new_err("a hash is 64 hex characters"));
             };
+            let raw = raw.map(|r| bytes_of(&r)).transpose()?;
             keyed.push((key, raw, local, from));
         }
         let shared = self.shared.clone();
@@ -1056,7 +1067,8 @@ impl NetService {
     /// Send a block Python took (or proposed) to every peer but ``except``: the peers it was
     /// queued to (the rest are sent it over HTTP). Its copies coming back are set aside.
     #[pyo3(signature = (raw, except=None))]
-    fn send_block(&self, raw: Vec<u8>, except: Option<String>) -> PyResult<Vec<String>> {
+    fn send_block(&self, raw: &Bound<'_, PyAny>, except: Option<String>) -> PyResult<Vec<String>> {
+        let raw = bytes_of(raw)?;
         if raw.is_empty() || raw.len() > proto::MAX_BLOCK_BYTES {
             return Err(PyValueError::new_err("a block is 1 byte to 15 MiB"));
         }
@@ -1070,7 +1082,8 @@ impl NetService {
     /// Send votes Python took (or made) to every peer but ``except``: the peers they were
     /// queued to. Copies coming back are set aside.
     #[pyo3(signature = (raws, except=None))]
-    fn send_votes(&self, raws: Vec<Vec<u8>>, except: Option<String>) -> PyResult<Vec<String>> {
+    fn send_votes(&self, raws: &Bound<'_, PyList>, except: Option<String>) -> PyResult<Vec<String>> {
+        let raws: Vec<Vec<u8>> = raws.iter().map(|r| bytes_of(&r)).collect::<PyResult<_>>()?;
         if raws
             .iter()
             .any(|v| v.is_empty() || v.len() > proto::MAX_VOTE_BYTES)
@@ -1123,7 +1136,14 @@ impl NetService {
 
     /// Hold operations to answer peers' requests for a block's (those of a block this node
     /// sends that its pool does not hold): (hash, raw).
-    fn hold(&self, items: Vec<(String, Vec<u8>)>) -> PyResult<()> {
+    fn hold(&self, items: &Bound<'_, PyList>) -> PyResult<()> {
+        let items: Vec<(String, Vec<u8>)> = items
+            .iter()
+            .map(|item| {
+                let (hash, raw): (String, Bound<'_, PyAny>) = item.extract()?;
+                Ok((hash, bytes_of(&raw)?))
+            })
+            .collect::<PyResult<_>>()?;
         let mut memory = self.shared.memory.lock().unwrap();
         for (hash, raw) in items {
             let key = unhex32(&hash).ok_or_else(|| PyValueError::new_err("a hash is 64 hex"))?;

@@ -211,6 +211,41 @@ def judge(
 PROPOSER: Any = None
 
 
+# Blocks being imported now, by height, from the moment they arrive (before they wait for the
+# block-processing lock: qrdx/rpc/modules/p2p.py). A proposer whose parent is among them waits for
+# it — the import builds the proposer's block on it before running it — instead of giving up after
+# the grace and building on the grandparent: a block that competes with its own parent, loses the
+# tie-break on half the network and costs those nodes a rollback.
+_INCOMING: Dict[int, int] = {}
+
+
+class incoming_block:
+    """``async with incoming_block(height):`` — a block at ``height`` is being imported."""
+
+    def __init__(self, height: Any) -> None:
+        try:
+            self.height: Optional[int] = int(height)
+        except (TypeError, ValueError):
+            self.height = None
+
+    async def __aenter__(self) -> "incoming_block":
+        if self.height is not None:
+            _INCOMING[self.height] = _INCOMING.get(self.height, 0) + 1
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        h = self.height
+        if h is not None and h in _INCOMING:
+            _INCOMING[h] -= 1
+            if _INCOMING[h] <= 0:
+                del _INCOMING[h]
+
+
+def incoming(height: int) -> bool:
+    """Whether a block at ``height`` is being imported."""
+    return int(height) in _INCOMING
+
+
 # The highest block a peer sent above this node's tip, with its proposer's signature checked, and
 # when (monotonic): a validator two or more blocks behind the network builds only a fork that loses.
 _AHEAD: List[Tuple[int, float]] = []

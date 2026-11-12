@@ -8,7 +8,13 @@
 //! Nodes come from the update's own writes, then from the caller's cache (``nkey`` → bytes).
 //! One that is in neither is not loaded here: the update stops and names it, the caller loads it
 //! and runs the update again (it is a pure function of the tree, the changes and the version).
+//!
+//! The cache is a Python dict (``smt_update``) or, on the node's path, ``SmtNodes``: the nodes
+//! held here, so a read crosses no Python object, and ``smt_update_into`` hands back the new and
+//! stale nodes already packed as the store keeps them (the node's ~3,000 a block were packed one
+//! at a time in Python).
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use blake2::digest::consts::U32;
@@ -156,8 +162,21 @@ type Change = (Vec<u8>, Option<Vec<u8>>);
 /// What a node read needs: in the writes, in the cache, or missing.
 struct Missing(String);
 
-struct Tree<'a, 'py> {
-    cache: &'a Bound<'py, PyDict>,
+/// Where an update reads the nodes it did not write.
+trait NodeSource {
+    fn with_node<R>(&self, nkey: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R>;
+}
+
+impl<'py> NodeSource for Bound<'py, PyDict> {
+    fn with_node<R>(&self, nkey: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let v = self.get_item(nkey).ok().flatten()?;
+        let b = v.downcast::<PyBytes>().ok()?;
+        Some(f(b.as_bytes()))
+    }
+}
+
+struct Tree<'a, C: NodeSource> {
+    cache: &'a C,
     version: u64,
     /// The writes, as a Python dict keeps them: insertion order, a deleted key re-inserted at
     /// the end.
@@ -168,7 +187,7 @@ struct Tree<'a, 'py> {
     missing: Vec<String>,
 }
 
-impl<'a, 'py> Tree<'a, 'py> {
+impl<'a, C: NodeSource> Tree<'a, C> {
     fn nkey(&self, depth: usize, key: &[u8]) -> String {
         format!("{}:{}:{}", self.version, depth, path_hex(key, depth))
     }
@@ -183,17 +202,11 @@ impl<'a, 'py> Tree<'a, 'py> {
     }
 
     fn node(&self, r: &Ref) -> Result<Node, Missing> {
-        let data: Vec<u8> = match self.index.get(&r.nkey) {
-            Some(&i) => self.writes[i].as_ref().expect("an indexed write").1.clone(),
-            None => match self.cache.get_item(&r.nkey).ok().flatten() {
-                Some(v) => match v.downcast::<PyBytes>() {
-                    Ok(b) => b.as_bytes().to_vec(),
-                    Err(_) => return Err(Missing(r.nkey.clone())),
-                },
-                None => return Err(Missing(r.nkey.clone())),
-            },
+        let decoded = match self.index.get(&r.nkey) {
+            Some(&i) => Node::decode(&self.writes[i].as_ref().expect("an indexed write").1),
+            None => self.cache.with_node(&r.nkey, Node::decode).flatten(),
         };
-        Node::decode(&data).ok_or_else(|| Missing(r.nkey.clone()))
+        decoded.ok_or_else(|| Missing(r.nkey.clone()))
     }
 
     fn node_or_note(&mut self, r: &Ref) -> Result<Node, Missing> {
@@ -343,14 +356,7 @@ pub fn smt_update<'py>(
     cache: &Bound<'py, PyDict>,
 ) -> PyResult<PyObject> {
     let (root, _) = Ref::decode(root, 0).ok_or_else(|| PyValueError::new_err("bad root ref"))?;
-    let mut parsed: Vec<Change> = Vec::with_capacity(changes.len());
-    for item in changes.iter() {
-        let (k, v): (Vec<u8>, Option<Vec<u8>>) = item.extract()?;
-        if k.len() != 32 {
-            return Err(PyValueError::new_err("a key is 32 bytes"));
-        }
-        parsed.push((k, v));
-    }
+    let parsed = parse_changes(changes)?;
     let mut tree = Tree {
         cache,
         version,
@@ -380,6 +386,171 @@ pub fn smt_update<'py>(
                 tree.stale,
             )
                 .into_py(py))
+        }
+    }
+}
+
+/// The state tree's nodes this process holds (qrdx/state_proofs.py), by node key: the most
+/// recently used kept, down to ``capacity`` after each update (``smt_update_into``). Loads
+/// past twice ``capacity`` evict too, but only nodes last used before the latest update
+/// settled: an update's missing nodes, loaded between its passes, stay until it settles.
+#[pyclass(module = "qrdx_native")]
+pub struct SmtNodes {
+    map: HashMap<String, (Vec<u8>, Cell<u64>)>,
+    tick: Cell<u64>,
+    capacity: usize,
+    settled: u64,
+}
+
+impl SmtNodes {
+    fn stamp(&self) -> u64 {
+        let t = self.tick.get() + 1;
+        self.tick.set(t);
+        t
+    }
+
+    fn put(&mut self, nkey: String, data: Vec<u8>) {
+        let t = self.stamp();
+        self.map.insert(nkey, (data, Cell::new(t)));
+    }
+
+    /// Down to nine tenths of the capacity once past ``limit``, the least recently used first,
+    /// evicting none used after ``protect``.
+    fn trim(&mut self, limit: usize, protect: u64) {
+        if self.map.len() <= limit {
+            return;
+        }
+        let keep = self.capacity * 9 / 10;
+        let mut stamps: Vec<u64> =
+            self.map.values().map(|(_, t)| t.get()).filter(|&t| t <= protect).collect();
+        let drop = (self.map.len() - keep).min(stamps.len());
+        if drop == 0 {
+            return;
+        }
+        let (_, &mut cut, _) = stamps.select_nth_unstable(drop - 1);
+        self.map.retain(|_, (_, t)| t.get() > cut);
+    }
+}
+
+impl NodeSource for SmtNodes {
+    fn with_node<R>(&self, nkey: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let (data, t) = self.map.get(nkey)?;
+        t.set(self.stamp());
+        Some(f(data))
+    }
+}
+
+#[pymethods]
+impl SmtNodes {
+    #[new]
+    #[pyo3(signature = (capacity=200_000))]
+    fn new(capacity: usize) -> Self {
+        SmtNodes { map: HashMap::new(), tick: Cell::new(0), capacity: capacity.max(1), settled: 0 }
+    }
+
+    fn __len__(&self) -> usize {
+        self.map.len()
+    }
+
+    fn __contains__(&self, nkey: &str) -> bool {
+        self.map.contains_key(nkey)
+    }
+
+    /// A node's bytes (None if not held).
+    fn get<'py>(&self, py: Python<'py>, nkey: &str) -> Option<Bound<'py, PyBytes>> {
+        self.with_node(nkey, |d| PyBytes::new_bound(py, d))
+    }
+
+    /// Hold nodes: ``[(nkey, bytes)]``.
+    fn insert_many(&mut self, items: &Bound<'_, PyList>) -> PyResult<()> {
+        for item in items.iter() {
+            let (k, v): (String, Bound<'_, PyBytes>) = item.extract()?;
+            self.put(k, v.as_bytes().to_vec());
+        }
+        let (limit, protect) = (2 * self.capacity, self.settled);
+        self.trim(limit, protect);
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+}
+
+fn parse_changes(changes: &Bound<'_, PyList>) -> PyResult<Vec<Change>> {
+    let mut parsed: Vec<Change> = Vec::with_capacity(changes.len());
+    for item in changes.iter() {
+        let (k, v): (Bound<'_, PyBytes>, Option<Bound<'_, PyBytes>>) = item.extract()?;
+        let k = k.as_bytes();
+        if k.len() != 32 {
+            return Err(PyValueError::new_err("a key is 32 bytes"));
+        }
+        parsed.push((k.to_vec(), v.map(|v| v.as_bytes().to_vec())));
+    }
+    Ok(parsed)
+}
+
+/// ``smt_update`` over the nodes ``nodes`` holds, writing the new ones to it. Returns
+/// ``("ok", root as encode_ref writes it, [(store key, store value)] of the new nodes,
+/// [(store key, b"")] of the stale ones)`` — as ``smt_nodes`` (``(nkey,)`` → ``(data,)``) and
+/// ``smt_stale`` (``(version, nkey)`` → ``()``) keep them — or ``("missing", [nkey, ...])``.
+#[pyfunction]
+pub fn smt_update_into<'py>(
+    py: Python<'py>,
+    root: &[u8],
+    changes: &Bound<'py, PyList>,
+    version: u64,
+    nodes: &Bound<'py, SmtNodes>,
+) -> PyResult<PyObject> {
+    use crate::store::codec::{escaped_into, uint_into, BYTES_TAG, STRING_TAG};
+
+    let (root, _) = Ref::decode(root, 0).ok_or_else(|| PyValueError::new_err("bad root ref"))?;
+    let parsed = parse_changes(changes)?;
+    let mut held = nodes.borrow_mut();
+    let (outcome, writes, stale, missing) = {
+        let mut tree = Tree {
+            cache: &*held,
+            version,
+            writes: Vec::new(),
+            index: HashMap::new(),
+            stale: Vec::new(),
+            missing: Vec::new(),
+        };
+        let outcome = tree.update(root, &parsed, 0);
+        (outcome, tree.writes, tree.stale, tree.missing)
+    };
+    match outcome {
+        Err(_) => {
+            let mut missing = missing;
+            missing.sort();
+            missing.dedup();
+            Ok(("missing", missing).into_py(py))
+        }
+        Ok(new_root) => {
+            let mut encoded = Vec::new();
+            encode_ref(&new_root, &mut encoded);
+            let packed = PyList::empty_bound(py);
+            for (k, v) in writes.into_iter().flatten() {
+                let mut key = Vec::with_capacity(k.len() + 2);
+                escaped_into(&mut key, STRING_TAG, k.as_bytes());
+                let mut value = Vec::with_capacity(v.len() + 8);
+                escaped_into(&mut value, BYTES_TAG, &v);
+                packed.append((PyBytes::new_bound(py, &key), PyBytes::new_bound(py, &value)))?;
+                held.put(k, v);
+            }
+            let (capacity, now) = (held.capacity, held.tick.get());
+            held.trim(capacity, now);
+            held.settled = held.tick.get();
+            let gone = PyList::empty_bound(py);
+            let mut prefix = Vec::with_capacity(9);
+            uint_into(&mut prefix, version);
+            let nothing = PyBytes::new_bound(py, b"");
+            for k in stale {
+                let mut key = prefix.clone();
+                escaped_into(&mut key, STRING_TAG, k.as_bytes());
+                gone.append((PyBytes::new_bound(py, &key), nothing.clone()))?;
+            }
+            Ok(("ok", PyBytes::new_bound(py, &encoded), packed, gone).into_py(py))
         }
     }
 }

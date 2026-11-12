@@ -534,6 +534,34 @@ Each block's phase line ends with its store commits (`db N`; they were SQLite ro
     seconds, the collections per generation. Its proposal lines say when the slot loop woke and
     how long it waited for an in-flight parent (`grace`).
 
+37. **What 2,000 a second still costs a validator.** Profiled at 1,500 a second, a validator's
+    loop was active about two thirds of the time: importing blocks 35%, admitting transactions
+    19%, building its own blocks 17%, the transaction index 10%. At 2,000 a second each
+    validator imports 2.7 blocks a second (~140 ms each) and builds 1.3, and a node that falls a
+    little behind queues blocks on the block lock. Its next proposer then raced the queued block
+    from the grandparent, the two competed at one height, and the lowest-hash tie-break rolled
+    back half the network. What changed:
+    * **A proposer waits for a parent being imported** (`pipeline.incoming_block`). A block is
+      noted from the moment it arrives, before it waits for the lock. A proposer whose parent is
+      noted keeps waiting past the grace until only 30% of its slot is left
+      (`QRDX_PARENT_WAIT_LEFT`), and the import builds its block on that parent first (32).
+    * **The proof tree's nodes are cached natively** and its writes come back packed (NATIVE.md).
+    * **The transport reads bytes in place** (NATIVE.md): its relay was 14% of admission.
+    * **A transaction's canonical bytes are remembered** with its hash, while every field they
+      are made of is unchanged: the signature's check, each "already checked?" and the hash had
+      each serialized them again.
+    * **The transaction index writes its rows natively** (`Table.put_rows`: packed in Rust,
+      `_coerce` only for a value not already of its column's type, the same bytes as `put`).
+
+    | 4 nodes, one host, 2,048 accounts | Before (after 36) | After |
+    |---|---:|---:|
+    | 1,500 a second: blocks a second | 3.74–3.89 | 3.79 |
+    | 1,500 a second: slots with a proposal; reorgs | 214 of 224; 6 | 160 of 163; 0 |
+    | 2,000 a second: blocks a second (executed) | 2.87–3.59 (1,871–1,971) | 3.63 (1,899) |
+    | 2,000 a second: reorgs in 40 s | 16–24 | 7 |
+
+    2,000 a second still builds a backlog (latency p50 ~15 s).
+
 ## The block pipeline, measured offline
 
 `scripts/bench/exchange_block.py` times one block's exchange section on a real database.

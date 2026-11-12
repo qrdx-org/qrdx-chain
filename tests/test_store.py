@@ -361,3 +361,33 @@ async def test_a_sqlite_database_from_before_the_store_is_refused(tmp_path):
                                            "system_wallets"):
         await DatabaseSQLite.create(path)
     assert sorted(os.listdir(tmp_path)) == ["old.db"]   # (nothing opened, nothing written)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_rows_put_together_are_rows_put_one_by_one(tmp_path, seed):
+    """``put_rows`` packs natively and calls ``_coerce`` only for a value not already of its
+    column's type: the same bytes as ``put``, for values of every type in columns of every
+    affinity."""
+    import datetime
+    from decimal import Decimal
+
+    rng = random.Random(seed)
+    spec = Spec("t", [("k", "TEXT"), ("n", "INTEGER")],
+                [("a", "TEXT", None), ("b", "INTEGER", None), ("c", "BLOB", None),
+                 ("d", "REAL", None)])
+    kinds = [None, 0, -7, 2**70, True, 1.5, 3.0, float("inf"), "12", " 5 ", "1e3", "x", "",
+             Decimal("2.50"), Decimal("4"), b"\x00raw", bytearray(b"ba"),
+             datetime.datetime(2026, 1, 2, 3, 4, 5), datetime.date(2026, 1, 2)]
+    rows = [(f"key{i}", i, *(rng.choice(kinds) for _ in range(4))) for i in range(300)]
+    one, many = Store(str(tmp_path / "one"), [spec]), Store(str(tmp_path / "many"), [spec])
+    try:
+        for r in rows:
+            one["t"].put(*r)
+        assert many["t"].put_rows(iter(rows)) == len(rows)
+        t1, t2 = one["t"], many["t"]
+        assert one.native.scan(t1.id) == many.native.scan(t2.id)
+        with pytest.raises(ValueError):
+            t2.put_rows([("short", 1)])
+    finally:
+        one.close()
+        many.close()

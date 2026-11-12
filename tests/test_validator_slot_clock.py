@@ -88,3 +88,60 @@ async def test_sub_second_slots_keep_time(monkeypatch):
     await node._sleep_until(41)
     await node._sleep_until(41, 1 / 3)
     assert abs(slept[0] - 0.15) < 0.03 and abs(slept[1] - (0.15 + 0.25 / 3)) < 0.03
+
+
+class _Tip:
+    """A database whose next height changes when told to."""
+
+    def __init__(self, height):
+        self.height = height
+
+    async def get_next_block_id(self):
+        return self.height
+
+
+async def test_a_proposer_waits_for_a_parent_being_imported_past_the_grace():
+    """The grace (a short wait for the previous slot's block) ends early while nothing is coming;
+    while a block at the parent's height is being imported it goes on — the import builds this
+    slot's block on it — until only PARENT_WAIT_LEFT of the slot is left."""
+    import asyncio
+
+    from qrdx.validator import pipeline
+
+    d = NI.SLOT_DURATION_SECONDS
+    node = _node(time.time() - 7 * d)  # (slot 7 has just begun)
+    node.db = _Tip(10)
+    started = time.monotonic()
+    await node._await_tip_change(0.02, parent_height=10, slot=7)  # (nothing incoming)
+    assert time.monotonic() - started < 0.1
+
+    async with pipeline.incoming_block(10):
+        assert pipeline.incoming(10) and not pipeline.incoming(11)
+        started = time.monotonic()
+
+        async def lands():
+            await asyncio.sleep(0.05)
+            node.db.height = 11
+
+        landing = asyncio.ensure_future(lands())
+        await node._await_tip_change(0.01, parent_height=10, slot=7)
+        assert 0.04 <= time.monotonic() - started < 0.04 + d  # (past the grace: until it landed)
+        await landing
+    assert not pipeline.incoming(10)
+
+    node.db = _Tip(10)
+    node._genesis_ts = time.time() - 7 * d - (1 - NI.PARENT_WAIT_LEFT) * d  # (too little left)
+    async with pipeline.incoming_block(10):
+        started = time.monotonic()
+        await node._await_tip_change(0.01, parent_height=10, slot=7)
+        assert time.monotonic() - started < 0.05
+
+
+async def test_the_registry_counts_each_copy_of_a_block():
+    from qrdx.validator import pipeline
+
+    async with pipeline.incoming_block("12"), pipeline.incoming_block(12):
+        assert pipeline.incoming(12)
+    assert not pipeline.incoming(12)
+    async with pipeline.incoming_block(None):  # (a block without a height: nothing noted)
+        pass
