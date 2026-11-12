@@ -469,6 +469,10 @@ class ValidatorNode:
                 iteration_started = time.perf_counter()
                 last_slot = current_slot
                 current_epoch = current_slot // SLOTS_PER_EPOCH
+                # (what the slot's handling spends before it builds, for the proposal's log line:
+                # how late the loop woke, the set and rank, the wait for an in-flight parent)
+                phases = Phases()
+                woke_at = await self._into_slot(current_slot)
 
                 logger.debug(
                     f"📍 Checking slot {current_slot} (epoch {current_epoch}) for block proposal..."
@@ -494,8 +498,10 @@ class ValidatorNode:
                 # for this height has landed — so a slow/offline primary no longer leaves
                 # the slot empty. Eligibility is re-checked identically in propose_block +
                 # on import (deterministic top-K for the slot).
+                phases.mark("prep")
                 await self._refresh_validator_set(current_slot)
                 rank = await self.manager.proposer_rank(current_slot)
+                phases.mark("rank")
                 if rank is None:
                     await self._sleep_until(current_slot + 1)
                     continue
@@ -527,6 +533,7 @@ class ValidatorNode:
                         tip_slot = None
                     if tip_slot is not None and int(tip_slot) < current_slot - 1:
                         await self._await_tip_change(_PROPOSER_PROPAGATION_GRACE_SECONDS)
+                phases.mark("grace")
 
                 # Everything from the tip re-check to storing the block runs under the node's
                 # block-processing lock — the one every import path and the reorg rebuild
@@ -537,7 +544,7 @@ class ValidatorNode:
                 # of a replay, out of order. The block goes to peers as soon as it is signed,
                 # while it is stored here: peers' import overlaps this node's writes.
                 _build_started = time.perf_counter()
-                phases = Phases()
+                self._woke_at = woke_at
                 broadcast: Optional[asyncio.Task] = None
                 async with self._production_lock():
                     phases.mark("lock")
@@ -1939,6 +1946,9 @@ class ValidatorNode:
         if genesis is not None and sent_wall is not None:
             offset = sent_wall - genesis - current_slot * SLOT_DURATION_SECONDS
             into = f", sent +{1000 * offset:.0f} ms into its slot"
+        woke = self.__dict__.pop("_woke_at", None)
+        if woke is not None and "parent" not in str(phases):
+            into += f", the slot loop woke +{1000 * woke:.0f} ms into it"
         logger.info(
             f"📦 Proposed block #{next_height} at slot {current_slot}: {block.hash[:16]}... "
             f"({len(exchange_txs)} ops, {1000 * (sent_at - locked_at):.0f} ms to send, "
@@ -2135,6 +2145,27 @@ class ValidatorNode:
                         logger.info(f"⏳ Loop held {1000 * stale:.0f} ms so far, in: {where}")
 
         threading.Thread(target=watch, name="loop-lag-watchdog", daemon=True).start()
+        # The cyclic garbage collector's pauses (each collection of 20 ms or more): they stop
+        # the process wherever it allocates.
+        import gc
+
+        gc_started: List[float] = []
+        gc_slow: List[Tuple[int, float, int]] = []
+        gc_totals = [[0, 0.0] for _ in range(3)]  # per generation: collections, seconds
+        totals_since = time.perf_counter()
+
+        def on_gc(phase: str, info: Dict[str, Any]) -> None:
+            if phase == "start":
+                gc_started[:] = [time.perf_counter()]
+            elif gc_started:
+                spent = time.perf_counter() - gc_started.pop()
+                generation = int(info["generation"])
+                gc_totals[generation][0] += 1
+                gc_totals[generation][1] += spent
+                if spent >= 0.02:
+                    gc_slow.append((generation, spent, int(info["collected"])))
+
+        gc.callbacks.append(on_gc)
         while self._running:
             asked = time.perf_counter()
             beat[0] = asked
@@ -2142,6 +2173,23 @@ class ValidatorNode:
             late = time.perf_counter() - asked - tick
             if late >= report:
                 logger.info(f"⏳ Event loop held {1000 * late:.0f} ms")
+            while gc_slow:
+                generation, spent, collected = gc_slow.pop(0)
+                logger.info(
+                    f"🗑  Garbage collection (generation {generation}): {1000 * spent:.0f} ms, "
+                    f"{collected} collected"
+                )
+            if time.perf_counter() - totals_since >= 10.0:
+                logger.info(
+                    "🗑  Garbage collection in the last %.0f s: %s",
+                    time.perf_counter() - totals_since,
+                    ", ".join(
+                        f"generation {g} {n} × = {1000 * t:.0f} ms"
+                        for g, (n, t) in enumerate(gc_totals)
+                    ),
+                )
+                gc_totals[:] = [[0, 0.0] for _ in range(3)]
+                totals_since = time.perf_counter()
 
     def _follow_broadcast(self, broadcast: "asyncio.Future", height: Optional[int]) -> None:
         """Log a block's broadcast when it finishes (kept referenced until then). ``height`` is
@@ -2181,6 +2229,13 @@ class ValidatorNode:
         from . import pipeline
 
         return 0.05 if pipeline.enabled() else 0.5
+
+    async def _into_slot(self, slot: int) -> Optional[float]:
+        """Seconds since ``slot`` began (None before genesis is known)."""
+        genesis = await self._genesis_timestamp()
+        if genesis is None:
+            return None
+        return datetime.now(timezone.utc).timestamp() - genesis - slot * SLOT_DURATION_SECONDS
 
     async def _slot_left(self, slot: int) -> float:
         """The share of ``slot`` still to come (0 once it has passed)."""

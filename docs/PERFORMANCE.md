@@ -507,6 +507,33 @@ The fourth round, consensus changes for the regenesis (2026-11-05):
 
 Each block's phase line ends with its store commits (`db N`; they were SQLite round trips).
 
+36. **The garbage collector stopped every validator for a slot every few seconds**
+    (qrdx/node/gc_policy.py). Profiled live at 1,500 transfers a second, each validator's event
+    loop was busy about two thirds of the time, not saturated. But phases that take 15–60 ms
+    sometimes took 200–400 ms ("sign 348", "run 361"), anywhere. CPython's full collections ran
+    every 2–3 seconds on each validator, 200–335 ms each: about 5 of every 55 seconds, one slot
+    at a time. They freed almost nothing (34 of them found 1,161 objects in all, most none): a
+    node's garbage is freed by reference counting. Once the node has started, what is alive is
+    now frozen, full collections no longer run automatically, and one runs every
+    `QRDX_GC_FULL_SECONDS` (10 minutes) for the few cycles that do become garbage. Young
+    collections are unchanged; under load they take a few milliseconds in ten seconds.
+    `QRDX_GC_POLICY=0` keeps CPython's defaults.
+
+    | 4 nodes, one host, 2,048 accounts | Before | After |
+    |---|---:|---:|
+    | 1,500 a second: blocks a second | 2.75–3.12 | 3.74–3.89 |
+    | 1,500 a second: latency p50 / p95 | 3–9 s / 29–46 s | 0.5–0.6 s / 1.7 s |
+    | 1,500 a second: slots with a proposal | 171–175 of 224 | 214 of 224 |
+    | 1,500 a second: proposal sent into its slot (median) | 151–160 ms | 37 ms |
+    | 1,500 a second: reorgs in 55 s | 22–29 | 6 |
+    | 2,000 a second: blocks a second (executed) | 2.75 (1,844) | 3.05–3.59 (1,842–1,909) |
+
+    1,000 a second is unchanged (4.0 blocks a second). 2,000 still falls behind.
+
+    With `QRDX_LOOP_LAG_LOG=1` a node also logs each collection of 20 ms or more and, every ten
+    seconds, the collections per generation. Its proposal lines say when the slot loop woke and
+    how long it waited for an in-flight parent (`grace`).
+
 ## The block pipeline, measured offline
 
 `scripts/bench/exchange_block.py` times one block's exchange section on a real database.

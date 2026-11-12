@@ -1128,6 +1128,13 @@ async def startup():
     # Initialize Kademlia DHT subsystem (non-blocking, non-fatal)
     await _discovery._init_dht()
 
+    # The collector's policy (qrdx/node/gc_policy.py): what is alive now is frozen, and full
+    # collections run on a timer instead of stopping the node every few seconds under load.
+    from qrdx.node import gc_policy
+
+    if gc_policy.install():
+        app.state.gc_task = asyncio.create_task(gc_policy.run())
+
     logger.info(f"Denaro node server started on http://{DENARO_NODE_HOST}:{DENARO_NODE_PORT}")
     logger.info("Application startup complete.")
 
