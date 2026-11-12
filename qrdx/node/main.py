@@ -692,6 +692,7 @@ async def startup():
                     validator_wallet_path,
                     validator_password,
                     broadcast_callback=_peers.propagate,  # Pass propagate function for block broadcasting
+                    send_now=_peers.send_block_now,
                 )
 
                 if validator_node:

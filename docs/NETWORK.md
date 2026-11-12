@@ -99,7 +99,10 @@ Every count and length is checked against what the frame holds before anything i
 
 * **A block** goes in its compact form (its exchange operations named by hash,
   docs/PERFORMANCE.md) to every peer on the transport, and over HTTP to the peers that are not
-  (`peers.propagate`). A peer passes a block on only once it has taken it, as over HTTP.
+  (`peers.propagate`). A peer passes a block on only once it has taken it, as over HTTP. A block
+  its proposer signs goes on the transport at once, synchronously (`peers.send_block_now`):
+  the proposer runs it next without pausing, and a send left to a task waited for that
+  (PERFORMANCE.md item 41).
 * **What Python does with one** is what it does with one that came over HTTP: the same handler
   (`P2PModule.submitCompactBlock`, `submitBlock`), with the peer the transport authenticated as
   the verified sender (`rpc_caller`). Whatever the block itself names as its sender is dropped.

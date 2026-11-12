@@ -22,6 +22,7 @@ The node's state (the exchange mempool) lives in qrdx.node.main and is read from
 time, as ``_node.<name>``.
 """
 
+import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -106,7 +107,10 @@ async def rebuild(
     ``whole``: fetch every operation from the sender (over HTTP, by position) rather than
     reading the mempool. ``sender_node``: the sender's node id, asked over the transport."""
     from qrdx.exchange.transactions import ExchangeTransaction
+    from qrdx.node.observability import BLOCK_ARRIVED
 
+    started = time.perf_counter()
+    arrived = BLOCK_ARRIVED.get() or started
     hashes = block_data.get("exchange_tx_hashes")
     if not isinstance(hashes, list) or not all(isinstance(h, str) for h in hashes):
         return None, "a compact block names its exchange operations by hash"
@@ -116,19 +120,32 @@ async def rebuild(
     txs: List[Optional[ExchangeTransaction]] = (
         [None] * len(hashes) if whole else [mempool.get(h) for h in hashes]
     )
+    # (each step's time and what it found, for the block's log line: "pool 1, held 12 2, ...")
+    steps: List[Tuple[str, float]] = [("queued", started - arrived)]
+    clock = [started]
+
+    def step(name: str) -> None:
+        now = time.perf_counter()
+        steps.append((name, now - clock[0]))
+        clock[0] = now
+
     missing = [i for i, t in enumerate(txs) if t is None]
+    step("pool")
     if missing and not whole:
         held = _from_transport([hashes[i] for i in missing])
         for i, tx in zip(missing, held, strict=True):
             txs[i] = tx
-        missing = [i for i, t in enumerate(txs) if t is None]
+        before, missing = len(missing), [i for i, t in enumerate(txs) if t is None]
+        step(f"held {before - len(missing)} in")
     if missing and not whole and sender_node:
         held = await _from_sender(sender_node, [hashes[i] for i in missing])
         for i, tx in zip(missing, held, strict=True):
             txs[i] = tx
-        missing = [i for i, t in enumerate(txs) if t is None]
+        before, missing = len(missing), [i for i, t in enumerate(txs) if t is None]
+        step(f"asked {before - len(missing)} in")
     if missing:
         fetched = await _fetch(sender_url, block_data.get("block_hash"), missing)
+        step(f"fetched {len(missing)} in")
         if fetched is None or len(fetched) != len(missing):
             return None, f"{len(missing)} of the block's exchange operations are unavailable"
         for i, item in zip(missing, fetched, strict=True):
@@ -149,6 +166,8 @@ async def rebuild(
     )
     full["_exchange_objects"] = objects
     full["_exchange_tx_hashes"] = list(hashes)
+    step("encode")
+    full["_relay"] = (arrived, steps)  # (taken off by the caller: observability.BLOCK_RELAY)
     if missing:
         logger.info(
             f"compact block {block_data.get('id')}: fetched {len(missing)} of {len(hashes)} "

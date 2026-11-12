@@ -12,6 +12,7 @@ section from its own mempool. What must hold:
 * nothing a node keeps beside a block (the decoded operations) goes on the wire.
 """
 
+import inspect
 import json
 
 import pytest
@@ -237,7 +238,9 @@ class _Sent:
         self.held.extend(items)
 
 
-async def test_blocks_and_votes_go_over_the_transport_and_http_carries_the_rest(txs, monkeypatch):
+def _wire_propagation(monkeypatch):
+    """``peers.propagate`` over a transport reaching qxa and qxb, and HTTP to qxc: (what went
+    on the transport, what went over HTTP)."""
     from qrdx.node import netd, peers
     from qrdx.node.nodes_manager import NodeInterface, NodesManager
 
@@ -277,6 +280,13 @@ async def test_blocks_and_votes_go_over_the_transport_and_http_carries_the_rest(
     monkeypatch.setattr(NodeInterface, "post_prepared", post_prepared)
     monkeypatch.setattr(NodeInterface, "prepare_rpc", staticmethod(prepare))
     monkeypatch.setattr(NodeInterface, "push_attestation", push_attestation)
+    return sent, over_http
+
+
+async def test_blocks_and_votes_go_over_the_transport_and_http_carries_the_rest(txs, monkeypatch):
+    from qrdx.node import peers
+
+    sent, over_http = _wire_propagation(monkeypatch)
     data = _block(txs)
     await peers.propagate("submit_block", data, ignore_node_id=None, db=None)
     form = json.loads(sent.blocks[0])
@@ -287,6 +297,31 @@ async def test_blocks_and_votes_go_over_the_transport_and_http_carries_the_rest(
     await peers.propagate("push_attestation", {"attestation": {"slot": 3}}, db=None)
     assert [json.loads(v) for v in sent.votes] == [{"slot": 3}]
     assert len(over_http) == 2 and "qxc" in str(over_http[1])
+
+
+async def test_a_signed_block_is_on_the_transport_before_its_proposer_runs_it(txs, monkeypatch):
+    """The proposer runs a block right after signing it, without pausing: a broadcast left to a
+    task went out only then (a 2,000-a-second load measured blocks reaching peers ~100 ms after
+    "sent" over a 25 ms link). It goes on the transport when signed; the task carries it over
+    HTTP to the rest, and not over the transport again."""
+    from qrdx.node import peers
+    from qrdx.validator import node_integration as NI
+
+    sent, over_http = _wire_propagation(monkeypatch)
+    data = _block(txs)
+    peers.send_block_now(data)  # (synchronous: nothing awaited)
+    assert len(sent.blocks) == 1 and over_http == []
+    await peers.propagate("submit_block", data, ignore_node_id=None, db=None)
+    assert len(sent.blocks) == 1                                       # (not sent twice)
+    assert len(over_http) == 1 and "qxc" in str(over_http[0])
+    await peers.propagate("submit_block", data, ignore_node_id=None, db=None)
+    assert len(sent.blocks) == 2  # (a later propagation of it, a relay's: the transport again)
+    # The proposer sends it so before scheduling the broadcast, and the node wires it.
+    send = inspect.getsource(NI.ValidatorNode._sign_and_send)
+    assert send.index("propose_block(") < send.index("self.send_now(") < send.index(
+        "broadcast_callback("
+    )
+    assert "send_now=_peers.send_block_now" in inspect.getsource(node_main)
 
 
 async def test_a_block_from_the_transport_is_taken_as_one_from_http(monkeypatch):

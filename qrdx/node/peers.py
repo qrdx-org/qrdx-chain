@@ -15,6 +15,7 @@ import socket
 import time
 import traceback
 from asyncio import gather
+from collections import OrderedDict
 from typing import Any, Dict, Optional, Set
 from urllib.parse import urlparse
 
@@ -83,8 +84,13 @@ async def propagate(
                 non_banned_peers.append(peer)
 
         # Blocks and votes go over the native transport to the peers connected on it
-        # (qrdx/node/netd.py); HTTP carries them to the rest.
-        reached = _over_transport(path, data, ignore_node_id)
+        # (qrdx/node/netd.py); HTTP carries them to the rest. A block this node signed went on
+        # the transport already, when it was signed (``send_block_now``).
+        reached = (
+            _SENT_NOW.pop(str(data.get("block_hash")), None) if path == "submit_block" else None
+        )
+        if reached is None:
+            reached = _over_transport(path, data, ignore_node_id)
         if reached:
             non_banned_peers = [p for p in non_banned_peers if p["node_id"] not in reached]
 
@@ -184,6 +190,27 @@ async def propagate(
             tasks.append(communication_task(peer, path, data))
 
         await gather(*tasks)
+
+
+# Blocks this node put on the transport the moment it signed them, with the peers they reached:
+# their ``propagate`` sends over HTTP to the rest only.
+_SENT_NOW: "OrderedDict[str, Set[str]]" = OrderedDict()
+
+
+def send_block_now(data: dict) -> None:
+    """Put a block this node just signed on the transport now (its ``propagate``, scheduled
+    beside it, then reaches the peers off the transport). Scheduled alone, the block left when
+    the event loop next ran that task: after the proposer had run the block — tens of
+    milliseconds of work without a pause, more under load — and, for a block built on a parent
+    still being imported (qrdx/validator/pipeline.py), after the parent's import too. Its peers
+    waited that long on top of the link."""
+    reached = _over_transport("submit_block", data, None)
+    block_hash = data.get("block_hash")
+    if not isinstance(block_hash, str):
+        return  # (its propagate sends it again: peers drop a block they have)
+    _SENT_NOW[block_hash] = reached
+    while len(_SENT_NOW) > 64:
+        _SENT_NOW.popitem(last=False)
 
 
 def _over_transport(path: str, data: dict, ignore_node_id: Optional[str]) -> Set[str]:

@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ...constants import SLOTS_PER_EPOCH
 from ...logger import get_logger
-from ...node.observability import Phases
+from ...node.observability import BLOCK_RELAY, Phases
 from ..server import (
     RPCError,
     RPCErrorCode,
@@ -460,8 +460,12 @@ class P2PModule(RPCModule):
         """
         self._require_db()
         _metric("qrdx_p2p_blocks_received_total")
-        _received = time.perf_counter()
-        phases = Phases()
+        # A compact block's time began when it arrived, before it was rebuilt (block_relay).
+        relay = BLOCK_RELAY.get()
+        if relay is not None:
+            BLOCK_RELAY.set(None)  # (this block's alone)
+        _received = relay[0] if relay is not None else time.perf_counter()
+        phases = Phases(relay[1] if relay is not None else ())
 
         block_content = block_data.get("block_content")
         if not block_content:
@@ -1174,7 +1178,11 @@ class P2PModule(RPCModule):
         )
         if full is None:
             return {"ok": False, "error": why}
-        reply = await self.submitBlock(full)
+        token = BLOCK_RELAY.set(full.pop("_relay", None))
+        try:
+            reply = await self.submitBlock(full)
+        finally:
+            BLOCK_RELAY.reset(token)
         if not reply.get("ok") and "body_root" in str(reply.get("error", "")):
             full, why = await self._block_relay.rebuild(block_data, sender_url, whole=True)
             if full is None:

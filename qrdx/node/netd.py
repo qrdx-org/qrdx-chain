@@ -34,6 +34,7 @@ import asyncio
 import json
 import os
 import socket
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -116,7 +117,7 @@ def _on_events() -> None:
         if kind == "txs":
             asyncio.ensure_future(_admit(event[1], event[2]))
         elif kind == "block":
-            asyncio.ensure_future(_receive_block(event[1], event[2]))
+            asyncio.ensure_future(_receive_block(event[1], event[2], time.perf_counter()))
         elif kind == "votes":
             asyncio.ensure_future(_receive_votes(event[1], event[2]))
         elif kind == "block_txs":
@@ -164,10 +165,14 @@ async def _admit(peer: str, items: List[Tuple[bytes, Optional[str], Any, Any, An
         logger.debug(f"peer transport: a batch from {peer[:16]} not admitted: {e}")
 
 
-async def _receive_block(peer: str, raw: bytes) -> None:
+async def _receive_block(peer: str, raw: bytes, at: Optional[float] = None) -> None:
     """A block a peer sent over the transport, taken as one sent over HTTP is: the same handler,
-    the peer the transport authenticated as its verified sender."""
+    the peer the transport authenticated as its verified sender. ``at``: when it was drained
+    from the transport (its import's log line counts from there)."""
+    from qrdx.node.observability import BLOCK_ARRIVED
     from qrdx.rpc.server import rpc_caller
+
+    BLOCK_ARRIVED.set(at)  # (this task's own context)
 
     try:
         block = json.loads(raw)

@@ -687,6 +687,33 @@ Each block's phase line ends with its store commits (`db N`; they were SQLite ro
     132 slots proposed, blocks sent a median 142 ms into their slot and imported in 133 ms.
     There a slot holds a build, a round trip and an import, on two CPUs.
 
+41. **A signed block leaves when it is signed.** The proposer scheduled its block's broadcast
+    as a task and went on to run the block: tens of milliseconds without a pause (more under
+    load), and, for a block built on a parent still being imported (pipelining), the rest of the
+    parent's import too. The task, and the send, waited for that. Across emulated machines at
+    1,500 a second, blocks were logged "sent" a median 55 ms into their slot and reached their
+    peers' event loops at 156 ms, 101 ms over a 25 ms link. Now the block goes on the peer
+    transport synchronously when signed (`peers.send_block_now`), and the broadcast task
+    carries it over HTTP to the peers off the transport only.
+
+    An import's log line now counts from when the transport handed the block to Python, with
+    what rebuilding it from its operations' hashes took first: `queued` (waiting for the event
+    loop), `pool`, `held N`/`asked N`/`fetched N` (operations found on the transport, asked of
+    the sender, fetched over HTTP), `encode`. That is how the gap was found: a block's
+    operations were nearly always in the mempool already (`asked` never appeared), and the
+    blocks sat on the sender, not on the receiver (`queued` a median 2 ms). The containers'
+    CPU quota (`--cpus 2`) was checked too: 0–3 of each ~57 periods throttled, too little to
+    explain it.
+
+    | Across emulated machines (2 CPUs a node, 25 ms each way) | 1,500 a second, first step | 2,000 |
+    |---|---|---|
+    | Before | 2.70–2.90 blocks/s, p95 11–24 s; sent +55 ms, arrived +156 ms | 2.68 blocks/s |
+    | After | **3.99 blocks/s, p95 0.72 s**; sent +36 ms, arrived +65 ms, imported by +178 ms | 3.54 blocks/s, backlog |
+
+    At 2,000 a second there, an import of a median 388 operations takes 142 ms (execution 54,
+    the store 24, the roots 20), and ends a median 285 ms into the slot: what remains is each
+    node's own work, on an event loop that also admits 2,000 transactions a second.
+
 ## The block pipeline, measured offline
 
 `scripts/bench/exchange_block.py` times one block's exchange section on a real database.

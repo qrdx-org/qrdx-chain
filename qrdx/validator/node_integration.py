@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..constants import SLOT_DURATION, SLOTS_PER_EPOCH
 from ..logger import get_logger
@@ -166,7 +166,14 @@ class ValidatorNode:
     - Handle slashing detection
     """
 
-    def __init__(self, db, validator_wallet_path: str, password: str = "", broadcast_callback=None):
+    def __init__(
+        self,
+        db,
+        validator_wallet_path: str,
+        password: str = "",
+        broadcast_callback=None,
+        send_now: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ):
         """
         Initialize validator node.
 
@@ -175,11 +182,15 @@ class ValidatorNode:
             validator_wallet_path: Path to PQ wallet JSON file
             password: Wallet password (optional for testnet)
             broadcast_callback: Async function to broadcast blocks to peers
+            send_now: Puts a block this node signed on the peer transport at once (synchronous:
+                qrdx/node/peers.py ``send_block_now``); ``broadcast_callback`` then reaches the
+                rest
         """
         self.db = db
         self.wallet_path = validator_wallet_path
         self.password = password
         self.broadcast_callback = broadcast_callback
+        self.send_now = send_now
 
         self.wallet: Optional[PQWallet] = None
         self.config: Optional[ValidatorConfig] = None
@@ -1921,6 +1932,13 @@ class ValidatorNode:
         phases.mark("sign")
         block_data = assemble_pos_block_data(block, next_height, exchange_txs, None, evm_raws, None)
         broadcast = None
+        if self.send_now is not None:
+            # On the transport now: the task below runs only once this coroutine pauses — after
+            # the block has run here (and, built ahead, after its parent's import).
+            try:
+                self.send_now(block_data)
+            except Exception as e:
+                logger.warning(f"Block #{next_height} not sent on the transport: {e}")
         if self.broadcast_callback:
             broadcast = asyncio.ensure_future(
                 self.broadcast_callback("submit_block", block_data, ignore_node_id=None, db=self.db)
@@ -2287,7 +2305,11 @@ class ValidatorNode:
 
 
 async def initialize_validator_node(
-    db, wallet_path: str, password: str = "", broadcast_callback=None
+    db,
+    wallet_path: str,
+    password: str = "",
+    broadcast_callback=None,
+    send_now: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Optional[ValidatorNode]:
     """
     Initialize and start a validator node.
@@ -2301,7 +2323,7 @@ async def initialize_validator_node(
     Returns:
         ValidatorNode instance if successful, None otherwise
     """
-    validator = ValidatorNode(db, wallet_path, password, broadcast_callback)
+    validator = ValidatorNode(db, wallet_path, password, broadcast_callback, send_now)
 
     if await validator.initialize():
         await validator.start()

@@ -23,6 +23,7 @@ import asyncio
 import json
 import time
 from collections import defaultdict
+from contextvars import ContextVar
 from typing import (
     AbstractSet,
     Any,
@@ -30,6 +31,7 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
+    Iterable,
     List,
     Literal,
     Optional,
@@ -610,6 +612,15 @@ CHAIN_CHANGED = ChangeSignal()
 DB_CALLS = [0]
 
 
+# A block a peer sent: when the transport handed it to Python (``netd``), then what rebuilding it
+# from its operations' hashes took (``block_relay.rebuild``) — its import's log line starts there.
+# A context, not a key of the block's dict: a peer writes the dict.
+BLOCK_ARRIVED: "ContextVar[Optional[float]]" = ContextVar("block_arrived", default=None)
+BLOCK_RELAY: "ContextVar[Optional[Tuple[float, List[Tuple[str, float]]]]]" = ContextVar(
+    "block_relay", default=None
+)
+
+
 class Phases:
     """Wall time of a task's steps, for its log line: ``mark(name)`` ends the step called
     ``name``. ``str()`` reads "lock 3, exchange 41, store 9, db 2" (milliseconds; steps under
@@ -617,9 +628,9 @@ class Phases:
 
     __slots__ = ("_last", "_steps", "_db")
 
-    def __init__(self) -> None:
+    def __init__(self, before: Iterable[Tuple[str, float]] = ()) -> None:
         self._last = time.perf_counter()
-        self._steps: List[Tuple[str, float]] = []
+        self._steps: List[Tuple[str, float]] = list(before)  # (steps timed elsewhere first)
         self._db = DB_CALLS[0]
 
     def mark(self, name: str) -> None:
