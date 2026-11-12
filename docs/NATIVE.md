@@ -119,9 +119,17 @@ Each entry is added into a running sum, never held as a vector of its own, and a
 is split evenly across the module's threads, each folding its share into one sum; fewer than
 48 are summed on the calling thread, where waking the pool cost more than the work (2–47
 entries took about 30 µs each). The store folds changed rows and recomputes a domain from every
-row the same way. On this machine (AVX2, no AVX-512) BLAKE3 writes an entry's 4 KB one block at
-a time, about 3.3 µs an entry on one thread; 1,000 entries take 0.5–0.9 ms on the pool, and
-beyond about eight threads they do not get faster.
+row the same way.
+
+An entry's 4 KB is BLAKE3's extendable output of a short input: 64 output blocks, each the same
+compression of the input's root node with its own counter. The `blake3` crate computes several
+at once only with AVX-512; elsewhere it computes them one after another, about 2.8 µs an entry
+on one thread here (AVX2, no AVX-512). `src/xof.rs` computes the root node of a one-chunk input
+(≤ 1,024 bytes: every entry the node makes) and then eight output blocks at a time in AVX2
+lanes, adding each word's low 16 bits into the sum as it goes: 0.93 µs an entry on one thread,
+0.55 µs on two. A longer input, or a CPU without AVX2, goes to the crate. The output is the
+crate's byte for byte (its tests, at every length of a chunk, and the commitments against
+Python's).
 
 Together, a commitment of 1,000 changed entries in a collection of 100,000 went from 33.6 ms
 to 15 ms; the rest is Python encoding each entry.

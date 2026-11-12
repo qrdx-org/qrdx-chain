@@ -749,6 +749,15 @@ Each block's phase line ends with its store commits (`db N`; they were SQLite ro
     At 2,000 an import of ~494 operations takes 118 ms there: execution 45, the store 22, the
     roots 21 — the store and the roots now cost what execution does.
 
+43. **LtHash entries eight output blocks at a time.** Every changed row of the database's
+    domains and every changed entry of the exchange's collections adds an LtHash entry, 4 KB of
+    BLAKE3 output: a transfer about six (its nonce, its two account rows, each out and in). The
+    `blake3` crate computes long outputs a block at a time without AVX-512 — 2.8 µs an entry, on
+    a node of two CPUs most of the roots' time. `src/xof.rs` computes them eight blocks at a time
+    with AVX2 (docs/NATIVE.md, "The exchange's accumulators"): 0.93 µs an entry on one thread.
+    The bench on two threads (a container's share): import 144 → 135 µs a transfer (execution
+    20.5 → 18.4, the roots 17.7 → 15.3), and the second thread's time freed besides.
+
 ## The block pipeline, measured offline
 
 `scripts/bench/exchange_block.py` times one block's exchange section on a real database.

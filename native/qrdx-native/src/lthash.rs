@@ -16,15 +16,7 @@ pub(crate) type Vector = Box<[u16; LANES]>;
 #[inline]
 pub(crate) fn add_entry(total: &mut [u16; LANES], tag: &[u8], data: &[u8]) -> Option<()> {
     let len = u32::try_from(data.len()).ok()?;
-    let mut h = blake3::Hasher::new();
-    h.update(tag);
-    h.update(&len.to_le_bytes());
-    h.update(data);
-    let mut out = [0u8; SIZE];
-    h.finalize_xof().fill(&mut out);
-    for (t, word) in total.iter_mut().zip(out.chunks_exact(4)) {
-        *t = t.wrapping_add(u16::from_le_bytes([word[0], word[1]]));
-    }
+    crate::xof::add4096(&[tag, &len.to_le_bytes(), data], total);
     Some(())
 }
 

@@ -37,6 +37,7 @@ mod oqs;
 mod tx;
 mod wire;
 mod xfer;
+mod xof;
 
 create_exception!(_native, Unsupported, PyException);
 
