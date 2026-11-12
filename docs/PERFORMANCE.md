@@ -682,6 +682,11 @@ Each block's phase line ends with its store commits (`db N`; they were SQLite ro
     too (p95 0.66 s); after the steps before it, only with the cores shared. 2,500 a second
     builds a backlog either way.
 
+    Across emulated machines (`--hosts containers`: 2 CPUs a node, 25 ms each way) 1,000 and
+    1,500 a second hold (p95 0.51 and 0.63 s), and 2,000 does not: 2.67 blocks a second, 99 of
+    132 slots proposed, blocks sent a median 142 ms into their slot and imported in 133 ms.
+    There a slot holds a build, a round trip and an import, on two CPUs.
+
 ## The block pipeline, measured offline
 
 `scripts/bench/exchange_block.py` times one block's exchange section on a real database.
