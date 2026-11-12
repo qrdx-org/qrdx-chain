@@ -117,8 +117,8 @@ async def run(args) -> None:
             assert not refused, refused[:1]
             with clock.phase("preload balances"):
                 BP.apply_enforcement(mgr)
-                await BP.preload_sender_balances(db, kept, mgr, b)
-                await BP.preload_token_balances(db, kept, mgr)
+                known = await BP.preload_sender_balances(db, kept, mgr, b)
+                await BP.preload_token_balances(db, kept, mgr, known=known)
             with clock.phase("execute"):
                 ok, err, root = BP.process_exchange_transactions(b, ts, kept, mgr)
             assert ok, err

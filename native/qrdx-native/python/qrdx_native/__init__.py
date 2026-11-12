@@ -17,6 +17,7 @@ from ._native import (
     lt_mix_entries,
     mldsa65_keypair,
     mldsa65_verify_batch,
+    mldsa65_verify_bind_batch,
     mt_build,
     mt_prove,
     mt_update,
@@ -30,6 +31,7 @@ from ._native import (
     tx_read,
     wire_build,
     wire_parse,
+    wire_read,
     wire_text,
 )
 
@@ -50,6 +52,7 @@ __all__ = [
     "lt_mix_entries",
     "mldsa65_keypair",
     "mldsa65_verify_batch",
+    "mldsa65_verify_bind_batch",
     "mt_build",
     "mt_prove",
     "mt_update",
@@ -63,5 +66,6 @@ __all__ = [
     "tx_read",
     "wire_build",
     "wire_parse",
+    "wire_read",
     "wire_text",
 ]

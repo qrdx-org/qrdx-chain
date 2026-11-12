@@ -157,12 +157,22 @@ async def test_a_sections_verdicts_are_the_same_with_and_without_the_module(monk
 
     keys = [PQPrivateKey.generate() for _ in range(5)]
     wire = []
-    for i in range(40):
+    for i in range(60):
         k = keys[i % 5]
-        t = ExchangeTransaction(op_type=ExchangeOpType.TOKEN_TRANSFER, sender=k.public_key.to_address(),
-                                nonce=i, params={"token_address": "QRDX", "to": "0xPQ" + "b" * 64,
-                                                 "amount": "1"},
-                                gas_limit=40_000, gas_price=10 ** 9, chain_id=CHAIN_ID)
+        params = {"token_address": "QRDX", "to": "0xPQ" + "b" * 64, "amount": "1"}
+        sender, chain, gas = k.public_key.to_address(), CHAIN_ID, 40_000
+        # (signed as they are, yet refused by a check besides the signature — or not)
+        if i % 13 == 7:
+            chain = CHAIN_ID + 1                                  # another network
+        if i % 17 == 9:
+            gas = 1                                               # below the operation's cost
+        if i % 19 == 11:
+            del params["to"]                                      # malformed
+        if i % 23 == 13:
+            sender = sender.lower()                               # the address in another case
+        t = ExchangeTransaction(op_type=ExchangeOpType.TOKEN_TRANSFER, sender=sender,
+                                nonce=i, params=params,
+                                gas_limit=gas, gas_price=10 ** 9, chain_id=chain)
         t.public_key = k.public_key.to_bytes()
         t.signature = k.sign(t.signing_bytes()).to_bytes()
         d = t.to_dict()
@@ -179,8 +189,9 @@ async def test_a_sections_verdicts_are_the_same_with_and_without_the_module(monk
     monkeypatch.setattr(native, "_native", None)
     monkeypatch.setattr(native, "AVAILABLE", False)
     without = await verify_exchange_txs(fresh())
-    assert with_module == without
+    assert with_module == without  # (and the refusals worded alike)
     assert 0 < sum(ok for ok, _ in with_module) < len(wire)
+    assert {why.split(":")[0] for ok, why in with_module if not ok} >= {"invalid structure"}
 
 
 def test_the_transport_json_writes_what_json_writes():

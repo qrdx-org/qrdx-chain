@@ -150,6 +150,13 @@ def decode(raw: Any) -> Any:
     module = _native()
     if module is None:
         return py_decode(bytes(raw) if isinstance(raw, (bytes, bytearray)) else from_text(raw))
+    if isinstance(raw, (str, bytes)):
+        read = getattr(module, "wire_read", None)
+        fields = read(raw) if read is not None else None
+        if fields is not None:
+            tx = _from_read(fields, raw)
+            if tx is not None:
+                return tx
     from .transactions import ExchangeTransaction
 
     if not isinstance(raw, (str, bytes)):
@@ -178,6 +185,48 @@ def decode(raw: Any) -> Any:
         data["signer"] = signer
     tx = ExchangeTransaction.from_dict(data)  # (its own checks, as the JSON form's)
     tx.signature, tx.public_key = signature, public_key
+    return tx
+
+
+def _from_read(fields: Any, given: Any) -> Any:
+    """The transaction ``wire_read`` read whole (src/xfer.rs; docs/NATIVE.md): the fields
+    ``from_dict`` sets, as it sets them for this form, and what the node would otherwise compute
+    again — its signed bytes, its hash, its binary form and text — remembered on it, under the
+    same keys as ``tx_hash``, ``to_wire`` and ``to_text`` keep them. None for an operation type
+    no transaction has (Python's path refuses it, with the reason)."""
+    from .transactions import ExchangeOpType, ExchangeTransaction
+
+    (op, chain_id, nonce, gas_limit, gas_price, timestamp, sender, pairs, signature,
+     public_key, canonical, tx_hash, raw, own_text) = fields  # fmt: skip
+    try:
+        op_type = ExchangeOpType(op)
+    except ValueError:
+        return None
+    tx = ExchangeTransaction.__new__(ExchangeTransaction)
+    d = tx.__dict__
+    d.update(
+        op_type=op_type,
+        sender=sender,
+        nonce=nonce,
+        params=dict(pairs),
+        gas_limit=gas_limit,
+        gas_price=gas_price,
+        timestamp=timestamp,
+        signature=signature,
+        public_key=public_key,
+        chain_id=chain_id,
+        signer="",
+        gas_used=0,
+        success=False,
+        result={},
+        error="",
+    )
+    key = tx._fingerprint()
+    d["_bytes_memo"] = (key, canonical)
+    d["_hash_memo"] = (key, tx_hash)
+    d["_wire_memo"] = ((key, timestamp, signature, public_key), raw)
+    if own_text:
+        d["_text_memo"] = (raw, given)
     return tx
 
 

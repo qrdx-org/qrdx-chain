@@ -591,6 +591,38 @@ Each block's phase line ends with its store commits (`db N`; they were SQLite ro
     proposer races them, and the backlog grows. What moves it now is less work per operation on
     the loop: the exchange's state and admission natively, or a second core per node.
 
+39. **Admission and import, per operation** (`scripts/bench/import_block.py`: what an importing
+    validator does with a block's transfers, admitted from peers and then imported from its
+    mempool, phase by phase).
+    * **A transaction is read whole, natively** (`wire_read`; NATIVE.md "Transactions read
+      whole"): its fields, its signed bytes and its hash in one call, and its binary form and
+      text remembered on it. Each had been computed again by its hash, its signature's check,
+      its relay, a compact block's rebuild and storage.
+    * **Its signature and its sender's binding in one batch** (`mldsa65_verify_bind_batch`): a
+      transaction that passes is marked verified without the per-transaction Python around the
+      verdict.
+    * **A block's QRDX transfers name their senders once:** the token pre-load read every
+      sender's balance again after the sender pre-load had (`known`).
+    * **A plain transfer is prepared for the native lane when it is admitted**
+      (`transfer_lane.prepare`, a function of its fields): the block that carries it, built or
+      imported on the path every block waits on, finds it done.
+    * **No module imported per call in the hot helpers** (the minimum gas price, the chain id,
+      the wire form, the mempool's state lookups): about 0.35 µs each, 25 an admitted transfer.
+
+    | µs a transfer (500 a block, 2,048 accounts) | Before | After |
+    |---|---:|---:|
+    | Admission (decode, checks, mempool) | 99 | 74 without the lane's preparation, 89 with it |
+    | Import: balance pre-loads | 15 | 12 |
+    | Import: execution | 49 | 33 |
+    | Import, in all | 111 | 89 |
+
+    Live (4 nodes, 2,048 accounts): 1,500 a second at 4.00 blocks a second, every slot proposed,
+    p95 0.9 s; an import's median 96–110 → 82 ms. 2,000 a second executed every operation
+    (1,977 a second, none refused) but at 2.9 blocks a second, with a backlog.
+
+    The alternative — a second process per node for admission and the index — is designed in
+    docs/SECOND_CORE.md.
+
 ## The block pipeline, measured offline
 
 `scripts/bench/exchange_block.py` times one block's exchange section on a real database.

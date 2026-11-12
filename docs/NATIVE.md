@@ -25,6 +25,8 @@ byte.
 | `order_lane_run` | `process_transaction` for plain spot orders (limit and market), cancels and swaps: matching, the pools and the router (`router.rs`), settlement, fees, escrow | a block's runs of them over the native books (`qrdx/exchange/order_lane.py`) |
 | `wire_parse`, `wire_build`, `wire_text` | `wire.py_decode`, `py_encode`, `base64` | exchange transactions' binary form: every block section decoded on import, encoded by its proposer (`qrdx/exchange/wire.py`) |
 | `tx_read` | the transport's own reading of a relayed transaction (its JSON or binary form): its hash and signed bytes | tests (`tests/test_exchange_wire.py`) |
+| `wire_read(item)` | `wire.decode` and the hash, signed bytes and binary form computed after it | every exchange transaction read in the common form: admission, block sections (`wire._from_read`) |
+| `mldsa65_verify_bind_batch(items)` | `mldsa65_verify_batch` and `verify`'s binding of a key to its sender's address | a batch's signatures (`block_processor._verify_natively`) |
 | `NetService` | signed HTTP batches of JSON between peers | the peer transport for transactions, blocks and votes (docs/NETWORK.md, `qrdx/node/netd.py`) |
 
 On a block of 2,000 transfers (`scripts/bench/exchange_block.py`, 24 cores):
@@ -117,6 +119,31 @@ negative zero or a nonce out of sequence makes the call bail, and Python runs th
 writes back goes through the same dicts and undo records, new keys in the order Python's would
 have inserted them. Anything else in a block (another token, another operation, an agent's or a
 multisig's signature) is Python's.
+
+### Transactions read whole
+
+`wire_read` reads an exchange transaction in the common form — the binary form exactly as
+`wire.encode` writes it, no signer, a whole gas price, a timestamp set, params a flat object of
+plain strings, keys sorted — and returns its fields with what the node would otherwise compute
+again: the bytes it is signed and hashed over, its hash, its binary form and whether the text it
+came as is that form's own. `wire._from_read` builds the transaction from them as `from_dict`
+would, and remembers the rest on it under the keys `tx_hash`, `to_wire` and `to_text` keep
+them. Anything else goes the Python way.
+
+Two conditions keep a remembered form honest. The bytes must be the ones `wire.encode` writes
+(a varint is read only in its shortest form), and a text is remembered only if it is the one
+`b64encode` writes: Python's decoder accepts stray bits in the last character before the
+padding. A non-canonical form remembered would make a compact block rebuilt by another node
+differ from its proposer's.
+
+`mldsa65_verify_bind_batch` checks each signature and whether its key's PQ address
+(`0xPQ` and keccak-256 of the key, compared without regard to case) is the address it signs
+for, on the module's threads. A transaction that passes both, and the checks
+`verify_exchange_tx` makes besides them (its form, its chain id, its gas limit's cover), is
+marked verified at once; any other goes through `verify_exchange_tx` with the batch's verdicts,
+so a refusal is worded as before. tests/test_wire_read.py and tests/test_native.py hold both to
+the Python path: every field and its type, the hash, the signed bytes, both forms and every
+verdict.
 
 ### Plain spot orders and cancels
 

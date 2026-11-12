@@ -29,6 +29,7 @@ from collections import OrderedDict
 from decimal import Decimal
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
+from . import transfer_lane
 from .transactions import ExchangeOpType, ExchangeTransaction
 
 logger = logging.getLogger(__name__)
@@ -231,6 +232,13 @@ class ExchangeSubmitter:
             if err.startswith("duplicate"):
                 return True, "", tx_hash
             return False, err, None
+        # A plain transfer's own checks for the native lane, done now and remembered on it
+        # (``transfer_lane.prepare``: a function of its fields alone): the block that carries
+        # it — built here, or imported, on the path every block waits on — finds them done.
+        try:
+            transfer_lane.prepare(tx)
+        except Exception:  # (a hint: never a refusal)
+            pass
         if self._transport is not None:
             if not propagated and raw is None:
                 raw = tx.to_wire()  # (the binary form: half the bytes of its JSON)

@@ -155,8 +155,8 @@ async def _apply_exchange_section_on_import(
     # Phase E: pre-load senders' real QRDX + token balances so the collateral and
     # spot-sufficiency checks can read them during the sync section processing.
     try:
-        await preload_sender_balances(_node.db, _decoded, mgr, int(block_height))
-        await preload_token_balances(_node.db, _decoded, mgr)
+        known = await preload_sender_balances(_node.db, _decoded, mgr, int(block_height))
+        await preload_token_balances(_node.db, _decoded, mgr, known=known)
     except Exception as e:
         logger.debug(f"exchange balance pre-load skipped at block {block_height}: {e}")
 

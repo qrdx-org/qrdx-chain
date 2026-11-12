@@ -749,10 +749,12 @@ class ValidatorNode:
                                         apply_enforcement(mgr)
                                         # Phase E: pre-load senders' real QRDX + token balances for
                                         # the collateral + spot-sufficiency checks during processing.
-                                        await preload_sender_balances(
+                                        known = await preload_sender_balances(
                                             self.db, exchange_txs, mgr, next_height
                                         )
-                                        await preload_token_balances(self.db, exchange_txs, mgr)
+                                        await preload_token_balances(
+                                            self.db, exchange_txs, mgr, known=known
+                                        )
                                         phases.mark("preload")
                                         ok, err, root = process_exchange_transactions(
                                             next_height,
@@ -2054,8 +2056,8 @@ class ValidatorNode:
         try:
             if exchange_txs:
                 apply_enforcement(mgr)
-                await preload_sender_balances(self.db, exchange_txs, mgr, height)
-                await preload_token_balances(self.db, exchange_txs, mgr)
+                known = await preload_sender_balances(self.db, exchange_txs, mgr, height)
+                await preload_token_balances(self.db, exchange_txs, mgr, known=known)
                 ok, err, _root = process_exchange_transactions(
                     height, float(block_timestamp), exchange_txs, mgr
                 )

@@ -42,6 +42,29 @@ DEFAULT_MAX_MEMPOOL = 65_536  # total admitted txs
 DEFAULT_MAX_PER_SENDER = 256  # queued txs per sender
 DEFAULT_MAX_NONCE_GAP = 256  # how far ahead of expected a nonce may be
 
+
+def _block_limits():
+    """qrdx/block_limits.py (imported when first asked, then bound: it imports the exchange)."""
+    from .. import block_limits
+
+    global _block_limits
+
+    def bound():
+        return block_limits
+
+    _block_limits = bound
+    return block_limits
+
+
+def _manager():
+    """The exchange's state manager (imported when first asked: it imports this module)."""
+    from .state_manager import ExchangeStateManager
+
+    global _manager
+    _manager = ExchangeStateManager.get_instance  # (asked once a transaction, several times)
+    return ExchangeStateManager.get_instance()
+
+
 # nonce lane (``ExchangeTransaction.nonce_key``: the account, or account|signer) -> next nonce
 NonceProvider = Callable[[str], int]
 # why a transaction's signer may not act for its sender ("" if it may)
@@ -49,27 +72,19 @@ SignerCheck = Callable[[ExchangeTransaction], str]
 
 
 def _default_nonce_provider(address: str) -> int:
-    from .state_manager import ExchangeStateManager
-
-    return ExchangeStateManager.get_instance().get_nonce(address)
+    return _manager().get_nonce(address)
 
 
 def _default_signer_check(tx: ExchangeTransaction) -> str:
-    from .state_manager import ExchangeStateManager
-
-    return ExchangeStateManager.get_instance().signer_error(tx)
+    return _manager().signer_error(tx)
 
 
 def _default_free_check(tx: ExchangeTransaction) -> str:
-    from .state_manager import ExchangeStateManager
-
-    return ExchangeStateManager.get_instance().free_action_error(tx)
+    return _manager().free_action_error(tx)
 
 
 def _default_vote_seq_provider(address: str) -> int:
-    from .state_manager import ExchangeStateManager
-
-    return ExchangeStateManager.get_instance().oracle_vote_seq(address)
+    return _manager().oracle_vote_seq(address)
 
 
 class ExchangeMempool:
@@ -131,9 +146,7 @@ class ExchangeMempool:
                 return False, str(e)
 
         # More gas than a block may carry: it could never be included (docs/BLOCK_LIMITS.md).
-        from ..block_limits import exchange_gas_limit_at
-
-        most = exchange_gas_limit_at(None)
+        most = _block_limits().exchange_gas_limit_at(None)
         if int(tx.gas_limit) > most:
             return False, (
                 f"gas limit {tx.gas_limit} exceeds the block's exchange gas limit {most}"

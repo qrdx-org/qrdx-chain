@@ -44,25 +44,19 @@ ZERO = Decimal("0")
 
 
 def _min_gas_price() -> int:
-    from .. import constants
-
-    return constants.EXCHANGE_MIN_GAS_PRICE_WEI
+    return _constants.EXCHANGE_MIN_GAS_PRICE_WEI  # type: ignore[no-any-return]
 
 
 def _network_chain_id() -> int:
     """The chain id of this process's network (its chain spec)."""
-    from .. import chain_spec
-
-    return chain_spec.active().chain_id
+    return _chain_spec.active().chain_id  # type: ignore[no-any-return]
 
 
 _SIGNING_TAG = b"QRDX-EXCHANGE-TX-v1\x00"
 
 
 def _wei_per_qrdx() -> Decimal:
-    from .. import constants
-
-    return _decimal_of(constants.WEI_PER_QRDX)
+    return _decimal_of(_constants.WEI_PER_QRDX)
 
 
 @functools.lru_cache(maxsize=8)
@@ -344,9 +338,7 @@ class ExchangeTransaction:
         memo = self.__dict__.get("_signature_gas")
         if memo is not None and memo[0] is self.signature:
             return memo[1]
-        from ..crypto import multisig_wire
-
-        gas = multisig_wire.signer_count(self.signature) * MULTISIG_GAS_PER_SIGNATURE
+        gas = _multisig_wire.signer_count(self.signature) * MULTISIG_GAS_PER_SIGNATURE
         self.__dict__["_signature_gas"] = (self.signature, gas)
         return gas
 
@@ -389,7 +381,7 @@ class ExchangeTransaction:
         if self.chain_error():
             return False
         signing_address = str(self.signer or self.sender)
-        from ..crypto import multisig_wire
+        multisig_wire = _multisig_wire
 
         if multisig_wire.is_multisig_material(self.public_key):
             # An m-of-n multisig (docs/ACCOUNT_CONTROL.md): the keyset derives the address it
@@ -448,7 +440,7 @@ class ExchangeTransaction:
     def to_wire(self) -> bytes:
         """The binary form (qrdx/exchange/wire.py), remembered while every field it is made of is
         as it was."""
-        from . import wire
+        wire = _wire
 
         key = self._fingerprint()
         key = None if key is None else (key, self.timestamp, self.signature, self.public_key)
@@ -462,7 +454,7 @@ class ExchangeTransaction:
 
     def to_text(self) -> str:
         """The binary form as a block body carries it (base64), remembered with it."""
-        from . import wire
+        wire = _wire
 
         raw = self.to_wire()
         memo = self.__dict__.get("_text_memo")
@@ -474,14 +466,14 @@ class ExchangeTransaction:
 
     @classmethod
     def from_wire(cls, raw: bytes) -> "ExchangeTransaction":
-        from . import wire
+        wire = _wire
 
         return wire.decode(raw)  # type: ignore[no-any-return]
 
     @classmethod
     def from_any(cls, item: Any) -> "ExchangeTransaction":
         """A section's or a peer's item: the binary form's text or bytes, or the JSON object."""
-        from . import wire
+        wire = _wire
 
         if isinstance(item, cls):
             return item
@@ -1263,3 +1255,11 @@ _NFT_REQUIRED = {
     ExchangeOpType.NFT_UPDATE: ("collection",),
     ExchangeOpType.NFT_SET_AUTHORITY: ("collection", "authority", "new_authority"),
 }
+
+
+# The modules the hot paths above read, bound once this module has defined everything (each
+# imports it in turn, or is imported along with it). A function-level import costs about
+# 0.35 µs, and an admitted transfer ran about 25 of them.
+from .. import chain_spec as _chain_spec, constants as _constants  # noqa: E402
+from ..crypto import multisig_wire as _multisig_wire  # noqa: E402
+from . import wire as _wire  # noqa: E402

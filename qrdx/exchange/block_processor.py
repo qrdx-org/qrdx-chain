@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..constants import UNBONDING_PERIOD_EPOCHS
 from .state_manager import ExchangeStateManager
@@ -249,13 +249,16 @@ async def ensure_oracle_committee(
 
 async def preload_sender_balances(
     db, txs, state_manager: Optional[ExchangeStateManager] = None, height: Optional[int] = None
-) -> None:
+) -> Dict[str, Decimal]:
     """
     Phase E: pre-load each exchange-tx sender's real account_state balance into the
     state manager's balance bridge BEFORE the (sync) section is processed, so the
     collateral check can read it. Called by the async block paths (proposer +
     importer). Deterministic: ``db.get_address_balance`` reads the same
     account_state every node has at this point in block application.
+
+    Returns the balances it read, by holder: ``preload_token_balances`` (called next, on the
+    same transactions) takes them rather than reading a block's every sender again.
     """
     mgr = state_manager or ExchangeStateManager.get_instance()
     mgr.clear_available_balances()
@@ -281,7 +284,8 @@ async def preload_sender_balances(
         payer = mgr.fee_payer(tx) if isinstance(tx, ExchangeTransaction) else sender
         for holder in (sender, payer):
             seen.setdefault(holder)
-    for holder, balance in (await _balances(db, list(seen))).items():
+    loaded = await _balances(db, list(seen))
+    for holder, balance in loaded.items():
         mgr.set_available_balance(holder, balance)
     # A governance system_spend debits a system wallet, not its sender: pre-load that wallet's
     # balance too, under the key the execution debits (the wallet's lowercase address).
@@ -303,6 +307,7 @@ async def preload_sender_balances(
             mgr.set_available_balance(wallet, await db.get_address_balance(wallet))
         except Exception as e:
             logger.debug("preload_sender_balances: %s for system wallet %s", e, wallet)
+    return loaded
 
 
 def _swap_paths(op, p: Dict[str, Any], asset, hubs: Iterable[str] = ()) -> List[List[str]]:
@@ -342,7 +347,10 @@ def _operations(txs) -> Iterable[Tuple[Any, Any, Dict[str, Any]]]:
 
 
 async def preload_token_balances(
-    db, txs, state_manager: Optional[ExchangeStateManager] = None
+    db,
+    txs,
+    state_manager: Optional[ExchangeStateManager] = None,
+    known: Optional[Dict[str, Decimal]] = None,
 ) -> None:
     """
     Phase E (spot): pre-load the (holder, token) balances the block's spot ops will
@@ -350,6 +358,9 @@ async def preload_token_balances(
     sufficiency checks (swap token_in, transfer amount, add-liquidity token0/token1)
     can read them. Deterministic: ``db.get_token_balance`` reads the same ledger on
     every node at this point. Scans op params for the (sender, token) pairs to load.
+
+    ``known``: the QRDX balances ``preload_sender_balances`` just read for these transactions
+    (what it returned), not read again — a block of QRDX transfers named its every sender twice.
     """
     mgr = state_manager or ExchangeStateManager.get_instance()
     mgr.clear_available_token_balances()
@@ -464,7 +475,9 @@ async def preload_token_balances(
 
     ordered = sorted(wanted)
     native = [holder for holder, token in ordered if is_native_asset(token)]
-    native_balances = await _balances(db, native)
+    known = known or {}
+    native_balances = {h: known[h] for h in native if h in known}
+    native_balances.update(await _balances(db, [h for h in native if h not in known]))
     tokens = await _token_balances(db, [(t, h) for h, t in ordered if not is_native_asset(t)])
     for holder, token in ordered:
         if is_native_asset(token):  # native QRDX: the account balance
@@ -737,29 +750,68 @@ def _verify_chunk(txs: List[ExchangeTransaction]) -> List[Tuple[bool, str]]:
 
 async def _verify_natively(txs: List[ExchangeTransaction]) -> List[Tuple[bool, str]]:
     """``verify_exchange_tx`` of each, with every ML-DSA-65 signature among them checked first in
-    one batch by the native module, on its threads and off the event loop. The checks are the
-    Python ones; only the signature verdicts come from the batch (the same liboqs)."""
+    one batch by the native module, on its threads and off the event loop — with the binding of
+    each key to the address it signs for (``mldsa65_verify_bind_batch``). A transaction whose
+    signature and binding hold, and that passes the checks ``verify_exchange_tx`` makes besides
+    them, is marked verified there; the rest go through ``verify_exchange_tx`` as before, the
+    batch's verdicts in place of asking liboqs again, so a refusal is worded as it was."""
     import asyncio
 
     from .. import native
     from ..crypto import multisig_wire
-    from ..crypto.pq import dilithium
+    from ..crypto.pq import dilithium, openssl_backend
 
-    items = [
-        (bytes(tx.public_key), tx.signing_bytes(), bytes(tx.signature))
+    eligible = [
+        tx
         for tx in txs
         if tx.public_key
         and tx.signature
         and len(tx.public_key) == dilithium.PUBLIC_KEY_SIZE
         and not multisig_wire.is_multisig_material(tx.public_key)
     ]
-    verdicts = await asyncio.get_running_loop().run_in_executor(
-        None, native.mldsa65_verify_batch, items
-    )
-    if verdicts is None:
-        return _verify_chunk(txs)
-    with dilithium.precomputed(dict(zip(items, verdicts, strict=True))):
-        return _verify_chunk(txs)
+    loop = asyncio.get_running_loop()
+    bind = getattr(native._native, "mldsa65_verify_bind_batch", None)
+    passed: Set[int] = set()
+    if bind is not None and not openssl_backend.shadow_enabled():
+        items = [
+            (
+                bytes(tx.public_key),
+                tx.signing_bytes(),
+                bytes(tx.signature),
+                str(tx.signer or tx.sender),
+            )
+            for tx in eligible
+        ]
+        both = await loop.run_in_executor(None, bind, items)
+        verdicts = {item[:3]: sig_ok for item, (sig_ok, _bound) in zip(items, both, strict=True)}
+        for tx, (sig_ok, bound) in zip(eligible, both, strict=True):
+            if sig_ok and bound and _passes_besides_signature(tx):
+                tx.__dict__["_verified"] = _verified_form(tx)
+                passed.add(id(tx))
+    else:
+        triples = [
+            (bytes(tx.public_key), tx.signing_bytes(), bytes(tx.signature)) for tx in eligible
+        ]
+        found = await loop.run_in_executor(None, native.mldsa65_verify_batch, triples)
+        if found is None:
+            return _verify_chunk(txs)
+        verdicts = dict(zip(triples, found, strict=True))
+    with dilithium.precomputed(verdicts):
+        return [(True, "") if id(tx) in passed else verify_exchange_tx(tx) for tx in txs]
+
+
+def _passes_besides_signature(tx: ExchangeTransaction) -> bool:
+    """The checks ``verify_exchange_tx`` makes besides the signature and its binding: the
+    transaction's form, its chain id and its gas limit."""
+    try:
+        tx.validate_basic()
+    except ValueError:
+        return False
+    if tx.chain_error():
+        return False
+    from .transactions import EXCHANGE_GAS_COSTS
+
+    return int(tx.gas_limit) >= EXCHANGE_GAS_COSTS.get(tx.op_type, 100_000) + tx.signature_gas()
 
 
 async def verify_exchange_txs(txs: List[ExchangeTransaction]) -> List[Tuple[bool, str]]:
@@ -1091,8 +1143,8 @@ async def rebuild_exchange_state_from_chain(
         # would at this height. Must run BEFORE process_exchange_transactions.
         if flush_to_account_state:
             try:
-                await preload_sender_balances(db, txs, mgr, height)
-                await preload_token_balances(db, txs, mgr)
+                known = await preload_sender_balances(db, txs, mgr, height)
+                await preload_token_balances(db, txs, mgr, known=known)
             except Exception as e:
                 logger.debug("rebuild_exchange_state preload skipped at %d: %s", height, e)
         ok, err, _root = process_exchange_transactions(height, ts, txs, mgr, revertible=True)
@@ -1245,8 +1297,8 @@ async def tick_and_flush(
         # judged as a section's transactions are, on the balances they may spend.
         if flush:
             apply_enforcement(mgr)
-        await preload_sender_balances(db, [], mgr, block_height)
-        await preload_token_balances(db, [], mgr)
+        known = await preload_sender_balances(db, [], mgr, block_height)
+        await preload_token_balances(db, [], mgr, known=known)
     root = run_exchange_tick(block_height, block_timestamp, mgr)
     if flush:
         await flush_exchange_balance_deltas(db, mgr, enforce=ENFORCE_EXCHANGE_COLLATERAL)

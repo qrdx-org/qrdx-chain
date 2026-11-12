@@ -47,6 +47,11 @@ const UNATTRIBUTED: i64 = -1;
 
 type Bytes = Vec<u8>;
 
+/// EINTR (4 on every platform the node runs on: Linux, the BSDs, macOS).
+fn libc_eintr() -> i32 {
+    4
+}
+
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(format!("store: {e}"))
 }
@@ -519,7 +524,7 @@ impl Inner {
         let layers = std::mem::take(&mut self.layers);
         let names: Vec<String> = self.tables.iter().map(|t| t.name.clone()).collect();
         let env = self.env.clone();
-        let result = py.allow_threads(|| -> Result<(), libmdbx::Error> {
+        let write = || -> Result<(), libmdbx::Error> {
             let txn = env.begin_rw_txn()?;
             for (name, layer) in names.iter().zip(layers.iter()) {
                 if layer.writes.is_empty() && !layer.cleared {
@@ -540,6 +545,20 @@ impl Inner {
             }
             txn.commit()?;
             Ok(())
+        };
+        // A system call a signal interrupted (EINTR: a profiler, a debugger, any handler) fails
+        // the transaction before anything reached the file: written again, whole. It used to
+        // drop the block's every write.
+        let result = py.allow_threads(|| {
+            let mut tries = 0;
+            loop {
+                match write() {
+                    Err(libmdbx::Error::Other(code)) if code == libc_eintr() && tries < 100 => {
+                        tries += 1;
+                    }
+                    other => return other,
+                }
+            }
         });
         self.layers = (0..self.tables.len()).map(|_| Layer::default()).collect();
         match result {

@@ -485,8 +485,8 @@ async def _replay(db, mgr, sm, execute_tx, start: int, end: int) -> Dict[str, An
                     section = None
                 if section:
                     txs = decode_exchange_txs(section)
-                    await preload_sender_balances(db, txs, mgr, height)
-                    await preload_token_balances(db, txs, mgr)
+                    known = await preload_sender_balances(db, txs, mgr, height)
+                    await preload_token_balances(db, txs, mgr, known=known)
                     ok, err, _root = process_exchange_transactions(
                         height, float(raw_ts), txs, mgr, revertible=True
                     )
