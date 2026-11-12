@@ -746,22 +746,29 @@ batching is the lever that moves it.
 
 In the order they would pay, toward four blocks a second at 2,000–4,000 transfers:
 
-1. **Native state, and the database behind it.** Plain transfers and the commitments' trees and
-   accumulators are native now; the exchange's other operations, each entry's encoding for its
-   commitment, the flush and the store are Python (5–35 µs a transaction each, above). Under
-   load a block's import is now 100–200 ms at 600–900 transfers: the exchange section 40–95,
-   storing it 15–35 (about 11 KB of JSON an operation), its body root and rules 10–22. Holding
-   the exchange's state natively, with the database written behind it, is still the change
-   that moves the ceiling by a multiple.
-2. **What an import costs a transaction.** At 1,500 transfers a second each node spends most of
-   every second importing blocks: about 175 µs a transfer offline for a 500-transfer block
-   (execute 40, flush 34, state root 34 — nearly all the proof tree's node writes — store 20,
-   preloads 14, plus signatures where not already checked), 100 ms a block live with tails of
-   300–500 ms behind the node's other work. A late block is raced, the fork costs a rollback,
-   and the chain falls behind. 2,000 a second with headroom needs that cost about halved. The
-   proof tree's root is not needed until the block two on (two blocks): taking its update off
-   the block's path is the largest single step, but every write shares one SQLite connection,
-   whose transaction a refused block rolls back.
+1. **The exchange's state held natively.** After 36–39 an importing validator spends about
+   180 µs of its one thread on each transfer (`scripts/bench/import_block.py`; about twice that
+   live, beside three other nodes): admission 75–90, the import 89 (execution 33, the store 16,
+   the roots 16, pre-loads 11, the flush 9). What is left is no longer one cost but dozens of
+   2–6 µs ones, and most are one thing: the exchange's balances, deltas and nonces live in
+   Python dicts of `Decimal`, so the native lane converts each value to text and back, writes
+   an undo record a key, and the pre-load, the flush and the commitments each read or write
+   them again. The step that removes them together, in this order:
+   * **A native balance plane:** a block's available balances and deltas held by the native
+     module, read from the store natively (no row objects, no `Decimal` a holder), changed by
+     the lane in place, flushed to `account_state` natively, with the undo journal's records
+     natively too. The state manager reads and writes it through a mapping, so the Python
+     operations (everything but plain transfers and spot orders) see the same values.
+   * **The nonces and their commitment** the same way: the lane's nonce updates and the
+     commitment entries they feed, without a Python value each.
+   * **Receipts** recorded natively and turned into dicts when read.
+   The Python state stays the reference the native one is held to, as the lanes are now
+   (random blocks run both ways). A second core per node (docs/SECOND_CORE.md) is the
+   alternative for admission and the index.
+2. **What an import costs beside execution.** The rules a block is judged by (its body root,
+   its gas and fee rules, about 13 ms a block), storing its section (about 11 KB of text an
+   operation) and the roots (the proof tree native since 37–38) are paid by every validator
+   for every block.
 3. **The size of what a block stores and hashes.** Binary transactions (30, above) took a third
    off; the rest is the signature itself (3.3 KB) and a key (1.9 KB) in every transaction. A
    key named by its account once the chain has seen it would take the key out, but no registry

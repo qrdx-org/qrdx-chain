@@ -60,13 +60,17 @@ def enabled() -> bool:
 
 
 class Prepared:
-    """What Python's own checks found of a plain transfer, for the native passes."""
+    """What Python's own checks found of a plain transfer, for the native passes — and the
+    decimals' text, as the native passes take them (written once, with the rest remembered on
+    the transaction: ``prepare``)."""
 
-    __slots__ = ("amount", "to", "memo", "max_fee", "fee", "base_gas")
+    __slots__ = ("amount", "to", "memo", "max_fee", "fee", "base_gas", "amount_s", "max_fee_s",
+                 "fee_s")  # fmt: skip
 
     def __init__(self, amount, to, memo, max_fee, fee, base_gas) -> None:
         self.amount, self.to, self.memo = amount, to, memo
         self.max_fee, self.fee, self.base_gas = max_fee, fee, base_gas
+        self.amount_s, self.max_fee_s, self.fee_s = str(amount), str(max_fee), str(fee)
 
 
 def prepare(tx: Any) -> Optional[Prepared]:
@@ -180,7 +184,12 @@ def judge(
             owing[payer] = str(owed[payer])
     out = fn(
         [
-            (tx.nonce_key(), tx.nonce, payers[tx.sender], str(pr.max_fee))
+            (
+                tx.nonce_key(),
+                tx.nonce,
+                payers[tx.sender],
+                pr.max_fee_s if type(pr) is Prepared else str(pr.max_fee),  # (the order lane's too)
+            )
             for tx, pr in zip(txs, prepared, strict=True)
         ],
         lanes,
@@ -247,10 +256,10 @@ def run(
                 tx.nonce,
                 tx.sender,
                 pr.to,
-                str(pr.amount),
+                pr.amount_s,
                 paid[0],
                 str(paid[1]),
-                str(pr.fee),
+                pr.fee_s,
             )
             for tx, pr, paid in zip(txs, prepared, prepaid, strict=True)
         ],
@@ -284,7 +293,7 @@ def run(
     results: List[ExchangeExecResult] = []
     for tx, pr, (ran, found) in zip(txs, prepared, outcomes, strict=True):
         if ran:
-            data: Dict[str, Any] = {"token_address": "QRDX", "to": pr.to, "amount": str(pr.amount)}
+            data: Dict[str, Any] = {"token_address": "QRDX", "to": pr.to, "amount": pr.amount_s}
             if pr.memo:
                 data["memo"] = pr.memo
             result = ExchangeExecResult(success=True, gas_used=GAS, data=data)

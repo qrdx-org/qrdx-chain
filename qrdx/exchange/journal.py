@@ -56,6 +56,10 @@ def _history_enabled() -> bool:
 
 def jsonable(value: Any) -> Any:
     """Decimals as strings, recursively — everything the journal hands out is JSON-safe."""
+    if type(value) is dict and all(
+        type(k) is str and type(v) is str for k, v in value.items()
+    ):  # (most results: flat text, kept as it is)
+        return dict(value)
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, dict):

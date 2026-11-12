@@ -21,6 +21,9 @@ from .logger import get_logger
 logger = get_logger(__name__)
 
 
+_WEI = Decimal(10**18)
+
+
 def _now() -> str:
     """A row's ``created_at``, as SQLite's CURRENT_TIMESTAMP wrote it (UTC, to the second)."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -592,17 +595,20 @@ class DatabaseSQLite:
             except ValueError:
                 ids[a] = None  # unkeyable: no account can exist for it
         wanted = sorted({i for i in ids.values() if i})
-        found = dict(
-            zip(wanted, self.store["account_state"].get_many((i,) for i in wanted), strict=True)
-        )
+        # (the balance column alone: read without making each row's tuple)
+        from .store import unpack
+
+        accounts = self.store["account_state"]
+        values = self.store.native.get_many(accounts.id, [accounts.key(i) for i in wanted])
+        found = {i: unpack(v)[0] for i, v in zip(wanted, values, strict=True) if v is not None}
         out: Dict[str, Decimal] = {}
         for a, i in ids.items():
-            row = found.get(i) if i else None
+            balance = found.get(i) if i else None
             try:
-                wei = int(row.balance) if row is not None and row.balance else 0
+                wei = int(balance) if balance else 0
             except (TypeError, ValueError):
                 wei = 0
-            out[a] = Decimal(wei) / Decimal(10**18) if wei > 0 else Decimal(0)
+            out[a] = Decimal(wei) / _WEI if wei > 0 else Decimal(0)
         return out
 
     async def get_token_balances_of(self, pairs) -> Dict[Tuple[str, str], "Decimal"]:
