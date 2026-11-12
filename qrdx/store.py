@@ -35,6 +35,8 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 
 import qrdx_native
 
+from . import native as _native  # noqa: F401  (sizes the module's thread pool before it starts)
+
 pack = qrdx_native.store_pack
 unpack = qrdx_native.store_unpack
 

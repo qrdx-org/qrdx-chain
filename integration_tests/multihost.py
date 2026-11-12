@@ -25,6 +25,7 @@ ladder this way.
 """
 
 import asyncio
+import math
 import os
 import subprocess
 from typing import IO, Dict, List, Optional
@@ -147,6 +148,8 @@ class ContainerNode:
 
         env = {k: v for k, v in _inherited_env().items() if k.startswith(PASSED)}
         env.update(self.env)
+        # (its own CPUs, not a share of this machine's that the config file names)
+        env["QRDX_NATIVE_THREADS"] = str(max(1, math.ceil(h.cpus)))
         env["PYTHONPATH"] = ":".join([*h.extra_mounts, self.project_root])
         os.makedirs(env["HOME"], exist_ok=True)
         flags: List[str] = []

@@ -24,6 +24,7 @@ byte.
 | `NativeBook` | `orderbook.OrderBook` | every spot pair's book, behind the Python book's interface (`qrdx/exchange/native_book.py`; docs/EXCHANGE_ENGINE.md) |
 | `order_lane_run` | `process_transaction` for plain spot orders (limit and market), cancels and swaps: matching, the pools and the router (`router.rs`), settlement, fees, escrow | a block's runs of them over the native books (`qrdx/exchange/order_lane.py`) |
 | `wire_parse`, `wire_build`, `wire_text` | `wire.py_decode`, `py_encode`, `base64` | exchange transactions' binary form: every block section decoded on import, encoded by its proposer (`qrdx/exchange/wire.py`) |
+| `wire_heads(items)` | `wire.peek` of each item | a section's gas and fee rules and the gas a stored block declares (`wire.heads`) |
 | `tx_read` | the transport's own reading of a relayed transaction (its JSON or binary form): its hash and signed bytes | tests (`tests/test_exchange_wire.py`) |
 | `wire_read(item)` | `wire.decode` and the hash, signed bytes and binary form computed after it | every exchange transaction read in the common form: admission, block sections (`wire._from_read`) |
 | `mldsa65_verify_bind_batch(items)` | `mldsa65_verify_batch` and `verify`'s binding of a key to its sender's address | a batch's signatures (`block_processor._verify_natively`) |
@@ -88,6 +89,14 @@ The update had read each node through a Python dict, and Python had packed its ~
 block one at a time (the bench's state root: 11.9 → 9.0 ms a block). Nodes an update loaded are
 never evicted before it settles.
 
+An update of 256 changes or more is split: the walk from the root first finds the subtrees a
+few levels down (about four a thread) that have changes below them, each is updated on the
+module's threads with its own writes, stale list and missing nodes, and the walk from the root
+then takes each one's result where it would have made it itself — so the writes and stale
+nodes come out in the serial walk's order, byte for byte. The cache's use stamps are atomic so
+the subtrees can share it. 1,000 changes to 2,048 accounts: 3.1 → 2.3 ms for the walk; the rest
+is packing its ~3,500 writes.
+
 The exchange keeps a tree per collection and order book in memory, deep-copied with the state
 every block. Each Python update allocated and hashed a node object per level of each changed
 path: 22 ms for 1,000 changes to a collection of 100,000 entries. The native tree has the same
@@ -101,8 +110,16 @@ native functions raise `ValueError` otherwise rather than give the input a meani
 
 A collection's commitment is an LtHash of its entries' digests. Python built each changed
 entry's 4 KB vector as a big integer: about 6 ms for 1,000 changed entries, plus the sums.
-`lt_mix_entries` builds the vectors in parallel, without Python's lock, and mixes them into the
-accumulator lane by lane. An accumulator that is not well formed is handed back to Python.
+`lt_mix_entries` builds the vectors without Python's lock and mixes them into the accumulator
+lane by lane. An accumulator that is not well formed is handed back to Python.
+
+Each entry is added into a running sum, never held as a vector of its own, and a run of entries
+is split evenly across the module's threads, each folding its share into one sum; fewer than
+48 are summed on the calling thread, where waking the pool cost more than the work (2–47
+entries took about 30 µs each). The store folds changed rows and recomputes a domain from every
+row the same way. On this machine (AVX2, no AVX-512) BLAKE3 writes an entry's 4 KB one block at
+a time, about 3.3 µs an entry on one thread; 1,000 entries take 0.5–0.9 ms on the pool, and
+beyond about eight threads they do not get faster.
 
 Together, a commitment of 1,000 changed entries in a collection of 100,000 went from 33.6 ms
 to 15 ms; the rest is Python encoding each entry, which stays Python's.
@@ -223,6 +240,16 @@ tree by Python's `_py_build`.
 The transport has its own tests (tests/test_net_transport.py, docs/NETWORK.md).
 
 The tests skip when the module is not installed. CI builds it, so they run there.
+
+## Its threads
+
+The module's parallel work (signature batches, the commitments, the proof tree) runs on one
+pool of threads, every core by default. `QRDX_NATIVE_THREADS` sizes it (it sets rayon's
+`RAYON_NUM_THREADS` before the pool starts: qrdx/native.py, which the store imports first).
+Nodes that share a machine should split its cores: scripts/testnet.sh and the test harness give
+each node the machine's cores divided among the nodes (at least 2), and a container node its
+own CPUs. With every core in each of four nodes, their pools' bursts competed for the cores the
+nodes' event loops ran on (docs/PERFORMANCE.md, 40).
 
 ## Building it
 

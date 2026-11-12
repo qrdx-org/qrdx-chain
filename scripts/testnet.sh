@@ -365,6 +365,11 @@ create_node_config() {
     local ws_port=$((8546 + node_id))
     local node_dir="${DATA_DIR}/node${node_id}"
     local config_file="${CONFIG_DIR}/node${node_id}.env"
+    # Each node's native thread pool: its share of this machine's cores (at least 2), unless
+    # QRDX_NATIVE_THREADS is set. A pool of every core in each of four nodes slowed them all
+    # (docs/PERFORMANCE.md, 40).
+    local native_threads=${QRDX_NATIVE_THREADS:-$(( $(nproc 2>/dev/null || echo 4) / total_nodes ))}
+    [ "$native_threads" -lt 2 ] && native_threads=2
     
     mkdir -p "$node_dir"
     
@@ -425,6 +430,9 @@ LOG_DIR=${LOGS_DIR}/node${node_id}
 
 # Suppress liboqs version warnings
 PYTHONWARNINGS=ignore
+
+# The native module's threads (docs/NATIVE.md): the nodes share this machine's cores
+QRDX_NATIVE_THREADS=${native_threads}
 
 # Validator settings
 EOF

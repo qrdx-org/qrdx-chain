@@ -21,6 +21,20 @@ import os
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 
+def _size_pool() -> None:
+    """``QRDX_NATIVE_THREADS``: how many threads the module's pool runs (rayon's
+    ``RAYON_NUM_THREADS``, read when the pool first starts; every core by default). Nodes that
+    share a machine split its cores between them (scripts/testnet.sh writes it): a pool the
+    machine's size in each made their threads compete for the cores the nodes' event loops run
+    on (docs/PERFORMANCE.md, 40)."""
+    raw = os.environ.get("QRDX_NATIVE_THREADS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        os.environ["RAYON_NUM_THREADS"] = raw
+
+
+_size_pool()
+
+
 def _load() -> Any:
     if os.environ.get("QRDX_NATIVE", "1").strip().lower() in ("0", "false", "no", "off"):
         return None  # (turned off)

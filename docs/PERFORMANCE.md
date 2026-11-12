@@ -632,6 +632,55 @@ Each block's phase line ends with its store commits (`db N`; they were SQLite ro
 
     The alternative — a second process per node for admission and the index — is designed in
     docs/SECOND_CORE.md.
+40. **The commitments on the module's threads, a transaction checked once, a section's heads
+    read together, and each node's share of the cores.**
+    * **LtHash on the pool** (docs/NATIVE.md, "The exchange's accumulators"): an entry is
+      added into a running sum (no 2 KB vector each), and a run of entries is split evenly
+      across the module's threads; fewer than 48 are summed on the calling thread (2–47 had
+      cost about 30 µs each, waking the pool). The store's fold and full recomputation sum
+      rows the same way. 1,000 entries: 3.3 ms on one thread, 0.5–0.9 ms now.
+    * **The proof tree's update split across threads** (NATIVE.md, "The proof trees"): the
+      subtrees a few levels down are updated apart and put back in the serial walk's order.
+      4.5 → 3.2 ms a block of 500 transfers.
+    * **A transaction checked once at admission:** `validate_basic` remembers a pass under the
+      transaction's fingerprint (it was asked three times a transaction); no module imported
+      per call on admission's path (seven a transaction); an account without a policy shares
+      one default.
+    * **A section's heads in one call** (`wire.heads`, natively `wire_heads`): the block's gas
+      limit, its fee rules and the gas a stored block declares each read every item's head
+      with Python's `peek`, 3.4 µs an item. Live, a block's rules took 15 ms at 2,000 a second;
+      now 5.
+    * **A block holds its transactions' fingerprints while it runs** (`fingerprints_held`): its
+      hash, signed bytes, lane preparation and validation were each asked of a transaction,
+      each computing one.
+    * **Each node its share of the cores in the multi-node harnesses**
+      (`QRDX_NATIVE_THREADS`: scripts/testnet.sh and the orchestrator write the machine's
+      cores divided among the nodes, at least 2; a container node, its CPUs). Each node's
+      pool had every core, so four nodes' bursts — commitments, proof trees, signature batches
+      — competed for the cores their event loops ran on. A node alone on its machine keeps the
+      default (every core).
+
+    | µs a transfer (500 a block, 2,048 accounts) | Before | After |
+    |---|---:|---:|
+    | Admission (decode, checks, mempool) | 57 | 43 |
+    | Import: execution | 34 | 29 |
+    | Import: flush | 9.5 | 8.2 |
+    | Import: unified state root | 17.7 | 14.4 |
+    | In all | 150 | 125 |
+
+    Live (4 nodes, 2,048 accounts, steps of 30 s):
+
+    | | 1,000 a second | 1,500 | 2,000 | 2,500 |
+    |---|---|---|---|---|
+    | Before (after 39) | p95 0.49 s | p95 0.68 s | 2.84 blocks/s, p50 3.85 s | — |
+    | The code above, every core a node | p95 0.32 s | p95 0.59 s | 3.59 blocks/s, p50 0.65 s, p95 1.93 s | 2.91 blocks/s (first step) |
+    | …and 6 threads a node | p95 0.35 s | p95 0.53 s | **3.99 blocks/s, p50 0.48 s, p95 0.87 s** | 2.81–3.31 blocks/s, backlog |
+
+    At 2,000 a second every slot was proposed, with no fork or reorganization; an import's
+    median was 88 ms for a median 456 operations (it had been 134 ms for 586, the backlog's
+    blocks being bigger). 2,000 a second as the first step sustained with every core a node
+    too (p95 0.66 s); after the steps before it, only with the cores shared. 2,500 a second
+    builds a backlog either way.
 
 ## The block pipeline, measured offline
 
@@ -756,11 +805,11 @@ batching is the lever that moves it.
 
 In the order they would pay, toward four blocks a second at 2,000–4,000 transfers:
 
-1. **The exchange's state held natively.** After 36–39 an importing validator spends about
-   157 µs of its one thread on each transfer (`scripts/bench/import_block.py`; about twice that
-   live, beside three other nodes): admission 67, the import 89 (execution 35, the store 16,
-   the roots 16, pre-loads 11, the flush 10). What is left is no longer one cost but dozens of
-   2–6 µs ones, and most are one thing: the exchange's balances, deltas and nonces live in
+1. **The exchange's state held natively.** After 36–40 an importing validator spends about
+   125 µs of its one thread on each transfer (`scripts/bench/import_block.py`; about 1.8 times
+   that live, beside three other nodes): admission 43, the import 82 (execution 29, the store
+   17, the roots 14, pre-loads 11, the flush 8). What is left is no longer one cost but dozens
+   of 2–6 µs ones, and most are one thing: the exchange's balances, deltas and nonces live in
    Python dicts of `Decimal`, so the native lane converts each value to text and back, writes
    an undo record a key, and the pre-load, the flush and the commitments each read or write
    them again. The step that removes them together, in this order:
@@ -775,10 +824,10 @@ In the order they would pay, toward four blocks a second at 2,000–4,000 transf
    The Python state stays the reference the native one is held to, as the lanes are now
    (random blocks run both ways). A second core per node (docs/SECOND_CORE.md) is the
    alternative for admission and the index.
-2. **What an import costs beside execution.** The rules a block is judged by (its body root,
-   its gas and fee rules, about 13 ms a block), storing its section (about 11 KB of text an
-   operation) and the roots (the proof tree native since 37–38) are paid by every validator
-   for every block.
+2. **What an import costs beside execution.** The rules a block is judged by (since 40 about
+   5 ms a block, most of it the body root: SHA-256 over the section's ~4 MB of text), storing
+   its section (about 11 KB of text an operation) and the roots (the proof tree native since
+   37–38, split across threads since 40) are paid by every validator for every block.
 3. **The size of what a block stores and hashes.** Binary transactions (30, above) took a third
    off; the rest is the signature itself (3.3 KB) and a key (1.9 KB) in every transaction. A
    key named by its account once the chain has seen it would take the key out, but no registry

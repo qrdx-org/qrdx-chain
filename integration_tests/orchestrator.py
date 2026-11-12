@@ -308,6 +308,10 @@ class TestnetOrchestrator:
             "QRDX_DISABLE_RATE_LIMIT": "true",
             # Operational-readiness: exercise the realtime stream (/ws + /stream) in-suite.
             "QRDX_ENABLE_STREAMING": "true",
+            # The native module's threads: the nodes share this machine's cores (a pool of
+            # every core in each slowed them all: docs/PERFORMANCE.md, 40).
+            "QRDX_NATIVE_THREADS": os.environ.get("QRDX_NATIVE_THREADS")
+            or str(max(2, (os.cpu_count() or 4) // max(1, self.num_nodes))),
         }
 
         if self.hosts is not None:
