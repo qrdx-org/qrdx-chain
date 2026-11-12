@@ -60,23 +60,36 @@ pub(crate) fn bit(key: &[u8], i: usize) -> bool {
 /// The first ``depth`` bits of ``key`` as a number, in lowercase hex without leading zeros
 /// (Python's ``f"{path:x}"``).
 fn path_hex(key: &[u8], depth: usize) -> String {
-    let mut digits: Vec<u8> = Vec::new(); // big-endian bits → nibbles
-    let mut value: Vec<bool> = (0..depth).map(|i| bit(key, i)).collect();
-    if value.is_empty() {
+    if depth == 0 {
         return "0".to_string();
     }
-    let pad = (4 - value.len() % 4) % 4;
-    let mut bits: Vec<bool> = vec![false; pad];
-    bits.append(&mut value);
-    for chunk in bits.chunks(4) {
-        let n = chunk.iter().fold(0u8, |acc, &b| (acc << 1) | b as u8);
-        digits.push(n);
+    // The first ``depth`` bits as a number: padded at the front to whole nibbles.
+    let pad = (4 - depth % 4) % 4;
+    let mut out = String::with_capacity(depth / 4 + 1);
+    let mut started = false;
+    let mut at = 0usize; // (the next bit of the key)
+    for j in 0..(depth + pad) / 4 {
+        let mut n = 0u32;
+        for b in 0..4 {
+            let i = j * 4 + b;
+            let one = if i < pad {
+                false
+            } else {
+                let one = bit(key, at);
+                at += 1;
+                one
+            };
+            n = (n << 1) | one as u32;
+        }
+        if n != 0 || started {
+            started = true;
+            out.push(char::from_digit(n, 16).expect("a nibble"));
+        }
     }
-    let first = digits.iter().position(|&d| d != 0).unwrap_or(digits.len() - 1);
-    digits[first..]
-        .iter()
-        .map(|&d| char::from_digit(d as u32, 16).expect("a nibble"))
-        .collect()
+    if out.is_empty() {
+        out.push('0');
+    }
+    out
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -240,16 +253,16 @@ impl<'a, C: NodeSource> Tree<'a, C> {
         }
     }
 
-    /// The subtree of ``live`` (sorted, distinct keys, all present) below ``depth``.
+    /// The subtree of ``live`` (sorted, distinct keys, all present) below ``depth``. Sorted keys
+    /// sharing their first ``depth`` bits split at one point by the next.
     fn build(&mut self, depth: usize, live: &[(Vec<u8>, Vec<u8>)]) -> Option<Ref> {
         match live.len() {
             0 => None,
             1 => Some(self.leaf(depth, &live[0].0, &live[0].1)),
             _ => {
-                let (l, r): (Vec<_>, Vec<_>) =
-                    live.iter().cloned().partition(|c| !bit(&c.0, depth));
-                let lref = self.build(depth + 1, &l);
-                let rref = self.build(depth + 1, &r);
+                let split = live.partition_point(|c| !bit(&c.0, depth));
+                let lref = self.build(depth + 1, &live[..split]);
+                let rref = self.build(depth + 1, &live[split..]);
                 Some(self.internal(depth, &live[0].0, lref, rref))
             }
         }
@@ -301,18 +314,19 @@ impl<'a, C: NodeSource> Tree<'a, C> {
                 Ok(self.build(depth, &live))
             }
             Node::Internal { left, right } => {
-                let (lc, rc): (Vec<Change>, Vec<Change>) =
-                    changes.iter().cloned().partition(|c| !bit(&c.0, depth));
+                // (sorted, under one node: the changes split at one point by this depth's bit)
+                let split = changes.partition_point(|c| !bit(&c.0, depth));
+                let (lc, rc) = (&changes[..split], &changes[split..]);
                 // (both sides, even if one is missing a node: every missing node in one pass)
                 let lres = if lc.is_empty() {
                     Ok(left.clone())
                 } else {
-                    self.update(left.clone(), &lc, depth + 1)
+                    self.update(left.clone(), lc, depth + 1)
                 };
                 let rres = if rc.is_empty() {
                     Ok(right.clone())
                 } else {
-                    self.update(right.clone(), &rc, depth + 1)
+                    self.update(right.clone(), rc, depth + 1)
                 };
                 let (lref, rref) = (lres?, rres?);
                 if lref == left && rref == right {
@@ -487,6 +501,9 @@ fn parse_changes(changes: &Bound<'_, PyList>) -> PyResult<Vec<Change>> {
         }
         parsed.push((k.to_vec(), v.map(|v| v.as_bytes().to_vec())));
     }
+    // (the walk splits sorted changes by position: in key order, a later duplicate after an
+    // earlier one, as a stable sort leaves them)
+    parsed.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(parsed)
 }
 
@@ -494,13 +511,18 @@ fn parse_changes(changes: &Bound<'_, PyList>) -> PyResult<Vec<Change>> {
 /// ``("ok", root as encode_ref writes it, [(store key, store value)] of the new nodes,
 /// [(store key, b"")] of the stale ones)`` — as ``smt_nodes`` (``(nkey,)`` → ``(data,)``) and
 /// ``smt_stale`` (``(version, nkey)`` → ``()``) keep them — or ``("missing", [nkey, ...])``.
+/// Given ``store`` and its ``(smt_nodes, smt_stale)`` table ids, it writes them there itself
+/// and returns how many of each instead (``("ok", root, n_new, n_stale)``).
 #[pyfunction]
+#[pyo3(signature = (root, changes, version, nodes, store=None, tables=None))]
 pub fn smt_update_into<'py>(
     py: Python<'py>,
     root: &[u8],
     changes: &Bound<'py, PyList>,
     version: u64,
     nodes: &Bound<'py, SmtNodes>,
+    store: Option<&Bound<'py, crate::store::Store>>,
+    tables: Option<(usize, usize)>,
 ) -> PyResult<PyObject> {
     use crate::store::codec::{escaped_into, uint_into, BYTES_TAG, STRING_TAG};
 
@@ -529,6 +551,35 @@ pub fn smt_update_into<'py>(
         Ok(new_root) => {
             let mut encoded = Vec::new();
             encode_ref(&new_root, &mut encoded);
+            if let (Some(store), Some((nodes_table, stale_table))) = (store, tables) {
+                let mut prefix = Vec::with_capacity(9);
+                uint_into(&mut prefix, version);
+                let gone: Vec<(Vec<u8>, Vec<u8>)> = stale
+                    .iter()
+                    .map(|k| {
+                        let mut key = prefix.clone();
+                        escaped_into(&mut key, STRING_TAG, k.as_bytes());
+                        (key, Vec::new())
+                    })
+                    .collect();
+                let mut packed: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(writes.len());
+                for (k, v) in writes.into_iter().flatten() {
+                    let mut key = Vec::with_capacity(k.len() + 2);
+                    escaped_into(&mut key, STRING_TAG, k.as_bytes());
+                    let mut value = Vec::with_capacity(v.len() + 8);
+                    escaped_into(&mut value, BYTES_TAG, &v);
+                    packed.push((key, value));
+                    held.put(k, v);
+                }
+                let (capacity, now) = (held.capacity, held.tick.get());
+                held.trim(capacity, now);
+                held.settled = held.tick.get();
+                let (n_new, n_stale) = (packed.len(), gone.len());
+                let store = store.borrow();
+                store.write_packed(nodes_table, packed)?;
+                store.write_packed(stale_table, gone)?;
+                return Ok(("ok", PyBytes::new_bound(py, &encoded), n_new, n_stale).into_py(py));
+            }
             let packed = PyList::empty_bound(py);
             for (k, v) in writes.into_iter().flatten() {
                 let mut key = Vec::with_capacity(k.len() + 2);

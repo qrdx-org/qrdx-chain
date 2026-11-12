@@ -280,14 +280,15 @@ def _native_update_into(
     root_ref: Optional[smt.Ref],
     changes: List[smt.Change],
     version: int,
-) -> Tuple[Optional[smt.Ref], List[Tuple[bytes, bytes]], List[Tuple[bytes, bytes]]]:
-    """``_native_update`` over the native node cache: the new root, and the new and stale nodes
-    as the store keeps them (the cache holds the new nodes already)."""
+) -> Optional[smt.Ref]:
+    """``_native_update`` over the native node cache, writing the new and stale nodes to the
+    store (and the new ones to the cache) itself: the new root."""
     encoded = smt.encode_ref(root_ref)
+    tables = (store["smt_nodes"].id, store["smt_stale"].id)
     for _ in range(300):
-        out = update(encoded, changes, version, cache)
+        out = update(encoded, changes, version, cache, store.native, tables)
         if out[0] == "ok":
-            return smt.Ref.decode(out[1])[0], out[2], out[3]
+            return smt.Ref.decode(out[1])[0]
         _load_missing(store, cache, list(out[1]))
     raise RuntimeError("the state tree update did not settle")
 
@@ -381,11 +382,9 @@ async def proof_root(db: Any, height: int, exchange_root: Optional[bytes] = None
             changes = _changes(store, marks)
             update_into = smt_update_into_function()
             if update_into is not None and not isinstance(cache, OrderedDict):
-                root_ref, packed, gone = _native_update_into(
+                root_ref = _native_update_into(
                     update_into, store, cache, root_ref, changes, version
                 )
-                store["smt_nodes"].put_raw(packed)
-                store["smt_stale"].put_raw(gone)
             else:
                 native_update = smt_update_function()
                 if native_update is not None:

@@ -219,6 +219,10 @@ class ExchangeSubmitter:
             await self._yield_to()
         self._saw(tx_hash)
         await self._preverify(tx)
+        if self._yield_to is not None:
+            # (blocks first again: a block that arrived while the batch's signatures were checked
+            # would otherwise wait for the whole batch's admission at its every step)
+            await self._yield_to()
         short = await self._unaffordable(tx)
         if short:
             return False, short, None

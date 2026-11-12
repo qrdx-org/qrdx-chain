@@ -24,7 +24,7 @@ Methods:
 import asyncio
 import json
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ...constants import SLOTS_PER_EPOCH
 from ...logger import get_logger
@@ -137,6 +137,10 @@ class P2PModule(RPCModule):
         super().__init__(context)
         self._block_relay: Any = None  # compact blocks (qrdx/node/block_relay.py)
         self._rebuilding: set = set()  # (block hashes being rebuilt from a compact block now)
+        # A block one above the tip, held until its parent is imported (by height: the block,
+        # its sender, its timer). A block often overtakes its parent under load: dropped, it was
+        # fetched again by fork resolution, and meanwhile its slot's successor built over it.
+        self._early: Dict[int, Tuple[Dict, Optional[str], Any]] = {}
         self._db: Any = None
         self._security: Any = None
         self._propagate_fn: Any = None
@@ -247,6 +251,66 @@ class P2PModule(RPCModule):
             self._on_fork(sender, f"{reason} (height {block_no})")
         except Exception as e:
             logger.debug(f"fork signal dropped: {e}")
+
+    # A held block is given up after this long (then fork resolution fetches what it needs).
+    EARLY_FOR = 1.0
+
+    def _hold_early(self, height: int, block_data: Dict) -> bool:
+        """Hold a block one above the tip until its parent is imported; False if one is held at
+        that height already (this one goes to fork resolution, as before)."""
+        if height in self._early:
+            return False
+        from ...validator import pipeline
+
+        sender = rpc_caller.get()
+        loop = asyncio.get_running_loop()
+        timer = loop.call_later(self.EARLY_FOR, self._expire_early, height)
+        self._early[height] = (block_data, sender, timer)
+        pipeline.note_incoming(height, 1)  # (a proposer waits for it as for one being imported)
+        return True
+
+    def _take_early(self, height: int) -> Optional[Tuple[Dict, Optional[str]]]:
+        held = self._early.pop(height, None)
+        if held is None:
+            return None
+        from ...validator import pipeline
+
+        block_data, sender, timer = held
+        timer.cancel()
+        pipeline.note_incoming(height, -1)
+        return block_data, sender
+
+    def _release_early(self, height: int) -> None:
+        """Its parent is imported: submit the block held at ``height`` (as its sender sent it)."""
+        held = self._take_early(height)
+        if held is None:
+            return
+        block_data, sender = held
+
+        async def resubmit() -> None:
+            token = rpc_caller.set(sender)
+            try:
+                reply = await self.submitBlock(block_data)
+                if not reply.get("ok"):
+                    logger.debug(f"held block {height} not taken: {reply.get('error')}")
+            except Exception as e:
+                logger.debug(f"held block {height} failed: {e}")
+            finally:
+                rpc_caller.reset(token)
+
+        asyncio.ensure_future(resubmit())
+
+    def _expire_early(self, height: int) -> None:
+        """Its parent did not come: fork resolution, as for any block above the tip."""
+        held = self._take_early(height)
+        if held is None:
+            return
+        block_data, sender = held
+        token = rpc_caller.set(sender)
+        try:
+            self._signal_fork(height, block_data, "a block above our tip")
+        finally:
+            rpc_caller.reset(token)
 
     def _require_db(self):
         if self._db is None:
@@ -469,6 +533,8 @@ class P2PModule(RPCModule):
             if next_block_id < block_no:
                 # Peer is ahead—request sync (and check whether it is on another branch).
                 await self._note_network_ahead(block_data, block_no, block_content)
+                if block_no == next_block_id + 1 and self._hold_early(int(block_no), block_data):
+                    return {"ok": False, "error": "held: its parent is not imported yet"}
                 self._signal_fork(block_no, block_data, "a block above our tip")
                 return {
                     "ok": False,
@@ -576,10 +642,13 @@ class P2PModule(RPCModule):
                     if ahead is not None:
                         phases.mark("ahead")
                 try:
-                    return await self._run_pos_block(
+                    reply = await self._run_pos_block(
                         block_data, block_no, block_hash, block_content, validator_address,
                         phases, _received, ahead,
                     )  # fmt: skip
+                    if isinstance(reply, dict) and reply.get("ok"):
+                        self._release_early(int(block_no) + 1)
+                    return reply
                 finally:
                     if ahead is not None and not ahead.finished:
                         logger.warning(

@@ -353,6 +353,39 @@ async def test_the_tree_update_into_native_nodes_is_pythons(seed):
     assert py_root is not None and len(nodes) <= 40  # (down to capacity after each update)
 
 
+def test_the_tree_update_writes_into_a_store_what_it_would_return(tmp_path):
+    """Given the store and its tables, ``smt_update_into`` writes the new and stale nodes there
+    itself: the very rows it returns packed otherwise."""
+    from qrdx.crypto import smt
+    from qrdx.store import Spec, Store
+
+    specs = [Spec("smt_nodes", [("nkey", "TEXT")], [("data", "BLOB", b"")]),
+             Spec("smt_stale", [("version", "INTEGER"), ("nkey", "TEXT")], [])]
+    rng = random.Random(7)
+    keys = [smt.key_of(bytes([i])) for i in range(80)]
+    store = Store(str(tmp_path / "t"), specs)
+    try:
+        a, b = N.SmtNodes(1000), N.SmtNodes(1000)
+        root_a = root_b = None
+        tables = (store["smt_nodes"].id, store["smt_stale"].id)
+        returned = {"smt_nodes": [], "smt_stale": []}
+        for version in range(1, 15):
+            changes = sorted({rng.choice(keys): (None if rng.random() < 0.2 else rng.randbytes(20))
+                              for _ in range(15)}.items())
+            out_a = N.smt_update_into(smt.encode_ref(root_a), changes, version, a)
+            out_b = N.smt_update_into(smt.encode_ref(root_b), changes, version, b,
+                                      store.native, tables)
+            assert out_a[0] == out_b[0] == "ok" and out_a[1] == out_b[1]
+            assert (len(out_a[2]), len(out_a[3])) == (out_b[2], out_b[3])
+            returned["smt_nodes"] += out_a[2]
+            returned["smt_stale"] += out_a[3]
+            root_a = root_b = smt.Ref.decode(out_a[1])[0]
+        for table, rows in returned.items():
+            assert store.native.scan(store[table].id) == sorted(dict(rows).items())
+    finally:
+        store.close()
+
+
 def test_the_native_node_cache_keeps_the_most_recently_used():
     from qrdx.crypto import smt
 

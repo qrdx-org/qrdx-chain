@@ -562,6 +562,35 @@ Each block's phase line ends with its store commits (`db N`; they were SQLite ro
 
     2,000 a second still builds a backlog (latency p50 ~15 s).
 
+38. **Blocks first, and a block that overtakes its parent.**
+    * **A block that arrives before its parent is held** (qrdx/rpc/modules/p2p.py
+      `_hold_early`) and submitted once its parent is imported; a proposer waits for it as for
+      one being imported. Under load a block often overtook its parent. It was dropped, fetched
+      again by fork resolution (which takes the block lock), and meanwhile the next slot's
+      proposer built a competing block over it. Its parent not imported within a second, it
+      goes to fork resolution as before.
+    * **Admission yields to blocks twice:** after the batch's signature check too. When the
+      check finished, every submission of the batch resumed even if a block had arrived
+      meanwhile, and ran inside its import's awaits (an import's exchange phase took about
+      twice its CPU time).
+    * **The proof tree's update walks sorted changes by position** instead of copying them at
+      every level, and writes its nodes into the store itself (no Python object a node): 6.4 →
+      4.8 ms for 1,000 of 2,048 leaves, and the store writes that `put_raw` did.
+
+    | 4 nodes, one host, 2,048 accounts | Before (after 37) | After |
+    |---|---:|---:|
+    | 1,500 a second: blocks a second | 3.79 | 3.97 |
+    | 1,500 a second: latency p50 / p95 | 0.53 s / 1.75 s | 0.48–0.52 s / 0.89–1.02 s |
+    | 1,500 a second: proof root in an import (median) | 21–25 ms | 15 ms |
+    | 2,000 a second: blocks a second (executed) | 3.63 (1,899) | 3.03–3.41 (1,864–1,912) |
+    | 2,000 a second: branch switches (whole run) | 26 | 13 |
+
+    At 1,500 a second every operation is executed, with p95 latency about a second. 2,000 a
+    second still falls behind: each validator's loop is about 70–80% busy there (an import of
+    ~500 operations is ~140 ms, ~90 of it CPU), so blocks arrive and import late, the next
+    proposer races them, and the backlog grows. What moves it now is less work per operation on
+    the loop: the exchange's state and admission natively, or a second core per node.
+
 ## The block pipeline, measured offline
 
 `scripts/bench/exchange_block.py` times one block's exchange section on a real database.

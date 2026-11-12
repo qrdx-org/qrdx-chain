@@ -591,6 +591,20 @@ macro_rules! with {
     }};
 }
 
+impl Store {
+    /// Rows already packed, written as ``put_many`` writes them: for the crate's other modules
+    /// (the proof tree writes its nodes here without a Python object each).
+    pub(crate) fn write_packed(&self, t: usize, items: Vec<(Vec<u8>, Vec<u8>)>) -> PyResult<()> {
+        with!(self, inner, {
+            inner.table(t)?;
+            for (k, v) in items {
+                inner.write(t, k, Some(v))?;
+            }
+            Ok(())
+        })
+    }
+}
+
 #[pymethods]
 impl Store {
     /// Open (or create) the store at ``path`` (a file) with ``tables``. ``max_gb``: the most

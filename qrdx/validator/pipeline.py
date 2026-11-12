@@ -242,8 +242,19 @@ class incoming_block:
 
 
 def incoming(height: int) -> bool:
-    """Whether a block at ``height`` is being imported."""
+    """Whether a block at ``height`` is being imported (or held for its parent)."""
     return int(height) in _INCOMING
+
+
+def note_incoming(height: int, delta: int) -> None:
+    """Count (``delta`` 1) or uncount (-1) a block at ``height`` outside ``incoming_block``: one
+    held until its parent is imported (qrdx/rpc/modules/p2p.py)."""
+    h = int(height)
+    n = _INCOMING.get(h, 0) + delta
+    if n > 0:
+        _INCOMING[h] = n
+    else:
+        _INCOMING.pop(h, None)
 
 
 # The highest block a peer sent above this node's tip, with its proposer's signature checked, and
