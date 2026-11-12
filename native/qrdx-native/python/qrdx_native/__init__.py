@@ -31,6 +31,7 @@ from ._native import (
     tx_read,
     wire_build,
     wire_parse,
+    wire_heads,
     wire_read,
     wire_text,
 )
@@ -66,6 +67,7 @@ __all__ = [
     "tx_read",
     "wire_build",
     "wire_parse",
+    "wire_heads",
     "wire_read",
     "wire_text",
 ]

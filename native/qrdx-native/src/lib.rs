@@ -264,6 +264,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(wire::wire_parse, m)?)?;
     m.add_function(wrap_pyfunction!(wire::wire_build, m)?)?;
     m.add_function(wrap_pyfunction!(wire::wire_text, m)?)?;
+    m.add_function(wrap_pyfunction!(wire::wire_heads, m)?)?;
     m.add_function(wrap_pyfunction!(xfer::wire_read, m)?)?;
     m.add_function(wrap_pyfunction!(xfer::mldsa65_verify_bind_batch, m)?)?;
     m.add_class::<net::NetService>()?;

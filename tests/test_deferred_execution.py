@@ -207,5 +207,5 @@ def test_a_failed_section_refuses_the_block_under_the_feature():
     does not run refuses the block (it used to be adopted on the root-less path)."""
     from qrdx.node import block_import
 
-    src = inspect.getsource(block_import._apply_exchange_section_on_import)
+    src = inspect.getsource(block_import._apply_decoded_section)  # (the section, decoded, run)
     assert "if deferred:\n                return False, err" in src

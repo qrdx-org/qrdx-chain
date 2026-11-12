@@ -305,3 +305,61 @@ mod tests {
         }
     }
 }
+
+/// ``peek`` of each item (qrdx/exchange/wire.py): ``(op_type, gas_limit, gas_price)`` read from
+/// the head of a transaction's text — its first 64 characters, decoded strictly — where Python's
+/// reader takes the fast path (a whole price); None for anything else (bytes, a price written
+/// as text, a head Python would read whole, anything malformed), which ``peek`` reads or refuses.
+/// A section's gas and fee rules read every item's head: in Python, about 3.4 µs each.
+#[pyfunction]
+pub fn wire_heads(py: Python<'_>, items: &Bound<'_, pyo3::types::PyList>) -> PyResult<PyObject> {
+    let out = pyo3::types::PyList::empty_bound(py);
+    for item in items.iter() {
+        let head = item.downcast::<PyString>().ok().and_then(|s| {
+            let text = s.to_str().ok()?.as_bytes();
+            let prefix = &text[..text.len().min(64)];
+            if !prefix.is_ascii() {
+                return None;
+            }
+            head_of(&b64_decode(prefix)?)
+        });
+        match head {
+            Some((op, gas, price)) => out.append((op, gas, price))?,
+            None => out.append(py.None())?,
+        }
+    }
+    Ok(out.into_py(py))
+}
+
+/// The fast path of ``peek``'s reader over a head: version, operation, chain id, nonce, gas
+/// limit, then a whole price (tag 0). Varints as ``_Reader.varint`` reads them: up to 11 bytes,
+/// any form.
+fn head_of(raw: &[u8]) -> Option<(u8, u128, u128)> {
+    fn varint(bytes: &mut impl Iterator<Item = u8>) -> Option<u128> {
+        let (mut n, mut shift) = (0u128, 0u32);
+        loop {
+            let b = bytes.next()?;
+            n |= u128::from(b & 0x7F) << shift;
+            if b & 0x80 == 0 {
+                return Some(n);
+            }
+            shift += 7;
+            if shift > 70 {
+                return None;
+            }
+        }
+    }
+    let mut bytes = raw.iter().copied();
+    if bytes.next()? != VERSION {
+        return None;
+    }
+    let op = bytes.next()?;
+    varint(&mut bytes)?; // (chain id)
+    varint(&mut bytes)?; // (nonce)
+    let gas = varint(&mut bytes)?;
+    if bytes.next()? != 0 {
+        return None; // (a price written as text: Python decodes the whole)
+    }
+    let price = varint(&mut bytes)?;
+    Some((op, gas, price))
+}

@@ -143,7 +143,7 @@ def test_every_path_sets_the_gates_through_one_function():
     from qrdx.node import block_import
 
     root = pathlib.Path(BP.__file__).parents[1]
-    importer = inspect.getsource(block_import._apply_exchange_section_on_import)
+    importer = inspect.getsource(block_import._apply_decoded_section)
     proposer_src = (root / "validator" / "node_integration.py").read_text()
     bodies = {
         "importer": importer,

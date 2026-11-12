@@ -31,6 +31,7 @@ Security:
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import json
@@ -38,7 +39,7 @@ import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, cast
 
 ZERO = Decimal("0")
 
@@ -1097,6 +1098,27 @@ CANCEL_OPS = frozenset(
         ExchangeOpType.TWAP_CANCEL,
     }
 )
+
+
+@contextlib.contextmanager
+def fingerprints_held(txs: Iterable[Any]) -> Iterator[None]:
+    """Hold each transaction's fingerprint (``_fp_held``) while the block that carries them
+    runs: nothing changes a transaction's signed fields then, and its hash, signed bytes,
+    binary form, lane preparation and validation, remembered under its fingerprint, are each
+    asked of it (a fingerprint was computed four times a transaction). Released when the block
+    is done, whatever happens; one already held (by another holder) is left to it."""
+    held = []
+    for tx in txs:
+        if type(tx) is ExchangeTransaction and "_fp_held" not in tx.__dict__:
+            fingerprint = tx._fingerprint()
+            if fingerprint is not None:
+                tx.__dict__["_fp_held"] = fingerprint
+                held.append(tx)
+    try:
+        yield
+    finally:
+        for tx in held:
+            tx.__dict__.pop("_fp_held", None)
 
 
 def free_trading_op(op_type: "ExchangeOpType", params: Dict[str, Any]) -> bool:

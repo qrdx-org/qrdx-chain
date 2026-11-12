@@ -306,7 +306,7 @@ def test_every_path_sets_the_committee_before_each_block():
     assert "preload_sender_balances(db, txs, mgr, height)" in inspect.getsource(DSR)
     assert "await ensure_oracle_committee(" in inspect.getsource(block_import._exchange_tick_on_import)
     assert "preload_sender_balances(_node.db, _decoded, mgr, int(block_height))" in inspect.getsource(
-        block_import._apply_exchange_section_on_import)
+        block_import._apply_decoded_section)
     assert "ensure_oracle_committee(" in inspect.getsource(p2p)
     src = inspect.getsource(NI.ValidatorNode._block_production_loop)
     assert "ensure_oracle_committee(" in src and "mgr, next_height" in src

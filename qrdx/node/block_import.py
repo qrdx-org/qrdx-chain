@@ -117,19 +117,8 @@ async def _apply_exchange_section_on_import(
     """
     if not ex_section:
         return True, ""
-    from ..exchange.block_processor import (
-        ENFORCE_EXCHANGE_COLLATERAL,
-        apply_enforcement,
-        decode_exchange_txs,
-        flush_exchange_balance_deltas,
-        flush_token_balance_deltas,
-        flush_validator_lifecycle_deltas,
-        preload_sender_balances,
-        preload_token_balances,
-        section_form_error,
-        verify_exchange_txs,
-    )
-    from ..exchange.state_manager import ExchangeStateManager
+    from ..exchange.block_processor import decode_exchange_txs, section_form_error
+    from ..exchange.transactions import fingerprints_held
 
     # Authenticate every transaction first, on both paths, before anything changes. The
     # trust-replay branch (no declared root) used to execute the section unverified: a proposer
@@ -146,6 +135,30 @@ async def _apply_exchange_section_on_import(
         _decoded = decode_exchange_txs(ex_section)
     except Exception as e:
         return False, f"undecodable exchange section: {e}"
+    # (nothing changes these transactions' signed fields while the block runs: what is
+    # remembered on them by their fingerprints is asked without computing one each time)
+    with fingerprints_held(_decoded):
+        return await _apply_decoded_section(
+            block_height, block_timestamp, _decoded, declared_root, block_epoch
+        )
+
+
+async def _apply_decoded_section(
+    block_height, block_timestamp, _decoded, declared_root, block_epoch
+):
+    """``_apply_exchange_section_on_import`` from its decoded transactions on."""
+    from ..exchange.block_processor import (
+        ENFORCE_EXCHANGE_COLLATERAL,
+        apply_enforcement,
+        flush_exchange_balance_deltas,
+        flush_token_balance_deltas,
+        flush_validator_lifecycle_deltas,
+        preload_sender_balances,
+        preload_token_balances,
+        verify_exchange_txs,
+    )
+    from ..exchange.state_manager import ExchangeStateManager
+
     for _i, (_ok, _why) in enumerate(await verify_exchange_txs(_decoded)):
         if not _ok:
             return False, f"exchange tx {_i} in block {block_height} failed verification: {_why}"

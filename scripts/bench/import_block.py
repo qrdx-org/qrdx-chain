@@ -41,6 +41,7 @@ async def run(args) -> None:
     from qrdx.exchange import ExchangeStateManager, block_processor as BP
     from qrdx.exchange.mempool import ExchangeMempool
     from qrdx.exchange.submission import ExchangeSubmitter
+    from qrdx.exchange.transactions import fingerprints_held
     from qrdx.validator.node_integration import ValidatorNode
 
     db, path, keys = await _setup(args.accounts)
@@ -98,6 +99,9 @@ async def run(args) -> None:
             mgr = ExchangeStateManager.get_instance()
             with phase("import: decode, already checked?"):
                 txs = BP.decode_exchange_txs(section)
+                # (as block_import holds them, from decoding to the journal)
+                held = fingerprints_held(txs)
+                held.__enter__()
                 for ok, why in await BP.verify_exchange_txs(txs):
                     assert ok, why
             with phase("import: preload balances"):
@@ -114,6 +118,7 @@ async def run(args) -> None:
                 )
                 await BP.flush_token_balance_deltas(db, mgr)
                 await BP.flush_validator_lifecycle_deltas(db, mgr, block_epoch=0, block_height=b)
+                held.__exit__(None, None, None)
             with phase("import: unified state root"):
                 await ValidatorNode._compute_unified_state_root(SimpleNamespace(db=db), b, b)
             with phase("import: store the block"):

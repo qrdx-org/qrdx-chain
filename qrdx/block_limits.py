@@ -60,14 +60,17 @@ def max_evm_tx_gas() -> int:
 
 def exchange_section_gas(section: Optional[Iterable[Any]]) -> int:
     """The declared gas limits of an exchange section's operations, summed."""
+    from .exchange.wire import heads
+
     total = 0
-    for item in section or ():
+    items = list(section or ())
+    # (the binary form's texts: their heads read alone, together)
+    texts = iter(heads([i for i in items if isinstance(i, str)]))
+    for item in items:
         if isinstance(item, dict):
             gas = item.get("gas_limit", 100_000)
-        elif isinstance(item, str):  # (the binary form's text: its head read alone)
-            from .exchange.wire import peek
-
-            gas = peek(item)[1]
+        elif isinstance(item, str):
+            gas = next(texts)[1]
         else:
             gas = item.gas_limit
         total += int(gas)

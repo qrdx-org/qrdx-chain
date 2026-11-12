@@ -8,6 +8,7 @@ not flat plain strings, a varint or base64 written another way, an unset timesta
 
 import base64
 import json
+import re
 import random
 import struct
 
@@ -269,3 +270,110 @@ def test_a_text_is_remembered_only_if_it_is_the_one_python_writes():
                 if base64.b64decode(other) == raw:
                     assert native._native.wire_read(other)[-1] is (other == text)
     assert seen == {0, 1, 2}
+
+
+def _head_items(rng):
+    """Transactions' texts and binary forms with every head ``peek`` reads: whole prices of any
+    size, a price in text, varints written long (up to Python's eleven bytes, and past it),
+    texts shorter than the 64 characters read, malformed and non-ASCII texts."""
+    t = _tx(rng)
+    raw = t.to_wire()
+    out = [raw, t.to_text()]
+    # (the chain id, nonce and gas limit rewritten as long varints, or past eleven bytes)
+    head = bytes([raw[0], raw[1]])
+    fields = [rng.randrange(2**rng.choice([7, 64, 76, 77])) for _ in range(3)]
+    for long in (False, True):
+        b = bytearray(head)
+        for n in fields:
+            b += _varint_long(n) if long else _varint(n)
+        b += bytes([0]) + _varint(rng.randrange(2**rng.choice([8, 64, 80])))
+        out += [bytes(b), base64.b64encode(bytes(b)).decode()]
+    over = bytes(head) + bytes([0x80] * 11) + bytes([1, 0, 0, 0, 5])
+    out += [base64.b64encode(over + bytes(60)).decode()]
+    text = t.to_text()
+    out += [
+        text[:20] + "!" + text[21:],  # (not base64)
+        text[:30] + "é" + text[31:],  # (not ASCII)
+        text[:8],  # (shorter than a head)
+        base64.b64encode(bytes([2]) + raw[1:]).decode(),  # (another version)
+    ]
+    return out
+
+
+def _varint(n):
+    out = bytearray()
+    while True:
+        b, n = n & 0x7F, n >> 7
+        if n == 0:
+            out.append(b)
+            return bytes(out)
+        out.append(b | 0x80)
+
+
+def _peeked(item):
+    try:
+        return wire.peek(item)
+    except ValueError as e:
+        return ("refused", str(e))
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_heads_read_together_are_what_peek_reads(seed):
+    """``wire.heads`` (natively, ``wire_heads``, for texts in the common form) is ``peek`` of each
+    item: the same operation, gas limit and price, of the same types; the same refusal, at the
+    first item ``peek`` refuses."""
+    rng = random.Random(seed)
+    items = [x for _ in range(60) for x in _head_items(rng)]
+    native_read = 0
+    for item in items:
+        want = _peeked(item)
+        if want[0] == "refused":
+            with pytest.raises(ValueError, match=re.escape(want[1])):
+                wire.heads([item])
+            continue
+        (got,) = wire.heads([item])
+        assert got == want and [type(x) for x in got] == [type(x) for x in want]
+        native_read += native._native.wire_heads([item])[0] is not None
+    assert native_read > 50  # (the common form, and heads written long, read natively)
+    good = [i for i in items if _peeked(i)[0] != "refused"]
+    assert wire.heads(good) == [wire.peek(i) for i in good]
+    first_bad = next(i for i in items if _peeked(i)[0] == "refused")
+    with pytest.raises(ValueError, match=re.escape(_peeked(first_bad)[1])):
+        wire.heads(good[:5] + [first_bad] + good[5:])
+
+
+def test_a_block_holds_its_transactions_fingerprints_while_it_runs():
+    """``fingerprints_held``: each transaction's fingerprint is held while the block runs (what
+    is remembered under it is asked without computing one), and released afterwards — on an
+    error too; a hold already in place (another holder's) is left to its holder; a transaction
+    changed after the block still hashes as changed."""
+    from qrdx.exchange.transactions import fingerprints_held
+
+    def tx(n):
+        t = ExchangeTransaction(
+            op_type=ExchangeOpType.TOKEN_TRANSFER,
+            sender="0xPQa",
+            nonce=n,
+            params={"amount": "1", "to": "0xPQb", "token_address": "QRDX"},
+            gas_limit=9,
+            gas_price=7,
+            timestamp=2.0,
+            chain_id=3,
+        )
+        t.signature, t.public_key = b"s", b"k"
+        return t
+
+    a, b, c = tx(1), tx(2), tx(3)
+    c.__dict__["_fp_held"] = theirs = c._fingerprint()  # (another holder's)
+    before = [t.tx_hash() for t in (a, b, c)]
+    with pytest.raises(RuntimeError):
+        with fingerprints_held([a, b, c, "not a transaction"]):
+            for t in (a, b):  # (the held value itself: none computed)
+                assert t._fingerprint() is t.__dict__["_fp_held"]
+            assert [t.tx_hash() for t in (a, b)] == before[:2]
+            raise RuntimeError("the block failed")
+    assert "_fp_held" not in a.__dict__ and "_fp_held" not in b.__dict__
+    assert c.__dict__["_fp_held"] is theirs
+    del c.__dict__["_fp_held"]
+    a.nonce = 9
+    assert a.tx_hash() == tx(9).tx_hash() != before[0]

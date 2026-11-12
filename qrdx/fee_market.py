@@ -29,7 +29,7 @@ from __future__ import annotations
 import contextvars
 import weakref
 from collections import OrderedDict
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 # The EVM base fee of the block whose EVM section is executing (evm_block_apply sets it from the
 # chain; the BASEFEE opcode reads it). None outside a block: the floor.
@@ -63,29 +63,50 @@ def floors() -> Tuple[int, int]:
     return int(EVM_MIN_GAS_PRICE_WEI), int(EXCHANGE_MIN_GAS_PRICE_WEI)
 
 
-def _is_vote(item: Any) -> bool:
-    from .exchange.transactions import ExchangeOpType
+def _heads(section: Optional[Iterable[Any]]) -> List[Tuple[Any, Optional[Tuple[int, int, Any]]]]:
+    """Each item of an exchange section, with its head (``wire.peek``) where it is the binary
+    form's text: every text's read together (``wire.heads``)."""
+    from .exchange.wire import heads
 
-    if isinstance(item, str):  # (the binary form's text)
+    items = list(section or ())
+    read = iter(heads([i for i in items if isinstance(i, str)]))
+    return [(i, next(read) if isinstance(i, str) else None) for i in items]
+
+
+_ORACLE_VOTE: List[int] = []  # (the operation's number, read once: asked of every item)
+
+
+def _oracle_vote() -> int:
+    if not _ORACLE_VOTE:
+        from .exchange.transactions import ExchangeOpType
+
+        _ORACLE_VOTE.append(int(ExchangeOpType.ORACLE_VOTE))
+    return _ORACLE_VOTE[0]
+
+
+def _is_vote(item: Any, head: Optional[Tuple[int, int, Any]] = None) -> bool:
+    if head is not None:
+        op: Any = head[0]
+    elif isinstance(item, str):  # (the binary form's text)
         from .exchange.wire import peek
 
-        op: Any = peek(item)[0]
+        op = peek(item)[0]
     else:
         op = item.get("op_type") if isinstance(item, dict) else getattr(item, "op_type", None)
     if op is None:
         return False
     try:
-        return int(op) == int(ExchangeOpType.ORACLE_VOTE)
+        return int(op) == _oracle_vote()
     except (TypeError, ValueError):
         return False
 
 
-def _in_free_lane(item: Any) -> bool:
+def _in_free_lane(item: Any, head: Optional[Tuple[int, int, Any]] = None) -> bool:
     """A trading operation sent at gas price 0 in the free lane (docs/TOKENOMICS.md)."""
+    if _price(item, head) != 0:
+        return False
     from .exchange.transactions import ExchangeOpType, free_trading_op
 
-    if _price(item) != 0:
-        return False
     if isinstance(item, str):  # (a free one in the binary form: decoded for its params)
         from .exchange.transactions import ExchangeTransaction
 
@@ -101,7 +122,9 @@ def _in_free_lane(item: Any) -> bool:
     return free_trading_op(op_type, params or {})
 
 
-def _price(item: Any) -> int:
+def _price(item: Any, head: Optional[Tuple[int, int, Any]] = None) -> int:
+    if head is not None:
+        return int(head[2])
     if isinstance(item, str):  # (the binary form's text: its head read alone)
         from .exchange.wire import peek
 
@@ -119,7 +142,9 @@ def fee_gas(
     from .contracts.evm_mempool import parse_eth_raw_tx
 
     evm_gas = sum(int(parse_eth_raw_tx(raw)["gas"]) for raw in evm_section or ())
-    exchange_gas = exchange_section_gas([i for i in exchange_section or () if not _is_vote(i)])
+    exchange_gas = exchange_section_gas(
+        [i for i, h in _heads(exchange_section) if not _is_vote(i, h)]
+    )
     return evm_gas, exchange_gas
 
 
@@ -310,10 +335,10 @@ def block_fee_error(
         price = int(parse_eth_raw_tx(raw)["gas_price"])
         if price < evm_fee:
             return f"evm tx {i} offers {price} wei of gas, under the base fee {evm_fee}"
-    for i, item in enumerate(exchange_section or ()):
-        if _is_vote(item) or _in_free_lane(item):
+    for i, (item, head) in enumerate(_heads(exchange_section)):
+        if _is_vote(item, head) or _in_free_lane(item, head):
             continue  # (a free operation's budget is judged when it executes)
-        price = _price(item)
+        price = _price(item, head)
         if price < exchange_fee:
             return f"exchange op {i} offers {price} wei of gas, under the base fee {exchange_fee}"
     return ""

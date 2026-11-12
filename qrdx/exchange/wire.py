@@ -27,7 +27,7 @@ import base64
 import binascii
 import json
 import struct
-from typing import Any, Tuple
+from typing import Any, List, Tuple
 
 VERSION = 1
 _MAX_LEN = 1 << 22  # (no field of a transaction is 4 MB)
@@ -292,6 +292,18 @@ def peek(item: Any) -> Tuple[int, int, Any]:
         pass
     tx = decode(bytes(item) if isinstance(item, (bytes, bytearray)) else from_text(item))
     return int(tx.op_type), int(tx.gas_limit), tx.gas_price
+
+
+def heads(items: Any) -> List[Tuple[int, int, Any]]:
+    """``peek`` of each item, in order: the heads of transactions' texts read in one native call
+    where the module is (``wire_heads``; a section's gas and fee rules read every item's), any
+    other item by ``peek``. Raises as ``peek`` does, at the first item it refuses."""
+    items = list(items)
+    module = _native()
+    read = getattr(module, "wire_heads", None) if module is not None else None
+    if read is None:
+        return [peek(i) for i in items]
+    return [h if h is not None else peek(i) for h, i in zip(read(items), items, strict=True)]
 
 
 def to_text(raw: bytes) -> str:
