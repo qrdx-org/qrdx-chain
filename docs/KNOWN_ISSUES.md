@@ -27,23 +27,27 @@ before that day's changes showed no crash in 12 runs, too few to rule its change
 Load runs now check every node's database afterwards; a recurrence is to be caught under a
 debugger for a native backtrace.
 
-## OPEN — Live throughput is about a quarter of what the protocol allows
+## OPEN — Live throughput is about half of what the protocol allows
 
-**Severity: medium (capacity, not safety).** Measured 2026-11-05 (docs/PERFORMANCE.md).
+**Severity: medium (capacity, not safety).** Measured 2026-11-12 (docs/PERFORMANCE.md, items
+40–43).
 
 The exchange gas limit allows 4,000 transfers a second sustained, 8,000 in bursts. A 4-node
-network fills every slot at 1,000 a second, on one host and across emulated machines (2 CPUs a
-node, 25 ms apart); it was 600 before the fifth round. Past that a block carries up to about 800
-transfers at about 2.4 blocks a second on one host. Across machines at 1,500 a second one node
-fell 144 blocks behind and caught up by sync.
+network sustains 2,000 a second on one host (4.0 blocks a second, p95 0.60 s) and across
+emulated machines (2 CPUs a node, 25 ms apart: 4.03 blocks a second, every slot proposed, p95
+0.54–0.65 s). At 2,500 across emulated machines blocks keep coming every slot and every
+transfer executes, with latency rising (p95 2.9 s); on one host 2,500 builds a backlog. It was
+1,000 on 2026-11-05.
 
 * Pipelined execution (`deferred_execution`) took the proposer's own run off the path between
-  slots: a block is signed and sent before it runs. The next proposer still runs it before it
-  can sign the next one, so one run of a block must fit the slot.
-* Every node runs every block, partly in Python: plain transfers and the commitments' trees
-  and accumulators are native, and the rest costs 5–35 µs a transaction a phase (131 µs in all
-  offline, from 225). Under load a block of 600–900 imports in 100–200 ms. An empty block's
-  fixed cost is 6–8 ms (40 database round trips; it was 12–16 ms and 132–178).
+  slots: a block is signed and sent before it runs — and since 2026-11-12 it leaves when it is
+  signed (it used to wait for the proposer to run it). The next proposer still runs it before
+  it can sign the next one, so one run of a block must fit the slot.
+* Every node runs every block, partly in Python: plain transfers, the block's QRDX balances
+  (the balance plane), the plain collections' commitments and the trees and accumulators are
+  native, and the rest costs 2–18 µs a transaction a phase (about 120 µs in all offline, from
+  225). Across emulated machines at 2,000 a second a block of ~460 imports in a median 93 ms.
+  An empty block's fixed cost is 6–8 ms.
 * A block is about 10.5 KB of hex JSON a transfer, hashed for its body root and stored whole.
 * A fork now costs its rollback one undo per block taken back (qrdx/exchange/block_undo.py),
   not an epoch of blocks replayed.
@@ -56,12 +60,12 @@ fell 144 blocks behind and caught up by sync.
     admission refuses rather than prices.
 
 **Closing it requires** (docs/PERFORMANCE.md, "What limits it next"):
-* the exchange's state held and executed natively beyond plain transfers, with the database
-  written behind it (docs/NATIVE.md);
-* the cost of importing a block, about 218 µs a transfer (docs/PERFORMANCE.md, "What limits it
-  next"): at 1,500 a second it fills each node's second, and late blocks are raced. (A proposer
-  now builds before its parent has run — `two_block_deferral` and qrdx/validator/pipeline.py —
-  which takes the parent's trip off the path on real networks, not each node's own work);
+* the exchange's state held and executed natively beyond plain transfers and their QRDX
+  balances (the token balances, the receipts, the nonces), with the database written behind it
+  (docs/NATIVE.md);
+* the cost of importing a block beside execution — the store and the roots, now as much as
+  execution — and of admission and the transaction index, which share each node's event loop
+  with it (a second core per node: docs/SECOND_CORE.md);
 * a binary wire format, shrinking what each block hashes and stores (a fork);
 * the geo-distributed soak (docs/MAINNET_READINESS.md §3.4) to measure it on real hosts.
 

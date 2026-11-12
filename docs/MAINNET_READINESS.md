@@ -371,6 +371,13 @@ The node is Python on a 250 ms clock.
   of what the protocol allows". It needs execution in native code and admission off the block
   thread.*
 
+*2026-11-12 (docs/PERFORMANCE.md, items 36–43):* *a 4-node network sustains 2,000 transfers a
+second on one host and across emulated machines (2 CPUs a node, 25 ms apart): every slot
+proposed, p95 latency 0.54–0.65 s. Across emulated machines 2,500 keeps every slot with latency
+rising (p95 2.9 s). The gap is now about half the protocol's limit (docs/KNOWN_ISSUES.md, "Live
+throughput is about half of what the protocol allows"); real machines (the geo-distributed soak,
+§3.4) are the measure still missing.*
+
 ### Determinism checks in CI
 
 The rollback-audit plugin, the hash-seed check and the rebuild-equivalence tests catch the bugs

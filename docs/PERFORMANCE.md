@@ -68,6 +68,23 @@ was fixed in five places:
   which scans both to match them. Sends are now bounded at 256 in flight. Measurement calls
   have a client of their own, so the queue of sends does not delay them.
 
+## Results (2026-11-12)
+
+After items 36–43 below (native admission and commitments, each node's share of the cores, a
+signed block leaving when it is signed, the block's QRDX balances held natively, LtHash entries
+eight blocks at a time). Four nodes, 2,048 accounts, 30 s a step.
+
+| Load (transfers/s) | One host | Across emulated machines (2 CPUs a node, 25 ms each way) |
+|---|---|---|
+| 1,000 | 4.03 blocks/s, p95 0.30 s | 3.99 blocks/s, p95 0.49 s |
+| 1,500 | 3.99 blocks/s, p95 0.39 s | 4.02 blocks/s, p95 0.52 s |
+| 2,000 | **4.01 blocks/s, p95 0.60 s** | **4.02–4.03 blocks/s, every slot proposed, p95 0.54–0.65 s** |
+| 2,500 | 2.98 blocks/s, backlog | 4.03 blocks/s, every transfer executed, p95 2.9 s |
+
+(One host: with a profiler attached to one node. Every executed transfer counted; no
+refusals at 1,000–2,000.) Offline an importing validator spends about 120 µs of its thread on
+a transfer, admission included (it was 225). What limits it next is below.
+
 ## Results (2026-11-05)
 
 After the fifth round (below, 26–29: plain transfers and the exchange's commitments native, a
@@ -757,6 +774,23 @@ Each block's phase line ends with its store commits (`db N`; they were SQLite ro
     with AVX2 (docs/NATIVE.md, "The exchange's accumulators"): 0.93 µs an entry on one thread.
     The bench on two threads (a container's share): import 144 → 135 µs a transfer (execution
     20.5 → 18.4, the roots 17.7 → 15.3), and the second thread's time freed besides.
+
+    With the transaction index's own trim (each row reads only the keys present and writes its
+    detail with the native canonical JSON: 21 → 17 µs a transaction), across emulated machines
+    (2 CPUs a node, 25 ms each way, steps of 30 s, 2,048 accounts):
+
+    | | 1,000 a second | 1,500 | 2,000 | 2,500 |
+    |---|---|---|---|---|
+    | After 41 | p95 0.51 s | p95 0.72 s | 3.54 blocks/s, p50 11.9 s | — |
+    | After 42 | p95 0.49 s | p95 0.52 s | 3.39 blocks/s, p50 0.90 s | — |
+    | **After 43** | p95 0.49 s | p95 0.52 s | **4.02–4.03 blocks/s, p50 0.32–0.39 s, p95 0.54–0.65 s** | 4.03 blocks/s, every transfer executed, p50 0.94 s, p95 2.9 s |
+
+    At 2,000 a second there every slot was proposed (151 of 151, 156 of 156 in the repeat), with
+    no fork or reorganization; an import of a median 462 operations took 93 ms and ended a
+    median 156 ms into its slot (p90 217). Every node's database ended on the same tip with its
+    accumulators equal to their recomputation. On one host 2,000 holds too (p95 0.60 s, with a
+    profiler attached to a node), and 2,500 builds a backlog there (the four nodes share the
+    host's cores and memory).
 
 ## The block pipeline, measured offline
 
