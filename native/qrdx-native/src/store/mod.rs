@@ -150,14 +150,15 @@ struct Inner {
 }
 
 enum Encoded {
-    Vector(Vector),
+    Added,
     Nothing,
     /// Only Python can say.
     Python,
 }
 
-/// The row's entry, natively (lthash.rs ``encode``), from its committed columns.
-fn encode(kind: &str, row: &[Field]) -> Encoded {
+/// The row's entry added into ``total`` (``Added``), or that it has none, or that only Python
+/// can say.
+fn encode_into(kind: &str, row: &[Field], total: &mut [u16; LANES]) -> Encoded {
     let tag: &[u8] = match kind {
         "account" => b"qrdx/account/v1",
         "storage" => b"qrdx/storage/v1",
@@ -179,10 +180,47 @@ fn encode(kind: &str, row: &[Field]) -> Encoded {
             None => return Encoded::Python,
         }
     }
-    match lthash::entry(tag, texts.join("\x00").as_bytes()) {
-        Some(v) => Encoded::Vector(v),
+    match lthash::add_entry(total, tag, texts.join("\x00").as_bytes()) {
+        Some(()) => Encoded::Added,
         None => Encoded::Python,
     }
+}
+
+/// Σ of rows' entries, natively, on the module's threads when there are many: ``slots`` sums
+/// (``slot_of`` says which a row's entry goes in; None: none), and the rows only Python can
+/// encode, as ``(index, slot)``, in order.
+fn sum_rows<R: Sync>(
+    rows: &[R],
+    slots: usize,
+    entry: impl Fn(&R, &mut Vec<[u16; LANES]>, &mut Vec<(usize, usize)>, usize) + Sync,
+) -> (Vec<[u16; LANES]>, Vec<(usize, usize)>) {
+    use rayon::prelude::*;
+
+    let fold = |base: usize, part: &[R]| {
+        let mut sums = vec![[0u16; LANES]; slots];
+        let mut python = Vec::new();
+        for (i, row) in part.iter().enumerate() {
+            entry(row, &mut sums, &mut python, base + i);
+        }
+        (sums, python)
+    };
+    if rows.len() < lthash::SERIAL_BELOW {
+        return fold(0, rows);
+    }
+    let chunk = lthash::chunk_for(rows.len());
+    rows.par_chunks(chunk)
+        .enumerate()
+        .map(|(c, part)| fold(c * chunk, part))
+        .reduce(
+            || (vec![[0u16; LANES]; slots], Vec::new()),
+            |(mut a, mut pa), (b, pb)| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    lthash::add_lanes(x, y);
+                }
+                pa.extend(pb);
+                (a, pa)
+            },
+        )
 }
 
 /// The cursor's next row in [lo, hi) (the first, if ``first``), None past the range.
@@ -432,8 +470,6 @@ impl Inner {
         if self.pending.is_empty() {
             return Ok(());
         }
-        use rayon::prelude::*;
-
         let pending: Vec<((usize, Bytes), Option<Bytes>)> = self.pending.drain().collect();
         let txn = self.ro()?;
         // (domain, kind, columns of the old row, of the new) for each row that changed
@@ -450,36 +486,37 @@ impl Inner {
         }
         drop(txn);
         let kinds: Vec<String> = self.tables.iter().map(|i| i.commitment.as_ref().map_or(String::new(), |c| c.kind.clone())).collect();
-        let encoded: Vec<(Encoded, Encoded)> = py.allow_threads(|| {
-            work.par_iter()
-                .map(|(_, t, old, new, had_old, has_new)| {
-                    let one = |cols: &Option<Vec<Field>>, present: bool| match (cols, present) {
-                        (_, false) => Encoded::Nothing,
-                        (Some(c), true) => encode(&kinds[*t], c),
-                        (None, true) => Encoded::Python,
+        // (slot 2d: the old rows of domain d, folded out; 2d + 1: the new ones, folded in)
+        let ndomains = self.domains.len();
+        let (mut sums, python) = py.allow_threads(|| {
+            sum_rows(&work, 2 * ndomains, |(domain, t, old, new, had_old, has_new), sums, python, i| {
+                for (which, cols, present) in [(0, old, *had_old), (1, new, *has_new)] {
+                    if !present {
+                        continue;
+                    }
+                    let slot = 2 * domain + which;
+                    let native = match cols {
+                        Some(c) => !matches!(encode_into(&kinds[*t], c, &mut sums[slot]), Encoded::Python),
+                        None => false,
                     };
-                    (one(old, *had_old), one(new, *has_new))
-                })
-                .collect()
-        });
-        let mut sums: HashMap<usize, ([u16; LANES], [u16; LANES])> = HashMap::new();
-        for ((domain, t, old, new, _, _), (o, n)) in work.iter().zip(encoded) {
-            let entry = sums.entry(*domain).or_insert(([0; LANES], [0; LANES]));
-            for (which, enc, cols) in [(0, o, old), (1, n, new)] {
-                let vector = match enc {
-                    Encoded::Vector(v) => Some(v),
-                    Encoded::Nothing => None,
-                    Encoded::Python => self.python_entry(py, *t, cols)?,
-                };
-                if let Some(v) = vector {
-                    let total = if which == 0 { &mut entry.0 } else { &mut entry.1 };
-                    for (x, y) in total.iter_mut().zip(v.iter()) {
-                        *x = x.wrapping_add(*y);
+                    if !native {
+                        python.push((i, slot));
                     }
                 }
+            })
+        });
+        for (i, slot) in python {
+            let (_, t, old, new, _, _) = &work[i];
+            if let Some(v) = self.python_entry(py, *t, if slot % 2 == 0 { old } else { new })? {
+                lthash::add_lanes(&mut sums[slot], &v);
             }
         }
-        for (domain, (minus, plus)) in sums {
+        let mut touched = vec![false; ndomains];
+        for (domain, ..) in &work {
+            touched[*domain] = true;
+        }
+        for domain in (0..ndomains).filter(|d| touched[*d]) {
+            let (minus, plus) = (&sums[2 * domain], &sums[2 * domain + 1]);
             let acc = &mut self.accs[domain];
             for i in 0..LANES {
                 let lane = u16::from_le_bytes([acc[4 * i], acc[4 * i + 1]])
@@ -1070,8 +1107,6 @@ impl Store {
 
     /// ``domain``'s accumulator recomputed from every row of its tables (a check; O(state)).
     fn full_acc<'py>(&self, py: Python<'py>, domain: &str) -> PyResult<Bound<'py, PyBytes>> {
-        use rayon::prelude::*;
-
         with!(self, inner, {
             let mut total = [0u16; LANES];
             for t in 0..inner.tables.len() {
@@ -1082,28 +1117,22 @@ impl Store {
                 let rows = inner.scan(t, None, None, false, None)?;
                 let kind = c.kind.clone();
                 let columns = c.columns.clone();
-                let encoded: Vec<(Encoded, Option<Vec<Field>>)> = py.allow_threads(|| {
-                    rows.par_iter()
-                        .map(|(k, v)| {
-                            let cols = Inner::columns(k, v, &columns);
-                            let e = match &cols {
-                                Some(c) => encode(&kind, c),
-                                None => Encoded::Python,
-                            };
-                            (e, cols)
-                        })
-                        .collect()
-                });
-                for (e, cols) in encoded {
-                    let v = match e {
-                        Encoded::Vector(v) => Some(v),
-                        Encoded::Nothing => None,
-                        Encoded::Python => inner.python_entry(py, t, &cols)?,
-                    };
-                    if let Some(v) = v {
-                        for (x, y) in total.iter_mut().zip(v.iter()) {
-                            *x = x.wrapping_add(*y);
+                let (sums, python) = py.allow_threads(|| {
+                    sum_rows(&rows, 1, |(k, v), sums, python, i| {
+                        let native = match Inner::columns(k, v, &columns) {
+                            Some(cols) => !matches!(encode_into(&kind, &cols, &mut sums[0]), Encoded::Python),
+                            None => false,
+                        };
+                        if !native {
+                            python.push((i, 0));
                         }
+                    })
+                });
+                lthash::add_lanes(&mut total, &sums[0]);
+                for (i, _) in python {
+                    let (k, v) = &rows[i];
+                    if let Some(v) = inner.python_entry(py, t, &Inner::columns(k, v, &columns))? {
+                        lthash::add_lanes(&mut total, &v);
                     }
                 }
             }

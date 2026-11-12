@@ -136,7 +136,7 @@ async def run(args) -> None:
                 os.remove(p)
     if profiler is not None:
         stats = pstats.Stats(profiler)
-        stats.sort_stats("tottime").print_stats(35)
+        stats.sort_stats(os.environ.get("BENCH_SORT", "tottime")).print_stats(int(os.environ.get("BENCH_TOP", "35")))
         if os.environ.get("BENCH_CALLERS"):
             stats.print_callers(os.environ["BENCH_CALLERS"])
     print(

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional
 
+from . import chain_spec
+
 # Each proof carries two signed messages to verify; a block of them is still a few hundred
 # milliseconds of verification at most. Offences are rare: a backlog waits a block.
 MAX_SLASHING_EVIDENCE_PER_BLOCK = 16
@@ -76,8 +78,6 @@ def exchange_gas_limit_at(height: Optional[int]) -> int:
     """The exchange gas a block at ``height`` may carry (``BLOCK_EXCHANGE_GAS_LIMIT``, which a
     fork may change). With no height, the largest the schedule ever allows: a mempool turning
     away an operation that no block could carry."""
-    from . import chain_spec
-
     spec = chain_spec.active()
     name = "BLOCK_EXCHANGE_GAS_LIMIT"
     if height is not None:

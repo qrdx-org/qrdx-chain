@@ -28,7 +28,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..constants import UNBONDING_PERIOD_EPOCHS
 from .state_manager import ExchangeStateManager
-from .transactions import ExchangeOpType, ExchangeTransaction
+from .transactions import EXCHANGE_GAS_COSTS, ExchangeOpType, ExchangeTransaction
 
 logger = logging.getLogger(__name__)
 
@@ -809,8 +809,6 @@ def _passes_besides_signature(tx: ExchangeTransaction) -> bool:
         return False
     if tx.chain_error():
         return False
-    from .transactions import EXCHANGE_GAS_COSTS
-
     return int(tx.gas_limit) >= EXCHANGE_GAS_COSTS.get(tx.op_type, 100_000) + tx.signature_gas()
 
 

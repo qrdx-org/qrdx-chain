@@ -76,6 +76,10 @@ class Policy:
         return tuple(account_id(g) for g in self.guardians)
 
 
+# An account that set no policy: its own key, nothing else (frozen: one serves every account).
+_NO_POLICY = Policy()
+
+
 @dataclass(frozen=True)
 class Change:
     """A change the account's own key signed, waiting out the account's delay."""
@@ -263,11 +267,11 @@ class AccountAuthority:
 
     def policy(self, address: str) -> Policy:
         if not len(self.policies):
-            return Policy()
+            return _NO_POLICY
         try:
-            return self.policies.peek(account_id(address)) or Policy()
+            return self.policies.peek(account_id(address)) or _NO_POLICY
         except ValueError:
-            return Policy()
+            return _NO_POLICY
 
     def may_control(self, account: str, signer: str) -> bool:
         """Is ``signer`` a controller of ``account`` (any address forms)?"""

@@ -238,10 +238,12 @@ def _column(rng):
                        "1e", "1e1234567", "sNaN", "Infinity", "+.0", "5.", "١"])
 
 
-async def test_the_store_keeps_the_accumulators_python_computes(tmp_path):
+@pytest.mark.parametrize("commit_every", [0.05, 0.002])
+async def test_the_store_keeps_the_accumulators_python_computes(tmp_path, commit_every):
     """Through the store (qrdx/store.py), which folds rows natively: random writes to every
     domain's tables, with the column values the trigger function is checked on (odd numerals,
-    bytes, Unicode digits), then the accumulators it kept against Python's from the rows."""
+    bytes, Unicode digits), then the accumulators it kept against Python's from the rows —
+    folded a few rows at a time, or hundreds (on the module's threads, a share each)."""
     from qrdx import state_commitment as sc
     from qrdx.database_sqlite import DatabaseSQLite
 
@@ -249,8 +251,8 @@ async def test_the_store_keeps_the_accumulators_python_computes(tmp_path):
     db = await DatabaseSQLite.create(str(tmp_path / "s.db"))
     try:
         accounts, tokens = db.store["account_state"], db.store["token_balances"]
-        for _ in range(400):
-            a = f"0xPQ{rng.randrange(30):064x}"
+        for _ in range(400 if commit_every > 0.01 else 1500):
+            a = f"0xPQ{rng.randrange(30 if commit_every > 0.01 else 600):064x}"
             amount = rng.choice(["0", "1.5", str(rng.randrange(10 ** 6)), "0E-18", "12.000",
                                  _column(rng)])
             k = rng.random()
@@ -266,11 +268,13 @@ async def test_the_store_keeps_the_accumulators_python_computes(tmp_path):
                 tokens.update(("0xTOKEN", a), balance=amount)
             else:
                 accounts.delete(a)
-            if rng.random() < 0.05:
+            if rng.random() < commit_every:
                 await db.connection.commit()
         await db.connection.commit()
         for domain in sc.DOMAINS:
-            assert await sc.stored_accumulator(db, domain) == await sc.full_accumulator(db, domain)
+            want = await sc.full_accumulator(db, domain)
+            assert await sc.stored_accumulator(db, domain) == want
+            assert db.store.native.full_acc(domain) == want
     finally:
         await db.close()
 
@@ -362,6 +366,52 @@ async def test_the_tree_update_into_native_nodes_is_pythons(seed):
             assert nodes.get(k) in (d, None)  # (held as written, unless evicted)
         store.update(tree.writes)
     assert py_root is not None and len(nodes) <= 40  # (down to capacity after each update)
+
+
+@pytest.mark.parametrize("seed", range(4))
+async def test_a_large_update_split_across_threads_is_pythons(seed):
+    """An update of hundreds of entries is split: the subtrees some levels down are updated on
+    the module's threads, then put together. The same root as Python's tree, and the new and
+    stale nodes in Python's very order — with entries removed, keys sharing long prefixes, and
+    a cache too small to hold the tree (nodes named missing from inside the subtrees)."""
+    from qrdx.crypto import smt
+    from qrdx.store import pack
+
+    rng = random.Random(seed)
+    store: dict = {}
+    py_root = nat_root = None
+    keys = [smt.key_of(seed.to_bytes(1, "big") + i.to_bytes(2, "big")) for i in range(2500)]
+    if seed % 2:
+        keys = [bytes([0xAB] * 2) + k[2:] for k in keys[:1500]] + keys[1500:]
+    nodes = N.SmtNodes(400 if seed < 2 else 200_000)
+    passes = 0
+
+    async def load(nkey):
+        return store.get(nkey)
+
+    for version in range(1, 9):
+        n = 2000 if version == 1 else rng.choice([256, 300, 700, 1200])
+        changes = {}
+        for k in rng.sample(keys, n):
+            changes[k] = None if version > 1 and rng.random() < 0.25 else rng.randbytes(30)
+        changes = sorted(changes.items())
+        tree = smt.Tree(load, version)
+        py_root = await tree.update(py_root, changes)
+        encoded = smt.encode_ref(nat_root)
+        for _ in range(300):
+            out = N.smt_update_into(encoded, changes, version, nodes)
+            passes += 1
+            if out[0] == "ok":
+                break
+            nodes.insert_many([(nkey, store[nkey]) for nkey in out[1]])
+        assert out[0] == "ok"
+        nat_root = smt.Ref.decode(out[1])[0]
+        assert nat_root == py_root
+        assert out[2] == [(pack((k,)), pack((d,))) for k, d in tree.writes.items()]
+        assert out[3] == [(pack((version, k)), pack(())) for k in tree.stale]
+        store.update(tree.writes)
+    if seed < 2:
+        assert passes > 8  # (the small cache: some updates named missing nodes first)
 
 
 def test_the_tree_update_writes_into_a_store_what_it_would_return(tmp_path):
@@ -495,8 +545,9 @@ def test_the_exchange_accumulator_mix_is_pythons(seed):
     rng = random.Random(seed)
     acc = lthash.ZERO
     for _ in range(20):
-        removed = [rng.randbytes(32) for _ in range(rng.randint(0, 40))]
-        added = [rng.randbytes(32) for _ in range(rng.randint(0, 40))]
+        # (some past SERIAL_BELOW: summed on the module's threads, a share each)
+        removed = [rng.randbytes(32) for _ in range(rng.choice([rng.randint(0, 40), 300]))]
+        added = [rng.randbytes(32) for _ in range(rng.choice([rng.randint(0, 40), 97]))]
         r, a = lthash.Accumulator(), lthash.Accumulator()
         for d in removed:
             r.add(C._vector("t", d))

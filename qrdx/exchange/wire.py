@@ -157,8 +157,6 @@ def decode(raw: Any) -> Any:
             tx = _from_read(fields, raw)
             if tx is not None:
                 return tx
-    from .transactions import ExchangeTransaction
-
     if not isinstance(raw, (str, bytes)):
         raw = bytes(raw) if isinstance(raw, bytearray) else raw
     try:
@@ -194,8 +192,6 @@ def _from_read(fields: Any, given: Any) -> Any:
     again — its signed bytes, its hash, its binary form and text — remembered on it, under the
     same keys as ``tx_hash``, ``to_wire`` and ``to_text`` keep them. None for an operation type
     no transaction has (Python's path refuses it, with the reason)."""
-    from .transactions import ExchangeOpType, ExchangeTransaction
-
     (op, chain_id, nonce, gas_limit, gas_price, timestamp, sender, pairs, signature,
      public_key, canonical, tx_hash, raw, own_text) = fields  # fmt: skip
     try:
@@ -232,8 +228,6 @@ def _from_read(fields: Any, given: Any) -> Any:
 
 def py_decode(raw: bytes) -> Any:
     """``decode`` in Python, of the binary form (the reference)."""
-    from .transactions import ExchangeTransaction
-
     if not isinstance(raw, (bytes, bytearray)):
         raise ValueError("a binary transaction is bytes")
     r = _Reader(bytes(raw))
@@ -317,3 +311,7 @@ def from_text(text: str) -> bytes:
 def is_text(item: Any) -> bool:
     """A section item in the binary form's text (rather than a JSON object)."""
     return isinstance(item, str)
+
+
+# (Bound after the module: transactions.py imports this one.)
+from .transactions import ExchangeOpType, ExchangeTransaction  # noqa: E402

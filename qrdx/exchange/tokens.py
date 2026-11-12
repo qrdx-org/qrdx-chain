@@ -57,6 +57,7 @@ from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ..crypto.account_id import to_account_id
 from .commitment import Section, committed, encode_value
 
 ZERO = Decimal(0)
@@ -106,8 +107,6 @@ class TokenError(ValueError):
 def account(address: Any) -> str:
     """The account id a token authority, allowance or freeze is keyed by — the same key the
     token ledger uses for balances, so every address form of one account is one holder."""
-    from ..crypto.account_id import to_account_id
-
     try:
         return to_account_id(str(address))
     except ValueError as e:

@@ -10,9 +10,11 @@ pub(crate) const SIZE: usize = 4 * LANES;
 
 pub(crate) type Vector = Box<[u16; LANES]>;
 
-/// lthash.entry: the low 16 bits of each little-endian u32 of 4,096 bytes of BLAKE3 over
-/// tag | len(data) (u32 LE) | data.
-pub(crate) fn entry(tag: &[u8], data: &[u8]) -> Option<Vector> {
+/// lthash.entry — the low 16 bits of each little-endian u32 of 4,096 bytes of BLAKE3 over
+/// tag | len(data) (u32 LE) | data — added into ``total`` lane by lane (wrapping), with nothing
+/// allocated.
+#[inline]
+pub(crate) fn add_entry(total: &mut [u16; LANES], tag: &[u8], data: &[u8]) -> Option<()> {
     let len = u32::try_from(data.len()).ok()?;
     let mut h = blake3::Hasher::new();
     h.update(tag);
@@ -20,21 +22,58 @@ pub(crate) fn entry(tag: &[u8], data: &[u8]) -> Option<Vector> {
     h.update(data);
     let mut out = [0u8; SIZE];
     h.finalize_xof().fill(&mut out);
-    let mut v: Vector = Box::new([0u16; LANES]);
-    for (i, lane) in v.iter_mut().enumerate() {
-        *lane = u16::from_le_bytes([out[4 * i], out[4 * i + 1]]);
+    for (t, word) in total.iter_mut().zip(out.chunks_exact(4)) {
+        *t = t.wrapping_add(u16::from_le_bytes([word[0], word[1]]));
     }
-    Some(v)
+    Some(())
+}
+
+/// ``a += b`` lane by lane (wrapping).
+#[inline]
+pub(crate) fn add_lanes(a: &mut [u16; LANES], b: &[u16; LANES]) {
+    for (x, y) in a.iter_mut().zip(b.iter()) {
+        *x = x.wrapping_add(*y);
+    }
+}
+
+/// Fewer items than this are summed on the calling thread: waking the pool costs more.
+pub(crate) const SERIAL_BELOW: usize = 48;
+
+/// How many items each of the pool's threads takes at once: one run of ``n`` split evenly, so a
+/// thread folds its share into one sum (a task an item cost more than the item).
+pub(crate) fn chunk_for(n: usize) -> usize {
+    n.div_ceil(rayon::current_num_threads().max(1)).max(16)
+}
+
+/// Σ ``entry(tag, item)`` over ``items``, on the module's threads when there are many; None if
+/// an item is too long to be an entry.
+pub(crate) fn sum<D: AsRef<[u8]> + Sync>(tag: &[u8], items: &[D]) -> Option<[u16; LANES]> {
+    use rayon::prelude::*;
+
+    let fold = |part: &[D]| -> Option<[u16; LANES]> {
+        let mut total = [0u16; LANES];
+        for d in part {
+            add_entry(&mut total, tag, d.as_ref())?;
+        }
+        Some(total)
+    };
+    if items.len() < SERIAL_BELOW {
+        return fold(items);
+    }
+    items.par_chunks(chunk_for(items.len())).map(fold).try_reduce(
+        || [0u16; LANES],
+        |mut a, b| {
+            add_lanes(&mut a, &b);
+            Some(a)
+        },
+    )
 }
 
 /// ``lthash.Accumulator`` over ``items`` (each ``entry(tag, item)``): the digest's 4,096 bytes.
 pub(crate) fn accumulate<'a>(tag: &[u8], items: impl Iterator<Item = &'a [u8]>) -> Option<Vec<u8>> {
     let mut total = [0u16; LANES];
     for item in items {
-        let v = entry(tag, item)?;
-        for (t, x) in total.iter_mut().zip(v.iter()) {
-            *t = t.wrapping_add(*x);
-        }
+        add_entry(&mut total, tag, item)?;
     }
     let mut out = vec![0u8; SIZE];
     for (i, lane) in total.iter().enumerate() {
@@ -90,45 +129,26 @@ pub fn lt_mix_entries<'py>(
     py: Python<'py>,
     acc: &[u8],
     tag: &[u8],
-    removed: Vec<Vec<u8>>,
-    added: Vec<Vec<u8>>,
-) -> Option<Bound<'py, PyBytes>> {
-    let out = py.allow_threads(|| mix(acc, tag, &removed, &added))?;
-    Some(PyBytes::new_bound(py, &out))
+    removed: &Bound<'py, PyAny>,
+    added: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyBytes>>> {
+    // (the digests read where they are: a Vec<u8> each was copied a byte at a time)
+    let held = |items: &Bound<'py, PyAny>| -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        items.iter()?.map(|item| Ok(item?.downcast_into::<PyBytes>()?)).collect()
+    };
+    let (removed, added) = (held(removed)?, held(added)?);
+    let minus: Vec<&[u8]> = removed.iter().map(|b| b.as_bytes()).collect();
+    let plus: Vec<&[u8]> = added.iter().map(|b| b.as_bytes()).collect();
+    let out = py.allow_threads(|| mix(acc, tag, &minus, &plus));
+    Ok(out.map(|out| PyBytes::new_bound(py, &out)))
 }
 
 /// ``lt_mix_entries`` without Python: the new accumulator, or None if ``acc`` is not well formed.
-pub(crate) fn mix(acc: &[u8], tag: &[u8], removed: &[Vec<u8>], added: &[Vec<u8>]) -> Option<Vec<u8>> {
-    use rayon::prelude::*;
-
+pub(crate) fn mix<D: AsRef<[u8]> + Sync>(acc: &[u8], tag: &[u8], removed: &[D], added: &[D]) -> Option<Vec<u8>> {
     if acc.len() != SIZE || acc.chunks(4).any(|slot| slot[2] != 0 || slot[3] != 0) {
         return None;
     }
-    let sum = |items: &[Vec<u8>]| -> Option<[u16; LANES]> {
-        items
-            .par_iter()
-            .map(|d| entry(tag, d))
-            .try_fold(
-                || [0u16; LANES],
-                |mut total, v| {
-                    let v = v?;
-                    for (t, x) in total.iter_mut().zip(v.iter()) {
-                        *t = t.wrapping_add(*x);
-                    }
-                    Some(total)
-                },
-            )
-            .try_reduce(
-                || [0u16; LANES],
-                |mut a, b| {
-                    for (x, y) in a.iter_mut().zip(b.iter()) {
-                        *x = x.wrapping_add(*y);
-                    }
-                    Some(a)
-                },
-            )
-    };
-    let (minus, plus) = (sum(removed)?, sum(added)?);
+    let (minus, plus) = (sum(tag, removed)?, sum(tag, added)?);
     let mut out = acc.to_vec();
     for i in 0..LANES {
         let lane = u16::from_le_bytes([acc[4 * i], acc[4 * i + 1]])

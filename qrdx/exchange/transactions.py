@@ -614,7 +614,23 @@ class ExchangeTransaction:
 
         Raises:
             ValueError: with specific reason
+
+        A pass is remembered while every field it read is as it was (``_fingerprint``: the
+        fields it is signed over, which are all it reads besides the network's free lane, asked
+        only at a price of 0): admission, the lanes and a block's checks each ask it of the same
+        transaction.
         """
+        key = self._fingerprint() if self.gas_price != 0 else None
+        if key is not None:
+            memo = self.__dict__.get("_valid_memo")
+            if memo is key or (memo is not None and memo == key):
+                return True
+        self._check_basic()
+        if key is not None:
+            self.__dict__["_valid_memo"] = key
+        return True
+
+    def _check_basic(self) -> None:
         if not self.sender:
             raise ValueError("Missing sender address")
         if self.nonce < 0:
@@ -646,14 +662,18 @@ class ExchangeTransaction:
             ExchangeOpType.TWAP_ORDER,
         ):
             _check_trade_leverage(self.params or {})
-        return True
 
     def _validate_params(self) -> None:
         """Validate operation-specific parameters."""
         p = self.params or {}
         op = self.op_type
 
-        if op == ExchangeOpType.CREATE_POOL:
+        if op == ExchangeOpType.TOKEN_TRANSFER:  # (most operations: asked first)
+            for key in ("token_address", "to", "amount"):
+                if key not in p:
+                    raise ValueError(f"TOKEN_TRANSFER missing param: {key}")
+
+        elif op == ExchangeOpType.CREATE_POOL:
             for key in ("token0", "token1", "fee_tier", "pool_type", "stake_amount"):
                 if key not in p:
                     raise ValueError(f"CREATE_POOL missing param: {key}")
@@ -953,11 +973,6 @@ class ExchangeTransaction:
                 if key not in p:
                     raise ValueError(f"{op.name} missing param: {key}")
 
-        elif op == ExchangeOpType.TOKEN_TRANSFER:
-            for key in ("token_address", "to", "amount"):
-                if key not in p:
-                    raise ValueError(f"TOKEN_TRANSFER missing param: {key}")
-
         elif op == ExchangeOpType.TOKEN_UPDATE_METADATA:
             if "token_address" not in p:
                 raise ValueError("TOKEN_UPDATE_METADATA missing param: token_address")
@@ -1088,9 +1103,7 @@ def free_trading_op(op_type: "ExchangeOpType", params: Dict[str, Any]) -> bool:
     """Whether the free trading lane takes this operation (docs/TOKENOMICS.md): the network runs
     one, and it is a trading operation (``AGENT_SCOPE``: orders, cancels, modifies, triggers,
     TWAPs, swaps, leverage; a batch only of those)."""
-    from .. import constants
-
-    if not constants.EXCHANGE_FREE_TRADING or op_type not in AGENT_SCOPE:
+    if not _constants.EXCHANGE_FREE_TRADING or op_type not in AGENT_SCOPE:
         return False
     if op_type == ExchangeOpType.BATCH:
         try:

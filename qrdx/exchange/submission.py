@@ -80,8 +80,6 @@ def parse_exchange_tx(tx: Any) -> ExchangeTransaction:
 
 
 def free_action_error(tx: ExchangeTransaction) -> str:
-    from .state_manager import ExchangeStateManager
-
     return ExchangeStateManager.get_instance().free_action_error(tx)
 
 
@@ -119,8 +117,6 @@ def _gas_terms(tx: ExchangeTransaction) -> Tuple[str, Optional[str], Optional[De
         tx.validate_fee()
     except ValueError as e:
         return str(e), None, None
-    from .state_manager import ExchangeStateManager
-
     return "", ExchangeStateManager.get_instance().fee_payer(tx), tx.max_fee()
 
 
@@ -490,3 +486,7 @@ class ExchangeSubmitter:
                 await self._forward(url, tx_dict)
             except Exception as e:
                 logger.debug("exchange gossip to %s failed: %s", url, e)
+
+
+# (Bound after the module: the state manager's modules import this package's.)
+from .state_manager import ExchangeStateManager  # noqa: E402

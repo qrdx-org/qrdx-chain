@@ -14,8 +14,8 @@
 //! stale nodes already packed as the store keeps them (the node's ~3,000 a block were packed one
 //! at a time in Python).
 
-use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
@@ -198,7 +198,22 @@ struct Tree<'a, C: NodeSource> {
     stale: Vec<String>,
     /// Nodes found missing: every one this pass could reach, so one load serves them all.
     missing: Vec<String>,
+    /// Subtrees already updated on other threads (``update_split``): at this depth, by the
+    /// position of their first change.
+    parts: Option<(usize, HashMap<usize, Part>)>,
 }
+
+/// A subtree's update, done apart: what ``update`` returned, and what it wrote, made stale and
+/// found missing, in order.
+struct Part {
+    out: Result<Option<Ref>, Missing>,
+    writes: Vec<Option<(String, Vec<u8>)>>,
+    stale: Vec<String>,
+    missing: Vec<String>,
+}
+
+/// Fewer changes than this are applied on the calling thread.
+const SPLIT_FROM: usize = 256;
 
 impl<'a, C: NodeSource> Tree<'a, C> {
     fn nkey(&self, depth: usize, key: &[u8]) -> String {
@@ -276,14 +291,25 @@ impl<'a, C: NodeSource> Tree<'a, C> {
         self.put(depth, key, Node::Internal { left: l, right: r }, hash)
     }
 
+    /// ``changes`` (sorted; ``at``: the position of the first among all of the update's) applied
+    /// below ``r`` at ``depth``.
     fn update(
         &mut self,
         r: Option<Ref>,
         changes: &[Change],
         depth: usize,
+        at: usize,
     ) -> Result<Option<Ref>, Missing> {
         if changes.is_empty() {
             return Ok(r);
+        }
+        if let Some(part) = self.parts.as_mut().filter(|(d, _)| *d == depth).and_then(|(_, p)| p.remove(&at)) {
+            for (nkey, data) in part.writes.into_iter().flatten() {
+                self.write(nkey, data);
+            }
+            self.stale.extend(part.stale);
+            self.missing.extend(part.missing);
+            return part.out;
         }
         let Some(r) = r else {
             let live: Vec<(Vec<u8>, Vec<u8>)> = changes
@@ -321,12 +347,12 @@ impl<'a, C: NodeSource> Tree<'a, C> {
                 let lres = if lc.is_empty() {
                     Ok(left.clone())
                 } else {
-                    self.update(left.clone(), lc, depth + 1)
+                    self.update(left.clone(), lc, depth + 1, at)
                 };
                 let rres = if rc.is_empty() {
                     Ok(right.clone())
                 } else {
-                    self.update(right.clone(), rc, depth + 1)
+                    self.update(right.clone(), rc, depth + 1, at + split)
                 };
                 let (lref, rref) = (lres?, rres?);
                 if lref == left && rref == right {
@@ -357,6 +383,79 @@ impl<'a, C: NodeSource> Tree<'a, C> {
     }
 }
 
+impl<'a, C: NodeSource + Sync> Tree<'a, C> {
+    /// ``update(root, changes, 0, 0)``, the subtrees some levels down updated on the module's
+    /// threads: the levels above them are walked first (``plan``), each subtree below is
+    /// updated apart, and the walk from the root then takes each one's result, writes, stale
+    /// nodes and missing ones where it would have made them itself — the same in every byte
+    /// and in the same order.
+    fn update_split(&mut self, root: Option<Ref>, changes: &[Change]) -> Result<Option<Ref>, Missing> {
+        use rayon::prelude::*;
+
+        let threads = rayon::current_num_threads();
+        if changes.len() < SPLIT_FROM || threads < 2 {
+            return self.update(root, changes, 0, 0);
+        }
+        // (about four subtrees a thread, each with enough changes to be worth one)
+        let mut depth = 1;
+        while (1usize << depth) < 4 * threads && changes.len() >> depth >= 32 && depth < 12 {
+            depth += 1;
+        }
+        let mut tasks: Vec<(usize, Option<Ref>, usize)> = Vec::new();
+        self.plan(root.clone(), changes, 0, 0, depth, &mut tasks);
+        if tasks.len() < 2 {
+            return self.update(root, changes, 0, 0);
+        }
+        let (cache, version) = (self.cache, self.version);
+        let done: Vec<Part> = tasks
+            .par_iter()
+            .map(|(at, r, n)| {
+                let mut t = Tree {
+                    cache,
+                    version,
+                    writes: Vec::new(),
+                    index: HashMap::new(),
+                    stale: Vec::new(),
+                    missing: Vec::new(),
+                    parts: None,
+                };
+                let out = t.update(r.clone(), &changes[*at..*at + *n], depth, *at);
+                Part { out, writes: t.writes, stale: t.stale, missing: t.missing }
+            })
+            .collect();
+        self.parts = Some((depth, tasks.iter().map(|(at, ..)| *at).zip(done).collect()));
+        let out = self.update(root, changes, 0, 0);
+        self.parts = None;
+        out
+    }
+
+    /// The subtrees at ``depth`` the walk from ``r`` reaches through internal nodes with changes
+    /// below them: (position of the first change, the subtree, how many changes).
+    fn plan(
+        &self,
+        r: Option<Ref>,
+        changes: &[Change],
+        at: usize,
+        level: usize,
+        depth: usize,
+        tasks: &mut Vec<(usize, Option<Ref>, usize)>,
+    ) {
+        if changes.is_empty() {
+            return;
+        }
+        if level == depth {
+            tasks.push((at, r, changes.len()));
+            return;
+        }
+        // (a leaf, nothing, or a node not held: the walk from the root does it there)
+        let Some(r) = r else { return };
+        let Ok(Node::Internal { left, right }) = self.node(&r) else { return };
+        let split = changes.partition_point(|c| !bit(&c.0, level));
+        self.plan(left, &changes[..split], at, level + 1, depth, tasks);
+        self.plan(right, &changes[split..], at + split, level + 1, depth, tasks);
+    }
+}
+
 /// ``Tree(load, version).update(root, changes)`` over the nodes in ``cache``. Returns
 /// ``("ok", root as encode_ref writes it, [(nkey, data)] in the dict's order, [stale nkey])``, or
 /// ``("missing", [nkey, ...])``: nodes neither written nor cached (load them into the cache, and
@@ -378,8 +477,9 @@ pub fn smt_update<'py>(
         index: HashMap::new(),
         stale: Vec::new(),
         missing: Vec::new(),
+        parts: None,
     };
-    match tree.update(root, &parsed, 0) {
+    match tree.update(root, &parsed, 0, 0) {
         Err(_) => {
             let mut missing = tree.missing;
             missing.sort();
@@ -410,22 +510,20 @@ pub fn smt_update<'py>(
 /// settled: an update's missing nodes, loaded between its passes, stay until it settles.
 #[pyclass(module = "qrdx_native")]
 pub struct SmtNodes {
-    map: HashMap<String, (Vec<u8>, Cell<u64>)>,
-    tick: Cell<u64>,
+    map: HashMap<String, (Vec<u8>, AtomicU64)>,
+    tick: AtomicU64,
     capacity: usize,
     settled: u64,
 }
 
 impl SmtNodes {
     fn stamp(&self) -> u64 {
-        let t = self.tick.get() + 1;
-        self.tick.set(t);
-        t
+        self.tick.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn put(&mut self, nkey: String, data: Vec<u8>) {
         let t = self.stamp();
-        self.map.insert(nkey, (data, Cell::new(t)));
+        self.map.insert(nkey, (data, AtomicU64::new(t)));
     }
 
     /// Down to nine tenths of the capacity once past ``limit``, the least recently used first,
@@ -436,20 +534,20 @@ impl SmtNodes {
         }
         let keep = self.capacity * 9 / 10;
         let mut stamps: Vec<u64> =
-            self.map.values().map(|(_, t)| t.get()).filter(|&t| t <= protect).collect();
+            self.map.values().map(|(_, t)| t.load(Ordering::Relaxed)).filter(|&t| t <= protect).collect();
         let drop = (self.map.len() - keep).min(stamps.len());
         if drop == 0 {
             return;
         }
         let (_, &mut cut, _) = stamps.select_nth_unstable(drop - 1);
-        self.map.retain(|_, (_, t)| t.get() > cut);
+        self.map.retain(|_, (_, t)| t.load(Ordering::Relaxed) > cut);
     }
 }
 
 impl NodeSource for SmtNodes {
     fn with_node<R>(&self, nkey: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         let (data, t) = self.map.get(nkey)?;
-        t.set(self.stamp());
+        t.store(self.stamp(), Ordering::Relaxed);
         Some(f(data))
     }
 }
@@ -459,7 +557,7 @@ impl SmtNodes {
     #[new]
     #[pyo3(signature = (capacity=200_000))]
     fn new(capacity: usize) -> Self {
-        SmtNodes { map: HashMap::new(), tick: Cell::new(0), capacity: capacity.max(1), settled: 0 }
+        SmtNodes { map: HashMap::new(), tick: AtomicU64::new(0), capacity: capacity.max(1), settled: 0 }
     }
 
     fn __len__(&self) -> usize {
@@ -537,8 +635,9 @@ pub fn smt_update_into<'py>(
             index: HashMap::new(),
             stale: Vec::new(),
             missing: Vec::new(),
+            parts: None,
         };
-        let outcome = tree.update(root, &parsed, 0);
+        let outcome = py.allow_threads(|| tree.update_split(root, &parsed));
         (outcome, tree.writes, tree.stale, tree.missing)
     };
     match outcome {
@@ -571,9 +670,9 @@ pub fn smt_update_into<'py>(
                     packed.push((key, value));
                     held.put(k, v);
                 }
-                let (capacity, now) = (held.capacity, held.tick.get());
+                let (capacity, now) = (held.capacity, held.tick.load(Ordering::Relaxed));
                 held.trim(capacity, now);
-                held.settled = held.tick.get();
+                held.settled = held.tick.load(Ordering::Relaxed);
                 let (n_new, n_stale) = (packed.len(), gone.len());
                 let store = store.borrow();
                 store.write_packed(nodes_table, packed)?;
@@ -589,9 +688,9 @@ pub fn smt_update_into<'py>(
                 packed.append((PyBytes::new_bound(py, &key), PyBytes::new_bound(py, &value)))?;
                 held.put(k, v);
             }
-            let (capacity, now) = (held.capacity, held.tick.get());
+            let (capacity, now) = (held.capacity, held.tick.load(Ordering::Relaxed));
             held.trim(capacity, now);
-            held.settled = held.tick.get();
+            held.settled = held.tick.load(Ordering::Relaxed);
             let gone = PyList::empty_bound(py);
             let mut prefix = Vec::with_capacity(9);
             uint_into(&mut prefix, version);
