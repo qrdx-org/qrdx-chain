@@ -608,17 +608,27 @@ Each block's phase line ends with its store commits (`db N`; they were SQLite ro
       imported on the path every block waits on, finds it done.
     * **No module imported per call in the hot helpers** (the minimum gas price, the chain id,
       the wire form, the mempool's state lookups): about 0.35 µs each, 25 an admitted transfer.
+    * **What arrives together is admitted together** (`ExchangeSubmitter.submit_batch`): a
+      peer's gossip batch, and a client's JSON-RPC batch of `exchange_sendTransaction` (the
+      server runs a method's batch form, `batched_by`, for a batch's calls of it). The
+      signatures in one batch and the payers' balances in one read, as before; but no
+      coroutine, future and wait a transaction — a third of admission's time — and the
+      fingerprints of the transactions it has just read held for the batch (they were computed
+      eight times a transaction, once a remembered value). The same checks and answers as
+      `submit`, call by call (tests/test_gossip_announce.py).
 
     | µs a transfer (500 a block, 2,048 accounts) | Before | After |
     |---|---:|---:|
-    | Admission (decode, checks, mempool) | 99 | 74 without the lane's preparation, 89 with it |
-    | Import: balance pre-loads | 15 | 12 |
-    | Import: execution | 49 | 33 |
+    | Admission (decode, checks, mempool) | 99 | 67, with the lane's preparation (about 10) moved into it |
+    | Import: balance pre-loads | 15 | 11 |
+    | Import: execution | 49 | 35 |
     | Import, in all | 111 | 89 |
+    | In all | 210 | 157 |
 
     Live (4 nodes, 2,048 accounts): 1,500 a second at 4.00 blocks a second, every slot proposed,
-    p95 0.9 s; an import's median 96–110 → 82 ms. 2,000 a second executed every operation
-    (1,977 a second, none refused) but at 2.9 blocks a second, with a backlog.
+    latency p50 0.34 s, p95 0.68 s; an import's median 96–110 → 74 ms at 1,000 a second.
+    2,000 a second executes nearly all of it (1,885–1,977 a second) but at 2.8–2.9 blocks a
+    second, with a backlog (p50 4–6 s).
 
     The alternative — a second process per node for admission and the index — is designed in
     docs/SECOND_CORE.md.
@@ -747,9 +757,9 @@ batching is the lever that moves it.
 In the order they would pay, toward four blocks a second at 2,000–4,000 transfers:
 
 1. **The exchange's state held natively.** After 36–39 an importing validator spends about
-   180 µs of its one thread on each transfer (`scripts/bench/import_block.py`; about twice that
-   live, beside three other nodes): admission 75–90, the import 89 (execution 33, the store 16,
-   the roots 16, pre-loads 11, the flush 9). What is left is no longer one cost but dozens of
+   157 µs of its one thread on each transfer (`scripts/bench/import_block.py`; about twice that
+   live, beside three other nodes): admission 67, the import 89 (execution 35, the store 16,
+   the roots 16, pre-loads 11, the flush 10). What is left is no longer one cost but dozens of
    2–6 µs ones, and most are one thing: the exchange's balances, deltas and nonces live in
    Python dicts of `Decimal`, so the native lane converts each value to text and back, writes
    an undo record a key, and the pre-load, the flush and the commitments each read or write

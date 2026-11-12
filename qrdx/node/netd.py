@@ -158,10 +158,10 @@ async def _admit(peer: str, items: List[Tuple[bytes, Optional[str], Any, Any, An
             for tx, _ in txs:
                 verify_exchange_tx(tx)  # (the Python checks, with the transport's verdicts)
     submitter = _node._get_exchange_submitter()
-    await asyncio.gather(
-        *[submitter.submit(tx, propagated=True, origin=peer, raw=raw) for tx, raw in txs],
-        return_exceptions=True,
-    )
+    try:  # (the batch together: one signature batch, one balance read, no wait a transaction)
+        await submitter.submit_batch(txs, propagated=True, origin=peer)
+    except Exception as e:
+        logger.debug(f"peer transport: a batch from {peer[:16]} not admitted: {e}")
 
 
 async def _receive_block(peer: str, raw: bytes) -> None:

@@ -108,6 +108,31 @@ def signing_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     return {"signing_bytes": tx.signing_bytes().hex(), "tx_hash": tx.tx_hash(), "tx": body}
 
 
+def _gas_terms(tx: ExchangeTransaction) -> Tuple[str, Optional[str], Optional[Decimal]]:
+    """``(why it is refused, its payer, what its gas may cost)``: its form and fee floor checked
+    first (the checks below read its params and its price); no payer for a transaction that
+    pays none (the free lane, judged by the mempool)."""
+    try:
+        tx.validate_basic()
+        if tx.free_eligible():
+            return "", None, None
+        tx.validate_fee()
+    except ValueError as e:
+        return str(e), None, None
+    from .state_manager import ExchangeStateManager
+
+    return "", ExchangeStateManager.get_instance().fee_payer(tx), tx.max_fee()
+
+
+def _short_of(payer: str, need: Any, held: Decimal) -> str:
+    if held < need:
+        return (
+            f"insufficient QRDX for gas: {payer[:16]}… holds {held}; the transaction may "
+            f"cost {need} (gas_limit × gas_price)"
+        )
+    return ""
+
+
 class _Coalesced:
     """Balances read concurrently, read in one query: each call waits for the reads that arrived
     with it, then gets its own."""
@@ -167,6 +192,7 @@ class ExchangeSubmitter:
         # ``get_balances`` reads many at once: what arrives together (a peer's gossip batch,
         # a hundred calls at once) is read in one query, not one database round trip each.
         self._get_balance = get_balance
+        self._get_balances = get_balances
         if get_balance is not None and get_balances is not None:
             self._get_balance = _Coalesced(get_balances)
         self._verify_queue: List[Tuple[ExchangeTransaction, "asyncio.Future[None]"]] = []
@@ -227,6 +253,19 @@ class ExchangeSubmitter:
         short = await self._unaffordable(tx)
         if short:
             return False, short, None
+        return self._admit(tx, tx_hash, propagated, origin, raw)
+
+    def _admit(
+        self,
+        tx: ExchangeTransaction,
+        tx_hash: str,
+        propagated: bool,
+        origin: Optional[str],
+        raw: Any,
+    ) -> Tuple[bool, str, Optional[str]]:
+        """The mempool's admission of a transaction whose signature and payer were checked, and
+        what follows it: its preparation for the native lane and its relay."""
+        mempool = self._get_mempool()
         ok, err = mempool.admit(tx)
         if not ok:
             if err.startswith("duplicate"):
@@ -265,24 +304,87 @@ class ExchangeSubmitter:
         checked)."""
         if self._get_balance is None:
             return ""
-        try:  # (its form first: the checks below read its params and its price)
-            tx.validate_basic()
-            if tx.free_eligible():
-                return ""
-            tx.validate_fee()
-        except ValueError as e:
-            return str(e)
-        from .state_manager import ExchangeStateManager
+        why, payer, need = _gas_terms(tx)
+        if why or payer is None:
+            return why
+        return _short_of(payer, need, Decimal(await self._get_balance(payer)))
 
-        payer = ExchangeStateManager.get_instance().fee_payer(tx)
-        need = tx.max_fee()
-        held = Decimal(await self._get_balance(payer))
-        if held < need:
-            return (
-                f"insufficient QRDX for gas: {payer[:16]}… holds {held}; the transaction may "
-                f"cost {need} (gas_limit × gas_price)"
-            )
-        return ""
+    async def submit_batch(
+        self, items: List[Tuple[Any, Any]], propagated: bool = False, origin: Optional[str] = None
+    ) -> List[Tuple[bool, str, Optional[str]]]:
+        """``submit`` of each ``(tx, raw)``, together: what arrives together (a peer's gossip
+        batch, a client's JSON-RPC batch) is read, its signatures checked in one batch and its
+        payers' balances read in one query, then admitted one after another without a wait each.
+        The same checks in the same order, the same answers; in the order given."""
+        out: List[Optional[Tuple[bool, str, Optional[str]]]] = [None] * len(items)
+        mempool = self._get_mempool()
+        todo: List[Tuple[int, ExchangeTransaction, str, Any]] = []
+        # The transactions read here are this batch's alone until admitted: their fingerprints
+        # (``_fingerprint``, asked by every remembered value) are held until it is done.
+        held: List[ExchangeTransaction] = []
+        try:
+            return await self._submit_batch(items, propagated, origin, out, mempool, todo, held)
+        finally:
+            for tx in held:
+                tx.__dict__.pop("_fp_held", None)
+
+    async def _submit_batch(
+        self,
+        items: List[Tuple[Any, Any]],
+        propagated: bool,
+        origin: Optional[str],
+        out: List[Optional[Tuple[bool, str, Optional[str]]]],
+        mempool: Any,
+        todo: List[Tuple[int, ExchangeTransaction, str, Any]],
+        held: List[ExchangeTransaction],
+    ) -> List[Tuple[bool, str, Optional[str]]]:
+        for i, (item, raw) in enumerate(items):
+            try:
+                tx = parse_exchange_tx(item)
+            except Exception as e:
+                out[i] = (False, f"malformed exchange tx: {e}", None)
+                continue
+            if tx is not item:  # (read here: no one else holds it)
+                fingerprint = tx._fingerprint()
+                if fingerprint is not None:
+                    tx.__dict__["_fp_held"] = fingerprint
+                    held.append(tx)
+            tx_hash = tx.tx_hash()
+            if mempool.contains(tx_hash):
+                out[i] = (True, "", tx_hash)  # (a peer's echo: nothing to read or forward)
+                continue
+            todo.append((i, tx, tx_hash, raw))
+        if todo:
+            if self._yield_to is not None:
+                await self._yield_to()
+            for _i, _tx, tx_hash, _raw in todo:
+                self._saw(tx_hash)
+            from .. import native
+            from .block_processor import verify_exchange_txs
+
+            if native.AVAILABLE:
+                try:  # (as _preverify: the mempool's own check then finds each checked)
+                    await verify_exchange_txs([tx for _i, tx, _h, _raw in todo])
+                except Exception as e:
+                    logger.debug("exchange admission: batch verification skipped: %s", e)
+            if self._yield_to is not None:
+                await self._yield_to()
+            terms = [_gas_terms(tx) if self._get_balance is not None else ("", None, None)
+                     for _i, tx, _h, _raw in todo]  # fmt: skip
+            payers = sorted({payer for why, payer, _need in terms if not why and payer})
+            funds: Dict[str, Any] = {}
+            if payers:
+                if self._get_balances is not None:
+                    funds = await self._get_balances(payers)
+                else:
+                    for who in payers:
+                        funds[who] = await self._get_balance(who)  # type: ignore[misc]
+            for (i, tx, tx_hash, raw), (why, payer, need) in zip(todo, terms, strict=True):
+                if not why and payer is not None:
+                    why = _short_of(payer, need, Decimal(funds.get(payer, 0)))
+                out[i] = (False, why, None) if why else self._admit(tx, tx_hash, propagated,
+                                                                    origin, raw)  # fmt: skip
+        return [o for o in out if o is not None]
 
     def _relay_now(self) -> None:
         items, self._to_relay = self._to_relay, []

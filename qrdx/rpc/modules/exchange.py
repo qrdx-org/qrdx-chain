@@ -39,9 +39,9 @@ from the same views as the REST endpoints (qrdx/exchange/views.py), so all surfa
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from ..server import RPCError, RPCErrorCode, RPCModule, peer_only, rpc_method
+from ..server import RPCError, RPCErrorCode, RPCModule, batched_by, peer_only, rpc_method
 
 
 def _manager():
@@ -57,6 +57,7 @@ class ExchangeModule(RPCModule):
     namespace = "exchange"
 
     @rpc_method
+    @batched_by("sendTransactions")
     async def sendTransaction(self, tx: Any, propagated: bool = False) -> str:
         """Admit a signed exchange transaction (a JSON object, or the string ``to_hex()``
         makes) and gossip it. Returns its hash; the receipt appears once a block includes it."""
@@ -67,6 +68,32 @@ class ExchangeModule(RPCModule):
         if not ok:
             raise RPCError(RPCErrorCode.TRANSACTION_REJECTED, err)
         return tx_hash
+
+    async def sendTransactions(self, calls: List[List[Any]]) -> List[Any]:
+        """``sendTransaction`` of each call's params, together (``submit_batch``): each its hash
+        or the ``RPCError`` it would have raised (``NotImplemented`` for params it would not
+        take, which the server then runs alone). The JSON-RPC batch path; not a method itself."""
+        submitter = getattr(self.context, "submitter", None)
+        if submitter is None:
+            return [
+                RPCError(RPCErrorCode.RESOURCE_UNAVAILABLE, "exchange submission unavailable")
+            ] * len(calls)
+        out: List[Any] = [None] * len(calls)
+        groups: Dict[bool, List[Tuple[int, Any]]] = {}
+        for i, params in enumerate(calls):
+            if not 1 <= len(params) <= 2:
+                out[i] = NotImplemented  # (the server runs it alone: answered as ever)
+                continue
+            groups.setdefault(bool(params[1]) if len(params) == 2 else False, []).append(
+                (i, params[0])
+            )
+        for propagated, items in groups.items():
+            replies = await submitter.submit_batch(
+                [(tx, None) for _, tx in items], propagated=propagated
+            )
+            for (i, _tx), (ok, err, tx_hash) in zip(items, replies, strict=True):
+                out[i] = tx_hash if ok else RPCError(RPCErrorCode.TRANSACTION_REJECTED, err)
+        return out
 
     @rpc_method
     @peer_only

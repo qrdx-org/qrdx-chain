@@ -276,7 +276,12 @@ class ExchangeTransaction:
 
     def _fingerprint(self) -> Optional[Tuple[Any, ...]]:
         """Every input of ``_canonical_bytes``, as a comparable value — None when the params are
-        not flat (strings, numbers, booleans, None), which are hashed afresh every time."""
+        not flat (strings, numbers, booleans, None), which are hashed afresh every time. Held
+        (``_fp_held``) only while no one else can change the transaction: a submission batch
+        holds the fingerprints of the transactions it has just read, until it is done."""
+        held = self.__dict__.get("_fp_held")
+        if held is not None:
+            return held  # type: ignore[no-any-return]
         p = self.params
         if not isinstance(p, dict):
             return None

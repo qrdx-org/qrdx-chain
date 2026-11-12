@@ -14,7 +14,7 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .. import fastjson
 from ..logger import get_logger
@@ -179,6 +179,20 @@ def peer_only(func: RPCMethod) -> RPCMethod:
     signed by a node (``rpc_caller`` is set). Apply under ``@rpc_method``."""
     _mark(func, "__rpc_peer_only__")
     return func
+
+
+def batched_by(name: str) -> Callable[[RPCMethod], RPCMethod]:
+    """Mark an RPC method as having a form for many calls at once: the module's method ``name``,
+    given each call's params (a list each), returning each call's result, or an ``RPCError``, or
+    ``NotImplemented`` for a call it does not take (which then runs alone, as any call). The
+    server runs a JSON-RPC batch's calls of the method through it together. Apply under
+    ``@rpc_method``."""
+
+    def mark(func: RPCMethod) -> RPCMethod:
+        func.__rpc_batch__ = name  # type: ignore[attr-defined]
+        return func
+
+    return mark
 
 
 def rpc_method(func: RPCMethod) -> RPCMethod:
@@ -446,7 +460,7 @@ class RPCServer:
                     error = RPCError(RPCErrorCode.LIMIT_EXCEEDED, "Rate limit exceeded")
                     return RPCResponse(error=error.to_dict()).to_json()
 
-            responses = await asyncio.gather(*[self._handle_single(req) for req in parsed])
+            responses = await self._handle_batch(parsed)
 
             # Filter out None responses (notifications)
             responses = [r for r in responses if r is not None]
@@ -459,6 +473,62 @@ class RPCServer:
         if response is None:
             return None
         return fastjson.dumps(response)
+
+    async def _handle_batch(self, parsed: List[Any]) -> List[Optional[dict]]:
+        """A batch's responses, in its order. The calls of a method with a form for many
+        (``batched_by``) go through it together; every other call runs as it would alone."""
+        responses: List[Optional[dict]] = [None] * len(parsed)
+        groups: Dict[str, List[Tuple[int, RPCRequest]]] = {}
+        alone: List[int] = []
+        for i, data in enumerate(parsed):
+            try:
+                request = RPCRequest.from_dict(data)
+            except Exception:
+                alone.append(i)
+                continue
+            handler = self._methods.get(request.method) if request.method else None
+            if (
+                handler is not None
+                and getattr(handler, "__rpc_batch__", None)
+                and not getattr(handler, "__rpc_peer_only__", False)
+                and request.jsonrpc == "2.0"
+                and isinstance(request.params, list)
+            ):
+                groups.setdefault(request.method, []).append((i, request))
+            else:
+                alone.append(i)
+
+        async def together(method: str, calls: List[Tuple[int, RPCRequest]]) -> None:
+            handler: Any = self._methods[method]
+            many = getattr(handler.__self__, handler.__rpc_batch__)
+            for _ in calls:
+                _metric("qrdx_rpc_requests_total", labels={"method": method})
+            try:
+                outcomes = await many([list(r.params or []) for _, r in calls])
+            except Exception as e:
+                logger.exception(f"Error handling RPC method {method}")
+                outcomes = [RPCError(RPCErrorCode.INTERNAL_ERROR, str(e))] * len(calls)
+            for (i, request), outcome in zip(calls, outcomes, strict=True):
+                if outcome is NotImplemented:
+                    responses[i] = await self._handle_single(parsed[i])
+                    continue
+                if isinstance(outcome, RPCError):
+                    _metric("qrdx_rpc_errors_total", labels={"method": method})
+                if request.is_notification:
+                    continue
+                responses[i] = (
+                    RPCResponse(id=request.id, error=outcome.to_dict()).to_dict()
+                    if isinstance(outcome, RPCError)
+                    else RPCResponse(id=request.id, result=outcome).to_dict()
+                )
+
+        async def single(i: int) -> None:
+            responses[i] = await self._handle_single(parsed[i])
+
+        await asyncio.gather(
+            *[together(m, calls) for m, calls in groups.items()], *[single(i) for i in alone]
+        )
+        return responses
 
     async def _handle_single(self, data: dict) -> Optional[dict]:
         """Handle a single request and return response dict."""

@@ -4,9 +4,9 @@ A block as an importing validator meets it, phase by phase (docs/PERFORMANCE.md)
 transactions first arrive from peers and are admitted, then the block names them and is
 imported from the mempool's own copies (a compact block), on a real database.
 
-* **admit**: each transaction's binary text from a peer, through the node's submitter and
-  mempool (``ExchangeSubmitter.submit``: decoding, the signature in one batch, the payer's
-  balance, the mempool's checks).
+* **admit**: the transactions' binary text from a peer, as one gossip batch through the node's
+  submitter and mempool (``ExchangeSubmitter.submit_batch``: decoding, the signatures in one
+  batch, the payers' balances in one read, the mempool's checks).
 * **import**: the steps ``block_import._apply_exchange_section_on_import`` takes — decode and
   "already checked?", the balance pre-loads, execution with the exchange root, the flush — then
   the unified state root and storing the block.
@@ -58,6 +58,7 @@ async def run(args) -> None:
         get_balance=db.get_address_balance,
         get_balances=db.get_address_balances,
     )
+    submitter.use_transport(lambda items: None)  # (as the node relays: the native transport)
     clock = Clock()
     total = 0
     import cProfile
@@ -88,8 +89,8 @@ async def run(args) -> None:
             texts = BP.encode_exchange_txs(_transfers(keys, args.txs, nonces, CHAIN_ID), b)
 
             with phase("admit (decode, check, mempool)"):
-                replies = await asyncio.gather(
-                    *[submitter.submit(t, propagated=True, origin="peer") for t in texts]
+                replies = await submitter.submit_batch(  # (a peer's gossip batch)
+                    [(t, None) for t in texts], propagated=True, origin="peer"
                 )
             assert all(ok for ok, _e, _h in replies), [e for ok, e, _h in replies if not ok][:1]
             section = [mempool.get(h) for _ok, _e, h in replies]
