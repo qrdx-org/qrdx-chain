@@ -1,0 +1,180 @@
+# =============================================================================
+# QRDX Integration Testnet — 4 nodes (3 validators + 1 full node)
+#
+#   docker compose -f docker/docker-compose.testnet.yml up --build -d
+#   docker compose -f docker/docker-compose.testnet.yml logs -f node0
+#   docker compose -f docker/docker-compose.testnet.yml down -v     # wipe chain
+#
+# The `init` service generates the validator wallets and genesis_config.json
+# inside the shared testnet volume before any node starts (idempotent — a
+# restart reuses the existing genesis). No host Python or liboqs required.
+# The chain's first slot is QRDX_GENESIS_DELAY (45 s) after init, so all four
+# nodes are up and meshed before it: at 250 ms slots, a validator that starts
+# late misses its slots until it catches up.
+#
+# REGENESIS (a new chain on a new release): `down -v` (the volume holds the
+# genesis, the wallets, every database and identity), then `up --build -d`.
+# init refuses to start nodes on a genesis this release cannot run.
+#
+# Every node serves its REST API, JSON-RPC (/rpc), /metrics, /healthz, /readyz
+# on ONE port; the published host ports are 3007-3010. Nodes also talk over
+# the native peer transport, on their port + 10,000 (13007-13010), inside the
+# compose network only — nothing outside dials it.
+#
+# WARNING: validator wallet passwords are well-known constants. LOCAL USE ONLY.
+# =============================================================================
+
+x-node-base: &node-base
+  build:
+    context: ".."
+    dockerfile: "docker/Dockerfile"
+  image: qrdx-node:local
+  restart: unless-stopped
+  stop_grace_period: 30s
+  networks: [testnet]
+  volumes:
+    - testnet-data:/testnet
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "3" }
+  healthcheck:
+    test: ["CMD", "python", "/app/docker/docker-healthcheck.py"]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 60s
+
+x-node-env: &node-env
+  QRDX_CHAIN_ID: "7620"
+  QRDX_NETWORK_NAME: "qrdx-testnet"
+  QRDX_NODE_HOST: "0.0.0.0"
+  QRDX_RPC_ENABLED: "true"
+  QRDX_ENABLE_STREAMING: "1"
+  QRDX_DISABLE_RATE_LIMIT: "1"
+  LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+  PYTHONWARNINGS: "ignore"
+  # Four nodes share this host's CPUs: each sizes its native threads to a quarter of them
+  # (docker-entrypoint.sh). Set QRDX_NATIVE_THREADS to fix the number instead.
+  QRDX_NODES_PER_HOST: "4"
+  QRDX_NATIVE_THREADS: "${QRDX_NATIVE_THREADS:-}"
+
+services:
+  # ── Genesis + validator wallet bootstrap (runs once, then exits) ──────────
+  init:
+    <<: *node-base
+    container_name: qrdx-testnet-init
+    restart: "no"
+    healthcheck:
+      disable: true
+    environment:
+      <<: *node-env
+      QRDX_TESTNET_DIR: "/testnet"
+      QRDX_TESTNET_VALIDATORS: "3"
+      # Seconds from init to the chain's first slot (the nodes start meanwhile).
+      QRDX_GENESIS_DELAY: "${QRDX_GENESIS_DELAY:-45}"
+      # Network parameters go into the genesis chain spec, which every node reads; a node whose
+      # environment set a different value would refuse to start. A 3-validator set is below
+      # the production minimum.
+      QRDX_MIN_VALIDATORS: "1"
+    entrypoint: ["python", "/app/docker/testnet-init.py"]
+
+  # ── Bootstrap Node (Validator 0) ──────────────────────────────────────────
+  node0:
+    <<: *node-base
+    container_name: qrdx-testnet-node0
+    hostname: node0
+    ports: ["3007:3007"]
+    environment:
+      <<: *node-env
+      NODE_NAME: "node0"
+      QRDX_NODE_PORT: "3007"
+      QRDX_SELF_URL: "http://node0:3007"
+      QRDX_DATABASE_PATH: "/testnet/databases/node0.db"
+      QRDX_NODE_KEY_DIR: "/testnet/keys/node0"
+      # 'self' keeps the genesis bootstrap from dialling the public seed node.
+      # An EMPTY value would NOT do that — qrdx/constants.py treats empty as
+      # unset and falls back to http://node.qrdx.org.
+      QRDX_BOOTSTRAP_NODE: "self"
+      # Every node dials every other (a full mesh, as scripts/testnet.sh): a node
+      # learns a peer's URL only by dialling it, and a block reaches only the peers
+      # whose URL it has. Those not up yet are dialled again as they come up.
+      QRDX_BOOTSTRAP_NODES: "http://node1:3008,http://node2:3009,http://node3:3010"
+      QRDX_VALIDATOR_ENABLED: "true"
+      QRDX_VALIDATOR_WALLET: "/testnet/wallets/validator_0.json"
+      QRDX_VALIDATOR_PASSWORD: "testnet_validator_0"
+    depends_on:
+      init: { condition: service_completed_successfully }
+
+  # ── Validator 1 ───────────────────────────────────────────────────────────
+  node1:
+    <<: *node-base
+    container_name: qrdx-testnet-node1
+    hostname: node1
+    ports: ["3008:3008"]
+    environment:
+      <<: *node-env
+      NODE_NAME: "node1"
+      QRDX_NODE_PORT: "3008"
+      QRDX_SELF_URL: "http://node1:3008"
+      QRDX_DATABASE_PATH: "/testnet/databases/node1.db"
+      QRDX_NODE_KEY_DIR: "/testnet/keys/node1"
+      QRDX_BOOTSTRAP_NODE: "http://node0:3007"
+      QRDX_BOOTSTRAP_NODES: "http://node0:3007,http://node2:3009,http://node3:3010"
+      QRDX_VALIDATOR_ENABLED: "true"
+      QRDX_VALIDATOR_WALLET: "/testnet/wallets/validator_1.json"
+      QRDX_VALIDATOR_PASSWORD: "testnet_validator_1"
+    depends_on:
+      node0: { condition: service_healthy }
+
+  # ── Validator 2 ───────────────────────────────────────────────────────────
+  node2:
+    <<: *node-base
+    container_name: qrdx-testnet-node2
+    hostname: node2
+    ports: ["3009:3009"]
+    environment:
+      <<: *node-env
+      NODE_NAME: "node2"
+      QRDX_NODE_PORT: "3009"
+      QRDX_SELF_URL: "http://node2:3009"
+      QRDX_DATABASE_PATH: "/testnet/databases/node2.db"
+      QRDX_NODE_KEY_DIR: "/testnet/keys/node2"
+      QRDX_BOOTSTRAP_NODE: "http://node0:3007"
+      QRDX_BOOTSTRAP_NODES: "http://node0:3007,http://node1:3008,http://node3:3010"
+      QRDX_VALIDATOR_ENABLED: "true"
+      QRDX_VALIDATOR_WALLET: "/testnet/wallets/validator_2.json"
+      QRDX_VALIDATOR_PASSWORD: "testnet_validator_2"
+    depends_on:
+      node0: { condition: service_healthy }
+
+  # ── Full Node (non-validator) ─────────────────────────────────────────────
+  node3:
+    <<: *node-base
+    container_name: qrdx-testnet-node3
+    hostname: node3
+    ports: ["3010:3010"]
+    environment:
+      <<: *node-env
+      NODE_NAME: "node3"
+      QRDX_NODE_PORT: "3010"
+      QRDX_SELF_URL: "http://node3:3010"
+      QRDX_DATABASE_PATH: "/testnet/databases/node3.db"
+      QRDX_NODE_KEY_DIR: "/testnet/keys/node3"
+      QRDX_BOOTSTRAP_NODE: "http://node0:3007"
+      QRDX_BOOTSTRAP_NODES: "http://node0:3007,http://node1:3008,http://node2:3009"
+      QRDX_VALIDATOR_ENABLED: "false"
+    depends_on:
+      node0: { condition: service_healthy }
+
+networks:
+  testnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  # Single shared volume: genesis config + wallets + per-node databases/keys.
+  # The node finds genesis_config.json two directories up from its DB path,
+  # which is why the databases live in /testnet/databases/.
+  testnet-data:

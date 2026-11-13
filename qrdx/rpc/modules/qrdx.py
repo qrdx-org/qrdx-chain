@@ -4,10 +4,11 @@ QRDX qrdx_* RPC Methods
 Chain-specific JSON-RPC methods.
 """
 
-from typing import Any, Dict, List, Optional
-from decimal import Decimal
 import logging
-from ..server import RPCModule, rpc_method, rpc_admin_method, RPCError, RPCErrorCode
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
+
+from ..server import RPCError, RPCErrorCode, RPCModule, rpc_admin_method, rpc_method
 
 logger = logging.getLogger(__name__)
 
@@ -15,37 +16,38 @@ logger = logging.getLogger(__name__)
 class QRDXModule(RPCModule):
     """
     QRDX-specific RPC methods (qrdx_* namespace).
-    
+
     These methods provide chain-specific functionality not covered
     by the standard eth_* namespace.
     """
-    
+
     namespace = "qrdx"
-    
+
     @rpc_method
     async def getMiningInfo(self) -> Dict:
         """
         Returns mining information for creating a new block.
-        
+
         This is the main endpoint for miners.
-        
+
         Returns:
             Mining info including difficulty, block template, etc.
         """
         if not self.context or not self.context.db:
             raise RPCError(RPCErrorCode.INTERNAL_ERROR, "Database not available")
-        
+
         # Get current block info
         last_block = await self.context.db.get_last_block()
         next_block_id = (last_block["id"] + 1) if last_block else 0
-        
+
         # Get pending transactions
         pending_txs = await self.context.db.get_pending_transactions()
-        
+
         # Calculate difficulty
         from ...manager import calculate_difficulty
+
         difficulty, _ = await calculate_difficulty()
-        
+
         return {
             "height": next_block_id,
             "previousHash": last_block["hash"] if last_block else "0" * 64,
@@ -54,22 +56,17 @@ class QRDXModule(RPCModule):
             "pendingTransactions": len(pending_txs) if pending_txs else 0,
             "reward": str(self._calculate_reward(next_block_id)),
         }
-    
+
     @rpc_method
-    async def submitBlock(
-        self,
-        block_hash: str,
-        block_content: str,
-        address: str
-    ) -> Dict:
+    async def submitBlock(self, block_hash: str, block_content: str, address: str) -> Dict:
         """
         Submit a mined block.
-        
+
         Args:
             block_hash: The block's hash
             block_content: Block content in hex
             address: Miner's address for reward
-            
+
         Returns:
             Submission result with 'success' and optional 'error'
         """
@@ -94,7 +91,7 @@ class QRDXModule(RPCModule):
 
             # 3. Validate via the node's block-processing pipeline
             # The pipeline checks PoW/PoS, parent hash, difficulty, timestamps, etc.
-            if hasattr(self.context, 'node') and hasattr(self.context.node, 'process_block'):
+            if hasattr(self.context, "node") and hasattr(self.context.node, "process_block"):
                 accepted = await self.context.node.process_block(
                     block_hash=block_hash,
                     block_content=block_bytes,
@@ -102,7 +99,7 @@ class QRDXModule(RPCModule):
                 )
                 if not accepted:
                     return {"success": False, "error": "Block rejected by consensus rules"}
-            elif hasattr(self.context, 'add_block'):
+            elif hasattr(self.context, "add_block"):
                 accepted = await self.context.add_block(
                     block_hash=block_hash,
                     block_content=block_bytes,
@@ -111,12 +108,13 @@ class QRDXModule(RPCModule):
                 if not accepted:
                     return {"success": False, "error": "Block rejected by chain"}
             else:
-                # Legacy path: store directly via DB (used in simple miner setups)
-                from ...manager import check_block_is_valid
-                try:
-                    await check_block_is_valid(block_bytes)
-                except Exception as validation_error:
-                    return {"success": False, "error": f"Validation failed: {validation_error}"}
+                # No block pipeline is attached to this RPC context. Blocks enter a PoS node
+                # only through the proposer and peer import (p2p_submitBlock), so refuse
+                # rather than report success for a block nothing validated or stored.
+                return {
+                    "success": False,
+                    "error": "This node does not accept mined blocks over RPC",
+                }
 
             return {
                 "success": True,
@@ -125,71 +123,184 @@ class QRDXModule(RPCModule):
         except RPCError:
             raise
         except Exception as e:
-            raise RPCError(RPCErrorCode.INTERNAL_ERROR, str(e))
-    
+            raise RPCError(RPCErrorCode.INTERNAL_ERROR, str(e)) from e
+
     @rpc_method
     async def getAddressInfo(self, address: str) -> Dict:
         """
         Returns detailed information about an address.
-        
+
         Args:
             address: The address to query
-            
+
         Returns:
             Address info including balance, transaction count, etc.
         """
         if not self.context or not self.context.db:
             raise RPCError(RPCErrorCode.INTERNAL_ERROR, "Database not available")
-        
+
+        from ...crypto.account_id import to_account_id
+
         balance = await self.context.db.get_address_balance(address)
         pending_balance = await self.context.db.get_address_balance(address, True)
-        
+
+        try:
+            account_id = to_account_id(address)
+        except ValueError:
+            account_id = None
+
         return {
             "address": address,
+            # The 20-byte key this account's state actually lives under. For a
+            # 0xPQ address this is the form to hand to any Ethereum tool, and the
+            # form a contract sees as msg.sender.
+            "accountId": account_id,
             "balance": str(balance or Decimal(0)),
             "pendingBalance": str(pending_balance or Decimal(0)),
             "pendingDelta": str((pending_balance or Decimal(0)) - (balance or Decimal(0))),
         }
-    
+
     @rpc_method
-    async def getPendingTransactions(
-        self,
-        limit: int = 100,
-        offset: int = 0
+    async def getAccountId(self, address: str) -> Dict:
+        """
+        Resolve any QRDX address form to its canonical 20-byte account id.
+
+        Wallets and explorers need this to show a post-quantum account through
+        Ethereum tooling: a ``0xPQ…`` address is a credential fingerprint, while
+        the account id is the ledger key, the ``eth_getBalance`` argument, and what
+        a contract sees as ``msg.sender``.
+
+        Purely computational — a deterministic hash, no state access, so it is
+        answerable for an address that has never been funded.
+
+        Args:
+            address: ``0x…``, ``0xPQ…``, ``0xPQMS…``, or a legacy ``Q``/``R`` address.
+
+        Returns:
+            ``{"address", "accountId", "addressType", "isAccountId"}``
+        """
+        from ...crypto.account_id import is_account_id, to_account_id
+
+        try:
+            account_id = to_account_id(address)
+        except ValueError as e:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, str(e)) from e
+
+        if address.startswith("0xPQMS") or address.startswith("0xpqms"):
+            addr_type = "multisig"
+        elif address.startswith("0xPQ") or address.startswith("0xpq"):
+            addr_type = "post-quantum"
+        elif address[:1] in ("Q", "R"):
+            addr_type = "legacy"
+        else:
+            addr_type = "traditional"
+
+        return {
+            "address": address,
+            "accountId": account_id,
+            "addressType": addr_type,
+            # True when the input already WAS the canonical key (traditional
+            # addresses are their own account id).
+            "isAccountId": is_account_id(address) and account_id == address.lower(),
+        }
+
+    @rpc_method
+    async def getIntrinsicGas(
+        self, envelope: str = "legacy", data: str = "0x", is_create: bool = False
     ) -> Dict:
         """
+        The minimum gas a transaction must supply before execution begins.
+
+        Explicit counterpart to ``eth_estimateGas`` for callers that would rather ask than
+        set an EIP-2718 ``type`` field. It matters most for the post-quantum envelope: a
+        type-0x51 transaction carries a ~5.3KB ML-DSA-65 public key and signature, its
+        floor prices that (≈145,000 gas for a plain transfer), and a transaction below the
+        floor is rejected outright rather than merely reverting — so a wallet that guesses
+        21,000 would have every transaction refused.
+
+        Purely computational — no state access.
+
+        Args:
+            envelope: ``"legacy"`` (secp256k1 / EIP-155) or ``"pq"`` (type 0x51).
+            data: Calldata as a hex string; priced per byte.
+            is_create: True for contract creation (adds the EIP-2 surcharge).
+
+        Returns:
+            ``{"envelope", "intrinsicGas", "intrinsicGasHex", "txType"}``
+        """
+        from ...transactions.pq_tx import PQ_TX_TYPE, intrinsic_gas_pq
+
+        try:
+            call_data = bytes.fromhex(data[2:] if data.startswith("0x") else data)
+        except ValueError as e:
+            raise RPCError(RPCErrorCode.INVALID_PARAMS, f"invalid data: {e}") from e
+
+        kind = str(envelope).lower()
+        if kind in ("pq", "post-quantum", "postquantum", hex(PQ_TX_TYPE), str(PQ_TX_TYPE)):
+            from ...crypto.pq.dilithium import PUBLIC_KEY_SIZE, SIGNATURE_SIZE
+
+            gas = intrinsic_gas_pq(
+                call_data,
+                b"\x00" * PUBLIC_KEY_SIZE,
+                b"\x00" * SIGNATURE_SIZE,
+                is_create=bool(is_create),
+            )
+            tx_type = PQ_TX_TYPE
+            kind = "pq"
+        elif kind in ("legacy", "eip155", "eip-155", "0x0", "0"):
+            from ...contracts.evm_mempool import intrinsic_gas_legacy
+
+            gas = intrinsic_gas_legacy(call_data, is_create=bool(is_create))
+            tx_type = 0
+            kind = "legacy"
+        else:
+            raise RPCError(
+                RPCErrorCode.INVALID_PARAMS,
+                f"unknown envelope {envelope!r} (expected 'legacy' or 'pq')",
+            )
+
+        return {
+            "envelope": kind,
+            "txType": hex(tx_type),
+            "intrinsicGas": gas,
+            "intrinsicGasHex": hex(gas),
+        }
+
+    @rpc_method
+    async def getPendingTransactions(self, limit: int = 100, offset: int = 0) -> Dict:
+        """
         Returns pending transactions from the mempool.
-        
+
         Args:
             limit: Maximum transactions to return
             offset: Offset for pagination
-            
+
         Returns:
             List of pending transactions
         """
         if not self.context or not self.context.db:
             raise RPCError(RPCErrorCode.INTERNAL_ERROR, "Database not available")
-        
+
         pending = await self.context.db.get_pending_transactions(limit, offset)
-        
+
         return {
             "transactions": [self._format_pending_tx(tx) for tx in (pending or [])],
             "count": len(pending) if pending else 0,
         }
-    
+
     @rpc_method
     async def getNetworkInfo(self) -> Dict:
         """
         Returns network statistics.
-        
+
         Returns:
             Network info
         """
         if not self.context or not self.context.db:
             raise RPCError(RPCErrorCode.INTERNAL_ERROR, "Database not available")
-        
+
         last_block = await self.context.db.get_last_block()
-        
+
         return {
             "version": self._get_version(),
             "chainId": self.context.config.chain_id if self.context else 1,
@@ -198,108 +309,105 @@ class QRDXModule(RPCModule):
             "peerCount": await self._get_peer_count(),
             "syncing": False,  # Could check sync status from context if available
         }
-    
+
     @rpc_method
     async def getPeers(self) -> List[Dict]:
         """
         Returns list of connected peers.
-        
+
         Returns:
             List of peer info
         """
         if not self.context:
             return []
-        
+
         # Get peers from P2P manager if available
-        if hasattr(self.context, 'p2p') and self.context.p2p:
+        if hasattr(self.context, "p2p") and self.context.p2p:
             try:
-                if hasattr(self.context.p2p, 'peers'):
+                if hasattr(self.context.p2p, "peers"):
                     return [
-                        {
-                            "address": str(peer),
-                            "connected": True
-                        }
-                        for peer in self.context.p2p.peers
+                        {"address": str(peer), "connected": True} for peer in self.context.p2p.peers
                     ]
             except Exception as e:
                 logger.debug("getPeers failed: %s", e)
-        
+
         return []
-    
+
     @rpc_admin_method
     async def addPeer(self, uri: str) -> bool:
         """
         Manually add a peer.  Requires admin_token authentication.
-        
+
         Args:
             uri: Peer URI (qnode:// format)
-            
+
         Returns:
             True if added successfully
         """
         if not self.context:
             return False
-        
+
         # Add peer to P2P manager if available
-        if hasattr(self.context, 'p2p') and self.context.p2p:
+        if hasattr(self.context, "p2p") and self.context.p2p:
             try:
-                if hasattr(self.context.p2p, 'add_peer'):
+                if hasattr(self.context.p2p, "add_peer"):
                     await self.context.p2p.add_peer(uri)
                     return True
             except Exception as e:
                 logger.warning("addPeer failed for %s: %s", uri, e)
-        
+
         return False
-    
+
     @rpc_admin_method
     async def removePeer(self, node_id: str) -> bool:
         """
         Remove a peer.  Requires admin_token authentication.
-        
+
         Args:
             node_id: Node ID to remove
-            
+
         Returns:
             True if removed successfully
         """
         if not self.context:
             return False
-        
+
         # Remove peer from P2P manager if available
-        if hasattr(self.context, 'p2p') and self.context.p2p:
+        if hasattr(self.context, "p2p") and self.context.p2p:
             try:
-                if hasattr(self.context.p2p, 'remove_peer'):
+                if hasattr(self.context.p2p, "remove_peer"):
                     await self.context.p2p.remove_peer(node_id)
                     return True
             except Exception as e:
                 logger.warning("removePeer failed for %s: %s", node_id, e)
-        
+
         return False
-    
+
     @rpc_method
     async def getDifficulty(self) -> Dict:
         """
         Returns current mining difficulty.
-        
+
         Returns:
             Difficulty info
         """
         from ...manager import calculate_difficulty
+
         difficulty, last_block = await calculate_difficulty()
-        
+
         return {
             "difficulty": str(difficulty),
             "blockHeight": last_block.get("id", 0) if last_block else 0,
         }
-    
+
     @rpc_method
     async def getBlockReward(self, block_height: Optional[int] = None) -> Dict:
         """
         Returns block reward for a given height.
-        
+
         Args:
             block_height: Block height (uses latest if None)
-            
+
         Returns:
             Reward info
         """
@@ -309,35 +417,78 @@ class QRDXModule(RPCModule):
                 block_height = last_block["id"] + 1 if last_block else 0
             else:
                 block_height = 0
-        
+
         reward = self._calculate_reward(block_height)
-        
+
         return {
             "blockHeight": block_height,
             "reward": str(reward),
         }
-    
+
+    @rpc_method
+    async def chainSpec(self) -> Dict[str, Any]:
+        """The network this node follows and its upgrade schedule: chain id, parameters, active
+        rules, scheduled forks (with blocks until activation), fork id and node version
+        (docs/PROTOCOL_UPGRADES.md)."""
+        from ... import chain_spec
+        from ...constants import CHAIN_SPEC, NODE_VERSION
+
+        if not self.context or not self.context.db:
+            raise RPCError(RPCErrorCode.RESOURCE_UNAVAILABLE, "Node not ready")
+        genesis = await self.context.db.get_block_by_id(0)
+        if not genesis:
+            raise RPCError(RPCErrorCode.RESOURCE_UNAVAILABLE, "no genesis block")
+        tip = max(0, (await self.context.db.get_next_block_id()) - 1)
+        return chain_spec.report(
+            CHAIN_SPEC, genesis.get("hash") or genesis.get("block_hash"), tip, NODE_VERSION
+        )
+
+    @rpc_method
+    async def weakSubjectivityCheckpoint(self) -> Dict[str, Any]:
+        """A checkpoint to give a new node (qrdx/checkpoints.py, docs/WEAK_SUBJECTIVITY.md): the
+        finalized block this node holds, as ``QRDX_TRUSTED_CHECKPOINT`` takes it, with the
+        checkpoint this node itself trusts and the weak-subjectivity period. Ask a node you
+        trust: a checkpoint is only as good as its source."""
+        from ... import checkpoints
+        from ...validator.finality import finalized_block_height
+
+        if not self.context or not self.context.db:
+            raise RPCError(RPCErrorCode.RESOURCE_UNAVAILABLE, "Node not ready")
+        db = self.context.db
+        height = int(await finalized_block_height(db))
+        block_hash = ""
+        if height >= 1:
+            block_hash = (await db.get_block_hashes(height, height)).get(height, "")
+        trusted_height, trusted_hash = checkpoints.describe()
+        return {
+            "finalized": {"height": height, "hash": block_hash},
+            "env": f"{checkpoints.ENV}={height}:{block_hash}" if block_hash else "",
+            "trusted": {"height": trusted_height, "hash": trusted_hash},
+            "weak_subjectivity_seconds": checkpoints.weak_subjectivity_seconds(),
+        }
+
     # Helper methods
-    
+
     def _calculate_reward(self, block_height: int) -> Decimal:
         """Calculate block reward for height."""
-        from ...constants import INITIAL_REWARD, HALVING_INTERVAL
-        
+        from ...constants import HALVING_INTERVAL, INITIAL_REWARD
+
         halvings = block_height // HALVING_INTERVAL
-        reward = INITIAL_REWARD / (2 ** halvings)
+        reward = INITIAL_REWARD / (2**halvings)
         return reward
-    
+
     def _get_version(self) -> str:
         """Get node version."""
         from ...constants import NODE_VERSION
+
         return NODE_VERSION
-    
+
     async def _get_peer_count(self) -> int:
         """Get peer count."""
-        if self.context and hasattr(self.context, 'p2p'):
+        if self.context and hasattr(self.context, "p2p"):
             return len(self.context.p2p.peers)
         return 0
-    
+
     def _format_pending_tx(self, tx: Dict) -> Dict:
         """Format pending transaction."""
         return {

@@ -9,11 +9,11 @@ Provides:
 """
 
 from .multisig import (
-    SpendingScope,
-    SpendingPolicy,
     AutoRefillRule,
-    SubWallet,
     PrefundedWalletManager,
+    SpendingPolicy,
+    SpendingScope,
+    SubWallet,
 )
 
 __all__ = [

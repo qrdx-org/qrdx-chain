@@ -1,0 +1,205 @@
+"""
+Nodes publishing snapshots (qrdx/snapshot_publisher.py; docs/CHECKPOINT_SYNC.md "Publishing").
+
+A node with QRDX_SNAPSHOT_DIR writes a snapshot of its database at each newer exchange
+checkpoint, keeps the newest, serves it at /snapshot/ (resumable) and advertises it in its
+status; ``snapshot.py fetch --peer`` finds the newest one among the nodes it is given. A
+published snapshot leaves out what a restore discards — the node's own tables among them — and
+compacts the file, so their rows are gone rather than only unlinked.
+"""
+import hashlib
+import json
+import os
+
+import pytest
+
+from qrdx import snapshot, snapshot_publisher
+from qrdx.snapshot import SnapshotError, create, discover, fetch
+from qrdx.store import Store
+
+PEER_IP = "10.9.8.7"
+
+
+class _Closed:
+    def close(self):
+        pass
+
+
+def _node_db(path, checkpoint=100):
+    """A node database (the store's file) in miniature: chain, state and journal rows a restore
+    needs, and the node's own rows it does not."""
+    store = Store(path)
+    with store.recording(120):
+        store["account_state"].put(address="0xPQa", balance="5")
+    store["post_roots"].put("h", 99, "planted")  # (never trusted)
+    store["smt_nodes"].put("0:0:", b"planted")
+    for h in range(0, 150):
+        store["blocks"].put(block_height=h, block_hash=f"{h:064x}")
+        store["block_bodies"].put(h, b"x" * 200)
+    store["chain_index"].put(99, "h", 99, 12, "planted")  # (rebuilt from the blocks)
+    store["validator_log_roots"].put(99, "h", "planted")  # (never trusted)
+    store["exchange_checkpoint"].put(1, checkpoint, f"{checkpoint:064x}", b"state", b"journal")
+    store["tx_index"].put(3, 0, "t", "h")  # (the node's own: never published nor restored)
+    store["tx_participants"].put("0xPQa", 3, 0, "sender")
+    store["hist_trades"].put(3, 0, 1.0, "fill")
+    store["epochs"].put(epoch=1, finalized=1)
+    store["validator_stakes"].put(validator_address=f"http://{PEER_IP}:3007", stake=5)
+    store["contract_logs"].put(block_number=1, id=1, tx_hash="t", data=b"secret-receipt")
+    store.commit()
+    store.close()
+    return _Closed()
+
+
+def _store_count(path, table):
+    store = Store(path)
+    try:
+        return store[table].count()
+    finally:
+        store.close()
+        os.remove(path + "-lck")
+
+
+def _move_checkpoint(db, height):
+    store = Store(db)
+    try:
+        store["exchange_checkpoint"].update((1,), height=height, block_hash=f"{height:064x}")
+        store.commit()
+    finally:
+        store.close()
+
+
+def test_a_published_snapshot_leaves_out_what_a_restore_discards(tmp_path):
+    db = str(tmp_path / "node.db")
+    conn = _node_db(db)
+    try:
+        manifest = create(db, str(tmp_path / "pub"), public=True)
+    finally:
+        conn.close()
+    copy = str(tmp_path / "pub" / "qrdx.db")
+    assert _store_count(copy, "exchange_checkpoint") == 1
+    raw = open(copy, "rb").read()
+    for table in ("post_roots", "smt_nodes", "chain_index", "validator_log_roots", "tx_index",
+                  "tx_participants", "hist_trades", "epochs", "validator_stakes", "contract_logs"):
+        assert _store_count(copy, table) == 0, table
+    assert _store_count(copy, "account_state") == 1
+    assert _store_count(copy, "blocks") == 150
+    assert b"planted" not in raw   # (compacted: not only unlinked)
+    assert PEER_IP.encode() not in raw and b"secret-receipt" not in raw
+    assert manifest["checkpoint"]["height"] == 100 and manifest["tip"] == 149
+    assert manifest["format"] == 3
+    assert manifest["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert manifest["bytes"] == len(raw)
+    assert sorted(os.listdir(tmp_path / "pub")) == ["manifest.json", "qrdx.db"]
+
+
+def test_a_restore_also_discards_the_transaction_participants(tmp_path):
+    db = str(tmp_path / "node.db")
+    _node_db(db).close()
+    snapshot._clear_store(db, snapshot._STORE_RECOMPUTED + snapshot._STORE_LOCAL)
+    assert _store_count(db, "tx_participants") == 0
+    assert _store_count(db, "tx_index") == 0
+    assert _store_count(db, "blocks") == 150
+
+
+def test_a_node_publishes_each_newer_checkpoint_and_keeps_the_newest(tmp_path):
+    db, root = str(tmp_path / "node.db"), str(tmp_path / "published")
+    assert snapshot_publisher.publish(db, root) is None                 # no database yet
+    conn = _node_db(db)
+    try:
+        assert snapshot_publisher.publish(db, root)["checkpoint"]["height"] == 100
+        assert snapshot_publisher.publish(db, root) is None             # nothing newer
+        _move_checkpoint(db, 140)
+        assert snapshot_publisher.publish(db, root)["checkpoint"]["height"] == 140
+    finally:
+        conn.close()
+    assert sorted(os.listdir(root)) == ["140", "latest.json"]
+    assert snapshot_publisher.latest(root)["manifest"]["checkpoint"]["height"] == 140
+
+
+def test_only_the_published_snapshot_is_served_and_advertised(tmp_path, monkeypatch):
+    db, root = str(tmp_path / "node.db"), str(tmp_path / "published")
+    monkeypatch.setitem(snapshot_publisher._ROOT, "root", root)
+    assert snapshot_publisher.published_file("qrdx.db") is None and not snapshot_publisher.advertised()
+    _node_db(db).close()
+    snapshot_publisher.publish(db, root)
+    assert snapshot_publisher.published_file("qrdx.db").endswith("/100/qrdx.db")
+    for name in ("latest.json", "../latest.json", "100/qrdx.db", "qrdx.db-lck", "qrdx.db.store"):
+        assert snapshot_publisher.published_file(name) is None, name
+    ad = snapshot_publisher.advertised()
+    assert ad["path"] == "/snapshot/" and ad["checkpoint"]["height"] == 100
+
+
+def test_the_node_serves_it_with_range_requests(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from qrdx.node import main
+
+    class _NodeDB:  # (the app's middleware asks the node's database for old transactions)
+        async def get_need_propagate_transactions(self):
+            return []
+
+    monkeypatch.setattr(main, "db", _NodeDB())
+    db, root = str(tmp_path / "node.db"), str(tmp_path / "published")
+    _node_db(db).close()
+    snapshot_publisher.publish(db, root)
+    client = TestClient(main.app)
+    assert client.get("/snapshot/qrdx.db").status_code == 404           # not publishing
+    monkeypatch.setitem(snapshot_publisher._ROOT, "root", root)
+    whole = client.get("/snapshot/qrdx.db")
+    assert whole.status_code == 200
+    part = client.get("/snapshot/qrdx.db", headers={"Range": "bytes=100-199"})
+    assert part.status_code == 206 and part.content == whole.content[100:200]
+    assert client.get("/snapshot/manifest.json").json()["checkpoint"]["height"] == 100
+    assert client.get("/snapshot/latest.json").status_code == 404
+
+
+def _serve(directory):
+    import functools
+    import http.server
+    import threading
+
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(directory))
+    handler.log_message = lambda *a, **k: None
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def test_a_joining_node_takes_the_newest_snapshot_its_peers_publish(tmp_path):
+    servers, peers = [], []
+    try:
+        for name, height in (("a", 100), ("b", 140)):
+            db = str(tmp_path / f"{name}.db")
+            _node_db(db, checkpoint=height).close()
+            create(db, str(tmp_path / name / "snapshot"), public=True)   # served at /snapshot/
+            server, url = _serve(tmp_path / name)
+            servers.append(server)
+            peers.append(url)
+        url, manifest = discover(["http://127.0.0.1:9", *peers])           # one does not answer
+        assert url == peers[1] + "/snapshot/" and manifest["checkpoint"]["height"] == 140
+        got = fetch(url, str(tmp_path / "got"), progress=lambda m: None)
+        assert got == json.loads((tmp_path / "b" / "snapshot" / "manifest.json").read_text())
+        with pytest.raises(SnapshotError, match="none of these nodes"):
+            discover(["http://127.0.0.1:9"])
+    finally:
+        for server in servers:
+            server.shutdown()
+
+
+async def test_a_restore_refuses_code_stored_under_another_codes_hash(tmp_path):
+    """The root commits to each account's code hash, not to the code table keyed by it: a
+    server could swap a contract's code under its hash, and the node would run it."""
+    from eth_utils import keccak
+
+    from qrdx.database_sqlite import DatabaseSQLite
+
+    db = await DatabaseSQLite.create(str(tmp_path / "restoring.db"))
+    try:
+        code = bytes.fromhex("6000600055")
+        db.store["contract_code"].put(keccak(code).hex(), code, 0, "genesis", 5)
+        await snapshot._verify_code(db)                                    # the honest copy
+        db.store["contract_code"].update((keccak(code).hex(),), bytecode=b"\x60\x01\x00")
+        with pytest.raises(SnapshotError, match="is not that code"):
+            await snapshot._verify_code(db)
+    finally:
+        await db.close()

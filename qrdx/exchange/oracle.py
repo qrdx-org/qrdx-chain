@@ -19,26 +19,28 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
 MAX_OBSERVATIONS = 8640  # ~24 h at 10-second blocks
-MIN_OBSERVATION_PERIOD = 60.0   # seconds — TWAP not valid until this much data
+MIN_OBSERVATION_PERIOD = 60.0  # seconds — TWAP not valid until this much data
 MAX_PRICE_CHANGE_PCT = Decimal("0.50")  # 50% max single-observation price change
-STALENESS_THRESHOLD = 300.0     # 5 minutes — oracle considered stale
+STALENESS_THRESHOLD = 300.0  # 5 minutes — oracle considered stale
 
 
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Observation:
     """A single price observation recorded at a point in time."""
+
     timestamp: float
     price: Decimal
     log_price_cumulative: Decimal = ZERO  # Σ(ln(price) × dt)
@@ -48,6 +50,7 @@ class Observation:
 # ---------------------------------------------------------------------------
 # TWAP Oracle
 # ---------------------------------------------------------------------------
+
 
 class TWAPOracle:
     """
@@ -132,7 +135,7 @@ class TWAPOracle:
 
         # Trim to max
         if len(self._observations) > self.max_observations:
-            self._observations = self._observations[-self.max_observations:]
+            self._observations = self._observations[-self.max_observations :]
 
         return obs
 

@@ -1,0 +1,333 @@
+# Exchange — Production Readiness Specification
+
+> **Status:** The exchange *engine* is functionally complete and exercised end to
+> end in-process (`tests/test_exchange_e2e_leverage.py`). It is **not yet
+> consensus-integrated for production**. This document is the concrete, code-
+> grounded list of everything required to run it securely across nodes, plus the
+> security properties and certification gates.
+> **Date:** June 2026 · **Related:** `docs/archive/EVM_STATE_CONSENSUS_INTEGRATION.md`, `PRODUCTION_DEPLOYMENT.md`
+
+---
+
+## 1. Where it stands
+
+> **October 2026:** the table below is the original snapshot. Since then signature
+> verification, mempool admission, proposer inclusion, import replay with root validation,
+> real-balance settlement (Phase E) and the single block path (Phase C) are all done. Fees
+> are charged and burned (E1; KNOWN_ISSUES "Exchange operations were free"). The
+> circuit-breaker hooks, which were constructed but never invoked on the swap path, were
+> removed (F1): a trader bounds the price with `min_amount_out`. **Perps were rebuilt** on a zero-sum,
+> order-book-matched clearinghouse (docs/PERPS_CLEARINGHOUSE.md): mark price, liquidations
+> with a backstop vault and auto-deleveraging, funding, settlement in a USD stablecoin, and a
+> validator price oracle. The old engine traded against nobody and minted or burned QRDX on
+> every close (docs/KNOWN_ISSUES.md). **Spot was audited and fixed** (2026-10-02): Uniswap-V3
+> mathematics, all-or-nothing operations, owner-only liquidity removal paying principal and fees,
+> venue-correct settlement, order books committed in full in the state root. **Tokens** are one
+> native standard (docs/NATIVE_TOKENS.md: mint/freeze authorities, mint, burn, approvals) that
+> web3 wallets read as ERC-20s; the simulated EVM exchange precompiles are retired.
+
+| Capability | State | Evidence |
+|------------|-------|----------|
+| AMM, order book, perps, router, oracle | ✅ implemented | `qrdx/exchange/*` |
+| Deterministic single-entry execution | ✅ `ExchangeStateManager.process_transaction` | state_manager.py |
+| In-process E2E (tokens→pair→limit→leverage) | ✅ passing | test_exchange_e2e_leverage.py |
+| State-root determinism hooks | ⚠️ exists, unverified | `block_processor.process_exchange_transactions` |
+| **Tx signature verification** | ❌ **missing** | `process_transaction` checks only nonce+gas |
+| Mempool admission of exchange txs | ❌ no live path | — |
+| Block inclusion by the live proposer | ❌ | `ValidatorManager.propose_block` pulls UTXO pending only |
+| Import-side replay + state-root validation | ❌ not on live path | `validate_exchange_state_root` unused live |
+| Gas/fees charged to account capital | ❌ tracked, not debited | `process_transaction` step 6 |
+| Funding-rate / liquidation block duties | ⚠️ coded, unscheduled | `_settle_funding_rates`, `_check_liquidations` |
+
+---
+
+## 2. Critical findings (must fix before mainnet)
+
+1. **No signature verification (security-critical).** `ExchangeTransaction`
+   carries `signature` + `public_key` and exposes `signing_bytes()`, but nothing
+   verifies them. `process_transaction` trusts `tx.sender` outright — any party
+   can submit a transaction *as* any address (open a position, place an order,
+   move liquidity) subject only to nonce/gas. **This is a spoofing/theft vector.**
+   → Fix: a `verify()` primitive (Dilithium signature over `signing_bytes()` +
+   binding `public_key` to `sender` address) enforced at **mempool admission**
+   and at **block validation** (see §4). *(Implemented in this change — see §6.)*
+
+2. **Broken consensus scaffolding (PostgreSQL on a SQLite chain).**
+   `create_pos_block` / `commit_pos_block` (`qrdx/manager.py`) use
+   `database.pool.acquire()` and `$1` placeholders — non-functional on SQLite
+   (same class as the genesis-validator `Decimal` bug already fixed). The exchange
+   consensus hooks they call are therefore effectively dead on the live path.
+
+3. **Two competing block paths.** (a) `manager.create_pos_block`/`commit_pos_block`
+   + `node/validator_integration.py` (has exchange wiring, PG-broken); (b)
+   `validator/manager.py` `ValidatorManager.propose_block` + `node/main.py`
+   PoS fast-path (the live path, no exchange/EVM inclusion). These must be
+   reconciled into **one** audited path before mainnet.
+
+4. **Unified state root not enforced live.** A block header should commit to
+   `transactions_root` (UTXO) + `exchange_state_root` + `account_state_root`, and
+   **every importing node must recompute and reject on mismatch.** Today
+   `exchange_state_root` is computed only in the dead PG path and never validated
+   on the live import path.
+
+---
+
+## 3. Target architecture
+
+One block lifecycle, three state domains (UTXO, account/EVM, exchange), one root:
+
+```
+mempool ──┬─ UTXO txs ───────────────┐
+          ├─ EVM/account txs (eth) ───┤   proposer (single live path):
+          └─ exchange txs ────────────┘     1. select admitted txs (sig-verified)
+                                            2. execute each domain deterministically
+                                            3. roots: utxo_root, account_root, exch_root
+                                            4. state_root = H(parent, utxo, account, exch)
+                                            5. sign header
+        block gossip ─►  importing node:
+                                            1. verify proposer + attestations
+                                            2. RE-EXECUTE every tx deterministically
+                                            3. recompute the three roots
+                                            4. REJECT if state_root mismatches
+                                            5. commit atomically (or roll back)
+```
+
+Durability follows for free: because import re-executes from the block body, a
+node rebuilt from chain history reconstructs identical account/exchange state.
+
+---
+
+## 4. Work breakdown (sequenced)
+
+**Phase A — Security primitives (no consensus wire change; do first).**
+- A1. `ExchangeTransaction.verify()` — Dilithium sig over `signing_bytes()`, and
+  `PQPublicKey(public_key).to_address() == sender`. *(done, §6)*
+- A2. `verify_exchange_tx(tx)` admission helper + adversarial tests. *(done, §6)*
+- A3. Same primitive for EVM txs already exists (ECDSA recovery in
+  `eth_sendRawTransaction`); add explicit nonce/replay guard at admission.
+
+**Phase B — Determinism & state-root verification (consensus-safe to test now).**
+- B1. Property tests: identical tx sequence ⇒ identical `exchange_state_root`;
+  any tampered tx ⇒ different root; `validate_exchange_state_root` rejects it.
+  *(done, §6)*
+- B2. Cross-validator determinism: pin Decimal precision/rounding
+  (`getcontext().prec`) and canonical ordering; add differential test across two
+  fresh engine instances. *(measured: the exchange `exchange_state_root` is
+  already invariant under `getcontext().prec ∈ {28,50,78}` — the engine quantizes
+  deterministically, so this is not currently a divergence risk; a regression
+  test should still pin it.)*
+- B3. ✅ **State-root hashing now matches Whitepaper §3.6: BLAKE3, 512-bit.**
+  Added `state_root_hash`/`blake3_hash` (`qrdx/crypto/hashing.py`) and migrated
+  the exchange `compute_state_root` (now 128-hex BLAKE3-512) and the block-body
+  canonical digest off blake2b. `blake3` is a declared dependency
+  (`requirements-v3.txt`). Pinned by `tests/test_state_root_hash_standard.py`.
+  *(Remaining: the UTXO/PoW block `state_root` in `manager.py` still uses
+  SHA-256; migrate when the unified state root is bound into the header — D4.)*
+
+**Phase C — Reconcile to one block path (remove PG remnants). ✅ done (this change)**
+- C1. ✅ Removed the dead PostgreSQL duplicate path: deleted
+  `qrdx/node/validator_integration.py` (547 lines, provably unimported) and the
+  `create_pos_block` / `commit_pos_block` functions in `qrdx/manager.py` (broken
+  on SQLite: `database.pool` / `$1`). The exchange-wiring design they contained
+  is preserved in §3–§4 of this document. Verified dead first: zero references
+  repo-wide (incl. tests/scripts/dynamic imports). The live path is unchanged:
+  `node/block_import.py::process_and_create_block` → `manager.create_block`.
+- C2. ✅ Ported the one reachable PG remnant (`get_pos_chain_head`, called by the
+  validator RPC module) to SQLite; `manager.py` now has **zero** `database.pool`
+  / `$N` usages. Pinned by `tests/test_block_path_single_source.py`.
+- Verified: unit suite 1671 passed; integration testnet 11/11 (block production
+  + multi-node sync intact).
+- Remaining chain-wide: the legacy `qrdx/database.py` (asyncpg) is still present
+  but only referenced by a docstring; the live node uses `DatabaseSQLite`. Its
+  removal is deferred (low risk, separate cleanup) — track with
+  `grep -rn 'database.pool\|\$1' qrdx/ --include=*.py`.
+
+**Phase D — Mempool → block inclusion → import replay.**
+- D1. ✅ **done (this change).** Exchange-transaction admission gate:
+  `qrdx/exchange/mempool.py::ExchangeMempool`. Enforces authentication (PQ
+  signature + sender binding via `verify_exchange_tx`), replay/dedup (per tx hash
+  and per `(sender, nonce)`), a nonce window (reject stale + far-future), and
+  global/per-sender capacity caps. `select_for_block()` yields a deterministic,
+  gap-free, per-sender-ordered executable set (the canonical ordering D2 will
+  use). Reachable on a live node via `POST /submit_exchange_tx`
+  (`node/main.py`), which admits only — no block effect yet. 15 unit tests in
+  `tests/test_exchange_mempool.py`; unit suite 1686 passed, integration 11/11.
+  *Remaining for D1: EVM-tx admission already recovers the sender in
+  `eth_sendRawTransaction`; add the same explicit nonce-window/dedup guard there;
+  and cross-node gossip of admitted exchange txs (folds naturally into D2).*
+- D2. Proposer selects (`select_for_block`) and includes them in the block body.
+  - D2.1. ✅ **done (this change).** Canonical block-body codec for exchange txs:
+    `encode_exchange_txs` / `decode_exchange_txs` /
+    `exchange_txs_canonical_bytes` / `extract_exchange_transactions_from_dict`
+    (`qrdx/exchange/block_processor.py`). Round-trip preserves fields **and PQ
+    signatures** (decoded txs still authenticate), is JSON-safe, deterministic
+    and order/tamper-sensitive, and backward compatible (blocks without the
+    `exchange_transactions` section decode to empty). 10 tests in
+    `tests/test_exchange_block_codec.py`. Pure functions — no live-path change.
+  - D2.2a. ✅ **done (this change).** The proposer now includes the exchange
+    section in the broadcast/stored block body. `assemble_pos_block_data`
+    (`validator/node_integration.py`, pure + unit-tested) adds
+    `block[exchange_transactions]` from the node mempool's `select_for_block()`;
+    `ValidatorNode.set_exchange_tx_source(...)` wires the live mempool in
+    `node/main.py`. The section is **additive** (importers that don't understand
+    it ignore it) and authenticated txs survive the round trip. Conservatively,
+    the mempool is **not drained** on inclusion yet — durable removal waits for
+    receiver-side storage + replay (D2.2b/D3) so txs can't be lost before they
+    are consensus-final. Tests: `tests/test_pos_block_assembly.py` (4). Verified:
+    unit 1700; integration 11/11 (live proposer loop unchanged in behavior — the
+    section is empty when no exchange txs are queued).
+  - D2.2b. ✅ **done (this change).** The exchange section is now persisted as
+    protocol-level state on every node: new `block_exchange_transactions` table +
+    `add_block_exchange_txs` / `get_block_exchange_txs`
+    (`database_sqlite.py`). Receivers store it on both block paths
+    (`/submit_block` PoS fast-path and `process_and_create_block` sync path); the
+    proposer persists it locally and now **drains the mempool on inclusion**
+    (safe, because the section is included + stored). Storage only — no execution
+    yet (that is D3). Tests: `tests/test_block_exchange_storage.py` (4: round-trip
+    with order + authentication, empty no-op, idempotent insert, per-block
+    isolation). Verified: unit 1708; integration 11/11.
+    *Caveat: drain-on-inclusion does not yet handle reorgs (a dropped block would
+    lose its txs from the proposer's mempool); reorg-safe re-queue lands with D3
+    replay + fork-choice over the unified root.*
+  - **Known live-serialization debt (address in D2.2b/D3):** PoS blocks still
+    store `block_content = str(block.to_dict())` (a Python `repr`) with `to_dict`
+    omitting UTXO transactions; the block body is not yet a faithful parseable
+    record for *all* domains. The exchange section is a clean JSON list; the UTXO
+    body should be migrated to the same faithful form before D3 replay.
+- D3. ✅ **done (this change) for the exchange domain.** Importing nodes
+  re-execute the exchange section, verify it, and reject on mismatch:
+  - `apply_block_exchange_section` (`block_processor.py`): (1) authenticate every
+    tx (`verify_exchange_tx`) BEFORE touching state; (2) require a declared
+    `exchange_state_root`; (3) execute + recompute; (4) **revert on any
+    mismatch/failure**; (5) commit on success. Wired into both importer paths
+    (`/submit_block` PoS fast-path and `process_and_create_block` sync path) —
+    block is rejected if validation fails. Proposer declares the root
+    (`assemble_pos_block_data` + the production loop execute/commit).
+  - **Security fix (revert correctness):** `take_snapshot`/`_restore_snapshot`
+    were incomplete — they updated existing entities' fields but did not remove
+    entities *created* during a block (new pools/order books/oracles/perp
+    markets/positions), so a rejected block that created a pool would corrupt
+    state. Replaced with a complete deep-copy snapshot restored **in place**
+    (router references preserved). Added `commit_block()` to discard the revert
+    point on accept.
+  - Tests: `tests/test_exchange_block_replay.py` (8): accept+advance, proposer↔
+    importer determinism, forged/tampered tx rejected with state untouched,
+    wrong root rejected **and reverted**, section-without-root rejected, empty
+    no-op, commit-blocks-later-revert. Unit 1716; integration 11/11.
+  - D3 live e2e (S12): ✅ added `integration_tests/scenarios/s12_exchange_consensus.py`
+    and the read endpoint `GET /get_exchange_state_root`. A real PQ-signed
+    ExchangeTransaction is submitted to a running node, admitted, selected by the
+    validator proposer, executed through the consensus state machine, and the
+    BLAKE3 `exchange_state_root` advances with the new pool present — observed
+    live (full suite 12/12). The D3 import-validation was also wired into the
+    **live peer path** `p2p.submitBlock` (not only the REST `/submit_block` +
+    sync paths). Also hardened S03/S10 height checks to tolerate one lagging
+    non-validator (quorum drift), removing pre-existing snapshot flakiness.
+  - ✅ **Reorg safety + restart durability (addresses the finding above).**
+    `rebuild_exchange_state_from_chain(db)` (`block_processor.py`) makes exchange
+    state a deterministic function of the canonical chain: it resets the manager
+    and replays every canonical block's stored section in height order. Wired in:
+    - **startup** (`node/main.py` after genesis) → exchange state survives a
+      restart / fresh resync (Phase D3b durability);
+    - **reorg** (`handle_reorganization` after `db.remove_blocks`) → rebuild to
+      the new canonical tip so orphaned-block effects vanish, plus **re-queue**
+      orphaned exchange txs to the mempool for re-inclusion.
+    `remove_blocks` now also deletes orphaned `block_exchange_transactions` rows.
+    Tests: `tests/test_exchange_reorg_rebuild.py` (3): deterministic rebuild,
+    rolled-back effect disappears, empty chain → empty root. Unit 1719;
+    integration 12/12.
+  - *Remaining: per-reorg full-chain replay is O(all exchange txs) — add
+    checkpointing for scale; and strengthen S12 to assert full N-node
+    convergence now that orphaned state self-heals (currently asserts per-node
+    pipeline + determinism guard).*
+- D4. `account_state_root` + `exchange_state_root` unified into the header root.
+  - D4.1. ✅ **done (this change) — primitives.** `db.get_account_state_root()`
+    (deterministic BLAKE3-512 over `account_state`, canonical by address) and
+    `crypto.hashing.unified_state_root(utxo, account, exchange)` (one BLAKE3-512
+    commitment over all domains, Whitepaper §3.6), exposed at
+    `GET /get_unified_state_root` (with `enforced: false`). Tests:
+    `tests/test_unified_state_root.py` (6). Unit 1982; integration 12/12.
+  - D4.2. *(blocked)* Bind the unified root into the block **signing root** and
+    **enforce** it on import (recompute + reject). **Prerequisite:** every
+    committed domain must be deterministically re-executed on import. Exchange is
+    (D3); UTXO is consistent (blocks carry no UTXO txs in practice); the
+    **account/EVM domain is NOT** — `eth_sendRawTransaction` applies via gossip,
+    not consensus replay, so its root differs across nodes. Enforcing a unified
+    root that includes the account domain therefore requires giving the EVM/
+    account domain the same D1–D3 treatment the exchange domain received
+    (mempool admission → block inclusion → deterministic import replay). That
+    EVM-domain consensus integration is the gating work for D4.2 **and** Phase E.
+
+**Phase E — Economic integrity.**
+- ⚠️ **Coupling found: E1/E2 depend on D4 (unified balances).** Today the
+  exchange engine has NO balance ledger and no access to `account_state` — it
+  accumulates `_block_fees` but debits no payer, so an account with zero QRDX can
+  create pools / open positions without paying gas, stake, or real margin. True
+  economic integrity requires the exchange to debit the **same** QRDX the account
+  layer tracks; a separate parallel ledger would double-count. So E1/E2 must
+  follow **D4** (unify account + exchange state under one root + one balance).
+  Sequence D4 before E.
+- E1. Charge exchange gas/fees against the sender's unified account balance
+  (post-D4). Reject if underfunded.
+- E2. Margin/collateral debited from and returned to account balances on
+  open/close/liquidation (today margin lives only inside the perp engine).
+- E3. Schedule block-boundary duties every block: funding settlement
+  (`_settle_funding_rates`), liquidations (`_check_liquidations`), TWAP oracle
+  updates (`build_oracle_update_tx`).
+
+**Phase F — Hardening.**
+- F1. ~~Per-market circuit breakers / price-band checks on order placement.~~ Removed
+  (October 2026): the breaker was never on the swap path. Slippage bounds
+  (`min_amount_out`) protect the trader.
+- F2. Oracle manipulation resistance (TWAP windows, staleness already present).
+- F3. Rate limits + mempool DoS protection for exchange ops.
+- F4. ✅ **done (this change).** Adversarial property/fuzz suite for the exchange
+  math: `tests/test_exchange_invariants.py` (257 seeded cases). Asserts AMM swap
+  value-conservation (no free-mint round trip), non-negative liquidity, and
+  bad-input rejection; perp PnL sign-correctness, open-interest conservation,
+  margin-ratio monotonicity, leverage/size/price bounds; order-book matched-
+  quantity conservation, self-trade rejection, taker≥maker fees (§7.6), and
+  non-crossing orders resting. No invariant violations found — pinned as
+  regression guards.
+
+---
+
+## 5. Security properties to assert (the bar)
+
+1. **Authenticity:** no exchange/EVM state change without a valid signature whose
+   key binds to `sender`. (Phase A)
+2. **Determinism:** all honest validators compute byte-identical roots for the
+   same block. (Phase B)
+3. **Durability:** state survives a full resync (rebuild from blocks). (Phase D)
+4. **Solvency:** Σ margins + insurance ≥ Σ position losses; no negative balances;
+   gas/fees actually debited. (Phase E)
+5. **Replay-safety:** a tx is includable at most once; nonces strictly increase.
+6. **Liveness under failure:** a failing exchange tx reverts its own effects and
+   charges gas without halting the block.
+
+---
+
+## 6. Implemented in this change
+
+- `ExchangeTransaction.verify()` and `verify_exchange_tx()` — real Dilithium
+  signature verification bound to the sender address.
+- `tests/test_exchange_consensus.py`:
+  - signature: valid passes; tampered params, wrong key, wrong sender, empty sig
+    all rejected;
+  - determinism: identical sequences ⇒ identical `exchange_state_root`;
+  - tamper detection: a mutated tx ⇒ different root and
+    `validate_exchange_state_root` returns invalid.
+
+These satisfy parts of gates **A1–A2** and **B1**. The remaining phases (C–F),
+plus the certification gates below, remain before mainnet.
+
+---
+
+## 7. Certification gates (process, not code)
+
+Per `QRDX_IMPLEMENTATION_CHECKLIST.md` a feature is mainnet-eligible only after:
+- **Security Tested:** external audit of the consensus + exchange math.
+- **Production Ready:** ≥30 days on a persistent multi-validator testnet with no
+  state-root divergence and no solvency incidents.
+
+No amount of in-repo code substitutes for these; budget for them explicitly.

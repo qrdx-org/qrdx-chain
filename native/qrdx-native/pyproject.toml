@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "qrdx-native"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "Native hot paths for the QRDX node and validator"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "qrdx_native._native"
+python-source = "python"

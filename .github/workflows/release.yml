@@ -1,0 +1,194 @@
+# =============================================================================
+# Release — a signed, reproducible release from a maintainer-signed tag (docs/RELEASES.md)
+#
+#   1. preflight  the tag is signed by a maintainer (keys from the DEFAULT branch, not the tag),
+#                 versions agree, the tree is releasable
+#   2. build      the image twice, independently, from the committed tree: the two config
+#                 digests must be identical (the reproducibility gate); the test suite runs
+#                 INSIDE the image (what ships is what is tested); then a third build is
+#                 pushed, and must have the same config digest
+#   3. publish    cosign-sign the image (keyless, this workflow's identity), attach a signed
+#                 SBOM and SLSA build provenance, write the release manifest, sign it, and
+#                 create a DRAFT GitHub release
+#   4. maintainers (outside CI) rebuild, check, and add their SSH signatures to the draft; it
+#                 is published once `maintainer_threshold` have signed (scripts/release/sign-release.sh)
+#
+# Third-party actions are pinned by commit SHA. Scripts are run through their interpreter, so a
+# checkout that lost the executable bit (core.fileMode=false) still works.
+# =============================================================================
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/qrdx-org/qrdx-chain
+  PLATFORM: linux/amd64
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      # This job only reads (contents: read), so it keeps the checkout's credentials for the
+      # fetches below.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - id: tag
+        run: echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: The tag is signed by a maintainer
+        run: |
+          # The annotated tag object itself (it carries the signature), whatever the checkout
+          # made of the ref.
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag \
+            || { echo "::error::$GITHUB_REF_NAME is not an annotated, signed tag"; exit 1; }
+          # The maintainer list comes from the default branch, which is protected — a tag cannot
+          # vouch for itself by shipping its own list.
+          git fetch origin "${{ github.event.repository.default_branch }}"
+          git show "origin/${{ github.event.repository.default_branch }}:release/allowed_signers" > "$RUNNER_TEMP/allowed_signers"
+          git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed_signers" \
+              verify-tag "$GITHUB_REF_NAME"
+
+      - name: Releasable (clean, consistent versions, locks present)
+        run: python3 scripts/release/release.py preflight --ref "$GITHUB_REF_NAME"
+
+  build:
+    name: Reproducible build, test, push
+    needs: preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      config: ${{ steps.repro.outputs.config }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      # Each build runs in its own fresh BuildKit container with no cache. The config digest does
+      # not depend on how an image is exported (loaded, OCI archive, pushed), so the loaded
+      # build, the independent second build and the pushed build must all have the same one.
+      - name: Build twice and compare (reproducibility gate)
+        id: repro
+        run: |
+          bash scripts/release/build-image.sh --ref "$GITHUB_REF_NAME" --platform "$PLATFORM" \
+              --load qrdx-node:candidate --metadata "$RUNNER_TEMP/first.json"
+          a=$(jq -r '."containerimage.config.digest"' "$RUNNER_TEMP/first.json")
+          b=$(bash scripts/release/build-image.sh --ref "$GITHUB_REF_NAME" --platform "$PLATFORM" --print-config-digest)
+          echo "first build:  $a"
+          echo "second build: $b"
+          [[ "$a" == sha256:* ]] || { echo "::error::no config digest from the first build"; exit 1; }
+          test "$a" = "$b" || { echo "::error::the image is not reproducible ($a != $b)"; exit 1; }
+          echo "config=$a" >> "$GITHUB_OUTPUT"
+
+      - name: Test the image that ships (the first build)
+        run: bash scripts/release/test-image.sh qrdx-node:candidate
+
+      - name: Push
+        id: push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          bash scripts/release/build-image.sh --ref "$GITHUB_REF_NAME" --platform "$PLATFORM" \
+              --push "$IMAGE" --metadata "$RUNNER_TEMP/push.json"
+          digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/push.json")
+          # Read back from the registry: the config of what it serves under that digest.
+          config=$(docker buildx imagetools inspect "$IMAGE@$digest" --raw | jq -r .config.digest)
+          test "$config" = "${{ steps.repro.outputs.config }}" \
+            || { echo "::error::the pushed image ($config) is not the reproduced one"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Sign and publish (draft)
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # the draft release
+      packages: write        # signatures and attestations next to the image
+      id-token: write        # Sigstore keyless signing with this workflow's identity
+      attestations: write    # SLSA build provenance
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+      CONFIG: ${{ needs.build.outputs.config }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+
+      - name: Sign the image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          cosign sign --yes "$IMAGE@$DIGEST"
+
+      - name: SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c  # v0.24.3
+        with:
+          image: ${{ env.IMAGE }}@${{ env.DIGEST }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+
+      - name: Attach the SBOM to the image (signed)
+        run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$IMAGE@$DIGEST"
+
+      - name: Build provenance (SLSA)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.DIGEST }}
+          push-to-registry: true
+
+      - name: Source tarball, network genesis files, manifest
+        run: |
+          mkdir -p dist
+          python3 scripts/release/release.py source-tarball --ref "$TAG" --out "dist/qrdx-chain-$TAG-src.tar.gz"
+          python3 scripts/release/release.py manifest --ref "$TAG" --platform "$PLATFORM" \
+              --image-ref "$IMAGE@$DIGEST" --image-config "$CONFIG" \
+              --source-tarball "dist/qrdx-chain-$TAG-src.tar.gz" --out dist/release-manifest.json
+          for f in networks/*/genesis_config.json; do
+            [ -e "$f" ] || continue
+            cp "$f" "dist/$(basename "$(dirname "$f")").genesis_config.json"
+          done
+          cp sbom.spdx.json dist/
+          cosign sign-blob --yes --bundle dist/release-manifest.json.cosign.bundle dist/release-manifest.json
+          (cd dist && sha256sum -- * > SHA256SUMS)
+
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$TAG" dist/* --draft --verify-tag --title "QRDX $TAG" --notes "$(cat <<EOF
+          Image: \`$IMAGE@$DIGEST\` (config \`$CONFIG\`), reproducible from this tag.
+
+          **Draft until maintainers sign.** Each maintainer rebuilds and checks the release, then
+          adds a signature with \`scripts/release/sign-release.sh $TAG\`. Operators verify with
+          \`scripts/release/verify-release.sh $TAG\` and run the image by digest (docs/RELEASES.md).
+          EOF
+          )"

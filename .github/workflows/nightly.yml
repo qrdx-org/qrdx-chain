@@ -1,0 +1,66 @@
+# =============================================================================
+# Nightly — the checks too long for every push (docs/MAINNET_READINESS.md §4)
+#
+#   * determinism: the rollback-completeness audit of every exchange operation, and the suite
+#     under two hash seeds comparing every test's final exchange root (scripts/determinism);
+#   * a 4-node network: every scenario, then the attacks (integration_tests/adversarial.py),
+#     then a soak with a node killed and restarted, checking state roots agree across nodes;
+#   * deep fuzzing of every decoder peers and users reach.
+#
+# All of it runs inside the node image built from the commit, as CI's tests do.
+# =============================================================================
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  determinism:
+    name: Determinism (rollback audit, hash seeds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch the py-evm submodule (the image builds the EVM from it)
+        run: git submodule update --init py-evm
+
+      - name: Build the image from this commit
+        run: bash scripts/release/build-image.sh --ref HEAD --load qrdx-node:nightly
+
+      - name: Rollback audit
+        run: bash scripts/release/test-image.sh qrdx-node:nightly --script scripts/determinism/check.py rollback
+
+      - name: Hash-seed check
+        run: bash scripts/release/test-image.sh qrdx-node:nightly --script scripts/determinism/check.py hashseed
+
+      - name: Deep fuzzing
+        run: QRDX_FUZZ_EXAMPLES=20000 bash scripts/release/test-image.sh qrdx-node:nightly tests/test_fuzz_decoders.py -q
+
+  network:
+    name: 4-node network (scenarios, attacks, soak)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch the py-evm submodule (the image builds the EVM from it)
+        run: git submodule update --init py-evm
+
+      - name: Build the image from this commit
+        run: bash scripts/release/build-image.sh --ref HEAD --load qrdx-node:nightly
+
+      - name: Scenarios, attacks and a 15-minute soak
+        run: |
+          QRDX_ADVERSARIAL=1 QRDX_SOAK_SECONDS=900 \
+            bash scripts/release/test-image.sh qrdx-node:nightly tests/test_testnet_integration.py \
+              -m integration --timeout=7200 -q

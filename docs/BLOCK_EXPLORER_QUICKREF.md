@@ -102,7 +102,7 @@ Or on error:
 
 ## Implementation Files
 
-- **API Endpoints**: `/workspaces/qrdx-chain-denaro/qrdx/node/main.py` (lines ~3255-3700)
+- **API Endpoints**: `qrdx/node/api/chain.py` and `qrdx/node/api/accounts.py` (docs/NODE_LAYOUT.md)
 - **Database Schema**: 
   - `/workspaces/qrdx-chain-denaro/qrdx/schema.sql` (PoS tables)
   - `/workspaces/qrdx-chain-denaro/qrdx/schema_contracts.sql` (Contract tables)

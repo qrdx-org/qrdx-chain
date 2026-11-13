@@ -1,20 +1,30 @@
-# QRDX Production Docker Compose
-# Multi-service deployment with monitoring stack
+# =============================================================================
+# QRDX Production Stack — node + Prometheus + Grafana
 #
-# Usage:
+#   cp config.example.toml docker/config.toml      # then edit for production
 #   docker compose -f docker/docker-compose.prod.yml up -d
+#   docker compose -f docker/docker-compose.prod.yml ps
 #
-# Services:
-#   - qrdx-node     : QRDX blockchain node
-#   - prometheus     : Metrics collection
-#   - grafana        : Metrics dashboard
+# Secrets (QRDX_VALIDATOR_PASSWORD, GRAFANA_ADMIN_PASSWORD, ...) come from the
+# environment or a .env file next to this compose file — never from the image.
 #
-# Volumes:
-#   - qrdx-data      : Blockchain data (SQLite + wallets)
-#   - prometheus-data : Metrics storage
-#   - grafana-data    : Dashboard config
-
-version: "3.8"
+# PORTS: the node exposes ONE HTTP port (QRDX_NODE_PORT). It carries the REST
+# API, JSON-RPC at /rpc, Prometheus metrics at /metrics, /healthz, /readyz and
+# the optional /ws + /stream feeds. There is no separate 8545/8546/9090 listener.
+#
+# Beside it, the native peer transport (docs/NETWORK.md): transactions, blocks
+# and votes between nodes over one encrypted TCP connection a peer, on the node
+# port + 10,000 (QRDX_P2P_PUBLIC_PORT, 13007). A peer dials it at the port of
+# this node's advertised URL + 10,000, so QRDX_SELF_URL must carry the port
+# (http://203.0.113.5:3007, not a bare hostname) and both ports must be open.
+# Without it peers use HTTP alone: correct, much slower under load.
+#
+# REGENESIS (a new chain): stop the node, replace genesis_config.json on the
+# data volume with the new network's file, delete the database
+# (/app/data/qrdx.db and qrdx.db-lck) — keep keys/ and the validator wallet —
+# then start it. Its slashing-protection record is per network: the new chain
+# starts it afresh.
+# =============================================================================
 
 x-logging: &default-logging
   driver: json-file
@@ -27,45 +37,78 @@ services:
   # QRDX Node
   # ---------------------------------------------------------------------------
   qrdx-node:
+    # Production runs a VERIFIED release image, by digest (docs/RELEASES.md §5):
+    #   scripts/release/verify-release.sh vX.Y.Z            # prints the image reference
+    #   QRDX_IMAGE=ghcr.io/qrdx-org/qrdx-chain@sha256:… docker compose -f … up -d --no-build
+    # `build:` is for development images only; a local build is not a release.
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
+      context: ".."
+      dockerfile: "docker/Dockerfile"
+    image: ${QRDX_IMAGE:-qrdx-node:${QRDX_IMAGE_TAG:-latest}}
     container_name: qrdx-node
     restart: unless-stopped
     logging: *default-logging
+    stop_grace_period: 60s
 
     ports:
-      # HTTP JSON-RPC
-      - "${QRDX_RPC_HTTP_PORT:-8545}:8545"
-      # WebSocket JSON-RPC
-      - "${QRDX_RPC_WS_PORT:-8546}:8546"
-      # P2P
-      - "${QRDX_P2P_PORT:-30303}:30303"
-      # Legacy REST (if enabled)
-      - "${QRDX_LEGACY_PORT:-3007}:3007"
-      # Prometheus metrics
-      - "${QRDX_METRICS_PORT:-9090}:9090"
+      - "${QRDX_NODE_PORT:-3007}:${QRDX_NODE_PORT:-3007}"
+      # The peer transport: QRDX_NODE_PORT + 10,000 inside the container (it listens there),
+      # published on the same number (peers dial the advertised URL's port + 10,000).
+      - "${QRDX_P2P_PUBLIC_PORT:-13007}:${QRDX_P2P_PUBLIC_PORT:-13007}"
 
     volumes:
+      # Chain database, PQ node identity and slashing-protection DB.
       - qrdx-data:/app/data
-      # Mount config (read-only)
+      # Node configuration. This file MUST exist before `up`:
+      #   cp config.example.toml docker/config.toml
+      # If it is missing, Docker creates a DIRECTORY at that path and the node
+      # then fails to parse its config.
       - ./config.toml:/app/config.toml:ro
-      # Mount TLS certs (read-only, optional)
-      - ${QRDX_TLS_CERT_DIR:-./certs}:/app/certs:ro
+      #
+      # TLS certificates and the validator wallet are OPTIONAL and therefore not
+      # mounted here. A bind mount whose source does not exist makes Docker create
+      # it, which on Docker Desktop / WSL fails outright ("error while creating
+      # mount source path ... file exists"). Add them explicitly when you need
+      # them, with the secrets overlay:
+      #
+      #   export QRDX_TLS_CERT_DIR=/etc/qrdx/certs        # for TLS
+      #   export QRDX_VALIDATOR_WALLET_DIR=/etc/qrdx/wallet
+      #   docker compose -f docker/docker-compose.prod.yml \
+      #                  -f docker/docker-compose.prod-secrets.yml up -d
 
     environment:
-      - QRDX_CONFIG=/app/config.toml
-      - QRDX_DATA_DIR=/app/data
-      - QRDX_LOG_LEVEL=${QRDX_LOG_LEVEL:-INFO}
-      - QRDX_CHAIN_ID=${QRDX_CHAIN_ID:-1}
-      - QRDX_METRICS_ENABLED=true
-      - QRDX_METRICS_PORT=9090
-      # Sensitive values from environment only
-      - QRDX_VALIDATOR_PASSWORD=${QRDX_VALIDATOR_PASSWORD:-}
-      - QRDX_TLS_CERT=${QRDX_TLS_CERT:-}
-      - QRDX_TLS_KEY=${QRDX_TLS_KEY:-}
+      QRDX_CONFIG: "/app/config.toml"
+      QRDX_DATA_DIR: "/app/data"
+      QRDX_NODE_HOST: "0.0.0.0"
+      QRDX_NODE_PORT: "${QRDX_NODE_PORT:-3007}"
+      QRDX_DATABASE_PATH: "/app/data/qrdx.db"
+      QRDX_NODE_KEY_DIR: "/app/data/keys"
+      QRDX_SELF_URL: "${QRDX_SELF_URL:-}"
+      QRDX_BOOTSTRAP_NODE: "${QRDX_BOOTSTRAP_NODE:-https://node.qrdx.network}"
+      # The network's genesis file: its chain spec (chain id, consensus parameters, upgrade
+      # schedule) and genesis allocations. Required — without it the node would start a dev
+      # network of its own. Chain id and parameters come from this file, not the environment.
+      QRDX_GENESIS_FILE: "${QRDX_GENESIS_FILE:-/app/data/genesis_config.json}"
+      QRDX_LOG_LEVEL: "${QRDX_LOG_LEVEL:-INFO}"
+      LOG_LEVEL: "${QRDX_LOG_LEVEL:-INFO}"
+      QRDX_METRICS_ENABLED: "true"
+      QRDX_RPC_ENABLED: "${QRDX_RPC_ENABLED:-true}"
+      QRDX_ENABLE_STREAMING: "${QRDX_ENABLE_STREAMING:-}"
+      # The native module's threads: by default the CPU limit below (docker-entrypoint.sh).
+      QRDX_NATIVE_THREADS: "${QRDX_NATIVE_THREADS:-}"
+      # Validator (leave disabled on a plain full node)
+      QRDX_VALIDATOR_ENABLED: "${QRDX_VALIDATOR_ENABLED:-false}"
+      QRDX_VALIDATOR_WALLET: "${QRDX_VALIDATOR_WALLET:-}"
+      # Secrets — from the environment only. The validator key is an encrypted keystore (the
+      # node refuses any other form outside a dev network: scripts/validator/keystore.py makes
+      # one); its password comes from QRDX_VALIDATOR_PASSWORD, or from a file inside the
+      # container named by QRDX_VALIDATOR_PASSWORD_FILE (a secret mount).
+      QRDX_VALIDATOR_PASSWORD: "${QRDX_VALIDATOR_PASSWORD:-}"
+      QRDX_VALIDATOR_PASSWORD_FILE: "${QRDX_VALIDATOR_PASSWORD_FILE:-}"
+      QRDX_RPC_ADMIN_TOKEN: "${QRDX_RPC_ADMIN_TOKEN:-}"
+      QRDX_TLS_CERT: "${QRDX_TLS_CERT:-}"
+      QRDX_TLS_KEY: "${QRDX_TLS_KEY:-}"
 
-    # Resource limits
     deploy:
       resources:
         limits:
@@ -76,27 +119,29 @@ services:
           memory: "1G"
 
     healthcheck:
-      test: ["CMD", "python3", "/app/docker/docker-healthcheck.py"]
+      test: ["CMD", "python", "/app/docker/docker-healthcheck.py"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 60s
+      retries: 5
+      start_period: 120s
 
-    # Run as non-root
+    # Unprivileged. The image's own user is the same; stating it here means no image run by
+    # this file can quietly run the node as root. Bind-mounted data must be writable by it.
     user: "1000:1000"
-
-    # Security options
     security_opt:
       - no-new-privileges:true
-    read_only: true
     tmpfs:
       - /tmp
 
-    networks:
-      - qrdx-net
+    # NOTE: `read_only: true` is deliberately NOT set. The node writes its
+    # slashing-protection database to the working directory, and losing that
+    # file (or putting it on a tmpfs) would remove double-sign protection.
+    # /app is owned by the unprivileged user instead.
+
+    networks: [qrdx-net]
 
   # ---------------------------------------------------------------------------
-  # Prometheus — Metrics Collection
+  # Prometheus — metrics collection
   # ---------------------------------------------------------------------------
   prometheus:
     image: prom/prometheus:v2.51.0
@@ -118,17 +163,19 @@ services:
       - "--storage.tsdb.retention.time=30d"
       - "--web.enable-lifecycle"
 
+    depends_on:
+      qrdx-node: { condition: service_started }
+
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: "1G"
 
-    networks:
-      - qrdx-net
+    networks: [qrdx-net]
 
   # ---------------------------------------------------------------------------
-  # Grafana — Dashboards
+  # Grafana — dashboards
   # ---------------------------------------------------------------------------
   grafana:
     image: grafana/grafana:10.4.0
@@ -141,11 +188,18 @@ services:
 
     volumes:
       - grafana-data:/var/lib/grafana
+      # The Prometheus data source and the QRDX dashboard (docker/grafana/).
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
 
     environment:
-      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
-      - GF_USERS_ALLOW_SIGN_UP=false
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      # Required: a default password on a dashboard that sees the node is a way in.
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+
+    depends_on:
+      prometheus: { condition: service_started }
 
     deploy:
       resources:
@@ -153,12 +207,8 @@ services:
           cpus: "0.5"
           memory: "512M"
 
-    networks:
-      - qrdx-net
+    networks: [qrdx-net]
 
-# ---------------------------------------------------------------------------
-# Volumes
-# ---------------------------------------------------------------------------
 volumes:
   qrdx-data:
     driver: local
@@ -167,9 +217,6 @@ volumes:
   grafana-data:
     driver: local
 
-# ---------------------------------------------------------------------------
-# Networks
-# ---------------------------------------------------------------------------
 networks:
   qrdx-net:
     driver: bridge

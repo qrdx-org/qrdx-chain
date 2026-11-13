@@ -1,29 +1,37 @@
+import struct
 from decimal import Decimal
 from io import BytesIO
-from typing import List
+from typing import Any, Dict, List, Optional
 
 from fastecdsa import keys
-from icecream import ic
 
+from ..constants import CURVE, ENDIAN, SMALLEST
+from ..helpers import bytes_to_string, point_to_string, sha256
+from ..logger import get_logger
 from . import TransactionInput, TransactionOutput
 from .coinbase_transaction import CoinbaseTransaction
-from ..constants import ENDIAN, SMALLEST, CURVE
-from ..helpers import point_to_string, bytes_to_string, sha256
-from ..logger import get_logger
-
-import struct
 
 logger = get_logger(__name__)
 
-#print = ic
+# print = ic
 
 
 class Transaction:
-    def __init__(self, inputs: List[TransactionInput], outputs: List[TransactionOutput], message: bytes = None, version: int = None):#, timestamp: int = None):
+    def __init__(
+        self,
+        inputs: List[TransactionInput],
+        outputs: List[TransactionOutput],
+        message: Optional[bytes] = None,
+        version: Optional[int] = None,
+    ):  # , timestamp: int = None):
         if len(inputs) >= 256:
-            raise Exception(f'You can spend max 255 inputs in a single transactions, not {len(inputs)}')
+            raise Exception(
+                f"You can spend max 255 inputs in a single transactions, not {len(inputs)}"
+            )
         if len(outputs) >= 256:
-            raise Exception(f'You can have max 255 outputs in a single transactions, not {len(outputs)}')
+            raise Exception(
+                f"You can have max 255 outputs in a single transactions, not {len(outputs)}"
+            )
         self.inputs = inputs
         self.outputs = outputs
         self.message = message
@@ -39,31 +47,32 @@ class Transaction:
                 )
         if version > 3:
             raise ValueError(
-                f"Unsupported transaction version {version}; "
-                "this node supports versions 1-3"
+                f"Unsupported transaction version {version}; " "this node supports versions 1-3"
             )
         self.version = version
-        
-        #self.timestamp = timestamp
 
-        self._hex: str = None
-        self.fees: Decimal = None
-        self.tx_hash: str = None
+        # self.timestamp = timestamp
+
+        self._hex: Optional[str] = None
+        self.fees: Optional[Decimal] = None
+        self.tx_hash: Optional[str] = None
 
     def hex(self, full: bool = True):
         inputs, outputs = self.inputs, self.outputs
-        hex_inputs = ''.join(tx_input.tobytes().hex() for tx_input in inputs)
-        hex_outputs = ''.join(tx_output.tobytes().hex() for tx_output in outputs)
+        hex_inputs = "".join(tx_input.tobytes().hex() for tx_input in inputs)
+        hex_outputs = "".join(tx_output.tobytes().hex() for tx_output in outputs)
 
         version = self.version
 
-        self._hex = ''.join([
-            version.to_bytes(1, ENDIAN).hex(),
-            len(inputs).to_bytes(1, ENDIAN).hex(),
-            hex_inputs,
-            (len(outputs)).to_bytes(1, ENDIAN).hex(),
-            hex_outputs
-        ])
+        self._hex = "".join(
+            [
+                version.to_bytes(1, ENDIAN).hex(),
+                len(inputs).to_bytes(1, ENDIAN).hex(),
+                hex_inputs,
+                (len(outputs)).to_bytes(1, ENDIAN).hex(),
+                hex_outputs,
+            ]
+        )
 
         if not full and (version <= 2 or self.message is None):
             return self._hex
@@ -105,19 +114,26 @@ class Transaction:
 
     async def verify_double_spend(self):
         from .. import Database
+
         check_inputs = [(tx_input.tx_hash, tx_input.index) for tx_input in self.inputs]
         unspent_outputs = await Database.instance.get_unspent_outputs(check_inputs)
         return set(check_inputs) == set(unspent_outputs)
 
     async def verify_double_spend_pending(self):
         from .. import Database
+
         check_inputs = [(tx_input.tx_hash, tx_input.index) for tx_input in self.inputs]
         spent_outputs = await Database.instance.get_pending_spent_outputs(check_inputs)
         return spent_outputs == []
 
     async def _fill_transaction_inputs(self, txs=None) -> None:
         from .. import Database
-        check_inputs = [tx_input.tx_hash for tx_input in self.inputs if tx_input.transaction is None and tx_input.transaction_info is None]
+
+        check_inputs = [
+            tx_input.tx_hash
+            for tx_input in self.inputs
+            if tx_input.transaction is None and tx_input.transaction_info is None
+        ]
         if not check_inputs:
             return
         if txs is None:
@@ -132,14 +148,14 @@ class Transaction:
         checked_signatures = []
         for tx_input in self.inputs:
             if tx_input.signed is None:
-                logger.warning('Transaction not signed')
+                logger.warning("Transaction not signed")
                 return False
             await tx_input.get_public_key()
             signature = (tx_input.public_key, tx_input.signed)
             if signature in checked_signatures:
                 continue
             if not await tx_input.verify(tx_hex):
-                logger.warning('Transaction signature not valid')
+                logger.warning("Transaction signature not valid")
                 return False
             checked_signatures.append(signature)
         return True
@@ -150,17 +166,18 @@ class Transaction:
     async def verify(self, check_double_spend: bool = True) -> bool:
         # First check system wallet constraints
         from .validation import validate_transaction
+
         is_valid, error = validate_transaction(self)
         if not is_valid:
-            logger.warning(f'Transaction rejected: {error}')
+            logger.warning(f"Transaction rejected: {error}")
             return False
-        
+
         if check_double_spend and not self._verify_double_spend_same_transaction():
-            logger.warning('Transaction rejected: double spend inside same transaction')
+            logger.warning("Transaction rejected: double spend inside same transaction")
             return False
 
         if check_double_spend and not await self.verify_double_spend():
-            logger.warning('Transaction rejected: double spend')
+            logger.warning("Transaction rejected: double spend")
             return False
 
         await self._fill_transaction_inputs()
@@ -169,11 +186,11 @@ class Transaction:
             return False
 
         if not self._verify_outputs():
-            logger.warning('Transaction rejected: invalid outputs')
+            logger.warning("Transaction rejected: invalid outputs")
             return False
 
         if await self.get_fees() < 0:
-            logger.warning('Transaction rejected: negative fees (We are not the Federal Reserve)')
+            logger.warning("Transaction rejected: negative fees (We are not the Federal Reserve)")
             return False
 
         return True
@@ -181,12 +198,14 @@ class Transaction:
     async def verify_pending(self):
         return await self.verify() and await self.verify_double_spend_pending()
 
-    def sign(self, private_keys: list = []):
-        for private_key in private_keys:
+    def sign(self, private_keys: Optional[list] = None):
+        for private_key in private_keys or []:
             for input in self.inputs:
                 if input.private_key is None and (input.public_key or input.transaction):
                     public_key = keys.get_public_key(private_key, CURVE)
-                    input_public_key = input.public_key or input.transaction.outputs[input.index].public_key
+                    input_public_key = (
+                        input.public_key or input.transaction.outputs[input.index].public_key
+                    )
                     if public_key == input_public_key:
                         input.private_key = private_key
         for input in self.inputs:
@@ -204,11 +223,11 @@ class Transaction:
         self.fees = input_amount - output_amount
         assert (self.fees * SMALLEST) % 1 == 0.0
         return self.fees
-    
+
     # Timestamp handling might need to be changed in the future to address potential bugs and overflow issues.
     # Currently, the implementation "should" support Unix timestamps up to the maximum value of 4294967295.
     # This corresponds to the rollover date of 7 February 2106, 06:28:15 UTC, which is the upper limit
-    # for dates representable by a 32-bit unsigned integer. 
+    # for dates representable by a 32-bit unsigned integer.
     # Beyond this point, timestamp values will overflow...
     # Reference: https://en.wikipedia.org/wiki/Time_formatting_and_storage_bugs
 
@@ -216,51 +235,53 @@ class Transaction:
     async def timestamp_to_bytes(timestamp):
         """
         Converts a Unix timestamp to a 4-byte representation.
-    
+
         Args:
         - timestamp (int): The Unix timestamp to convert.
-    
+
         Returns:
         - bytes: The 4-byte representation of the timestamp.
         """
         # Ensure the timestamp is within the 32-bit unsigned integer range.
         if timestamp < 0 or timestamp > 4294967295:
-                                        
+
             raise ValueError("Timestamp must be between 0 and 4294967295.")
-    
-        return struct.pack('>I', timestamp)
-    
+
+        return struct.pack(">I", timestamp)
+
     @staticmethod
     async def bytes_to_timestamp(byte_data):
         """
         Converts a 4-byte representation back into a Unix timestamp.
-    
+
         Args:
         - byte_data (bytes): The 4 bytes to convert back to a timestamp.
-    
+
         Returns:
         - int: The Unix timestamp.
         """
         if len(byte_data) != 4:
             raise ValueError("Input must be exactly 4 bytes.")
 
-        return struct.unpack('>I', byte_data)[0]
-    
-    @staticmethod
-    async def from_hex(hexstring: str, check_signatures: bool = True):#, set_timestamp:bool = False):
+        return struct.unpack(">I", byte_data)[0]
 
-        #timestamp = None
+    @staticmethod
+    async def from_hex(
+        hexstring: str, check_signatures: bool = True
+    ):  # , set_timestamp:bool = False):
+
+        # timestamp = None
         # Check if the timestamp should be extracted and converted from the hexstring.
-        #if set_timestamp:
-             # Extracts the last 8 characters as timestamp in hexadecimal, converts to bytes, then to actual timestamp.
+        # if set_timestamp:
+        # Extracts the last 8 characters as timestamp in hexadecimal, converts to bytes, then to actual timestamp.
         #    timestamp_hex = hexstring[-8:]
         #    timestamp_bytes = bytes.fromhex(timestamp_hex)
         #    timestamp = await Transaction.bytes_to_timestamp(timestamp_bytes)
 
-            # Convert the rest of the hexstring (excluding the last 8 characters) to bytes
+        # Convert the rest of the hexstring (excluding the last 8 characters) to bytes
         #    tx_bytes = BytesIO(bytes.fromhex(hexstring[:-8]))
-        #else:
-            # If set_timestamp is False, convert the entire hexstring to bytes
+        # else:
+        # If set_timestamp is False, convert the entire hexstring to bytes
         #    tx_bytes = BytesIO(bytes.fromhex(hexstring))
 
         tx_bytes = BytesIO(bytes.fromhex(hexstring))
@@ -275,7 +296,7 @@ class Transaction:
 
         inputs = []
 
-        for i in range(0, inputs_count):
+        for _i in range(0, inputs_count):
             tx_hex = tx_bytes.read(32).hex()
             tx_index = int.from_bytes(tx_bytes.read(1), ENDIAN)
             inputs.append(TransactionInput(tx_hex, index=tx_index))
@@ -284,7 +305,7 @@ class Transaction:
 
         outputs = []
 
-        for i in range(0, outputs_count):
+        for _i in range(0, outputs_count):
             pubkey = tx_bytes.read(64 if version == 1 else 33)
             amount_length = int.from_bytes(tx_bytes.read(1), ENDIAN)
             amount = int.from_bytes(tx_bytes.read(amount_length), ENDIAN) / Decimal(SMALLEST)
@@ -305,7 +326,10 @@ class Transaction:
             signatures = []
 
             while True:
-                signed = (int.from_bytes(tx_bytes.read(32), ENDIAN), int.from_bytes(tx_bytes.read(32), ENDIAN))
+                signed = (
+                    int.from_bytes(tx_bytes.read(32), ENDIAN),
+                    int.from_bytes(tx_bytes.read(32), ENDIAN),
+                )
                 if signed[0] == 0:
                     break
                 signatures.append(signed)
@@ -318,8 +342,8 @@ class Transaction:
                     tx_input.signed = signatures[i]
             else:
                 if not check_signatures:
-                    return Transaction(inputs, outputs, message, version)#, timestamp)
-                index = {}
+                    return Transaction(inputs, outputs, message, version)  # , timestamp)
+                index: Dict[Any, Any] = {}
                 for tx_input in inputs:
                     public_key = point_to_string(await tx_input.get_public_key())
                     if public_key not in index.keys():
@@ -330,7 +354,7 @@ class Transaction:
                     for tx_input in index[list(index.keys())[i]]:
                         tx_input.signed = signed
 
-            return Transaction(inputs, outputs, message, version)#, timestamp)
+            return Transaction(inputs, outputs, message, version)  # , timestamp)
 
     def __eq__(self, other):
         if isinstance(other, self.__class__):
@@ -340,5 +364,3 @@ class Transaction:
 
     def __ne__(self, other):
         return not self.__eq__(other)
-
-

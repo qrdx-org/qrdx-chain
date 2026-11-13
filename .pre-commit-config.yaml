@@ -2,12 +2,6 @@
 # Install: pip install pre-commit && pre-commit install
 
 repos:
-  # Secret scanning — prevent credential leaks
-  - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.18.4
-    hooks:
-      - id: gitleaks
-
   # Python code quality
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0

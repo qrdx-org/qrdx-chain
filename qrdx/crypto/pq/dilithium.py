@@ -10,9 +10,13 @@ A node without liboqs cannot generate keys, sign, or verify — it will fail har
     pip install liboqs-python
 """
 
+import contextlib
+import contextvars
+import functools
 import hashlib
+import threading
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 try:
     import oqs
@@ -26,44 +30,30 @@ except ImportError as e:
     ) from e
 
 
+from . import algorithms as _algorithms  # noqa: E402
+
 # ML-DSA-65 parameters (formerly Dilithium3) — FIPS 204
-# Try ML-DSA-65 first (newer liboqs ≥0.9), fallback to Dilithium3 (older)
-ALGORITHM = "ML-DSA-65"
-ALGORITHM_LEGACY = "Dilithium3"
-PRIVATE_KEY_SIZE = 4032   # ML-DSA-65 private key size
-PUBLIC_KEY_SIZE = 1952    # ML-DSA-65 public key size
-SIGNATURE_SIZE = 3309     # ML-DSA-65 signature size
+ALGORITHM = _algorithms.SIG_ALGORITHM
+PRIVATE_KEY_SIZE = 4032  # ML-DSA-65 private key size
+PUBLIC_KEY_SIZE = 1952  # ML-DSA-65 public key size
+SIGNATURE_SIZE = 3309  # ML-DSA-65 signature size
 
 
 class PQCryptoError(Exception):
     """Post-quantum cryptography error."""
+
     pass
 
 
 class PQSignatureError(PQCryptoError):
     """Signature operation failed."""
+
     pass
 
 
-def _get_working_algorithm() -> str:
-    """Determine which algorithm name the installed liboqs supports."""
-    try:
-        oqs.Signature(ALGORITHM)
-        return ALGORITHM
-    except Exception:
-        try:
-            oqs.Signature(ALGORITHM_LEGACY)
-            return ALGORITHM_LEGACY
-        except Exception:
-            raise PQCryptoError(
-                f"Neither {ALGORITHM} nor {ALGORITHM_LEGACY} is supported by "
-                f"the installed liboqs. Upgrade liboqs to a version that "
-                f"supports FIPS 204 (ML-DSA-65)."
-            )
-
-
-# Validate at import time that at least one algorithm works
-_WORKING_ALGORITHM = _get_working_algorithm()
+# Prove the installed liboqs computes FIPS 204 before any key is used: QRDX runs exactly
+# ALGORITHM, never an older or draft scheme under a nearby name (see algorithms.py).
+_algorithms.require()
 
 
 @dataclass
@@ -74,6 +64,7 @@ class PQPublicKey:
     Attributes:
         key_bytes: Raw public key bytes (1952 bytes for ML-DSA-65)
     """
+
     key_bytes: bytes
 
     def __post_init__(self):
@@ -81,19 +72,18 @@ class PQPublicKey:
             raise TypeError("key_bytes must be bytes")
         if len(self.key_bytes) != PUBLIC_KEY_SIZE:
             raise ValueError(
-                f"Public key must be {PUBLIC_KEY_SIZE} bytes, "
-                f"got {len(self.key_bytes)}"
+                f"Public key must be {PUBLIC_KEY_SIZE} bytes, " f"got {len(self.key_bytes)}"
             )
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'PQPublicKey':
+    def from_bytes(cls, data: bytes) -> "PQPublicKey":
         """Create public key from bytes."""
         return cls(key_bytes=data)
 
     @classmethod
-    def from_hex(cls, hex_str: str) -> 'PQPublicKey':
+    def from_hex(cls, hex_str: str) -> "PQPublicKey":
         """Create public key from hex string."""
-        if hex_str.startswith('0x'):
+        if hex_str.startswith("0x"):
             hex_str = hex_str[2:]
         return cls(key_bytes=bytes.fromhex(hex_str))
 
@@ -111,8 +101,19 @@ class PQPublicKey:
 
         Address is first 32 bytes of keccak256(pubkey) with 0xPQ prefix.
         """
-        from ..address import public_key_to_address, AddressType
-        return public_key_to_address(self.key_bytes, AddressType.POST_QUANTUM)
+        return _address_of(bytes(self.key_bytes))
+
+    def to_account_id(self) -> str:
+        """
+        Derive the canonical 20-byte ACCOUNT ID this key controls.
+
+        This — not ``to_address()`` — is the key the ledger and the EVM use, so it
+        is what a PQ transaction's sender resolves to and what a contract sees as
+        ``msg.sender``.  ``to_address()`` remains the human-facing ``0xPQ…`` form.
+        """
+        from ..account_id import to_account_id
+
+        return to_account_id(self.to_address())
 
     def fingerprint(self) -> str:
         """
@@ -143,6 +144,7 @@ class PQSignature:
     Attributes:
         sig_bytes: Raw signature bytes (3309 bytes for ML-DSA-65)
     """
+
     sig_bytes: bytes
 
     def __post_init__(self):
@@ -152,14 +154,14 @@ class PQSignature:
             raise ValueError("Signature cannot be empty")
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'PQSignature':
+    def from_bytes(cls, data: bytes) -> "PQSignature":
         """Create signature from bytes."""
         return cls(sig_bytes=data)
 
     @classmethod
-    def from_hex(cls, hex_str: str) -> 'PQSignature':
+    def from_hex(cls, hex_str: str) -> "PQSignature":
         """Create signature from hex string."""
-        if hex_str.startswith('0x'):
+        if hex_str.startswith("0x"):
             hex_str = hex_str[2:]
         return cls(sig_bytes=bytes.fromhex(hex_str))
 
@@ -216,33 +218,43 @@ class PQPrivateKey:
     def _generate(self):
         """Generate new keypair using liboqs."""
         try:
-            self._signer = oqs.Signature(_WORKING_ALGORITHM)
+            self._signer = oqs.Signature(ALGORITHM)
             pub_bytes = self._signer.generate_keypair()
             self._public_key = PQPublicKey(pub_bytes)
             self._key_bytes = self._signer.export_secret_key()
         except Exception as e:
-            raise PQCryptoError(f"Key generation failed: {e}")
+            raise PQCryptoError(f"Key generation failed: {e}") from e
 
     def _restore_from_bytes(self, key_bytes: bytes):
-        """Restore keypair from private key bytes."""
+        """
+        Restore a keypair from secret-key bytes.
+
+        CRITICAL: do NOT call ``generate_keypair()`` here. Constructing
+        ``oqs.Signature(alg, secret_key)`` already loads the restored secret key
+        and it can sign directly (verified). ``generate_keypair()`` would instead
+        OVERWRITE that secret key with a brand-new random one — silently changing
+        both the signing identity AND the derived address. That footgun caused
+        validators to load their wallets and propose under random addresses that
+        never matched their genesis registration (validator-set non-convergence).
+
+        A Dilithium public key cannot be re-derived from the secret key alone, so
+        callers MUST supply it (``from_bytes/from_hex(..., public_key=...)``) to
+        get a usable address. If it is absent, ``_public_key`` stays None and
+        ``.public_key`` / ``.address`` raise a clear error — far safer than
+        returning a random identity. Signing still works either way.
+        """
         try:
-            self._signer = oqs.Signature(_WORKING_ALGORITHM, key_bytes)
-            if self._public_key is None:
-                # OQS API: when restoring from secret key, we must call
-                # generate_keypair() to initialize internal state.
-                # Callers SHOULD provide public_key for proper restoration.
-                pub_bytes = self._signer.generate_keypair()
-                self._public_key = PQPublicKey(pub_bytes)
+            self._signer = oqs.Signature(ALGORITHM, key_bytes)
         except Exception as e:
-            raise PQCryptoError(f"Key restoration failed: {e}")
+            raise PQCryptoError(f"Key restoration failed: {e}") from e
 
     @classmethod
-    def generate(cls) -> 'PQPrivateKey':
+    def generate(cls) -> "PQPrivateKey":
         """Generate a new random keypair."""
         return cls()
 
     @classmethod
-    def from_bytes(cls, data: bytes, public_key: Optional[PQPublicKey] = None) -> 'PQPrivateKey':
+    def from_bytes(cls, data: bytes, public_key: Optional[PQPublicKey] = None) -> "PQPrivateKey":
         """
         Create private key from bytes.
 
@@ -253,7 +265,7 @@ class PQPrivateKey:
         return cls(key_bytes=data, public_key=public_key)
 
     @classmethod
-    def from_hex(cls, hex_str: str, public_key_hex: Optional[str] = None) -> 'PQPrivateKey':
+    def from_hex(cls, hex_str: str, public_key_hex: Optional[str] = None) -> "PQPrivateKey":
         """
         Create private key from hex string.
 
@@ -261,7 +273,7 @@ class PQPrivateKey:
             hex_str: Private key hex (with or without 0x)
             public_key_hex: Optional public key hex for proper restoration
         """
-        if hex_str.startswith('0x'):
+        if hex_str.startswith("0x"):
             hex_str = hex_str[2:]
 
         public_key = None
@@ -286,7 +298,13 @@ class PQPrivateKey:
     def public_key(self) -> PQPublicKey:
         """Get corresponding public key."""
         if self._public_key is None:
-            raise PQCryptoError("Public key not initialized")
+            raise PQCryptoError(
+                "Public key unavailable: this key was restored from secret-key "
+                "bytes without its public key, which a Dilithium secret key cannot "
+                "re-derive. Provide it via from_bytes/from_hex(..., public_key=...) "
+                "(or load a keystore/wallet file that stores 'public_key'). The key "
+                "can still sign, but its address/public key are unknown."
+            )
         return self._public_key
 
     @property
@@ -318,7 +336,7 @@ class PQPrivateKey:
             sig_bytes = self._signer.sign(message)
             return PQSignature(sig_bytes)
         except Exception as e:
-            raise PQSignatureError(f"Signing failed: {e}")
+            raise PQSignatureError(f"Signing failed: {e}") from e
 
     def sign_hash(self, message_hash: bytes) -> PQSignature:
         """
@@ -370,6 +388,45 @@ def sign(private_key: PQPrivateKey, message: bytes) -> PQSignature:
     return private_key.sign(message)
 
 
+@functools.lru_cache(maxsize=65536)
+def _address_of(key_bytes: bytes) -> str:
+    """A key's ``0xPQ`` address, remembered: every transaction's signature is bound to its
+    sender's address through it, and deriving it (keccak and a checksum, in Python) cost as
+    much as checking the signature (docs/PERFORMANCE.md)."""
+    from ..address import AddressType, public_key_to_address
+
+    return public_key_to_address(key_bytes, AddressType.POST_QUANTUM)
+
+
+_verifiers = threading.local()
+
+# Verdicts already reached for a batch (``precomputed``), by (public key, message, signature):
+# ``verify`` reads them in place of asking liboqs again.
+_PRECOMPUTED: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar(
+    "qrdx_pq_precomputed", default=None
+)
+
+
+@contextlib.contextmanager
+def precomputed(verdicts: dict):
+    """Within this block, ``verify`` answers from ``verdicts`` where it holds the item (the
+    native module's batch, qrdx/native.py); anything else is checked as usual."""
+    token = _PRECOMPUTED.set(verdicts)
+    try:
+        yield
+    finally:
+        _PRECOMPUTED.reset(token)
+
+
+def _verifier():
+    """This thread's liboqs verifier (a new one each time cost a fifth of a verification). A
+    verification holds no state in it; one per thread keeps threads from sharing one."""
+    v = getattr(_verifiers, "sig", None)
+    if v is None:
+        v = _verifiers.sig = oqs.Signature(ALGORITHM)
+    return v
+
+
 def verify(public_key: PQPublicKey, message: bytes, signature: PQSignature) -> bool:
     """
     Verify a signature against a public key.
@@ -393,11 +450,20 @@ def verify(public_key: PQPublicKey, message: bytes, signature: PQSignature) -> b
     if not isinstance(message, bytes):
         return False
 
-    try:
-        verifier = oqs.Signature(_WORKING_ALGORITHM)
-        return verifier.verify(message, signature.to_bytes(), public_key.to_bytes())
-    except Exception:
-        return False
+    pre = _PRECOMPUTED.get()
+    known = pre.get((public_key.to_bytes(), message, signature.to_bytes())) if pre else None
+    if known is not None:
+        verdict = bool(known)
+    else:
+        try:
+            verdict = bool(_verifier().verify(message, signature.to_bytes(), public_key.to_bytes()))
+        except Exception:
+            verdict = False
+    from . import openssl_backend
+
+    if openssl_backend.shadow_enabled():  # (OpenSSL asked too: docs/PQ_CRYPTO_BACKEND.md)
+        openssl_backend.shadow(public_key.to_bytes(), message, signature.to_bytes(), verdict)
+    return verdict
 
 
 def is_available() -> bool:
@@ -421,7 +487,7 @@ def get_liboqs_error() -> Optional[str]:
 
 def get_algorithm_info() -> dict:
     """Get information about the signature algorithm."""
-    algo = _WORKING_ALGORITHM
+    algo = ALGORITHM
     try:
         sig = oqs.Signature(algo)
         details = sig.details
@@ -429,13 +495,13 @@ def get_algorithm_info() -> dict:
         details = {}
 
     return {
-        'algorithm': algo,
-        'algorithm_family': 'ML-DSA (Dilithium)',
-        'nist_standard': 'FIPS 204',
-        'private_key_size': PRIVATE_KEY_SIZE,
-        'public_key_size': PUBLIC_KEY_SIZE,
-        'signature_size': SIGNATURE_SIZE,
-        'liboqs_available': True,
-        'claimed_nist_level': details.get('claimed_nist_level', 3),
-        'is_euf_cma': details.get('is_euf_cma', True),
+        "algorithm": algo,
+        "algorithm_family": "ML-DSA (Dilithium)",
+        "nist_standard": "FIPS 204",
+        "private_key_size": PRIVATE_KEY_SIZE,
+        "public_key_size": PUBLIC_KEY_SIZE,
+        "signature_size": SIGNATURE_SIZE,
+        "liboqs_available": True,
+        "claimed_nist_level": details.get("claimed_nist_level", 3),
+        "is_euf_cma": details.get("is_euf_cma", True),
     }

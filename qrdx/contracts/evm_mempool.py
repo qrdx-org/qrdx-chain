@@ -1,0 +1,726 @@
+"""
+EVM transaction mempool — admission gate for account-model (eth) transactions.
+
+This is the EVM/account analog of ``qrdx.exchange.mempool.ExchangeMempool`` and
+the first step (E-D1) of giving the account domain the same consensus integration
+the exchange domain received (see docs/archive/EVM_STATE_CONSENSUS_INTEGRATION.md §6).
+
+Admission decides which signed EVM transactions are *eligible* to enter a block.
+It does NOT execute them or include them in blocks (E-D2/E-D3) — keeping it
+additive and independently testable.
+
+Authentication is intrinsic to EVM transactions: the sender is *recovered* from
+the ECDSA signature (you cannot produce a valid signature that recovers to a
+victim's address without their key), so successful recovery binds the sender —
+no separate signature check is needed (unlike exchange txs, whose sender is
+declared and must be bound). Admission then enforces a nonce window, dedup, and
+DoS caps.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_MEMPOOL = 8192
+DEFAULT_MAX_PER_SENDER = 64
+DEFAULT_MAX_NONCE_GAP = 64
+
+# address (0x-hex, lowercased) -> next expected account nonce
+NonceProvider = Callable[[str], int]
+
+
+# Intrinsic gas for the legacy/EIP-155 envelope (Ethereum's own schedule). The PQ
+# envelope has its own, larger floor in qrdx.transactions.pq_tx.
+_LEGACY_BASE_GAS = 21_000
+_LEGACY_CREATE_GAS = 32_000
+_GAS_TXDATA_ZERO = 4
+_GAS_TXDATA_NONZERO = 16
+# EIP-2930 access lists: what each pre-warmed address and storage key costs up front.
+_ACCESS_LIST_ADDRESS_GAS = 2_400
+_ACCESS_LIST_STORAGE_KEY_GAS = 1_900
+# Typed transactions (EIP-2718) wallets send: EIP-2930 (access lists) and EIP-1559 (fee caps).
+ACCESS_LIST_TX_TYPE = 0x01
+DYNAMIC_FEE_TX_TYPE = 0x02
+_SECP256K1_HALF_N = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+
+
+def intrinsic_gas_legacy(data: bytes, is_create: bool = False) -> int:
+    """
+    Minimum gas a legacy transaction must pay before execution begins.
+
+    This executor runs py-evm's ``apply_message``, which does no transaction-level
+    gas accounting (that lives in ``apply_transaction``) — so for a plain
+    EOA-to-EOA transfer the VM reports ``gas_used == 0``. Without this floor a
+    native transfer would be entirely free, which is both wrong and a spam vector.
+    """
+    gas = _LEGACY_BASE_GAS + (_LEGACY_CREATE_GAS if is_create else 0)
+    for byte in data or b"":
+        gas += _GAS_TXDATA_ZERO if byte == 0 else _GAS_TXDATA_NONZERO
+    return gas
+
+
+def _ecdsa_signer_allowed(raw_tx_hex: str) -> Tuple[bool, str]:
+    """Whether an ECDSA-signed transaction's signer may still sign: its account has not turned
+    its own key off, and the Doomsday Protocol has not turned every ECDSA key off. A transaction
+    whose signer cannot be recovered is the parser's to refuse."""
+    from ..exchange.state_manager import ExchangeStateManager
+
+    try:
+        sender = parse_eth_raw_tx(raw_tx_hex)["sender"]
+    except ValueError:
+        return True, ""
+    mgr = ExchangeStateManager.get_instance()
+    if mgr.doomsday_cutoff() is not None:
+        return False, (
+            "the Doomsday Protocol has turned ECDSA keys off: sign with the account's "
+            "post-quantum controller (docs/QUANTUM_MIGRATION.md)"
+        )
+    if not mgr.authority.own_key_enabled(sender):
+        return False, f"{sender}'s ECDSA key is turned off by its account policy"
+    return True, ""
+
+
+async def verify_delegated_spend(
+    db, raw_tx_hex: str, block_height: Optional[int] = None
+) -> Tuple[bool, str]:
+    """
+    Authorise a delegated spend: may the signer move value out of ``on_behalf_of``?
+
+    Only system wallets are delegable, and only to their registered controller (a PQ
+    address or an m-of-n multisig). The registry is the genesis-populated
+    ``system_wallets`` table, which every node holds identically — so admission and block
+    import reach the same verdict, and the decision is deterministic.
+
+    The controller's authority is temporary (docs/GOVERNANCE.md): it ends at
+    SYSTEM_WALLET_MASTER_SUNSET_HEIGHT, or earlier when governance freezes it
+    (``governance.master_authority``). ``block_height`` is the block the spend would be in
+    (import and proposal pass it; admission uses the next block). From then on system-wallet
+    funds move only by an executed governance proposal.
+
+    Returns ``(True, "")`` immediately for an ordinary (non-delegated) transaction, so
+    callers can apply it unconditionally.
+
+    **Deliberately async and db-backed rather than a module-level cache.** A cache would
+    have a load-order failure mode — and because this check FAILS CLOSED, an unloaded
+    cache would silently refuse every delegated spend. Reading the table is cheap and has
+    no such state.
+
+    Fails closed on any error: a delegated spend is exactly the operation that must never
+    be waved through on a check that did not run.
+    """
+    from eth_utils import decode_hex
+
+    from ..transactions.pq_tx import PQ_TX_TYPE, decode_pq_tx
+
+    try:
+        raw = decode_hex(raw_tx_hex)
+    except Exception:
+        return True, ""  # malformed hex is the parser's business, not ours
+    if not raw or raw[0] != PQ_TX_TYPE:
+        # An ECDSA envelope cannot delegate. Its signer's account may still have turned its own
+        # key off (quantum migration, docs/QUANTUM_MIGRATION.md), or the Doomsday Protocol may
+        # have turned every ECDSA key off: then it signs nothing.
+        return _ecdsa_signer_allowed(raw_tx_hex)
+
+    try:
+        tx = decode_pq_tx(raw)
+        signer = tx.sender()
+    except Exception:
+        return True, ""  # structural failure is the parser's business
+
+    # Account control (docs/ACCOUNT_CONTROL.md): a key its account turned off signs nothing, and
+    # an account a controller is bound to may be spent from by that controller. The policies are
+    # exchange state, applied up to this block's exchange section on every path (each block's
+    # exchange section runs before its EVM section), so every node reaches the same verdict.
+    from ..exchange.state_manager import ExchangeStateManager
+
+    authority = ExchangeStateManager.get_instance().authority
+    if not authority.own_key_enabled(signer):
+        return False, f"{signer[:20]}'s key is turned off by its account policy"
+    if not tx.is_delegated():
+        return True, ""
+
+    source = tx.spend_from()
+    if authority.may_control(source, signer):
+        return True, ""
+    # The registry is a handful of rows: matched by address case-insensitively, or by the
+    # account id of the address genesis created the wallet with (which may be a 0xPQ form whose
+    # account id is what the transaction names).
+    try:
+        wallets = [(w.address, w.controller_address) for w in db.store["system_wallets"].scan()]
+    except Exception as e:
+        return False, f"system-wallet registry unreadable ({e})"
+    from ..crypto.account_id import to_account_id
+
+    row = next(((c,) for a, c in wallets if str(a).lower() == str(source).lower()), None)
+    if not row:
+        for addr, controller in wallets:
+            try:
+                if to_account_id(addr) == source:
+                    row = (controller,)
+                    break
+            except ValueError:
+                continue
+
+    if not row:
+        return False, f"{source[:20]} is not a system wallet"
+
+    controller = row[0]
+    try:
+        from ..crypto.account_id import to_account_id
+
+        authorised = to_account_id(controller) == signer
+    except ValueError:
+        authorised = str(controller).lower() == signer.lower()
+
+    if not authorised:
+        return False, (
+            f"signer {signer[:20]} is not the controller of {source[:20]} "
+            f"(controller {str(controller)[:20]})"
+        )
+
+    # The controller's authority is temporary: it ends at the sunset height, or when
+    # governance freezes it (docs/GOVERNANCE.md).
+    try:
+        from ..exchange.governance import master_authority
+
+        if block_height is None:
+            block_height = int(await db.get_next_block_id())
+        allowed, why = master_authority(int(block_height))
+    except Exception as e:
+        return False, f"cannot establish the master controller's authority ({e})"
+    if not allowed:
+        return False, why
+    return True, ""
+
+
+def _parse_pq_raw_tx(raw_tx: bytes) -> Dict[str, Any]:
+    """
+    Decode **and authenticate** a type-0x51 post-quantum transaction.
+
+    Returns the same dict shape as a legacy transaction, with ``sender`` set to the
+    canonical 20-byte account id derived from the embedded Dilithium public key.
+    Because that id is 20 bytes, every downstream consumer — mempool, executor,
+    EVM, receipts — treats it exactly like a secp256k1 sender.
+
+    Authentication happens HERE, not later, because this function is the choke
+    point ``apply_block_evm_section`` uses to authenticate a block's whole EVM
+    section before touching state. A legacy tx authenticates implicitly (the
+    sender IS whatever the signature recovers to); a PQ tx must therefore have its
+    signature checked explicitly at the same point, or a proposer could smuggle an
+    unsigned transaction spending someone else's account.
+    """
+    from eth_hash.auto import keccak
+    from eth_utils import encode_hex
+
+    from ..transactions.pq_tx import PQ_TX_TYPE, decode_pq_tx
+
+    try:
+        tx = decode_pq_tx(raw_tx)
+    except Exception as e:
+        raise ValueError(f"malformed PQ transaction: {e}") from e
+
+    if not tx.verify():
+        raise ValueError("PQ signature verification failed")
+
+    # Replay protection across networks: the signed envelope names its chain, and only this
+    # network's id is valid here (see _require_chain_id).
+    _require_chain_id(tx.chain_id or None)
+
+    # Intrinsic gas is a VALIDITY rule, not a revert condition (as in Ethereum): a
+    # transaction supplying less than its floor is invalid, so a block carrying one
+    # is rejected outright rather than executing it as a revert. Raising here —
+    # inside the shared authentication choke point — gets that for free on both the
+    # mempool and the block-import path.
+    floor = tx.intrinsic_gas()
+    if tx.gas_limit < floor:
+        raise ValueError(
+            f"intrinsic gas too low: gas_limit {tx.gas_limit} < required {floor} "
+            f"(PQ envelope is {len(tx.public_key) + len(tx.signature)} bytes)"
+        )
+
+    return {
+        "sender": tx.sender(),
+        "spend_from": tx.spend_from(),
+        "nonce": tx.nonce,
+        "to": encode_hex(tx.to) if tx.to else None,
+        "value": tx.value,
+        "data": tx.data,
+        "gas": tx.gas_limit,
+        "gas_price": tx.gas_price,
+        "chain_id": tx.chain_id or None,
+        "tx_hash": encode_hex(keccak(raw_tx)),
+        "tx_type": PQ_TX_TYPE,
+        "intrinsic_gas": tx.intrinsic_gas(),
+        "pq_address": tx.pq_address(),
+    }
+
+
+def _require_chain_id(chain_id) -> None:
+    """
+    A transaction must be signed for THIS network's chain id (EIP-155; the PQ envelope carries
+    it too). Without the check a signature is valid on every chain: a transaction signed on a
+    testnet — or on any other EVM network where the same key holds an account — would execute
+    here as soon as the nonce lined up. Pre-EIP-155 legacy transactions name no chain at all
+    and are refused for the same reason.
+
+    Lives in the shared parser, so mempool admission, execution and block import all apply it:
+    a proposer cannot include what admission would refuse.
+    """
+    from ..constants import CHAIN_ID
+
+    if chain_id is None:
+        raise ValueError(
+            f"transaction is not bound to a chain id (pre-EIP-155 signature); sign it for "
+            f"chain id {CHAIN_ID}"
+        )
+    if int(chain_id) != CHAIN_ID:
+        raise ValueError(
+            f"transaction is signed for chain id {chain_id}, but this network's "
+            f"chain id is {CHAIN_ID}"
+        )
+
+
+def parse_eth_raw_tx(raw_tx_hex: str) -> Dict[str, Any]:
+    """
+    Decode a signed transaction and establish its sender.
+
+    Handles these envelopes, all of which end up with a 20-byte sender:
+
+      * **legacy / EIP-155** — sender recovered from ``(v, r, s)``.
+      * **type 0x01 (EIP-2930) and 0x02 (EIP-1559)** — what wallets send by default; sender
+        recovered from ``(y_parity, r, s)`` over the typed signing hash
+        (see ``_parse_typed_eth_tx``).
+      * **type 0x51 (PQ)** — sender derived from an embedded ML-DSA-65 public key,
+        signature verified here (see ``_parse_pq_raw_tx``).
+
+    Returns a dict: ``sender`` (0x-hex), ``nonce``, ``to`` (0x-hex or None),
+    ``value`` (wei int), ``data`` (bytes), ``gas``, ``gas_price``, ``chain_id``,
+    ``tx_hash`` (0x-hex, keccak of the raw bytes), and ``tx_type``. For a type-0x02
+    transaction ``gas_price`` is its fee cap (``max_fee_per_gas``), the most it can pay: what
+    the base-fee floor is judged against. What it does pay is ``effective_gas_price``.
+
+    Raises ValueError on malformed input, an unsupported transaction type, or a
+    signature that cannot be recovered / verified.
+    """
+    import rlp
+    from eth_hash.auto import keccak
+    from eth_keys import keys
+    from eth_utils import decode_hex, encode_hex
+
+    from ..transactions.pq_tx import PQ_TX_TYPE
+
+    try:
+        raw_tx = decode_hex(raw_tx_hex)
+    except Exception as e:
+        raise ValueError(f"malformed hex: {e}") from e
+    if not raw_tx:
+        raise ValueError("empty transaction")
+
+    # Typed transactions (EIP-2718) start with a type byte < 0x80.
+    if raw_tx[0] == PQ_TX_TYPE:
+        return _parse_pq_raw_tx(raw_tx)
+    if raw_tx[0] in (ACCESS_LIST_TX_TYPE, DYNAMIC_FEE_TX_TYPE):
+        return _parse_typed_eth_tx(raw_tx)
+    if raw_tx[0] < 0x80:
+        raise ValueError(
+            f"unsupported typed transaction 0x{raw_tx[0]:02x} (supported: legacy/EIP-155, "
+            f"0x01 EIP-2930, 0x02 EIP-1559, 0x{PQ_TX_TYPE:02x} post-quantum)"
+        )
+
+    try:
+        tx = rlp.decode(raw_tx)
+    except Exception as e:
+        raise ValueError(f"malformed RLP: {e}") from e
+    if len(tx) != 9:
+        raise ValueError(f"expected 9 RLP fields, got {len(tx)}")
+
+    nonce = int.from_bytes(tx[0], "big") if tx[0] else 0
+    gas_price = int.from_bytes(tx[1], "big") if tx[1] else 0
+    gas = int.from_bytes(tx[2], "big") if tx[2] else 0
+    to_bytes = tx[3]
+    value = int.from_bytes(tx[4], "big") if tx[4] else 0
+    data = tx[5]
+    v_int = int.from_bytes(tx[6], "big") if tx[6] else 0
+    r_int = int.from_bytes(tx[7], "big") if tx[7] else 0
+    s_int = int.from_bytes(tx[8], "big") if tx[8] else 0
+
+    if r_int == 0 or s_int == 0:
+        raise ValueError("missing signature (r/s zero)")
+
+    if v_int >= 35:  # EIP-155
+        chain_id = (v_int - 35) // 2
+        recovery_id = v_int - (chain_id * 2 + 35)
+        unsigned = [tx[i] for i in range(6)] + [
+            chain_id.to_bytes((chain_id.bit_length() + 7) // 8, "big"),
+            b"",
+            b"",
+        ]
+    else:  # pre-EIP-155
+        chain_id = None
+        recovery_id = v_int - 27
+        unsigned = [tx[i] for i in range(6)]
+
+    if recovery_id not in (0, 1):
+        raise ValueError(f"invalid recovery id {recovery_id}")
+    _require_chain_id(chain_id)
+
+    message_hash = keccak(rlp.encode(unsigned))
+    try:
+        sig = keys.Signature(
+            r_int.to_bytes(32, "big") + s_int.to_bytes(32, "big") + bytes([recovery_id])
+        )
+        pub = sig.recover_public_key_from_msg_hash(message_hash)
+        sender = pub.to_canonical_address()
+    except Exception as e:
+        raise ValueError(f"signature recovery failed: {e}") from e
+
+    return {
+        "sender": encode_hex(sender),
+        "nonce": nonce,
+        "to": encode_hex(to_bytes) if to_bytes else None,
+        "value": value,
+        "data": data,
+        "gas": gas,
+        "gas_price": gas_price,
+        "chain_id": chain_id,
+        "tx_hash": encode_hex(keccak(raw_tx)),
+        "tx_type": 0,
+        "spend_from": encode_hex(sender),
+        "intrinsic_gas": intrinsic_gas_legacy(data, is_create=not to_bytes),
+    }
+
+
+def _canonical_int(field: Any, name: str) -> int:
+    """An RLP integer in its one valid encoding: big-endian, no leading zero bytes."""
+    if not isinstance(field, bytes):
+        raise ValueError(f"{name} is not an integer")
+    if field[:1] == b"\x00":
+        raise ValueError(f"{name} has a leading zero byte (non-canonical encoding)")
+    if len(field) > 32:
+        raise ValueError(f"{name} does not fit in 256 bits")
+    return int.from_bytes(field, "big") if field else 0
+
+
+def _access_list(field: Any) -> List[Tuple[bytes, List[bytes]]]:
+    """An EIP-2930 access list: [[address (20 bytes), [storage key (32 bytes), ...]], ...]."""
+    if not isinstance(field, list):
+        raise ValueError("access list is not a list")
+    entries: List[Tuple[bytes, List[bytes]]] = []
+    for entry in field:
+        if not (isinstance(entry, list) and len(entry) == 2):
+            raise ValueError("access list entry is not [address, storage keys]")
+        address, keys = entry
+        if not (isinstance(address, bytes) and len(address) == 20):
+            raise ValueError("access list address is not 20 bytes")
+        if not isinstance(keys, list) or not all(
+            isinstance(k, bytes) and len(k) == 32 for k in keys
+        ):
+            raise ValueError("access list storage keys are not 32 bytes each")
+        entries.append((address, list(keys)))
+    return entries
+
+
+def access_list_gas(access_list: List[Tuple[bytes, List[bytes]]]) -> int:
+    """What an EIP-2930 access list costs up front."""
+    return sum(
+        _ACCESS_LIST_ADDRESS_GAS + _ACCESS_LIST_STORAGE_KEY_GAS * len(keys)
+        for _address, keys in access_list
+    )
+
+
+def _parse_typed_eth_tx(raw_tx: bytes) -> Dict[str, Any]:
+    """Decode and authenticate an EIP-2930 (0x01) or EIP-1559 (0x02) transaction.
+
+    0x01: ``0x01 || rlp([chain_id, nonce, gas_price, gas, to, value, data, access_list,
+    y_parity, r, s])``; 0x02: ``0x02 || rlp([chain_id, nonce, max_priority_fee_per_gas,
+    max_fee_per_gas, gas, to, value, data, access_list, y_parity, r, s])``. The signature is
+    over ``keccak(type || rlp(the fields before y_parity))``. Every integer must be in its
+    canonical encoding and ``s`` in the lower half of the curve order (EIP-2), so one
+    transaction has exactly one valid encoding and one hash.
+    """
+    import rlp
+    from eth_hash.auto import keccak
+    from eth_keys import keys
+    from eth_utils import encode_hex
+
+    tx_type = raw_tx[0]
+    try:
+        fields = rlp.decode(raw_tx[1:])
+    except Exception as e:
+        raise ValueError(f"malformed RLP: {e}") from e
+    want = 11 if tx_type == ACCESS_LIST_TX_TYPE else 12
+    if not isinstance(fields, list) or len(fields) != want:
+        raise ValueError(f"expected {want} RLP fields for a type-0x{tx_type:02x} transaction")
+
+    chain_id = _canonical_int(fields[0], "chain id")
+    nonce = _canonical_int(fields[1], "nonce")
+    if tx_type == ACCESS_LIST_TX_TYPE:
+        gas_price = _canonical_int(fields[2], "gas price")
+        max_priority = max_fee = gas_price
+        rest = fields[3:]
+    else:
+        max_priority = _canonical_int(fields[2], "max priority fee per gas")
+        max_fee = _canonical_int(fields[3], "max fee per gas")
+        if max_priority > max_fee:
+            raise ValueError(
+                f"max priority fee per gas {max_priority} exceeds max fee per gas {max_fee}"
+            )
+        gas_price = max_fee
+        rest = fields[4:]
+    gas = _canonical_int(rest[0], "gas")
+    to_bytes = rest[1]
+    if not isinstance(to_bytes, bytes) or len(to_bytes) not in (0, 20):
+        raise ValueError("to is neither empty nor a 20-byte address")
+    value = _canonical_int(rest[2], "value")
+    data = rest[3]
+    if not isinstance(data, bytes):
+        raise ValueError("data is not a byte string")
+    access_list = _access_list(rest[4])
+    y_parity = _canonical_int(rest[5], "y parity")
+    r_int = _canonical_int(rest[6], "r")
+    s_int = _canonical_int(rest[7], "s")
+    if y_parity not in (0, 1):
+        raise ValueError(f"invalid y parity {y_parity}")
+    if r_int == 0 or s_int == 0:
+        raise ValueError("missing signature (r/s zero)")
+    if s_int > _SECP256K1_HALF_N:
+        raise ValueError("signature s is in the upper half of the curve order (EIP-2)")
+    _require_chain_id(chain_id)
+
+    signed = len(fields) - 3
+    message_hash = keccak(bytes([tx_type]) + rlp.encode(fields[:signed]))
+    try:
+        sig = keys.Signature(
+            r_int.to_bytes(32, "big") + s_int.to_bytes(32, "big") + bytes([y_parity])
+        )
+        sender = sig.recover_public_key_from_msg_hash(message_hash).to_canonical_address()
+    except Exception as e:
+        raise ValueError(f"signature recovery failed: {e}") from e
+
+    return {
+        "sender": encode_hex(sender),
+        "nonce": nonce,
+        "to": encode_hex(to_bytes) if to_bytes else None,
+        "value": value,
+        "data": data,
+        "gas": gas,
+        "gas_price": gas_price,
+        "max_fee_per_gas": max_fee,
+        "max_priority_fee_per_gas": max_priority,
+        "access_list": access_list,
+        "chain_id": chain_id,
+        "tx_hash": encode_hex(keccak(raw_tx)),
+        "tx_type": tx_type,
+        "spend_from": encode_hex(sender),
+        "intrinsic_gas": intrinsic_gas_legacy(data, is_create=not to_bytes)
+        + access_list_gas(access_list),
+    }
+
+
+def effective_gas_price(parsed: Dict[str, Any], base_fee: int) -> int:
+    """What a transaction pays per unit of gas in a block with ``base_fee``: an EIP-1559
+    transaction ``min(max_fee_per_gas, base_fee + max_priority_fee_per_gas)``, every other one
+    its gas price. (All of it is burned: QRDX pays proposers no tips.)"""
+    if int(parsed.get("tx_type") or 0) == DYNAMIC_FEE_TX_TYPE:
+        return min(
+            int(parsed["max_fee_per_gas"]),
+            int(base_fee) + int(parsed["max_priority_fee_per_gas"]),
+        )
+    return int(parsed["gas_price"])
+
+
+def _default_nonce_provider(address: str) -> int:
+    """Next expected account nonce from the live EVM state (best-effort, 0)."""
+    return 0
+
+
+class EVMMempool:
+    """In-memory admission queue for signed EVM (account-model) transactions."""
+
+    def __init__(
+        self,
+        max_size: int = DEFAULT_MAX_MEMPOOL,
+        max_per_sender: int = DEFAULT_MAX_PER_SENDER,
+        max_nonce_gap: int = DEFAULT_MAX_NONCE_GAP,
+        nonce_provider: Optional[NonceProvider] = None,
+    ):
+        self.max_size = max_size
+        self.max_per_sender = max_per_sender
+        self.max_nonce_gap = max_nonce_gap
+        self._nonce_provider = nonce_provider or _default_nonce_provider
+        # tx_hash -> {raw, sender, nonce}
+        self._txs: Dict[str, Dict[str, Any]] = {}
+        self._by_sender: Dict[str, Set[str]] = {}
+
+    # ── Admission ──────────────────────────────────────────────────────
+
+    def admit(self, raw_tx_hex: str) -> Tuple[bool, str, Optional[str]]:
+        """
+        Attempt to admit a signed raw EVM transaction.
+
+        Returns (ok, error, tx_hash). On success ``error`` is "" and ``tx_hash``
+        is set. Never raises.
+        """
+        try:
+            parsed = parse_eth_raw_tx(raw_tx_hex)
+        except ValueError as e:
+            return False, f"invalid evm tx: {e}", None
+
+        tx_hash = parsed["tx_hash"]
+        sender = str(parsed["sender"]).lower()
+        nonce = int(parsed["nonce"])
+
+        # More gas than a block may carry, or a price under the floor: it could never be included
+        # (docs/BLOCK_LIMITS.md). (Above the floor it waits for the base fee to come down to it.)
+        from ..block_limits import max_evm_tx_gas
+        from ..constants import EVM_MIN_GAS_PRICE_WEI
+
+        if int(parsed["gas"]) > max_evm_tx_gas():
+            return (
+                False,
+                f"gas {parsed['gas']} exceeds the largest block's gas limit {max_evm_tx_gas()}",
+                None,
+            )
+        if int(parsed["gas_price"]) < EVM_MIN_GAS_PRICE_WEI:
+            return (
+                False,
+                f"gas price {parsed['gas_price']} is under the minimum {EVM_MIN_GAS_PRICE_WEI}",
+                None,
+            )
+
+        # Replay / dedup.
+        if tx_hash in self._txs:
+            return False, "duplicate: transaction already in mempool", None
+
+        # Capacity (global + per-sender).
+        if len(self._txs) >= self.max_size:
+            return False, "mempool full", None
+        sender_hashes = self._by_sender.get(sender, set())
+        if len(sender_hashes) >= self.max_per_sender:
+            return False, "per-sender mempool limit reached", None
+
+        # Nonce window.
+        expected = self._nonce_provider(sender)
+        if nonce < expected:
+            return False, f"nonce too low: {nonce} < expected {expected} (stale/replay)", None
+        if nonce > expected + self.max_nonce_gap:
+            return (
+                False,
+                f"nonce too far ahead: {nonce} > expected {expected} + gap {self.max_nonce_gap}",
+                None,
+            )
+        for h in sender_hashes:
+            if int(self._txs[h]["nonce"]) == nonce:
+                return False, f"nonce {nonce} already queued for sender", None
+
+        self._txs[tx_hash] = {
+            "raw": raw_tx_hex,
+            "sender": sender,
+            "nonce": nonce,
+            "gas": int(parsed["gas"]),
+            "gas_price": int(parsed["gas_price"]),
+        }
+        self._by_sender.setdefault(sender, set()).add(tx_hash)
+        return True, "", tx_hash
+
+    # ── Queries ────────────────────────────────────────────────────────
+
+    def contains(self, tx_hash: str) -> bool:
+        return tx_hash in self._txs
+
+    def size(self) -> int:
+        return len(self._txs)
+
+    def next_nonce(self, sender: str, base: int) -> int:
+        """
+        The next nonce a sender should sign, accounting for queued transactions.
+
+        ``base`` is the sender's confirmed on-chain nonce. Walking the queued set
+        upward from it gives the "pending" nonce every web3 client expects from
+        ``eth_getTransactionCount(addr, "pending")`` — without it a client that
+        sends twice before the next block signs the same nonce twice and its second
+        transaction is rejected as already queued.
+        """
+        queued = {
+            int(self._txs[h]["nonce"]) for h in self._by_sender.get(str(sender).lower(), set())
+        }
+        nonce = base
+        while nonce in queued:
+            nonce += 1
+        return nonce
+
+    def get_raw(self, tx_hash: str) -> Optional[str]:
+        entry = self._txs.get(tx_hash)
+        return str(entry["raw"]) if entry else None
+
+    # ── Selection (canonical, deterministic) ───────────────────────────
+
+    def select_for_block(
+        self,
+        limit: int = 256,
+        gas_limit: Optional[int] = None,
+        min_price: int = 0,
+        skip: Optional[Set[str]] = None,
+    ) -> List[str]:
+        """
+        Deterministically select executable raw txs for block inclusion.
+
+        For each sender, include a gap-free run of nonces starting at the
+        sender's expected next nonce; senders ordered by address; capped at
+        ``limit`` transactions and ``gas_limit`` gas (default ``BLOCK_GAS_LIMIT``: a block's
+        declared gas, docs/BLOCK_LIMITS.md), offering at least ``min_price`` (the block's base
+        fee). A sender's run stops at the first transaction that does not fit or pays too
+        little. Identical mempool + state ⇒ identical selection on every node. ``skip``: senders
+        (lowercase) to leave out — those a parent not yet run sends from (their nonces move).
+        """
+        if gas_limit is None:
+            from ..constants import BLOCK_GAS_LIMIT
+
+            gas_limit = BLOCK_GAS_LIMIT
+        selected: List[str] = []
+        gas = 0
+        for sender in sorted(self._by_sender.keys()):
+            if skip and sender.lower() in skip:
+                continue
+            by_nonce = {int(self._txs[h]["nonce"]): self._txs[h] for h in self._by_sender[sender]}
+            n = self._nonce_provider(sender)
+            while n in by_nonce and len(selected) < limit:
+                tx_gas = int(by_nonce[n].get("gas") or 0)
+                if gas + tx_gas > gas_limit or int(by_nonce[n].get("gas_price", 0)) < min_price:
+                    break
+                selected.append(str(by_nonce[n]["raw"]))
+                gas += tx_gas
+                n += 1
+            if len(selected) >= limit:
+                break
+        return selected
+
+    # ── Removal / pruning ──────────────────────────────────────────────
+
+    def remove(self, tx_hashes: List[str]) -> int:
+        removed = 0
+        for h in tx_hashes:
+            entry = self._txs.pop(h, None)
+            if entry is None:
+                continue
+            removed += 1
+            s = self._by_sender.get(str(entry["sender"]))
+            if s is not None:
+                s.discard(h)
+                if not s:
+                    del self._by_sender[str(entry["sender"])]
+        return removed
+
+    def prune_stale(self) -> int:
+        """Drop txs whose nonce is now below the sender's expected nonce."""
+        to_remove: List[str] = []
+        for sender, hashes in self._by_sender.items():
+            expected = self._nonce_provider(sender)
+            for h in hashes:
+                if int(self._txs[h]["nonce"]) < expected:
+                    to_remove.append(h)
+        return self.remove(to_remove)

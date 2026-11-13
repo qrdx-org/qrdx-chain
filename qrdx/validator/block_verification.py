@@ -1,0 +1,624 @@
+"""
+PoS block proposer authentication for the import path.
+
+Until now the import paths (sync, p2p `submitBlock`, REST `/submit_block`) accepted
+any height-correct block whose claimed ``proposer_address`` merely existed in the
+validator table — the proposer's Dilithium signature was never verified, and
+``validate_pos_block`` was dead code. This module provides the missing check.
+
+``verify_pos_block_proposer`` authenticates that a block was genuinely produced by
+the validator it claims, by:
+
+  1. **Identity binding** — deriving the 0xPQ address from the block's carried
+     ``proposer_public_key`` and requiring it to equal ``validator_address``. This
+     closes the impersonation vector: you cannot claim a victim validator's
+     address with your own key.
+  2. **Signature** — reconstructing the proposer's ``signing_root`` from the
+     block's own header fields (the exact bytes ``PoSBlock.signing_root`` signs)
+     and verifying the Dilithium signature over it with that public key.
+
+This is *authenticity* only — it does NOT enforce slot-proposer eligibility (which
+validator is scheduled for the slot). That is intentionally separate: the network
+runs validators that produce competing blocks at the tip, all of which are validly
+signed by their respective proposers, so authenticity verification accepts them
+and does not harm liveness. Slot-eligibility + RANDAO + attestation checks
+(`consensus.validate_pos_block`) are a heavier, liveness-sensitive follow-up.
+"""
+
+from __future__ import annotations
+
+import ast
+import copy
+import functools
+import hashlib
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
+
+from ..logger import get_logger
+
+logger = get_logger(__name__)
+
+# RANDAO mix used for proposer selection. The validator manager keeps this at
+# all-zeros network-wide (it is never reassigned), so importers must use the
+# same value to reproduce the proposer. If RANDAO accumulation is ever turned on,
+# the importer must track the identical mix per slot/epoch.
+PROPOSER_RANDAO_MIX = b"\x00" * 32
+
+
+def expected_proposer_for_slot(
+    slot: int,
+    validators: List[Tuple[str, Decimal]],
+    randao_mix: bytes = PROPOSER_RANDAO_MIX,
+) -> Optional[str]:
+    """
+    Deterministically reproduce the eligible proposer address for ``slot``.
+
+    ``validators`` is ``[(address, effective_stake), ...]`` reconstructed the same
+    way the proposer builds its set (every active/pending validator from
+    ``validator_stakes``, ``effective_stake = stake / 1e8``, all proposable). The
+    selection is order-independent (canonicalised by address in
+    ``ValidatorSelector``), so every node derives the same proposer. Returns the
+    address, or ``None`` if no eligible validators.
+    """
+    from .selection import ValidatorSelector
+    from .types import Validator, ValidatorStatus
+
+    vals = [
+        Validator(
+            address=addr,
+            public_key=b"",
+            stake=stake,
+            effective_stake=stake,
+            status=ValidatorStatus.ACTIVE,
+            activation_epoch=0,
+        )
+        for addr, stake in validators
+    ]
+    chosen = ValidatorSelector().select_proposer(slot, vals, randao_mix)
+    return chosen.address if chosen else None
+
+
+def eligible_proposers_for_slot(
+    slot: int,
+    validators: List[Tuple[str, Decimal]],
+    randao_mix: bytes = PROPOSER_RANDAO_MIX,
+    k: int = 1,
+) -> List[str]:
+    """The slot's ELIGIBLE proposer addresses (top-``k`` ranking: primary + backups) — the
+    enforced-RANDAO liveness set. Built identically to ``expected_proposer_for_slot`` so every
+    node agrees; ``k=1`` reproduces the single-primary check."""
+    from .selection import ValidatorSelector
+    from .types import Validator, ValidatorStatus
+
+    vals = [
+        Validator(
+            address=addr,
+            public_key=b"",
+            stake=stake,
+            effective_stake=stake,
+            status=ValidatorStatus.ACTIVE,
+            activation_epoch=0,
+        )
+        for addr, stake in validators
+    ]
+    return [v.address for v in ValidatorSelector().proposer_ranking(slot, vals, randao_mix, k)]
+
+
+# Header fields the proposer signs (see manager.PoSBlock.signing_root).
+_SIGNING_FIELDS = (
+    "number",
+    "parent_hash",
+    "state_root",
+    "transactions_root",
+    "timestamp",
+    "slot",
+    "epoch",
+    "proposer_address",
+    "body_root",
+    "base_fee",
+    "exchange_base_fee",
+    "randao_reveal",
+)
+
+
+def body_root(
+    block: Dict[str, Any],
+    exchange_section: Optional[List[Any]] = None,
+    evm_section: Optional[List[Any]] = None,
+) -> str:
+    """What a block carries besides its header — its votes, slashing proofs, graffiti, exchange
+    operations and EVM transactions, exactly as they travel — hashed into one root the header
+    commits to (``body_root``, signed). Nothing in a block can then change without breaking its
+    signature and its hash.
+
+    None of it used to be signed or hashed: anyone relaying or serving a block could strip or
+    swap the valid votes and slashing proofs it carried — which decide finality, rewards and
+    the validator set, so nodes holding different copies of one block derived different
+    validator sets — under the same hash (docs/KNOWN_ISSUES.md, "A block's body was not
+    signed"). The sections travel beside the content on some paths; pass them when they do."""
+    if exchange_section is None:
+        exchange_section = block.get("exchange_transactions")
+    if evm_section is None:
+        evm_section = block.get("evm_transactions")
+    body = {
+        "attestations": list(block.get("attestations") or ()),
+        "slashing_evidence": list(block.get("slashing_evidence") or ()),
+        "graffiti": block.get("graffiti") or "",
+        "exchange_transactions": list(exchange_section or ()),
+        "evm_transactions": list(evm_section or ()),
+    }
+    from .. import native  # (the same bytes, written in Rust when it is installed)
+
+    return native.body_root(b"qrdx-block-body:", body)
+
+
+def block_integrity_error(
+    block: Dict[str, Any],
+    exchange_section: Optional[List[Any]] = None,
+    evm_section: Optional[List[Any]] = None,
+    block_hash: Optional[str] = None,
+) -> str:
+    """Why a received block is not the block its proposer signed, or "" if it is: its body must
+    hash to the ``body_root`` its header carries, and its hash — as claimed by whoever sent it —
+    must be the one its header defines (``reconstruct_signing_root``). A claimed hash used to be
+    taken as given: one sender could store an honest block under a hash of its choosing (and
+    fork choice prefers the lowest)."""
+    declared = block.get("body_root")
+    if not declared:
+        return "block commits to no body (no body_root)"
+    try:
+        actual = body_root(block, exchange_section, evm_section)
+    except (TypeError, ValueError) as e:
+        return f"unreadable block body: {e}"
+    if actual != declared:
+        return f"block body does not match its body_root ({actual[:16]}… ≠ {str(declared)[:16]}…)"
+    if block_hash is not None:
+        try:
+            expected = reconstruct_signing_root(block).hex()
+        except Exception as e:
+            return f"unreadable block header: {e}"
+        if str(block_hash).lower().removeprefix("0x") != expected:
+            return f"block hash {str(block_hash)[:16]}… is not its header's ({expected[:16]}…)"
+    return ""
+
+
+# What ``ast.literal_eval`` builds a node for: a parse costs in proportion to these, not to the
+# text's length (a 4 MB signature is one string, read in milliseconds; 4 MB of ``1,1,1,…`` is two
+# million numbers, about four seconds). Counted in the raw text, quotes and all, so the count is
+# as cheap as a scan and the same on every node.
+_STRUCTURE = ",:[{('\"+-"
+
+
+def max_content_structure() -> int:
+    """How much structure a block's content may have (``_STRUCTURE``, counted): twice a full
+    block's — a header (about 90), a vote (64) and a slashing proof (184) each — plus room for a
+    graffiti. A block over it is refused before it is parsed (docs/BLOCK_LIMITS.md)."""
+    from ..block_limits import MAX_SLASHING_EVIDENCE_PER_BLOCK
+    from ..constants import MAX_ATTESTATIONS_PER_BLOCK
+
+    return 1024 + 128 * MAX_ATTESTATIONS_PER_BLOCK + 512 * MAX_SLASHING_EVIDENCE_PER_BLOCK
+
+
+def content_structure(text: str) -> int:
+    return sum(text.count(c) for c in _STRUCTURE)
+
+
+@functools.lru_cache(maxsize=8)
+def _parse_text(text: str) -> Any:
+    if content_structure(text) > max_content_structure():
+        raise ValueError("block content has more structure than a block may")
+    return ast.literal_eval(text)
+
+
+def _parse_block_content(block_content: Any) -> Dict[str, Any]:
+    """Block content is ``str(block.to_dict())`` — a Python-dict repr — or that text as it is
+    stored, compressed (qrdx/block_codec.py).
+
+    Content comes from anyone who submits a block, and every import path parses it several
+    times before the proposer's signature is checked. So content with more structure than a
+    block can have (``max_content_structure``) is refused unparsed, and a parse is done once
+    per content: each call gets its own copy, as when every call parsed (tests/
+    test_fuzz_decoders.py)."""
+    if isinstance(block_content, dict):
+        return block_content
+    if isinstance(block_content, (bytes, bytearray, memoryview)):
+        from ..block_codec import decode
+
+        block_content = decode(block_content)
+    if not isinstance(block_content, str) or not block_content:
+        raise ValueError("empty/invalid block_content")
+    return copy.deepcopy(_parse_text(block_content))
+
+
+def is_double_sign(block_content_a: Any, block_content_b: Any) -> bool:
+    """Slashing detection (DOUBLE_SIGN): True iff two blocks are a double-sign by the
+    SAME proposer — identical ``proposer_address`` AND ``slot`` but a different block
+    hash. Two DISTINCT proposers at adjacent slots producing a block at the same height
+    (the benign equal-height propagation race) is NOT a slashable offence, so the
+    proposer+slot identity is the discriminator. Pure; safe to call on any two parsed
+    block dicts or ``block_content`` reprs."""
+    try:
+        a = _parse_block_content(block_content_a)
+        b = _parse_block_content(block_content_b)
+    except Exception:
+        return False
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    pa, pb = a.get("proposer_address"), b.get("proposer_address")
+    if not pa or pa != pb:
+        return False
+    if a.get("slot") is None or a.get("slot") != b.get("slot"):
+        return False
+    return (a.get("hash") or a.get("block_hash")) != (b.get("hash") or b.get("block_hash"))
+
+
+def epoch_from_block(block_like: Dict[str, Any]) -> Optional[int]:
+    """Robustly extract a PoS block's epoch from any of the dict shapes the import
+    paths carry: a parsed block dict (epoch/slot top-level), or a wire envelope whose
+    header fields live inside a ``block_content`` repr string. Returns the epoch as an
+    int, or ``None`` if it cannot be determined. Used to schedule validator
+    activation/exit DETERMINISTICALLY from the carrying block (identical on every node)
+    — see flush_validator_lifecycle_deltas."""
+    if not isinstance(block_like, dict):
+        return None
+    # 1. Top-level epoch (parsed block dict).
+    ep = block_like.get("epoch")
+    if ep is not None:
+        try:
+            return int(ep)
+        except (TypeError, ValueError):
+            pass
+    # 2. Header fields nested in a content repr. The p2p/REST wire envelope calls it
+    #    `block_content`; the SYNC path's block dict comes from the peer's stored row,
+    #    where the column is `content`. Only `block_content` used to be checked, so every
+    #    block imported via sync — bulk sync and every post-reorg re-fetch — returned None
+    #    here, and its validator activations/exits were scheduled with no epoch at all.
+    bc = block_like.get("block_content")
+    if bc is None:
+        bc = block_like.get("content")
+    if bc is not None:
+        try:
+            content = _parse_block_content(bc)
+            if content.get("epoch") is not None:
+                return int(content["epoch"])
+            if content.get("slot") is not None:
+                from ..constants import SLOTS_PER_EPOCH
+
+                return int(content["slot"]) // SLOTS_PER_EPOCH
+        except Exception:
+            pass
+    # 3. Top-level slot fallback.
+    if block_like.get("slot") is not None:
+        try:
+            from ..constants import SLOTS_PER_EPOCH
+
+            return int(block_like["slot"]) // SLOTS_PER_EPOCH
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def reconstruct_signing_root(bc: Dict[str, Any]) -> bytes:
+    """The block signing root (``PoSBlock.signing_root``) for a block-content dict: this
+    network's block signing domain (chain_spec.signing_domain), then the signed header fields.
+    The domain makes a header signed on another network fail verification here — including as
+    DOUBLE_SIGN evidence. It is also the block's hash (``PoSBlock.hash``): the hash commits to
+    everything the proposer signed — its body through ``body_root``, its ancestry through
+    ``parent_hash``."""
+    from ..chain_spec import signing_domain
+
+    data = signing_domain("block") + (
+        int(bc["number"]).to_bytes(8, "little")
+        + bytes.fromhex(bc["parent_hash"])
+        + bytes.fromhex(bc["state_root"])
+        + bytes.fromhex(bc["transactions_root"])
+        + int(bc["timestamp"]).to_bytes(8, "little")
+        + int(bc["slot"]).to_bytes(8, "little")
+        + int(bc["epoch"]).to_bytes(8, "little")
+        + hashlib.sha256(str(bc["proposer_address"]).encode("utf-8")).digest()
+        + bytes.fromhex(bc["body_root"])
+        + int(bc["base_fee"]).to_bytes(32, "big")
+        + int(bc["exchange_base_fee"]).to_bytes(32, "big")
+        + bytes.fromhex(bc["randao_reveal"])  # the one variable-length field: last
+    )
+    return hashlib.sha256(data).digest()
+
+
+async def block_height_of(db: Any, bc: Dict[str, Any]) -> Optional[int]:
+    """A block's height: its parent's stored height + 1. (Its signed ``number`` is its SLOT —
+    the proposer sets ``number=slot`` — and runs ahead of the height once a slot is skipped, so
+    a rule gated by height must never be judged by it.) None if the parent is not stored."""
+    parent = str(bc.get("parent_hash") or "")
+    if not parent:
+        return None  # (content without a parent: nothing to judge by)
+    if set(parent) <= {"0"}:
+        return 0
+    try:
+        row = await db.get_block(parent)
+    except Exception:
+        return None
+    if not row or row.get("block_height") is None:
+        return None
+    return int(row["block_height"]) + 1
+
+
+async def verify_proposer_eligibility(
+    db: Any,
+    block_content: Any,
+    enforce: bool = False,
+    height: Optional[int] = None,
+) -> Tuple[bool, str]:
+    """
+    Verify the block's proposer is the validator selected for its slot.
+
+    The set it is selected from is ``S_E`` of the block's own parent chain
+    (qrdx/validator/epoch_state.py): a pure function of that chain, so the proposer
+    and every node judging the block — at once, during a sync, or when adopting the
+    branch it is on — compute the same set, however long after its slot. (It used to
+    be this node's live ``validators`` table, which changed with finality, so sync and
+    fork-choice adoption could not check it and trust-replayed instead.) The block's
+    parent must be the stored tip: every path applies blocks onto their parent.
+
+    Safe for liveness: a propagation-latency fork block still carries a *valid*
+    (slot, proposer) pair, so it passes — only genuinely out-of-turn blocks fail.
+
+    ``enforce=False`` (observe): a mismatch only warns and returns ``ok=True``.
+    Returns ``(True, "")`` when the chain has no validators to select from.
+    """
+    try:
+        bc = _parse_block_content(block_content)
+    except Exception:
+        return True, ""
+    try:
+        slot = int(bc["slot"])
+        proposer = bc.get("proposer_address")
+    except Exception:
+        return True, ""
+    if not proposer:
+        return True, ""
+    # The block's HEIGHT (given by the applying path, else its parent's + 1): the chain it is
+    # judged on ends at its parent, and height-gated rules apply by height.
+    if height is None:
+        height = await block_height_of(db, bc)
+    if height is None:
+        return (False, "unknown parent: the block cannot be judged") if enforce else (True, "")
+
+    from .epoch_state import proposers_for_slot
+
+    validators = await proposers_for_slot(db, slot, height - 1)
+    if not validators:
+        return True, ""
+
+    # Selection mix: the zero constant today; the per-EPOCH checkpoint mix when RANDAO
+    # selection is enforced — keyed off the block's SLOT via the SAME entry point the
+    # proposer uses (selection_mix_for_slot), so it is tip-independent and matches what the
+    # proposer computed. Behaviour-neutral while the gate is off. See docs item 5.
+    # Whether RANDAO selection applies is decided by the block's own HEIGHT (chain-spec feature
+    # randao_selection), never by this node's tip.
+    from .randao import randao_selection_active, selection_mix_for_slot
+
+    randao_enforced = randao_selection_active(height)
+    mix = PROPOSER_RANDAO_MIX
+    if randao_enforced:
+        try:
+            mix = await selection_mix_for_slot(db, slot)
+        except Exception as e:
+            logger.debug("eligibility: checkpoint mix fallback (zero): %s", e)
+            mix, randao_enforced = PROPOSER_RANDAO_MIX, False
+
+    if randao_enforced:
+        # Accept ANY of the slot's top-K eligible proposers (primary or a backup) — the
+        # liveness set, so a slow/offline primary that a backup covered still verifies.
+        from .randao import RANDAO_PROPOSER_ELIGIBLE_K
+
+        eligible = set(
+            eligible_proposers_for_slot(slot, validators, mix, RANDAO_PROPOSER_ELIGIBLE_K)
+        )
+        ok = (not eligible) or (proposer in eligible)
+        msg = (
+            (f"proposer {str(proposer)[:20]}... not in eligible set for slot {slot}")
+            if not ok
+            else ""
+        )
+    else:
+        expected = expected_proposer_for_slot(slot, validators, mix)
+        ok = not (expected and expected != proposer)
+        msg = (
+            (
+                f"proposer {str(proposer)[:20]}... not eligible for slot {slot} "
+                f"(expected {str(expected)[:20]}...)"
+            )
+            if not ok
+            else ""
+        )
+
+    if not ok:
+        if enforce:
+            return False, msg
+        logger.warning(f"[eligibility observe] {msg}")
+    return True, ""
+
+
+def verify_pos_block_proposer(
+    block_content: Any,
+    validator_address: str,
+    public_key: Optional[bytes] = None,
+) -> Tuple[bool, str]:
+    """
+    Authenticate a PoS block's proposer. Returns ``(ok, error)``.
+
+    On ``False`` the block MUST be rejected. The proposer's Dilithium key is ``public_key`` (from
+    the chain's key registry: ``verify_block_proposer``) or, for a header that carries it as
+    slashing evidence does, ``proposer_public_key``. Blocks no longer carry it: at 3.9 KB of hex
+    it was a fifth of every block, and the registry already holds every validator's key. Also
+    checks the RANDAO reveal (``randao.randao_reveal_required``).
+    """
+    try:
+        bc = _parse_block_content(block_content)
+    except Exception as e:
+        return False, f"unparseable block_content: {e}"
+    if not isinstance(bc, dict):
+        return False, "block_content is not a dict"
+
+    pubkey_hex = bc.get("proposer_public_key")
+    sig_hex = bc.get("proposer_signature")
+    if not sig_hex:
+        return False, "block missing proposer_signature"
+    if not pubkey_hex and not public_key:
+        return False, "proposer's public key unknown (not a registered validator)"
+
+    for f in _SIGNING_FIELDS:
+        if f not in bc:
+            return False, f"block missing signed header field '{f}'"
+
+    try:
+        pubkey = bytes.fromhex(pubkey_hex) if pubkey_hex else bytes(public_key or b"")
+        sig = bytes.fromhex(sig_hex)
+    except Exception as e:
+        return False, f"malformed proposer key/signature hex: {e}"
+
+    # 1. Identity binding: pubkey must derive to the claimed validator address.
+    try:
+        from ..crypto.pq.dilithium import PQPublicKey
+
+        derived = PQPublicKey.from_bytes(pubkey).to_address()
+    except Exception as e:
+        return False, f"could not derive address from proposer pubkey: {e}"
+    if derived != validator_address:
+        return False, (
+            f"proposer pubkey does not match address "
+            f"(derived {derived[:20]}..., claimed {str(validator_address)[:20]}...)"
+        )
+
+    # 2. Dilithium signature over the reconstructed signing root.
+    try:
+        signing_root = reconstruct_signing_root(bc)
+    except Exception as e:
+        return False, f"could not reconstruct signing root: {e}"
+    try:
+        from ..crypto.pq import PQPublicKey as PK, PQSignature, verify as pq_verify
+
+        ok = pq_verify(PK.from_bytes(pubkey), signing_root, PQSignature.from_bytes(sig))
+    except Exception as e:
+        return False, f"signature verification error: {e}"
+    if not ok:
+        return False, "invalid proposer Dilithium signature"
+
+    # 3. The RANDAO reveal: from shortly before RANDAO selection activates, the proposer's
+    # signature of the slot's reveal message (it used to be taken unchecked, so a proposer could
+    # have chosen the bytes folded into the mix); before that, absent (3.3 KB a block nothing
+    # used).
+    from .randao import randao_reveal_message, randao_reveal_required
+
+    reveal_hex = bc.get("randao_reveal") or ""
+    if randao_reveal_required(int(bc["number"])):
+        if not reveal_hex:
+            return False, "missing RANDAO reveal"
+        try:
+            ok = pq_verify(
+                PK.from_bytes(pubkey),
+                randao_reveal_message(int(bc["slot"])),
+                PQSignature.from_bytes(bytes.fromhex(reveal_hex)),
+            )
+        except Exception as e:
+            return False, f"RANDAO reveal verification error: {e}"
+        if not ok:
+            return False, "invalid RANDAO reveal"
+    elif reveal_hex:
+        return False, "RANDAO reveal present but RANDAO selection is not scheduled"
+
+    return True, ""
+
+
+async def verify_block_proposer(
+    db: Any, block_content: Any, validator_address: str, height: int
+) -> Tuple[bool, str]:
+    """``verify_pos_block_proposer`` with the proposer's key from the chain's key registry
+    (``ffg.validator_key``: the genesis record and canonical STAKE_DEPOSITs)."""
+    from .ffg import validator_key
+
+    key = await validator_key(db, validator_address, int(height))
+    return verify_pos_block_proposer(block_content, validator_address, key)
+
+
+# How far ahead of this node's clock a block's slot may be: about a second (clock skew between
+# honest nodes), and at least one slot.
+def _future_tolerance_slots() -> int:
+    from ..constants import SLOT_DURATION
+
+    return max(1, int(1.0 // float(SLOT_DURATION)) + 1)
+
+
+def slot_timestamp(genesis_time: float, slot: int) -> int:
+    """A slot's start time in whole seconds: genesis time + slot × slot duration, rounded down.
+    Exact (integer milliseconds), so every node computes the same second."""
+    from ..constants import SLOT_DURATION_MS
+
+    genesis_ms = int(round(float(genesis_time) * 1000))
+    return (genesis_ms + int(slot) * int(SLOT_DURATION_MS)) // 1000
+
+
+async def genesis_time(db: Any) -> Optional[float]:
+    """The genesis block's time (seconds), read once per database: the slot clock's origin."""
+    cached = getattr(db, "_qrdx_genesis_time", None)
+    if cached is not None:
+        return cached
+    from .node_integration import parse_block_timestamp
+
+    genesis = await db.get_block_by_id(0)
+    parsed = parse_block_timestamp(genesis.get("timestamp") if genesis else None)
+    if parsed is None:
+        return None
+    try:
+        db._qrdx_genesis_time = parsed.timestamp()
+    except AttributeError:
+        pass
+    return parsed.timestamp()
+
+
+async def verify_block_timestamp(db: Any, block_content: Any, height: int) -> Tuple[bool, str]:
+    """With ``slot_timestamps`` active, a block's timestamp must be its slot's start time
+    (``slot_timestamp``). It is the exchange's only clock: without this rule a proposer chose
+    it, and could run funding, oracle staleness, TWAPs, lockups and the bridge's deposit window
+    forwards or backwards."""
+    from .. import chain_spec
+
+    if height < 1 or not chain_spec.is_active("slot_timestamps", int(height)):
+        return True, ""
+    try:
+        bc = _parse_block_content(block_content)
+        slot, stamp = int(bc["slot"]), int(bc["timestamp"])
+    except Exception:
+        return False, "block has no readable slot and timestamp"
+    origin = await genesis_time(db)
+    if origin is None:
+        return False, "no genesis block to take the slot clock from"
+    expected = slot_timestamp(origin, slot)
+    if stamp != expected:
+        return False, f"timestamp {stamp} is not slot {slot}'s start time ({expected})"
+    return True, ""
+
+
+async def verify_slot_progression(
+    db: Any, block_content: Any, height: int, current_slot: Optional[int]
+) -> Tuple[bool, str]:
+    """A block's slot must be later than its parent's, and not ahead of this node's clock by
+    more than ``_future_tolerance_slots``. Eligibility binds a proposer to a slot; without the
+    first rule one eligible proposer could fill any number of heights from that slot, and
+    without the second it could sign blocks for slots it will be eligible in later. Checked by
+    every import path (the parent is the local tip) and respected by the proposer. A block from
+    the future is refused, not kept: fork choice fetches it again once its slot has come."""
+    from .. import chain_index
+
+    try:
+        bc = _parse_block_content(block_content)
+        slot = int(bc["slot"])
+    except Exception:
+        return False, "block has no readable slot"
+    if height >= 1:
+        parent = await chain_index.slot_at(db, height - 1)
+        if parent is not None and slot <= parent:
+            return False, f"slot {slot} is not after its parent's ({parent})"
+    if current_slot is not None and slot > current_slot + _future_tolerance_slots():
+        return False, f"slot {slot} is ahead of the clock (now {current_slot})"
+    return True, ""

@@ -81,7 +81,10 @@ def test_system_wallet_creation():
         total_balance += wallet.genesis_balance
     
     print(f"\n  Total allocation: {total_balance:,} QRDX")
-    assert total_balance == Decimal("75000000"), "Total should be 75M QRDX"
+    from qrdx.constants import TOTAL_SYSTEM_WALLET_ALLOCATION
+
+    # Operating budgets of $100k–$1M each at ~$400 a QRDX (docs/TOKENOMICS.md)
+    assert total_balance == TOTAL_SYSTEM_WALLET_ALLOCATION == Decimal("14000")
     
     print("\n✓ System wallet creation tests passed!")
 
@@ -104,10 +107,8 @@ def test_pq_controller_wallet():
     print(f"  Fingerprint:  {controller_pubkey.fingerprint()}")
     
     assert is_pq_address(controller_address), "Controller must be PQ address"
-    
+
     print("\n✓ PQ controller wallet tests passed!")
-    
-    return controller_key, controller_address
 
 
 @pytest.fixture
@@ -161,8 +162,6 @@ def test_system_wallet_manager(controller_address):
     assert manager.is_burner_wallet(burner_addr), "Garbage collector should be burner"
     
     print("\n✓ System wallet manager tests passed!")
-    
-    return manager
 
 
 def test_genesis_creation(controller_address):
@@ -214,8 +213,6 @@ def test_genesis_creation(controller_address):
     print(f"    Category: {dev_fund['category']}")
     
     print("\n✓ Genesis creation tests passed!")
-    
-    return state, block
 
 
 def test_transaction_validation(controller_key, controller_address, manager):
@@ -292,9 +289,13 @@ def main():
         # Run tests
         test_system_wallet_addresses()
         test_system_wallet_creation()
-        controller_key, controller_address = test_pq_controller_wallet()
-        manager = test_system_wallet_manager(controller_address)
-        state, block = test_genesis_creation(controller_address)
+        test_pq_controller_wallet()
+        # Build shared fixtures for tests that need them
+        controller_key = PQPrivateKey.generate()
+        controller_address = controller_key.public_key.to_address()
+        manager = initialize_system_wallets(controller_address)
+        test_system_wallet_manager(controller_address)
+        test_genesis_creation(controller_address)
         test_transaction_validation(controller_key, controller_address, manager)
         
         # Summary

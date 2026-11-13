@@ -1,0 +1,17 @@
+# QRDX release maintainers — who may sign a release (docs/RELEASES.md).
+#
+# One line per maintainer key, in OpenSSH allowed-signers format, restricted to the two
+# namespaces a maintainer signs in — "git" (the release TAG, checked by the release workflow
+# with `git verify-tag`) and "qrdx-release" (the release MANIFEST):
+#
+#   alice@qrdx.org namespaces="git,qrdx-release" sk-ssh-ed25519@openssh.com AAAAGnNr...
+#
+# (The namespace is part of what is signed, so neither signature can stand in for the other.)
+# Prefer hardware-backed keys (sk-ssh-ed25519@openssh.com, e.g. a YubiKey).
+#
+# A release verifies only when at least `maintainer_threshold` (release/policy.json) distinct
+# maintainers listed here have signed its manifest, AND (unless skipped) the release workflow's
+# own Sigstore signature checks out. Changes to this file are themselves a release-trust change:
+# land them through review, signed by existing maintainers, and announce them out of band.
+#
+# EMPTY ON PURPOSE: no maintainer keys are registered yet, so nothing verifies until they are.

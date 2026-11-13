@@ -19,26 +19,26 @@ SECURITY: Requires liboqs-python. There is NO fallback mode.
 """
 
 import hashlib
-from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Set, Tuple
 
 from .pq.dilithium import (
     PQPrivateKey,
     PQPublicKey,
     PQSignature,
-    PQCryptoError,
     PQSignatureError,
-    verify as dilithium_verify,
     generate_keypair as dilithium_generate_keypair,
-    PUBLIC_KEY_SIZE,
-    SIGNATURE_SIZE,
+    verify as dilithium_verify,
 )
 
 try:
     import blake3 as _blake3
+
     def _blake3_hash(data: bytes) -> bytes:
         return _blake3.blake3(data).digest()
+
 except ImportError:
+
     def _blake3_hash(data: bytes) -> bytes:
         return hashlib.sha256(data).digest()
 
@@ -54,14 +54,15 @@ MULTISIG_ADDRESS_PREFIX = "0xPQMS"
 DOMAIN_MULTISIG = b"QRDX-THRESHOLD-DILITHIUM-v1"
 
 # Limits
-MAX_SIGNERS = 150      # Absolute maximum n
-MAX_THRESHOLD = 100    # Absolute maximum m
-MIN_THRESHOLD = 1      # Minimum threshold
+MAX_SIGNERS = 150  # Absolute maximum n
+MAX_THRESHOLD = 100  # Absolute maximum m
+MIN_THRESHOLD = 1  # Minimum threshold
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # THRESHOLD CONFIG
 # ═══════════════════════════════════════════════════════════════════════
+
 
 @dataclass(frozen=True)
 class ThresholdConfig:
@@ -72,6 +73,7 @@ class ThresholdConfig:
         m: Minimum signers required (threshold)
         n: Total number of signers
     """
+
     m: int
     n: int
 
@@ -97,6 +99,7 @@ class ThresholdConfig:
 # MULTISIG KEYSET
 # ═══════════════════════════════════════════════════════════════════════
 
+
 @dataclass(frozen=True)
 class MultisigKeySet:
     """
@@ -110,15 +113,14 @@ class MultisigKeySet:
         public_keys: Tuple of n PQPublicKey (sorted by key_bytes)
         address: Derived multisig address (0xPQMS...)
     """
+
     config: ThresholdConfig
     public_keys: Tuple[PQPublicKey, ...]
     address: str
 
     def __post_init__(self):
         if len(self.public_keys) != self.config.n:
-            raise ValueError(
-                f"Expected {self.config.n} public keys, got {len(self.public_keys)}"
-            )
+            raise ValueError(f"Expected {self.config.n} public keys, got {len(self.public_keys)}")
 
     def contains_key(self, pub: PQPublicKey) -> bool:
         """Check if a public key is a member of this keyset."""
@@ -128,8 +130,8 @@ class MultisigKeySet:
         """Get the index of a public key in the sorted keyset."""
         try:
             return self.public_keys.index(pub)
-        except ValueError:
-            raise ValueError("Public key is not a member of this keyset")
+        except ValueError as exc:
+            raise ValueError("Public key is not a member of this keyset") from exc
 
     def to_dict(self) -> Dict:
         """Serialize to dictionary."""
@@ -141,7 +143,7 @@ class MultisigKeySet:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict) -> 'MultisigKeySet':
+    def from_dict(cls, data: Dict) -> "MultisigKeySet":
         """Deserialize from dictionary."""
         config = ThresholdConfig(m=data["m"], n=data["n"])
         pks = [PQPublicKey.from_hex(h) for h in data["public_keys"]]
@@ -151,6 +153,7 @@ class MultisigKeySet:
 # ═══════════════════════════════════════════════════════════════════════
 # PARTIAL SIGNATURE
 # ═══════════════════════════════════════════════════════════════════════
+
 
 @dataclass(frozen=True)
 class PartialSignature:
@@ -162,6 +165,7 @@ class PartialSignature:
         public_key: The signer's public key
         signature: Standard Dilithium signature over the domain-tagged message
     """
+
     signer_index: int
     public_key: PQPublicKey
     signature: PQSignature
@@ -175,7 +179,7 @@ class PartialSignature:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict) -> 'PartialSignature':
+    def from_dict(cls, data: Dict) -> "PartialSignature":
         """Deserialize."""
         return cls(
             signer_index=data["signer_index"],
@@ -187,6 +191,7 @@ class PartialSignature:
 # ═══════════════════════════════════════════════════════════════════════
 # MULTISIG SIGNATURE
 # ═══════════════════════════════════════════════════════════════════════
+
 
 @dataclass(frozen=True)
 class MultisigSignature:
@@ -202,6 +207,7 @@ class MultisigSignature:
         signer_mask: Bitmask indicating which signers contributed (bit i = signer i)
         partials: Tuple of m PartialSignature objects
     """
+
     config: ThresholdConfig
     keyset_address: str
     signer_mask: int
@@ -210,13 +216,12 @@ class MultisigSignature:
     def __post_init__(self):
         if len(self.partials) < self.config.m:
             raise ValueError(
-                f"Need at least {self.config.m} partial signatures, "
-                f"got {len(self.partials)}"
+                f"Need at least {self.config.m} partial signatures, " f"got {len(self.partials)}"
             )
         # Verify signer_mask matches partials
         expected_mask = 0
         for p in self.partials:
-            expected_mask |= (1 << p.signer_index)
+            expected_mask |= 1 << p.signer_index
         if self.signer_mask != expected_mask:
             raise ValueError("signer_mask does not match partial signature indices")
 
@@ -241,7 +246,7 @@ class MultisigSignature:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict) -> 'MultisigSignature':
+    def from_dict(cls, data: Dict) -> "MultisigSignature":
         """Deserialize."""
         config = ThresholdConfig(m=data["m"], n=data["n"])
         partials = tuple(PartialSignature.from_dict(d) for d in data["partials"])
@@ -257,6 +262,7 @@ class MultisigSignature:
 # KEY CREATION
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def derive_multisig_address(config: ThresholdConfig, sorted_keys: Tuple[PQPublicKey, ...]) -> str:
     """
     Derive deterministic multisig address from config + sorted public keys.
@@ -266,9 +272,9 @@ def derive_multisig_address(config: ThresholdConfig, sorted_keys: Tuple[PQPublic
     The address is always 44 characters: "0xPQMS" (6) + 38 hex (38) = 44.
     """
     hasher_input = (
-        config.m.to_bytes(2, 'big') +
-        config.n.to_bytes(2, 'big') +
-        b''.join(pk.to_bytes() for pk in sorted_keys)
+        config.m.to_bytes(2, "big")
+        + config.n.to_bytes(2, "big")
+        + b"".join(pk.to_bytes() for pk in sorted_keys)
     )
     digest = _blake3_hash(DOMAIN_MULTISIG + hasher_input)
     return MULTISIG_ADDRESS_PREFIX + digest.hex()[:38]
@@ -295,9 +301,7 @@ def create_multisig_keyset(
         ValueError: If key count != n, or duplicates found
     """
     if len(public_keys) != config.n:
-        raise ValueError(
-            f"Expected {config.n} public keys, got {len(public_keys)}"
-        )
+        raise ValueError(f"Expected {config.n} public keys, got {len(public_keys)}")
 
     # Check for duplicates
     key_bytes_set = {pk.to_bytes() for pk in public_keys}
@@ -340,7 +344,7 @@ def generate_multisig_keyset(
     keyset = create_multisig_keyset(config, public_keys)
 
     # Re-order private keys to match sorted public key order
-    pk_to_priv = {pk.to_bytes(): priv for pk, priv in zip(public_keys, private_keys)}
+    pk_to_priv = {pk.to_bytes(): priv for pk, priv in zip(public_keys, private_keys, strict=False)}
     sorted_privs = [pk_to_priv[pk.to_bytes()] for pk in keyset.public_keys]
 
     return keyset, sorted_privs
@@ -350,19 +354,21 @@ def generate_multisig_keyset(
 # DOMAIN-TAGGED MESSAGE
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def _domain_tag_message(keyset_address: str, message: bytes) -> bytes:
     """
     Apply domain separation to prevent cross-wallet replay.
 
     tagged = BLAKE3(DOMAIN_MULTISIG || keyset_address_bytes || message)
     """
-    addr_bytes = keyset_address.encode('utf-8')
+    addr_bytes = keyset_address.encode("utf-8")
     return _blake3_hash(DOMAIN_MULTISIG + addr_bytes + message)
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # SIGNING
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def create_partial_signature(
     private_key: PQPrivateKey,
@@ -428,8 +434,7 @@ def aggregate_partial_signatures(
     """
     if len(partials) < keyset.config.m:
         raise ValueError(
-            f"Need at least {keyset.config.m} partial signatures, "
-            f"got {len(partials)}"
+            f"Need at least {keyset.config.m} partial signatures, " f"got {len(partials)}"
         )
 
     tagged_message = _domain_tag_message(keyset.address, message)
@@ -458,17 +463,13 @@ def aggregate_partial_signatures(
             raise ValueError(f"Duplicate partial signature from signer {partial.signer_index}")
 
         # Verify the partial signature
-        is_valid = dilithium_verify(
-            partial.public_key, tagged_message, partial.signature
-        )
+        is_valid = dilithium_verify(partial.public_key, tagged_message, partial.signature)
         if not is_valid:
-            raise PQSignatureError(
-                f"Invalid partial signature from signer {partial.signer_index}"
-            )
+            raise PQSignatureError(f"Invalid partial signature from signer {partial.signer_index}")
 
         seen_indices.add(partial.signer_index)
         verified_partials.append(partial)
-        signer_mask |= (1 << partial.signer_index)
+        signer_mask |= 1 << partial.signer_index
 
     # Sort by signer index for canonical ordering
     verified_partials.sort(key=lambda p: p.signer_index)
@@ -484,6 +485,7 @@ def aggregate_partial_signatures(
 # ═══════════════════════════════════════════════════════════════════════
 # VERIFICATION
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def verify_multisig(
     keyset: MultisigKeySet,
@@ -553,6 +555,7 @@ def verify_multisig(
 # ═══════════════════════════════════════════════════════════════════════
 # ADDRESS UTILITIES
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def is_multisig_address(address: str) -> bool:
     """Check if an address is a multisig address (0xPQMS prefix)."""

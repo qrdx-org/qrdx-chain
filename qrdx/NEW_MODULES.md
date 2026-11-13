@@ -56,8 +56,8 @@ Web3-compatible RPC interfaces.
 
 | File | Description |
 |------|-------------|
-| [`/docs/MODERNIZATION_PLAN.md`](/workspaces/qrdx-chain-denaro/docs/MODERNIZATION_PLAN.md) | Complete modernization plan |
-| [`/docs/MODERNIZATION_CHECKLIST.md`](/workspaces/qrdx-chain-denaro/docs/MODERNIZATION_CHECKLIST.md) | Progress tracking checklist |
+| [`/docs/archive/MODERNIZATION_PLAN.md`](/workspaces/qrdx-chain-denaro/docs/archive/MODERNIZATION_PLAN.md) | Complete modernization plan |
+| [`/docs/archive/MODERNIZATION_CHECKLIST.md`](/workspaces/qrdx-chain-denaro/docs/archive/MODERNIZATION_CHECKLIST.md) | Progress tracking checklist |
 
 ## Usage Example
 
@@ -99,4 +99,4 @@ response = await server.handle_request('{"jsonrpc":"2.0","method":"eth_blockNumb
 3. **Phase 3**: Deprecation of legacy code
 4. **Phase 4**: Full v3.0 release
 
-See [MODERNIZATION_PLAN.md](../docs/MODERNIZATION_PLAN.md) for complete details.
+See [MODERNIZATION_PLAN.md](../docs/archive/MODERNIZATION_PLAN.md) for complete details.

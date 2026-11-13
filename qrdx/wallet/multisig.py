@@ -27,27 +27,29 @@ from typing import Dict, List, Optional, Tuple
 
 from ..crypto.pq.dilithium import PQPublicKey
 
-
 # ═══════════════════════════════════════════════════════════════════════
 # SPENDING SCOPE
 # ═══════════════════════════════════════════════════════════════════════
+
 
 class SpendingScope(IntFlag):
     """
     Bitmask for allowed sub-wallet operations.
     Matches Whitepaper §6.2 scope field.
     """
-    NONE     = 0
-    TRANSFER = 1    # Basic token transfers
-    SWAP     = 2    # Exchange/DEX operations
-    STAKE    = 4    # Staking deposits/withdrawals
-    BRIDGE   = 8    # Cross-chain bridge operations
-    ALL      = 15   # TRANSFER | SWAP | STAKE | BRIDGE
+
+    NONE = 0
+    TRANSFER = 1  # Basic token transfers
+    SWAP = 2  # Exchange/DEX operations
+    STAKE = 4  # Staking deposits/withdrawals
+    BRIDGE = 8  # Cross-chain bridge operations
+    ALL = 15  # TRANSFER | SWAP | STAKE | BRIDGE
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # SPENDING POLICY
 # ═══════════════════════════════════════════════════════════════════════
+
 
 @dataclass
 class SpendingPolicy:
@@ -59,8 +61,9 @@ class SpendingPolicy:
         daily_limit: Maximum daily spend (Decimal('0') = unlimited)
         allowed_scopes: Bitmask of allowed operation types
     """
+
     total_budget: Decimal
-    daily_limit: Decimal = Decimal('0')  # 0 = unlimited
+    daily_limit: Decimal = Decimal("0")  # 0 = unlimited
     allowed_scopes: SpendingScope = SpendingScope.ALL
 
     def __post_init__(self):
@@ -85,6 +88,7 @@ class SpendingPolicy:
 # AUTO-REFILL RULE
 # ═══════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class AutoRefillRule:
     """
@@ -97,6 +101,7 @@ class AutoRefillRule:
         refill_to: Target balance after refill (QRDX)
         enabled: Whether the rule is active
     """
+
     trigger_below: Decimal
     refill_to: Decimal
     enabled: bool = True
@@ -114,13 +119,14 @@ class AutoRefillRule:
     def refill_amount(self, current_balance: Decimal) -> Decimal:
         """Calculate how much to refill."""
         if not self.needs_refill(current_balance):
-            return Decimal('0')
+            return Decimal("0")
         return self.refill_to - current_balance
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # SUB-WALLET
 # ═══════════════════════════════════════════════════════════════════════
+
 
 @dataclass
 class SubWallet:
@@ -139,13 +145,14 @@ class SubWallet:
         frozen: If True, all spending is blocked
         auto_refill: Optional auto-refill configuration
     """
+
     address: str
     name: str
     delegate_key: PQPublicKey
     policy: SpendingPolicy
-    balance: Decimal = Decimal('0')
-    spent_total: Decimal = Decimal('0')
-    spent_today: Decimal = Decimal('0')
+    balance: Decimal = Decimal("0")
+    spent_total: Decimal = Decimal("0")
+    spent_today: Decimal = Decimal("0")
     last_reset_day: int = 0
     frozen: bool = False
     auto_refill: Optional[AutoRefillRule] = None
@@ -153,7 +160,7 @@ class SubWallet:
     def _reset_daily_if_needed(self, current_day: int) -> None:
         """Reset daily spending if a new day has started."""
         if current_day > self.last_reset_day:
-            self.spent_today = Decimal('0')
+            self.spent_today = Decimal("0")
             self.last_reset_day = current_day
 
     def check_spending_allowed(
@@ -241,6 +248,7 @@ class SubWallet:
 # PREFUNDED WALLET MANAGER
 # ═══════════════════════════════════════════════════════════════════════
 
+
 class PrefundedWalletManager:
     """
     Manages prefunded sub-wallets controlled by a master PQ wallet.
@@ -272,7 +280,7 @@ class PrefundedWalletManager:
         name: str,
         delegate_key: PQPublicKey,
         policy: SpendingPolicy,
-        initial_balance: Decimal = Decimal('0'),
+        initial_balance: Decimal = Decimal("0"),
         auto_refill: Optional[AutoRefillRule] = None,
     ) -> SubWallet:
         """
@@ -349,7 +357,7 @@ class PrefundedWalletManager:
             raise ValueError(f"Sub-wallet not found: {address}")
 
         reclaimed = wallet.balance
-        wallet.balance = Decimal('0')
+        wallet.balance = Decimal("0")
         wallet.frozen = True
         return reclaimed
 
@@ -427,12 +435,10 @@ class PrefundedWalletManager:
 
     def total_sub_wallet_balance(self) -> Decimal:
         """Total balance across all sub-wallets."""
-        return sum(w.balance for w in self._sub_wallets.values())
+        return sum((w.balance for w in self._sub_wallets.values()), Decimal("0"))
 
     def to_dict(self) -> Dict:
         return {
             "master_address": self.master_address,
-            "sub_wallets": {
-                addr: w.to_dict() for addr, w in self._sub_wallets.items()
-            },
+            "sub_wallets": {addr: w.to_dict() for addr, w in self._sub_wallets.items()},
         }

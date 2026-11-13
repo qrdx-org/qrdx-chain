@@ -17,6 +17,8 @@ testing
 logs/
 ref/
 testnet/
+testnet*
+!docker/testnet-init.py
 *.db
 *.log
 *.env
@@ -33,6 +35,18 @@ testnet/
 *secret_key*
 *_privkey*
 *.keystore
+docker/wallet/
+wallet/
 validator_wallet.json
 slashing_protection.db
 data/
+# Legacy denaro-coin VM checkout (not part of QRDX; was an undeclared submodule that broke fresh clones)
+dvm/
+
+# EVM conformance fixtures (scripts/conformance/fetch_eest.sh) and Hypothesis example databases
+.eest/
+.hypothesis/
+
+# The native module's build output (native/qrdx-native; docs/NATIVE.md)
+native/qrdx-native/target/
+native/qrdx-native/dist/
