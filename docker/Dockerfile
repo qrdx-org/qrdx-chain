@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # =============================================================================
 # QRDX Node — container image, built REPRODUCIBLY
 #
