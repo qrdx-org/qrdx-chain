@@ -23,6 +23,9 @@
 #   QRDX_DATABASE_PATH     SQLite path                         [/app/data/qrdx.db]
 #   QRDX_NODE_KEY_DIR      PQ node identity key directory      [/app/data/keys]
 #   ENABLE_PINGGY_TUNNEL   'true' to open a public reverse tunnel
+#   QRDX_NATIVE_THREADS    the native module's threads [this container's CPUs, divided
+#                          among QRDX_NODES_PER_HOST]
+#   QRDX_NODES_PER_HOST    nodes sharing these CPUs (a multi-node stack on one host) [1]
 #
 # NOTE: every QRDX_* variable is UPPERCASE. The node reads uppercase names only;
 #       the lowercase `qrdx_*` spelling used by older revisions of this script was
@@ -54,6 +57,40 @@ export LOG_CONSOLE_HIGHLIGHTING="${LOG_CONSOLE_HIGHLIGHTING:-True}"
 export LOG_INCLUDE_REQUEST_CONTENT="${LOG_INCLUDE_REQUEST_CONTENT:-False}"
 export LOG_INCLUDE_RESPONSE_CONTENT="${LOG_INCLUDE_RESPONSE_CONTENT:-False}"
 export LOG_INCLUDE_BLOCK_SYNC_MESSAGES="${LOG_INCLUDE_BLOCK_SYNC_MESSAGES:-False}"
+
+# The native module's threads (docs/NATIVE.md, "Its threads"): this container's share of the
+# CPUs. Left to itself the module's pool takes a thread per core of the HOST: a node capped at
+# 2 CPUs (cgroup quota) then runs a burst of threads into its cap and is throttled, and four nodes
+# on one host compete with each other's event loops. The CPUs are the container's CPU set
+# (nproc), lowered to its CPU limit, divided among the nodes that share them; at least 2 where
+# there are 2.
+if [ -z "${QRDX_NATIVE_THREADS:-}" ]; then
+    cpus="$(nproc 2>/dev/null || echo 1)"
+    limit=""
+    if [ -r /sys/fs/cgroup/cpu.max ]; then                      # cgroup v2: "<quota> <period>"
+        read -r quota period < /sys/fs/cgroup/cpu.max || true
+        if [ "${quota:-max}" != "max" ] && [ "${period:-0}" -gt 0 ] 2>/dev/null; then
+            limit=$(( (quota + period - 1) / period ))
+        fi
+    elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then       # cgroup v1
+        quota="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
+        period="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo 100000)"
+        if [ "${quota}" -gt 0 ] 2>/dev/null && [ "${period}" -gt 0 ] 2>/dev/null; then
+            limit=$(( (quota + period - 1) / period ))
+        fi
+    fi
+    if [ -n "${limit}" ] && [ "${limit}" -lt "${cpus}" ]; then
+        cpus="${limit}"
+    fi
+    nodes="${QRDX_NODES_PER_HOST:-1}"
+    [ "${nodes}" -ge 1 ] 2>/dev/null || nodes=1
+    share=$(( cpus / nodes ))
+    if [ "${share}" -lt 2 ]; then
+        share=$(( cpus < 2 ? cpus : 2 ))
+    fi
+    [ "${share}" -ge 1 ] || share=1
+    export QRDX_NATIVE_THREADS="${share}"
+fi
 
 mkdir -p "$(dirname "${QRDX_DATABASE_PATH}")" "${QRDX_NODE_KEY_DIR}"
 echo "Data directory:  $(dirname "${QRDX_DATABASE_PATH}")"
@@ -152,7 +189,9 @@ Node:       ${NODE_NAME}
 Bind:       ${QRDX_NODE_HOST}:${QRDX_NODE_PORT}
 Self URL:   ${QRDX_SELF_URL}
 Bootstrap:  ${QRDX_BOOTSTRAP_NODE}
+Transport:  ${QRDX_P2P_PORT:-$(( QRDX_NODE_PORT + ${QRDX_P2P_PORT_OFFSET:-10000} ))} (peer transport; QRDX_P2P=${QRDX_P2P:-1})
 Database:   ${QRDX_DATABASE_PATH}
+Threads:    ${QRDX_NATIVE_THREADS} (native module)
 Validator:  ${QRDX_VALIDATOR_ENABLED:-false}
 RPC (EVM):  ${QRDX_RPC_ENABLED:-false}
 Streaming:  ${QRDX_ENABLE_STREAMING:-off}

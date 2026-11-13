@@ -5,32 +5,29 @@ Prepare the validator identity for a containerised QRDX node.
 Behaviour, in order:
 
   1. If QRDX_VALIDATOR_ENABLED is not true -> no-op.
-  2. If the wallet file at QRDX_VALIDATOR_WALLET already exists -> validate that
-     it is loadable, print its address, and leave it untouched.
-  3. Otherwise generate a new ML-DSA-65 key and write it there with 0600
-     permissions: as an encrypted keystore when a password is configured, else as a
-     plaintext wallet (which only a dev network accepts).
+  2. If the wallet file at QRDX_VALIDATOR_WALLET already exists -> check it: an encrypted
+     keystore must open with the configured password; a PLAINTEXT wallet (an older stack
+     wrote those) is encrypted in place with it, keeping its key, when the file is writable.
+  3. Otherwise generate a new ML-DSA-65 key into an encrypted keystore there, mode 0600.
 
-Idempotent, and it never overwrites an existing wallet — restarting the stack
-reuses the same validator identity.
+Outside dev networks the node accepts only an encrypted keystore (scrypt and AES-256-GCM:
+qrdx/validator/keystore.py) and refuses a plaintext key, so a password is required. Idempotent:
+it never replaces a key — restarting the stack reuses the same validator identity.
 
 Environment
   QRDX_VALIDATOR_ENABLED        'true' to do anything at all    [false]
-  QRDX_VALIDATOR_WALLET         Wallet path  [/app/data/validator/validator.json]
-  QRDX_VALIDATOR_LABEL          Label stored in a plaintext wallet [QRDX Validator]
+  QRDX_VALIDATOR_WALLET         Keystore path  [/app/data/validator/validator.json]
+  QRDX_VALIDATOR_LABEL          Name recorded with a new key [QRDX Validator]
   QRDX_VALIDATOR_PASSWORD_FILE  File holding the keystore password (a secret)
   QRDX_VALIDATOR_PASSWORD       The password itself, if no file is given
 
-Outside dev networks the node accepts only an encrypted keystore (scrypt and
-AES-256-GCM: qrdx/validator/keystore.py) and refuses a plaintext key. Keep an offline
-backup of the keystore and its password; scripts/validator/keystore.py creates,
-encrypts, upgrades and checks keystores.
+Keep an offline backup of the keystore and its password; scripts/validator/keystore.py
+creates, encrypts, upgrades and checks keystores.
 """
 import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="[validator-init] %(message)s", stream=sys.stdout)
@@ -46,14 +43,22 @@ LABEL = os.getenv("QRDX_VALIDATOR_LABEL", "QRDX Validator")
 MIN_STAKE = "100,000"
 
 
+def _password():
+    from qrdx.validator.keystore import read_password
+
+    return read_password(dict(os.environ))
+
+
 def describe_existing(path: Path) -> int:
-    """Validate a wallet the operator supplied (or a previously generated one)."""
+    """Check a wallet the operator supplied (or a previously generated one); encrypt a plaintext
+    one in place."""
+    from qrdx.validator.keystore import ValidatorKeyError, encrypt_in_place, load_validator_wallet
+
     try:
         data = json.loads(path.read_text())
     except Exception as e:
         log.error("wallet at %s is not readable JSON: %s", path, e)
         return 1
-
     secret = "crypto" if "crypto" in data else "private_key"
     missing = [k for k in ("address", secret, "public_key") if not data.get(k)]
     if missing:
@@ -63,8 +68,28 @@ def describe_existing(path: Path) -> int:
         log.error("wallet at %s is missing required field(s): %s", path, ", ".join(missing))
         return 1
 
-    log.info("using existing validator wallet: %s", path)
-    log.info("validator address: %s", data["address"])
+    password = _password()
+    if not password:
+        log.error("no keystore password: set QRDX_VALIDATOR_PASSWORD (or QRDX_VALIDATOR_PASSWORD_FILE)")
+        return 1
+    try:
+        if secret == "private_key":
+            if not os.access(path, os.W_OK) or not os.access(path.parent, os.W_OK):
+                log.error(
+                    "%s holds an UNENCRYPTED key, which the node refuses outside a dev network, "
+                    "and it is read-only here: encrypt it with `python scripts/validator/keystore.py "
+                    "encrypt` and mount the keystore instead", path
+                )
+                return 1
+            wallet = encrypt_in_place(path, password)
+            log.warning("encrypted the plaintext validator wallet %s in place (same key)", path)
+        else:
+            wallet = load_validator_wallet(path, password, allow_plaintext=False)
+    except ValidatorKeyError as e:
+        log.error("%s", e)
+        return 1
+    log.info("using validator keystore: %s", path)
+    log.info("validator address: %s", wallet.address)
     return 0
 
 
@@ -79,56 +104,27 @@ def generate(path: Path) -> int:
     if not os.access(parent, os.W_OK):
         log.error(
             "no wallet at %s and its directory is not writable. Either mount an "
-            "existing wallet there, or point QRDX_VALIDATOR_WALLET at a path "
+            "existing keystore there, or point QRDX_VALIDATOR_WALLET at a path "
             "inside the writable data volume (e.g. /app/data/validator/validator.json).",
             path,
         )
         return 1
 
-    from qrdx.crypto.pq.dilithium import PQPrivateKey
-    from qrdx.validator.keystore import read_password
+    password = _password()
+    if not password:
+        log.error(
+            "no keystore password: set QRDX_VALIDATOR_PASSWORD (or QRDX_VALIDATOR_PASSWORD_FILE). "
+            "The node accepts a validator key only in an encrypted keystore outside a dev network."
+        )
+        return 1
 
-    password = read_password(dict(os.environ))
-    if password:
-        # Encrypted (scrypt + AES-256-GCM): what every network but a dev one requires.
-        from qrdx.wallet_v2.pq_wallet import PQWallet
+    from qrdx.validator.keystore import write_keystore
+    from qrdx.wallet_v2.pq_wallet import PQWallet
 
-        keystore = PQWallet.generate().to_keystore(password)
-        keystore["kind"] = "qrdx-validator"
-        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(keystore, f, indent=2)
-        log.info("generated a NEW encrypted validator keystore: %s", path)
-        log.info("validator address: %s", keystore["address"])
-        log.warning("Back up the keystore and its password: the key exists nowhere else.")
-        return 0
-
-    private_key = PQPrivateKey.generate()
-    public_key = private_key.public_key
-
-    wallet = {
-        "version": "2.0",
-        "type": "pq",
-        "algorithm": "ML-DSA-65",
-        "address": public_key.to_address(),
-        "public_key": public_key.to_hex(),
-        "private_key": private_key.to_hex(),
-        "label": LABEL,
-        "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-
-    # Write 0600 before the key ever hits the file.
-    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(wallet, f, indent=2)
-
-    log.info("generated a NEW validator wallet: %s", path)
-    log.info("validator address: %s", wallet["address"])
-    log.warning(
-        "This file holds an UNENCRYPTED private key, which only a dev network accepts. Set "
-        "QRDX_VALIDATOR_PASSWORD_FILE to generate an encrypted keystore instead, or encrypt this "
-        "one with scripts/validator/keystore.py encrypt."
-    )
+    wallet = write_keystore(PQWallet.generate(LABEL), password, path)
+    log.info("generated a NEW encrypted validator keystore: %s", path)
+    log.info("validator address: %s", wallet.address)
+    log.warning("Back up the keystore and its password: the key exists nowhere else.")
     log.warning(
         "If genesis-init writes this chain's genesis next, this address becomes its genesis "
         "validator and proposes from block 1. Joining an EXISTING chain instead, it only "

@@ -11,6 +11,15 @@
 # is set, the realtime WebSocket (/ws) and SSE (/stream) feeds.
 #
 # For a multi-node local network use docker-compose.testnet.yml instead.
+#
+# By default the node starts a development chain of its own (QRDX_BOOTSTRAP_NODE
+# 'self'). To follow an existing network instead, it needs that network's
+# genesis_config.json — every node of a chain starts from the same file, and a
+# node without it builds a dev genesis whose block 0 no network shares — and a
+# peer of it:
+#
+#   QRDX_GENESIS_FILE=/app/data/genesis_config.json   (copied onto the volume)
+#   QRDX_BOOTSTRAP_NODE=http://<peer>:3007
 # =============================================================================
 
 x-qrdx-node: &qrdx-node
@@ -37,6 +46,8 @@ services:
 
     ports:
       - "${QRDX_NODE_PORT:-3007}:${QRDX_NODE_PORT:-3007}"
+      # The native peer transport (node port + 10,000: docker-compose.prod.yml explains it).
+      - "${QRDX_P2P_PUBLIC_PORT:-13007}:${QRDX_P2P_PUBLIC_PORT:-13007}"
 
     volumes:
       # ONLY the data directory is a volume. Mounting a volume over /app would
@@ -61,8 +72,10 @@ services:
 
       # 'self'     — standalone; do not dial out (local genesis)
       # 'discover' — pick a peer from the shared registry
-      # <url>      — an explicit peer, e.g. https://node.qrdx.network
-      QRDX_BOOTSTRAP_NODE: "${QRDX_BOOTSTRAP_NODE:-https://node.qrdx.network}"
+      # <url>      — an explicit peer of the network whose genesis this node has
+      QRDX_BOOTSTRAP_NODE: "${QRDX_BOOTSTRAP_NODE:-self}"
+      # The network's genesis file (empty: a development chain of this node's own).
+      QRDX_GENESIS_FILE: "${QRDX_GENESIS_FILE:-}"
 
       # EVM / eth_* JSON-RPC modules (served at /rpc).
       QRDX_RPC_ENABLED: "${QRDX_RPC_ENABLED:-false}"

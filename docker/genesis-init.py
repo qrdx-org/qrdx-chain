@@ -30,6 +30,18 @@ and writes a fresh genesis. The validator wallet and the node identity key are k
 (unlike `down -v`). It only ever replaces a genesis this release cannot run; on a
 working chain it refuses.
 
+A planned regenesis — a new chain although this release could still run the old one — is
+--regenesis: the same, for a chain that works. Stop the node first (it must not write into
+the database being moved), then:
+
+  docker compose -f docker/docker-compose.tunnel.yml stop node
+  docker compose -f docker/docker-compose.tunnel.yml run --rm genesis-init --regenesis
+  docker compose -f docker/docker-compose.tunnel.yml up -d
+
+The new chain is a new network (its genesis is in every signature's domain), so the validator's
+slashing-protection record starts afresh for it and nothing it signed on the old chain stands in
+the way. Every other node of the chain needs the new genesis_config.json and an empty database.
+
 The file is written atomically. A half-written file would fail to parse, and the
 node would refuse to start on it.
 
@@ -48,6 +60,8 @@ Environment
   QRDX_SLOT_DURATION_MS, ...    any network parameter (qrdx/chain_spec.py PARAMS)
   QRDX_VALIDATOR_ENABLED        must be true — a genesis node has to propose
   QRDX_VALIDATOR_WALLET         [/app/data/validator/validator.json]
+  QRDX_GENESIS_DELAY            [0] seconds from now to the chain's first slot (a chain other
+                                validators start with gives them time to come up)
 """
 import json
 import logging
@@ -55,6 +69,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -80,13 +95,14 @@ CHAIN_ID_RAW = os.getenv("QRDX_CHAIN_ID", "").strip()
 NETWORK_NAME = os.getenv("QRDX_NETWORK_NAME", "").strip()
 VALIDATOR_ENABLED = os.getenv("QRDX_VALIDATOR_ENABLED", "false").lower() in TRUTHY
 WALLET_PATH = Path(os.getenv("QRDX_VALIDATOR_WALLET") or "/app/data/validator/validator.json")
+GENESIS_DELAY_RAW = os.getenv("QRDX_GENESIS_DELAY", "0").strip() or "0"
 
 
 def parse_amount(raw: str, what: str) -> Decimal:
     try:
         amount = Decimal(raw.replace("_", ""))
     except InvalidOperation:
-        raise ValueError(f"{what}: {raw!r} is not a number")
+        raise ValueError(f"{what}: {raw!r} is not a number") from None
     if not amount.is_finite() or amount <= 0:
         raise ValueError(f"{what}: {raw!r} must be a positive amount")
     return Decimal(format(amount, "f"))  # "1e9" -> 1000000000, as the genesis file records it
@@ -188,7 +204,17 @@ def retire_chain() -> Path:
 
 def main() -> int:
     reset = "--reset" in sys.argv[1:]
+    regenesis = "--regenesis" in sys.argv[1:]
     unusable = unusable_reason() if GENESIS_FILE.exists() else None
+    if not GENESIS_DELAY_RAW.isdigit():
+        log.error("QRDX_GENESIS_DELAY must be a whole number of seconds; got %r", GENESIS_DELAY_RAW)
+        return 1
+    genesis_delay = int(GENESIS_DELAY_RAW)
+    if regenesis and GENESIS_FILE.exists() and not unusable:
+        # A planned new chain: the old one is retired as --reset retires one this release
+        # cannot run (below), keys and identity kept.
+        unusable = "a new chain was asked for (--regenesis)"
+        reset = True
 
     if unusable and not reset:
         log.error("%s cannot be run by this release:", GENESIS_FILE)
@@ -204,8 +230,8 @@ def main() -> int:
     if reset and GENESIS_FILE.exists() and not unusable:
         log.error(
             "--reset refused: this release can run the chain on this volume. --reset only "
-            "replaces a genesis it cannot run; to discard a working chain use `down -v` (which "
-            "also deletes the validator key — back it up first)."
+            "replaces a genesis it cannot run; to start a new chain anyway (keeping the "
+            "validator key and identity), stop the node and run genesis-init --regenesis."
         )
         return 1
     if unusable:
@@ -273,7 +299,9 @@ def main() -> int:
         log.error("genesis rejected validator %s", validator["address"])
         return 1
 
-    state, block = creator.create_genesis()
+    state, block = creator.create_genesis(
+        genesis_time=int(time.time()) + genesis_delay if genesis_delay else None
+    )
 
     GENESIS_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = GENESIS_FILE.with_name(GENESIS_FILE.name + ".tmp")

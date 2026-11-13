@@ -8,13 +8,16 @@
 #
 #   export CLOUDFLARE_TUNNEL_TOKEN='eyJhIjoi...'     # from the Cloudflare dashboard
 #   export QRDX_PUBLIC_HOSTNAME='node.example.com'   # hostname routed to the tunnel
+#   export QRDX_CHAIN_ID=7620                        # the chain's id (7620: qrdx-testnet)
+#   export QRDX_VALIDATOR_PASSWORD='...'             # the validator keystore's password
 #   docker compose -f docker/docker-compose.tunnel.yml up --build -d
 #
 # This node STARTS ITS OWN CHAIN — it is the genesis node, not a node that joins
 # an existing network. On first start:
 #
-#   1. `validator-init` generates an ML-DSA-65 validator keypair into the data
-#      volume (or validates the wallet you mounted) and logs its address;
+#   1. `validator-init` generates an ML-DSA-65 validator key into an encrypted
+#      keystore on the data volume (or checks the keystore you mounted opens with
+#      QRDX_VALIDATOR_PASSWORD) and logs its address;
 #   2. `genesis-init` writes genesis_config.json onto the same volume, funding
 #      QRDX_GENESIS_ALLOCATIONS and making this node's validator the genesis
 #      validator;
@@ -53,13 +56,31 @@
 # Cloudflare terminates TLS at the edge; the tunnel leg to the node is plain
 # HTTP inside the compose network, which never leaves the Docker bridge.
 #
+# The tunnel carries HTTP only. Nodes elsewhere reach this one over HTTP, not
+# over the native peer transport (a direct TCP connection on the node's port +
+# 10,000, which a node advertising a URL with no port is never dialled on):
+# correct, and slower under load. A node meant to carry a network's load runs
+# with its ports published instead (docker-compose.prod.yml).
+#
 # -----------------------------------------------------------------------------
 # GENESIS — fixed once the chain exists
 # -----------------------------------------------------------------------------
 # Genesis is written once and never regenerated. Changing
 # QRDX_GENESIS_ALLOCATIONS after the first start only logs a warning; a different
-# genesis needs a fresh chain (`down -v`, which ALSO deletes the validator key on
-# the volume — back it up first).
+# genesis needs a fresh chain.
+#
+# REGENESIS — a new chain, keeping this node's validator key and identity:
+#
+#   docker compose -f docker/docker-compose.tunnel.yml build
+#   docker compose -f docker/docker-compose.tunnel.yml stop node
+#   docker compose -f docker/docker-compose.tunnel.yml run --rm genesis-init --regenesis
+#   docker compose -f docker/docker-compose.tunnel.yml up -d
+#
+# (add -f docker/docker-compose.tunnel-wallet.yml to each if you use it). The old
+# genesis and database move to /app/data/retired/<time>/ on the volume; delete
+# them when you no longer need them. A release that cannot run the old chain
+# refuses to start it, and `run --rm genesis-init --reset` does the same move.
+# `down -v` also starts over, but deletes the validator key on the volume too.
 #
 # The validator is in the genesis set with QRDX_GENESIS_VALIDATOR_STAKE (default
 # 100,000 QRDX = MIN_VALIDATOR_STAKE), so it proposes from block 1 with no
@@ -72,11 +93,12 @@
 # builds its own default genesis has a different block 0 and rejects this
 # chain's blocks.
 #
-# KEY CUSTODY: the wallet format this node loads is UNENCRYPTED — the Dilithium
-# secret key is plain hex in the JSON, and QRDX_VALIDATOR_PASSWORD is accepted by
-# that code path but never used to encrypt it. The `node-data` volume therefore
-# holds a live private key. Back it up, restrict access to the Docker host, and
-# do not put this volume on shared storage.
+# KEY CUSTODY: the validator key is an encrypted keystore (scrypt + AES-256-GCM,
+# qrdx/validator/keystore.py) — outside a dev network the node refuses any other
+# form. QRDX_VALIDATOR_PASSWORD (or a file named by QRDX_VALIDATOR_PASSWORD_FILE)
+# is its password, required at every start. A plaintext wallet an older version of
+# this stack wrote is encrypted in place by validator-init, keeping its key. Back
+# up the keystore and its password offline: the key exists nowhere else.
 #
 # To use your OWN wallet instead of a generated one, add the wallet overlay --
 # it mounts a host directory read-only at /app/wallet:
@@ -87,8 +109,10 @@
 #   docker compose -f docker/docker-compose.tunnel.yml \
 #                  -f docker/docker-compose.tunnel-wallet.yml up -d
 #
-# validator-init will validate that wallet and leave it alone. The directory MUST
-# already exist on the host; Compose will not create it for you.
+# validator-init checks that keystore opens with QRDX_VALIDATOR_PASSWORD and
+# leaves it alone (a plaintext wallet mounted read-only is refused: encrypt it
+# first with scripts/validator/keystore.py encrypt). The directory MUST already
+# exist on the host; Compose will not create it for you.
 #
 # -----------------------------------------------------------------------------
 # EXPOSURE — read before pointing this at a real domain
@@ -123,6 +147,9 @@ services:
       QRDX_VALIDATOR_ENABLED: "${QRDX_VALIDATOR_ENABLED:-true}"
       QRDX_VALIDATOR_WALLET: "${QRDX_VALIDATOR_WALLET:-/app/data/validator/validator.json}"
       QRDX_VALIDATOR_LABEL: "${QRDX_VALIDATOR_LABEL:-QRDX Validator}"
+      # The keystore's password (or a file holding it, inside the container).
+      QRDX_VALIDATOR_PASSWORD: "${QRDX_VALIDATOR_PASSWORD:?set QRDX_VALIDATOR_PASSWORD: the validator keystore's password (at least 12 characters)}"
+      QRDX_VALIDATOR_PASSWORD_FILE: "${QRDX_VALIDATOR_PASSWORD_FILE:-}"
 
   # ---------------------------------------------------------------------------
   # Genesis (runs once, then exits)
@@ -224,9 +251,10 @@ services:
       # QRDX_VALIDATOR_WALLET at your own file under /app/wallet.
       QRDX_VALIDATOR_ENABLED: "${QRDX_VALIDATOR_ENABLED:-true}"
       QRDX_VALIDATOR_WALLET: "${QRDX_VALIDATOR_WALLET:-/app/data/validator/validator.json}"
-      # Accepted by the wallet loader but unused: this wallet format is not
-      # encrypted. See the KEY CUSTODY note in the header.
-      QRDX_VALIDATOR_PASSWORD: "${QRDX_VALIDATOR_PASSWORD:-}"
+      # The keystore's password (see KEY CUSTODY in the header). The node removes it from
+      # its environment once read.
+      QRDX_VALIDATOR_PASSWORD: "${QRDX_VALIDATOR_PASSWORD:?set QRDX_VALIDATOR_PASSWORD: the validator keystore's password (at least 12 characters)}"
+      QRDX_VALIDATOR_PASSWORD_FILE: "${QRDX_VALIDATOR_PASSWORD_FILE:-}"
       QRDX_RPC_ADMIN_TOKEN: "${QRDX_RPC_ADMIN_TOKEN:-}"
 
       QRDX_ORACLE_FEED: "exchanges"

@@ -1,9 +1,10 @@
 # ---------------------------------------------------------------------------
 # Docker build context exclusions
 #
-# The repo root carries ~3.8 GB of local state (ref/, testnet/, logs/, .git).
-# Only qrdx/, py-evm/, run_node.py and requirements-v3.txt are needed to build
-# the node image, so everything else is excluded to keep the context small.
+# The repo root carries gigabytes of local state (ref/, testnet/, logs/, .git).
+# The image is built from qrdx/, contracts/, run_node.py, docker/ (its scripts),
+# native/qrdx-native/ (the Rust module, from source), py-evm/ and release/ (the
+# locked requirements); everything else is excluded to keep the context small.
 # ---------------------------------------------------------------------------
 
 # --- VCS / tooling ---
@@ -30,18 +31,24 @@ dvm/
 **/*.db
 **/*.db-shm
 **/*.db-wal
+**/*.db-lck
+**/*.p2p
+**/*.sqlite
+**/*.sqlite.lock
 **/*.log
 **/*.pid
+state/
 
 # --- Vendored reference material (1.5 GB, not used at runtime) ---
 ref/
 
-# --- Tests, examples, docs ---
+# --- Tests, examples, docs, the TypeScript SDK ---
 tests/
 integration_tests/
 examples/
 docs/
 changelogs/
+sdk/
 *.md
 !README.md
 
@@ -66,6 +73,7 @@ py-evm/.tox
 **/*.pq
 **/*.pq.pub
 **/*.keystore
+**/*.keystore.json
 **/node_key.*
 **/validator_wallet.json
 **/slashing_protection.db

@@ -140,6 +140,10 @@ To test public node behavior over the Internet, the Docker setup includes option
 
 **One port serves everything.** The REST API, JSON-RPC (`/rpc`), Prometheus metrics (`/metrics`), health probes (`/healthz`, `/readyz`) and the optional realtime feeds (`/ws`, `/stream`) are all served on `QRDX_NODE_PORT` (default `3007`). There is no separate `8545` / `9090` listener.
 
+**Peers also talk over the native transport** ([docs/NETWORK.md](docs/NETWORK.md)): one encrypted TCP connection per peer for transactions, blocks and votes, on the node port + 10,000 (`13007`). A peer dials it at the port of a node's advertised URL (`QRDX_SELF_URL`) + 10,000, so a public node publishes both ports and advertises a URL with its port. Without it, peers fall back to HTTP (correct, but slower under load).
+
+**Native threads.** The image's entrypoint sizes the native module's thread pool to the container's CPUs (its CPU limit, else its CPU set), divided by `QRDX_NODES_PER_HOST` where several nodes share a host. `QRDX_NATIVE_THREADS` sets it explicitly.
+
 **Compose files:**
 
 | File | Purpose |
@@ -160,7 +164,7 @@ To test public node behavior over the Internet, the Docker setup includes option
 git clone --recurse-submodules https://github.com/The-Sycorax/qrdx-chain-denaro.git
 cd qrdx-chain-denaro
 
-# Single node, joining the public network.
+# Single node: a development chain of its own.
 docker compose -f docker/docker-compose.yml up --build -d
 docker compose -f docker/docker-compose.yml logs -f
 
@@ -171,7 +175,7 @@ curl http://localhost:3007/readyz
 docker compose -f docker/docker-compose.yml down
 ```
 
-To run a standalone node that creates its own genesis instead of dialing the public seed, set `QRDX_BOOTSTRAP_NODE=self`.
+To follow an existing network instead, the node needs that network's `genesis_config.json` (every node of a chain starts from the same file; without it the node builds a development genesis no network shares) and one of its peers: set `QRDX_GENESIS_FILE` to the file's path on the data volume and `QRDX_BOOTSTRAP_NODE` to the peer's URL.
 
 </dl></dd>
 
@@ -181,7 +185,9 @@ To run a standalone node that creates its own genesis instead of dialing the pub
 
 <dl><dd>
 
-`docker-compose.testnet.yml` is self-contained: an `init` service generates the validator wallets and `genesis_config.json` inside the shared volume before any node starts, so no host Python, liboqs or jq is required. The generation is idempotent — restarting the stack reuses the existing genesis.
+`docker-compose.testnet.yml` is self-contained: an `init` service generates the validator wallets and `genesis_config.json` inside the shared volume before any node starts, so no host Python, liboqs or jq is required. The generation is idempotent — restarting the stack reuses the existing genesis. The chain's first slot is `QRDX_GENESIS_DELAY` (45 s) after `init`, so every node is up and meshed before the 250 ms slots begin. Each node takes a quarter of the host's CPUs for its native threads.
+
+**Regenesis** (a new chain, for example on a new release): `down -v`, then `up --build -d`. A release that cannot run the chain on the volume says so in `init`'s log and starts no node on it.
 
 ```bash
 docker compose -f docker/docker-compose.testnet.yml up --build -d
@@ -256,6 +262,8 @@ One-time setup in Cloudflare Zero Trust -> Networks -> Tunnels: create a Cloudfl
 ```bash
 export CLOUDFLARE_TUNNEL_TOKEN='eyJhIjoi...'
 export QRDX_PUBLIC_HOSTNAME='node.example.com'
+export QRDX_CHAIN_ID=7620          # the QRDX testnet's id; any other id no EVM network uses
+export QRDX_VALIDATOR_PASSWORD='...'   # the validator keystore's password (12+ characters)
 
 docker compose -f docker/docker-compose.tunnel.yml up --build -d
 
@@ -270,9 +278,18 @@ curl http://127.0.0.1:2000/ready      # cloudflared's own status
 docker compose -f docker/docker-compose.tunnel.yml down
 ```
 
-`QRDX_PUBLIC_HOSTNAME` must match the hostname you routed: it becomes `QRDX_SELF_URL`, the address this node advertises to peers. Both variables are required — Compose fails with an explanatory message if either is unset.
+`QRDX_PUBLIC_HOSTNAME` must match the hostname you routed: it becomes `QRDX_SELF_URL`, the address this node advertises to peers. These variables are required — Compose fails with an explanatory message if one is unset. The tunnel carries HTTP only: peers reach this node over HTTP, not the native transport.
 
-> **Genesis is fixed once the chain exists.** `genesis-init` writes it once and never regenerates it. If you change `QRDX_GENESIS_ALLOCATIONS` later, it only logs a warning. A different genesis needs a fresh chain: `down -v`, which **also deletes the validator key** on the volume, so back that up first. Every other node joining this chain must start from the same file: copy it out with `docker compose -f docker/docker-compose.tunnel.yml cp node:/app/data/genesis_config.json .` and place it two directories above that node's `QRDX_DATABASE_PATH`. A node that builds its own default genesis has a different block 0 and rejects this chain's blocks.
+> **Genesis is fixed once the chain exists.** `genesis-init` writes it once and never regenerates it. If you change `QRDX_GENESIS_ALLOCATIONS` later, it only logs a warning. A different genesis needs a new chain. To start one and **keep the validator key and node identity**:
+>
+> ```bash
+> docker compose -f docker/docker-compose.tunnel.yml build
+> docker compose -f docker/docker-compose.tunnel.yml stop node
+> docker compose -f docker/docker-compose.tunnel.yml run --rm genesis-init --regenesis
+> docker compose -f docker/docker-compose.tunnel.yml up -d
+> ```
+>
+> The old genesis and database move to `/app/data/retired/<time>/` on the volume. (`down -v` also starts over, but **deletes the validator key** on the volume too.) Every other node joining this chain must start from the same file: copy it out with `docker compose -f docker/docker-compose.tunnel.yml cp node:/app/data/genesis_config.json .` and place it two directories above that node's `QRDX_DATABASE_PATH`. A node that builds its own default genesis has a different block 0 and rejects this chain's blocks.
 
 > **Key custody:** outside dev networks the node accepts only an encrypted keystore (scrypt + AES-256-GCM) and refuses a plaintext key. Set `QRDX_VALIDATOR_PASSWORD_FILE` (or `QRDX_VALIDATOR_PASSWORD`) before the first start and `validator-init` writes one. Back up the keystore, its password and the validator's slashing-protection record together. See [docs/VALIDATOR_KEYS.md](docs/VALIDATOR_KEYS.md).
 

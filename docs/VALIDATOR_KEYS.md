@@ -50,7 +50,11 @@ Run the node with:
 | `QRDX_VALIDATOR_PASSWORD_FILE` | a file holding the password (a container secret, say); one trailing newline is ignored |
 | `QRDX_VALIDATOR_PASSWORD` | the password itself, if no file is given. The node removes it from its environment once read. Prefer the file: a variable shows in `/proc/<pid>/environ`. |
 
-`docker/validator-init.py` generates an encrypted keystore when a password is configured.
+The container stacks write encrypted keystores: `docker/validator-init.py` (the tunnel stack's
+genesis validator; it requires the password, and encrypts in place, keeping the key, a plaintext
+wallet an older stack left) and `docker/testnet-init.py` (the local 4-node testnet, under its
+well-known passwords). Both use `qrdx.validator.keystore.write_keystore`, which proves a keystore
+opens before anything relies on it.
 
 Keep an offline backup of the keystore and its password. The key exists nowhere else, and
 nothing can recover a lost one.

@@ -582,3 +582,19 @@ class TestDHTIntegrationComplete:
         assert '/dht/message' not in source
         assert '/rpc' in source
         assert 'dht_message' in source
+
+
+def test_the_dht_advertises_the_nodes_url_not_its_bind_address(monkeypatch):
+    """A node bound to every interface (0.0.0.0, as every node in a container is) told its DHT
+    peers to dial 0.0.0.0 — themselves — so every handshake from the DHT failed. It advertises
+    the host and port of its own URL; only without one, its bind address."""
+    from qrdx.node import discovery
+
+    monkeypatch.setattr(discovery, "DENARO_NODE_HOST", "0.0.0.0")
+    monkeypatch.setattr(discovery, "DENARO_NODE_PORT", "3007")
+    monkeypatch.setattr(discovery, "DENARO_SELF_URL", "http://node1:3008")
+    assert discovery._advertised_address() == ("node1", 3008)
+    monkeypatch.setattr(discovery, "DENARO_SELF_URL", "https://node.example.com")
+    assert discovery._advertised_address() == ("node.example.com", 443)
+    monkeypatch.setattr(discovery, "DENARO_SELF_URL", "")
+    assert discovery._advertised_address() == ("0.0.0.0", 3007)

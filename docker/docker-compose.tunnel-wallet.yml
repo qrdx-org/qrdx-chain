@@ -3,7 +3,8 @@
 # wallet from the host instead of letting validator-init generate one.
 #
 #   mkdir -p /secure/path                       # MUST exist; Compose won't create it
-#   cp my-validator.json /secure/path/
+#   cp my-validator.json /secure/path/          # an encrypted keystore
+#                                               # (scripts/validator/keystore.py new|encrypt)
 #   export QRDX_VALIDATOR_WALLET_DIR=/secure/path
 #   export QRDX_VALIDATOR_WALLET=/app/wallet/my-validator.json
 #

@@ -122,6 +122,20 @@ async def _periodic_dht_bridge() -> None:
         await asyncio.sleep(30)  # DHT sync every 30s
 
 
+def _advertised_address() -> Tuple[str, int]:
+    """Where the DHT tells peers to reach this node: the host and port of the URL it advertises
+    (``QRDX_SELF_URL``), and only without one the address it binds. A node bound to every
+    interface (0.0.0.0: every node in a container) told each peer to dial 0.0.0.0, which is the
+    peer itself; every such handshake failed."""
+    if DENARO_SELF_URL:
+        advertised = urlparse(DENARO_SELF_URL)
+        if advertised.hostname:
+            return advertised.hostname, advertised.port or (
+                443 if advertised.scheme == "https" else 80
+            )
+    return DENARO_NODE_HOST or "0.0.0.0", int(DENARO_NODE_PORT) if DENARO_NODE_PORT else 30303
+
+
 async def _init_dht() -> None:
     """
     Initialize the Kademlia DHT subsystem during node startup.
@@ -137,8 +151,7 @@ async def _init_dht() -> None:
     try:
         # Build the local P2P Node from existing identity
         pub_key = get_public_key_bytes()
-        listen_host = DENARO_NODE_HOST or "0.0.0.0"
-        listen_port = int(DENARO_NODE_PORT) if DENARO_NODE_PORT else 30303
+        listen_host, listen_port = _advertised_address()
         local_addr = P2PAddress(ip=listen_host, tcp_port=listen_port)
         local_node = P2PNode(public_key=pub_key, address=local_addr)
 

@@ -262,15 +262,30 @@ WORKDIR /app
 COPY --from=app --chown=1000:1000 /app /app
 
 # Fail the BUILD (not production) if the post-quantum stack is not usable: ML-DSA-65 must be
-# present and importing oqs must not trigger a source build.
+# present and importing oqs must not trigger a source build. Then: every module of the node
+# parses under THIS image's Python (development runs a newer one, whose syntax 3.11 refuses —
+# parsed only, no bytecode written), and the native module has what the node runs on: the store,
+# the peer transport, the balance plane and the exchange's native commitments (docs/NATIVE.md).
 RUN python -c "\
 import oqs;\
 mechs = oqs.get_enabled_sig_mechanisms();\
 assert 'ML-DSA-65' in mechs, 'ML-DSA-65 missing from liboqs build';\
 print('liboqs', oqs.oqs_version(), '| liboqs-python', oqs.oqs_python_version(), '| ML-DSA-65 OK')" \
     && python -c "from eth.vm.forks.qrdx import QRDXVM; print('py-evm QRDXVM OK')" \
+    && python -c "\
+import ast, pathlib, sys;\
+files = sorted(pathlib.Path('/app/qrdx').rglob('*.py')) + [pathlib.Path('/app/run_node.py')];\
+[ast.parse(f.read_bytes(), str(f)) for f in files];\
+print(len(files), 'modules parse under Python', sys.version.split()[0])" \
     && python -c "import qrdx.constants; print('qrdx package OK')" \
-    && python -c "import qrdx.native as n; assert n.AVAILABLE; print('native module OK')"
+    && python -c "\
+import qrdx.native as n;\
+assert n.AVAILABLE, 'native module missing';\
+missing = [c for c in ('Store', 'NetService', 'Plane', 'PlaneView', 'commit_plain', 'lane_run',\
+    'order_lane_run', 'smt_update_into', 'lt_mix_entries', 'wire_read', 'wire_heads',\
+    'mldsa65_verify_bind_batch') if not hasattr(n._native, c)];\
+assert not missing, f'native module lacks {missing}';\
+print('native module OK |', n._native.threads(), 'threads here')"
 
 # Non-root runtime user. UID/GID 1000 matches the default `user:` in the compose files so
 # bind-mounted data directories stay writable. /testnet exists in the image so that a named
@@ -295,7 +310,13 @@ LABEL org.opencontainers.image.title="qrdx-node" \
 # Default node port (QRDX_NODE_PORT). The HTTP API, JSON-RPC (/rpc), Prometheus metrics
 # (/metrics), health probes (/healthz, /readyz) and the optional WebSocket/SSE stream
 # (/ws, /stream) are ALL served on this one port.
-EXPOSE 3007
+#
+# The peer transport (docs/NETWORK.md: transactions, blocks and votes between nodes, encrypted,
+# TCP) listens on the node port + QRDX_P2P_PORT_OFFSET (10,000): 13007 by default. A peer dials
+# it at the port of this node's advertised URL (QRDX_SELF_URL) + 10,000, so a public node
+# publishes both, on host ports 10,000 apart, and advertises a URL with its port. Without it
+# peers reach the node over HTTP only (slower, never wrong).
+EXPOSE 3007 13007
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=90s --retries=5 \
     CMD ["python", "/app/docker/docker-healthcheck.py"]

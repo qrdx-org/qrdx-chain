@@ -27,9 +27,17 @@ Environment
                          (qrdx/chain_spec.py PARAMS). They are written into the genesis
                          file's chain spec, which is where every node reads them from; set
                          them HERE, on the init service, not on the nodes.
+  QRDX_GENESIS_DELAY     [45]        seconds from now to the chain's first slot: every node
+                         starts and meshes before it (at 250 ms slots a late validator
+                         misses its slots), as scripts/testnet.sh does
   QRDX_GENESIS_BALANCE   [1000000]   prefunded QRDX per validator
   QRDX_VALIDATOR_STAKE   [100000]    genesis stake per validator
   QRDX_VALIDATOR_PASSWORD_PREFIX [testnet_validator_]
+
+The validators' keys are encrypted keystores (scrypt + AES-256-GCM: qrdx/validator/keystore.py),
+the only form a node accepts outside a dev network, each under the password the compose file
+gives its node (QRDX_VALIDATOR_PASSWORD_PREFIX + its index). A plaintext validator wallet left by
+an older init is encrypted in place, keeping its key.
 
 WARNING: the generated wallets use well-known passwords and are for LOCAL
 TESTING ONLY. Never reuse this flow for a public network.
@@ -39,6 +47,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -51,6 +60,8 @@ NUM_VALIDATORS = int(os.getenv("QRDX_TESTNET_VALIDATORS", "3"))
 CHAIN_ID = int(os.getenv("QRDX_CHAIN_ID", "7620"))
 NETWORK_NAME = os.getenv("QRDX_NETWORK_NAME", "qrdx-testnet")
 GENESIS_BALANCE = Decimal(os.getenv("QRDX_GENESIS_BALANCE", "1000000"))
+GENESIS_DELAY = int(os.getenv("QRDX_GENESIS_DELAY", "45"))
+PASSWORD_PREFIX = os.getenv("QRDX_VALIDATOR_PASSWORD_PREFIX", "testnet_validator_")
 VALIDATOR_STAKE = Decimal(os.getenv("QRDX_VALIDATOR_STAKE", "100000"))
 
 WALLETS_DIR = TESTNET_DIR / "wallets"
@@ -92,6 +103,25 @@ def make_wallet(path: Path, label: str, purpose: str | None = None) -> dict:
     return wallet
 
 
+def make_validator(path: Path, password: str) -> dict:
+    """A validator's encrypted keystore (made, or encrypted from an older plaintext wallet, or
+    checked to open with its password): its address and public key."""
+    from qrdx.validator.keystore import encrypt_in_place, load_validator_wallet, write_keystore
+    from qrdx.wallet_v2.pq_wallet import PQWallet
+
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        wallet = write_keystore(PQWallet.generate(), password, path)
+        log.info("created %s -> %s", path.name, wallet.address[:24] + "...")
+    elif "crypto" not in json.loads(path.read_text()):
+        wallet = encrypt_in_place(path, password)
+        log.info("encrypted %s (plaintext from an older init) -> %s", path.name, wallet.address[:24] + "...")
+    else:
+        wallet = load_validator_wallet(path, password, allow_plaintext=False)
+        log.info("reusing %s", path.name)
+    return {"address": wallet.address, "public_key": json.loads(path.read_text())["public_key"]}
+
+
 def main() -> int:
     for sub in ("wallets", "databases", "keys"):
         (TESTNET_DIR / sub).mkdir(parents=True, exist_ok=True)
@@ -112,6 +142,19 @@ def main() -> int:
 
     log.info("bootstrapping a %d-validator testnet in %s", NUM_VALIDATORS, TESTNET_DIR)
 
+    from qrdx import chain_spec as cs
+
+    # The network's consensus definition, committed to by genesis (docs/PROTOCOL_UPGRADES.md),
+    # active before anything else of qrdx is imported: qrdx.constants (imported by the keystore
+    # and genesis modules) loads THIS spec. With no genesis file it would build a dev spec from
+    # the environment, which refuses qrdx-testnet's chain id.
+    spec = cs.build_spec(NETWORK_NAME, CHAIN_ID, cs.params_from_environment())
+    if "qrdx.constants" in sys.modules:
+        raise RuntimeError("qrdx.constants was imported before the chain spec was activated")
+    stub = Path(tempfile.mkdtemp()) / "genesis_config.json"
+    stub.write_text(json.dumps({"chain_spec": spec.to_dict()}))
+    os.environ["QRDX_GENESIS_FILE"] = str(stub)
+
     controller = make_wallet(
         WALLETS_DIR / "master_controller.json",
         "Master Controller (System Wallets)",
@@ -119,21 +162,10 @@ def main() -> int:
     )
 
     validators = [
-        make_wallet(WALLETS_DIR / f"validator_{i}.json", f"Validator {i}")
+        make_validator(WALLETS_DIR / f"validator_{i}.json", f"{PASSWORD_PREFIX}{i}")
         for i in range(NUM_VALIDATORS)
     ]
 
-    from qrdx import chain_spec as cs
-
-    # The network's consensus definition, committed to by genesis (docs/PROTOCOL_UPGRADES.md).
-    spec = cs.build_spec(NETWORK_NAME, CHAIN_ID, cs.params_from_environment())
-    # qrdx.constants (imported by the genesis module) loads THIS spec: with no genesis file it
-    # would build a dev spec from the environment, which refuses qrdx-testnet's chain id.
-    if "qrdx.constants" in sys.modules:
-        raise RuntimeError("qrdx.constants was imported before the chain spec was activated")
-    stub = Path(tempfile.mkdtemp()) / "genesis_config.json"
-    stub.write_text(json.dumps({"chain_spec": spec.to_dict()}))
-    os.environ["QRDX_GENESIS_FILE"] = str(stub)
     from qrdx.validator.genesis import GenesisConfig, GenesisCreator
 
     config = GenesisConfig(
@@ -155,12 +187,14 @@ def main() -> int:
     for v in validators:
         creator.add_validator(v["address"], v["public_key"], VALIDATOR_STAKE)
 
-    state, block = creator.create_genesis()
+    # (its first slot ahead, so the nodes meet before it: see QRDX_GENESIS_DELAY)
+    state, block = creator.create_genesis(genesis_time=int(time.time()) + max(0, GENESIS_DELAY))
     creator.export_genesis(state, block, str(GENESIS_FILE))
 
     log.info("chain spec   : %s (chain id %d)", spec.genesis_hash()[:16], spec.chain_id)
     log.info("genesis hash : %s", block.block_hash)
     log.info("state root   : %s", state.state_root)
+    log.info("first slot   : %d s from now", max(0, GENESIS_DELAY))
     log.info("validators   : %d", len(state.validators))
     log.info("system wallets: %d (controller %s)", len(state.system_wallets), controller["address"][:24] + "...")
     log.info("wrote %s", GENESIS_FILE)

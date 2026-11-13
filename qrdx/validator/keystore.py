@@ -130,3 +130,44 @@ def load_validator_wallet(
     logger.warning("the validator key in %s is UNENCRYPTED (accepted on a dev network only)", path)
     key = PQPrivateKey.from_hex(data["private_key"], public_key_hex=public_key_hex)
     return _check_keypair(PQWallet(private_key=key), data.get("address"))
+
+
+def write_keystore(
+    wallet: PQWallet, password: str, path: str | Path, *, replace: bool = False
+) -> PQWallet:
+    """Write ``wallet`` as an encrypted validator keystore at ``path`` (mode 0600) and prove it
+    opens with ``password`` under the rules a real network applies. Never over an existing file
+    unless ``replace``, and then atomically (a reader sees the old file or the new one). Returns
+    the wallet as the keystore reopens it."""
+    if not password:
+        raise ValidatorKeyError("a keystore needs a password")
+    path = Path(path)
+    keystore = wallet.to_keystore(password)
+    keystore["kind"] = "qrdx-validator"
+    target = path.with_name(path.name + ".tmp") if replace else path
+    fd = os.open(target, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(keystore, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        reopened = load_validator_wallet(target, password, allow_plaintext=False)
+        if reopened.address != wallet.address:
+            raise ValidatorKeyError(
+                f"{target} reopened as {reopened.address}, not {wallet.address}"
+            )
+    except BaseException:
+        if replace:
+            target.unlink(missing_ok=True)
+        raise
+    if replace:
+        os.replace(target, path)
+    return reopened
+
+
+def encrypt_in_place(path: str | Path, password: str) -> PQWallet:
+    """Replace a plaintext validator wallet with an encrypted keystore of the same key (a dev
+    network's wallet moving to a real one). The plaintext file is gone afterwards."""
+    wallet = load_validator_wallet(path, None, allow_plaintext=True)
+    return write_keystore(wallet, password, path, replace=True)

@@ -11,6 +11,19 @@
 # PORTS: the node exposes ONE HTTP port (QRDX_NODE_PORT). It carries the REST
 # API, JSON-RPC at /rpc, Prometheus metrics at /metrics, /healthz, /readyz and
 # the optional /ws + /stream feeds. There is no separate 8545/8546/9090 listener.
+#
+# Beside it, the native peer transport (docs/NETWORK.md): transactions, blocks
+# and votes between nodes over one encrypted TCP connection a peer, on the node
+# port + 10,000 (QRDX_P2P_PUBLIC_PORT, 13007). A peer dials it at the port of
+# this node's advertised URL + 10,000, so QRDX_SELF_URL must carry the port
+# (http://203.0.113.5:3007, not a bare hostname) and both ports must be open.
+# Without it peers use HTTP alone: correct, much slower under load.
+#
+# REGENESIS (a new chain): stop the node, replace genesis_config.json on the
+# data volume with the new network's file, delete the database
+# (/app/data/qrdx.db and qrdx.db-lck) — keep keys/ and the validator wallet —
+# then start it. Its slashing-protection record is per network: the new chain
+# starts it afresh.
 # =============================================================================
 
 x-logging: &default-logging
@@ -39,6 +52,9 @@ services:
 
     ports:
       - "${QRDX_NODE_PORT:-3007}:${QRDX_NODE_PORT:-3007}"
+      # The peer transport: QRDX_NODE_PORT + 10,000 inside the container (it listens there),
+      # published on the same number (peers dial the advertised URL's port + 10,000).
+      - "${QRDX_P2P_PUBLIC_PORT:-13007}:${QRDX_P2P_PUBLIC_PORT:-13007}"
 
     volumes:
       # Chain database, PQ node identity and slashing-protection DB.
@@ -78,11 +94,17 @@ services:
       QRDX_METRICS_ENABLED: "true"
       QRDX_RPC_ENABLED: "${QRDX_RPC_ENABLED:-true}"
       QRDX_ENABLE_STREAMING: "${QRDX_ENABLE_STREAMING:-}"
+      # The native module's threads: by default the CPU limit below (docker-entrypoint.sh).
+      QRDX_NATIVE_THREADS: "${QRDX_NATIVE_THREADS:-}"
       # Validator (leave disabled on a plain full node)
       QRDX_VALIDATOR_ENABLED: "${QRDX_VALIDATOR_ENABLED:-false}"
       QRDX_VALIDATOR_WALLET: "${QRDX_VALIDATOR_WALLET:-}"
-      # Secrets — from the environment only.
+      # Secrets — from the environment only. The validator key is an encrypted keystore (the
+      # node refuses any other form outside a dev network: scripts/validator/keystore.py makes
+      # one); its password comes from QRDX_VALIDATOR_PASSWORD, or from a file inside the
+      # container named by QRDX_VALIDATOR_PASSWORD_FILE (a secret mount).
       QRDX_VALIDATOR_PASSWORD: "${QRDX_VALIDATOR_PASSWORD:-}"
+      QRDX_VALIDATOR_PASSWORD_FILE: "${QRDX_VALIDATOR_PASSWORD_FILE:-}"
       QRDX_RPC_ADMIN_TOKEN: "${QRDX_RPC_ADMIN_TOKEN:-}"
       QRDX_TLS_CERT: "${QRDX_TLS_CERT:-}"
       QRDX_TLS_KEY: "${QRDX_TLS_KEY:-}"
